@@ -2,16 +2,16 @@
 #define COQUI_VERTEX_PI_ICC
 
 /**
- * ISDF-Vertex Phase 1d: second-order-exchange polarization cut Pi^C (G^4 W, single rung).
+ * Second-order-exchange polarization cut Pi^C (G^4 W, single rung) in the ISDF/THC representation.
  *
- * Physics (verified, sign_crossing_report.md; theoryB Eq. 13 with prefactor -1):
+ * Physics (overall prefactor -1):
  *
  *   P^C_{ab,cd}(q,inu) = -(1/(Nk*beta)^2) sum_{k,qx} sum_{iw,ivx} sum_{p1,p1',p3,p3' in C} sum_s
  *       G^s_{p3 b}(k+q, iw+inu) G^s_{c p3'}(k-qx+q, iw-ivx+inu)
  *       G^s_{p1 d}(k-qx, iw-ivx) G^s_{a p1'}(k, iw)
  *       * W_{(p1 p1'),(p3 p3')}(qx, ivx)              [W = Z + W_dyn, full rung]
  *
- * THC contraction (derived mechanically, notes/pi_c_kernel_design.md sections 2-3):
+ * THC contraction:
  *
  *   Pi^C_MN(q,inu) = -(spin/Nk^2) (1/beta^2) sum_{s,k,qx} sum_{w,vx} sum_{p1 p1' p3 p3' in C}
  *      [ zL_{N p1'}(k, iw) zR_{p3 N}(k+q, iw+inu) ]                    <- "T pair", shares N
@@ -23,7 +23,7 @@
  *   wbar = U1^T [Z + W_dyn](qx,ivx) U2,  U1_(P,(p1p1')) = X_P,p1(k-qx) X*_P,p1'(k),
  *                                        U2_(Q,(p3p3')) = X_Q,p3(k+q) X*_Q,p3'(k-qx+q).
  *
- * Imaginary-axis algorithm (exact; design doc section 4). The loop frequency threads both
+ * Imaginary-axis algorithm (exact). The loop frequency threads both
  * pairs and each pair has relative shift = the EXTERNAL inu; the rung sum couples the two
  * pairs with relative shift ivx. Exact evaluation on sparse grids:
  *
@@ -50,23 +50,22 @@
  *      The dynamic part therefore requires the DLR backend (as does the sibling
  *      double_boson_conv); the bare-Z rung (first iteration) is backend-agnostic.
  *
- * Remaining representability assumptions [A-comp] (same class as GG/WGG in GW/SOSEX):
+ * Remaining representability assumption (same class as GG/WGG in GW/SOSEX):
  * products of representable tau-objects (pair products, triple products with wbar~) stay
  * within the basis span given the instance's wmax headroom.
  *
- * ALSO IN THIS FILE: pi_dyn_factorized (eq:pibardynfact). B-L needs only the EQUAL-TIME
+ * ALSO IN THIS FILE: pi_dyn_factorized. Some consumers need only the EQUAL-TIME
  * value of the dynamic-rung polarization, pi^dyn(q) = (1/beta) sum_nu Pi^{C,dyn}(q,inu).
  * Summing the external frequency away closes the (12)/(34) pairs instead of (14)/(23) and
  * leaves ONE bosonic pairing of two ordinary bubbles against W -- so that quantity needs
  * NEITHER twisted pairs NOR the pole algebra above. See that function's own comment block.
  *
- * Symmetry (notes/vertex_ibz_symmetry.md): with a non-null vertex_sym::sym_ctx the
- * EXTERNAL q axis runs over the IBZ only while the internal (k, qx) sums cover the
- * FULL BZ; the rung at a non-IBZ transfer qx is sourced from the IBZ-stored W/Z via
- * the effective collocation columns Xhat (rotation + trev-leg conj) and, for
- * trev-mapped transfers, a PQ-transpose of the stored core (memo (P2)). G and the
- * external zL/zR are full-BZ objects supplied by the caller (gauge gather; memo
- * (G1)/(G2)). A null ctx reproduces the no-symmetry path bit-identically.
+ * Symmetry: with a non-null vertex_sym::sym_ctx the EXTERNAL q axis runs over the IBZ
+ * only while the internal (k, qx) sums cover the FULL BZ; the rung at a non-IBZ transfer
+ * qx is sourced from the IBZ-stored W/Z via the effective collocation columns Xhat
+ * (rotation + trev-leg conj) and, for trev-mapped transfers, a PQ-transpose of the stored
+ * core. G and the external zL/zR are full-BZ objects supplied by the caller (gauge
+ * gather). A null ctx reproduces the no-symmetry path bit-identically.
  */
 
 #include <map>
@@ -141,7 +140,7 @@ namespace vertex_pi {
       }
       utils::check(m0 >= 0, "vertex_pi::iaft_tools: bosonic Matsubara mesh does not contain nu=0.");
 
-      // tau mirror (beta - tau), requires a PH-symmetric mesh (same check as scr_coulomb_t.cpp:52-59)
+      // tau mirror (beta - tau), requires a PH-symmetric mesh (same check as scr_coulomb_t.cpp)
       auto tau = ft->tau_mesh();
       t_mirror = nda::array<long, 1>(nt_f);
       s_phys = nda::array<double, 1>(nt_f);
@@ -168,11 +167,10 @@ namespace vertex_pi {
     /**
      * Initialize the auxiliary DLR pole basis (dynamic-rung path only).
      *
-     * The residues now come from the REGULARIZED least-squares fit in dlr_pole_fit.hpp --
-     * see that file for the measurements. The old route (interpolate the backend tau data
-     * onto the aux tau nodes, then run a square interpolatory vals2coefs there) is a fixed
-     * linear map of 2-norm 9.4e6 at the production grid, and it is what turned O(eps)
-     * unrepresentable content in z into residues 384x the data.
+     * The residues come from the REGULARIZED least-squares fit in dlr_pole_fit.hpp. A square
+     * interpolatory route (interpolate the backend tau data onto the aux tau nodes, then
+     * vals2coefs there) is a linear map of very large 2-norm that turns O(eps) unrepresentable
+     * content in z into residues much larger than the data; the regularized fit avoids that.
      */
     void init_poles(double rtol = -1.0) {
       if (poles_ready) return;
@@ -183,8 +181,8 @@ namespace vertex_pi {
       // Self-check of the pole CONVENTION -- that a tau fit continues to sum_p c_p/(z-eps_p).
       // Two cases: a single off-grid pole, and a multi-pole Lehmann object spanning the grid.
       // (The single-pole case alone is far too weak to catch a representation failure -- it is
-      // trivially in the span, which is why it passed through every divergence. The runtime
-      // gate on fit_error against the ACTUAL data is what does that job now.)
+      // trivially in the span. The runtime check of fit_error against the ACTUAL data covers
+      // representability.)
       {
         auto wf = ft->wn_mesh_f();
         auto check_case = [&](nda::array<double, 1> const& es, nda::array<double, 1> const& ws,
@@ -207,9 +205,8 @@ namespace vertex_pi {
           }
           // A wrong convention gives an O(1) RELATIVE error, so this only has to be small
           // compared to 1. It must NOT double as an accuracy assertion -- that job belongs to
-          // fit_error and its runtime gate, which measure the REAL data every call. Twice now
-          // a tolerance tied closely to eps has aborted a run over a 1.4x miss on a synthetic
-          // probe (1.40e-07 against 1e-07), which tests nothing anyone cares about.
+          // fit_error and its runtime check, which measure the REAL data every call; a tolerance
+          // tied closely to eps would abort on harmless misses of the synthetic probe.
           // 1e-4 still separates a wrong convention by three to four orders.
           double rel = (ref_scale > 0) ? max_err / ref_scale : max_err;
           double tol = std::max(1e-4, 1e3 * ft->eps());
@@ -242,8 +239,8 @@ namespace vertex_pi {
 
     /**
      * Relative max-norm error of the pole fit, evaluated back on the SAME tau grid the data
-     * came from:  err = max|F - sum_p c_p K_F(s, eps_p)| / max|F|.  This is the honest
-     * accuracy of the representation for THIS data, and the quantity eval_Pi_C gates on.
+     * came from:  err = max|F - sum_p c_p K_F(s, eps_p)| / max|F|.  This is the actual
+     * accuracy of the representation for THIS data, and the quantity eval_Pi_C checks.
      */
     double fit_error(nda::MemoryArrayOfRank<2> auto const& F_td,
                      nda::array<ComplexType, 2> const& c) const {
@@ -337,11 +334,11 @@ namespace vertex_pi {
     /**
      * The rung's two collocation pair-legs at one tile. This is the SINGLE source of the
      * Xhat symmetry routing -- shared verbatim by pi_c_accumulate_w (both phases) and by
-     * pi_dyn_factorized, so the two can never drift apart on the part O7 flags as risky:
+     * pi_dyn_factorized, so the two cannot drift apart on the symmetry handling:
      *   U1(P, p1*Nb + p1')  = X(k-qx)_{P,p1}  conj(X(k)_{P,p1'})
      *   U2(P, p3*Nb + p3')  = X(k+q)_{P,p3}   conj(X(k-qx+q)_{P,p3'})
      * With an active sym_ctx the four legs read the EFFECTIVE columns Xhat(is, jsym, k)
-     * (rotation into the IBZ transfer frame + trev-leg conj; memo (X-hat)); the k-point
+     * (rotation into the IBZ transfer frame + trev-leg conj); the k-point
      * INDICES passed in stay the original full-BZ ones -- the rotation is internal to Xhat.
      * jsym is the qsymms position of the transfer's mapping symmetry (0 = identity, and
      * the only case without a symmetry context).
@@ -420,28 +417,26 @@ namespace vertex_pi {
   } // detail
 
   /**
-   * INCREMENT 3 -- THE Pi^C SLAB ACCUMULATOR (vertex parallelization; the 2026-08-02
-   * audit in notes/bl_head_balance_theory_and_plan.md section 5g). Ownership plan for
-   * the EXTERNAL q axis of the Pi^C accumulator. Under the 2D (tuple x q_ext) rank
-   * split each rank only ever writes the q_ext rows it strides, so the historic
-   * full-shape per-rank partial (nw_b, nq_ext, Np, Np) -- 46.6 GB/rank at Si kp666,
-   * the last replicated giant after the lean-W staging -- is structurally ZERO outside
-   * those rows. A plan makes the ownership explicit so the kernel can write a SLAB
-   * holding only the owned rows.
+   * THE Pi^C SLAB ACCUMULATOR. Ownership plan for the EXTERNAL q axis of the Pi^C
+   * accumulator. Under the 2D (tuple x q_ext) rank split each rank only ever writes the
+   * q_ext rows it strides, so a full-shape per-rank partial (nw_b, nq_ext, Np, Np) -- which
+   * can reach tens of GB per rank -- is structurally ZERO outside those rows. A plan makes
+   * the ownership explicit so the kernel can write a SLAB holding only the owned rows.
    *
    * Two deliberate choices:
    *  - ownership is assigned over +-q ORBITS {iq, qminus(iq)} (self-inverse and
    *    partnerless rows are singletons), so the caller's pair-symmetry projection
    *    P_PQ(q) = P_QP(-q) stays rank-local on the slab;
-   *  - the factorization preference is FLIPPED relative to the legacy in-kernel split:
+   *  - the factorization preference is the opposite of the in-kernel (plan-less) split:
    *    q_ext takes the LARGEST divisor of nproc the orbit count admits, the tuple axis
    *    takes the rest. Per-rank WORK is ntuples * nq_ext / nproc under EITHER
-   *    preference; what the flip changes is the accumulator, which shrinks by
-   *    qext_size. Cross-rank reduction order changes (~1e-14 class on energy bars);
-   *    at nproc = 1 the slab is the full array and everything is bit-identical.
+   *    preference; what this choice changes is the accumulator, which shrinks by
+   *    qext_size. The cross-rank reduction order differs from the plan-less split
+   *    (roundoff only); at nproc = 1 the slab is the full array and the result is bitwise
+   *    the same.
    *
-   * A null plan in the kernel is the EXACT legacy path (tuple-first split, full-shape
-   * output) -- direct kernel callers and the secondary (N_m) path are unaffected.
+   * A null plan in the kernel selects the plan-less path (tuple-first split, full-shape
+   * output) -- used by direct kernel callers and the secondary (N_m) path.
    */
   struct pi_qext_plan {
     long nq_ext = 0;            // full external q axis (the slab's global extent)
@@ -479,7 +474,7 @@ namespace vertex_pi {
     // ---- qext-FIRST factorization: the largest divisor of nproc the orbit count
     // admits, spilling the rest onto the (large) tuple axis. Fallback (nproc beyond
     // ntuples * n_orbits -- test-scale corner): keep the largest admissible qext and
-    // let the excess tuple ranks idle, exactly as the legacy split does.
+    // let the excess tuple ranks idle, exactly as the plan-less split does.
     long qd = 0;
     for (long d = nproc; d >= 1; --d)
       if (nproc % d == 0 and d <= n_orbits and nproc / d <= ntuples) { qd = d; break; }
@@ -502,29 +497,27 @@ namespace vertex_pi {
   }
 
   /**
-   * Accumulate Pi^C(q, inu) on the full bosonic Matsubara mesh, in the *notes* frequency
-   * convention with the code's (M,N) index routing (see file header). Contributions from
+   * Accumulate Pi^C(q, inu) on the full bosonic Matsubara mesh, in the frequency convention
+   * of the P^C formula with the code's (M,N) index routing (see file header). Contributions from
    * the (s,k,qx) tuples with (flat index % nproc == rank) are added to Pi_wqMN.
    *
    * @param Wdyn_qwPQ - dynamic W on the FULL bosonic mesh (nq, nw_b, Np, Np), or nullptr
    *                    (first iteration: bare-Z rung only).
    * @param kmq, kpq  - (nq, nk) index maps for k-q and k+q on the full (symmetry-free) mesh.
-   * @param skip_rung_gamma - q->0 policy on the INTERNAL rung transfer
-   *                    (notes/q0_head_treatment.md section 3):
-   *                    true  = v1 blanket skip of the qx = Gamma term, consistently for
-   *                            the bare-Z and dynamic parts (runtime fallback "v1_skip").
-   *                    false = v2: the Gamma cell is included with whatever the caller
+   * @param skip_rung_gamma - q->0 policy on the INTERNAL rung transfer:
+   *                    true  = blanket skip of the qx = Gamma term, consistently for
+   *                            the bare-Z and dynamic parts (the "v1_skip" policy).
+   *                    false = the Gamma cell is included with whatever the caller
    *                            put in Z_qPQ(Gamma)/Wdyn_qwPQ(Gamma). The stored objects
    *                            are the regularized body (v(G=0) zeroed at ERI build,
-   *                            potentials_impl.hpp:223) -- GW's own "ignore_g0"
+   *                            potentials_impl.hpp) -- GW's own "ignore_g0"
    *                            semantics; under the gygi-class policy the caller has
    *                            additionally added the analytic rank-1 head insertion
    *                            at Gamma (vertex_t.cpp).
    * @param qx_diag   - optional (nq_full): per-qx max |single contribution| to Pi^C(inu),
    *                    rank-local (for the q->0 diagnostics; logged by the caller).
-   * @param symc      - optional IBZ symmetry context (notes/vertex_ibz_symmetry.md).
-   *                    nullptr / !active: the no-symmetry path (all axes full-BZ,
-   *                    bit-identical to the historic kernel). Active: the external
+   * @param symc      - optional IBZ symmetry context.
+   *                    nullptr / !active: the no-symmetry path (all axes full-BZ). Active: the external
    *                    q axis of Pi_wqMN is nq_ibz, W/Z carry nq_ibz rows, kmq/kpq
    *                    carry the FULL transfer mesh, and G/X are full-BZ objects.
    */
@@ -545,10 +538,10 @@ namespace vertex_pi {
                          vertex_sym::sym_ctx const* symc = nullptr,
                          // [0] Pibar after the pole-free Phase 1, [1] max DLR pole residue
                          // of the z objects, [2] max |z| itself, [3] relative error of the
-                         // pole fit reconstructed on the tau grid. Diagnostic (2026-07-27).
+                         // pole fit reconstructed on the tau grid. Diagnostic only.
                          nda::array<double, 1>* phase_diag = nullptr,
-                         // Increment 3: non-null = Pi_wqMN is the OWNED-ROW SLAB described
-                         // by the plan (see pi_qext_plan above). nullptr = exact legacy
+                         // non-null = Pi_wqMN is the OWNED-ROW SLAB described by the plan
+                         // (see pi_qext_plan above). nullptr = the plan-less path
                          // (tuple-first split, full-shape output).
                          pi_qext_plan const* plan = nullptr) {
     (void)ft;
@@ -560,11 +553,11 @@ namespace vertex_pi {
     long Nb2 = Nb * Nb;
     const bool slab = (plan != nullptr);
 
-    // symmetry bookkeeping (notes/vertex_ibz_symmetry.md section 4):
+    // symmetry bookkeeping:
     //   nq_w    = rows of the stored W/Z (IBZ under symmetry)
     //   nq_full = internal transfer mesh (rows of kmq/kpq)
     //   nq_ext  = external output q axis of Pi_wqMN
-    // no-symmetry: all three coincide (== the historic nq).
+    // no-symmetry: all three coincide.
     const bool sym = (symc != nullptr and symc->active);
     long nq_w = Z_qPQ.shape(0);
     long nq_full = kmq.shape(0);
@@ -587,7 +580,7 @@ namespace vertex_pi {
                    "symmetry context (nq_w = {}, nq_full = {}, nq_ext = {}).",
                    nq_w, nq_full, nq_ext);
     }
-    long nq = nq_full;   // internal transfer axis (historic name)
+    long nq = nq_full;   // internal transfer axis
 
     utils::check(Pi_wqMN.shape(0) == nw_b and
                  Pi_wqMN.shape(1) == (slab ? long(plan->owned.size()) : nq_ext) and
@@ -599,7 +592,7 @@ namespace vertex_pi {
                    "{} but the kernel runs as rank {} of {}.",
                    plan->rank, plan->nproc, rank, nproc);
 
-    // spin factor mirrors rpa_pi.icc:312: external spin sum, ns==1 -> degeneracy 2
+    // spin factor mirrors rpa_pi.icc: external spin sum, ns==1 -> degeneracy 2
     const ComplexType pref = ComplexType(-((ns == 1) ? 2.0 : 1.0) / double(nk * nk));
 
     // Gamma index of the transfer mesh, detected index-based: qx = Gamma <=> k-qx = k
@@ -633,19 +626,19 @@ namespace vertex_pi {
 
     long ntuples = ns * nk * nq;
 
-    // ---- M2 item #4: 2D rank split (tuple axis) x (q_ext axis) -----------------------
-    // The (s,k,qx) tuple axis is round-robin over the combo grid (as today); the inner
-    // external-q loop (iq in nq_ext -- the untapped N_qIBZ-sized parallelism, spec
-    // section 3.3) is additionally split across a q_ext grid. Each rank accumulates a
-    // PARTIAL Pi_wqMN over its (tuple, q_ext) subset; the driver's final all_reduce sums
-    // the partials -- associative, so the per-tile twisted-pair pole algebra is
-    // byte-identical and only the q_ext/tuple reduction order changes (~1e-11 rel).
-    // Factorization mirrors eval_sigma_C: pour ranks onto the (large) tuple axis first,
-    // spilling the remainder onto q_ext, so on the target regime (ntuples >> nproc)
-    // qext_size == 1 and this is bit-identical to the historic 1D tuple RR.
+    // ---- 2D rank split (tuple axis) x (q_ext axis) ------------------------------------
+    // The (s,k,qx) tuple axis is round-robin over the combo grid; the inner external-q
+    // loop (iq in nq_ext -- parallelism of the size of the IBZ q count) is additionally
+    // split across a q_ext grid. Each rank accumulates a PARTIAL Pi_wqMN over its
+    // (tuple, q_ext) subset; the driver's final all_reduce sums the partials --
+    // associative, so the per-tile twisted-pair pole algebra is byte-identical and only
+    // the q_ext/tuple reduction order changes (roundoff).
+    // Without a plan the factorization mirrors eval_sigma_C: pour ranks onto the (large)
+    // tuple axis first, spilling the remainder onto q_ext, so for ntuples >> nproc
+    // qext_size == 1 and this is a plain 1D round-robin over tuples.
     long qext_size = 1, tup_size = nproc;
     if (slab) {
-      // Increment 3: the plan fixes the factorization (qext-FIRST preference).
+      // the plan fixes the factorization (qext-FIRST preference).
       qext_size = plan->qext_size;
       tup_size = plan->tup_size;
       utils::check(qext_size * tup_size == nproc,
@@ -666,13 +659,12 @@ namespace vertex_pi {
     }
     const long tup_rank  = rank / qext_size;   // which (s,k,qx) tuples this rank owns
     const long qext_rank = rank % qext_size;   // which q_ext subset this rank owns
-    // External-q iteration: the slab's owned-row list, or the legacy qext stride mapped
+    // External-q iteration: the slab's owned-row list, or the plan-less qext stride mapped
     // onto full-shape rows. AT FIXED FACTORIZATION the two are bit-identical per owned
     // cell: the tup stride is untouched and distinct iq write distinct cells, so every
     // (m, iq) cell receives the same additions in the same order -- only WHERE the row
     // is stored changes. (The plan's qext-first preference is a different factorization,
-    // i.e. a cross-rank reduction-order change bounded by the ~1e-14 class the e2e bars
-    // absorb.)
+    // i.e. a cross-rank reduction-order change at roundoff level.)
     std::vector<long> iq_own, iq_row;   // global iq  /  its row in Pi_wqMN
     if (slab) {
       iq_own = plan->owned;
@@ -691,7 +683,7 @@ namespace vertex_pi {
 
     // ---------------- helper: rung collocations + orbital-projected rung ----------------
     // Under symmetry the four rung legs use the effective columns Xhat(is, jsym, kL)
-    // (rotation to the IBZ transfer frame + trev-leg conj; memo (X-hat)); the leg
+    // (rotation to the IBZ transfer frame + trev-leg conj); the leg
     // k-point INDICES passed in stay the original full-BZ ones -- the rotation is
     // internal to Xhat. jsym is the qsymms position of the transfer's mapping
     // symmetry (0 = identity; also the only case without a symmetry context).
@@ -739,7 +731,7 @@ namespace vertex_pi {
           long ikxq = kmq(iqx, ikpq);
           build_U(is, ik, ikmqx, ikpq, ikxq, jsx);
           // trev-mapped transfer: the rotated transfer is -qs and the element is
-          // read from the qs storage by the exact side-swap = PQ-transpose (P2).
+          // read from the qs storage by the exact side-swap = PQ-transpose.
           if (trx)
             nda::blas::gemm(nda::transpose(Z_qPQ(qsx, all, all)), U2, ZU2);
           else
@@ -775,11 +767,10 @@ namespace vertex_pi {
       }
     }
 
-    // PHASE-1 SNAPSHOT (2026-07-27 divergence hunt). Phase 1 is the instantaneous Z rung:
-    // exact, backend-agnostic, and POLE-FREE. Phase 2 is the only part that runs the DLR
-    // pole algebra. Measured: with G, t, Zbar and Wbar all bounded and agreeing to four
-    // significant figures between a healthy and an exploding iteration, Pibar still moved
-    // 4.35 -> 3.22e9. Recording Pibar after Phase 1 splits that cleanly in two.
+    // PHASE-1 SNAPSHOT (diagnostic). Phase 1 is the instantaneous Z rung: exact,
+    // backend-agnostic, and POLE-FREE. Phase 2 is the only part that runs the DLR pole
+    // algebra. Recording Pibar after Phase 1 separates a problem in the pole algebra from
+    // one in the inputs.
     if (phase_diag != nullptr) {
       double m1 = 0.0;
       for (auto const& v : Pi_wqMN) m1 = std::max(m1, std::abs(v));
@@ -795,8 +786,8 @@ namespace vertex_pi {
     long np = tools.np;
 
     // pole coefficients of all z objects: cL(s,k): (np, Np, Nb); cR(s,k): (np, Nb, Np)
-    // The fit error is now measured UNCONDITIONALLY (it is O(nt.np.Np.Nb) per k, negligible
-    // against the kappa algebra) and hard-gated below: it is the only quantity that detects
+    // The fit error is measured UNCONDITIONALLY (it is O(nt.np.Np.Nb) per k, negligible
+    // against the kappa algebra) and hard-checked below: it is the only quantity that detects
     // the z data leaving the representable class, and it must not depend on a diagnostic flag.
     nda::array<ComplexType, 5> cL(ns, nk, np, Np, Nb), cR(ns, nk, np, Nb, Np);
     double fit_err_max = 0.0, res_ratio_max = 0.0;
@@ -824,9 +815,8 @@ namespace vertex_pi {
     imag_axes_ft::dlr_pole_fit_gate(fit_err_max, "vertex_pi::eval_Pi_C (z objects)",
                                     1e-3, 1e-2, res_ratio_max);
     // DLR pole residues of the z objects. zL/zR are bounded (X.G products of a bounded G);
-    // with the unregularized fit these residues were where the divergence first showed,
-    // BEFORE any of the kappa algebra (3.0 -> 9.4 -> 1411 over three iterations while every
-    // input stayed flat). Keep watching them -- they remain the earliest warning.
+    // growing residues are the earliest warning of a representation failure, appearing
+    // BEFORE any of the kappa algebra while every input stays bounded.
     if (phase_diag != nullptr) {
       double mc = 0.0;
       for (auto const& v : cL) mc = std::max(mc, std::abs(v));
@@ -841,15 +831,14 @@ namespace vertex_pi {
     // work arrays for the m-loop
     nda::array<ComplexType, 3> kap0, kap1;
 
-    // ---- M2 item #4: recompute pair caches PER TILE (kills the #1 memory wall) --------
-    // OLD: T0/T1/M0/M1 sized (ns, nk, nq_ext, nt, Nb2, Np) -- built for ALL (is,ik,iq)
-    // and REPLICATED on every rank inside the m-loop = 4*ns*nk*nq_ext*nt*Nb2*Np complex,
-    // rebuilt nw_b times. That store dominated per-rank memory (analysis section 1.2b).
-    // NEW: hold only the current tile's four pair components (nt, Nb2, Np) each -- ONE
-    // TILE LIVE. Per (owned tuple, owned q_ext, m) build exactly the T-pair at (is,ik,iq)
-    // and the M-pair at (is,ikmqx,iq) this tile consumes, then contract immediately.
-    // The pole algebra (build_pair_component / build_kappa) is BYTE-IDENTICAL per tile ->
-    // twisted-pair exactness preserved; only the reduction of tile partials reorders.
+    // ---- pair caches recomputed PER TILE ----------------------------------------------
+    // Caching the pair components T0/T1/M0/M1 for ALL (is,ik,iq) would need
+    // 4*ns*nk*nq_ext*nt*Nb2*Np complex numbers per rank, which dominates memory. Instead
+    // only the current tile's four pair components (nt, Nb2, Np) are held -- ONE TILE
+    // LIVE. Per (owned tuple, owned q_ext, m) build exactly the T-pair at (is,ik,iq) and
+    // the M-pair at (is,ikmqx,iq) this tile consumes, then contract immediately. The pole
+    // algebra (build_pair_component / build_kappa) is the same per tile, so the
+    // twisted-pair exactness is preserved; only the reduction of tile partials reorders.
     nda::array<ComplexType, 3> Tt0(nt, Nb2, Np), Tt1(nt, Nb2, Np);
     nda::array<ComplexType, 3> Mt0(nt, Nb2, Np), Mt1(nt, Nb2, Np);
 
@@ -887,25 +876,23 @@ namespace vertex_pi {
       detail::build_pair_component(kap1, cAp, cBp, Mt1);
     };
 
-    // ---- LOOP ORDER: tiles OUTER, m INNER (was m outer) -------------------------------
+    // ---- LOOP ORDER: tiles OUTER, m INNER ----------------------------------------------
     // The chain build_U -> wbarD -> wq_flat -> wt_flat depends ONLY on the tile
-    // (is,ik,ikmqx,ikpq,ikxq,jsx,iq) and on l -- never on m. With m outer it was rebuilt
-    // nw_b times per tile with identical results, and it is the DOMINANT block: nw_b gemms
-    // of Np x Np x Nb2 (~nw_b*Np^2*Nb2 flops, 5.7e9 at Np=1063/Nb2=64/nw_b=79) against
-    // build_kappa's ~np^2*nt_f (~1e6 at np=79) -- a factor ~570 apart. Interchanging trades
-    // build_kappa from nw_b total to nw_b*ntiles (cheap) for hoisting the W-fold from
-    // nw_b*ntiles to ntiles (expensive) => ~nw_b-fold saving on phase 2 overall.
-    // (Precomputing all nw_b kappas instead is NOT viable: 2*np^2*nt_f complex each is
-    //  ~15.6 MB, x nw_b ~ 1.2 GB at the production point.)
+    // (is,ik,ikmqx,ikpq,ikxq,jsx,iq) and on l -- never on m -- and it is the DOMINANT block:
+    // nw_b gemms of Np x Np x Nb2 (~nw_b*Np^2*Nb2 flops) against build_kappa's ~np^2*nt_f.
+    // With m inner, build_kappa runs nw_b*ntiles times (cheap) while the W-fold runs once
+    // per tile instead of nw_b times (expensive) => ~nw_b-fold saving on phase 2 overall.
+    // (Precomputing all nw_b kappas instead costs 2*np^2*nt_f complex numbers per
+    //  frequency, too much memory for realistic grids.)
     //
-    // BIT-IDENTICAL, not merely within tolerance. The only accumulator is
-    // `Pi_MN += Ctmp` on Pi_wqMN(m, iq, .., ..) via track_add, and for each FIXED (m, iq)
-    // cell the interchange leaves the tup sequence (ascending, stride tup_size) and the
-    // add_combo call order untouched -- so every cell receives the same additions in the
-    // same order. The other tracked quantity, qx_diag, is a max() reduction and is
-    // order-free. fit_err_max / res_ratio_max are finalized before this loop.
-    // The per-tile pole algebra (build_kappa / build_pair_component / add_combo) is itself
-    // unchanged, so twisted-pair exactness is preserved per tile.
+    // The result is BIT-IDENTICAL to the m-outer order, not merely within tolerance. The
+    // only accumulator is `Pi_MN += Ctmp` on Pi_wqMN(m, iq, .., ..) via track_add, and for
+    // each FIXED (m, iq) cell the tup sequence (ascending, stride tup_size) and the
+    // add_combo call order are the same in either order -- so every cell receives the same
+    // additions in the same order. The other tracked quantity, qx_diag, is a max()
+    // reduction and is order-free. fit_err_max / res_ratio_max are finalized before this
+    // loop. The per-tile pole algebra (build_kappa / build_pair_component / add_combo)
+    // preserves twisted-pair exactness per tile.
     for (long tup = tup_rank; tup < ntuples; tup += tup_size) {
       long is = tup / (nk * nq);
       long ik = (tup / nq) % nk;
@@ -920,8 +907,8 @@ namespace vertex_pi {
         build_U(is, ik, ikmqx, ikpq, ikxq, jsx);          // m-invariant: ONCE per tile
 
         // wbar_dyn(l) -> wmat layout -> tau form wt(s)[(p1'p3),(p1p3')]
-        // (trev-mapped transfer: PQ-transposed read of the IBZ-stored core, (P2))
-        // m-invariant: HOISTED out of the m loop (was recomputed nw_b times).
+        // (trev-mapped transfer: PQ-transposed read of the IBZ-stored core)
+        // m-invariant: HOISTED out of the m loop.
         for (long l = 0; l < nw_b; ++l) {
           if (trx)
             nda::blas::gemm(nda::transpose((*Wdyn_qwPQ)(qsx, l, all, all)), U2, ZU2);
@@ -937,7 +924,7 @@ namespace vertex_pi {
         nda::blas::gemm(tools.Ttw_bb, wq_flat, wt_flat);
 
         for (long m = 0; m < nw_b; ++m) {
-          tools.build_kappa(m, kap0, kap1);   // now nw_b * ntiles builds (see above)
+          tools.build_kappa(m, kap0, kap1);   // nw_b * ntiles builds in total (see above)
 
           long mbar = tools.w_mirror_b(m);
           bool is_m0 = (tools.wn_b(m) == 0);
@@ -981,19 +968,17 @@ namespace vertex_pi {
   }
 
   /**
-   * eq:pibardynfact -- the FACTORIZED equal-time dynamic-rung polarization.
+   * The FACTORIZED equal-time dynamic-rung polarization.
    *
    * Computes, directly and without ever forming Pi^C(q, i nu) on the frequency mesh,
    *
    *   pi^dyn(q)_{MN} = (1/beta) sum_nu Pi^{C,dyn}(q, i nu)_{MN} = Pi^{C,dyn}(q, tau = 0)_{MN}
    *
-   * which is what B-L's response middle factor needs (eq:deltawL / eq:XL). The current
-   * production route runs the FULL dynamic-rung kernel over all nw_b frequencies -- twisted
-   * pairs, DLR pole algebra and all -- and then keeps only the tau = 0 row, which measured
-   * 98.9 % of B-L's vertex time (notes/vertex_optimization_plan.md P2.1).
+   * for consumers that need only the equal-time value. The alternative -- the FULL
+   * dynamic-rung kernel over all nw_b frequencies (twisted pairs, DLR pole algebra and all),
+   * keeping only the tau = 0 row -- is far more expensive.
    *
-   * WHY IT FACTORIZES (notes/pibardynfact_increment.md section 1; theoryB_static
-   * eq:pibardynfact). Summing the EXTERNAL nu away closes the two G-pairs (12) and (34) --
+   * WHY IT FACTORIZES. Summing the EXTERNAL nu away closes the two G-pairs (12) and (34) --
    * NOT the (14)/(23) pairs of the instantaneous phase -- and leaves ONE bosonic sum over
    * the RUNG frequency nu_x of a product of two ordinary particle-hole bubbles against W:
    *
@@ -1006,18 +991,15 @@ namespace vertex_pi {
    * The rung's row pair (p1 p1') lands ENTIRELY inside b34 and its column pair (p3 p3')
    * ENTIRELY inside b12; the externals left open are a, d (from b34) and b, c (from b12).
    * Note the slot REVERSAL in each bubble ((a p1') vs (p1 d); (p3 b) vs (c p3')) -- that is
-   * where a transpose error would hide, and it is exactly what the routing pin discriminates.
-   *
-   * ROUTING PINNED to machine precision, notes/pins/pin_pibardynfact.py: on a cyclic
-   * Matsubara model with a random DENSE rung (no pair symmetry, so every transpose reading
-   * is separated) the brute-force triple-frequency sum_nu Pi^{C,dyn} and this factorized
-   * form agree to rel 1.5e-15 at three transfers, while all five plausible mis-readings
-   * (swapped bubbles, either bubble transposed, the (14)/(23) grouping, bubbles at q
-   * instead of qx) are rejected at O(1). O7's mechanical-verification requirement is met.
+   * where a transpose error would hide. The routing agrees to machine precision with the
+   * brute-force triple-frequency sum_nu Pi^{C,dyn} on a Matsubara model with a random DENSE
+   * rung (no pair symmetry, so every transpose reading is distinguishable), while the
+   * plausible mis-readings (swapped bubbles, either bubble transposed, the (14)/(23)
+   * grouping, bubbles at q instead of qx) differ at O(1).
    *
    * This is NOT "phase 1 with a dynamic rung": phase 1 pairs (14)/(23) at the EXTERNAL
    * frequency, this pairs (12)/(34) at the RUNG frequency. Looping phase 1 over nu_x does
-   * not produce pi^dyn -- the pin rejects that reading at 1.55.
+   * not produce pi^dyn.
    *
    * IMPLEMENTATION -- the cost trap. The (12)/(34) grouping puts BOTH external aux indices
    * in BOTH bubbles, so building the bubbles in the AUXILIARY basis would give Np^3
@@ -1025,26 +1007,25 @@ namespace vertex_pi {
    * are therefore kept in ORBITAL pairs (Nb2 x nbnd^2, tiny) and the externals are folded
    * onto (M, N) ONCE per tile, AFTER the nu_x sum -- legal because the fold is linear and
    * nu_x-independent, and it is what saves the extra factor nw_b on the fold. Per tile the
-   * dominant term is then the nw_b rung folds (~nw_b Np^2 Nb2), the same block the existing
-   * kernel already pays, with the whole tau-grid factor of the twisted-pair algebra gone.
+   * dominant term is then the nw_b rung folds (~nw_b Np^2 Nb2), the same block
+   * pi_c_accumulate_w pays, with the whole tau-grid factor of the twisted-pair algebra gone.
    *
    * The (1/beta) sum_{nu_x} is taken through the tau = 0 transform row R0 (the caller's
    * vertex_w0_detail::tau0_transform_row). A plain sum over the sampled nodes would be
    * WRONG: DLR/IR nodes are FITTING nodes, not Fourier points.
    *
-   * No pole algebra, no DLR requirement, no aux pole basis -- so this also removes B-L's
-   * only exposure to the parent project's open pole-conditioning defect (O7: "nothing in
-   * section BL needs pole algebra").
+   * No pole algebra, no DLR requirement, no aux pole basis -- so this route is also free
+   * of the conditioning issues of the pole fit.
    *
    * Rank split, Gamma policy, symmetry handling and the qx diagnostic all mirror
-   * pi_c_accumulate_w exactly; the caller all-reduces the partials as before.
+   * pi_c_accumulate_w exactly; the caller all-reduces the partials.
    *
    * @param Z_qPQ       - instantaneous rung core (nq_w, Np, Np).
    * @param Wdyn_qwPQ   - dynamic rung on the full bosonic mesh (nq_w, nw_b, Np, Np), or
    *                      nullptr. The rung used at node l is Z + Wdyn(l); with nullptr it
    *                      is the STATIC rung Z, for which this must reproduce
-   *                      R0-contracted phase-1-only Pi^C exactly (the pole-free refactor
-   *                      gate -- both sides backend-agnostic).
+   *                      R0-contracted phase-1-only Pi^C exactly (a pole-free consistency
+   *                      check -- both sides backend-agnostic).
    * @param R0          - the nw_b tau = 0 transform row.
    * @param Pi0_qMN     - [OUTPUT, accumulated] (nq_ext, Np, Np).
    */
@@ -1082,7 +1063,7 @@ namespace vertex_pi {
     utils::check(C0 + Nb <= nbnd,
                  "vertex_pi::pi_dyn_factorized: C = [{}, {}) exceeds the band range {}.",
                  C0, C0 + Nb, nbnd);
-    // audit E: the external fold below reads X_skPa(is, k, P, b) for EVERY band b < nbnd of G (and every full-BZ
+    // the external fold below reads X_skPa(is, k, P, b) for EVERY band b < nbnd of G (and every full-BZ
     // k of G's k axis); a collocation carrying fewer bands / k-points would be read out of bounds, not refused.
     utils::check(X_skPa.shape(0) == ns and X_skPa.shape(1) == nk and X_skPa.shape(3) == nbnd,
                  "vertex_pi::pi_dyn_factorized: X_skPa is ({}, {}, {}, {}), expected ({}, {}, Np, {}) -- the "
@@ -1116,7 +1097,7 @@ namespace vertex_pi {
                    (*Wdyn_qwPQ).shape(2) == Np and (*Wdyn_qwPQ).shape(3) == Np,
                    "vertex_pi::pi_dyn_factorized: Wdyn shape mismatch.");
 
-    // same spin/Nk^2 prefactor as the kernel (rpa_pi.icc:312); the two 1/beta of the
+    // same spin/Nk^2 prefactor as the kernel (and rpa_pi.icc); the two 1/beta of the
     // bubbles come from the pairing identity, the (1/beta) sum_{nu_x} from R0.
     const ComplexType pref = ComplexType(-((ns == 1) ? 2.0 : 1.0) / double(nk * nk));
 
@@ -1138,8 +1119,8 @@ namespace vertex_pi {
     }
 
     // ---- 2D rank split, identical factorization to pi_c_accumulate_w -------------------
-    // (Increment 3 exemption: the output here is (nq_ext, Np, Np) -- no nw_b axis -- so
-    //  the full-shape accumulator is small and no slab plan is threaded through.)
+    // (plan-less split only: the output here is (nq_ext, Np, Np) -- no nw_b axis -- so
+    //  the full-shape accumulator is small and no slab plan is needed.)
     const long ntuples = ns * nk * nq;
     long qext_size = 1, tup_size = nproc;
     {
@@ -1227,7 +1208,7 @@ namespace vertex_pi {
 
         // ---- the single bosonic pairing:  Facc = sum_l R0(l) B34(l)^T wbar(l) B12(l) --
         // trev-mapped transfer: the rotated transfer is -qs and the element is read from
-        // the qs storage by the exact side-swap = PQ-transpose (memo (P2)).
+        // the qs storage by the exact side-swap = PQ-transpose.
         if (Wdyn_qwPQ == nullptr) {
           // STATIC rung: wbar is l-independent -> hoisted entirely out of the l loop.
           if (trx) nda::blas::gemm(nda::transpose(Z_qPQ(qsx, all, all)), U2, WU2);
@@ -1292,15 +1273,15 @@ namespace vertex_pi {
   }
 
   /**
-   * Transform Pi^C(inu) (full bosonic mesh, notes convention) to the code's tau storage:
-   * out(it) = Pi_notes(beta - tau_it) for it in [0, nt_half) (design doc section 2, rule 3).
+   * Transform Pi^C(inu) (full bosonic mesh, the P^C-formula convention of the file header)
+   * to the code's tau storage: out(it) = Pi(beta - tau_it) for it in [0, nt_half).
    */
   inline void pi_w_to_code_tau(imag_axes_ft::IAFT const& ft, iaft_tools const& tools,
                                nda::array<ComplexType, 4> const& Pi_wqMN,
                                nda::MemoryArrayOfRank<4> auto&& Pi_tqMN_out) {
-    // Support RECTANGULAR trailing dims (P_bs != Q_bs): the distributed Pi^C upfold passes
-    // a (P,Q)-BLOCK (shape(2)=P_bs, shape(3)=Q_bs), not a full square Np x Np. Using shape(2)
-    // for both dims (the old `Np,Np`) overflowed the temp on asymmetric grids -> heap corruption.
+    // Supports RECTANGULAR trailing dims (P_bs != Q_bs): the distributed Pi^C upfold passes
+    // a (P,Q)-BLOCK (shape(2)=P_bs, shape(3)=Q_bs), not a full square Np x Np, so the temp
+    // must be sized from both trailing dims.
     long nq = Pi_wqMN.shape(1), nP = Pi_wqMN.shape(2), nQ = Pi_wqMN.shape(3);
     long nt = tools.nt_f;
     long nt_half = (nt % 2 == 0) ? nt / 2 : nt / 2 + 1;
