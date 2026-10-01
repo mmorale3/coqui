@@ -2973,7 +2973,7 @@ namespace solvers {
                      "({:.2f} %).\n"
                      "            THIS BREAKS PHI-DERIVABILITY: the B-L G-side oracle "
                      "(test_vertex_fdoracle) shows that deleting\n"
-                     "            a few % of this channel raises the B-L Euler-identity "
+                     "            removing even a small fraction of this channel raises the B-L Euler-identity "
                      "residual by many orders of magnitude.\n"
                      "            It is also applied to the SIGMA CUT ONLY (eval_Pi_C's "
                      "P^{{C,L}} keeps its head),\n"
