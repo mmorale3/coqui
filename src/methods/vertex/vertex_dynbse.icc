@@ -1077,6 +1077,7 @@ namespace solvers {
       nda::array<cplx, 4> Dc(nk, nc, nc, nout);   // external legs: aux (Nm) or Wannier-pair (nab) columns
       // per-block scratch, sized to the current RHS block width nR (the kd operator reads F.nR)
       nda::array<cplx, 4> Dblk, CbD, Vout, Fs, Ys;
+      nda::array<cplx, 4> Fs1, Ys1;   // factorize-vertex: family 1 of the fused two-family rung (dyn_fam_fuse)
       nda::array<cplx, 3> Fs3, Os3;
       nda::array<cplx, 2> Yc2;
       long nR_cur = -1;
@@ -1562,11 +1563,27 @@ namespace solvers {
           // inu = 0: family 1 (U_j^2 at the union's G nodes, kernel KF2) joins family 0 in ONE refit;
           // inu != 0: family 1 = the twisted pairs, its own refit (the phi_nu factor rides along)
           const long nfam = nu0 ? 1 : 2;
+          // factorize-vertex: inu != 0 with both families present -- ONE mirror-pair gemm per representative carries both
+          // families' tau columns (D x D)(D x 4 nR): K_d(rep) is streamed once per application instead of twice (the per-tau
+          // gemms are bandwidth-bound on the host). Same products, same refits (vertex_debug dyn_fam_fuse = 0 restores).
+          auto fam_nz = [&](long ff) {
+            for (auto const &v : F.fam(ff, nda::ellipsis{})) if (v != cplx(0.0)) return true;
+            return false;
+          };
+          static const bool fam_fuse = (vertex_debug::number("dyn_fam_fuse", 1.0) != 0.0);   // vertex_debug: dyn_fam_fuse
+          const bool fuse2 = fam_fuse and nfam == 2 and opt.dense_rung and rung_pair and rrank == 0 and fam_nz(0) and fam_nz(1);
+          if (fuse2 and (Fs1.shape(0) != nt or Fs1.shape(3) != nR)) {
+            Fs1 = nda::array<cplx, 4>(nt, nk, nc2, nR);
+            Ys1 = nda::array<cplx, 4>(nt, nk, nc2, nR);
+          }
           for (long fam = 0; fam < nfam; ++fam) {
             bool anyf = false;
             for (long ff = fam; ff < (nu0 ? 2 : fam + 1) and not anyf; ++ff)
               for (auto const &v : F.fam(ff, nda::ellipsis{})) { if (v != cplx(0.0)) { anyf = true; break; } }
             if (not anyf) continue;
+            const bool fused_done = fuse2 and fam == 1;    // family 1 already went through the fused rung of family 0
+            vertex_ladder_detail::prof_watch kwatch;
+            if (not fused_done) {
             // tau values (nt, nk, nc2, nR) = KF (nt, np) . fam (np, nk nc2 nR)   [+ KF2 . fam1 at inu = 0]
             auto Fs2 = nda::reshape(Fs, std::array<long, 2>{nt, nk * nc2 * nR});
             Fs2() = cplx(0.0);
@@ -1580,8 +1597,15 @@ namespace solvers {
                 for (long p = 0; p < np; ++p) KFc(i, p) = cplx((ff == 1 and nu0) ? b.KF2(i, p) : b.KF(i, p));
               nda::blas::gemm(cplx(1.0), KFc, fam2, cplx(1.0), Fs2);
             }
+            if (fuse2) {                                   // family 1's tau values (inu != 0: KF)
+              auto Fs12 = nda::reshape(Fs1, std::array<long, 2>{nt, nk * nc2 * nR});
+              auto fam12 = nda::reshape(F.fam(1, nda::ellipsis{}), std::array<long, 2>{np, nk * nc2 * nR});
+              for (long i = 0; i < nt; ++i)
+                for (long p = 0; p < np; ++p) KFc(i, p) = cplx(b.KF(i, p));
+              nda::blas::gemm(cplx(1.0), KFc, fam12, cplx(0.0), Fs12);
+            }
             bthr(false);
-            vertex_ladder_detail::prof_watch kwatch;
+            kwatch.lap();
             if (opt.dense_rung and rrank > 0) {
               // factorize-vertex: Ys(i) = scale_k sum_r c_r(s_i) K_r Fs(i) for ALL tau nodes: the (i, N) columns are split
               // into nthr contiguous chunks; each thread gathers its c_r-scaled chunk (D x w) and runs R gemms
@@ -1613,15 +1637,21 @@ namespace solvers {
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
               for (long r = 0; r < ndist; ++r) {
                 const long i0 = rep_nodes[size_t(r)].first, i1 = rep_nodes[size_t(r)].second;
-                const long nb = (i1 < 0) ? 1 : 2, w = nb * nR;
+                const long nb = (i1 < 0) ? 1 : 2, nf = fuse2 ? 2 : 1, w = nf * nb * nR;
                 nda::array<cplx, 2> F2(D, w), Y2(D, w);
-                for (long y = 0; y < D; ++y)
-                  for (long bb = 0; bb < nb; ++bb)
-                    for (long N = 0; N < nR; ++N) F2(y, bb * nR + N) = Fs(bb ? i1 : i0, y / nc2, y % nc2, N);
+                for (long f = 0; f < nf; ++f) {
+                  auto const &Fsrc = f ? Fs1 : Fs;
+                  for (long y = 0; y < D; ++y)
+                    for (long bb = 0; bb < nb; ++bb)
+                      for (long N = 0; N < nR; ++N) F2(y, (f * nb + bb) * nR + N) = Fsrc(bb ? i1 : i0, y / nc2, y % nc2, N);
+                }
                 nda::blas::gemm(scale_k, Kd_s(r, all, all), F2, cplx(0.0), Y2);
-                for (long y = 0; y < D; ++y)
-                  for (long bb = 0; bb < nb; ++bb)
-                    for (long N = 0; N < nR; ++N) Ys(bb ? i1 : i0, y / nc2, y % nc2, N) = Y2(y, bb * nR + N);
+                for (long f = 0; f < nf; ++f) {
+                  auto &Ydst = f ? Ys1 : Ys;
+                  for (long y = 0; y < D; ++y)
+                    for (long bb = 0; bb < nb; ++bb)
+                      for (long N = 0; N < nR; ++N) Ydst(bb ? i1 : i0, y / nc2, y % nc2, N) = Y2(y, (f * nb + bb) * nR + N);
+                }
               }
             } else if (opt.dense_rung) {
               // Ys(i) = scale_k K_d(s_i) Fs(i): nt gemms (D x D)(D x nR) on the mirrored blocks
@@ -1640,7 +1670,10 @@ namespace solvers {
               }
             }
             if (met) met->t_rung += kwatch.lap();
-            auto Ys2 = nda::reshape(Ys, std::array<long, 2>{nt, nk * nc2 * nR});
+            }                                              // (not fused_done)
+            auto &Ysf = fused_done ? Ys1 : Ys;
+            auto &Fsf = fused_done ? Fs1 : Fs;
+            auto Ys2 = nda::reshape(Ysf, std::array<long, 2>{nt, nk * nc2 * nR});
             Yc2() = Ys2;
             bthr(true);
             auto c = db::basis_coeffs(b, Yc2);
@@ -1650,7 +1683,7 @@ namespace solvers {
             fe = std::max(fe, fef);
             if (dbg)
               app_log(2, "  [dynbse dbg]   fam {}: |F(s)| {:.3e} |W F(s)| {:.3e} refit {:.3e} |coeffs| {:.3e}", fam,
-                      nrm(Fs), nrm(Ys), fef, nrm(c));
+                      nrm(Fsf), nrm(Ysf), fef, nrm(c));
             // O-1: the coefficient scatter (np_fit x nk nc2 nR) in parallel over the nodes (elementwise: bitwise)
 #pragma omp parallel for schedule(static) num_threads(nthr)
             for (long p = 0; p < b.np_fit; ++p)
