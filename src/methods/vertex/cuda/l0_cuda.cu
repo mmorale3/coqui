@@ -1521,6 +1521,29 @@ namespace methods::solvers::dynbse_cuda {
     return b * 1.05 + 512.0e6;                                              // cuSOLVER / cuBLAS workspaces
   }
 
+  // factorize-vertex: the device bytes of the stages created after the unit (one source of truth for their own checks and for
+  // the unit's memory partition, which keeps exactly this much free for them)
+  double ue_kb_bytes(long ns, long nq, long Nm, long nk, long nc, long nrep) {
+    const long nc2 = nc * nc;
+    const double tables = double(ns * nk * Nm * nc) + double(nq * Nm * Nm) * (2.0 + double(nrep));
+    const double per_k = double(nk) * (3.0 * double(Nm * nc2) + double(nc2 * nc2));
+    return 16.0 * (tables + per_k) + 64.0e6;
+  }
+  double ue_sd_bytes(sd_config const &c, long R) {
+    const long nt = c.nt, nw = c.nw_f, ns = c.ns, nk = c.nk, nc2 = c.nc * c.nc, np = c.np, ng = c.ng, Nm = c.Nm, D = nk * nc2;
+    const double W = double(D) * double(R);
+    const double acc = double(nt * ns * nk * nc2) * (1.0 + 2.0 * double(np));
+    const double blk = W * (3.0 + 2.0 * double(nw) + double(nt)) + double(R * Nm) + double(ng * nk * nc2) +
+                       double(ns * nw * nk * nc2) + 2.0 * double(nt * nw) + 2.0 * double(nw * np) + 2.0 * double(np * ng * nt);
+    const double per_a = double(nk) * (2.0 * double(nc2 * nc2) + double(ng * nc2));
+    return 16.0 * (acc + blk + per_a) + 64.0e6;
+  }
+  double ue_dressed_bytes(long ng, long np, long nk, long nc, long nout, long R) {
+    const long nc2 = nc * nc, D = nk * nc2;
+    const double W = double(D) * double(R);
+    return 16.0 * (double(4 * ng * np) + 4.0 * double(ng * nk * nc2) + double(D * nout) * 3.0 + W * (2.0 * ng + 3.0 * ng + 1.0));
+  }
+
   unit_engine *ue_create(ue_config const &c, double free_bytes, char *why, long why_len) {
     const double need = ue_bytes(c);
     const double Dd = double(c.nk * c.nc * c.nc), kds_bytes = 16.0 * double(c.ndist) * Dd * Dd;
@@ -1999,12 +2022,9 @@ namespace methods::solvers::dynbse_cuda {
       return false;
     }
     const long nt = c.nt, nw = c.nw_f, ns = c.ns, nk = c.nk, nc2 = e->nc2, np = c.np, ng = c.ng, Nm = c.Nm, D = e->D, R = e->c.nR_max;
-    const double W = double(D) * double(R);
-    const double acc = double(nt * ns * nk * nc2) * (1.0 + 2.0 * double(np));
-    const double blk = W * (3.0 + 2.0 * double(nw) + double(nt)) + double(R * Nm) + double(ng * nk * nc2) +
-                       double(ns * nw * nk * nc2) + 2.0 * double(nt * nw) + 2.0 * double(nw * np) + 2.0 * double(np * ng * nt);
+    (void)nt; (void)nw; (void)ns; (void)Nm; (void)D; (void)R;
     const double per_a = double(nk) * (2.0 * double(nc2 * nc2) + double(ng * nc2));
-    const double need = 16.0 * (acc + blk + per_a) + 64.0e6;
+    const double need = ue_sd_bytes(c, e->c.nR_max);
     if (need > 0.9 * free_bytes) {
       std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB free", need / 1e9, free_bytes / 1e9);
       return false;
@@ -2297,9 +2317,8 @@ namespace methods::solvers::dynbse_cuda {
       std::snprintf(why, size_t(why_len), "rep count %ld differs from the engine's ndist %ld", nrep, e->c.ndist);
       return false;
     }
-    const double tables = double(ns * nk * Nm * e->c.nc) + double(nq * Nm * Nm) * (2.0 + double(nrep));
     const double per_k = double(nk) * (3.0 * double(Nm * nc2) + double(nc2 * nc2));
-    const double need = 16.0 * (tables + per_k) + 64.0e6;
+    const double need = ue_kb_bytes(ns, nq, Nm, nk, e->c.nc, nrep);
     if (need > 0.9 * free_bytes) {
       std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB free", need / 1e9, free_bytes / 1e9);
       return false;
@@ -2625,8 +2644,8 @@ namespace methods::solvers::dynbse_cuda {
     if (not d.on or d.ng != ng) {
       for (void *p : d.allocs) if (p) (void)cudaFree(p);
       d.allocs.clear();
-      const double need = 16.0 * (double(4 * ng * np) + 4.0 * double(ng * nk * nc2) + double(D * nout) * 3.0 +
-                                  double(W) * (2.0 * ng + 3.0 * ng + 1.0));
+      const double need = ue_dressed_bytes(ng, np, nk, e->c.nc, nout, R);
+      (void)W;
       size_t fr = 0, tot = 0;
       cu_check(cudaMemGetInfo(&fr, &tot), "dr memgetinfo");
       if (need > 0.9 * double(fr)) {

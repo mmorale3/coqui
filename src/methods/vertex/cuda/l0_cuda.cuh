@@ -143,6 +143,11 @@ namespace methods::solvers::dynbse_cuda {
     double um_reserve = 6.0e9;      // device bytes kept free for the later device stages (rung builds, Sigma deposits, dressed)
   };
 
+  struct sd_config;
+  /** factorize-vertex: the device bytes of the later stages (the unit's partition keeps them free; their own checks use them) */
+  double ue_kb_bytes(long ns, long nq, long Nm, long nk, long nc, long nrep);
+  double ue_sd_bytes(sd_config const &c, long nR_max);
+  double ue_dressed_bytes(long ng, long np, long nk, long nc, long nout, long nR_max);
   /** nullptr when the device cannot hold the working set (the caller keeps the host path); `why` then says what failed */
   unit_engine *ue_create(ue_config const &c, double free_bytes, char *why, long why_len);
   void ue_destroy(unit_engine *e);

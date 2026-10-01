@@ -1419,8 +1419,31 @@ namespace solvers {
           uc.l0_fz_cfg = int(vertex_debug::number("dynbse_l0_fz_cfg", 44.0));     // vertex_debug: dynbse_l0_fz_cfg
           uc.l0_fz_bench = int(vertex_debug::number("dynbse_l0_fz_bench", 0.0)); // vertex_debug: dynbse_l0_fz_bench
           uc.l0_asm_gemm = int(vertex_debug::number("dynbse_l0_asm_gemm", 1.0));  // vertex_debug: dynbse_l0_asm_gemm
-          uc.um_mode = int(vertex_debug::number("dyn_um", 0.0));                   // vertex_debug: dyn_um (factorize-vertex TEST: managed K_d(s))
-          uc.um_reserve = 1.0e9 * vertex_debug::number("dyn_um_reserve_gb", 6.0);  // vertex_debug: dyn_um_reserve_gb
+          // factorize-vertex: the memory partition of the rung slab (pol_vertex_dyn_device_memory; vertex_debug dyn_um overrides it
+          // for tests: 0 resident, 2 managed, 3 stream) and the device bytes kept free for the later stages, computed exactly
+          {
+            auto const &mpol = dyn_device_memory_state();
+            const double um_dbg = vertex_debug::number("dyn_um", -1.0);              // vertex_debug: dyn_um (test override)
+            uc.um_mode = (um_dbg >= 0.0) ? int(um_dbg) : (mpol == "stream" ? 3 : (mpol == "managed" ? 2 : 0));
+            const long nrep_b = (rrank > 0) ? rrank : ndist;
+            const bool kb_will = not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0;
+            const bool sd_will = opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma);
+            const bool dr_will = dressed_req and (opt.sigma == nullptr or sd_will);
+            double later = 0.0;
+            if (kb_will) later += dynbse_cuda::ue_kb_bytes(ns, nq, Nm, nk, nc, nrep_b) / 0.9;
+            if (sd_will) {
+              dynbse_cuda::sd_config sc;
+              sc.nt = nt; sc.nw_f = long(tools.ft->Ttw_ff().shape(1)); sc.ns = ns; sc.nk = nk; sc.nc = nc; sc.np = np;
+              sc.np_fit = b.np_fit; sc.ng = ng; sc.Nm = Nm;
+              later += dynbse_cuda::ue_sd_bytes(sc, nrb) / 0.9;
+            }
+            if (dr_will) later += dynbse_cuda::ue_dressed_bytes(ng, np, nk, nc, nout, nrb) / 0.9;
+            uc.um_reserve = later + 0.5e9 + 1.0e9 * vertex_debug::number("dyn_um_extra_gb", 0.0);   // vertex_debug: dyn_um_extra_gb
+            if (rank == 0)
+              app_log(1, "  [dynbse] device memory policy \"{}\"{}: {:.2f} GB kept free for the later device stages (rung builds {}, "
+                         "Sigma deposits {}, dressed legs {})", mpol, um_dbg >= 0.0 ? " (vertex_debug dyn_um override)" : "",
+                      uc.um_reserve / 1e9, kb_will, sd_will, dr_will);
+          }
           char why[256] = {0};
           ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
           if (ue) {                                       // factorize-vertex: the rung form (mirror pairs / frequency-factorized)
