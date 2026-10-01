@@ -351,9 +351,9 @@ namespace solvers {
                      "(|Im| / |.| = {:.3e}).\n"
                      "            The antisymmetric part is DISCARDED -- it is illegal at a "
                      "self-inverse transfer\n"
-                     "            (it would make Sigma^C non-Hermitian and, in B-L, "
+                     "            (it would make Sigma^C non-Hermitian, give e_corr a spurious imaginary part and, in B-L, "
                      "compound through the Dyson\n"
-                     "            equation). Keeping it is what made Im(e_corr) grow on Si.",
+                     "            equation).",
                   rel);
       }
       return true;
@@ -628,10 +628,10 @@ namespace solvers {
         build_pair_matrix(Xb_skma, 0, nc, kmq, iq, B_Im);
         build_pair_matrix(X_skPa, orb0, nc, kmq, iq, C_IP);
         double e = eta_of(B_Im, C_IP, t_qmP(iq, all, all), core(iq));
-        app_log(3, "    Refinement 2 eta[{}](q = {}) = {}", label, iq, e);
+        app_log(3, "    secondary ISDF basis eta[{}](q = {}) = {}", label, iq, e);
         mx = std::max(mx, e);
       }
-      app_log(2, "  Refinement 2 downfold residual (Eq. 40): max_q eta[{}] = {}", label, mx);
+      app_log(2, "  secondary ISDF basis downfold residual: max_q eta[{}] = {}", label, mx);
       return mx;
     }
 
@@ -726,7 +726,7 @@ namespace solvers {
     utils::check(_band_window.size() == 0 or
                      (_band_window.first() == W_rng.first() and _band_window.last() == W_rng.last()),
                  "vertex_t::set_wannier_projector: vertex_band_window = [{}, {}) differs from the Wannier projector's band "
-                 "window W_rng = [{}, {}) of {} (audit D8): in Wannier mode C is the projector's span on W_rng. Set "
+                 "window W_rng = [{}, {}) of {}: in Wannier mode C is the projector's span on W_rng. Set "
                  "vertex_band_window = [{}, {}) or leave it empty.", _band_window.first(), _band_window.last(),
                  W_rng.first(), W_rng.last(), proj.C_file(), W_rng.first(), W_rng.last());
     // the pol-vertex ladder's window (pol_vertex_band_window, inheriting vertex_band_window) is the C window of the readout
@@ -734,11 +734,11 @@ namespace solvers {
     utils::check(not pol_vertex_active() or
                      (_pol_band_window.first() == W_rng.first() and _pol_band_window.last() == W_rng.last()),
                  "vertex_t::set_wannier_projector: pol_vertex_band_window = [{}, {}) differs from the Wannier projector's band "
-                 "window W_rng = [{}, {}) of {} (audit D8): the ladder readout runs on the projector's span on W_rng. Set "
+                 "window W_rng = [{}, {}) of {}: the ladder readout runs on the projector's span on W_rng. Set "
                  "pol_vertex_band_window = [{}, {}).", _pol_band_window.first(), _pol_band_window.last(),
                  W_rng.first(), W_rng.last(), proj.C_file(), W_rng.first(), W_rng.last());
     if (_band_window.size() == 0)
-      app_log(1, "  [audit D8] vertex_band_window was empty: the effective vertex window is the Wannier projector's W_rng = "
+      app_log(1, "  [vertex Wannier] vertex_band_window was empty: the effective vertex window is the Wannier projector's W_rng = "
                  "[{}, {}).", W_rng.first(), W_rng.last());
 
     _wannier = true;
@@ -761,14 +761,13 @@ namespace solvers {
       }
     _iso_defect = defect_max;
 
-    app_log(1, "\n  Vertex subspace C = Wannier projector P = U U^dag "
-               "(notes/wannier_projector_theory.md)\n"
+    app_log(1, "\n  Vertex subspace C = Wannier projector P = U U^dag\n"
                "  ------------------------------------------------------------------\n"
                "  Wannier file             = {}\n"
                "  Subspace rank M          = {} orbitals\n"
                "  Injection window W_rng   = [{}, {})  ({} bands)\n"
                "  Isometry defect max_sk ||U^dag U - 1||_F (before Loewdin) = {:.3e}\n"
-               "  Loewdin orthonormalize   = {} (owner ruling Q1)\n",
+               "  Loewdin orthonormalize   = {}\n",
             _wannier_file.empty() ? "(in-memory projector)" : _wannier_file,
             M, _band_window.first(), _band_window.last(), nW, defect_max,
             loewdin ? "yes" : "no");
@@ -778,8 +777,8 @@ namespace solvers {
                  "            P is only approximately idempotent, so the subspace "
                  "interpretation, the\n"
                  "            q->0 head delta_ab reduction, and gauge invariance "
-                 "degrade at O(defect)\n"
-                 "            (memo section 1.3). Prefer the default Loewdin path.\n",
+                 "degrade at O(defect).\n"
+                 "            Prefer the default Loewdin path.\n",
               defect_max);
   }
 
@@ -906,8 +905,9 @@ namespace solvers {
                      "vertex_t::build_sym_ctx: rung-transfer direction check FAILED at "
                      "q' = {} (isym pos {}, qs = {}, trev = {}): q'*R (crystal) = "
                      "({}, {}, {}) vs target ({}, {}, {}). The MF symmetry conventions "
-                     "deviate from the derivation in notes/vertex_ibz_symmetry.md "
-                     "section 3.1 -- refusing to rotate the wrong way.",
+                     "deviate from the row-vector convention q' * R = +-q_s assumed by the IBZ "
+                     "rung rotation -- refusing to rotate the wrong way. Run on a symmetry-free "
+                     "(nosym) k-mesh.",
                      iq, js, qs, int(ctx.q_trev(iq)),
                      qrot_v(0), qrot_v(1), qrot_v(2), qtgt(0), qtgt(1), qtgt(2));
       }
@@ -1080,7 +1080,7 @@ namespace solvers {
     _sym_leak_max = std::max(_sym_leak_max, ctx.leak_max);
     _sym_leak_mean = ctx.leak_mean;
 
-    app_log(1, "\n  IBZ symmetry context READY (notes/vertex_ibz_symmetry.md): "
+    app_log(1, "\n  IBZ symmetry context READY: "
                "nk {} -> {} IBZ, nq {} -> {} IBZ, {} symmetry ops, naux = {}\n"
                "  C-window D-matrix leakage out of C = [{}, {}): max = {:.3e}, "
                "mean = {:.3e}\n"
@@ -1088,8 +1088,8 @@ namespace solvers {
                "carry O(leakage)\n"
                "         relative error -- the C-window analogue of the nbnd "
                "truncation warning in\n"
-               "         generate_dmatrix (symmetry.hpp:1084-1092). No abort "
-               "(theory-owner ruling).\n",
+               "         generate_dmatrix (symmetry.hpp). Reported only; the "
+               "run continues.\n",
             ctx.nk_full, ctx.nk_ibz, ctx.nq_full, ctx.nq_ibz, ctx.nsym, ctx.naux,
             C0_global, C0_global + nW, ctx.leak_max, ctx.leak_mean);
     app_log(1, "  C-sector rotation UNITARITY defect max ||Dc^dag Dc - 1||_F = {:.3e}\n"
@@ -1099,7 +1099,7 @@ namespace solvers {
                "leakage above).\n", ctx.d_unitarity_max);
     if (wan)
       app_log(1, "  (Wannier mode: leakage is the projector-level "
-                 "||(1 - P(Sk)) D U(k)||^2; 0 for a symmetry-closed set, memo 2.8)\n");
+                 "||(1 - P(Sk)) D U(k)||^2; 0 for a symmetry-closed set)\n");
     if (ctx.leak_max > 1e-2)
       app_log(1, "  [WARNING] C-window D-matrix leakage max = {:.3e} > 1e-2: the "
                  "window cuts deeply\n"
@@ -1127,7 +1127,7 @@ namespace solvers {
     const std::unordered_set<std::string> exact = {"ignore_g0", "v1_skip"};
     utils::check(exact.count(div) > 0 or div.find("gygi") != std::string::npos,
                  "vertex_t: unknown vertex div_treatment: {}. Valid options are "
-                 "\"ignore_g0\" (v2 default), \"gygi\"-class, and \"v1_skip\".", div);
+                 "\"ignore_g0\" (default), \"gygi\"-class, and \"v1_skip\".", div);
     _div_treatment = std::move(div);
   }
 
@@ -1153,8 +1153,8 @@ namespace solvers {
                  _vertex_type);
     utils::check(_isdf_mode == "global" or _isdf_mode == "secondary",
                  "vertex_t: unknown vertex_isdf mode: {}. Valid options are \"global\" "
-                 "(the original path) and \"secondary\" (Refinement 2, "
-                 "notes/refinement2_optionA.md).", _isdf_mode);
+                 "(the global THC basis) and \"secondary\" (a secondary ISDF basis "
+                 "on the subspace C).", _isdf_mode);
     utils::check(_isdf_svd_tol >= 0.0 and _isdf_svd_tol < 1.0,
                  "vertex_t: invalid vertex_isdf_svd_tol = {}. Expect 0 <= tol < 1.",
                  _isdf_svd_tol);
@@ -1175,20 +1175,20 @@ namespace solvers {
                  "  Second-order exchange vertex correction (ISDF-Vertex)\n"
                  "  ------------------------------------------------------\n"
                  "  Vertex type              = {}\n"
-                 "  Rung mode                = {} (notes/static_vertex_implementation_plan.md)\n"
+                 "  Rung mode                = {}\n"
                  "  Subspace C band window   = [{}, {})\n"
                  "  Subspace C size          = {} orbitals (nbnd = {})\n"
                  "  Cuts                     = Sigma^C (G3W2) + Pi^C (G4W), always both\n"
-                 "  q->0 rung policy         = {} (notes/q0_head_treatment.md)\n"
+                 "  q->0 rung policy         = {}\n"
                  "  Auxiliary basis          = {}{}\n"
                  "  Status                   = kernels ACTIVE for this rung mode\n",
               _vertex_type, rung_str(), _band_window.first(), _band_window.last(),
               _band_window.size(), nbnd, _div_treatment, _isdf_mode,
-              secondary() ? std::string(" (Refinement 2: requested N_m = ") +
+              secondary() ? std::string(" (secondary ISDF basis: requested N_m = ") +
                             (_isdf_rank > 0 ? std::to_string(_isdf_rank)
                                             : std::string("auto = nc^2*nk")) +
                             ", svd_tol(B) = " + std::to_string(_isdf_svd_tol) +
-                            "; notes/refinement2_optionA.md)"
+                            ")"
                           : std::string(" (global THC, dimension Np)"));
       // Announce which theory is active. Each rung mode assembles ALL of its own cuts,
       // so a half-theory cannot be configured.
@@ -1212,7 +1212,7 @@ namespace solvers {
                  "vertex_band_window: C = empty set, so the vertex contributes nothing in "
                  "ANY rung mode and the calculation reduces to plain scGW exactly\n"
                  "          (unless a Wannier projector defines C next; the MBPT drivers abort on a vertex request whose C "
-                 "stays empty -- audit D7).\n",
+                 "stays empty).\n",
               _vertex_type, rung_str());
     }
   }
@@ -1253,11 +1253,11 @@ namespace solvers {
     Nm_req = std::min(Nm_req, (long)thc.Np());
     if (Nm_req < Nm_asked) {
       if (_isdf_rank > 0)
-        app_log(1, "  [WARNING] Refinement 2: vertex_isdf_rank = {} exceeds the global THC basis size Np = {}; the secondary "
+        app_log(1, "  [WARNING] secondary ISDF basis: vertex_isdf_rank = {} exceeds the global THC basis size Np = {}; the secondary "
                    "basis is capped at N_m = {} (the secondary ISDF lives in the span of the global basis).",
                 Nm_asked, thc.Np(), Nm_req);
       else
-        app_log(1, "  Refinement 2: auto N_m = nc^2 * nk = {} exceeds the global THC basis size Np = {}; using N_m = {}.",
+        app_log(1, "  secondary ISDF basis: auto N_m = nc^2 * nk = {} exceeds the global THC basis size Np = {}; using N_m = {}.",
                 Nm_asked, thc.Np(), Nm_req);
     }
 
@@ -1271,12 +1271,12 @@ namespace solvers {
     // 1e-6 in that case so the pivoted Cholesky still has a meaningful stop criterion.
     double sec_thresh = (_isdf_thresh > 0.0) ? _isdf_thresh : thc.thresh();
     if (sec_thresh <= 0.0) {
-      app_log(1, "  Refinement 2: global THC thresh is unset (nIpts-only path); "
+      app_log(1, "  secondary ISDF basis: global THC thresh is unset (nIpts-only path); "
                  "defaulting secondary-ISDF selection thresh to 1e-6.");
       sec_thresh = 1e-6;
     }
 
-    app_log(1, "\n  Refinement 2: building the secondary ISDF basis on the subspace C "
+    app_log(1, "\n  Building the secondary ISDF basis on the subspace C "
                "(rank M = {}, {})\n"
                "  requested N_m = {} ({}), used N_m target = {}, svd_tol(B) = {}, sec_thresh = {} (global THC thresh = {}), "
                "N_pair (per q, spin-stacked) = {}\n",
@@ -1337,10 +1337,10 @@ namespace solvers {
         if (wan_in >= 0)
           utils::check((wan_in != 0) == _wannier,
                        "vertex_t::build_secondary_basis: the frozen points of {} were selected in {} mode, this run is in {} "
-                       "mode (audit A19): re-dump the points with the same projector setting (vertex_wannier_file).",
+                       "mode: re-dump the points with the same projector setting (vertex_wannier_file).",
                        _isdf_points_file, wan_in ? "Wannier" : "band-window", _wannier ? "Wannier" : "band-window");
         else
-          app_log(1, "  [WARNING] the frozen points file {} carries no \"wannier\" flag (an old dump): its window-vs-Wannier "
+          app_log(1, "  [WARNING] the frozen points file {} carries no \"wannier\" flag: its window-vs-Wannier "
                      "selection mode cannot be checked against this run ({} mode).", _isdf_points_file,
                   _wannier ? "Wannier" : "band-window");
         // Frozen points mean NO point selection, so the selection knobs the user set explicitly do nothing here.
@@ -1377,7 +1377,7 @@ namespace solvers {
                   Xa(is, ik, a, m) = Xw(is, ik, a, m);
                 }
               }
-        app_log(1, "  [W-int] secondary ISDF points FROZEN from {}: N_m = {} (FFT mesh {} x {} x {}, window [{}, {}), "
+        app_log(1, "  [vertex Wannier] secondary ISDF points FROZEN from {}: N_m = {} (FFT mesh {} x {} x {}, window [{}, {}), "
                    "{}); no point selection on this mesh.",
                 _isdf_points_file, Nm, mesh_now(0), mesh_now(1), mesh_now(2), _band_window.first(),
                 _band_window.last(), _wannier ? "X_bar = X U" : "window");
@@ -1411,7 +1411,7 @@ namespace solvers {
         }
         utils::check(not sym_mesh,
                      "vertex_t::build_secondary_basis: the Wannier rotated point-selection "
-                     "overload does not support symmetry-reduced k-meshes (thc.cpp:207), "
+                     "overload does not support symmetry-reduced k-meshes (thc.cpp), "
                      "including meshes reduced by time reversal alone. "
                      "Use vertex_isdf = \"global\" for Wannier + symmetry runs.");
         const long nbnd = MF->nbnd();
@@ -1442,7 +1442,7 @@ namespace solvers {
       utils::check(Nm > 0,
                    "vertex_t::build_secondary_basis: point selection returned 0 points.");
       if (Nm < Nm_req and not frozen)
-        app_log(1, "  [NOTE] Refinement 2: point selection stopped at N_m = {} "
+        app_log(1, "  [NOTE] secondary ISDF basis: point selection stopped at N_m = {} "
                    "(< target {}):\n"
                    "         the C pair-density metric is numerically rank-deficient below "
                    "the selection thresh = {};\n"
@@ -1470,7 +1470,7 @@ namespace solvers {
         h5::h5_write(g, "window_first", long(_band_window.first()));
         h5::h5_write(g, "wannier", long(_wannier ? 1 : 0));
         h5::h5_write(g, "nm", Nm);
-        app_log(1, "  [W-int] secondary ISDF points written to {} (N_m = {}) -- freeze them on the fine mesh with "
+        app_log(1, "  [vertex Wannier] secondary ISDF points written to {} (N_m = {}) -- freeze them on the fine mesh with "
                    "pol_vertex_isdf_points_file.", fn, Nm);
       }
     }
@@ -1546,7 +1546,7 @@ namespace solvers {
             den += std::norm(C_IP(I, P));
           }
         const double fit = std::sqrt(num) / std::max(std::sqrt(den), 1e-300);
-        app_log(3, "    Refinement 2 t(q = {}): sv(B) in [{}, {}], cond(s) = {}, "
+        app_log(3, "    secondary ISDF basis t(q = {}): sv(B) in [{}, {}], cond(s) = {}, "
                    "rank = {}/{}, discarded = {}, ||Bt - C||_F/||C||_F = {}",
                 iq, smin, smax, cond_s, rank, _Nm, discarded, fit);
         cond_s_max = std::max(cond_s_max, cond_s);
@@ -1563,7 +1563,7 @@ namespace solvers {
     fit_max    = mpi->comm.all_reduce_value(fit_max, boost::mpi3::max<>{});
     disc_max   = mpi->comm.all_reduce_value(disc_max, boost::mpi3::max<>{});
     const long total_solve = mpi->comm.all_reduce_value(my_nsolve, std::plus<>{});
-    app_log(1, "  Refinement 2 secondary basis READY: N_m = {} (pair rank {} per q), "
+    app_log(1, "  secondary ISDF basis READY: N_m = {} (pair rank {} per q), "
                "max_q cond(s) = {} (raw metric), {} (regularized solve, rcond = {}),\n"
                "  max_q discarded sv = {}, max_q fit residual ||Bt - C||_F/||C||_F = {}\n"
                "  t(q) solve distributed over {} ranks: this rank ran {} of {} gelss "
@@ -1573,7 +1573,7 @@ namespace solvers {
     // store the REGULARIZED conditioning (what the cap controls); cond_eff_max <= the cap.
     _cond_s_max = cond_eff_max;
     if (_isdf_cond_max > 0.0)
-      app_log(1, "  Refinement 2: conditioning cap vertex_isdf_cond_max = {} -> per-q "
+      app_log(1, "  secondary ISDF basis: conditioning cap vertex_isdf_cond_max = {} -> per-q "
                  "downfold conditioning bounded to max_q {} (rcond = {}); the raw metric "
                  "cond(s) = {} is regularized in the solve.",
               _isdf_cond_max, cond_eff_max, rcond_eff, cond_s_max);
@@ -1594,7 +1594,8 @@ namespace solvers {
                    "{}: vertex_rung = \"{}\" also requires the DLR IAFT backend "
                    "(iaft basis = \"dlr\") for now. The static rungs themselves need no "
                    "pole algebra; what is missing on IR is the Pi^{{C,0}}(tau = 0) "
-                   "interpolation row (decision D3, open until increment S4).",
+                   "interpolation row, which the IR driver does not provide. Use iaft "
+                   "basis = \"dlr\".",
                    where, rung_str());
     }
   }
@@ -1704,8 +1705,8 @@ namespace solvers {
     if (T("SIG_RESP_PIDYN") > 0.0) {
       app_log(2, "  * Pi^{{C,dyn}} @tau=0 runs the FULL dynamic kernel (incl. the aux pole\n"
                  "    algebra) and keeps only the tau = 0 row. It is REPLACED by the\n"
-                 "    factorized eq:pibardynfact row above unless vertex_pidyn = \"kernel\"\n"
-                 "    or \"check\"; when both rows are present their ratio IS the win.");
+                 "    factorized pi^dyn row above unless vertex_pidyn = \"kernel\"\n"
+                 "    or \"check\"; when both rows are present their ratio is the speedup of the factorized route.");
       if (T("SIG_RESP_PIDYNF") > 0.0 and T("SIG_RESP_PIDYN") > 0.0)
         app_log(2, "    measured pi^dyn speedup: {:.1f}x (kernel {:.3f} s vs factorized "
                    "{:.3f} s)", T("SIG_RESP_PIDYN") / T("SIG_RESP_PIDYNF"),
@@ -1794,7 +1795,7 @@ namespace solvers {
     app_log(1, "\n  ISDF-Vertex: evaluating Sigma^C (G^3 W^2, double bosonic convolution)\n"
                "  ---------------------------------------------------------------------\n"
                "  Subspace C band window = [{}, {})  ({} orbitals)\n"
-               "  nbnd = {}, Np = {}, nkpts = {}, prefactor = +1 (sign_crossing_report)\n",
+               "  nbnd = {}, Np = {}, nkpts = {}, prefactor = +1\n",
             _band_window.first(), _band_window.last(), _band_window.size(),
             nbnd, Np, nkpts);
 
@@ -1894,7 +1895,7 @@ namespace solvers {
           Z_qPQ(iq_gamma, all, all) += ComplexType(1.0 + _w0_eps_head) * H_PQ;
           double h_max = 0.0;
           for (auto const& v : H_PQ) h_max = std::max(h_max, std::abs(v));
-          app_log(1, "  Sigma^C head insertion [H1 STATIC]: madelung = {}, |H|_max = {}, "
+          app_log(1, "  Sigma^C head insertion [balanced head]: madelung = {}, |H|_max = {}, "
                      "weight 1 + eps_inv_head(i.nu=0) = {:.6e} applied to Z(Gamma); the "
                      "dynamic piece is NOT added (dW = W - W0 is analytic-head-free).",
                   MF->madelung(), h_max, 1.0 + _w0_eps_head);
@@ -1949,7 +1950,7 @@ namespace solvers {
           // instantaneous slot (Z(Gamma) above), so the fluctuation dW = W - W0 -- and
           // with it dWw_lin, pi^dyn's rung, and every downstream consumer -- carries no
           // analytic head. See _bl_head_static_all.
-          app_log(1, "  Sigma^C head insertion [H1 STATIC]: dynamic piece SKIPPED "
+          app_log(1, "  Sigma^C head insertion [balanced head]: dynamic piece SKIPPED "
                      "(the static-weight head is in the instantaneous slot; dW is "
                      "analytic-head-free).");
         } else if (mb_state.eps_inv_head.has_value()) {
@@ -1991,7 +1992,7 @@ namespace solvers {
           *mpi, std::array<long, 4>{nqpts_ibz, wtls->nw_b, Np, Np}));
       if (head_ok) {
         if (_bl_head_static_all) {
-          app_log(1, "  Sigma^C head insertion [H1 STATIC]: dynamic piece SKIPPED "
+          app_log(1, "  Sigma^C head insertion [balanced head]: dynamic piece SKIPPED "
                      "(the static-weight head is in the instantaneous slot; dW is "
                      "analytic-head-free).");
         } else if (mb_state.eps_inv_head.has_value()) {
@@ -2110,7 +2111,7 @@ namespace solvers {
     sG_CC.win().fence();
     auto G_CC = sG_CC.local();
     app_log(2, "  Sigma^C externals restricted to {} a, b in [0, {}) "
-               "(strict Phi cut; notes/refinement2_optionA.md DECISION 2).",
+               "(strict Phi cut).",
             wan ? "range(P) (Wannier labels)" : "the C-C block", nc);
     // effective window collocation: WINDOW = X(:,C); WANNIER = X_bar = X.U (Np x M).
     // (also the sym-ctx input; secondary uses Xb). orb0 of the pair matrices is 0 in
@@ -2136,11 +2137,11 @@ namespace solvers {
     const long orb0_glob = wan ? 0 : _band_window.first();
     if (sec) {
       build_secondary_basis(thc, X_glob, orb0_glob, kmq, iq_gamma);
-      app_log(1, "  Refinement 2: Sigma^C runs in the SECONDARY basis (N_m = {} vs "
+      app_log(1, "  secondary ISDF basis: Sigma^C runs in the SECONDARY basis (N_m = {} vs "
                  "Np = {}); externals a, b in C.", _Nm, Np);
       // eta diagnostics on the rung arrays ACTUALLY consumed (test scale only: N_pair <= 4096)
       if (not need_dyn) {
-        app_log(2, "  Refinement 2: eta diagnostic skipped in static-rung mode "
+        app_log(2, "  secondary ISDF basis: eta diagnostic skipped in static-rung mode "
                    "(the only rung is W0bar, downfolded by build_w0).");
       } else if (ns * nkpts * nc * nc <= 4096) {
         vertex_secondary_detail::eta_max_over_q(
@@ -2153,7 +2154,7 @@ namespace solvers {
             "dW(tau_mid)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
             [&](long iq) { return Wt_qtPQ(iq, nt / 2, all, all); });
       } else {
-        app_log(2, "  Refinement 2: eta diagnostic skipped (N_pair = {} > 4096).",
+        app_log(2, "  secondary ISDF basis: eta diagnostic skipped (N_pair = {} > 4096).",
                 ns * nkpts * nc * nc);
       }
       // fold the cores at IBZ q (frequency-slice-wise; t is frequency-independent;
@@ -2425,9 +2426,9 @@ namespace solvers {
                            "      COHERENCE |h_dW| / max|dW(Gamma)| = {:.2f} of the "
                            "chi-aligned rank-1 ceiling {:.2f}  ->  {:.3f}\n"
                            "      Read the ABSOLUTE and the COHERENCE, not the ratio: the "
-                           "ratio is ~0.4 at EVERY q\n"
-                           "      (see the control below), so it is not what the head "
-                           "changes. What the head changes is\n"
+                           "ratio is typically of the same size at q != Gamma\n"
+                           "      (compare the control line below), so it does not isolate "
+                           "the head. What the head changes is\n"
                            "      how much sits in ONE rank-1 direction that the kernel "
                            "then sums over N_p^2 terms in phase.\n"
                            "      COHERENCE -> 1 means dW(Gamma) IS c chi chi^dag, i.e. the "
@@ -2848,11 +2849,10 @@ namespace solvers {
                           "needs pi^dyn tighter, the lever is iaft prec (\"medium\" = 1e-10, "
                           "\"high\" = 1e-13), NOT vertex_pidyn.", drel, _ft->eps());
             utils::check(drel <= ctol,
-                         "vertex_t::eval_Sigma_C: the eq:pibardynfact factorized pi^dyn "
+                         "vertex_t::eval_Sigma_C: the factorized pi^dyn "
                          "disagrees with the dynamic-rung kernel at tau = 0 by rel = {}, "
                          "above the O(1) abort bar {} (iaft eps = {}). This is too large to be "
-                         "the representability floor -- the closest mis-routing the routing "
-                         "pin rejects sits at 1.24 -- so suspect a ROUTING or PLUMBING break, "
+                         "the representability floor, so suspect a ROUTING or PLUMBING break, "
                          "not the grid. Do NOT raise this bar to make a run proceed: confirm "
                          "first with test_methods_vertex_pibardynfact, whose "
                          "production_grid_attribution section separates the two (the floor "
@@ -2900,7 +2900,7 @@ namespace solvers {
         _diag_xl_rel = (p0 > 0.0 ? xl / p0 : 0.0);
         app_log(1, "  X^L diagnostic: max|pi^dyn - Pi^(C,0)(tau=0)| = {:.4e}, "
                    "relative to max|Pi^(C,0)(tau=0)| = {:.4e}  -> X^L/Pi^0 = {:.4f} "
-                   "(vanishes iff the screening is truly static; theory diagnostic O3)",
+                   "(vanishes iff the screening is truly static)",
                 xl, p0, (p0 > 0.0 ? xl / p0 : 0.0));
       }
 
@@ -2971,18 +2971,15 @@ namespace solvers {
                      "removed |<H,Pi>|/||H||^2 = {:.4e},\n"
                      "            max|removed| = {:.4e} vs max|Pi(Gamma)| = {:.4e} "
                      "({:.2f} %).\n"
-                     "            🚨 THIS BREAKS PHI-DERIVABILITY. The B-L G-side oracle "
-                     "shows that deleting only\n"
-                     "            20 % of this channel takes the eq:eulerBL1 residual from "
-                     "3.3e-11 to 1.6e-01 --\n"
-                     "            worse than the untransposed-sandwich control the same "
-                     "test exists to reject.\n"
+                     "            THIS BREAKS PHI-DERIVABILITY: the B-L G-side oracle "
+                     "(test_vertex_fdoracle) shows that deleting\n"
+                     "            a few % of this channel raises the B-L Euler-identity "
+                     "residual by many orders of magnitude.\n"
                      "            It is also applied to the SIGMA CUT ONLY (eval_Pi_C's "
                      "P^{{C,L}} keeps its head),\n"
                      "            so Sigma and P are no longer two cuts of one Phi. "
                      "DIAGNOSTIC USE ONLY -- the\n"
-                     "            resulting energies are NOT conserving. See "
-                     "notes/bl_head_channel_diagnosis.md.",
+                     "            resulting energies are NOT conserving.",
                   (lin ? "Sigma^(L,r)" : "Sigma^(C,r)"), std::abs(c), dmax, pmax,
                   (pmax > 0.0 ? 100.0 * dmax / pmax : 0.0));
         }
@@ -2996,14 +2993,14 @@ namespace solvers {
         vertex_detail::build_delta_w(W0g, Pi0g, qmin, Dw, /*assume_reflection*/ sym_mesh, sym_mesh ? &refl : nullptr);
         if (sym_mesh) {
           constexpr double refl_tol = 1e-8;
-          app_log(1, "  [audit D10] {} reflection identity Pi(-q) = Pi(q)^T on the IBZ mesh: checked on {} of {} transfers "
+          app_log(1, "  [vertex] {} reflection identity Pi(-q) = Pi(q)^T on the IBZ mesh: checked on {} of {} transfers "
                      "(self-inverse or stored +-q pair), max relative violation = {:.3e} (q = {}); {} transfer(s) without a "
                      "stored -q are not checkable.", (lin ? "Delta_w^L" : "Delta_w"), refl.n_checked, nqpts_ibz,
                   refl.rel_max, refl.iq_worst, refl.n_unchecked);
           utils::check(refl.rel_max <= refl_tol or _allow_unchecked_reflection,
                        "vertex_t::eval_Sigma_C: the response rung on this IBZ mesh assumes Pi(-q) = Pi(q)^T (build_delta_w, "
-                       "assume_reflection), but the {} middle factor violates it by a relative {:.3e} > {:.0e} at q = {} "
-                       "(audit D10): the symmetrized middle factor would be replaced by a plain transpose that is not equal to "
+                       "assume_reflection), but the {} middle factor violates it by a relative {:.3e} > {:.0e} at q = {}"
+                       ": the symmetrized middle factor would be replaced by a plain transpose that is not equal to "
                        "it. Run on a symmetry-free (nosym) mesh, or set vertex_allow_unchecked_reflection = true to continue.",
                        (lin ? "Pi^L (pi^dyn - Pi^(C,0))" : "Pi^(C,0)"), refl.rel_max, refl_tol, refl.iq_worst);
           if (refl.rel_max > refl_tol)
@@ -3079,7 +3076,7 @@ namespace solvers {
       _diag_resp_share = (xmax > 0.0 ? rmax / xmax : 0.0);
       app_log(1, "  Sigma^({}): max|.| = {:.4e}; response share "
                  "||Sigma^(C,r)||/||Sigma^(C,x)|| = {:.4f} (large => the deleted rung "
-                 "dynamics likely matters; theory diagnostic O3)",
+                 "dynamics likely matters)",
               (lin ? "L,r" : "C,r"), rmax, (xmax > 0.0 ? rmax / xmax : 0.0));
     }
 
@@ -3127,7 +3124,7 @@ namespace solvers {
     const double lam_s = vertex_scale();
     if (lam_s != 1.0) {
       Sigma_C *= ComplexType(lam_s);
-      app_log(1, "  [ISDF-Vertex] Sigma^C scaled by lambda = {:.4f} (Phi_2^C -> lambda "
+      app_log(1, "  [vertex] Sigma^C scaled by lambda = {:.4f} (Phi_2^C -> lambda "
                  "Phi_2^C; BOTH cuts carry the same lambda, so conservation is exact).",
               lam_s);
     }
@@ -3140,7 +3137,7 @@ namespace solvers {
                    "accumulated Sigma.\n"
                    "         DIAGNOSTIC ONLY: one cut without the other is NOT "
                    "Phi-derivable and these\n"
-                   "         energies do not conserve. Used to read off each piece's exact "
+                   "         energies do not conserve. Use it to read off each piece's exact "
                    "energy share.",
                 _bl_drop, (_bl_drop == 1 ? "Sigma^(L,r), the response term"
                            : _bl_drop == 2 ? "Sigma^(C,x), the kernel term"
@@ -3471,8 +3468,8 @@ namespace solvers {
       // is W0bar (below).
       utils::check(_allow_bare_rung,
                    "vertex_t::eval_Pi_C: no dynamic W in MBState{} -- the dynamic-rung Pi^C would fall back to the BARE "
-                   "rung W = Z, a large uncontrolled perturbation (audit D4). The update_w RPA bootstrap was bypassed (a caller "
-                   "outside the scf loop?). Set pol_vertex_allow_bare_rung = true only to reproduce the historic behaviour.",
+                   "rung W = Z, a large uncontrolled perturbation. The update_w RPA bootstrap was bypassed (a caller "
+                   "outside the scf loop?). Set pol_vertex_allow_bare_rung = true only to run deliberately with the bare rung.",
                    sec ? " and no cached Wbar" : "");
       ++_bare_rung_uses;
       app_log(1, "  [WARNING] Pi^C: no dynamic W in MBState{} -- falling back to the "
@@ -3549,8 +3546,7 @@ namespace solvers {
     }
     sG_CC.win().fence();
     auto G_CC = sG_CC.local();
-    app_log(2, "  Pi^C external legs restricted to {} [0, {}) (strict Phi cut; "
-               "notes/refinement2_optionA.md DECISION 2).",
+    app_log(2, "  Pi^C external legs restricted to {} [0, {}) (strict Phi cut).",
             wan ? "range(P) (Wannier labels)" : "the C window", nc);
     // effective window collocation: WINDOW = X(:,C); WANNIER = X_bar = X.U (Np x M).
     // node-share X_C (one copy per node; see eval_Sigma_C).
@@ -3570,7 +3566,7 @@ namespace solvers {
     const long orb0_glob = wan ? 0 : _band_window.first();
     if (sec) {
       build_secondary_basis(thc, X_glob, orb0_glob, kmq, iq_gamma);
-      app_log(1, "  Refinement 2: Pi^C runs in the SECONDARY basis (N_m = {} vs Np = {}); "
+      app_log(1, "  secondary ISDF basis: Pi^C runs in the SECONDARY basis (N_m = {} vs Np = {}); "
                  "upfold Pi^C = t^dag Pibar t.", _Nm, Np);
       // In the SECONDARY path neither the all-q tau slab W_qtPQ (nq*nt*Np^2) nor
       // the full nu-domain Wdyn_qwPQ (nq*nw_b*Np^2) is materialized. For each q we gather
@@ -3648,7 +3644,7 @@ namespace solvers {
               [&](long iq) { return eta_W_slice(iq, tools.nw_b - 1); });
         }
       } else {
-        app_log(2, "  Refinement 2: eta diagnostic skipped (N_pair = {} > 4096).",
+        app_log(2, "  secondary ISDF basis: eta diagnostic skipped (N_pair = {} > 4096).",
                 ns * nkpts * nc * nc);
       }
       // --- bare core Zbar = t Z t^dag: DISTRIBUTED downfold ------------------------------
@@ -3722,10 +3718,10 @@ namespace solvers {
                      "(nq, nw_half, N_m, N_m) = ({}, {}, {}, {}).",
                      Wbh.shape(0), Wbh.shape(1), Wbh.shape(2), Wbh.shape(3),
                      nqpts_ibz, nw_half, _Nm, _Nm);
-        app_log(1, "  Refinement 2: Pi^C dynamic rung from the CACHED Wbar (previous "
+        app_log(1, "  secondary ISDF basis: Pi^C dynamic rung from the CACHED Wbar (previous "
                    "iteration's W, downfolded\n"
-                   "  at update_w time; the same one-iteration lag as the retained-dW "
-                   "path it replaces).");
+                   "  at update_w time; the same one-iteration lag as the global path, "
+                   "which retains dW).");
         Wbdyn_qwmm.emplace(nda::array<ComplexType, 4>(nqpts_ibz, tools.nw_b, _Nm, _Nm));
         for (long iq = 0; iq < nqpts_ibz; ++iq)
           for (long l = 0; l < tools.nw_b; ++l) {
@@ -3911,7 +3907,7 @@ namespace solvers {
       utils::check(n_skip == 0 or not pi_c_injected or _allow_unprojected,
                    "vertex_t::eval_Pi_C: {} of {} stored transfers have no stored -q partner (IBZ mesh), so the pair-symmetry "
                    "projection P_PQ(q) = P_QP(-q) cannot be applied there, and this Pi^C (vertex_rung = \"{}\") is injected into "
-                   "the Dyson equation, where the unprojected component is amplified by the self-consistency loop (audit D5). "
+                   "the Dyson equation, where the unprojected component is amplified by the self-consistency loop. "
                    "Use a symmetry-free (nosym) k-mesh, or set pol_vertex_allow_unprojected = true to continue with a WARNING.",
                    n_skip, nqpts_ibz, rung_str());
       if (n_skip > 0)
@@ -3946,14 +3942,14 @@ namespace solvers {
       g_m = mpi->comm.all_reduce_value(g_m, boost::mpi3::max<>{});
       mpi->comm.all_reduce_in_place_n(phase_diag.data(), phase_diag.size(),
                                       boost::mpi3::max<>{});
-      app_log(1, "  [ISDF-Vertex] kernel scales: max|G_CC| = {:.4e}  max|t| = {:.4e}  "
+      app_log(1, "  [vertex] kernel scales: max|G_CC| = {:.4e}  max|t| = {:.4e}  "
                  "max|Zbar| = {:.4e}  max|Wbar| = {:.4e}  max|Pibar(partial)| = {:.4e}",
               g_m, t_m, zb_m, wb_m, pib);
       // Phase 1 is the pole-free instantaneous Z rung; Phase 2 is the ONLY part running the
       // DLR pole algebra. If Pibar is already huge after Phase 1 the fault is in the exact
       // bubble contraction; if it is small there and huge at the end, it is the pole algebra
       // -- and then max|z| vs max|pole residue| says whether pole_coeffs is the amplifier.
-      app_log(1, "  [ISDF-Vertex] phase split: max|Pibar after Phase 1 (pole-free)| = {:.4e}  "
+      app_log(1, "  [vertex] phase split: max|Pibar after Phase 1 (pole-free)| = {:.4e}  "
                  "max|z| = {:.4e}  max|DLR residue of z| = {:.4e}  pole-fit rel err = {:.4e}"
                  "  -> final = {:.4e}",
               phase_diag(0), phase_diag(2), phase_diag(1), phase_diag(3), pib);
@@ -3962,7 +3958,7 @@ namespace solvers {
                    "(rel err {:.2e}).\n"
                    "            Its residues then enter the twisted-pair algebra as products, "
                    "so this is\n"
-                   "            squared into Pi^C. See notes/vertex_divergence_diagnosis.md.",
+                   "            squared into Pi^C.",
                 phase_diag(3));
     }
 
@@ -4014,8 +4010,8 @@ namespace solvers {
         leak_max = std::max(leak_max, std::abs(S_up - S_bar) /
                                       std::max(std::abs(S_bar), 1e-300));
       }
-      app_log(2, "  Refinement 2 no-leak residual (Eq. 39; nu = 0 node, bare-Z pairing): "
-                 "max_q = {}", leak_max);
+      app_log(2, "  secondary ISDF basis no-leak residual |<t^dag Pibar t, Z> - <Pibar, Zbar>| / |<Pibar, Zbar>| "
+                 "(nu = 0 node, bare-Z pairing): max_q = {}", leak_max);
     }
 
     // ---- upfold + tau conversion, then materialize the RPA-distributed Pi^C -------------
@@ -4084,7 +4080,7 @@ namespace solvers {
       const double lam = vertex_scale();
       if (lam != 1.0) {
         dPi_C_tqPQ.local() *= ComplexType(lam);
-        app_log(1, "  [ISDF-Vertex] Pi^C scaled by lambda = {:.4f} (ramp iteration {} of "
+        app_log(1, "  [vertex] Pi^C scaled by lambda = {:.4f} (ramp iteration {} of "
                    "{})", lam, _vertex_iter, _ramp_iters);
       }
     }
@@ -4117,7 +4113,7 @@ namespace solvers {
     decltype(nda::range::all) all;
     utils::check(active() and secondary(),
                  "vertex_t::cache_w: requires an ACTIVE vertex in isdf mode \"secondary\" "
-                 "(the global path retains the full dW instead; notes/wbar_cache.md).");
+                 "(the global path retains the full dW instead).");
     // On the DEVICE path the source is the device W (mb_state.dW_qtPQ_dev) whenever it is present;
     // update_w then keeps no host mirror for this consumer (vertex_t::reads_host_W).
 #if defined(ENABLE_DEVICE)
@@ -4161,8 +4157,7 @@ namespace solvers {
                  "vertex_t::cache_w: unexpected dW_qtPQ global shape ({}, {}, {}, {}).",
                  gs[0], gs[1], gs[2], gs[3]);
 
-    app_log(1, "\n  Refinement 2: caching the downfolded rung Wbar = t dW t^dag "
-               "(notes/wbar_cache.md)\n"
+    app_log(1, "\n  secondary ISDF basis: caching the downfolded rung Wbar = t dW t^dag\n"
                "  -- filled at update_w time from THIS iteration's (dW, eps_inv_head); "
                "consumed by the NEXT\n"
                "  iteration's Pi^C (one-iteration lag); dW itself is then freed by the "
@@ -4234,7 +4229,7 @@ namespace solvers {
       head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ,
                                                                     _bl_head_scale);
       if (not head_ok and _bl_head_scale == 0.0)
-        app_log(1, "  [W-int-3] cache_w: vertex_bl_head_scale = 0 -- the dynamic rung W-bar(q, i nu) carries NO analytic "
+        app_log(1, "  [vertex Wannier] cache_w: vertex_bl_head_scale = 0 -- the dynamic rung W-bar(q, i nu) carries NO analytic "
                    "q -> 0 head (body-only vertex kernel).");
       else if (not head_ok and head_unusable_continue("vertex_t::cache_w"))   // aborts unless allowed
         app_log(1, "  [WARNING] cache_w: gygi head insertion requested but head data "
@@ -4321,7 +4316,7 @@ namespace solvers {
             bool use_head = false;
             if (head_ok and iq == iq_gamma) {
               if (_bl_head_static_all and _rung == linear_rung) {
-                app_log(1, "  cache_w head insertion [H1 STATIC]: dynamic piece SKIPPED for the "
+                app_log(1, "  cache_w head insertion [balanced head]: dynamic piece SKIPPED for the "
                            "cached B-L rung (dW is analytic-head-free).");
               } else if (mb_state.eps_inv_head.has_value()) {
                 auto& eps = mb_state.eps_inv_head.value();
@@ -4410,7 +4405,7 @@ namespace solvers {
             // Balanced head (see _bl_head_static_all): the cached B-L rung must be analytic-head-free
             // in its dynamic part, exactly like eval_Sigma_C's Wt_qtPQ -- the static-weight
             // head rides the instantaneous slot at the consumer.
-            app_log(1, "  cache_w head insertion [H1 STATIC]: dynamic piece SKIPPED for the "
+            app_log(1, "  cache_w head insertion [balanced head]: dynamic piece SKIPPED for the "
                        "cached B-L rung (dW is analytic-head-free).");
           } else if (mb_state.eps_inv_head.has_value()) {
             auto& eps = mb_state.eps_inv_head.value();
@@ -4453,7 +4448,7 @@ namespace solvers {
       }
       if (eta_diag) mpi->comm.all_reduce_in_place_n(W_diag.data(), W_diag.size(), std::plus<>{});
       const long total_fold = mpi->comm.all_reduce_value(my_nfold, std::plus<>{});
-      app_log(2, "  Refinement 2 W-bar fold distributed over {} ranks: this rank folded "
+      app_log(2, "  secondary ISDF basis W-bar fold distributed over {} ranks: this rank folded "
                  "{} of {} q-points (~1/P work; one q of W alive per rank){}.", mpi->comm.size(), my_nfold,
               total_fold, fill_redist ? (src_dev ? " -- the device W redistributed to whole-q device slabs, folded ON THE DEVICE"
                                      : fill_dev ? " -- redistributed to whole-q slabs, folded ON THE DEVICE" : " -- redistributed to whole-q slabs") : "");
@@ -4468,7 +4463,7 @@ namespace solvers {
           "dW(nu_max)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
           [&](long iq) { return W_diag(iq, 1, all, all); });
     } else {
-      app_log(2, "  Refinement 2: eta diagnostic skipped (N_pair = {} > 4096).",
+      app_log(2, "  secondary ISDF basis: eta diagnostic skipped (N_pair = {} > 4096).",
               ns * nkpts * nc * nc);
     }
 
@@ -4486,8 +4481,8 @@ namespace solvers {
         nda::h5_read(g, "Wbar_qwmm", Wl);
         for (auto const *key : {"window_first", "window_size", "nm", "beta", "nw_half", "kpts"})
           utils::check(g.has_dataset(key),
-                       "vertex_t::cache_w: wbar_load {} carries no \"{}\": its W-bar cannot be validated against this run "
-                       "(audit A18). Copy the metadata datasets window_first, window_size, nm, beta, nw_half, kpts (and "
+                       "vertex_t::cache_w: wbar_load {} carries no \"{}\": its W-bar cannot be validated against this run. "
+                       "Copy the metadata datasets window_first, window_size, nm, beta, nw_half, kpts (and "
                        "Xb_skma) of the wbar_dump file into it.", *wl, key);
         long w0_in = -1, nw_in = -1, nm_in = -1, nwh_in = -1;
         double beta_in = 0.0;
@@ -4499,14 +4494,14 @@ namespace solvers {
         h5::h5_read(g, "nw_half", nwh_in);
         nda::h5_read(g, "kpts", kpts_in);
         utils::check(w0_in == long(_band_window.first()) and nw_in == long(_band_window.size()),
-                     "vertex_t::cache_w: wbar_load {} was dumped on the window [{}, {}), this run's is [{}, {}) (audit A18).",
+                     "vertex_t::cache_w: wbar_load {} was dumped on the window [{}, {}), this run's is [{}, {}).",
                      *wl, w0_in, w0_in + nw_in, _band_window.first(), _band_window.last());
-        utils::check(nm_in == _Nm, "vertex_t::cache_w: wbar_load {} has N_m = {}, this run's secondary basis has N_m = {} "
-                                   "(audit A18).", *wl, nm_in, _Nm);
+        utils::check(nm_in == _Nm, "vertex_t::cache_w: wbar_load {} has N_m = {}, this run's secondary basis has N_m = {}"
+                                   ".", *wl, nm_in, _Nm);
         utils::check(std::abs(beta_in - tools.beta) <= 1e-10 * std::max(1.0, std::abs(tools.beta)),
-                     "vertex_t::cache_w: wbar_load {} was dumped at beta = {}, this run's beta = {} (audit A18).",
+                     "vertex_t::cache_w: wbar_load {} was dumped at beta = {}, this run's beta = {}.",
                      *wl, beta_in, tools.beta);
-        utils::check(nwh_in == nw_half, "vertex_t::cache_w: wbar_load {} has nw_half = {}, this run's = {} (audit A18).",
+        utils::check(nwh_in == nw_half, "vertex_t::cache_w: wbar_load {} has nw_half = {}, this run's = {}.",
                      *wl, nwh_in, nw_half);
         nda::array<double, 2> kpts_now(MF->kpts());
         bool kpts_ok = (kpts_in.shape(0) == kpts_now.shape(0) and kpts_in.shape(1) == kpts_now.shape(1));
@@ -4517,7 +4512,7 @@ namespace solvers {
           kpts_ok = (kdev <= 1e-8);
         }
         utils::check(kpts_ok, "vertex_t::cache_w: wbar_load {} was dumped on a different k-mesh ({} k-points vs {}; max "
-                              "|dk| = {:.3e}) (audit A18).", *wl, kpts_in.shape(0), kpts_now.shape(0), kdev);
+                              "|dk| = {:.3e}).", *wl, kpts_in.shape(0), kpts_now.shape(0), kdev);
         if (g.has_dataset("Xb_skma")) {
           nda::array<ComplexType, 4> Xb_in;
           nda::h5_read(g, "Xb_skma", Xb_in);
@@ -4534,7 +4529,7 @@ namespace solvers {
           }
           utils::check(xb_ok, "vertex_t::cache_w: wbar_load {}: the stored secondary collocation Xb_skma differs from this "
                               "run's (max |dXb| = {:.3e} vs max |Xb| = {:.3e}, or a different shape): the W-bar is expressed in "
-                              "another secondary basis (audit A18).", *wl, xdev, xsc);
+                              "another secondary basis.", *wl, xdev, xsc);
         } else {
           app_log(1, "  [WARNING] vertex_t::cache_w: wbar_load {} carries no Xb_skma -- the secondary BASIS of the loaded W-bar "
                      "cannot be compared with this run's (window / N_m / beta / k-mesh match).", *wl);
@@ -4551,7 +4546,7 @@ namespace solvers {
       }
       // Loud on purpose: this runs on EVERY cache_w call, so the rung of every iteration is the file's: the dynamic rung is
       // FROZEN at the loaded W-bar and does not follow this run's W.
-      app_log(1, "  [WARNING] [factorize-vertex] the W-bar cache (the dynamic rung) is REPLACED by the file {} (vertex_debug "
+      app_log(1, "  [WARNING] [dynamic vertex] the W-bar cache (the dynamic rung) is REPLACED by the file {} (vertex_debug "
                  "wbar_load; metadata validated). This happens at EVERY cache fill, so the rung is FROZEN at the file's W-bar "
                  "and does not follow the self-consistent W of this run.", *wl);
     }
@@ -4591,13 +4586,13 @@ namespace solvers {
         h5::h5_write(g, "window_first", long(_band_window.first()));
         h5::h5_write(g, "window_size", long(_band_window.size()));
         h5::h5_write(g, "nm", _Nm);
-        app_log(1, "  [factorize-vertex] Wbar cache dumped to {} ((nq, nw_half, N_m, N_m) = ({}, {}, {}, {}), head {})",
+        app_log(1, "  [dynamic vertex] Wbar cache dumped to {} ((nq, nw_half, N_m, N_m) = ({}, {}, {}, {}), head {})",
                 fn, nqpts_ibz, nw_half, _Nm, _Nm, head_ok);
       }
       mpi->comm.barrier();
       if (vertex_debug::flag("wbar_dump_exit")) {
         // a debug request, never quiet -- the iteration's readout / Sigma and every later step are skipped
-        app_log(1, "  [WARNING] [factorize-vertex] exiting after the W-bar dump by request (vertex_debug wbar_dump_exit): "
+        app_log(1, "  [WARNING] [dynamic vertex] exiting after the W-bar dump by request (vertex_debug wbar_dump_exit): "
                    "MPI_Finalize + exit(0) now -- the rest of this iteration (readout, Sigma) and of the run is NOT computed.");
         app_log_flush();
         MPI_Finalize();
@@ -4609,10 +4604,10 @@ namespace solvers {
     const double to_mb = 16.0 / (1024.0 * 1024.0);   // complex<double>
     const double cache_mb = double(nqpts_ibz) * double(nw_half) * double(_Nm) * double(_Nm) * to_mb;
     const double dw_mb = double(nqpts_ibz) * double(nt_half) * double(Np) * double(Np) * to_mb;
-    app_log(2, "  Refinement 2 W-bar cache FILLED: (nq, nw_half, N_m, N_m) = "
+    app_log(2, "  secondary ISDF basis W-bar cache FILLED: (nq, nw_half, N_m, N_m) = "
                "({}, {}, {}, {}) = {:.3f} MB (replicated store; fold WORK distributed "
-               "over q, M3 item #7)\n"
-               "  vs the retained dW it replaces: (nq, nt_half, Np, Np) = "
+               "over q)\n"
+               "  vs retaining the full dW (global path): (nq, nt_half, Np, Np) = "
                "({}, {}, {}, {}) = {:.3f} MB -- ratio {:.3e}\n",
             nqpts_ibz, nw_half, _Nm, _Nm, cache_mb,
             nqpts_ibz, nt_half, Np, Np, dw_mb, cache_mb / dw_mb);
@@ -4716,11 +4711,10 @@ namespace solvers {
     // break the Phi-derivability of the response terms).
     reset_w0();
 
-    app_log(1, "\n  [ISDF-Vertex] static rung W0[G] (increment S2; "
-               "notes/static_vertex_implementation_plan.md section 2.2)\n"
+    app_log(1, "\n  [vertex] static rung W0[G]\n"
                "  W0(q) = Z(q) + dW(q, i.nu = 0) from the SAME-ITERATION RPA "
                "polarizability -- no lag,\n"
-               "  no Pi^C content (decision D2). Grid (nt_half, nq, Np) = ({}, {}, {}), "
+               "  no Pi^C content. Grid (nt_half, nq, Np) = ({}, {}, {}), "
                "rung mode = {}.",
             nt_half_ft, nqpts_ibz, Np, rung_str());
 
@@ -4827,7 +4821,7 @@ namespace solvers {
       double gmax = mpi->comm.all_reduce_value(epsinv_max, boost::mpi3::max<>{});
       long q_of_max = (epsinv_max == gmax) ? epsinv_q : -1;
       q_of_max = mpi->comm.all_reduce_value(q_of_max, boost::mpi3::max<>{});
-      app_log(2, "  [ISDF-Vertex] W0 conditioning: max_q ||[I - Z.Pi_RPA(i.nu=0)]^-1||_max "
+      app_log(2, "  [vertex] W0 conditioning: max_q ||[I - Z.Pi_RPA(i.nu=0)]^-1||_max "
                  "= {:.4e} (worst q = {}; the single-frequency Dysons on the device)", gmax, q_of_max);
 #endif
     } else {
@@ -4867,7 +4861,7 @@ namespace solvers {
         double gmax = mpi->comm.all_reduce_value(epsinv_max, boost::mpi3::max<>{});
         long q_of_max = (epsinv_max == gmax) ? epsinv_q : -1;
         q_of_max = mpi->comm.all_reduce_value(q_of_max, boost::mpi3::max<>{});
-        app_log(2, "  [ISDF-Vertex] W0 conditioning: max_q ||[I - Z.Pi_RPA(i.nu=0)]^-1||_max "
+        app_log(2, "  [vertex] W0 conditioning: max_q ||[I - Z.Pi_RPA(i.nu=0)]^-1||_max "
                    "= {:.4e} (worst q = {})", gmax, q_of_max);
       }
     }   // SLATE path
@@ -4917,12 +4911,12 @@ namespace solvers {
         _w0_head_c = ComplexType(double(nkpts) * xi * _ladder_head_scale);
         _w0_head_applied = true;
         if (_ladder_head_scale != 1.0)
-          app_log(1, "  [DA D-4] ladder_head_scale = {:.6g}: the analytic rank-1 q -> 0 "
+          app_log(1, "  [vertex ladder] ladder_head_scale = {:.6g}: the analytic rank-1 q -> 0 "
                      "head of the static rung W0(Gamma) -- i.e. the head INSIDE the ladder "
                      "kernel W-bar_0 -- is scaled by this factor. The loop's own RPA W and "
                      "its div_treatment are untouched.", _ladder_head_scale);
       } else if (_bl_head_scale == 0.0) {
-        app_log(1, "  [W-int-3] W0: vertex_bl_head_scale = 0 -- the static rung W-bar_0 carries NO analytic q -> 0 head "
+        app_log(1, "  [vertex Wannier] W0: vertex_bl_head_scale = 0 -- the static rung W-bar_0 carries NO analytic q -> 0 head "
                    "(body-only vertex kernel; the loop's RPA W keeps its {} head).", _div_treatment);
       } else if (head_unusable_continue("vertex_t::build_w0")) {   // aborts unless allowed (scale 0 handled above)
         app_log(1, "  [WARNING] W0: gygi head insertion requested but the head data are "
@@ -4939,7 +4933,7 @@ namespace solvers {
             div_utils::eps_inv_head_w(dW0_1qPQ, thc, *MF, _div_treatment);
         (void)eps_inv_w;
         _w0_eps_head = eps_inv_q0_w(0).real();
-        app_log(1, "  [ISDF-Vertex] W0 head insertion at i.nu = 0: madelung = {}, "
+        app_log(1, "  [vertex] W0 head insertion at i.nu = 0: madelung = {}, "
                    "Nk*madelung = {:.6e},\n"
                    "  Re[eps^-1_head(i.nu=0) - 1] = {:.6e}  =>  epsilon_inf(RPA, W0) = "
                    "{:.6f}",
@@ -4993,12 +4987,12 @@ namespace solvers {
       }
     }
     if (not head_insertion)
-      app_log(1, "  [ISDF-Vertex] W0 q->0 policy: {} -- W0(Gamma) is the stored regularized "
+      app_log(1, "  [vertex] W0 q->0 policy: {} -- W0(Gamma) is the stored regularized "
                  "body\n"
                  "  Z(Gamma) + dW0(Gamma) (v(G=0) zeroed at ERI build); no analytic head{}.",
               _div_treatment,
               w0_skip_gamma() ? ", and the Gamma cell of the rung transfer will be "
-                                "DROPPED by the S3+ kernels (v1_skip fallback)"
+                                "DROPPED by the rung kernels (v1_skip fallback)"
                               : " (GW ignore_g0 analogue)");
 
     _Timer.stop("W0_HEAD");
@@ -5115,7 +5109,7 @@ namespace solvers {
       _w0_head_share_pre = h_pre / std::max(n_pre, 1e-300);
       _w0_head_share_post = h_post / std::max(n_post, 1e-300);
       _w0_head_atten = _w0_head_share_post / std::max(_w0_head_share_pre, 1e-300);
-      app_log(1, "  [DA D-7 head] pre/post-fold head meter at Gamma (H1b): "
+      app_log(1, "  [vertex] pre/post-fold head meter at Gamma: "
                  "|c_eff| = {:.6e}; ||chi||^2 = {:.6e} -> ||t.chi||^2 = {:.6e} "
                  "(kept {:.4f});\n"
                  "    ||H||_F = {:.6e} of ||W0(G)||_F = {:.6e}  => head share PRE  = "
@@ -5123,7 +5117,7 @@ namespace solvers {
                  "    ||H_bar||_F = {:.6e} of ||W0bar(G)||_F = {:.6e}  => head share POST = "
                  "{:.6e}\n"
                  "    ATTENUATION (post share / pre share) = {:.6f}   [< 1 = the fold "
-                 "represents the head worse than the body = H1b]",
+                 "represents the head worse than the body]",
               std::abs(c_eff), chi2, tchi2, (chi2 > 0.0 ? tchi2 / chi2 : 0.0),
               h_pre, n_pre, _w0_head_share_pre, h_post, n_post, _w0_head_share_post,
               _w0_head_atten);
@@ -5136,11 +5130,11 @@ namespace solvers {
       for (auto const &v : _W0b_qmm.value()) wb_max = std::max(wb_max, std::abs(v));
       const long Nm_eff = _W0b_qmm.value().shape(1);
       const double to_mb = 16.0 / (1024.0 * 1024.0);
-      app_log(1, "  [ISDF-Vertex] W0 BUILT: max|W0| = {:.4e} (distributed {} x {} x {}, "
+      app_log(1, "  [vertex] W0 BUILT: max|W0| = {:.4e} (distributed {} x {} x {}, "
                  "{:.3f} MB total),\n"
                  "  max|W0bar| = {:.4e} (replicated {} x {} x {}, {:.3f} MB/rank); "
                  "iteration-local -- both\n"
-                 "  are dropped at the next build (plan section 2.3).\n",
+                 "  are dropped at the next build.\n",
               w0_max, nqpts_ibz, Np, Np,
               double(nqpts_ibz) * double(Np) * double(Np) * to_mb,
               wb_max, nqpts_ibz, Nm_eff, Nm_eff,
