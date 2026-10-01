@@ -44,7 +44,7 @@ def sigma_sector(ik, sector):
         for iq in range(nk):
             wq = wres[iq] if sector == '>' else np.transpose(wres[iq], (0, 2, 1))
             acc += gw.gtilde(ck.qk_to_k2[iq, ik], t, sector) * np.einsum('tj,jpq->tpq', Ew, wq)
-        acc /= nk
+        acc *= (1.0 if sector == '>' else -1.0) / nk
         out += np.einsum('zt,tab->zab', F[:, i0:i0 + gw.t_chunk], (Xk.conj().T @ acc) @ Xk)
     return out
 Sp = sigma_sector(ik, '>'); Sh = sigma_sector(ik, '<'); Sl = Sp + Sh

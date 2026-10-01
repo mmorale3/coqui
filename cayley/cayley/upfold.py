@@ -39,6 +39,8 @@ def upfold_block(C, K, wp, mu=0.0, tol_c0=1e-12, tol_gram=1e-12, tol_svd=1e-12, 
     B, Bp, Chat = normalize_c0(C, tol_c0)
     r = B.shape[1]
     T = block_toeplitz(Chat, K)
+    if not np.all(np.isfinite(T)) or T.size == 0:
+        raise ValueError("upfold_block: moments are empty or non-finite (C0 rank %d)" % r)
     lam, V = np.linalg.eigh(T)
     lam_max = lam.max()
     keep = lam > tol_gram * lam_max

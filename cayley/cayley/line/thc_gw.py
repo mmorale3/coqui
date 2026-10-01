@@ -29,9 +29,6 @@ class LineGW:
         self.theta, self.theta_t = theta, theta_t
         self.bos, self.fz = bos_basis, np.asarray(ferm_zeta, complex)
         self.t_chunk, self.ray_decades, self.ray_kw = t_chunk, ray_decades, (ray_kw or {})
-        # bosonic evaluation points: nodes and their mirrors (for the reflection formula)
-        zb = self.bos.zeta
-        self.zb_all = np.concatenate([zb, -np.conj(zb)])
         self.poles = None
 
     # ---------------------------------------------------------------- pole data
@@ -72,21 +69,28 @@ class LineGW:
 
     # ---------------------------------------------------------------- polarization and W
     def polarization(self, iq, zeta=None):
-        """Pi(q, zeta) (nz, Np, Np) at mu-relative points zeta (default: bosonic nodes), via Pi^> on zeta and mirrors."""
-        zeta = self.zb_all if zeta is None else np.asarray(zeta, complex)
-        zall = np.concatenate([zeta, -np.conj(zeta)])
-        ray = self.ray_p
-        F = ray.transform_matrix(zall)                                  # (2nz, nt)
-        Pp = np.zeros((len(zall), self.Np, self.Np), complex)
-        for i0 in range(0, len(ray), self.t_chunk):
-            t = ray.t[i0:i0 + self.t_chunk]
-            acc = np.zeros((len(t), self.Np, self.Np), complex)
-            for ik in range(self.nk):
-                acc += self.gtilde(ik, t, '>') * np.conj(self.gtilde(self.qk[iq, ik], t, '<'))
-            acc *= 2.0 / self.nk
-            Pp += np.einsum('zt,tpq->zpq', F[:, i0:i0 + self.t_chunk], acc)
-        nz = len(zeta)
-        return Pp[:nz] + np.conj(Pp[nz:])                               # Pi^>(zeta) + conj(Pi^>(-conj zeta))
+        """Pi(q, zeta) (nz, Np, Np) at mu-relative points zeta (default: bosonic nodes).
+        Both sectors are built explicitly on their rays (no q -> -q symmetry assumed), matching the Casida transition sum
+        Pi = sum_t sg_t S_t S_t^H/(zeta - E_t) with S_t = sqrt(2/Nk) X(k,n) conj(X(k-q,m)):
+          Pi^>(q,t)_PQ = +(2/Nk) sum_k [sum_{n occ(k)}   R~_n,PQ(k) e^{+i e_n t}] [sum_{m unocc(k-q)} conj(R~_m,PQ(k-q)) e^{-i e_m t}]   (particle ray)
+          Pi^<(q,t)_PQ = -(2/Nk) sum_k [sum_{n unocc(k)} R~_n,PQ(k) e^{+i e_n t}] [sum_{m occ(k-q)}   conj(R~_m,PQ(k-q)) e^{-i e_m t}]   (hole ray)
+        with sum_m R~_m,PQ e^{+i e_m t} = conj(G~(k, conj t))_QP and conj(R~_m,PQ) e^{-i e_m t} = G~(k, t)_QP (Hermitian residues),
+        and Pi^{>/<}(zeta) = -i int_0^inf dt e^{i zeta t} Pi^{>/<}(t)."""
+        zeta = self.bos.zeta if zeta is None else np.asarray(zeta, complex)
+        out = np.zeros((len(zeta), self.Np, self.Np), complex)
+        for sector, ray, sign in (('>', self.ray_p, 1.0), ('<', self.ray_h, -1.0)):
+            s_k, s_kmq = ('<', '>') if sector == '>' else ('>', '<')        # occupation of the state at k / at k-q
+            F = ray.transform_matrix(zeta)
+            for i0 in range(0, len(ray), self.t_chunk):
+                t = ray.t[i0:i0 + self.t_chunk]
+                acc = np.zeros((len(t), self.Np, self.Np), complex)
+                for ik in range(self.nk):
+                    A = np.conj(self.gtilde(ik, np.conj(t), s_k))                  # (nt, Np, Np): entries QP of sum R~ e^{+i e t}
+                    B = self.gtilde(self.qk[iq, ik], t, s_kmq)                    # entries QP of sum conj(R~) e^{-i e t}
+                    acc += np.transpose(A * B, (0, 2, 1))
+                acc *= sign * 2.0 / self.nk
+                out += np.einsum('zt,tpq->zpq', F[:, i0:i0 + self.t_chunk], acc)
+        return out
 
     def dyson_w(self, iq, Pi):
         """W(q, zeta_i) = ([1 - Z Pi]^-1 - 1) Z for each node; (nz, Np, Np)."""
@@ -115,7 +119,7 @@ class LineGW:
                     w = wres[iq] if sector == '>' else np.transpose(wres[iq], (0, 2, 1))
                     Wt = np.einsum('tj,jpq->tpq', Ew, w)
                     acc += self.gtilde(self.qk[iq, ik], t, sector) * Wt
-                acc /= self.nk
+                acc *= (1.0 if sector == '>' else -1.0) / self.nk              # T=0 factor [theta(nu) - theta(-eps)] = -1 in the hole sector
                 S_ab = (Xk.conj().T @ acc) @ Xk                           # (nt, nb, nb)
                 out += np.einsum('zt,tab->zab', F[:, i0:i0 + self.t_chunk], S_ab)
         return out

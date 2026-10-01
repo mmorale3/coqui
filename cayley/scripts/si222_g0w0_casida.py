@@ -2,7 +2,7 @@
 """Si kp222 nbnd58 G0W0 (CoQui v6_nb58 base): EXACT Cayley moments from the Casida pole structure of Sigma_c
 -> block Toeplitz upfolding -> A(k, w) against the exact spectral function of the same Sigma_c. Usage: [ik] [wp_Ha]"""
 import sys, os, time, numpy as np
-ROOT = '/Users/mmorales/Projects/Cayley_real_axis_scGW'
+ROOT = os.environ.get('CAYLEY_ROOT', '/Users/mmorales/Projects/Cayley_real_axis_scGW')
 sys.path.insert(0, ROOT + '/coqui/cayley')
 from cayley.coqui_io import Checkpoint, THC
 from cayley.casida_g0w0 import CasidaG0W0
@@ -55,7 +55,7 @@ win = np.abs(om - mu) < 0.19     # ~ +-5 eV
 res = dict(om=om, mu=mu, mu0=mu0, mu1=mu1, wp=wp, C=C, Cl=Cl, Cg=Cg, H=H, pole_summary=np.array([ps['hole_edge'], ps['particle_edge']]))
 for eta in etas: res[f'Aex_tr_eta{eta}'] = np.trace(Aex[eta], axis1=1, axis2=2).real; res[f'Aex_diag_eta{eta}'] = np.einsum('wii->wi', Aex[eta]).real
 # 5. upfold at several orders, total measure and sector-split
-Ks = [4, 8, 12, 16, 24, 32, 40]
+Ks = [4, 8, 12, 16, 24, 32]
 for mode in ['total', 'sectors']:
     print(f"== upfolding ({mode}); rel. max error of Tr A in |w-mu|<5 eV / full +-12 eV, per eta")
     for K in Ks:
