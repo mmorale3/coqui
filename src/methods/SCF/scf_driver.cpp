@@ -294,7 +294,7 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     // imaginary-axis window leaves a small NON-causal residue that a Dyson loop with semicore states amplifies geometrically
     // (MgO drift, AlAs / LiF divergence at the 1.5 x bandwidth window). Logged every iteration (level 2), at level 1 when the
     // residue exceeds 1e-6 or grows by more than 3x per iteration. vertex_debug = "scf_causality_meter=0" disables it.
-    if (vertex_debug::text("scf_causality_meter", "1") != "0") {   // vertex_debug: scf_causality_meter = 0 disables it
+    if (vertex_debug::number("scf_causality_meter", 1.0) != 0.0) {   // strict parse: "off" / "false" disable it too (audit)   // vertex_debug: scf_causality_meter = 0 disables it
       double gmin = 1e300, smax = -1e300;
       long nviol = 0;
       if (mpi->node_comm.root()) {

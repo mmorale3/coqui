@@ -580,7 +580,7 @@ namespace solvers {
       // so that every (tau, k') / (a, k') contraction below is a (nc^2 x nR)(nR x nc^2) gemm instead of the two
       // (nc^2 x nR)(nR x Nm) + (nc^2 x Nm)(Nm x nc^2) ones (the M-contraction repeated nt / np times): ~7x on the legs.
       // The summation order changes (sum_N sum_M -> sum_M sum_N): rounding class. COQUI_SIGDYN_LEGS=wm restores the old order.
-      static const bool legs_wm = (vertex_debug::text("sigdyn_legs", "dw") == "wm");   // vertex_debug: sigdyn_legs = dw | wm
+      static const bool legs_wm = [] { const auto v = vertex_debug::text("sigdyn_legs", "dw"); utils::check(v == "dw" or v == "wm", "sigma_dyn: vertex_debug sigdyn_legs = \"{}\" is not dw | wm.", v); return v == "wm"; }();   // vertex_debug: sigdyn_legs = dw | wm
       nda::array<cplx, 3> DWall(legs_wm ? 0 : nk, nc2, nR);
       if (not legs_wm) {
         nda::array<cplx, 2> Dck(nc2, Nm);
@@ -854,7 +854,7 @@ namespace solvers {
      *  with the order of a few products changed (w(tau) folded into the w -> tau matrix, the j-sums of the all-node T
      *  family inside the gemms): rounding class. vertex_debug dynbse_dev_sigma = 0 keeps the host deposits (the A/B). */
     inline bool sigma_dyn_device_ok(sigma_dyn_hook const &h) {
-      const bool legs_wm = (vertex_debug::text("sigdyn_legs", "dw") == "wm");
+      const bool legs_wm = [] { const auto v = vertex_debug::text("sigdyn_legs", "dw"); utils::check(v == "dw" or v == "wm", "sigma_dyn: vertex_debug sigdyn_legs = \"{}\" is not dw | wm.", v); return v == "wm"; }();
       return vertex_debug::number("dynbse_dev_sigma", 1.0) != 0.0 and not h.poles and not h.ibz and not h.dump and   // vertex_debug: dynbse_dev_sigma
              not h.single_acc and not legs_wm and (h.col == "static_dyn" or h.col == "dyn1_bare" or h.col == "dyn1");
     }

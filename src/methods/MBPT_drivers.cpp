@@ -150,6 +150,18 @@ namespace mbpt_vertex_audit {
                  "{}: pol_vertex_sigma = \"{}\" needs the ladder machinery (pol_vertex = \"ladder\" with a non-empty "
                  "pol_vertex_band_window), but pol_vertex = \"none\": the Sigma vertex would never be built (audit A15).",
                  driver, sig_mode);
+    // keys that only act on the Sigma^C / Pi^C vertex (vertex_type): set without it they used to be ignored silently
+    if (not v.enabled()) {
+      const double vs = io::get_value_with_default<double>(pt, "vertex_scale", 1.0);
+      const long vr = io::get_value_with_default<long>(pt, "vertex_ramp_iters", 0);
+      utils::check(vs == 1.0 and vr == 0, "{}: vertex_scale = {} / vertex_ramp_iters = {} act on the Sigma^C / Pi^C vertex "
+                   "(vertex_type), which is \"none\": they would be ignored. Remove them or set vertex_type.", driver, vs, vr);
+    }
+    // a Wannier frame with no vertex at all
+    utils::check(io::get_value_with_default<std::string>(pt, "vertex_wannier_file", "").empty() or v.enabled() or
+                 v.pol_vertex_enabled(),
+                 "{}: vertex_wannier_file is set but no vertex is requested (vertex_type = \"none\", pol_vertex = \"none\"): it "
+                 "would be ignored.", driver);
   }
 
   /** audit A14: the [evgw] / [qpgw] knob carrier (vertex_type = "none") used to IGNORE the vertex keys the [gw] sites
