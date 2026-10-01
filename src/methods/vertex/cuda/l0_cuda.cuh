@@ -133,6 +133,12 @@ namespace methods::solvers::dynbse_cuda {
     long nout = 0;                  // the external-leg / readout dimension (aux N_m, or the Wannier pair count)
     int l0_fused = 2, l0_asm_gemm = 1;   // the resident L0 plan's kernels (l0_tables::fused / asm_gemm)
     int l0_fz_cfg = 44, l0_fz_bench = 0; // l0_tables::fz_cfg / fz_bench
+    // factorize-vertex TEST (vertex_debug dyn_um): the dense rung slab K_d(s) (ndist D^2) in CUDA managed memory so the unit
+    // runs when it does not fit: 0 = device-resident (default); 1 = managed, preferred on the device (the driver migrates and
+    // evicts on demand); 2 = managed, split: the part that fits preferred on the device (prefetched), the rest host-resident
+    // and read over the link (AccessedBy device, no migration). The rest of the unit stays device-resident.
+    int um_mode = 0;
+    double um_reserve = 6.0e9;      // device bytes kept free for the later device stages (rung builds, Sigma deposits, dressed)
   };
 
   /** nullptr when the device cannot hold the working set (the caller keeps the host path); `why` then says what failed */

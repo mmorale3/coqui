@@ -46,6 +46,7 @@
 #include "methods/mb_state/mb_state.hpp"
 #include "methods/ERI/detail/concepts.hpp"
 #include "methods/vertex/vertex_sym.hpp"
+#include "methods/vertex/dyn_device_fallback.hpp"   // factorize-vertex: pol_vertex_dyn_device_fallback
 #include "methods/embedding/projector_t.h"
 
 namespace methods {
@@ -1952,6 +1953,10 @@ namespace vertex_pi { struct iaft_tools; }
     /** pol_vertex_dyn_resolvent (default "inverse"): the static resolvent T_s = K_s (1 - Cb K_s)^-1 of the dynamic solver --
      *  "inverse" forms the explicit inverse and stores T_s dense (D x D); "lu" (P7) factorizes 1 - Cb K_s once (getrf, built
      *  blockwise) and applies T_s as a solve + one K_s gemm: no D^3 inverse, D^2 fewer words, identical to rounding. */
+    /** pol_vertex_dyn_device_fallback (default false): a dynamic-vertex device stage that does not fit in device memory may
+     *  move to the CPU only when true (logged as a WARNING); false aborts the calculation with the reason (factorize-vertex). */
+    void set_ladder_dyn_device_fallback(bool on) { dyn_device_fallback_state() = on; }
+    bool ladder_dyn_device_fallback() const { return dyn_device_fallback_state(); }
     void set_ladder_dyn_resolvent(std::string const &m) {
       utils::check(m == "inverse" or m == "lu", "vertex_t::set_ladder_dyn_resolvent: pol_vertex_dyn_resolvent must be inverse | lu (got \"{}\").", m);
       _dyn_resolvent = m;

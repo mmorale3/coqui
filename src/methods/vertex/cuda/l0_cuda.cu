@@ -1515,8 +1515,11 @@ namespace methods::solvers::dynbse_cuda {
 
   unit_engine *ue_create(ue_config const &c, double free_bytes, char *why, long why_len) {
     const double need = ue_bytes(c);
-    if (need > 0.9 * free_bytes) {
-      std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB free", need / 1e9, free_bytes / 1e9);
+    const double Dd = double(c.nk * c.nc * c.nc), kds_bytes = 16.0 * double(c.ndist) * Dd * Dd;
+    const double need_dev = (c.um_mode > 0) ? need - 1.05 * kds_bytes : need;   // um: K_d(s) is not counted as device memory
+    if (need_dev > 0.9 * free_bytes) {
+      std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory%s, %.1f GB free", need_dev / 1e9,
+                    c.um_mode > 0 ? " besides the managed K_d(s)" : "", free_bytes / 1e9);
       return nullptr;
     }
     auto *e = new unit_engine;
@@ -1530,7 +1533,34 @@ namespace methods::solvers::dynbse_cuda {
     e->Ut = dalloc<cd>(size_t(c.n_kept) * nt, "ue Ut"); e->Vs = dalloc<cd>(size_t(c.np_fit) * size_t(c.n_kept), "ue Vs");
     e->Kmat = dalloc<cd>(nt * size_t(c.np_fit), "ue Kc");
     e->Ks = dalloc<cd>(D * D, "ue Ks"); e->Kd0 = dalloc<cd>(D * D, "ue Kd0");
-    e->Kds = dalloc<cd>(size_t(c.ndist) * D * D, "ue Kds");
+    if (c.um_mode > 0) {
+      // factorize-vertex TEST: K_d(s) in managed memory (see ue_config::um_mode)
+      const size_t bytes = size_t(c.ndist) * D * D * sizeof(cd);
+      cu_check(cudaMallocManaged(&e->Kds, bytes), "ue Kds (managed)");
+      int dev = 0;
+      cu_check(cudaGetDevice(&dev), "ue Kds getdevice");
+      const double room = 0.9 * free_bytes - need_dev - c.um_reserve;           // device bytes left for K_d(s)
+      const size_t page = size_t(2) << 20;
+      size_t fit = (room > 0.0) ? std::min(bytes, size_t(room)) : size_t(0);
+      fit = (fit / page) * page;
+      if (c.um_mode == 1) {
+        cu_check(cudaMemAdvise(e->Kds, bytes, cudaMemAdviseSetPreferredLocation, dev), "ue Kds advise pref");
+        cu_check(cudaMemAdvise(e->Kds, bytes, cudaMemAdviseSetAccessedBy, dev), "ue Kds advise acc");
+      } else {
+        if (fit > 0) cu_check(cudaMemAdvise(e->Kds, fit, cudaMemAdviseSetPreferredLocation, dev), "ue Kds advise pref dev");
+        if (bytes > fit) {
+          char *rest = reinterpret_cast<char *>(e->Kds) + fit;
+          cu_check(cudaMemAdvise(rest, bytes - fit, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId), "ue Kds advise pref cpu");
+          cu_check(cudaMemAdvise(rest, bytes - fit, cudaMemAdviseSetAccessedBy, dev), "ue Kds advise acc");
+        }
+      }
+      if (fit > 0) cu_check(cudaMemPrefetchAsync(e->Kds, fit, dev, 0), "ue Kds prefetch");
+      std::snprintf(why, size_t(why_len), "MANAGED K_d(s) (dyn_um = %d): %.1f GB, %.1f GB device-preferred, %.1f GB %s", c.um_mode,
+                    double(bytes) / 1e9, double(c.um_mode == 1 ? bytes : fit) / 1e9, double(c.um_mode == 1 ? 0 : bytes - fit) / 1e9,
+                    c.um_mode == 1 ? "(the driver migrates / evicts)" : "host-resident, read over the link");
+    } else {
+      e->Kds = dalloc<cd>(size_t(c.ndist) * D * D, "ue Kds");
+    }
     e->Cbk = dalloc<cd>(size_t(c.nk) * e->nc2 * e->nc2, "ue Cbk"); e->M = dalloc<cd>(D * D, "ue M");
     e->ipiv = dalloc<int>(D, "ue ipiv"); e->dinfo = dalloc<int>(1, "ue info");
     if (cusolverDnZgetrf_bufferSize(e->cs, int(D), int(D), e->M, int(D), &e->lwork) != CUSOLVER_STATUS_SUCCESS)

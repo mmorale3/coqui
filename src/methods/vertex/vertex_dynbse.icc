@@ -1262,6 +1262,28 @@ namespace solvers {
       nda::array<cplx, 2> Kd0;
       std::optional<db::pair_poles> Pcache;
       std::map<long, db::shift_tables> stab_cache;         // the twisted-pair tables depend on the nu node alone
+      // factorize-vertex: NO SILENT WORKFLOW CHANGES. A device stage that does not fit moves to the CPU only when
+      // pol_vertex_dyn_device_fallback = true (with a WARNING); otherwise the run aborts with the reason.
+      auto dev_fallback = [&](std::string const &what, std::string const &why_s) {
+        utils::check(dyn_device_fallback_state(),
+                     "pair_space_ladder_dyn: {} cannot run on the device ({}). pol_vertex_dyn_device_fallback = false forbids moving it "
+                     "to the CPU: ABORTING. Set pol_vertex_dyn_device_fallback = true to allow the CPU path, or use devices with more "
+                     "memory (e.g. H100-SXM5 94 GB / H200), or reduce the footprint (vertex_debug dyn_rung_rank = R).", what, why_s);
+        app_log(1, "  [dynbse] WARNING (rank {}): {} cannot run on the device ({}): MOVED TO THE CPU (pol_vertex_dyn_device_fallback = true)",
+                rank, what, why_s);
+      };
+      (void)dev_fallback;                                  // (a CPU build has no device stage)
+      // the dressed-leg request (vertex_debug dyn_dressed) and whether this pass can honour it: a dynamic pass that cannot use
+      // the dressed legs aborts instead of running the standard path (the static-only pass has no dynamic rung: nothing to dress)
+      const bool dressed_flag = vertex_debug::flag("dyn_dressed");
+      const bool dressed_sig_ok = (opt.sigma == nullptr) or (opt.sigma->col == "dyn1" or opt.sigma->col == "dyn1_bare" or
+                                                             opt.sigma->col == "static_dyn");
+      const bool dressed_req = dressed_flag and (opt.gamma1_only or opt.one_rung_only) and not opt.static_only and dressed_sig_ok;
+      utils::check(not dressed_flag or opt.static_only or dressed_req,
+                   "pair_space_ladder_dyn: vertex_debug dyn_dressed is set but this dynamic pass cannot use the dressed legs ({}). "
+                   "ABORTING instead of silently running the standard path: the dressed legs apply to the Gamma_1-only / one-bare-rung "
+                   "passes (pol_vertex_dyn_gamma1_only = true) and the Sigma columns dyn1 / dyn1_bare / static_dyn.",
+                   (opt.sigma != nullptr and not dressed_sig_ok) ? "Sigma column " + opt.sigma->col : std::string("the full GMRES resummation"));
 #if defined(ENABLE_CUDA)
       // THE DEVICE-RESIDENT UNIT (gpu port plan 4d, 2026-09-27): the Gamma_1 block -- both ls_apply's (L0, T_s through a
       // cuSOLVER LU of 1 - Cb K_s) and K_d (the DLR expansion, the dense tau rungs, the refit) -- runs on the device with
@@ -1274,6 +1296,10 @@ namespace solvers {
                            opt.gamma1_only and not opt.static_only and
                            not opt.one_rung_only and db::l0_cols_state() and not b.npf_mask and
                            not (opt.sigma != nullptr and opt.sigma->col == "dyn");
+      if (rank == 0 and db::l0_device_enabled() and not ue_want)
+        app_log(1, "  [dynbse] WARNING: the device-resident unit does not cover this pass (scope: dense rung, GMRES Gamma_1-only, "
+                   "unmasked basis, no resummed Sigma column; static_only {} one_rung_only {} gamma1_only {} dense {}): its units run "
+                   "on the CPU with the device L0", opt.static_only, opt.one_rung_only, opt.gamma1_only, opt.dense_rung);
       bool ue_tried = false;
       db::l0_table_store ue_store;
       sigma_dyn_dev sd_dev;                                // D-3: the Sigma deposits on the engine (off = the host deposits)
@@ -1393,6 +1419,8 @@ namespace solvers {
           uc.l0_fz_cfg = int(vertex_debug::number("dynbse_l0_fz_cfg", 44.0));     // vertex_debug: dynbse_l0_fz_cfg
           uc.l0_fz_bench = int(vertex_debug::number("dynbse_l0_fz_bench", 0.0)); // vertex_debug: dynbse_l0_fz_bench
           uc.l0_asm_gemm = int(vertex_debug::number("dynbse_l0_asm_gemm", 1.0));  // vertex_debug: dynbse_l0_asm_gemm
+          uc.um_mode = int(vertex_debug::number("dyn_um", 0.0));                   // vertex_debug: dyn_um (factorize-vertex TEST: managed K_d(s))
+          uc.um_reserve = 1.0e9 * vertex_debug::number("dyn_um_reserve_gb", 6.0);  // vertex_debug: dyn_um_reserve_gb
           char why[256] = {0};
           ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
           if (ue) {                                       // factorize-vertex: the rung form (mirror pairs / frequency-factorized)
@@ -1408,8 +1436,9 @@ namespace solvers {
             dynbse_cuda::ue_set_basis(ue.get(), b.KF.data(), b.KF2.data(), Utk.data(), Vsk.data(), Kck.data());
           }
           if (rank == 0)
-            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated){}{}", ue ? "ON" : "OFF, the host path runs",
-                    dynbse_cuda::ue_bytes(uc) / 1e9, ue ? "" : " -- ", ue ? "" : why);
+            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated){}{}", ue ? "ON" : "OFF",
+                    dynbse_cuda::ue_bytes(uc) / 1e9, why[0] ? " -- " : "", why);
+          if (not ue) dev_fallback("the device-resident unit", why);
           // D-1b: the rungs built on the device (nosym meshes); vertex_debug dynbse_dev_kbig = 0 keeps the host builds (the A/B)
           if (ue and not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0) {   // vertex_debug: dynbse_dev_kbig
             const long nrep_dev = (rrank > 0) ? rrank : ndist;     // factorize-vertex: K_r = K[A_r] in the rung slots
@@ -1423,16 +1452,33 @@ namespace solvers {
             kb_dev = dynbse_cuda::ue_kb_init(ue.get(), ns, nq, Nm, Xc.data(), qxc.data(), W0c.data(), Wd0c.data(), Wreps.data(), nrep_dev,
                                              1.0e6 * double(utils::freemem_device_effective()), whyk, 256);
             if (rank == 0)
-              app_log(1, "  [dynbse] device rung builds (K_s, K_d(s), K_d0): {}{}", kb_dev ? "ON" : "OFF, built on the host -- ",
-                      kb_dev ? "" : whyk);
+              app_log(1, "  [dynbse] device rung builds (K_s, K_d(s), K_d0): {}{}", kb_dev ? "ON" : "OFF -- ", kb_dev ? "" : whyk);
+            if (not kb_dev) dev_fallback("the device rung builds (K_s, K_d(s), K_d0)", whyk);
+          } else if (ue and rank == 0) {
+            app_log(1, "  [dynbse] WARNING: the device rung builds do not cover this run ({}): K_s, K_d(s), K_d0 are built on the CPU "
+                       "and uploaded", sym ? "a symmetry-reduced mesh" : "vertex_debug dynbse_dev_kbig = 0");
           }
           if (ue and opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma)) {
             std::string why_sd;
             const bool ok = sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, G_CC, nk, nc, ng, epsG, Nm, tools, why_sd);
             if (rank == 0)
               app_log(1, "  [dynbse] device Sigma deposits: {}{}", ok ? "ON (accumulators resident, flushed at checkpoints and the end)"
-                                                                        : "OFF, the host deposits run -- ", ok ? "" : why_sd);
+                                                                        : "OFF -- ", ok ? "" : why_sd);
             if (ok) sd_flush_hook = [&]() { sigma_dyn_device_flush(*opt.sigma, sd_dev, ue.get()); };
+            else dev_fallback("the device Sigma deposits", why_sd);
+          } else if (ue and opt.sigma != nullptr and rank == 0) {
+            app_log(1, "  [dynbse] WARNING: the device Sigma deposits do not support this configuration (Wannier pairs or the Sigma "
+                       "column); the Sigma deposits run on the CPU");
+          }
+          // factorize-vertex: the device dressed-leg path needs the device Sigma deposits. Without them the dressed legs run only
+          // on the host unit: move the whole unit to the CPU when allowed, else abort -- never fall back to the standard path.
+          if (ue and dressed_req and opt.sigma != nullptr and not sd_dev.on) {
+            dev_fallback("the device dressed-leg path with the Sigma hook (it needs the device Sigma deposits)",
+                         "the device Sigma deposits are off");
+            if (rank == 0)
+              app_log(1, "  [dynbse] WARNING: the device-resident unit is released; the dressed-leg units run on the CPU");
+            ue.reset();
+            kb_dev = false;
           }
         }
         if (kb_dev) {
@@ -1775,10 +1821,7 @@ namespace solvers {
           // (the one-bare-rung pass is the same readout with T_s = 0: d~ = e~ = d)
           // the Sigma side: the columns built from (Gsum0, Gsum1, y1) are supported (Gsum1 = Cb d~ + (1 + Cb T_s)(L0 y1)^sum, the
           // full pair vector (L0 y1)^sum = Zt + Cb y1.cst from the same Grams); the resummed "dyn" column is not
-          const bool sig_ok = (opt.sigma == nullptr) or (opt.sigma->col == "dyn1" or opt.sigma->col == "dyn1_bare" or
-                                                         opt.sigma->col == "static_dyn");
-          const bool dressed = vertex_debug::flag("dyn_dressed") and (opt.gamma1_only or opt.one_rung_only) and
-                               not opt.static_only and sig_ok;                                  // vertex_debug: dyn_dressed
+          const bool dressed = dressed_req;                                                    // vertex_debug: dyn_dressed
           const bool ts_zero = opt.one_rung_only;
           nda::array<cplx, 4> Et;                               // (nk, nc, nc, nout)
           std::optional<db::dressed_grams> dgram;
@@ -1801,9 +1844,10 @@ namespace solvers {
 #else
           const bool host_unit = true;
 #endif
-          if (dressed and not dressed_dev and not host_unit and rank == 0 and units_taken == 1)
-            app_log(1, "  [factorize-vertex] dyn_dressed with the Sigma hook on the device unit is not implemented: the standard device "
-                       "Gamma_1 path runs");
+          utils::check(not (dressed and not dressed_dev and not host_unit),
+                       "pair_space_ladder_dyn: dyn_dressed is set but neither the device dressed path nor the host dressed path can run "
+                       "this unit (internal: the device unit is on without the device Sigma deposits). Refusing to run the standard "
+                       "path instead.");
           if (dressed and not dressed_dev and host_unit) {
             const double tw0 = db::wall_now();
             utils::apply_blas_threads(nthr);                  // the serial BLAS3 of the dressed legs: the rank's threads

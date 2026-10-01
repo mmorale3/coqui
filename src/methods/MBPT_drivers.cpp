@@ -356,7 +356,9 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 "<prefix>.dynunits.<tag>.g<call>.r<rank>.bin" of the dynamic solves),
  *                 pol_vertex_dyn_dense (true: the dense per-tau rung K_d(s), nt/2 x D^2 per rank;
  *                 false: the THC pair-space streaming route), pol_vertex_dyn_resolvent ("inverse": the static resolvent
- *                 T_s stored dense; "lu": factorized once and applied as a solve -- P7), pol_vertex_dyn_vmask_lo / _hi (Ha about mu: drop the in-gap
+ *                 T_s stored dense; "lu": factorized once and applied as a solve -- P7), pol_vertex_dyn_device_fallback (false:
+ *                 a dynamic-vertex device stage that does not fit in device memory aborts the run; true: it moves to the
+ *                 CPU with a WARNING), pol_vertex_dyn_vmask_lo / _hi (Ha about mu: drop the in-gap
  *                 vertex nodes, the small-nu fix's second half; off by default), pol_vertex_dyn_gamma1_only (false:
  *                 the full resummation; true: stop at Gamma_1, 5-8x cheaper), pol_vertex_dyn_tfold (0: off; r > 0 folds the twisted
  *                 pair components with |eps| >= r |nu| into the unshifted family -- the small-nu fix, Si r = 30), pol_vertex_dyn_iaft_prec ("": the loop's grid;
@@ -691,6 +693,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         vertex.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
         vertex.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         vertex.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
+        vertex.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
         vertex.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         vertex.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
         vertex.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
@@ -1125,6 +1128,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
         pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
+        pol_vertex_carrier.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
         pol_vertex_carrier.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
@@ -1411,6 +1415,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
         pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
+        pol_vertex_carrier.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
         pol_vertex_carrier.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
@@ -1746,6 +1751,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         vertex.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
         vertex.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         vertex.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
+        vertex.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
         vertex.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         vertex.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
         vertex.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
@@ -2104,6 +2110,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         pol_vertex_carrier.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
         pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
+        pol_vertex_carrier.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
         pol_vertex_carrier.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
