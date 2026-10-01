@@ -21,12 +21,18 @@ ck = Checkpoint(D + '/si222c.mbpt.h5'); thc = THC(D + '/si222c.thc.h5')
 X, Z = thc.X[0], thc.Z; nk, nb = ck.nk, ck.nb; mu0 = ck.mu[0]; eks = ck.eig[0]; H0 = ck.H0[0]
 nelec = 8.0
 sc = LineSCGW(X, Z, ck.qk_to_k2, nk, nelec, H0, mu0, theta=theta, eps=eps, wp=0.11, K=K, mixing=mixing, k_weight=ck.k_weight)
-sc.start_from_hamiltonian(np.array([np.diag(eks[k]) for k in range(nk)]).astype(complex))
-F1 = ck.F(1)[0]
-print(f"start: F[Dm_KS] vs CoQui F_1 max|diff| {np.abs(sc.F - F1).max():.2e}; mu0 {mu0:.6f}", flush=True)
 out = ROOT + f'/results/si222c_line_scgw_th{np.degrees(theta):.0f}_K{K}'
-for it in range(niter):
+state = out + '_state.npz'
+if os.path.exists(state):
+    sc.start_from_hamiltonian(np.array([np.diag(eks[k]) for k in range(nk)]).astype(complex))   # builds rays/bases
+    sc.load_state(state)
+else:
+    sc.start_from_hamiltonian(np.array([np.diag(eks[k]) for k in range(nk)]).astype(complex))
+    F1 = ck.F(1)[0]
+    print(f"start: F[Dm_KS] vs CoQui F_1 max|diff| {np.abs(sc.F - F1).max():.2e}; mu0 {mu0:.6f}", flush=True)
+while len(sc.history) < niter:
     rec = sc.iterate()
+    sc.save_state(state)
     np.savez(out + '.npz', history=np.array(sc.history, dtype=object), fz=sc.fz, mu=sc.mu,
              Sig=np.array([sc.sigma_total(k) for k in range(nk)]), F=sc.F)
 # V4 against the converged Matsubara scGW on the same THC, if available

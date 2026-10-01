@@ -96,3 +96,20 @@ class LineSCGW:
 
     def sigma_total(self, ik):
         return self.Sig_prev[ik][0] + self.Sig_prev[ik][1]
+
+    # ---------------------------------------------------------------- checkpoint / resume (preemptible queues)
+    def save_state(self, fname):
+        e, coef = self.gw.poles
+        np.savez(fname, e=e, coef=coef, F=self.F, mu=self.mu, niter=len(self.history),
+                 Sig_p=np.array([s[0] for s in self.Sig_prev]) if self.Sig_prev is not None else np.zeros(0),
+                 Sig_h=np.array([s[1] for s in self.Sig_prev]) if self.Sig_prev is not None else np.zeros(0),
+                 history=np.array(self.history, dtype=object), fz=self.fz)
+
+    def load_state(self, fname):
+        z = np.load(fname, allow_pickle=True)
+        assert np.allclose(z['fz'], self.fz), "line nodes differ from the saved state (theta/eps/gaps changed)"
+        self.mu = float(z['mu']); self.gw.mu = self.mu
+        self.gw.set_poles(z['e'], coef=z['coef']); self.F = z['F']
+        self.history = list(z['history'])
+        self.Sig_prev = [[z['Sig_p'][k], z['Sig_h'][k]] for k in range(self.nk)] if z['Sig_p'].size else None
+        if self.verbose: print(f"resumed from {fname}: {len(self.history)} iterations done, mu {self.mu:.6f}", flush=True)
