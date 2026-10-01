@@ -360,7 +360,9 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 a dynamic-vertex device stage that does not fit in device memory aborts the run; true: it moves to the
  *                 CPU with a WARNING), pol_vertex_dyn_device_memory ("stream": a dense rung slab that does not fit in
  *                 device memory keeps the part that fits resident and streams the rest from pinned host memory; "managed": CUDA
- *                 managed memory; "resident": no partition), pol_vertex_dyn_vmask_lo / _hi (Ha about mu: drop the in-gap
+ *                 managed memory; "resident": no partition), pol_vertex_dyn_dressed ("auto": the exact dressed-leg Gamma_1 readout
+ *                 on every pass that supports it, the others run the standard path and say so; "on": required, abort where it
+ *                 cannot apply; "off"), pol_vertex_dyn_vmask_lo / _hi (Ha about mu: drop the in-gap
  *                 vertex nodes, the small-nu fix's second half; off by default), pol_vertex_dyn_gamma1_only (false:
  *                 the full resummation; true: stop at Gamma_1, 5-8x cheaper), pol_vertex_dyn_tfold (0: off; r > 0 folds the twisted
  *                 pair components with |eps| >= r |nu| into the unshifted family -- the small-nu fix, Si r = 30), pol_vertex_dyn_iaft_prec ("": the loop's grid;
@@ -697,6 +699,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         vertex.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
         vertex.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
         vertex.set_ladder_dyn_device_memory(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_device_memory","stream"));
+        vertex.set_ladder_dyn_dressed(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_dressed","auto"));
         vertex.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         vertex.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
         vertex.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
@@ -1133,6 +1136,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
         pol_vertex_carrier.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
         pol_vertex_carrier.set_ladder_dyn_device_memory(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_device_memory","stream"));
+        pol_vertex_carrier.set_ladder_dyn_dressed(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_dressed","auto"));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
         pol_vertex_carrier.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
@@ -1421,6 +1425,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
         pol_vertex_carrier.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
         pol_vertex_carrier.set_ladder_dyn_device_memory(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_device_memory","stream"));
+        pol_vertex_carrier.set_ladder_dyn_dressed(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_dressed","auto"));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
         pol_vertex_carrier.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
@@ -1758,6 +1763,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         vertex.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
         vertex.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
         vertex.set_ladder_dyn_device_memory(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_device_memory","stream"));
+        vertex.set_ladder_dyn_dressed(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_dressed","auto"));
         vertex.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         vertex.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
         vertex.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
@@ -2118,6 +2124,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
         pol_vertex_carrier.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
         pol_vertex_carrier.set_ladder_dyn_device_memory(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_device_memory","stream"));
+        pol_vertex_carrier.set_ladder_dyn_dressed(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_dressed","auto"));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
         pol_vertex_carrier.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));

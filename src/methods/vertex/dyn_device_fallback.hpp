@@ -24,6 +24,18 @@ namespace methods::solvers {
     static std::string v = "stream";
     return v;
   }
+  /** factorize-vertex: pol_vertex_dyn_dressed (input, default "auto"). The dressed-leg Gamma_1 readout (exact: the static
+   *  ladder moved onto the frequency-independent legs, notes/dressed_leg_gamma1.pdf):
+   *    "auto": on every dynamic pass that supports it (the Gamma_1-only and one-bare-rung passes, the Sigma columns dyn1 /
+   *            dyn1_bare / static_dyn); a pass that does not (the GMRES resummation, the Sigma column dyn) runs the standard
+   *            path and logs that it does;
+   *    "on"  : required -- a dynamic pass that cannot use it aborts;
+   *    "off" : the standard path everywhere.
+   *  vertex_debug dyn_dressed = 1 | 0 overrides it with "on" | "off". */
+  inline std::string &dyn_dressed_state() {
+    static std::string v = "auto";
+    return v;
+  }
 }
 
 #endif

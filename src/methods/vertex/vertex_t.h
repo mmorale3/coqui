@@ -1957,6 +1957,12 @@ namespace vertex_pi { struct iaft_tools; }
      *  move to the CPU only when true (logged as a WARNING); false aborts the calculation with the reason (factorize-vertex). */
     void set_ladder_dyn_device_fallback(bool on) { dyn_device_fallback_state() = on; }
     bool ladder_dyn_device_fallback() const { return dyn_device_fallback_state(); }
+    /** pol_vertex_dyn_dressed (default "auto"): auto | on | off -- dyn_device_fallback.hpp */
+    void set_ladder_dyn_dressed(std::string const &m) {
+      utils::check(m == "auto" or m == "on" or m == "off",
+                   "vertex_t::set_ladder_dyn_dressed: pol_vertex_dyn_dressed must be auto | on | off (got \"{}\").", m);
+      dyn_dressed_state() = m;
+    }
     /** pol_vertex_dyn_device_memory (default "stream"): resident | stream | managed -- dyn_device_fallback.hpp */
     void set_ladder_dyn_device_memory(std::string const &m) {
       utils::check(m == "resident" or m == "stream" or m == "managed",

@@ -1273,17 +1273,27 @@ namespace solvers {
                 rank, what, why_s);
       };
       (void)dev_fallback;                                  // (a CPU build has no device stage)
-      // the dressed-leg request (vertex_debug dyn_dressed) and whether this pass can honour it: a dynamic pass that cannot use
-      // the dressed legs aborts instead of running the standard path (the static-only pass has no dynamic rung: nothing to dress)
-      const bool dressed_flag = vertex_debug::flag("dyn_dressed");
+      // the dressed-leg request and whether this pass can honour it ("on" + a pass that cannot use it aborts; "auto" runs the
+      // standard path there and logs it; the static-only pass has no dynamic rung: nothing to dress)
+      // pol_vertex_dyn_dressed (auto | on | off; vertex_debug dyn_dressed = 1 | 0 overrides with on | off)
+      const double dr_dbg = vertex_debug::number("dyn_dressed", -1.0);   // vertex_debug: dyn_dressed
+      const std::string dressed_mode = (dr_dbg >= 0.0) ? std::string(dr_dbg != 0.0 ? "on" : "off") : dyn_dressed_state();
       const bool dressed_sig_ok = (opt.sigma == nullptr) or (opt.sigma->col == "dyn1" or opt.sigma->col == "dyn1_bare" or
                                                              opt.sigma->col == "static_dyn");
-      const bool dressed_req = dressed_flag and (opt.gamma1_only or opt.one_rung_only) and not opt.static_only and dressed_sig_ok;
-      utils::check(not dressed_flag or opt.static_only or dressed_req,
-                   "pair_space_ladder_dyn: vertex_debug dyn_dressed is set but this dynamic pass cannot use the dressed legs ({}). "
-                   "ABORTING instead of silently running the standard path: the dressed legs apply to the Gamma_1-only / one-bare-rung "
-                   "passes (pol_vertex_dyn_gamma1_only = true) and the Sigma columns dyn1 / dyn1_bare / static_dyn.",
-                   (opt.sigma != nullptr and not dressed_sig_ok) ? "Sigma column " + opt.sigma->col : std::string("the full GMRES resummation"));
+      const bool dressed_fits = (opt.gamma1_only or opt.one_rung_only) and not opt.static_only and dressed_sig_ok;
+      const bool dressed_req = (dressed_mode != "off") and dressed_fits;
+      const std::string dressed_why = (opt.sigma != nullptr and not dressed_sig_ok) ? "Sigma column " + opt.sigma->col
+                                                                                   : std::string("the full GMRES resummation");
+      utils::check(not (dressed_mode == "on" and not opt.static_only and not dressed_fits),
+                   "pair_space_ladder_dyn: pol_vertex_dyn_dressed = on (required) but this dynamic pass cannot use the dressed legs "
+                   "({}): ABORTING. The dressed legs apply to the Gamma_1-only / one-bare-rung passes (pol_vertex_dyn_gamma1_only = "
+                   "true) and the Sigma columns dyn1 / dyn1_bare / static_dyn; use \"auto\" to run the standard path on the others.",
+                   dressed_why);
+      if (rank == 0 and not opt.static_only)
+        app_log(1, "  [dynbse] dressed legs (pol_vertex_dyn_dressed = {}): {}", dressed_mode,
+                dressed_req ? std::string("ON for this pass")
+                            : (dressed_mode == "off" ? std::string("off -- the standard path runs")
+                                                     : "not applicable to " + dressed_why + " -- the standard path runs"));
 #if defined(ENABLE_CUDA)
       // THE DEVICE-RESIDENT UNIT (gpu port plan 4d, 2026-09-27): the Gamma_1 block -- both ls_apply's (L0, T_s through a
       // cuSOLVER LU of 1 - Cb K_s) and K_d (the DLR expansion, the dense tau rungs, the refit) -- runs on the device with
@@ -1839,12 +1849,12 @@ namespace solvers {
             }
           }
           if (met) met->t_lu += watch.lap();
-          // ---- factorize-vertex: the DRESSED-LEG Gamma_1 readout (vertex_debug dyn_dressed = 1; dynbse.hpp block comment) ----
+          // ---- factorize-vertex: the DRESSED-LEG Gamma_1 readout (pol_vertex_dyn_dressed; dynbse.hpp block comment) ----
           // e~ = d + T_s^dag Cb^dag d for all nout left legs, once per unit
           // (the one-bare-rung pass is the same readout with T_s = 0: d~ = e~ = d)
           // the Sigma side: the columns built from (Gsum0, Gsum1, y1) are supported (Gsum1 = Cb d~ + (1 + Cb T_s)(L0 y1)^sum, the
           // full pair vector (L0 y1)^sum = Zt + Cb y1.cst from the same Grams); the resummed "dyn" column is not
-          const bool dressed = dressed_req;                                                    // vertex_debug: dyn_dressed
+          const bool dressed = dressed_req;                                                    // pol_vertex_dyn_dressed
           const bool ts_zero = opt.one_rung_only;
           nda::array<cplx, 4> Et;                               // (nk, nc, nc, nout)
           std::optional<db::dressed_grams> dgram;
