@@ -167,16 +167,16 @@ namespace methods {
       void print_chol_gw_timers(); 
 
       void print_rpa_gw_timers(); 
-      // LFF-Sigma (Route 1): {max |dSigma|, max |Sigma^GW|} of the last vertex contraction (gate + logs)
+      // Sigma vertex: {max |dSigma|, max |Sigma^GW|, max |dF|} of the last vertex contraction (checks + logs)
       std::array<double, 3> sigma_lff_dsigma() const { return {_sigma_lff_dmax, _sigma_lff_smax, _sigma_lff_dfmax}; }
-      // LFF-Sigma Route 2 (L-6): {max |dSigma_pair|, max |Sigma^GW| on the C block} of the last accumulation
+      // Sigma vertex, pair-resolved: {max |dSigma_pair|, max |Sigma^GW| on the C block} of the last accumulation
       std::array<double, 2> sigma_pair_dsigma() const { return {_sigma_pair_dmax, _sigma_pair_smax}; }
 
       //void set_MF(mf::MF *MF) { _MF = MF; }
 
     private:
-      double _sigma_lff_dmax = 0.0, _sigma_lff_smax = 0.0, _sigma_lff_dfmax = 0.0;   // LFF-Sigma meters (dynamic, Sigma^GW, static)
-      double _sigma_pair_dmax = 0.0, _sigma_pair_smax = 0.0;   // LFF-Sigma pair (L-6) meters
+      double _sigma_lff_dmax = 0.0, _sigma_lff_smax = 0.0, _sigma_lff_dfmax = 0.0;   // Sigma-vertex meters (dynamic, Sigma^GW, static)
+      double _sigma_pair_dmax = 0.0, _sigma_pair_smax = 0.0;   // pair-resolved Sigma-vertex meters
       /*** THC implementation details ***/
       template<MEMORY_SPACE MEM = HOST_MEMORY,
                nda::MemoryArray Array_view_5D_t, typename dArray_4D_t>
@@ -264,7 +264,7 @@ namespace methods {
 
       std::string _div_treatment = "ignore_g0";
 
-      // optional second-order-exchange vertex correction (ISDF-Vertex, not owned).
+      // optional second-order-exchange vertex correction (vertex_t, not owned).
       // nullptr or an inactive vertex leaves the GW self-energy untouched.
       vertex_t* _vertex = nullptr;
 

@@ -38,7 +38,7 @@
 #include "utilities/interpolation_utils.hpp"
 #include "mean_field/symmetry/unfold_bz.h"
 #include "methods/SCF/simple_dyson.h"
-#include "methods/scr_coulomb/cvv_head.hpp"   // scGW-tilde C3: cvv_eps readout
+#include "methods/scr_coulomb/cvv_head.hpp"   // cvv_eps readout
 #include "pproc_t.h"
 
 namespace methods {
@@ -687,7 +687,7 @@ namespace methods {
     app_log(1, "####### wannier interpolation routines end #######\n");
   }
 
-  // P24 / G31 (notes/vertex_perf_plan.md): the interpolation kernel of the qp_gaps fine-mesh report.
+  // The interpolation kernel of the qp_gaps fine-mesh report.
   // The chain is the "quasiparticle" branch of wannier_interpolation above -- projector downfold on
   // the coarse full-BZ mesh, k -> R with utils::k_to_R_coefficients on the Wigner-Seitz R grid,
   // R -> k with utils::R_to_k_coefficients (1/degeneracy weights) -- with two deliberate differences:
@@ -695,7 +695,7 @@ namespace methods {
   // (ii) the imaginary part of H(R) is kept. With (ii) the round trip k -> R -> k is the identity on the
   // coarse mesh (e^{ik.T} = 1 for every supercell vector T at a mesh k, and the WS copies of an R class
   // carry weights 1/deg summing to 1), so the fine-mesh bands at a coarse k are EXACTLY the eigenvalues
-  // of the downfolded Heff(k) -- the gate of test_methods_pproc. H(R) obeys H(-R) = H(R)^dag, so the
+  // of the downfolded Heff(k) (checked by test_methods_pproc). H(R) obeys H(-R) = H(R)^dag, so the
   // interpolant is Hermitian at every k up to rounding; it is Hermitized explicitly before heev.
   auto pproc_t::interpolate_qp_bands_on_mesh(utils::mpi_context_t<mpi3::communicator> &context, mf::MF &mf,
                                              projector_t const& proj,
@@ -1247,8 +1247,8 @@ namespace methods {
 
   void pproc_t::cvv_eps(mf::MF &mf, ptree const& pt, std::string grp_name, long iter) {
     std::string filename = _scf_output + ".mbpt.h5";
-    app_log(1, "\nCVV dielectric readout (scGW-tilde increment C3, "
-               "notes/scgwt_implementation_plan.md)");
+    app_log(1, "\nCVV dielectric readout (covariant-velocity q -> 0 head "
+               "of the polarizability)");
     auto ft = imag_axes_ft::read_iaft(filename);
     utils::check(ft.basis() == imag_axes_ft::dlr_basis,
                  "cvv_eps: the CVV machinery requires the DLR IAFT backend "

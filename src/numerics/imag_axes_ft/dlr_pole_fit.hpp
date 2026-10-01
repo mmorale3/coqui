@@ -30,35 +30,23 @@
  * with
  *          F(z) = sum_p c_p / (z - eps_p).
  *
- * WHY THIS FILE EXISTS (measured 2026-07-27/28, notes/vertex_divergence_diagnosis.md section 0)
- * -------------------------------------------------------------------------------------------
- * Three call sites previously built those residues as
+ * WHY A REGULARIZED FIT
+ * ---------------------
+ * The obvious construction is
  *
  *      c = vals2coefs_NONSYM( Tmap . F ),   Tmap = interpolate(backend tau nodes -> aux nodes)
  *
  * i.e. a square interpolatory solve on an auxiliary grid, fed by an interpolation from the
- * backend grid. As one fixed linear map that composite has 2-norm 9.4e6 at the production
- * (lambda = 3959.84, eps = 1e-6) -- singular values spanning 9.4e6 down to 0.098. It is well
- * behaved on data that is exactly Lehmann-class, which is why it worked for years, but the
- * z objects are Lehmann only to the backend's OWN representation accuracy: they carry O(eps)
+ * backend grid. As one fixed linear map that composite is very badly conditioned (2-norm of
+ * order 1e7 at lambda = 3959.84, eps = 1e-6, singular values spanning eight orders of
+ * magnitude). It is well behaved on data that is exactly Lehmann-class, but the vertex z
+ * objects are Lehmann only to the backend's OWN representation accuracy: they carry O(eps)
  * content in directions no pole basis resolves, and the square solve reproduces that content
  * by emitting enormous compensating residues. The downstream algebras are BILINEAR in the
- * residues, so the damage is squared.
- *
- * Measured, injecting a perturbation of relative size delta along the worst-conditioned
- * direction of the old composite (probe over the production grid):
- *
- *      delta     old max|c|/max|F|   old fit err     this map   fit err
- *      0                   0.83         2.2e-05         0.86    5.1e-06
- *      1e-6                3.81         2.4e-05         0.86    5.1e-06
- *      1e-5               37.8          2.4e-04         0.86    7.1e-06
- *      1e-4              379            2.4e-03         0.86    7.1e-05
- *
- * The delta = 1e-4 row reproduces the observed scGW+vertex blow-up (max|c|/max|z| = 383,
- * fit error 3.19e-03) to a few percent. Every physical input was flat across that break:
- * max|G_CC| 0.98212 -> 0.98246 -> 0.98259, max|Wbar| 1.417e-2 -> 1.406e-2 -> 1.401e-2,
- * max|z| 3.6834 -> 3.6904 -> 3.6774, and the pole-free part of Pi^C 3.2e-2 -> 2.9e-2 -> 1.2e-1,
- * while the residues went 3.0 -> 9.4 -> 1411 and Pibar went 0.33 -> 11 -> 1.2e10.
+ * residues, so the damage is squared. A relative perturbation of 1e-4 along the
+ * worst-conditioned direction is enough to inflate max|c|/max|F| from O(1) to O(400) through
+ * the square solve, while every physical input stays flat; the least-squares map below keeps
+ * the ratio O(1) at a reconstruction error of order the perturbation.
  *
  * WHAT THIS DOES INSTEAD
  * ----------------------
@@ -67,29 +55,28 @@
  *      minimize ||K c - F||,   K(i,p) = K_F(tau_i, eps_p),   solved by truncated SVD
  *
  * WHAT ACTUALLY DOES THE WORK is LEAST SQUARES, not the SVD cut. A least-squares fit is free
- * to leave unrepresentable content in the residual; the old SQUARE interpolatory solve had to
- * reproduce it exactly at its nodes, and could only do that by emitting huge residues. Measured
- * at the amplitude that reproduces the production break, with the truncation switched off
- * entirely (all 38 directions kept), the residue ratio is 1.95 against the old route's 379.
- * Dropping Tmap also removes a gratuitous factor ||Tmap|| = 45 and is strictly more accurate
- * (it interpolated, then interpolated again).
+ * to leave unrepresentable content in the residual; a SQUARE interpolatory solve has to
+ * reproduce it exactly at its nodes, and can only do that by emitting huge residues. Even with
+ * the truncation switched off entirely the least-squares residues stay O(1) where the square
+ * solve's grow by two orders of magnitude. Dropping Tmap also removes a gratuitous factor
+ * ||Tmap|| (~45) and is strictly more accurate (no interpolate-then-interpolate).
  *
  * The rank is FIXED at build() from the singular spectrum -- see dlr_pole_fit_rel_tol for the
  * three requirements (gauge covariance, MPI invariance, elementwise batch semantics) that
  * rule out every data-dependent rule.
  *
- * Two REJECTED alternatives, recorded so they are not retried (both measured on the same grid):
+ * Two alternatives that do NOT work:
  *   - "match the aux pole rank to the backend DLR rank" (i.e. use the backend's own SYM basis).
  *     cond(cf2it_SYM) = 6.2e10 against cond(cf2it_NONSYM) = 6.7e6, and on realistic Lehmann
- *     data the SYM basis emits residues 30-200x LARGER. The rank mismatch 38 < 40 is real but
- *     is not the defect; the SYM grid's near-degenerate +/- node pairs make it strictly worse.
- *     The NONSYM grid is retained here for exactly the reason it was chosen originally
- *     (min node gap 2.17 vs 0.0041 dimensionless -- the residue algebra divides by node gaps).
+ *     data the SYM basis emits residues 30-200x LARGER; the SYM grid's near-degenerate +/- node
+ *     pairs make it strictly worse. The NONSYM grid is used because its nodes are well
+ *     separated (min node gap 2.17 vs 0.0041 dimensionless -- the residue algebra divides by
+ *     node gaps).
  *   - dropping the pole route entirely. The dynamic rung genuinely needs it; only the
  *     instantaneous rung is representable without poles.
  *
  * The fit is exact-to-eps on Lehmann-class data (that is what the DLR is), and its ACTUAL
- * error is measurable per call via fit_error() -- callers gate on it.
+ * error is measurable per call via fit_error() -- callers check it.
  */
 
 #include <cmath>
@@ -122,12 +109,11 @@ namespace imag_axes_ft {
    * independent requirements force this, and any data-dependent rule violates at least one:
    *
    *  1. GAUGE COVARIANCE. Physical results depend on range(P) only: under U(k) -> U(k)V(k)
-   *     both vertex cuts are exactly invariant (CLAUDE.md section 8), pinned by
+   *     both vertex cuts are exactly invariant, as checked by
    *     test_methods_vertex_wannier. The fit is applied to a batch whose columns carry the
    *     C-orbital index, so a gauge rotation MIXES those columns. Only a fixed linear map
-   *     commutes with that mixing. Measured: a per-column data-adaptive rank gives a gauge
-   *     deviation of 0.246 (test_dlr_pole_fit case 3c) and breaks the vertex gauge test at
-   *     |D e_hf| = 4.8e-08 against its 1e-10 threshold.
+   *     commutes with that mixing: a per-column data-adaptive rank gives an O(0.1) gauge
+   *     deviation (test_dlr_pole_fit case 3c) and breaks the vertex gauge test.
    *  2. MPI INVARIANCE. In production the batch axis is distributed over ranks. A rank chosen
    *     from batch-summed quantities would make the physics depend on the processor grid.
    *  3. ELEMENTWISE BATCH SEMANTICS. double_boson_conv is documented elementwise in the
@@ -135,7 +121,7 @@ namespace imag_axes_ft {
    *
    * Requirements 2 and 3 together kill batch-wide rules; requirement 1 kills per-column rules.
    * What is left is a fixed threshold, and the value below was chosen by sweeping it against
-   * both accuracy gates (see the table in notes/vertex_divergence_diagnosis.md section 8).
+   * both accuracy requirements (the reconstruction error and the residue amplification).
    *
    * Note this is NOT tied to the instance's eps: an eps-multiple would give a 0.1 cut at the
    * production setting (eps = 1e-6), which is absurd. It is an absolute conditioning cut.
@@ -316,24 +302,15 @@ namespace imag_axes_ft {
     /**
      * max|c| / max|F| -- the residue amplification actually realised on THIS data.
      *
-     * WATCH THIS, NOT ONLY fit_error. Measured on Si kp222/M12 head-on (2026-07-28), the one
-     * window that still diverges with the regularized fit in place:
+     * WATCH THIS, NOT ONLY fit_error. When the iterated vertex runs away, the ratio grows a
+     * FULL ITERATION before the fit error does: least squares reports an accurate fit while the
+     * data genuinely REQUIRES residues much larger than itself, i.e. it is a near-cancelling
+     * combination of poles. The fit is not lying -- the downstream algebra is bilinear in these
+     * residues and squares them.
      *
-     *     iter   max|z|   max|residue|   res/z    fit err     Pibar
-     *      1     3.7519      3.1885       0.85    9.7e-06    3.2e+03
-     *      2     3.4301     54.30        15.8     4.5e-05    2.5e+05     <- fit still "healthy"
-     *      3     3.4487   6306.8       1829       4.6e-03    2.0e+13
-     *
-     * The ratio moves a FULL ITERATION before the fit error does. That is the signature of the
-     * post-fix failure mode and it is qualitatively different from the pre-fix one: least
-     * squares reports an accurate fit (4.5e-05) while the data genuinely REQUIRES residues 16x
-     * its own size, i.e. it is a near-cancelling combination of poles. The fit is not lying --
-     * the downstream algebra is bilinear in these residues and squares them.
-     *
-     * Healthy values are 0.70-0.91 across every converged window and both meshes, so a warning
-     * at 50 has ~50x headroom. Deliberately NOT a hard gate: a legitimately near-cancelling
-     * object is possible, the threshold has not been calibrated across systems, and a false
-     * abort costs a multi-hour run. fit_error remains the hard gate.
+     * Healthy values are O(1) (typically 0.7-0.9), so a warning at 50 has ample headroom.
+     * Deliberately NOT a hard abort: a legitimately near-cancelling object is possible and the
+     * threshold is not calibrated across systems. fit_error remains the hard check.
      */
     double residue_ratio(nda::MemoryArrayOfRank<2> auto const& F_td,
                          nda::array<ComplexType, 2> const& c) const {
@@ -358,11 +335,7 @@ namespace imag_axes_ft {
       // strided in p over c) has the same flop count as the reconstruction gemm but a far
       // worse access pattern. Blocking keeps the temp in cache instead of allocating an
       // nt x d array, which would be tens of MB per call at that width.
-      //   Measured honestly: at the SMALL batch widths of the unit tests this costs nothing
-      //   either way -- ablating the fit_error calls entirely moves test_methods_vertex_sigma
-      //   from 234.5 s to 235.0 s. (An earlier note here claimed the scalar form caused a 16x
-      //   slowdown; that was a misreading of a stale CTestCostData average from when the test
-      //   was smaller, and is retracted.)
+      // At the small batch widths of the unit tests the two forms cost the same.
       long d = F_td.shape(1);
       if (d == 0) return 0.0;
       constexpr long BJ = 256;
@@ -645,15 +618,14 @@ namespace imag_axes_ft {
   }
 
   /**
-   * scGW-tilde increment C2: the SAME regularized auxiliary pole fit, ingesting
+   * The SAME regularized auxiliary pole fit, ingesting
    * FERMIONIC MATSUBARA-NODE data instead of tau data.
    *
    * WHY IT EXISTS. The CVV head builds M_alpha = v~_alpha G as a PRODUCT at the
    * backend's fermionic iw nodes (that is where both factors live); its tau
    * representation is exactly what the fit is asked to produce, so a tau-side fit is
    * circular, and pushing the product through the square interpolatory w -> tau map is
-   * the alias trap this file exists to forbid (rule 7 of
-   * notes/scgwt_implementation_plan.md). Kernel
+   * the ill-conditioned square solve this file exists to avoid. Kernel
    *
    *      K(n,p) = 1 / (iw_n - eps_p)     (backend fermionic nodes iw_n, aux poles eps_p)
    *

@@ -69,7 +69,7 @@ namespace methods {
       utils::check(chol.MF()->nkpts() == chol.MF()->nkpts_ibz(),
                    "gw_t::cholesky_gw::evaluate: Symmetry is not implemented yet.");
       utils::check(_vertex == nullptr or not _vertex->active(),
-                   "gw_t::cholesky_gw::evaluate: vertex corrections (ISDF-Vertex) are only "
+                   "gw_t::cholesky_gw::evaluate: vertex corrections are only "
                    "implemented for THC ERIs.");
       utils::check(_ft->nt_f() == _ft->nt_b(),
                    "chol-gw:: we assume nt_f == nt_b at least for now \n"

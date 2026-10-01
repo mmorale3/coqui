@@ -21,7 +21,7 @@ namespace lff_sigma_detail {
 template<int N> using shape_t = std::array<long, N>;
 
 /**
- * LFF-Sigma (Route 1, notes/lff_aux_plan.md 2026-09-19): the THC EXCHANGE contraction of hf_t::thc_hf_Xqindep with a
+ * Sigma vertex: the THC EXCHANGE contraction of hf_t::thc_hf_Xqindep with a
  * CUSTOM static kernel U(q) in place of the bare Coulomb Z -- the instantaneous part of the vertex-corrected screened
  * interaction, dW~(i nu -> inf) = Herm[Z t^dag G1(inf) t], which is a delta(tau) the bosonic tau machinery cannot carry
  * and therefore enters the STATIC (Fock-like) self-energy:  F_out(k) = - sum_q  X^dag [ Dm(k - q) o U(q) ] X  (the K
@@ -40,7 +40,7 @@ void exchange_with_kernel(const Array_primary_t &Dm_skij, dArray_t &dU_qPQ, sArr
   auto mpi = thc.mpi();
   utils::check(thc.thc_X_type() == "q_indep" and MF->nqpts_ibz() == MF->nqpts(),
                "lff_sigma_detail::exchange_with_kernel: only the q-independent, symmetry-free (nq_ibz == nq) THC path is "
-               "implemented (the static LFF-Sigma piece on a symmetric mesh is not).");
+               "implemented (the static Sigma-vertex piece on a symmetric mesh is not).");
   const long NP = thc.Np(), ns = Dm_skij.extent(0), npol = MF->npol(), nkpts = MF->nkpts(), nkpts_ibz = MF->nkpts_ibz();
   auto grd = dU_qPQ.grid();
   const int np_P = int(grd[1]), np_Q = int(grd[2]);

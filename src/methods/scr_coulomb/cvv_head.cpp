@@ -41,7 +41,7 @@ namespace solvers {
     utils::check(_built, "cvv_head_t::velocity: build() has not run.");
     utils::check(is >= 0 and is < _ns and ik >= 0 and ik < _kpts.shape(0),
                  "cvv_head_t::velocity: index out of range (is = {}, ik = {}).", is, ik);
-    // P1: the stores and _Rcart/_wR are COMPACTED to the kept shells
+    // the stores and _Rcart/_wR are COMPACTED to the kept shells
     const long nRs = _Rcart.shape(0);
     auto P = cvv_detail::phase_rows(_Rcart, _wR, _kpts(ik, all), false);   // (3, nRs)
     nda::array<ComplexType, 4> v(3, _nw, _nb, _nb);
@@ -71,9 +71,8 @@ namespace solvers {
   std::vector<long> cvv_head_t::select_kept_shells(
       nda::array_view<ComplexType, 4> hs_stage,
       nda::array_view<ComplexType, 5> const *sig_stage) const {
-    // per-R squared Frobenius norm over the FULL staged object (rule 6: the truncation
-    // is measured on the data, not guessed). The pre-P1 truncate_shells math verbatim;
-    // P1 only changed WHAT happens to the decision (compaction instead of zeroing).
+    // per-R squared Frobenius norm over the FULL staged object (the truncation is
+    // measured on the data, not guessed); the dropped shells are removed by compaction.
     const long nR = hs_stage.shape(1);
     std::vector<double> n2(nR, 0.0);
     for (long is = 0; is < _ns; ++is)

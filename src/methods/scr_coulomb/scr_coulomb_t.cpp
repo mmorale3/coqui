@@ -43,7 +43,7 @@
 #endif
 #include "utilities/proc_grid_partition.hpp"
 #include "nda/linalg/eigenelements.hpp"
-#include "hamiltonian/one_body_hamiltonian.hpp"   // scGW-tilde C4: H0 for the CVV velocity
+#include "hamiltonian/one_body_hamiltonian.hpp"   // CVV head: H0 for the covariant velocity
 #include "hamiltonian/pseudo/pseudopot.h"
 #include "cvv_head.hpp"
 #include "scr_coulomb_t.h"
@@ -319,12 +319,12 @@ namespace solvers {
     utils::device_sync();
     _Timer.stop("TEMP_UW_dyson_W_from_Pi");
     _Timer.stop("DYSON_W");
-    // scGW-tilde C4 (div_treatment = "cvv"): the q -> 0 HEAD comes from the
+    // CVV head (div_treatment = "cvv"): the q -> 0 HEAD comes from the
     // covariant-velocity subtracted head (eval_cvv_eps_inv_head) INSTEAD of the
     // stored/gygi extrapolation; the q-RESOLVED eps_inv (diagnostics + dump) is
     // div-treatment-independent, so eps_inv_head_t runs with "ignore_g0" (its head
     // slot -- the smallest-q value -- is then replaced). Every consumer reads the
-    // same mb_state.eps_inv_head (single-sourcing; vertex_t.h coupling warning).
+    // same mb_state.eps_inv_head (single-sourced; see the coupling warning in vertex_t.h).
     const bool cvv = (_div_treatment == "cvv");
 
     // div_utils::eval_eps_inv_q (called inside eps_inv_head_t) is now
@@ -575,7 +575,7 @@ namespace solvers {
     print_timers();
   }
 
-  // scGW-tilde C4: see the declaration in scr_coulomb_t.h for the contract. The
+  // CVV head: see the declaration in scr_coulomb_t.h for the contract. The
   // returned array matches div_utils::eps_inv_head_t's head slot exactly: the PH-sym
   // tau half grid storing (eps^{-1}_head - 1)(tau).
   nda::array<ComplexType, 1> scr_coulomb_t::eval_cvv_eps_inv_head(MBState &mb_state,
@@ -611,13 +611,13 @@ namespace solvers {
         acc += 1.0 / (1.0 - 4.0 * M_PI * head.Phead_wab(i0 + j, a, a));
       Ew(j, 0) = acc / 3.0 - 1.0;
     }
-    // T-d meter (PDF G-c): v(q).P00 at the head; the pre-fix runs showed it climbing
-    // toward 1 (dielectric collapse carries the J > 1 feedback)
+    // head meter v(q).P00: a value approaching 1 signals dielectric collapse (the
+    // J > 1 feedback)
     double td = 0.0;
     for (int a = 0; a < 3; ++a)
       td = std::max(td, std::abs(4.0 * M_PI * head.Phead_wab(i0, a, a)));
     app_log(1, "  [CVV] head (div_treatment = cvv): eps_inf(x, y, z) = "
-               "({:.6f}, {:.6f}, {:.6f}); T-d meter v.P00 = {:.4f}{}",
+               "({:.6f}, {:.6f}, {:.6f}); head meter v.P00 = {:.4f}{}",
             1.0 - 4.0 * M_PI * head.Phead_wab(i0, 0, 0).real(),
             1.0 - 4.0 * M_PI * head.Phead_wab(i0, 1, 1).real(),
             1.0 - 4.0 * M_PI * head.Phead_wab(i0, 2, 2).real(), td,
