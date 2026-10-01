@@ -25,7 +25,7 @@ def normalize_c0(C, tol=1e-12):
     return B, Bp, Chat
 
 
-def upfold_block(C, K, wp, mu=0.0, tol_c0=1e-12, tol_gram=1e-12, tol_svd=1e-12, nphi=360,
+def upfold_block(C, K, wp, mu=0.0, tol_c0=1e-12, tol_gram=1e-12, tol_svd=1e-12, nphi=72,
                  reject_unity=1e-6, phase_refine=True, return_info=False):
     """Unitary realization of block moments C[0..K]; C[K+1] is the held-out moment that fixes the terminal phase.
 

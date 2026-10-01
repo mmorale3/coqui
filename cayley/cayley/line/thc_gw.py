@@ -35,9 +35,15 @@ class LineGW:
         self.poles = None
 
     # ---------------------------------------------------------------- pole data
-    def set_poles(self, e, v):
-        """e: (nk, M) mu-relative energies; v: (nk, nb, M) vectors (columns), G(k) = sum_m v_m v_m^dag/(zeta - e_m)."""
-        self.poles = (np.asarray(e), np.asarray(v))
+    def set_poles(self, e, v=None, coef=None):
+        """G(k, zeta) = sum_m coef_m /(zeta - e_m) with real mu-relative energies e (nk, M). Either v (nk, nb, M) column
+        vectors (coef_m = v_m v_m^dagger, Lehmann form) or general matrix coefficients coef (nk, M, nb, nb) (compressed
+        real-pole fit per sector). Sector = sign of e_m."""
+        e = np.asarray(e)
+        if coef is None:
+            v = np.asarray(v)
+            coef = np.einsum('kim,kjm->kmij', v, v.conj())
+        self.poles = (e, np.asarray(coef))
         emin = min(np.abs(e[e > 0]).min(), np.abs(e[e < 0]).min())
         self.ray_p = TimeRay.for_spectrum(self.theta_t, emin, decades=self.ray_decades, sector='>', **self.ray_kw)
         self.ray_h = TimeRay.for_spectrum(self.theta_t, emin, decades=self.ray_decades, sector='<', **self.ray_kw)
@@ -49,12 +55,20 @@ class LineGW:
         return e - mu, v
 
     def gtilde(self, ik, t, sector):
-        """G~(k, t) (nt, Np, Np) for the given sector on complex times t (nt,)."""
-        e, v = self.poles
+        """G~(k, t) (nt, Np, Np) for the given sector on complex times t (nt,): X(k) [sum_m coef_m e^{-i e_m t}] X(k)^dag."""
+        e, coef = self.poles
         m = e[ik] > 0 if sector == '>' else e[ik] < 0
-        Xv = self.X[ik] @ v[ik][:, m]                                   # (Np, M)
         ph = np.exp(-1j * e[ik][m][None, :] * t[:, None])              # (nt, M)
-        return np.einsum('tm,pm,qm->tpq', ph, Xv, Xv.conj())
+        Gt = np.einsum('tm,mij->tij', ph, coef[ik][m])                  # (nt, nb, nb)
+        Xk = self.X[ik]
+        return np.einsum('pi,tij,qj->tpq', Xk, Gt, Xk.conj())
+
+    def g_line(self, ik, zeta, sector=None):
+        """G(k, zeta) (nz, nb, nb) from the pole data (any complex zeta off the real axis)."""
+        e, coef = self.poles
+        m = np.ones(e.shape[1], bool) if sector is None else (e[ik] > 0 if sector == '>' else e[ik] < 0)
+        K = 1.0 / (np.asarray(zeta, complex)[:, None] - e[ik][m][None, :])
+        return np.einsum('zm,mij->zij', K, coef[ik][m])
 
     # ---------------------------------------------------------------- polarization and W
     def polarization(self, iq, zeta=None):
@@ -108,9 +122,9 @@ class LineGW:
 
     # ---------------------------------------------------------------- static part
     def density_matrix(self):
-        """Dm(k) = sum_{m<} v_m v_m^dag (per spin, T=0)."""
-        e, v = self.poles
-        return np.array([v[ik][:, e[ik] < 0] @ v[ik][:, e[ik] < 0].conj().T for ik in range(self.nk)])
+        """Dm(k) = sum_{m<} coef_m (per spin, T=0)."""
+        e, coef = self.poles
+        return np.array([coef[ik][e[ik] < 0].sum(0) for ik in range(self.nk)])
 
     def hartree_exchange(self, Dm, iq0=0):
         """F = V_H + Sigma_x (nk, nb, nb) in the THC basis; Dm per spin (closed shell: total density = 2 Dm).
