@@ -43,9 +43,9 @@ def sigma_sector(ik, sector):
         t = ray.t[i0:i0 + gw.t_chunk]; acc = np.zeros((len(t), Np, Np), complex); Ew = bos.time_exponentials(t, sector)
         for iq in range(nk):
             wq = wres[iq] if sector == '>' else np.transpose(wres[iq], (0, 2, 1))
-            acc += gw.gtilde(ck.qk_to_k2[iq, ik], t, sector) * np.einsum('tj,jpq->tpq', Ew, wq)
+            acc += gw.gtilde(ck.qk_to_k2[iq, ik], t, sector) * (Ew @ wq.reshape(wq.shape[0], -1)).reshape(Ew.shape[0], wq.shape[1], wq.shape[2])
         acc *= (1.0 if sector == '>' else -1.0) / nk
-        out += np.einsum('zt,tab->zab', F[:, i0:i0 + gw.t_chunk], (Xk.conj().T @ acc) @ Xk)
+        out += (F[:, i0:i0 + gw.t_chunk] @ ((Xk.conj().T @ acc) @ Xk).reshape(acc.shape[0], -1)).reshape(-1, Xk.shape[1], Xk.shape[1])
     return out
 Sp = sigma_sector(ik, '>'); Sh = sigma_sector(ik, '<'); Sl = Sp + Sh
 Sx = cas.sigma_z(ik, mu0 + fz)

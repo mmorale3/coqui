@@ -56,7 +56,7 @@ class LineGW:
         e, coef = self.poles
         m = e[ik] > 0 if sector == '>' else e[ik] < 0
         ph = np.exp(-1j * e[ik][m][None, :] * t[:, None])              # (nt, M)
-        Gt = np.einsum('tm,mij->tij', ph, coef[ik][m])                  # (nt, nb, nb)
+        Gt = (ph @ coef[ik][m].reshape(ph.shape[1], -1)).reshape(ph.shape[0], self.nb, self.nb)                  # (nt, nb, nb)
         Xk = self.X[ik]
         return (Xk @ Gt) @ Xk.conj().T                                  # (nt, Np, Np): two GEMMs per t
 
@@ -89,7 +89,7 @@ class LineGW:
                     B = self.gtilde(self.qk[iq, ik], t, s_kmq)                    # entries QP of sum conj(R~) e^{-i e t}
                     acc += np.transpose(A * B, (0, 2, 1))
                 acc *= sign * 2.0 / self.nk
-                out += np.einsum('zt,tpq->zpq', F[:, i0:i0 + self.t_chunk], acc)
+                out += (F[:, i0:i0 + self.t_chunk] @ acc.reshape(acc.shape[0], -1)).reshape(-1, acc.shape[1], acc.shape[2])
         return out
 
     def dyson_w(self, iq, Pi):
@@ -117,11 +117,11 @@ class LineGW:
                 Ew = self.bos.time_exponentials(t, sector)              # (nt, r)
                 for iq in range(self.nk):
                     w = wres[iq] if sector == '>' else np.transpose(wres[iq], (0, 2, 1))
-                    Wt = np.einsum('tj,jpq->tpq', Ew, w)
+                    Wt = (Ew @ w.reshape(w.shape[0], -1)).reshape(Ew.shape[0], w.shape[1], w.shape[2])
                     acc += self.gtilde(self.qk[iq, ik], t, sector) * Wt
                 acc *= (1.0 if sector == '>' else -1.0) / self.nk              # T=0 factor [theta(nu) - theta(-eps)] = -1 in the hole sector
                 S_ab = (Xk.conj().T @ acc) @ Xk                           # (nt, nb, nb)
-                out += np.einsum('zt,tab->zab', F[:, i0:i0 + self.t_chunk], S_ab)
+                out += (F[:, i0:i0 + self.t_chunk] @ S_ab.reshape(S_ab.shape[0], -1)).reshape(-1, S_ab.shape[1], S_ab.shape[2])
         return out
 
     # ---------------------------------------------------------------- static part
