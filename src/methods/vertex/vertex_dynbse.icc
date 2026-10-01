@@ -207,6 +207,9 @@ namespace solvers {
       double wtau_sym = 0.0;                  // max |W_d(s) - W_d(beta - s)| / max |W_d|
       double ritz_max = 0.0;                  // watchdog: max over units of |Ritz(K_d L_s)| / contraction
       long it_max = 0, it_sum = 0, nunits = 0, nconv = 0;
+      // audit C1: how the units ended -- converged to tol / stagnated (at the refit floor) / stopped by the readout criterion /
+      // converged by definition (one application: one-bare-rung, static, direct Gamma_1) / hit maxit / restored from a dump
+      long n_stag = 0, n_rconv = 0, n_def = 0, n_maxit = 0, n_restored = 0;
       long r1_fused = 0, r1_missing = 0;      // units whose one-bare-rung column came from the device unit / was requested but not produced
       double t_setup = 0.0, t_kbig = 0.0, t_cb = 0.0, t_lu = 0.0, t_solve = 0.0, t_read = 0.0;
       double t_rung = 0.0, t_refit = 0.0;   // inside the solve: the rung applications (all tau nodes), the tau refits
@@ -237,6 +240,13 @@ namespace solvers {
         mx(fit_err_G); mx(rr_G); mx(dsq_err); mx(refit_err_max); mx(wtau_sym); mx(ritz_max);
         it_max = comm.all_reduce_value(it_max, boost::mpi3::max<>{});
         sm(it_sum); sm(nunits); sm(nconv); sm(r1_fused); sm(r1_missing);
+        sm(n_stag); sm(n_rconv); sm(n_def); sm(n_maxit); sm(n_restored);
+        if (comm.root() and (n_maxit > 0 or n_stag > 0 or n_rconv > 0))
+          app_log(1, "  [dynbse] {}WARNING: of {} units, {} hit maxit WITHOUT converging, {} stopped on stagnation (residual above tol, "
+                     "at the refit floor), {} stopped on the readout criterion; worst refit {:.2e}, max iterations {}{}",
+                  n_maxit > 0 ? "" : "(convergence) ", nunits, n_maxit, n_stag, n_rconv, refit_err_max, it_max,
+                  n_restored > 0 ? " (" + std::to_string(n_restored) + " units restored from dumps: their convergence was logged by the run "
+                                       "that wrote them)" : std::string());
         mx(t_setup); mx(t_kbig); mx(t_cb); mx(t_lu); mx(t_solve); mx(t_read); mx(rss_max_gb);
         mx(t_rung); mx(t_refit); sm(n_apps); mx(t_l0); mx(t_ts); mx(t_orth);
         mx(t_l0_nu0); mx(t_l0_host); mx(t_l0_dev); mx(t_l0_prep); mx(t_l0_alloc); mx(t_l0_h2d); mx(t_l0_kernel); mx(t_l0_d2h);
@@ -1115,6 +1125,10 @@ namespace solvers {
         app_log(2, "  [dynbse] rung k-sum: {} (mesh transform check {:.2e})",
                 use_ft ? (kft.fft ? "mesh FFT (FFTW)" : "dense mesh Fourier transform") : "direct", kft.check);
       if (met) met->ksum_ft = use_ft;
+      // audit E: the transform was requested and applicable but could not be built -> the direct sum runs (same answer, slower)
+      if (rank == 0 and opt.ksum_ft and opt.kcrys != nullptr and nk >= 8 and not use_ft and not opt.dense_rung)
+        app_log(1, "  [dynbse] WARNING: the mesh Fourier transform of the rung k-sum could not be built (check {:.2e}); the direct "
+                   "k-sum runs (same result, slower)", kft.check);
       auto rung_apply = [&](auto &&Wfn, cplx sc, auto const &Fin, auto &&Oout, long is_, long iq_) {
         if (use_ft) thc_rung_apply_ft(Xb, is_, iq_, kpq, kft, Wfn, sc, Fin, Oout, nb, symc);   // P6: symc (nullptr on nosym)
         else thc_rung_apply(Xb, is_, iq_, kpq, qx_of, Wfn, sc, Fin, Oout, nb, symc);
@@ -1374,8 +1388,8 @@ namespace solvers {
                            not (opt.sigma != nullptr and opt.sigma->col == "dyn");
       if (rank == 0 and db::l0_device_enabled() and not ue_want)
         app_log(1, "  [dynbse] WARNING: the device-resident unit does not cover this pass (scope: dense rung, GMRES Gamma_1-only, "
-                   "unmasked basis, no resummed Sigma column; static_only {} one_rung_only {} gamma1_only {} dense {}): its units run "
-                   "on the CPU with the device L0", opt.static_only, opt.one_rung_only, opt.gamma1_only, opt.dense_rung);
+                   "unmasked basis, no resummed Sigma column; static_only {} one_rung_only {} gamma1_only {} dense {} gmres {}): its units "
+                   "run on the CPU with the device L0", opt.static_only, opt.one_rung_only, opt.gamma1_only, opt.dense_rung, opt.gmres_m);
       bool ue_tried = false;
       db::l0_table_store ue_store;
       sigma_dyn_dev sd_dev;                                // D-3: the Sigma deposits on the engine (off = the host deposits)
@@ -1417,7 +1431,7 @@ namespace solvers {
           }
         }
         if (sig_ckpt and sig_done.count(std::make_tuple(is, iq, nu_list[size_t(jn_unit)]))) {
-          if (met) { ++met->nunits; ++met->nconv; }
+          if (met) { ++met->nunits; ++met->nconv; ++met->n_restored; }   // audit C1: restored, reported separately
           continue;                                             // P20: the deposits of this unit are in a loaded checkpoint
         }
         if (not dumped.empty()) {
@@ -1436,7 +1450,7 @@ namespace solvers {
               for (long e = 0; e < nout * nout and not any; ++e) any = (blk[size_t(nout * nout + e)] != cplx(0.0));
               if (any) ++met->r1_fused; else ++met->r1_missing;
             }
-            if (met) { ++met->nunits; ++met->nconv; }
+            if (met) { ++met->nunits; ++met->nconv; ++met->n_restored; }   // audit C1: restored, reported separately
             continue;
           }
         }
@@ -1578,10 +1592,15 @@ namespace solvers {
           // factorize-vertex: the device dressed-leg path needs the device Sigma deposits. Without them the dressed legs run only
           // on the host unit: move the whole unit to the CPU when allowed, else abort -- never fall back to the standard path.
           if (ue and dressed_req and opt.sigma != nullptr and not sd_dev.on) {
-            dev_fallback("the device dressed-leg path with the Sigma hook (it needs the device Sigma deposits)",
-                         "the device Sigma deposits are off");
+            // audit B3: a SCOPE limit (the device deposits do not cover Wannier pairs / this Sigma configuration) moves the unit to
+            // the CPU with a WARNING (the answer does not change); a MEMORY failure goes through pol_vertex_dyn_device_fallback
+            const bool sd_scope = (not wan) and sigma_dyn_device_ok(*opt.sigma);
+            if (sd_scope)
+              dev_fallback("the device dressed-leg path with the Sigma hook (it needs the device Sigma deposits, which do not fit)",
+                           "the device Sigma deposits are off");
             if (rank == 0)
-              app_log(1, "  [dynbse] WARNING: the device-resident unit is released; the dressed-leg units run on the CPU");
+              app_log(1, "  [dynbse] WARNING: the device-resident unit is released{}; the dressed-leg units run on the CPU",
+                      sd_scope ? "" : " (the device Sigma deposits do not support this configuration: Wannier pairs or the Sigma column)");
             ue.reset();
             kb_dev = false;
           }
@@ -1947,7 +1966,10 @@ namespace solvers {
             char whyd[256] = {0};
             dressed_dev = dynbse_cuda::ue_dressed_prepare(ue.get(), P.ng, dgram->H.data(), dgram->Gh.data(), dgram->Gt.data(),
                                                           P.gk.data(), P.gkq.data(), ts_zero, whyd, 256);
-            utils::check(dressed_dev, "pair_space_ladder_dyn: the device dressed-leg readout could not be prepared: {}", whyd);
+            // audit B2: its bytes are reserved up front (ue_dressed_bytes in the unit's partition), so a failure here is an estimate
+            // error, not a configuration the user can route to the CPU mid-transfer: abort with the reason
+            utils::check(dressed_dev, "pair_space_ladder_dyn: the device dressed-leg readout could not be prepared: {} (its memory was "
+                         "reserved when the unit was created -- raise vertex_debug dyn_um_extra_gb or report this). ABORTING.", whyd);
             if (rank == 0 and units_taken == 1) app_log(1, "  [factorize-vertex] dressed-leg Gamma_1 readout ON THE DEVICE UNIT");
           }
 #endif
@@ -2358,7 +2380,14 @@ namespace solvers {
             met->it_max = std::max(met->it_max, res.iterations);
             met->it_sum += res.iterations;
             ++met->nunits;
-            if (res.converged or res.stagnated or res.readout_converged) ++met->nconv;   // stagnated at the refit floor / readout-converged count as done
+            // audit C1: count each ending separately (stagnated / readout-stopped still count as done, but are reported; the
+            // one-application passes are converged by definition instead of reporting "false")
+            const bool by_def = opt.one_rung_only or opt.static_only;
+            if (res.converged) ++met->nconv;
+            else if (res.stagnated) { ++met->nconv; ++met->n_stag; }
+            else if (res.readout_converged) { ++met->nconv; ++met->n_rconv; }
+            else if (by_def) { ++met->nconv; ++met->n_def; }
+            else ++met->n_maxit;
           }
           if (met) {
             met->t_read += watch.lap();
@@ -2852,6 +2881,9 @@ namespace solvers {
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // P5
     o.readout_tol = 1e-6;                // the physical readout's own stop (the 1e-8 residual is below the refit floor)
+    if (not _dyn_gamma1_only)            // audit C2: an extra (looser) stopping rule beside pol_vertex_dyn_tol -- say so
+      app_log(1, "  [dynbse] WARNING: the GMRES resummation also stops when the physical readout moves by < 1e-6 (fixed readout_tol), "
+                 "besides pol_vertex_dyn_tol = {:.1e}", _dyn_tol);
     if (_wannier) {
       o.wannier_pairs = pair_frame;
       if (pair_frame) app_log(1, "  [scGW-tilde T2] Wannier-pair vertex output (W-int-0/1): Pi_loc(q) in the MLWF pair basis (M = {}, nab = {}; G_bar / X_bar inputs, identity pair legs) -- the SAME-CELL pair block.", _M, nout);
@@ -2990,6 +3022,8 @@ namespace solvers {
     o.kcrys = std::addressof(kc);
     o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = _dyn_sign;
+    if (_dyn_gmres < 12)                 // audit C2: the input is raised here -- say so
+      app_log(1, "  [dynbse] WARNING: pol_vertex_dyn_gmres = {} is raised to GMRES(12) for this pass", _dyn_gmres);
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
     o.resolvent = _dyn_resolvent;
@@ -3089,7 +3123,7 @@ namespace solvers {
     const bool compatible = (opt.col == "dyn1" and _dyn_gamma1_only) or (opt.col == "dyn" and not _dyn_gamma1_only);
     if (not compatible) {
       if (opt.col == "dyn1" or opt.col == "dyn")
-        app_log(1, "  [LFF-Sigma dyn] P3: pol_vertex_sigma_share ignored -- the P-side solve is {} and the Sigma column is {} (separate solves)",
+        app_log(1, "  [LFF-Sigma dyn] WARNING: P3: pol_vertex_sigma_share ignored -- the P-side solve is {} and the Sigma column is {} (separate solves)",
                 _dyn_gamma1_only ? "Gamma_1 only" : "resummed", opt.col);
       return 0;
     }
@@ -3410,6 +3444,8 @@ namespace solvers {
     o.kcrys = std::addressof(kc);
     o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = opt.sign_ks;
+    if (_dyn_gmres < 12)                 // audit C2
+      app_log(1, "  [LFF-Sigma dyn] WARNING: pol_vertex_dyn_gmres = {} is raised to GMRES(12) for the Sigma solve", _dyn_gmres);
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
     o.resolvent = _dyn_resolvent;

@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -1185,11 +1187,14 @@ namespace methods::solvers::dynbse_cuda {
         for (int o = 16; o > 0; o >>= 1) v = fmax(v, __shfl_down_sync(0xffffffffu, v, o));
       return v;
     }
+    // audit B5: fmax drops NaN -- the meters map a non-finite entry to +inf (kept by fmax / atomicMax on the bit pattern), and
+    // the host readback (meter_value) aborts on a non-finite meter
+    __device__ inline double nan_inf(double x) { return isfinite(x) ? x : __longlong_as_double(0x7ff0000000000000LL); }
     __global__ void maxdiff_kernel(long n, cd const *__restrict__ a, cd const *__restrict__ b, unsigned long long *__restrict__ red) {
       double num = 0.0, den = 0.0;
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) {
-        num = fmax(num, cuCabs(a[e] - b[e]));
-        den = fmax(den, cuCabs(a[e]));
+        num = fmax(num, nan_inf(cuCabs(a[e] - b[e])));
+        den = fmax(den, nan_inf(cuCabs(a[e])));
       }
       num = block_max(num);
       den = block_max(den);
@@ -1200,13 +1205,20 @@ namespace methods::solvers::dynbse_cuda {
     }
     __global__ void maxabs_kernel(long n, cd const *__restrict__ x, unsigned long long *__restrict__ slot) {
       double m = 0.0;
-      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) m = fmax(m, cuCabs(x[e]));
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) m = fmax(m, nan_inf(cuCabs(x[e])));
       m = block_max(m);
       if (threadIdx.x == 0) atomicMax(slot, (unsigned long long)__double_as_longlong(m));
     }
     inline unsigned grid_for(long n) { return unsigned(std::min<long>((n + 255) / 256, 65535)); }
     inline unsigned grid_red(long n) { return unsigned(std::max<long>(1, std::min<long>((n + 255) / 256, 1024))); }
 
+    /** audit B5: a device meter's value; a non-finite one (NaN / inf in the reduced data) aborts with what was measured */
+    inline double meter_value(unsigned long long u, char const *what) {
+      double d = 0.0;
+      std::memcpy(&d, &u, sizeof(d));
+      if (not std::isfinite(d)) APP_ABORT(std::string(" dynbse device: non-finite values (NaN / inf) in ") + what + " -- ABORTING.");
+      return d;
+    }
     template <typename T>
     T *dalloc(size_t n, char const *what) {
       T *p = nullptr;
@@ -1631,7 +1643,14 @@ namespace methods::solvers::dynbse_cuda {
     e->red = dalloc<unsigned long long>(2, "ue red");
     size_t fr = 0, tot = 0;
     cu_check(cudaMemGetInfo(&fr, &tot), "ue memgetinfo");
-    e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, double(fr), c.l0_fused != 0, c.l0_asm_gemm != 0, c.l0_fused == 2);
+    // audit B1: size the resident L0 k-batch from what is left AFTER the bytes kept for the later device stages (rung builds,
+    // Sigma deposits, dressed legs: c.um_reserve, computed exactly by the caller) -- it used to take 85 % of the raw free memory
+    const double l0_room = std::max(0.0, double(fr) - c.um_reserve);
+    e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, l0_room, c.l0_fused != 0, c.l0_asm_gemm != 0, c.l0_fused == 2);
+    {
+      const size_t used = std::strlen(why);
+      std::snprintf(why + used, size_t(why_len) - used, "%sresident L0 k-batch K = %ld of %ld", used ? "; " : "", e->l0->K, long(c.nk));
+    }
     e->l0->fz_cfg = c.l0_fz_cfg;
     e->l0->fz_bench = (c.l0_fz_bench != 0);
     return e;
@@ -1761,6 +1780,11 @@ namespace methods::solvers::dynbse_cuda {
                 "ue transpose Fs");
       if (cusolverDnZgetrs(e->cs, CUBLAS_OP_T, int(D), int(nR), e->M, int(D), e->ipiv, e->Y, int(D), e->dinfo) != CUSOLVER_STATUS_SUCCESS)
         APP_ABORT(std::string(" ue_ts: cusolverDnZgetrs failed."));
+      {   // audit B7: getrs' devInfo (an illegal argument is reported there, not in the status)
+        int info = 0;
+        cu_check(cudaMemcpy(&info, e->dinfo, sizeof(int), cudaMemcpyDeviceToHost), "ue_ts getrs info");
+        if (info != 0) APP_ABORT(" ue_ts: cusolverDnZgetrs devInfo = " + std::to_string(info) + " -- ABORTING.");
+      }
       cub_check(cublasZgemm(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(nR), int(D), int(D), &one, e->Y, int(D), e->Ks, int(D), &zero,
                             e->csb, int(nR)), "ue K_s z");
       ue_cb_times(e, nR, e->csb, e->cbb, false);
@@ -1876,8 +1900,7 @@ namespace methods::solvers::dynbse_cuda {
         launch_check("ue maxdiff");
         unsigned long long r[2] = {0, 0};
         cu_check(cudaMemcpy(r, e->red, sizeof(r), cudaMemcpyDeviceToHost), "ue red d2h");
-        double num = 0.0, den = 0.0;
-        std::memcpy(&num, &r[0], sizeof(double)); std::memcpy(&den, &r[1], sizeof(double));
+        const double num = meter_value(r[0], "the rung output / its DLR refit"), den = meter_value(r[1], "the rung output");
         fe = std::max(fe, (den > 0.0) ? num / den : num);
         // the scatter: y.fam(fam, p < np_fit) = c(p): the same row-major layout, one copy
         cu_check(cudaMemcpy(yfam + size_t(fam) * np * W, e->coef, size_t(e->c.np_fit) * W * sizeof(cd), cudaMemcpyDeviceToDevice), "ue scatter");
@@ -2011,13 +2034,14 @@ namespace methods::solvers::dynbse_cuda {
         Ym[e] = Y[b * nc4 + (c * nc + i) + (x * nc + j) * nc2];
       }
     }
-    double bits_to_double(unsigned long long u) { double d = 0.0; std::memcpy(&d, &u, sizeof(d)); return d; }
+    double bits_to_double(unsigned long long u) { return meter_value(u, "the device Sigma deposit meters"); }
   } // namespace
 
   bool ue_sd_init(unit_engine *e, sd_config const &c, cplx const *Ttwh, cplx const *Uwh, cplx const *Gwh, double const *eps,
                   double const *epsG, double free_bytes, char *why, long why_len) {
     auto &s = e->sd;
     if (c.nk != e->c.nk or c.nc != e->c.nc or c.np != e->c.np or c.nt != e->c.nt or c.ng != e->c.ng) {
+      APP_ABORT(std::string(" ue_sd_init: the Sigma deposit sizes differ from the engine's (internal inconsistency) -- ABORTING."));   // audit B3
       std::snprintf(why, size_t(why_len), "the deposit sizes differ from the engine's");
       return false;
     }
@@ -2297,8 +2321,8 @@ namespace methods::solvers::dynbse_cuda {
       const long tot = D * D;
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
         const long i = e / D, j = e % D;
-        num = fmax(num, cuCabs(K[e] - cuConj(K[j * D + i])));
-        den = fmax(den, cuCabs(K[e]));
+        num = fmax(num, nan_inf(cuCabs(K[e] - cuConj(K[j * D + i]))));
+        den = fmax(den, nan_inf(cuCabs(K[e])));
       }
       num = block_max(num);
       den = block_max(den);
@@ -2314,6 +2338,8 @@ namespace methods::solvers::dynbse_cuda {
     auto &k = e->kb;
     const long nk = e->c.nk, nc2 = e->nc2;
     if (nrep != e->c.ndist) {
+      APP_ABORT(" ue_kb_init: rep count " + std::to_string(nrep) + " differs from the engine's ndist " + std::to_string(e->c.ndist) +
+                " (internal inconsistency) -- ABORTING.");   // audit B3
       std::snprintf(why, size_t(why_len), "rep count %ld differs from the engine's ndist %ld", nrep, e->c.ndist);
       return false;
     }
@@ -2340,8 +2366,8 @@ namespace methods::solvers::dynbse_cuda {
     h2d_c(k.W0, W0h, size_t(nq * Nm * Nm), "kb W0"); h2d_c(k.Wd0, Wd0h, size_t(nq * Nm * Nm), "kb Wd0");
     h2d_c(k.Wds, Wdsh, size_t(nrep * nq * Nm * Nm), "kb Wds");
     k.qx.assign(qx_of, qx_of + nk * nk);
-    for (long v : k.qx)
-      if (v < 0 or v >= nq) { std::snprintf(why, size_t(why_len), "qx_of out of range"); return false; }
+    for (long v : k.qx)   // audit B3: an invariant (it used to return false = "does not fit" after allocating)
+      if (v < 0 or v >= nq) APP_ABORT(" ue_kb_init: transfer index " + std::to_string(v) + " out of range [0, " + std::to_string(nq) + ") -- ABORTING.");
     k.on = true;
     return true;
   }
@@ -2396,7 +2422,7 @@ namespace methods::solvers::dynbse_cuda {
     launch_check("kb herm");
     unsigned long long r[2] = {0, 0};
     cu_check(cudaMemcpy(r, e->red, sizeof(r), cudaMemcpyDeviceToHost), "kb herm d2h");
-    std::memcpy(&herm[0], &r[0], sizeof(double)); std::memcpy(&herm[1], &r[1], sizeof(double));
+    herm[0] = meter_value(r[0], "K_s (rung build)"); herm[1] = meter_value(r[1], "K_s (rung build)");
     e->trep.assign(trep, trep + e->c.nt);
     e->scale = sk;
     e->unit_ok = false;
@@ -2433,9 +2459,7 @@ namespace methods::solvers::dynbse_cuda {
     unsigned long long r = 0;
     cu_check(cudaMemcpy(&r, slot, sizeof(r), cudaMemcpyDeviceToHost), "dev_maxabs d2h");
     cu_check(cudaFree(slot), "dev_maxabs free");
-    double m = 0.0;
-    std::memcpy(&m, &r, sizeof(double));
-    return m;
+    return meter_value(r, "dev_maxabs");
   }
 
   void dev_add_rows(cplx *y, long ldy, cplx const *x, long ldx, long rows, long n) {
@@ -2532,9 +2556,7 @@ namespace methods::solvers::dynbse_cuda {
       launch_check("fin fit error");
       unsigned long long r[2] = {0, 0};
       cu_check(cudaMemcpy(r, red, sizeof(r), cudaMemcpyDeviceToHost), "fin red d2h");
-      double num = 0.0, den = 0.0;
-      std::memcpy(&num, &r[0], sizeof(double));
-      std::memcpy(&den, &r[1], sizeof(double));
+      const double num = meter_value(r[0], "the Sigma finish fit"), den = meter_value(r[1], "the Sigma finish fit");
       *fit_err = (den > 0.0) ? num / den : num;
       cu_check(cudaFree(red), "fin free red");
       cu_check(cudaFree(drec), "fin free rec");
@@ -2681,6 +2703,11 @@ namespace methods::solvers::dynbse_cuda {
               "dr u = Ks^T w");
     if (cusolverDnZgetrs(e->cs, CUBLAS_OP_N, int(D), int(nout), e->M, int(D), e->ipiv, u, int(D), e->dinfo) != CUSOLVER_STATUS_SUCCESS)
       APP_ABORT(std::string(" ue_dressed_prepare: cusolverDnZgetrs failed."));
+    {   // audit B7
+      int info = 0;
+      cu_check(cudaMemcpy(&info, e->dinfo, sizeof(int), cudaMemcpyDeviceToHost), "dr getrs info");
+      if (info != 0) APP_ABORT(" ue_dressed_prepare: cusolverDnZgetrs devInfo = " + std::to_string(info) + " -- ABORTING.");
+    }
     cub_check(cublasZgeam(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(D), int(nout), &one, X0, int(D), &one, u, int(D), X0, int(D)), "dr X0 += u");
     cub_check(cublasZgeam(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(nout), int(D), &one, X0, int(D), &zero, d.Etj, int(nout), d.Etj, int(nout)),
               "dr Etj");
@@ -2743,6 +2770,12 @@ namespace methods::solvers::dynbse_cuda {
 
 
   void ue_set_rung_mode(unit_engine *e, bool rung_pair, long rr, cplx const *ctr_h) {
+    // audit B6: the streamed rung (pol_vertex_dyn_device_memory = stream with reps on the host) supports the mirror-pair rung only;
+    // checked here, when the unit is created, instead of at the first application after the rung builds
+    if (e->n_dev >= 0 and e->n_dev < e->c.ndist and (not rung_pair or rr > 0))
+      APP_ABORT(std::string(" ue_set_rung_mode: the streamed rung (") + std::to_string(e->c.ndist - e->n_dev) +
+                " matrices in host memory) needs the mirror-pair rung (vertex_debug dyn_rung_pair = 1)" +
+                (rr > 0 ? " and all R factorized matrices on the device" : "") + " -- ABORTING.");
     e->rung_pair = rung_pair;
     e->rr = rr;
     if (rr > 0) {

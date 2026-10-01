@@ -28,6 +28,7 @@
 #include <cmath>
 #include "configuration.hpp"
 #include "nda/nda.hpp"
+#include "IO/app_loggers.h"
 #include "nda/linalg.hpp"
 #include "utilities/check.hpp"
 
@@ -107,11 +108,16 @@ namespace nusamp {
         for (long s2 = 0; s2 < nS; ++s2) Gss(s, s2) = G(S[size_t(s)], S[size_t(s2)]);
       auto [lam, V] = modes(Gss);                                        // descending
       Ginv() = cplx(0.0);
+      long used = 0;
       for (long a = 0; a < K; ++a) {
         if (lam(a) <= 1e-14 * lam(0)) break;
         for (long s = 0; s < nS; ++s)
           for (long s2 = 0; s2 < nS; ++s2) Ginv(s, s2) += V(s, a) * std::conj(V(s2, a)) / lam(a);
+        ++used;
       }
+      if (used < K)   // audit E: the regression ran at a lower rank than requested -- say so
+        app_log(1, "  [nu-sampling] WARNING: the regression reconstruction uses {} of the requested {} modes (the sampled Gram is "
+                   "rank-deficient below 1e-14)", used, K);
       for (long m = 0; m < nw; ++m)
         for (long s = 0; s < nS; ++s) GcS(m, s) = G(m, S[size_t(s)]);
       nda::blas::gemm(GcS, Ginv, R);                                      // G(:, S) G(S, S)^-1_K
@@ -165,6 +171,9 @@ namespace nusamp {
       taken[size_t(best)] = 1;
       orth(best);
     }
+    if (long(S.size()) < K)   // audit E: fewer sampled nodes than requested -- say so
+      app_log(1, "  [nu-sampling] WARNING: pivot_nodes found {} of the requested {} nodes (the mode matrix has lower rank)",
+              long(S.size()), K);
     std::sort(S.begin(), S.end());
     return S;
   }
