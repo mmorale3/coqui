@@ -79,19 +79,22 @@ class LineSCGW:
         v_arr = np.array([np.pad(v, ((0, 0), (0, M - v.shape[1]))) for v in v_all])
         dmu, e_homo, e_lumo, nfill = chemical_potential(e_arr, v_arr, nk, self.nelec, self.k_weight)
         self.mu += dmu; e_arr = e_arr - dmu; self.gw.mu = self.mu
+        wk_ = np.full(nk, 1.0 / nk) if self.k_weight is None else np.asarray(self.k_weight) / np.sum(self.k_weight)
+        nel_exact = float(sum(2.0 * wk_[k] * (np.abs(v_arr[k][:, e_arr[k] < 0]) ** 2).sum() for k in range(nk)))
         # compressed per-sector G and the new static part
-        w_g, c_g = [], []
+        w_g, c_g, dropped = [], [], 0.0
         for ik in range(nk):
-            wk, ck_ = compress_sectors(self.gp, self.gh, self.fz, e_arr[ik], v_arr[ik]); w_g.append(wk); c_g.append(ck_)
+            wk, ck_, dr = compress_sectors(self.gp, self.gh, self.fz, e_arr[ik], v_arr[ik]); w_g.append(wk); c_g.append(ck_); dropped = max(dropped, dr)
         gw.set_poles(np.array(w_g), coef=np.array(c_g))
         Dm = gw.density_matrix(); nel = 2 * np.einsum('kii->', Dm).real / nk
         self.F = gw.hartree_exchange(Dm)
-        rec = dict(dSigma=dS, mu=self.mu, dmu=dmu, gap_eV=(e_lumo - e_homo) * 27.211386, nelec=nel, npoles=[i['npoles'] for i in info_all],
-                   heldout=[i['heldout_err'] for i in info_all], tW=tW, tS=tS, ttot=time.time() - t0)
+        rec = dict(dSigma=dS, mu=self.mu, dmu=dmu, gap_eV=(e_lumo - e_homo) * 27.211386, nelec=nel, nelec_exact=nel_exact, dropped_weight=dropped,
+                   npoles=[i['npoles'] for i in info_all], heldout=[i['heldout_err'] for i in info_all], tW=tW, tS=tS, ttot=time.time() - t0)
         self.history.append(rec)
         if self.verbose:
-            print(f"iter {len(self.history)}: dSigma {dS:.2e}  mu {self.mu:.6f} (dmu {dmu*27.2114:+.4f} eV)  gap(poles) {rec['gap_eV']:.4f} eV  "
-                  f"nelec {nel:.6f}  npoles {min(rec['npoles'])}-{max(rec['npoles'])}  held-out {max(rec['heldout']):.1e}  [W {tW:.0f}s, Sigma {tS:.0f}s, total {rec['ttot']:.0f}s]", flush=True)
+            print(f"iter {len(self.history)}: dSigma {dS:.2e}  mu {self.mu:.6f} (dmu {dmu*27.2114:+.4f} eV)  QP gap {rec['gap_eV']:.4f} eV  "
+                  f"nelec {nel:.6f} (Lehmann {nel_exact:.6f}, dropped weight {dropped:.1e})  npoles {min(rec['npoles'])}-{max(rec['npoles'])}  "
+                  f"held-out {max(rec['heldout']):.1e}  [W {tW:.0f}s, Sigma {tS:.0f}s, total {rec['ttot']:.0f}s]", flush=True)
         return rec
 
     def sigma_total(self, ik):

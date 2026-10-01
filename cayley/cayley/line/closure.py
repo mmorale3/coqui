@@ -30,24 +30,33 @@ def lehmann_from_sigma(Hstat_rel, w, g, wp, K, tol_gram=1e-10, nphi=72):
     return e, V[:nb, :], dict(npoles=len(d), **info)
 
 
-def chemical_potential(e, v, nk, nelec, k_weight=None):
-    """T=0 filling: order all poles (k, m) by energy, fill weight 2*|v|^2*w_k until nelec; return the mid-gap mu shift."""
+def chemical_potential(e, v, nk, nelec, k_weight=None, qp_weight=0.1):
+    """T=0 filling: order all poles (k, m) by energy, fill weight 2*|v|^2*w_k until nelec; returns the mid-gap mu shift,
+    the HOMO/LUMO pole energies among QUASIPARTICLE-like poles (total weight > qp_weight) and the filled weight."""
     nk_ = len(e)
     wk = np.full(nk_, 1.0 / nk_) if k_weight is None else np.asarray(k_weight) / np.sum(k_weight)
     E = np.concatenate([e[k] for k in range(nk_)])
     Wt = np.concatenate([2.0 * wk[k] * (np.abs(v[k]) ** 2).sum(0) for k in range(nk_)])
+    Wtot = np.concatenate([(np.abs(v[k]) ** 2).sum(0) for k in range(nk_)])        # weight per pole (sum over orbitals)
     order = np.argsort(E); cum = np.cumsum(Wt[order])
     j = int(np.searchsorted(cum, nelec - 1e-8))
-    e_homo, e_lumo = E[order][j], E[order][min(j + 1, len(E) - 1)]
-    return 0.5 * (e_homo + e_lumo), e_homo, e_lumo, cum[j] if j < len(cum) else cum[-1]
+    e_f = 0.5 * (E[order][j] + E[order][min(j + 1, len(E) - 1)])                    # between the last filled and first empty pole
+    qp = Wtot > qp_weight
+    e_homo = E[qp & (E <= e_f)].max() if np.any(qp & (E <= e_f)) else E[order][j]
+    e_lumo = E[qp & (E > e_f)].min() if np.any(qp & (E > e_f)) else E[order][min(j + 1, len(E) - 1)]
+    return 0.5 * (e_homo + e_lumo), e_homo, e_lumo, cum[min(j, len(cum) - 1)]
 
 
-def compress_sectors(basis_p, basis_h, zeta, e, v):
+def compress_sectors(basis_p, basis_h, zeta, e, v, emax=None):
     """Compressed matrix-coefficient real-pole representation of the Lehmann G per sector by LS fit on the line nodes.
-    Returns (w_all, coef_all) with sector by sign of w (hole poles first)."""
+    Poles beyond emax (default: the basis range lam) cannot be represented and are dropped; their weight is returned.
+    Returns (w_all, coef_all, dropped_weight) with sector by sign of w (hole poles first)."""
+    emax = basis_p.lam if emax is None else emax
+    keep = np.abs(e) <= emax
+    dropped = float((np.abs(v[:, ~keep]) ** 2).sum())
     def lehmann(mask):
         K = 1.0 / (zeta[:, None] - e[mask][None, :]); vm = v[:, mask]
         return (vm[None, :, :] * K[:, None, :]) @ vm.conj().T                  # (nz, nb, nb)
-    Gp = lehmann(e > 0); Gh = lehmann(e < 0)
+    Gp = lehmann(keep & (e > 0)); Gh = lehmann(keep & (e < 0))
     cp = basis_p.fit(zeta, Gp); ch = basis_h.fit(zeta, Gh)
-    return np.concatenate([basis_h.w, basis_p.w]), np.concatenate([ch, cp], axis=0)
+    return np.concatenate([basis_h.w, basis_p.w]), np.concatenate([ch, cp], axis=0), dropped
