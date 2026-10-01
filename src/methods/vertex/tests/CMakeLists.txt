@@ -19,7 +19,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# ISDF-Vertex: Sigma^C (G3W2) kernel tests
+# Vertex: Sigma^C (G3W2) kernel tests
 set(TEST_ID methods_vertex_sigma)
 
 add_executable(test_${TEST_ID} test_vertex_sigma.cpp)
@@ -30,7 +30,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# ISDF-Vertex conservation: Sigma^C and Pi^C are the two cuts of
+# Vertex conservation: Sigma^C and Pi^C are the two cuts of
 # ONE Phi_2^C:  Tr[Sigma^C G] + Tr[Pi^C W] = 0
 set(TEST_ID methods_vertex_conservation)
 
@@ -42,7 +42,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# ISDF-Vertex: C = empty set reproduces plain scGW bit-for-bit
+# Vertex: C = empty set reproduces plain scGW bit-for-bit
 set(TEST_ID methods_vertex_noop)
 
 add_executable(test_${TEST_ID} test_vertex_noop.cpp)
@@ -53,7 +53,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# scGW-tilde: the knobs OFF/inert (pol_vertex none-or-empty-window, cvv_rspace_tol set but
+# Vertex ladder: the knobs OFF/inert (pol_vertex none-or-empty-window, cvv_rspace_tol set but
 # unused without div_treatment = "cvv") reproduce the plain scGW loop bit-for-bit, in both
 # production wirings; plus the pair-space ladder diagnostics and eps_M readouts.
 set(TEST_ID methods_vertex_scgwt_noop)
@@ -66,9 +66,9 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# scGW-tilde CVV head: the R-space engine + covariant velocity (toy tight-binding oracle,
-# hermiticity/trev identities, FD-in-k cross-check, LiH-222 build smoke) and the head
-# tensor checks.
+# CVV head of the screened interaction: the R-space engine + covariant velocity (toy
+# tight-binding oracle, hermiticity/trev identities, FD-in-k cross-check, LiH-222 build
+# smoke) and the head tensor checks.
 set(TEST_ID methods_scr_cvv)
 
 add_executable(test_${TEST_ID} test_scr_cvv.cpp)
@@ -79,7 +79,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# ISDF-Vertex: secondary ISDF basis with the downfolded rung: transfer algebra, no-leak,
+# Vertex: secondary ISDF basis with the downfolded rung: transfer algebra, no-leak,
 # secondary-vs-global, eta(q, nu) rank scan, conservation identity in the secondary path,
 # end-to-end.
 set(TEST_ID methods_vertex_refinement2)
@@ -92,7 +92,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# ISDF-Vertex: IBZ k-point symmetry: leakage diagnostic, the sym-vs-nosym gold check, the
+# Vertex: IBZ k-point symmetry: leakage diagnostic, the sym-vs-nosym gold check, the
 # star-weighted conservation identity on the symmetry-reduced mesh, and the C = empty noop
 # on the sym mesh.
 set(TEST_ID methods_vertex_ibz)
@@ -105,9 +105,9 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# ISDF-Vertex: W-bar iteration cache: the secondary path caches the downfolded rung at
+# Vertex: W-bar iteration cache: the secondary path caches the downfolded rung at
 # update_w time so the scf driver frees dW unconditionally; machine-identity vs the
-# retained-dW (legacy) consumption + memory behavior at the retention site.
+# retained-dW consumption + memory behavior at the retention site.
 set(TEST_ID methods_vertex_wcache)
 
 add_executable(test_${TEST_ID} test_vertex_wcache.cpp)
@@ -118,7 +118,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# ISDF-Vertex: Wannier-projector generalization of the subspace C: degenerate-U
+# Vertex: Wannier-projector generalization of the subspace C: degenerate-U
 # bit-identity vs the window path, gauge invariance (Phi depends on range(P) only), a
 # genuinely restricting rank-1 Wannier C + the secondary rotated point selection, and the
 # Loewdin isometry repair. Links embed_lib for projector_t (the U source).
@@ -230,7 +230,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# ISDF-Vertex self-consistency diagnostic under k-point symmetry: the little-group residual
+# Vertex self-consistency diagnostic under k-point symmetry: the little-group residual
 # of the SELF-CONSISTENT G with the vertex OFF (baseline control), the same with the vertex
 # ON over several iterations, and a sym-vs-nosym e_corr TRAJECTORY over more iterations
 # than the 2-iteration gold check of test_vertex_ibz.
@@ -260,7 +260,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# ISDF-Vertex: ABSOLUTE normalization/sign cross-check of Sigma^C against CoQui's own
+# Vertex: ABSOLUTE normalization/sign cross-check of Sigma^C against CoQui's own
 # bare second-order exchange (GF2 exchange channel, pyscf-pinned). With C = full band
 # range and W -> Z the vertex functional IS the bare second-order exchange, so the two
 # self-energies must be identical. It is the only test that constrains the ABSOLUTE
@@ -275,7 +275,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# scGW-tilde: the discrete-Ward leg vertex ALGEBRA (ward_legs.hpp) on exact rational data --
+# Ward legs: the discrete-Ward leg vertex ALGEBRA (ward_legs.hpp) on exact rational data --
 # closed-form pole sums vs dense Matsubara oracles, the q = 0 matrix telescoping, the
 # Z-link + positivity, R = 0 bitwise, the window complement identity. Pure toy.
 set(TEST_ID methods_vertex_ward_legs)
@@ -288,7 +288,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# scGW-tilde: the WIRING of the discrete-Ward leg vertex (pol_vertex_legs = "ward") into
+# Ward legs: the WIRING of the discrete-Ward leg vertex (pol_vertex_legs = "ward") into
 # the ladder readout on lih222 -- the bitwise leg at Sigma = 0 (iteration 1), the
 # report-only loop invariance, the zero-rung normalization pin against eval_pol_pi0, and
 # the fixture telescoping / fit meters.
@@ -302,7 +302,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# scGW-tilde dynamic-rung BSE: the two-family DLR algebra of the resummed DYNAMIC-rung BSE
+# Dynamic-rung BSE: the two-family DLR algebra of the resummed DYNAMIC-rung BSE
 # (dynbse.hpp) against a dense Matsubara BSE oracle on an exact rational toy -- the static
 # limit, the first iterate and the resummed vertex, at inu = 0 and inu != 0; then the
 # fitted-residue (shared aux grid) pathway. Pure toy.
@@ -316,7 +316,7 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
-# scGW-tilde dynamic-rung BSE: the production driver's checks on lih222 -- the THC rung
+# Dynamic-rung BSE: the production driver's checks on lih222 -- the THC rung
 # operator vs Kbig, the static limit vs the static pair-space ladder resolvent, the one
 # bare dynamic rung vs pi_c_accumulate_w, GMRES vs Neumann, Hermiticity.
 set(TEST_ID methods_vertex_dynbse_gate)

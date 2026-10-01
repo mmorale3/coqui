@@ -249,7 +249,7 @@ namespace bdft_tests {
       const double new_bytes = 4.0 * double(nt) * Nb2 * Np * 16.0;
       const double factor = old_bytes / new_bytes;
       if (world.root())
-        app_log(1, "vertex_rankinv pair-cache footprint: OLD (replicated) = {} B, NEW "
+        app_log(1, "vertex_rankinv pair-cache footprint: replicated store = {} B, tiled "
                    "(one tile live) = {} B, reduction factor = {} (= ns*nk*nq_ext = {}).",
                 old_bytes, new_bytes, factor, ns * nk * nq_ext);
       REQUIRE(factor == Approx(double(ns * nk * nq_ext)));

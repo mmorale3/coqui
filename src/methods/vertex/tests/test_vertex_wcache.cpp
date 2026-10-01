@@ -116,7 +116,7 @@ namespace bdft_tests {
     };
 
     auto [e_hf_leg, e_corr_leg, dw_leg, nm_leg] = run("secondary", false);
-    app_log(1, "wcache e2e: secondary LEGACY (retained dW): e_hf = {:.17g}, "
+    app_log(1, "wcache e2e: secondary, retained dW:         e_hf = {:.17g}, "
                "e_corr = {:.17g}, dW retained = {}, N_m = {}",
             e_hf_leg, e_corr_leg, dw_leg, nm_leg);
 
@@ -132,8 +132,8 @@ namespace bdft_tests {
     app_log(1, "wcache e2e: secondary CACHED Wbar:          e_hf = {:.17g}, "
                "e_corr = {:.17g}, dW retained = {}, N_m = {}",
             e_hf_c, e_corr_c, dw_c, nm_c);
-    app_log(1, "wcache e2e: |D e_hf| = {}, |D e_corr| = {} (cache vs legacy; bitwise "
-               "expected -- notes/wbar_cache.md section 2)",
+    app_log(1, "wcache e2e: |D e_hf| = {}, |D e_corr| = {} (cached vs retained dW; bitwise "
+               "expected: the cached Wbar is the same downfold of the same dW)",
             std::abs(e_hf_c - e_hf_leg), std::abs(e_corr_c - e_corr_leg));
     REQUIRE(nm_c == nm_leg);
     // MACHINE-IDENTITY: the cached consumption is algebraically identical to the
@@ -250,7 +250,7 @@ namespace bdft_tests {
       double diff = max_diff(dPi_legacy.local(), dPi_cached.local());
       double g[2] = {scale, diff};
       mpi_context->comm.all_reduce_in_place_n(g, 2, mpi3::max<>{});
-      app_log(1, "wcache id [{}]: max|Pi^C(legacy)| = {}, max|cached - legacy| = {} "
+      app_log(1, "wcache id [{}]: max|Pi^C(retained dW)| = {}, max|cached - retained| = {} "
                  "(bitwise expected)", div, g[0], g[1]);
       REQUIRE(g[0] > 1e-12);
       // MACHINE-IDENTITY of the consumption: same arithmetic on the same data; only

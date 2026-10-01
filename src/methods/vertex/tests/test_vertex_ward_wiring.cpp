@@ -54,13 +54,13 @@ namespace bdft_tests {
 
   using namespace methods;
 
-  TEST_CASE("ward_wiring_readout", "[methods][vertex][scgwt][tier15]") {
+  TEST_CASE("ward_wiring_readout", "[methods][vertex][scgwt][ward_legs]") {
 #ifndef ENABLE_DLR
     SUCCEED("ward_wiring_readout skipped: build has ENABLE_DLR=OFF.");
 #else
     auto &mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
-    std::string output = "coqui_t15_wiring";
+    std::string output = "coqui_ward_wiring";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
@@ -124,13 +124,13 @@ namespace bdft_tests {
 #endif
   }
 
-  TEST_CASE("ward_wiring_gates", "[methods][vertex][scgwt][tier15]") {
+  TEST_CASE("ward_wiring_gates", "[methods][vertex][scgwt][ward_legs]") {
 #ifndef ENABLE_DLR
     SUCCEED("ward_wiring_gates skipped: build has ENABLE_DLR=OFF.");
 #else
     auto &mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
-    std::string output = "coqui_t15_gates";
+    std::string output = "coqui_ward_gates";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",

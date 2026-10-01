@@ -272,8 +272,8 @@ namespace bdft_tests {
     // vertex_pi_toy "wannier_gauge") check the covariance of both cuts to machine precision.
     // End to end the same MF/THC feeds every run, so the gauge rotation cancels to rounding
     // and a 1e-10 tolerance is ample.
-    app_log(1, "vertex_wannier gauge: complex-U invariance MACHINE-EXACT (chain-rule "
-               "injection); see notes section 6.2.");
+    app_log(1, "vertex_wannier gauge: complex-U invariance is machine-exact (chain-rule "
+               "injection).");
     REQUIRE(std::abs(ehf_V - ehf_win) < 1e-10);
     REQUIRE(std::abs(ec_V - ec_win) < 1e-10);
     REQUIRE(std::abs(ehf_Vk - ehf_win) < 1e-10);

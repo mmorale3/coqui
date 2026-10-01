@@ -59,7 +59,7 @@ namespace bdft_tests {
   namespace wl = methods::solvers::ward_legs;
 
   // ======================================================================================
-  TEST_CASE("ward_legs_conventions", "[methods][vertex][scgwt][tier15]") {
+  TEST_CASE("ward_legs_conventions", "[methods][vertex][scgwt][ward_legs]") {
     auto &mpi = utils::make_unit_test_mpi_context();
     (void)mpi;
 
@@ -122,7 +122,7 @@ namespace bdft_tests {
   }
 
   // ======================================================================================
-  TEST_CASE("ward_legs_toy_gates", "[methods][vertex][scgwt][tier15]") {
+  TEST_CASE("ward_legs_toy_gates", "[methods][vertex][scgwt][ward_legs]") {
     auto &mpi = utils::make_unit_test_mpi_context();
     (void)mpi;
 
@@ -243,7 +243,7 @@ namespace bdft_tests {
         nda::array<cplx, 2> trb, trf;
         traced(ctx, jn, 0, trb, trf);
         const double sb = max_abs(trb), sf = max_abs(trf);
-        app_log(1, "ward_legs_toy_gates P1 (G-g): nu node {}: |traced bare| = {:.3e}, "
+        app_log(1, "ward_legs_toy_gates q = 0 telescoping: nu node {}: |traced bare| = {:.3e}, "
                    "|traced chi0_Lambda| = {:.3e} (ratio {:.3e})", jn, sb, sf, sf / sb);
         worst = std::max(worst, sf / sb);
         REQUIRE(sb > 1e-3);              // the bare bubble violates the q = 0 Ward identity at O(1)
@@ -258,7 +258,7 @@ namespace bdft_tests {
       double e = 0.0;
       for (long i = 0; i < nb; ++i)
         for (long k = 0; k < nb; ++k) e = std::max(e, std::abs(trf(i, k) - ref(i, k)));
-      app_log(1, "ward_legs_toy_gates P1 (G-g) nu = 0: traced chi0_Lambda vs sum_j g_j f'(lambda_j): "
+      app_log(1, "ward_legs_toy_gates q = 0 telescoping at nu = 0: traced chi0_Lambda vs sum_j g_j f'(lambda_j): "
                  "max err {:.3e} (scale {:.3e}, bare {:.3e})", e, max_abs(ref), max_abs(trb));
       REQUIRE(e < 1e-12 * std::max(1.0, max_abs(ref)));
     }
@@ -274,7 +274,7 @@ namespace bdft_tests {
             for (long k = 0; k < nb; ++k) tr += t.g(j, i, k) * (L(k, i) + ((i == k) ? 1.0 : 0.0));
           worst = std::max(worst, std::abs(tr - 1.0));
         }
-      app_log(1, "ward_legs_toy_gates P2 (G-h): max |Tr[g_j Lambda0(lambda_j; 0)] - 1| = {:.3e}", worst);
+      app_log(1, "ward_legs_toy_gates Z-link: max |Tr[g_j Lambda0(lambda_j; 0)] - 1| = {:.3e}", worst);
       REQUIRE(worst < 1e-10);
       // positivity of Herm[Lambda0(i pi/beta; 0) - 1] at beta = 1000 (T -> 0 corner)
       const double b1 = 1000.0;
@@ -285,7 +285,7 @@ namespace bdft_tests {
       auto ev = nda::linalg::eigenvalues(Hm);
       double emin = 1e300, emax = -1e300;
       for (long i = 0; i < nb; ++i) { emin = std::min(emin, ev(i)); emax = std::max(emax, ev(i)); }
-      app_log(1, "ward_legs_toy_gates P2 (G-h) positivity at beta = 1000: eig[Herm(Lambda0 - 1)] in "
+      app_log(1, "ward_legs_toy_gates positivity at beta = 1000: eig[Herm(Lambda0 - 1)] in "
                  "[{:.4e}, {:.4e}]", emin, emax);
       REQUIRE(emin > -1e-12 * emax);
       REQUIRE(emax > 0.0);
@@ -306,7 +306,7 @@ namespace bdft_tests {
       bool same = true;
       for (long r = 0; r < nc2; ++r)
         for (long c = 0; c < nc2; ++c) same = same and (Cb(r, c) == Cref(r, c));
-      app_log(1, "ward_legs_toy_gates P3 (G-i): R = 0 leaves the pair block bitwise: {}", same);
+      app_log(1, "ward_legs_toy_gates R = 0 leaves the pair block bitwise: {}", same);
       REQUIRE(same);
     }
 
@@ -330,7 +330,7 @@ namespace bdft_tests {
             scale = std::max(scale, std::abs(comp));
           }
       }
-      app_log(1, "ward_legs_toy_gates P4 (window C = [0,2) of 3): traced residual + complement: "
+      app_log(1, "ward_legs_toy_gates window complement (C = [0,2) of 3): traced residual + complement: "
                  "max {:.3e} (complement scale {:.3e})", worst, scale);
       REQUIRE(scale > 1e-6);
       REQUIRE(worst < 1e-12 * std::max(1.0, scale));
@@ -370,7 +370,7 @@ namespace bdft_tests {
   // own side. The bare pair element (1/beta) sum G_v G_c is a screening-like (negative)
   // number; a coherent-pole estimate predicts Delta of the SAME sign at ~ (1/Z - 1)
   // relative size. Reported, not asserted.
-  TEST_CASE("ward_legs_interband_sign", "[methods][vertex][scgwt][tier15]") {
+  TEST_CASE("ward_legs_interband_sign", "[methods][vertex][scgwt][ward_legs]") {
     auto &mpi = utils::make_unit_test_mpi_context();
     (void)mpi;
     for (double beta : {10.0, 1000.0}) {
@@ -437,7 +437,7 @@ namespace bdft_tests {
   // Lambda0(E_k) - Lambda0(E_{k+q}) -- O(dispersion x dLambda/dE) over the same denominator,
   // i.e. O(1) at any finite q: a Pauli-blocking violation of the ansatz in the channel whose
   // density vertex is O(1). Reported, not asserted.
-  TEST_CASE("ward_legs_intraband_probe", "[methods][vertex][scgwt][tier15]") {
+  TEST_CASE("ward_legs_intraband_probe", "[methods][vertex][scgwt][ward_legs]") {
     auto &mpi = utils::make_unit_test_mpi_context();
     (void)mpi;
     const double beta = 1000.0;
@@ -495,7 +495,7 @@ namespace bdft_tests {
   // build_ward_legs does. Compared against the exact-residue result at q = 0: the traced
   // pair propagator (bare and Lambda) at nu = 0 and at the first two nu != 0 nodes.
   // This isolates the "bilinear in the residues" hazard at the nu = 0 derivative branches.
-  TEST_CASE("ward_legs_fitted_residues", "[methods][vertex][scgwt][tier15]") {
+  TEST_CASE("ward_legs_fitted_residues", "[methods][vertex][scgwt][ward_legs]") {
 #ifndef ENABLE_DLR
     SUCCEED("ward_legs_fitted_residues skipped: build has ENABLE_DLR=OFF.");
 #else

@@ -582,7 +582,7 @@ namespace bdft_tests {
         // cross-policy discrimination: pairing the default-policy Phi^ cut against the
         // v1_skip-truncated trace (or vice versa) must NOT cancel
         double rel_x = cons::rel_residual(S_SG, S_PW_v1);
-        app_log(1, "conservation_toy: cross-policy control rel(v2 Sigma vs v1 trace) = {}",
+        app_log(1, "conservation_toy: cross-policy control rel(default-policy Sigma vs v1_skip trace) = {}",
                 rel_x);
         REQUIRE(rel_x > 1e3 * std::max(rel, 1e-14));
       }

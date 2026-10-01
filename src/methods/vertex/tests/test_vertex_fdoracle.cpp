@@ -630,7 +630,7 @@ namespace bdft_tests {
           for (long Q = 0; Q < Np; ++Q) e2n += Pi0(q, P, Q) * W0(q, P, Q);
       e2n /= double(nk);
       app_log(1, "vertex_fdoracle_bs euler(ii): sum Pi.Wt = {:.10g}{:+.10g}i vs -4 Phi = "
-                 "{:.10g}{:+.10g}i (rel {:.3e}); notes' plain Pi_IJ W0_IJ direction: "
+                 "{:.10g}{:+.10g}i (rel {:.3e}); plain (untransposed) Pi_IJ W0_IJ direction: "
                  "rel {:.3e}", e2.real(), e2.imag(), (-4.0 * phi_hat).real(),
               (-4.0 * phi_hat).imag(), rel2,
               std::abs(e2n + 4.0 * phi_hat) / std::abs(4.0 * phi_hat));
@@ -697,7 +697,7 @@ namespace bdft_tests {
                                                     mdl.kmq, mdl.qmin, Sr_n);
       const cplx pred_n = t_x + pairing(Sr_n, dG, nbnd, nbnd);
       const double rel_n = std::abs(dphi_fd - pred_n) / std::abs(dphi_fd);
-      app_log(1, "vertex_fdoracle_bs control (c): the notes' untransposed/unsymmetrized "
+      app_log(1, "vertex_fdoracle_bs control (c): the untransposed/unsymmetrized "
                  "W0.Pi.W0 sandwich gives rel = {:.3e}", rel_n);
       REQUIRE(rel_n > 1e-3);
     }

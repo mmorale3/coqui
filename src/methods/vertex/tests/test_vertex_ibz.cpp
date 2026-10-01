@@ -777,7 +777,7 @@ namespace bdft_tests {
       auto [ehf_glo2, ec_glo2, lglo2] = run("qe_lih222_sym", nda::range(1, 3), 2, "global");
       const double grot_glo2 = last_grot;
       (void)ehf_sec2; (void)ehf_glo2; (void)lsec2; (void)lglo2;
-      app_log(1, "ibz REPRO (2-iter, C=[1,3) closed): e_corr secondary {:.12f} vs global "
+      app_log(1, "ibz secondary vs global (2 iterations, C=[1,3) closed): e_corr secondary {:.12f} vs global "
                  "{:.12f} (|D| = {:.3e}); G-rotation residual secondary = {:.3e}, global = "
                  "{:.3e}; window D-leak secondary = {:.3e}, global = {:.3e}",
               ec_sec2, ec_glo2, std::abs(ec_sec2 - ec_glo2), grot_sec2, grot_glo2, lsec2, lglo2);
@@ -805,7 +805,7 @@ namespace bdft_tests {
       auto [ehf1, ec1, l1] = run("qe_lih222_sym", nda::range(1, 3), 1, "secondary", cap);
       const long Nm1 = last_Nm; const double cond1 = last_cond;
       (void)ehf0; (void)ehf1; (void)l0; (void)l1;
-      app_log(1, "ibz COND-CAP: uncapped cond(s)_eff = {:.3e} (N_m = {}); cap = {:.3e} -> "
+      app_log(1, "ibz conditioning cap: uncapped cond(s)_eff = {:.3e} (N_m = {}); cap = {:.3e} -> "
                  "cond(s)_eff = {:.3e} (N_m = {}); e_corr {:.10f} -> {:.10f}",
               cond0, Nm0, cap, cond1, Nm1, ec0, ec1);
       REQUIRE(std::isfinite(ec1));

@@ -983,7 +983,7 @@ namespace bdft_tests {
     app_log(1, "vertex_pi_lih_smoke: vertex gygi (isolated on the ignore_g0 state) "
                "max|Pi^C| = {}", pi_gy);
     app_log(1, "vertex_pi_lih_smoke: Delta e_corr: v1_skip = {}, ignore_g0 = {}, "
-               "(v2 - v1) = {}", e_corr_1 - e_corr_0, e_corr_2 - e_corr_0, e_corr_2 - e_corr_1);
+               "(ignore_g0 - v1_skip) = {}", e_corr_1 - e_corr_0, e_corr_2 - e_corr_0, e_corr_2 - e_corr_1);
 
     for (double e : {e_hf_1, e_corr_1, e_hf_2, e_corr_2}) REQUIRE(std::isfinite(e));
     // the vertex must change the screened interaction (and thus e_corr), but not blow up

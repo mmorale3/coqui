@@ -23,7 +23,7 @@
  * basis, Wbar = t W t^dag, with the transfer t fitted so that B t ~= C, where B / C are
  * the C-window pair matrices in the secondary / primary ISDF bases.
  *
- *  - vertex_refinement2_toy: transfer-algebra unit checks on a synthetic THC model
+ *  - vertex_secondary_isdf_toy: transfer-algebra unit checks on a synthetic THC model
  *    (independently-coded pair matrices B/C, truncated-SVD t, fold/upfold):
  *    s = B^dag B Hermitian PSD with cond reported; B t = C at full secondary rank;
  *    the no-leak identity Tr[(t^dag Pibar t) W] = Tr[Pibar (t W t^dag)] at machine
@@ -32,7 +32,7 @@
  *    kernel on G~ = P_C G P_C) at machine class; the conservation identity
  *    S_SigmaG + S_PW = 0 in the secondary path; eta and controlled degradation at
  *    reduced rank.
- *  - vertex_refinement2_lih: LiH-222 (nosym), C = [1,3). One restricted-range ISDF
+ *  - vertex_secondary_isdf_lih: LiH-222 (nosym), C = [1,3). One restricted-range ISDF
  *    point selection (max = 32 = the pair rank nc^2 nk); nested rank scan
  *    N_m in {8, 16, 24, 32}: eta(q, nu) table, monotone decreasing and
  *    small at full rank. Kernel-level secondary-vs-global agreement at N_m = 32 on
@@ -378,9 +378,9 @@ namespace bdft_tests {
   } // namespace r2
 
   // ====================================================================================
-  TEST_CASE("vertex_refinement2_toy", "[methods][vertex][refinement2]") {
+  TEST_CASE("vertex_secondary_isdf_toy", "[methods][vertex][secondary_isdf]") {
 #ifndef ENABLE_DLR
-    SUCCEED("vertex_refinement2_toy skipped: build has ENABLE_DLR=OFF.");
+    SUCCEED("vertex_secondary_isdf_toy skipped: build has ENABLE_DLR=OFF.");
 #else
     auto& mpi_context = utils::make_unit_test_mpi_context();
     auto& comm = mpi_context->comm;   // kernels all-reduce internally; inputs replicated
@@ -433,7 +433,7 @@ namespace bdft_tests {
       }
       auto [t, sv, rank] = r2::solve_t(B, C, 1e-12);
       double cond_s = (sv(0) / sv(sv.size() - 1)) * (sv(0) / sv(sv.size() - 1));
-      app_log(1, "r2 toy: q = {}: cond(s) = {}, rank = {}/{}", iq, cond_s, rank, Nm_full);
+      app_log(1, "secondary ISDF toy: q = {}: cond(s) = {}, rank = {}/{}", iq, cond_s, rank, Nm_full);
       REQUIRE(rank == Nm_full);
       // full rank: B t = C exactly (range(B) spans the pair space)
       double dmax = 0.0, cmax = 0.0;
@@ -444,11 +444,11 @@ namespace bdft_tests {
           dmax = std::max(dmax, std::abs(bt - C(I, P)));
           cmax = std::max(cmax, std::abs(C(I, P)));
         }
-      app_log(1, "r2 toy: q = {}: max|B t - C| = {} (scale {})", iq, dmax, cmax);
+      app_log(1, "secondary ISDF toy: q = {}: max|B t - C| = {} (scale {})", iq, dmax, cmax);
       REQUIRE(dmax < 1e-10 * cmax);
       // eta on the bare core must vanish at full rank
       double e = r2::eta(B, C, t, mdl.Z_qPQ(iq, r_all, r_all));
-      app_log(1, "r2 toy: q = {}: eta[Z] (full rank) = {}", iq, e);
+      app_log(1, "secondary ISDF toy: q = {}: eta[Z] (full rank) = {}", iq, e);
       REQUIRE(e < 1e-10);
       t_q.push_back(std::move(t));
     }
@@ -473,7 +473,7 @@ namespace bdft_tests {
         for (long m = 0; m < Nm; ++m)
           for (long n = 0; n < Nm; ++n) S2 += Pib(m, n) * Wb(n, m);
         double rel = std::abs(S1 - S2) / std::max(std::abs(S2), 1e-300);
-        app_log(1, "r2 toy: no-leak (Nm = {}, q = {}): rel = {}", Nm, iq, rel);
+        app_log(1, "secondary ISDF toy: no-leak (Nm = {}, q = {}): rel = {}", Nm, iq, rel);
         REQUIRE(rel < 1e-12);
       }
     }
@@ -521,7 +521,7 @@ namespace bdft_tests {
               smax = std::max(smax, std::abs(g));
               dmax = std::max(dmax, std::abs(g - Sig_s(it, 0, ik, a, b)));
             }
-      app_log(1, "r2 toy: Sigma^C secondary vs global (C-C block, full rank): "
+      app_log(1, "secondary ISDF toy: Sigma^C secondary vs global (C-C block, full rank): "
                  "max|diff| = {}, scale = {}, rel = {}", dmax, smax, dmax / smax);
       REQUIRE(smax > 1e-10);
       REQUIRE(dmax < 1e-9 * std::max(smax, 1.0));
@@ -548,7 +548,7 @@ namespace bdft_tests {
           for (long M = 0; M < r2::Np; ++M)
             for (long N = 0; N < r2::Np; ++N)
               dmax = std::max(dmax, std::abs(Pi_g(l, iq, M, N) - Pi_up(l, iq, M, N)));
-      app_log(1, "r2 toy: Pi^C upfolded secondary vs global[G~] (full rank): "
+      app_log(1, "secondary ISDF toy: Pi^C upfolded secondary vs global[G~] (full rank): "
                  "max|diff| = {}, scale = {}, rel = {}", dmax, smax, dmax / smax);
       REQUIRE(smax > 1e-10);
       REQUIRE(dmax < 1e-9 * std::max(smax, 1.0));
@@ -568,9 +568,9 @@ namespace bdft_tests {
       cplx S_PW_up = r2::trace_pi_W(ft, tools, T0row, Pi_up, mdl.Z_qPQ, Wt, r2::nk);
       double rel = r2::rel_residual(S_SG, S_PW_bar);
       double leak = std::abs(S_PW_bar - S_PW_up) / std::max(std::abs(S_PW_bar), 1e-300);
-      app_log(1, "r2 toy: conservation (secondary): S_SG = ({}, {}), S_PW = ({}, {}), "
+      app_log(1, "secondary ISDF toy: conservation (secondary): S_SG = ({}, {}), S_PW = ({}, {}), "
                  "rel = {}", S_SG.real(), S_SG.imag(), S_PW_bar.real(), S_PW_bar.imag(), rel);
-      app_log(1, "r2 toy: trace-level no-leak: |S_PW(bar) - S_PW(upfold vs global)| rel = {}",
+      app_log(1, "secondary ISDF toy: trace-level no-leak: |S_PW(bar) - S_PW(upfold vs global)| rel = {}",
               leak);
       REQUIRE(std::abs(S_SG) > 1e-12);
       REQUIRE(rel < 1e-8);
@@ -604,7 +604,7 @@ namespace bdft_tests {
         if (not std::isfinite(std::abs(v))) ++nbad;
         smax = std::max(smax, std::abs(v));
       }
-      app_log(1, "r2 toy: reduced rank Nm = {}: max_q eta[Z] = {}, max|Sigma^C| = {} "
+      app_log(1, "secondary ISDF toy: reduced rank Nm = {}: max_q eta[Z] = {}, max|Sigma^C| = {} "
                  "(full-rank scale for comparison logged above)", Nm, eta_max, smax);
       REQUIRE(nbad == 0);
       REQUIRE(eta_max > 1e-8);   // genuinely truncated
@@ -613,15 +613,15 @@ namespace bdft_tests {
   }
 
   // ====================================================================================
-  TEST_CASE("vertex_refinement2_lih", "[methods][vertex][refinement2][smoke]") {
+  TEST_CASE("vertex_secondary_isdf_lih", "[methods][vertex][secondary_isdf][smoke]") {
 #ifndef ENABLE_DLR
-    SUCCEED("vertex_refinement2_lih skipped: build has ENABLE_DLR=OFF.");
+    SUCCEED("vertex_secondary_isdf_lih skipped: build has ENABLE_DLR=OFF.");
 #else
     auto& mpi_context = utils::make_unit_test_mpi_context();
     // wmax = 6.0: the headroom the vertex needs so that products of tau-objects (pair and
     // triple products) stay within the IAFT basis span
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
-    std::string output = "coqui_vertex_r2";
+    std::string output = "coqui_vertex_secisdf";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
@@ -643,7 +643,7 @@ namespace bdft_tests {
                                        solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
                                        1, false, 1e-9, true);
     mpi_context->comm.barrier();
-    app_log(1, "r2 lih: baseline scGW iteration: e_hf = {}, e_corr = {}", e_hf_0, e_corr_0);
+    app_log(1, "secondary ISDF lih: baseline scGW iteration: e_hf = {}, e_corr = {}", e_hf_0, e_corr_0);
     REQUIRE(std::isfinite(e_hf_0));
     REQUIRE(std::isfinite(e_corr_0));
     scr_eri.update_w(mb_state, thc, -1);
@@ -654,7 +654,7 @@ namespace bdft_tests {
     const long nkpts = MF->nkpts(), nqpts = MF->nqpts();
     const long Np = thc.Np(), nbnd = MF->nbnd();
     utils::check(nqpts == MF->nqpts_ibz() and nkpts == MF->nkpts_ibz() and nqpts == nkpts,
-                 "vertex_refinement2_lih: needs a symmetry-free mesh.");
+                 "vertex_secondary_isdf_lih: needs a symmetry-free mesh.");
     auto G_loc = mb_state.sG_tskij.value().local();
     const long nt = G_loc.shape(0), ns = G_loc.shape(1);
     const long nt_half = (nt % 2 == 0) ? nt / 2 : nt / 2 + 1;
@@ -726,7 +726,7 @@ namespace bdft_tests {
           int(iq_gamma), int(Npair), Crng, Crng);
       (void)dXb;
       Nm_sel = ipts.extent(0);
-      app_log(1, "r2 lih: restricted point selection returned N_m = {} (requested {})",
+      app_log(1, "secondary ISDF lih: restricted point selection returned N_m = {} (requested {})",
               Nm_sel, Npair);
       REQUIRE(Nm_sel >= 8);
       nda::array<cplx, 4> Xa(ns, nkpts, nc, Nm_sel);
@@ -749,7 +749,7 @@ namespace bdft_tests {
     // per-rank transfers + eta table (eta on Z and on dW(tau = 0) slices, all q)
     std::vector<std::vector<nda::array<cplx, 2>>> t_of_rank(ranks.size());
     std::vector<double> etaZ_max(ranks.size(), 0.0), etaW_max(ranks.size(), 0.0);
-    app_log(1, "r2 lih: ---- eta(q) table (Eq. 40): rows = N_m, cols = q ----");
+    app_log(1, "secondary ISDF lih: ---- downfold-error eta(q) table: rows = N_m, cols = q ----");
     for (size_t ir = 0; ir < ranks.size(); ++ir) {
       long Nm = ranks[ir];
       nda::array<cplx, 4> Xb(ns, nkpts, Nm, nc);
@@ -776,9 +776,9 @@ namespace bdft_tests {
         rowW += sci(eW);
         t_of_rank[ir].push_back(std::move(t));
       }
-      app_log(1, "r2 lih: N_m = {:2}: eta[Z](q)  = {}   (max = {:.3e}, max cond(s) = {:.3e})",
+      app_log(1, "secondary ISDF lih: N_m = {:2}: eta[Z](q)  = {}   (max = {:.3e}, max cond(s) = {:.3e})",
               Nm, rowZ, etaZ_max[ir], cond_max);
-      app_log(1, "r2 lih: N_m = {:2}: eta[dW](q) = {}   (max = {:.3e})",
+      app_log(1, "secondary ISDF lih: N_m = {:2}: eta[dW](q) = {}   (max = {:.3e})",
               Nm, rowW, etaW_max[ir]);
     }
     // monotone decreasing in N_m (nested bases; small slack for the truncated solve)
@@ -835,7 +835,7 @@ namespace bdft_tests {
                 scc = std::max(scc, std::abs(g));
                 dmax = std::max(dmax, std::abs(g - Sig_s(it, is, ik, a, b)));
               }
-      app_log(1, "r2 lih: Sigma^C at N_m = {}: max|Sig_glob| (full) = {}, (C-C) = {}, "
+      app_log(1, "secondary ISDF lih: Sigma^C at N_m = {}: max|Sig_glob| (full) = {}, (C-C) = {}, "
                  "max|Sig_sec - Sig_glob|_CC = {}, rel = {}",
               NmB, sfull, scc, dmax, dmax / std::max(scc, 1e-300));
       REQUIRE(scc > 1e-12);
@@ -870,7 +870,7 @@ namespace bdft_tests {
           for (long M = 0; M < Np; ++M)
             for (long N = 0; N < Np; ++N)
               dmax = std::max(dmax, std::abs(Pi_g(l, iq, M, N) - Pi_up(l, iq, M, N)));
-      app_log(1, "r2 lih: Pi^C at N_m = {}: max|Pi_glob[G~]| = {}, "
+      app_log(1, "secondary ISDF lih: Pi^C at N_m = {}: max|Pi_glob[G~]| = {}, "
                  "max|Pi_upfold - Pi_glob| = {}, rel = {}",
               NmB, smax, dmax, dmax / std::max(smax, 1e-300));
       REQUIRE(smax > 1e-12);
@@ -890,10 +890,10 @@ namespace bdft_tests {
       cplx S_PW_up = r2::trace_pi_W(ft, tools, T0row, Pi_up, Z_qPQ, Wt_qtPQ, nkpts);
       double rel = r2::rel_residual(S_SG, S_PW_bar);
       double leak = std::abs(S_PW_bar - S_PW_up) / std::max(std::abs(S_PW_bar), 1e-300);
-      app_log(1, "r2 lih: conservation (secondary, ignore_g0): S_SG = ({}, {}), "
+      app_log(1, "secondary ISDF lih: conservation (secondary, ignore_g0): S_SG = ({}, {}), "
                  "S_PW = ({}, {}), rel = {}",
               S_SG.real(), S_SG.imag(), S_PW_bar.real(), S_PW_bar.imag(), rel);
-      app_log(1, "r2 lih: trace-level no-leak: rel = {}", leak);
+      app_log(1, "secondary ISDF lih: trace-level no-leak: rel = {}", leak);
       REQUIRE(std::abs(S_SG) > 1e-12);
       REQUIRE(rel < 1e-3);
       REQUIRE(leak < 1e-10);
@@ -954,7 +954,7 @@ namespace bdft_tests {
       cplx S_SG_g = r2::trace_sigma_G(tools, Sig_sg, G_CC);
       cplx S_PW_g = r2::trace_pi_W(ft, tools, T0row, Pi_sg, Zb_a, Wtb_a, nkpts);
       double rel_g = r2::rel_residual(S_SG_g, S_PW_g);
-      app_log(1, "r2 lih: conservation (secondary, gygi head downfolded): "
+      app_log(1, "secondary ISDF lih: conservation (secondary, gygi head downfolded): "
                  "S_SG = ({}, {}), S_PW = ({}, {}), rel = {}",
               S_SG_g.real(), S_SG_g.imag(), S_PW_g.real(), S_PW_g.imag(), rel_g);
       REQUIRE(std::isfinite(rel_g));
@@ -970,13 +970,13 @@ namespace bdft_tests {
   // End-to-end: 1-iteration scGW with BOTH cuts through the PRODUCTION vertex_t
   // plumbing (lazy secondary-basis build, per-iteration folding, C-C placement,
   // upfold), global vs secondary at N_m = 32 and N_m = 8.
-  TEST_CASE("vertex_refinement2_lih_end2end", "[methods][vertex][refinement2][smoke]") {
+  TEST_CASE("vertex_secondary_isdf_lih_end2end", "[methods][vertex][secondary_isdf][smoke]") {
 #ifndef ENABLE_DLR
-    SUCCEED("vertex_refinement2_lih_end2end skipped: build has ENABLE_DLR=OFF.");
+    SUCCEED("vertex_secondary_isdf_lih_end2end skipped: build has ENABLE_DLR=OFF.");
 #else
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
-    std::string output = "coqui_vertex_r2_e2e";
+    std::string output = "coqui_vertex_secisdf_e2e";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
@@ -1011,15 +1011,15 @@ namespace bdft_tests {
     auto [e_hf_8, e_corr_8, nm_8] = run("secondary", 8);
     (void)nm_g;
 
-    app_log(1, "r2 e2e: ---- end-to-end table (LiH-222 nosym, 1-iteration scGW, both "
+    app_log(1, "secondary ISDF e2e: ---- end-to-end table (LiH-222 nosym, 1-iteration scGW, both "
                "cuts, ignore_g0) ----");
-    app_log(1, "r2 e2e: global            e_hf = {}, e_corr = {}", e_hf_g, e_corr_g);
-    app_log(1, "r2 e2e: secondary N_m={:2} e_hf = {}, e_corr = {}  (D e_corr vs global = {})",
+    app_log(1, "secondary ISDF e2e: global            e_hf = {}, e_corr = {}", e_hf_g, e_corr_g);
+    app_log(1, "secondary ISDF e2e: secondary N_m={:2} e_hf = {}, e_corr = {}  (D e_corr vs global = {})",
             nm_32, e_hf_32, e_corr_32, e_corr_32 - e_corr_g);
-    app_log(1, "r2 e2e: secondary N_m={:2} e_hf = {}, e_corr = {}  (D e_corr vs N_m=32 = {})",
+    app_log(1, "secondary ISDF e2e: secondary N_m={:2} e_hf = {}, e_corr = {}  (D e_corr vs N_m=32 = {})",
             nm_8, e_hf_8, e_corr_8, e_corr_8 - e_corr_32);
-    app_log(1, "r2 e2e: NOTE: STRICT C-C externals (theory-owner ruling, memo DECISION "
-               "2) -- both paths now\n"
+    app_log(1, "secondary ISDF e2e: NOTE: externals are restricted to the C-C block -- both "
+               "paths\n"
                "        evaluate the SAME functional cuts; at full secondary rank the "
                "residual difference is\n"
                "        pure downfold truncation (svd_tol class), asserted below.");
@@ -1032,7 +1032,7 @@ namespace bdft_tests {
     // returns the NUMERICAL rank of the C pair metric, <= the counting rank 32) global
     // and secondary must agree to the downfold/kernel accuracy class.
     if (nm_32 < 32)
-      app_log(1, "r2 e2e: [NOTE] selection returned N_m = {} < 32 (numerical pair-metric "
+      app_log(1, "secondary ISDF e2e: [NOTE] selection returned N_m = {} < 32 (numerical pair-metric "
                  "rank); the downfold is complete there.", nm_32);
     REQUIRE(std::abs(e_hf_32 - e_hf_g) < 1e-5);
     REQUIRE(std::abs(e_corr_32 - e_corr_g) < 1e-5);

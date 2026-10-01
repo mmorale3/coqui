@@ -749,7 +749,7 @@ namespace bdft_tests {
       const double collapse = meig / std::max(mfix, 1e-300);
       app_log(1, "cvv_ks_head_control: EIGEN-GAUGE mechanism pin: max|Phead| fixed "
                  "basis = {:.4e}, eigen gauge = {:.4e}, ratio = {:.3e} "
-                 "(H1: the eigen-gauge store loses the interband dipole)",
+                 "(the eigen-gauge store loses the interband dipole)",
               mfix, meig, collapse);
       REQUIRE(std::isfinite(collapse));
       REQUIRE(collapse < 0.05);   // the collapse IS the mechanism; the bar leaves
@@ -834,7 +834,7 @@ namespace bdft_tests {
       solvers::cvv_head_t cvvc(&ft, 0.9);
       cvvc.build(*mf, dyson.H0(), mb_state.sF_skij.value().local(),
                  mb_state.sSigma_tskij.value().local());
-      app_log(1, "cvv_build_lih222: P1 aggressive tol 0.9 -> nR_kept = {} / {}",
+      app_log(1, "cvv_build_lih222: aggressive compaction tol 0.9 -> nR_kept = {} / {}",
               cvvc.nR_kept(), cvvc.nR());
       REQUIRE(cvvc.nR_kept() >= 1);
       REQUIRE(cvvc.nR_kept() < cvvc.nR());

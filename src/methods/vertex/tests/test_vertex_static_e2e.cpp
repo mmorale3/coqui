@@ -357,27 +357,27 @@ namespace bdft_tests {
             (std::abs(off.e_corr - ref.e_corr) > 0.0
                  ? 100.0 * std::abs(on.e_corr - off.e_corr)
                        / std::abs(off.e_corr - ref.e_corr) : 0.0));
-    app_log(1, "  Si reference for the same quantity: 1.17e-02, i.e. 1.6x the whole B-S "
+    app_log(1, "  Si reference value for the same quantity: 1.17e-02, i.e. 1.6x the B-S "
                "vertex correction (+7.118e-03).");
     app_log(1, "  ---- head meters (last iteration) ----");
     app_log(1, "    |<H, Pi^L(Gamma)>|      OFF {:.6e}   ON {:.6e}", off.hl, on.hl);
     app_log(1, "    |<H, Pi^{{C,0}}(Gamma)>|  OFF {:.6e}   ON {:.6e}", off.hs, on.hs);
     app_log(1, "    max|removed|/max|Pi^L|  OFF {:.4f}         ON {:.4f}   "
-               "(Si: 0.6590 at the converged solution)", off.removed, on.removed);
+               "(Si reference value: 0.6590, converged)", off.removed, on.removed);
     app_log(1, "    resp share |S^(C,r)|/|S^(C,x)|  OFF {:.4f}   ON {:.4f}   "
-               "(Si: 1.0126 OFF / 0.1037 ON; LiH range on file 0.12-0.24)",
+               "(Si reference values: 1.0126 OFF / 0.1037 ON; LiH reference range 0.12-0.24)",
             off.resp_share, on.resp_share);
     app_log(1, "  ---- THE SIGN QUESTION, at ONE policy on ONE system ----");
-    app_log(1, "    d(e_corr):  B-S {:+.4e}   B-L(honest, projection OFF) {:+.4e}   "
+    app_log(1, "    d(e_corr):  B-S {:+.4e}   B-L (projection OFF) {:+.4e}   "
                "-> signs {}",
             bs.e_corr - ref.e_corr, off.e_corr - ref.e_corr,
             (((bs.e_corr - ref.e_corr) * (off.e_corr - ref.e_corr)) > 0.0
                  ? "AGREE" : "DISAGREE"));
-    app_log(1, "    Si at the same policy: B-S +7.118e-03, B-L OFF -6.850e-03 -> DISAGREE.");
-    app_log(1, "    The +1.153e-03 / +1.134e-03 LiH pair on file that motivated \"LiH "
-               "agrees, Si does not\"");
-    app_log(1, "    was measured at div_treatment = \"ignore_g0\", i.e. WITH NO GAMMA HEAD "
-               "AT ALL.");
+    app_log(1, "    Si reference values, same policy: B-S +7.118e-03, B-L OFF -6.850e-03 -> DISAGREE.");
+    app_log(1, "    LiH reference values B-S +1.153e-03 / B-L +1.134e-03 (signs agree) "
+               "belong to");
+    app_log(1, "    div_treatment = \"ignore_g0\", i.e. to the policy with NO Gamma head "
+               "at all.");
     app_log(1, "==========================================================================\n");
 
     REQUIRE(std::isfinite(ref.e_corr));
@@ -837,7 +837,7 @@ namespace bdft_tests {
                  "frequencies", s.dw_rel);
       app_log(1, "    NAIVE power counting predicts |S1+S2|/|S3| ~ 2 * {:.4f} = {:.3f}; "
                  "measured {:.3f}\n"
-                 "    -> UNEXPLAINED AMPLIFICATION {:.2f}x",
+                 "    -> amplification over power counting {:.2f}x",
               s.dw_rel, 2.0 * s.dw_rel, s.ratio,
               (s.dw_rel > 0.0 ? s.ratio / (2.0 * s.dw_rel) : 0.0));
       app_log(1, "    d(e_corr) signs:  B-S {}   B-L {}   -> {}",
@@ -1017,7 +1017,7 @@ namespace bdft_tests {
     const auto n = run("linear", "ignore_g0");
     const auto s = run("static", "gygi");
 
-    app_log(1, "\n========== P0.1: DOES THE GAMMA HEAD CANCEL IN dW = W - W0? ==========");
+    app_log(1, "\n========== B-L dW HEAD CHANNEL: DOES THE GAMMA HEAD CANCEL IN dW = W - W0? ==========");
     app_log(1, "  LiH-222, C = [1,3), 2 COLD iterations, meters from the LAST eval_Sigma_C.");
     app_log(1, "  chi = thc.basis_head() (the G = 0 components of the aux basis) -- the");
     app_log(1, "  direction the rank-1 head is built from, so this is ITS channel.");
@@ -1038,7 +1038,7 @@ namespace bdft_tests {
     app_log(1, "    COHERENCE (1 = pure chi chi^dag)      {:11.3f}   {:11.3f}   -> {:.1f}x",
             g.head_coh, n.head_coh,
             (n.head_coh > 0.0 ? g.head_coh / n.head_coh : 0.0));
-    app_log(1, "  ---- and why the log's i.nu = 0 meter could never see any of it ----");
+    app_log(1, "  ---- the same channel at i.nu = 0 (where dW vanishes by construction) ----");
     app_log(1, "    |h_dW| at i.nu = 0    [a.u.]          {:11.4e}   {:11.4e}",
             g.head_nu0, n.head_nu0);
     app_log(1, "    the nu = 0 slice understates by       {:11.1f}x  {:11.1f}x",
@@ -1049,7 +1049,7 @@ namespace bdft_tests {
     app_log(1, "  B-S control @ gygi: dw_rel = {:.4f}, head_rel = {:.4f}, head_bg = {:.4f} "
                "(-1 = NEVER MEASURED, as it must be: B-S has no dW)",
             s.dw_rel, s.head_rel, s.head_bg);
-    app_log(1, "  Reference from [blmixed] on the same protocol: |S1+S2|/|S3| = 3.228 "
+    app_log(1, "  Reference values from [blmixed], same protocol: |S1+S2|/|S3| = 3.228 "
                "(gygi) vs 0.035 (ignore_g0).");
     app_log(1, "======================================================================\n");
 
@@ -1139,14 +1139,14 @@ namespace bdft_tests {
   //
   // HIDDEN ([.]), 4 runs. Run with:
   //   cd build/tests/bin
-  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blh1]"
-  TEST_CASE("vertex_bl_head_static_all_gate0", "[.][methods][vertex][static][blh1]") {
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blstatichead]"
+  TEST_CASE("vertex_bl_head_static_all", "[.][methods][vertex][static][blstatichead]") {
 #ifndef ENABLE_DLR
-    SUCCEED("vertex_bl_head_static_all_gate0 skipped: build has ENABLE_DLR=OFF.");
+    SUCCEED("vertex_bl_head_static_all skipped: build has ENABLE_DLR=OFF.");
 #else
     auto &mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
-    std::string output = "coqui_vertex_blh1";
+    std::string output = "coqui_vertex_blstatichead";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
@@ -1197,21 +1197,21 @@ namespace bdft_tests {
     const double d_off = bl_off.e_corr - E_SCGW;
     const double d_on  = bl_on.e_corr - E_SCGW;
 
-    app_log(1, "\n========== GATE 0: THE H1 STATIC-HEAD VERTEX (delta W_head == 0) ==========");
+    app_log(1, "\n========== B-L WITH THE STATIC HEAD IN EVERY W INPUT (delta W_head == 0) ==========");
     app_log(1, "  LiH-222, C = [1,3), 2 COLD iterations, meters from the LAST eval_Sigma_C.");
-    app_log(1, "  arm                      e_corr          d(e_corr)      dw_rel   head_abs     head_coh");
-    app_log(1, "    B-S gygi   H1 off   {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
+    app_log(1, "  arm (static head)        e_corr          d(e_corr)      dw_rel   head_abs     head_coh");
+    app_log(1, "    B-S gygi   off      {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
             bs_off.e_corr, d_bs, bs_off.dw_rel, bs_off.head_abs, bs_off.head_coh);
-    app_log(1, "    B-S gygi   H1 ON    {:.12f}   {:+.4e}   (must be bit-identical to the row above)",
+    app_log(1, "    B-S gygi   ON       {:.12f}   {:+.4e}   (must be bit-identical to the row above)",
             bs_on.e_corr, bs_on.e_corr - E_SCGW);
-    app_log(1, "    B-L gygi   H1 off   {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
+    app_log(1, "    B-L gygi   off      {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
             bl_off.e_corr, d_off, bl_off.dw_rel, bl_off.head_abs, bl_off.head_coh);
-    app_log(1, "    B-L gygi   H1 ON    {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
+    app_log(1, "    B-L gygi   ON       {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
             bl_on.e_corr, d_on, bl_on.dw_rel, bl_on.head_abs, bl_on.head_coh);
-    app_log(1, "  head_abs collapse: {:.1f}x   coherence: {:.3f} -> {:.3f}   d(B-L,H1)/d(B-S) = {:.3f}",
+    app_log(1, "  head_abs collapse: {:.1f}x   coherence: {:.3f} -> {:.3f}   d(B-L,static head)/d(B-S) = {:.3f}",
             (bl_on.head_abs > 0.0 ? bl_off.head_abs / bl_on.head_abs : -1.0),
             bl_off.head_coh, bl_on.head_coh, (d_bs != 0.0 ? d_on / d_bs : 0.0));
-    app_log(1, "  References: B-L @ ignore_g0 d = +1.1343e-03; [blmixed] |S1+S2|/|S3| = 3.228 (gygi).");
+    app_log(1, "  Reference values (same protocol): B-L @ ignore_g0 d = +1.1343e-03; [blmixed] |S1+S2|/|S3| = 3.228 (gygi).");
     app_log(1, "============================================================================\n");
 
     // ---- HARNESS INTEGRITY: the H1-off arms reproduce the reference energies -------------
@@ -1246,7 +1246,7 @@ namespace bdft_tests {
     // fluctuation head moves it by well under 1 % of the gygi-vs-ignore_g0 difference. The
     // damage is carried by the STATIC head weight eps^-1(0) in B-L's W0-consuming
     // structures, which a lambda scan cannot separate from the fluctuation head (both are
-    // linear in lambda); see vertex_bl_h1_static_head_split. These checks pin that
+    // linear in lambda); see vertex_bl_static_head_split. These checks pin that
     // behavior: if the energy ever starts responding to the fluctuation head, they fire.
     REQUIRE(std::abs(bl_on.e_corr - bl_off.e_corr) < 1.0e-3);   // energy-insensitive
     REQUIRE(d_on < 0.0);                                        // still sign-flipped
@@ -1263,7 +1263,7 @@ namespace bdft_tests {
 
   // ======================================================================================
   // B-L STATIC-HEAD SPLIT: where does the static-head damage live? With the knob of
-  // [blh1], the gygi damage is NOT dW's coherent head (removing it barely moves the
+  // [blstatichead], the gygi damage is NOT dW's coherent head (removing it barely moves the
   // energy); it is proportional to the STATIC head weight eps^-1(0) carried by B-L's
   // W0-consuming structures. Under H1 those are, exhaustively:
   //   (i)   S1/S2's static rung  (W0(Gamma) head x the dW BODY convolution),
@@ -1278,14 +1278,14 @@ namespace bdft_tests {
   //
   // HIDDEN ([.]), 7 runs. Run with:
   //   cd build/tests/bin
-  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blh1split]"
-  TEST_CASE("vertex_bl_h1_static_head_split", "[.][methods][vertex][static][blh1split]") {
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blstaticheadsplit]"
+  TEST_CASE("vertex_bl_static_head_split", "[.][methods][vertex][static][blstaticheadsplit]") {
 #ifndef ENABLE_DLR
-    SUCCEED("vertex_bl_h1_static_head_split skipped: build has ENABLE_DLR=OFF.");
+    SUCCEED("vertex_bl_static_head_split skipped: build has ENABLE_DLR=OFF.");
 #else
     auto &mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
-    std::string output = "coqui_vertex_blh1split";
+    std::string output = "coqui_vertex_blstaticheadsplit";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
@@ -1317,7 +1317,7 @@ namespace bdft_tests {
     };
 
     const double E_SCGW  = -0.096212991792;   // plain scGW, this protocol
-    const double E_FULL0 = -0.100096475753;   // [blh1]'s bl_on: full B-L @ gygi + H1
+    const double E_FULL0 = -0.100096475753;   // [blstatichead]'s bl_on: full B-L @ gygi + H1
 
     const double e_full = run(0, 0);   // everything
     const double e_d3   = run(3, 0);   // P^{C,L} via Sigma_GW alone (the shares' baseline)
@@ -1332,9 +1332,9 @@ namespace bdft_tests {
     const double sh_cx  = e_d1 - e_d3;      // full Sigma^{C,x} share
     const double S1 = e_s1 - e_d3, S2 = e_s2 - e_d3, S3 = e_s3 - e_d3;
 
-    app_log(1, "\n========== GATE 0.5: THE STATIC-HEAD DAMAGE, LOCALIZED (all arms H1) ==========");
-    app_log(1, "  B-L @ gygi + H1, LiH-222, C = [1,3), 2 COLD iterations. Shares are");
-    app_log(1, "  ABLATIONS WITH FEEDBACK (trap 8): signs and orders only.");
+    app_log(1, "\n========== B-L STATIC-HEAD SPLIT: THE DAMAGE, LOCALIZED (all arms static head) ==========");
+    app_log(1, "  B-L @ gygi + static head, LiH-222, C = [1,3), 2 COLD iterations. Shares are");
+    app_log(1, "  ABLATIONS WITH FEEDBACK (the pieces do not add): signs and orders only.");
     app_log(1, "    full theory            e = {:.12f}   d = {:+.4e}", e_full, e_full - E_SCGW);
     app_log(1, "    P^(C,L) alone (drop 3) e = {:.12f}   share = {:+.4e}", e_d3, sh_pcl);
     app_log(1, "    Sigma^(L,r)  share (drop2 - drop3)   = {:+.4e}", sh_lr);
@@ -1344,10 +1344,10 @@ namespace bdft_tests {
     app_log(1, "    S3 = W0_x W0_y share                 = {:+.4e}", S3);
     app_log(1, "    |S1 + S2| / |S3|                     = {:.4f}",
             (S3 != 0.0 ? std::abs(S1 + S2) / std::abs(S3) : -1.0));
-    app_log(1, "  On-file columns, same protocol, NO H1 ([blmixed]):");
+    app_log(1, "  Reference values from [blmixed], same protocol, NO static head:");
     app_log(1, "    gygi:      S3 +1.9648e-03, S1 = S2 = -3.1708e-03, ratio 3.228");
     app_log(1, "    ignore_g0: S3 +1.8911e-03, S1 = S2 = +3.2730e-05, ratio 0.035");
-    app_log(1, "  READ:  S1/S2 still ~ -3e-03 -> the damage is W0's STATIC head x the dW BODY");
+    app_log(1, "  Reading: S1/S2 still ~ -3e-03 -> the damage is W0's STATIC head x the dW BODY");
     app_log(1, "         (the mixed terms' Gamma_x cell). S1/S2 collapsed to +3e-05 class ->");
     app_log(1, "         the damage lives in P^(C,L) injection and/or Sigma^(L,r) instead.");
     app_log(1, "===============================================================================\n");
@@ -1359,7 +1359,7 @@ namespace bdft_tests {
     REQUIRE(std::isfinite(e_s1));
     REQUIRE(std::isfinite(e_s2));
     REQUIRE(std::isfinite(e_s3));
-    // Harness integrity: the full arm reproduces [blh1]'s bl_on number.
+    // Harness integrity: the full arm reproduces [blstatichead]'s bl_on number.
     REQUIRE(std::abs(e_full - E_FULL0) < 1e-8);
     // Liveness of the slot probe: restricting to S3 must differ from full Sig^{C,x}.
     REQUIRE(std::abs(e_s3 - e_d1) > 1e-6);
@@ -1409,7 +1409,7 @@ namespace bdft_tests {
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
 
-    // Same protocol as [blmixed]/[bldwhead]/[blh1]: LiH-222, C = [1,3), 2 COLD
+    // Same protocol as [blmixed]/[bldwhead]/[blstatichead]: LiH-222, C = [1,3), 2 COLD
     // iterations, gw and scr_coulomb pinned at ignore_g0.
     auto run = [&](std::string const &rung, std::string const &policy) -> double {
       solvers::hf_t hf;
@@ -1437,8 +1437,8 @@ namespace bdft_tests {
     const double d_n  = p_n - E_SCGW;
     const double gap  = d_g - d_n;
 
-    app_log(1, "\n========== GATE 1: THE PARENT (DYNAMIC-RUNG) HEAD GAP ==========");
-    app_log(1, "  LiH-222, C = [1,3), 2 COLD iterations. On-file companions, same protocol:");
+    app_log(1, "\n========== THE PARENT (DYNAMIC-RUNG) HEAD GAP ==========");
+    app_log(1, "  LiH-222, C = [1,3), 2 COLD iterations. Reference values, same protocol:");
     app_log(1, "    B-S  d = +1.1986e-03 (gygi) / +1.1529e-03 (ig0)  -> gap = +4.57e-05");
     app_log(1, "    B-L  d = -3.8642e-03 (gygi) / +1.1343e-03 (ig0)  -> gap = -5.00e-03");
     app_log(1, "  PARENT:");
@@ -1446,10 +1446,10 @@ namespace bdft_tests {
     app_log(1, "    e_corr(ignore_g0) = {:.12f}   d = {:+.4e}", p_n, d_n);
     app_log(1, "    gap               = {:+.4e}   gap/gap_BS = {:+.1f}   gap/gap_BL = {:+.3f}",
             gap, gap / 4.57e-05, gap / -5.00e-03);
-    app_log(1, "  VERDICT KEY: |gap| ~ 5e-05 class -> (a) B-L's anomaly is pure truncation");
-    app_log(1, "               (H1 accurate; the Phi^(2) cross terms cancel the head).");
+    app_log(1, "  Interpretation: |gap| ~ 5e-05 class -> (a) B-L's anomaly is pure truncation");
+    app_log(1, "               (static head accurate; the Phi^(2) cross terms cancel the head).");
     app_log(1, "               gap ~ -5e-03 class  -> (b) head dominance is REAL parent");
-    app_log(1, "               physics at N_k = 8 (program-wide coarse-mesh issue).");
+    app_log(1, "               physics at N_k = 8 (a coarse-mesh effect).");
     app_log(1, "================================================================\n");
 
     REQUIRE(std::isfinite(p_g));
@@ -1582,7 +1582,7 @@ namespace bdft_tests {
     for (auto const *sys : {"qe_si211", "qe_lih222", "qe_lih223"})
       res.push_back(measure(sys));
 
-    app_log(1, "\n===== P0.2: DOES THE Gamma HEAD MOVE THE N_k -> inf LIMIT? =====");
+    app_log(1, "\n===== B-L HEAD N_k CONVERGENCE: DOES THE Gamma HEAD MOVE THE N_k -> inf LIMIT? =====");
     app_log(1, "  C = [1,3), 2 COLD iterations per arm, 5 arms per system.");
     app_log(1, "  gap := d(e_corr)[gygi] - d(e_corr)[ignore_g0]. A legitimate finite-size");
     app_log(1, "  accelerator must have gap -> 0 as N_k grows. B-S is the control (same two");
@@ -1594,13 +1594,13 @@ namespace bdft_tests {
                  "{:8.2f}",
               r.sys, r.nkpts, r.d_bs_g, r.d_bs_n, r.gap_bs, r.d_bl_g, r.d_bl_n, r.gap_bl,
               (std::abs(r.d_bl_n) > 0.0 ? std::abs(r.gap_bl) / std::abs(r.d_bl_n) : 0.0));
-    app_log(1, "  ---- the P0.1 head-channel meters on the B-L gygi arm ----");
+    app_log(1, "  ---- the dW head-channel meters on the B-L gygi arm ----");
     app_log(1, "  system      N_k   madelung      |h_dW(Gamma)|   coherence (1 = pure "
                "chi chi^dag)");
     for (auto const &r : res)
       app_log(1, "  {:<10} {:4}  {:+.4e}   {:.4e}      {:.3f}",
               r.sys, r.nkpts, r.madelung, r.head_abs, r.head_coh);
-    app_log(1, "  ---- ⭐ WITHOUT THE HEAD, DOES B-L TRACK B-S? ----");
+    app_log(1, "  ---- WITHOUT THE HEAD, DOES B-L TRACK B-S? ----");
     app_log(1, "  system      N_k   d_BS(ig0)    d_BL(ig0)    |difference|   relative");
     for (auto const &r : res)
       app_log(1, "  {:<10} {:4}  {:+.4e}  {:+.4e}  {:.4e}   {:8.2f} %",
@@ -1623,7 +1623,7 @@ namespace bdft_tests {
                    ? "B-L gap SHRINKS (accelerator behaving)"
                    : "B-L gap DOES NOT SHRINK (the two policies are not converging together)"));
     }
-    app_log(1, "  ⚠ Two rungs per material only -- this measures the DIRECTION of gap(N_k),");
+    app_log(1, "  NOTE Two rungs per material only -- this measures the DIRECTION of gap(N_k),");
     app_log(1, "    NOT a convergence exponent. Si and LiH numbers are not comparable.");
     app_log(1, "===============================================================\n");
 
@@ -1787,11 +1787,11 @@ namespace bdft_tests {
     const double bl_g0 = run("linear", "gygi", 0.0);        // lambda = 0 at gygi
     const double bl_ig = run("linear", "ignore_g0", 1.0);   // the real ignore_g0
 
-    app_log(1, "\n===== P0.3: THE Gamma-HEAD STRENGTH SCAN =====");
+    app_log(1, "\n===== THE Gamma-HEAD STRENGTH SCAN =====");
     app_log(1, "  LiH-222, C = [1,3), 2 COLD iterations. plain scGW e_corr = {:.12f}", ref);
     app_log(1, "  ---- the two pins ----");
-    app_log(1, "    lambda = 1 @ gygi      e_corr = {:.12f}   (must equal the -3.8642e-03 "
-               "shift on file)", bl_g1);
+    app_log(1, "    lambda = 1 @ gygi      e_corr = {:.12f}   (reference value: shift "
+               "-3.8642e-03)", bl_g1);
     app_log(1, "    lambda = 0 @ gygi      e_corr = {:.12f}", bl_g0);
     app_log(1, "    div_treatment ignore_g0 e_corr = {:.12f}   |difference| = {:.3e}",
             bl_ig, std::abs(bl_g0 - bl_ig));
@@ -1989,13 +1989,13 @@ namespace bdft_tests {
     const double ref10 = run_plain("");
     const double bs10  = run_plain("static");
 
-    app_log(1, "\n===== P4: COLD B-L ON LiH AT gygi, {} ITERATIONS =====", NIT);
+    app_log(1, "\n===== COLD-START B-L ON LiH AT gygi, {} ITERATIONS =====", NIT);
     app_log(1, "  mixing 0.7, projection OFF   e_corr = {:.9f}", m07);
     app_log(1, "  mixing 0.3, projection OFF   e_corr = {:.9f}   <- damping only; touches "
                "the ITERATION MAP, not Phi", m03);
     app_log(1, "  mixing 0.7, projection ON    e_corr = {:.9f}   <- Phi-BREAKING, reference "
                "only", proj);
-    app_log(1, "  Si cold reference: e_corr reached -2.46 / -2.02 / -5.97 at iterations 4-8.");
+    app_log(1, "  Si reference values (cold start): e_corr -2.46 / -2.02 / -5.97 at iterations 4-8.");
     app_log(1, "  plain-scGW scale here is ~-0.096, so |e_corr| >> 1 means DIVERGED.");
     app_log(1, "  --> LiH cold at mixing 0.7 {} reproduce the Si instability.",
             (std::abs(m07) > 1.0 or not std::isfinite(m07)) ? "DOES" : "does NOT");
@@ -2007,7 +2007,7 @@ namespace bdft_tests {
     app_log(1, "    plain scGW  e_corr = {:.9f}", ref10);
     app_log(1, "    B-S         e_corr = {:.9f}   d = {:+.4e}", bs10, bs10 - ref10);
     app_log(1, "    B-L         e_corr = {:.9f}   d = {:+.4e}", m07, m07 - ref10);
-    app_log(1, "    at 2 iterations these were  B-S +1.1986e-03 / B-L -3.8642e-03 -> DISAGREE");
+    app_log(1, "    reference values at 2 iterations:  B-S +1.1986e-03 / B-L -3.8642e-03 -> DISAGREE");
     app_log(1, "    at {} iterations they {}.", NIT,
             (((bs10 - ref10) * (m07 - ref10)) > 0.0 ? "AGREE -- the 2-iteration reading "
                                                       "does NOT survive"
@@ -2130,8 +2130,8 @@ namespace bdft_tests {
   //
   // WHAT THE PROFILE DECIDES: the head enters the S1 kernel at the q_x = Gamma cell (the
   // static-rung W0_x head) and at q_y = Gamma inside every q_x row (the dW_y head, which is
-  // energetically irrelevant, see [blh1]). So the gygi-vs-ignore_g0 difference profile
-  // should be CONCENTRATED at q_x = Gamma -- the per-q_x counterpart of the [blh1] result
+  // energetically irrelevant, see [blstatichead]). So the gygi-vs-ignore_g0 difference profile
+  // should be CONCENTRATED at q_x = Gamma -- the per-q_x counterpart of the [blstatichead] result
   // by an entirely different meter -- and the ignore_g0 body profile shows the integrand's
   // q_x -> 0 behavior under a retarded partner, the quantity a fine-q microcell
   // integration has to be compared against.
@@ -2256,7 +2256,7 @@ namespace bdft_tests {
     auto T_v = trace_qx(qxS_v, gA_v);
 
     // ---- the table -------------------------------------------------------------------
-    app_log(1, "\n========== T1 STEP 1: THE PER-q_x S1 PROFILE (iteration-{} kernel) ==========", NIT);
+    app_log(1, "\n========== THE PER-q_x S1 PROFILE (iteration-{} kernel) ==========", NIT);
     app_log(1, "  LiH-222, C = [1,3), S1 = W0_x dW_y only (only_term = 1); gw/scr at ignore_g0.");
     app_log(1, "  T(q_x) = the q_x slice of Tr[Sigma^(S1) G] in the eval_corr_energy convention.");
     app_log(1, "  e_corr(S1-only arms): gygi {:.9f}, ignore_g0 {:.9f}, v1_skip {:.9f}", e_g, e_n, e_v);
@@ -2298,7 +2298,7 @@ namespace bdft_tests {
     REQUIRE(nda::max_element(nda::abs(qxS_v(iq_gamma, nda::ellipsis{}))) == 0.0);
 
     // the policy difference is where the theory says it is: concentrated at q_x = Gamma
-    // (the q_y = Gamma dW-head leakage into the body rows is the [blh1]-irrelevant piece)
+    // (the q_y = Gamma dW-head leakage into the body rows is the [blstatichead]-irrelevant piece)
     REQUIRE(std::abs(dT_gamma) > body_absdiff);
 
     // ---- regression values for this protocol ----------------------------------------
@@ -2308,7 +2308,7 @@ namespace bdft_tests {
     //   a few x the neighbouring cells for this mesh. That excess weight is the
     //   integrand-level face of the static-head x retarded-partner mechanism.
     //   Gamma-concentration of the A/B: |dT(Gamma)| / sum_body |dT| is ~50 (about 98 % of
-    //   the difference sits at Gamma) -- the [blh1] result (dW-head irrelevant) per q_x.
+    //   the difference sits at Gamma) -- the [blstatichead] result (dW-head irrelevant) per q_x.
     //   The bars below sit well inside the observed values (ratios ~54 and ~253).
     REQUIRE(std::abs(dT_gamma) > 20.0 * body_absdiff);
     REQUIRE(std::abs(T_g(iq_gamma).real() / T_n(iq_gamma).real()) > 100.0);

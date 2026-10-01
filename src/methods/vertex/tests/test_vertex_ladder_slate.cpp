@@ -158,7 +158,7 @@ namespace bdft_tests {
       REQUIRE(P2.shape(1) == P1.shape(1));
       REQUIRE(P2.shape(2) == P1.shape(2));
       auto [rel_P, scale_P] = relmax(P1, P2);
-      app_log(1, "@@LADSLATE B-1: eval_pol_ladder_whalf g = {} vs g = 1 -- max|dP|/max|P| "
+      app_log(1, "[ladder solve] eval_pol_ladder_whalf g = {} vs g = 1 -- max|dP|/max|P| "
                  "= {:.3e} (max|P| = {:.6e}; {} nu nodes x {} q x {} x {})",
               g, rel_P, scale_P, P1.shape(0), P1.shape(1), P1.shape(2), P1.shape(3));
       REQUIRE(scale_P > 0.0);         // non-vacuous: the ladder is not identically zero
@@ -172,8 +172,8 @@ namespace bdft_tests {
         dlam = std::max(dlam, std::abs(lam1(j) - lam2(j)));
         lscale = std::max(lscale, std::abs(lam1(j)));
       }
-      app_log(1, "@@LADSLATE B-3: lambda_max g = {} vs g = 1 -- max|dlambda| = {:.3e} at "
-                 "max lambda = {:.6f} (relative {:.3e}); the 20-step protocol's own break "
+      app_log(1, "[ladder solve] lambda_max g = {} vs g = 1 -- max|dlambda| = {:.3e} at "
+                 "max lambda = {:.6f} (relative {:.3e}); the 20-step power iteration's own break "
                  "test is 1e-3 relative", g, dlam, lscale,
               dlam / std::max(lscale, 1e-300));
       REQUIRE(lscale > 0.0);
@@ -190,7 +190,7 @@ namespace bdft_tests {
       pv->set_ladder_solve(0, 1e-9);
       auto Pb = pv->eval_pol_ladder_whalf(mb_state, thc, nullptr);
       auto [rel_b, scale_b] = relmax(P1, Pb);
-      app_log(1, "@@LADSLATE B-1b: AUTO grid -- huge budget (=> g = 1) rel = {:.3e}, tiny "
+      app_log(1, "[ladder solve] AUTO grid -- huge budget (=> g = 1) rel = {:.3e}, tiny "
                  "budget (=> widest g that fits) rel = {:.3e} (scale {:.6e})",
               rel_a, rel_b, scale_a);
       REQUIRE(rel_a == 0.0);
@@ -207,7 +207,7 @@ namespace bdft_tests {
     for (long g : gs) {
       pv->set_ladder_solve(g, 8.0);
       auto d2 = pv->ladder_whalf_gate(mb_state, thc, 2.0);
-      app_log(1, "@@LADSLATE B-2: whalf gate node_map_resid -- g = 1: {:.3e} (bitwise), "
+      app_log(1, "[ladder solve] ladder_whalf_gate node_map_resid -- g = 1: {:.3e} (bitwise), "
                  "g = {}: {:.3e} ; ph_sym_resid {:.3e} vs {:.3e} ; ladder_max {:.6e} vs "
                  "{:.6e}", d1.node_map_resid, g, d2.node_map_resid, d1.ph_sym_resid,
               d2.ph_sym_resid, d1.ladder_max, d2.ladder_max);
@@ -237,7 +237,7 @@ namespace bdft_tests {
         pv->set_ladder_solve(g, 8.0);
         auto L2 = pv->eval_pol_ladder_loc_whalf(mb_state, thc, U_syn);
         auto [rel_L, scale_L] = relmax(L1, L2);
-        app_log(1, "@@LADSLATE B-4: eval_pol_ladder_loc_whalf (E legs, {} orbitals) g = {} "
+        app_log(1, "[ladder solve] eval_pol_ladder_loc_whalf (E legs, {} orbitals) g = {} "
                    "vs g = 1 -- max|dP|/max|P| = {:.3e} (max|P| = {:.6e})", norb, g, rel_L,
                 scale_L);
         REQUIRE(scale_L > 0.0);

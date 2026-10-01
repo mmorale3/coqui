@@ -144,9 +144,9 @@ namespace bdft_tests {
 #endif
   }
 
-  TEST_CASE("scgwt_ladder_l1", "[methods][vertex][scgwt][ladder]") {
+  TEST_CASE("scgwt_ladder_pair_space", "[methods][vertex][scgwt][ladder]") {
 #ifndef ENABLE_DLR
-    SUCCEED("scgwt_ladder_l1 skipped: build has ENABLE_DLR=OFF.");
+    SUCCEED("scgwt_ladder_pair_space skipped: build has ENABLE_DLR=OFF.");
 #else
     // Pair-space ladder diagnostics (vertex_t::ladder_l1_gates) on a static-rung state:
     //  l1a  upfold(Pi-bar^0) vs the C-masked GLOBAL-basis Hadamard bubble -- the
@@ -156,7 +156,7 @@ namespace bdft_tests {
     //       Pi^C (pi_c_accumulate_w phase 1 with W0bar); see the assertion below.
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
-    std::string output = "coqui_scgwt_l1";
+    std::string output = "coqui_scgwt_ladder";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
@@ -177,7 +177,7 @@ namespace bdft_tests {
     auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                    solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
                                    2, false, 1e-9, true);
-    app_log(1, "scgwt_ladder_l1: B-S secondary state e_hf = {}, e_corr = {}", e_hf, e_corr);
+    app_log(1, "scgwt_ladder_pair_space: B-S secondary state e_hf = {}, e_corr = {}", e_hf, e_corr);
 
     auto diag = vtx.ladder_l1_gates(mb_state, thc);
     // l1a: the pair-density bubble is correct at the representation floor (the bound is
@@ -189,7 +189,7 @@ namespace bdft_tests {
     // is an algebraic REARRANGEMENT of pi_c_accumulate_w phase 1's own sums
     // (vertex_ladder.icc header for the derivation), so it must reproduce the
     // implemented static-rung Pi^C to machine precision with NO fitted scale.
-    app_log(1, "scgwt_ladder_l1: one-rung rebuild resid = {:.3e}; >= 2-rung content "
+    app_log(1, "scgwt_ladder_pair_space: one-rung rebuild resid = {:.3e}; >= 2-rung content "
                "= {:.3e} (max one-rung {:.3e}, max ladder {:.3e})",
             diag.l1b_resid, diag.ladder_frac, diag.onerung_max, diag.ladder_max);
     REQUIRE(diag.l1b_resid < 1e-10);
@@ -207,8 +207,8 @@ namespace bdft_tests {
     //  meter:   a tol_L = 0.5 kernel genuinely drops shells and its j = 1 error is
     //           visibly larger (the monotone truncation meter).
     auto d4 = vtx.ladder_p4_gates(mb_state, thc);
-    app_log(1, "scgwt_ladder_l1: P4 j1 = {:.3e}, neumann = {:.3e} ({} rungs), "
-               "trunc meter: dropped = {:.3e}, j1_trunc = {:.3e}",
+    app_log(1, "scgwt_ladder_pair_space: matrix-free ladder j1 = {:.3e}, neumann = {:.3e} "
+               "({} rungs), trunc meter: dropped = {:.3e}, j1_trunc = {:.3e}",
             d4.j1_resid, d4.neumann_resid, d4.rungs_used, d4.dropped_frac_test,
             d4.j1_resid_trunc);
     REQUIRE(d4.j1_resid < 1e-11);
@@ -221,7 +221,7 @@ namespace bdft_tests {
     //  nc-length dots -- FP-accumulation differences only);
     //  a tau_PQ = 0.5 list must genuinely drop pairs and its j = 1 error must sit
     //  above the all-kept floor (the monotone pair meter).
-    app_log(1, "scgwt_ladder_l1: P4 sampled (P,Q): all-kept j1 = {:.3e}, neumann = "
+    app_log(1, "scgwt_ladder_pair_space: sampled (P,Q) ladder: all-kept j1 = {:.3e}, neumann = "
                "{:.3e}, reldiff vs dense = {:.3e}; tau=0.5 kept frac = {:.3e}, "
                "j1_trunc = {:.3e}",
             d4.pq_all_j1_resid, d4.pq_all_neumann_resid, d4.pq_all_max_reldiff,
@@ -237,8 +237,8 @@ namespace bdft_tests {
     // The grouped assembly is disjoint writes + a zeros-elsewhere all_reduce, so
     // every scheduling variant must reproduce the replicated reference BITWISE.
     auto d3 = vtx.ladder_p3_gate(mb_state, thc);
-    app_log(1, "scgwt_ladder_l1: P3 scheduling invariance: P2 = {:.3e}, grp1 = "
-               "{:.3e}, grpN = {:.3e} (max abs diff vs replicated)",
+    app_log(1, "scgwt_ladder_pair_space: node-group scheduling invariance: round-robin = "
+               "{:.3e}, grp1 = {:.3e}, grpN = {:.3e} (max abs diff vs replicated)",
             d3.p2_max_diff, d3.grp1_max_diff, d3.grpN_max_diff);
     REQUIRE(d3.p2_max_diff == 0.0);
     REQUIRE(d3.grp1_max_diff == 0.0);
@@ -250,9 +250,9 @@ namespace bdft_tests {
 #endif
   }
 
-  TEST_CASE("scgwt_ladder_l2_readout", "[methods][vertex][scgwt][ladder]") {
+  TEST_CASE("scgwt_ladder_eps_readout", "[methods][vertex][scgwt][ladder]") {
 #ifndef ENABLE_DLR
-    SUCCEED("scgwt_ladder_l2_readout skipped: build has ENABLE_DLR=OFF.");
+    SUCCEED("scgwt_ladder_eps_readout skipped: build has ENABLE_DLR=OFF.");
 #else
     // The ladder eps_M READOUT on a pol-vertex-only run (vertex_type = "none",
     // pol_vertex = "ladder"). Two checks:
@@ -262,7 +262,7 @@ namespace bdft_tests {
     //       (the DIRECTION is only logged here, not asserted).
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
-    std::string output = "coqui_scgwt_l2";
+    std::string output = "coqui_scgwt_readout";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
@@ -294,9 +294,9 @@ namespace bdft_tests {
 
     auto [eh0, ec0, er0, el0] = run(false);
     auto [eh1, ec1, er1, el1] = run(true);
-    app_log(1, "scgwt_ladder_l2_readout: plain e_corr = {}; with readout e_corr = {} "
+    app_log(1, "scgwt_ladder_eps_readout: plain e_corr = {}; with readout e_corr = {} "
                "(D = {:.3e})", ec0, ec1, std::abs(ec1 - ec0));
-    app_log(1, "scgwt_ladder_l2_readout: eps_M(q_min) RPA = {}, +ladder = {} "
+    app_log(1, "scgwt_ladder_eps_readout: eps_M(q_min) RPA = {}, +ladder = {} "
                "(Delta = {:+.6f})", er1, el1, el1 - er1);
     REQUIRE(eh1 == eh0);            // (1) report-only: the loop is bit-identical
     REQUIRE(ec1 == ec0);
@@ -348,7 +348,7 @@ namespace bdft_tests {
                                      2, false, 1e-9, true);
       app_log(1, "scgwt_ladder_ibz: sym B-S state e_hf = {}, e_corr = {}", e_hf, e_corr);
       auto d = vtx.ladder_sym_gate(mb_state, thc);
-      app_log(1, "scgwt_ladder_ibz: sym anchor gate resid = {:.3e}; >= 2-rung content "
+      app_log(1, "scgwt_ladder_ibz: sym one-rung anchor resid = {:.3e}; >= 2-rung content "
                  "= {:.3e} (max one-rung {:.3e}, max ladder {:.3e})",
               d.l1b_resid, d.ladder_frac, d.onerung_max, d.ladder_max);
       REQUIRE(d.sym_active);
