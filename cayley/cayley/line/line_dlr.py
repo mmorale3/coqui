@@ -16,8 +16,8 @@ class LineBasis:
         t = np.exp(np.linspace(np.log(tmin), np.log(tmax), nline))
         self.zeta_dense = np.concatenate([t * np.exp(1j * theta), t * np.exp(1j * (np.pi - theta))])
         Dm, Dp = gap
-        gp = np.exp(np.linspace(np.log(max(Dp, 1e-4 * lam)), np.log(lam), npole // 2))
-        gm = np.exp(np.linspace(np.log(max(Dm, 1e-4 * lam)), np.log(lam), npole // 2))
+        gp = np.exp(np.linspace(np.log(max(Dp, 1e-4 * lam)), np.log(lam), npole // 2)) if Dp < lam else np.zeros(0)
+        gm = np.exp(np.linspace(np.log(max(Dm, 1e-4 * lam)), np.log(lam), npole // 2)) if Dm < lam else np.zeros(0)
         w = np.concatenate([-gm[::-1], gp])
         if Dm <= 0 and Dp <= 0: w = np.concatenate([-gm[::-1], [0.0], gp])
         K = 1.0 / (self.zeta_dense[:, None] - w[None, :])
