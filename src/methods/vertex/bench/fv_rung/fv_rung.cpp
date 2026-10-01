@@ -1,10 +1,11 @@
 // ============================================================================================
-// fv_rung -- factorize_vertex miniapp: the DYNAMIC RUNG APPLICATION of the Gamma_1 vertex, extracted.
+// fv_rung -- factorized-vertex miniapp: the DYNAMIC RUNG APPLICATION of the Gamma_1 vertex, extracted.
 //
 //   y(k', tau_i) = sum_k K_d(tau_i)[(k', p1 p3'), (k, p1' p3)] F(k, tau_i)[(p1' p3)],   i = 0 .. nt-1,
 //   K_d(tau)[(k',p1 p3'),(k,p1' p3)] = sum_PQ X_P,p1(k') X*_P,p1'(k) W_PQ(k - k', tau) X_Q,p3(k+q) X*_Q,p3'(k'+q)
 // (vertex_dynbse.icc::build_kbig / kd, the scale -1/nk and the constant part omitted: they are identical in every variant).
-// Real Si 4^3 data (the W-bar cache dump, analysis/prep_bench.py). Variants:
+// Input: real data in an HDF5 file (load_data in fv_common.hpp: the collocation X, the rung W per transfer and tau
+// representative, the k maps, and the freqR / spatial factors ctau, A, U, Lam), e.g. from a W-bar cache dump. Variants:
 //   dense   : the production path. K_d(tau_r) built per PH-representative tau node (ndist D x D matrices); nt gemms (D x D)(D x nR).
 //   dense2  : same matrices, the two mirror nodes of a representative in ONE gemm (D x D)(D x 2 nR): half the K traffic.
 //   freqR   : W(q', tau) ~ sum_r c_r(tau) A_r(q') (universal time functions): R matrices K_r = Kbig[A_r];

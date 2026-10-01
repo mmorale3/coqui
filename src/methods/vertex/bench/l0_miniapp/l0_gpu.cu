@@ -259,8 +259,8 @@ __global__ void scatter_kernel_v3(kdims d, int which_pass, cd inu,
 // H100's ~233 k resident), so a single k-point underfills the device by ~3x, and the gemm batch
 // is only ng deep. Processing K k-points together multiplies both: grid (ncomp, K) and a
 // cuBLAS batch of ng*K. The cost is memory -- P/Q/B scale with K -- so K is chosen at run time
-// from cudaMemGetInfo (see pick_kbatch). The per-k arrays get a leading K index; K = 1 is the
-// previous behaviour.
+// from cudaMemGetInfo (see pick_kbatch). The per-k arrays get a leading K index; K = 1
+// processes one k-point at a time.
 // cublasZgemmStridedBatched cannot express "A varies with (k, pole), B varies with k only", so
 // the batched-pointer form is used.
 // ============================================================================================
@@ -482,8 +482,8 @@ int main(int argc, char **argv) {
 
   // ---- dynamic batch size: the largest K whose working set fits the device ------------------
   // fixed (independent of K): X, F, the pole tables, Dsq, Fsum.  per k: Vt + 3 * ng * W (P/Q/B)
-  // + 5 accumulators + ng pole matrices. The ultimate implementation has to do exactly this, and
-  // at kp666 / nc 16 it is what keeps the problem on the device at all.
+  // + 5 accumulators + ng pole matrices. A production implementation has to size its batch the
+  // same way; for large meshes and windows this is what keeps the problem on the device at all.
   long Kbatch = 0;
   for (int i = 1; i < argc; ++i)
     if (std::string(argv[i]).rfind("--kbatch=", 0) == 0) Kbatch = std::atol(argv[i] + 9);

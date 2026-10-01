@@ -8,7 +8,7 @@ namespace l0mini {
 
 // ---- a tiny column-major-free gemm: C(M,N) = A(M,K) B(K,N), all row-major -------------------
 // The production code calls nda::blas::gemm (MKL). The miniapp keeps its own so it builds
-// anywhere; -DUSE_BLAS swaps in zgemm, which is what the timings below use on rusty.
+// anywhere; -DUSE_BLAS swaps in zgemm (use it for representative timings).
 #ifdef USE_BLAS
 extern "C" void zgemm_(const char *, const char *, const int *, const int *, const int *, const void *,
                        const void *, const int *, const void *, const int *, const void *, void *, const int *);
@@ -372,8 +372,9 @@ void l0_kernel(inputs const &in, outputs &out, int nthreads, bool materialize_l)
 // In mulU / mulT the component index c selects the node a = c - 1 (or c - 1 - np), so each
 // (pole, component) pair does a read-modify-write of TWO 32 KB node blocks: A[nj], whose index
 // depends only on the pole, and A[a], whose index sweeps the whole node axis as c runs. With the
-// pole loop outside, A[nj] stays in L1 across the 319 components -- but A[a] is a cold RMW
-// 2 * ng * ncomp times per k (~0.8 GB per k), and that is the kernel's DRAM traffic.
+// pole loop outside, A[nj] stays in L1 across the ncomp components -- but A[a] is a cold RMW
+// 2 * ng * ncomp times per k (~0.8 GB per k at the default dims), and that is the kernel's
+// DRAM traffic.
 //
 // Swap the nesting inside a TILE of PB poles: gemm the tile first, then loop components outside
 // and the tile's poles inside. The a-indexed term becomes a REDUCTION over the tile accumulated

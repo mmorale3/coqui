@@ -21,8 +21,8 @@
 #define COQUI_VERTEX_WANNIER_DETAIL_HPP
 
 // The Wannier-projector helpers of vertex_t (Loewdin, G_bar = U^dag G U, X_bar = X U, the chain-rule
-// Sigma injection). Extracted from vertex_t.cpp (W-int-1) so the .icc kernels included BEFORE the
-// vertex_t.cpp body (vertex_ladder.icc::ladder_inputs) can rotate their inputs to the MLWF frame too.
+// Sigma injection). They live in a header so the .icc kernels included BEFORE the vertex_t.cpp body
+// (vertex_ladder.icc::ladder_inputs) can rotate their inputs to the MLWF frame too.
 #include "nda/nda.hpp"
 #include "nda/linalg/eigenelements.hpp"
 #include "utilities/check.hpp"
@@ -32,19 +32,19 @@ namespace methods {
 namespace solvers {
 
   /**
-   * WANNIER-projector helpers (notes/wannier_projector_theory.md section 0-2).
-   * The whole substitution is the linearity lemma (memo section 2.0): with the
-   * fixed Norb x M isometry U(s,k) the four input-slice sites become
+   * WANNIER-projector helpers.
+   * The kernels are linear in their projected inputs, so with the fixed Norb x M
+   * isometry U(s,k) the four input-slice sites become
    *   G_bar = U^dag G U   (M x M),   X_bar = X . U   (Np x M),
-   * fed to the ALREADY projector-general kernels; the Sigma^C cut comes out in
-   * Wannier labels and is injected back as the operator sandwich U Sigma_bar U^dag
-   * (memo C2/C3). All rotations act on the W_rng rows only (U is zero elsewhere),
-   * so the U arrays carry exactly W_rng.size() rows.
+   * fed to the unchanged projector-general kernels; the Sigma^C cut comes out in
+   * Wannier labels and is injected back into the band basis (upfold_Sigma, the
+   * chain-rule sandwich conj(U) Sigma_bar U^T). All rotations act on the W_rng rows
+   * only (U is zero elsewhere), so the U arrays carry exactly W_rng.size() rows.
    */
   namespace vertex_wannier_detail {
 
     // Loewdin orthonormalization of one Norb x M block: U_orth = U (U^dag U)^{-1/2},
-    // via the Hermitian eig of the M x M Gram s = U^dag U (owner ruling Q1). Returns
+    // via the Hermitian eig of the M x M Gram s = U^dag U. Returns
     // ||s - 1_M||_F measured BEFORE the correction. If loewdin == false the block is
     // left raw (the caller warns). nrow = W_rng.size(), M = columns.
     inline double loewdin_block(nda::MemoryArrayOfRank<2> auto &&U, bool loewdin) {
@@ -85,8 +85,7 @@ namespace solvers {
       nda::blas::gemm(tmp, U, Gbar);                  // (U^dag G) U
     }
 
-    // Sigma^C injection (C3, memo section 2.3). CHAIN-RULE form (memo section 1.2),
-    // PINNED-BY-TEST by the gauge check + the kernel-level phase razor (memo section 6.2):
+    // Sigma^C injection, CHAIN-RULE form (pinned by the gauge-invariance tests):
     //   Sigma^C_ij += sum_ab conj(U_ia) Sigma_bar_ab U_jb = [conj(U) Sigma_bar U^T]_ij
     // over i,j in W_rng. The Sigma kernel emits Sigma_bar(a,b) with the external index a
     // carrying the NON-conjugated collocation leg (X_bar, phase phi_a) and b the
@@ -125,9 +124,9 @@ namespace solvers {
     }
 
     // G_bar(t,s,k) = U(s,k)^dag G(t,s,k)|_{W_rng,W_rng} U(s,k) on the FULL BZ k axis.
-    // Under symmetry the band-basis block is sourced with (G1)/(G2): non-trev k is a
+    // Under symmetry the band-basis block is sourced from the IBZ: non-trev k is a
     // pure copy of the IBZ block, trev k the tau-pointwise TRANSPOSE (the same gauge
-    // gather the window path uses; memo section 2.8 / 3.5). G_ibz has the IBZ k axis.
+    // gather the window path uses). G_ibz has the IBZ k axis.
     inline void build_Gbar_fullbz(nda::MemoryArrayOfRank<5> auto const &G_ibz,  // (nt,ns,nk_src,nbnd,nbnd)
                                   nda::array<ComplexType, 4> const &U_skia,
                                   nda::range W_rng, bool sym_mesh,

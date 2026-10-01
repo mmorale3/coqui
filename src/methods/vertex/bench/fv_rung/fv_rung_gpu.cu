@@ -1,5 +1,5 @@
 // ============================================================================================
-// fv_rung_gpu -- the GPU side of the factorize_vertex rung miniapp (see fv_rung.cpp for the math and variants).
+// fv_rung_gpu -- the GPU side of the factorized-vertex rung miniapp (see fv_rung.cpp for the math and variants).
 // Rungs / tables are built on the host (fv_common.hpp, the same code as the CPU miniapp) and uploaded; only the APPLICATION
 // is timed on the device (cuBLAS, row-major data used through the column-major transpose identity C^T = B^T A^T).
 //   dense   : nt zgemm (D x D)(D x nR), K_d(tau_r) resident.

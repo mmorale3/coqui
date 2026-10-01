@@ -2,7 +2,7 @@
 #define COQUI_VERTEX_SIGMA_INTERP_HPP
 
 /**
- * P16 (notes/vertex_perf_plan.md, 2026-09-21): the coarse -> fine interpolation of the pair-resolved Sigma vertex
+ * The coarse -> fine interpolation of the pair-resolved Sigma vertex
  * dSigma(tau, k) (the C-window block of the self-energy correction, vertex_sigma_pair.icc / vertex_sigma_dyn.icc).
  *
  * The band basis at k is gauge-dependent (phases, degenerate mixing), so the smooth object is the WANNIER-frame one,
@@ -12,16 +12,16 @@
  *     dS(tau, R) = 1/N_c sum_k e^{-i k R} dS(tau, k),   dS(tau, k_f) = sum_R w_R e^{i k_f R} dS(tau, R),
  * and the fine mesh's own projector puts it back on the fine window bands, dSigma_f(tau, k_f)_{ij} = sum_ab
  * C_f(k_f)^*_{a i} dS(tau, k_f)_{ab} C_f(k_f)_{b j}, Hermitized when pol_vertex_sigma_pair_herm is on (its anti-Hermitian
- * residual measured first and returned, audit C5). The coarse run writes the Wannier-frame object with its k list, R grid,
+ * residual is measured first and returned). The coarse run writes the Wannier-frame object with its k list, R grid,
  * tau nodes, lattice and the full Sigma-vertex configuration (dump_sigma_pair_wannier; the fine run aborts on any
- * configuration mismatch, audit A12); the fine run consumes it instead of solving
+ * configuration mismatch); the fine run consumes it instead of solving
  * (interpolate_sigma_pair). Requirements: a NOSYM coarse mesh (the full BZ is what the R transform needs), the same
  * imaginary-axis grid (beta and the tau nodes are checked), a fine projector on the fine mesh whose window is the
  * fine pair vertex's window (nc_f = |W_rng|), unitary projectors (the round trip downfold -> upfold is the identity
  * on the window only then; the measured unitarity defect is reported), and -- not checkable here -- the SAME Wannier
  * functions on both meshes: the Wannier-frame object is covariant under a k-INDEPENDENT unitary of the orbitals (the
- * upfold undoes it) but not under a k-dependent gauge difference between two separately generated projector files
- * (notes/CLAUDE.md section 8, demand D2: one U per run). Coarse and fine projectors must come from one Wannierization
+ * upfold undoes it) but not under a k-dependent gauge difference between two separately generated projector files.
+ * Coarse and fine projectors must come from one Wannierization
  * (the fine one by interpolation of the coarse MLWFs, or both from a common set with the same projections and gauge).
  */
 
@@ -48,11 +48,10 @@ namespace vertex_sigma_interp {
   using cplx = ComplexType;
 
   /**
-   * audit A12 (2026-10-01): EVERY option that shapes the stored dSigma. The dump used to carry col / outer only and the
-   * fine run compared nothing, so a dump produced with another column, junction, scale, rung sign, Hermitization, Sigma
-   * path or band window was consumed as if it were this run's. The coarse run writes the full set (cfg_version 1); the
-   * fine run compares it with its own settings and aborts on any mismatch, and a dump without cfg_version (written before
-   * this change) is refused with "regenerate the dump". Fill it with cfg_of(sigma_pair_opts, sigma_pair_dynamic()).
+   * EVERY option that shapes the stored dSigma (column, outer leg, junction side, scale, rung sign, Hermitization, Sigma
+   * path; the band window and lattice are stored separately). The coarse run writes the full set (cfg_version 1); the
+   * fine run compares it with its own settings and aborts on any mismatch, and a dump without cfg_version is refused
+   * with "regenerate the dump". Fill it with cfg_of(sigma_pair_opts, sigma_pair_dynamic()).
    */
   struct interp_cfg {
     std::string col, outer, side;
@@ -75,9 +74,9 @@ namespace vertex_sigma_interp {
     return c;
   }
   inline constexpr long interp_cfg_version = 1;
-  /** audit C5: above this the downfold -> upfold round trip is not the identity on the window (WARNING) */
+  /** above this the downfold -> upfold round trip is not the identity on the window (WARNING) */
   inline constexpr double proj_unitarity_warn_tol = 1e-8;
-  /** audit C5: what the fine consumer measured -- herm_resid is the anti-Hermitian residual of the upfolded dSigma BEFORE
+  /** what the fine consumer measured -- herm_resid is the anti-Hermitian residual of the upfolded dSigma BEFORE
    *  any symmetrization (max |Y - Y^dag| / max |Y|, the eval_sigma_pair dsig_herm convention) */
   struct interp_meter {
     double herm_resid = 0.0, dunit_fine = 0.0, dunit_coarse = 0.0;
@@ -122,7 +121,7 @@ namespace vertex_sigma_interp {
           for (long a = 0; a < M; ++a) for (long b = 0; b < M; ++b) dunit = std::max(dunit, std::abs(CC(a, b) - ((a == b) ? cplx(1.0) : cplx(0.0))));
         }
     }
-    // audit A12: the coarse lattice, so the consumer converts the coarse k with the lattice they were generated on
+    // the coarse lattice, so the consumer converts the coarse k with the lattice they were generated on
     nda::array<double, 2> lat(3, 3);
     {
       auto L = mf.lattv();
@@ -133,7 +132,7 @@ namespace vertex_sigma_interp {
       h5::file f(fn, 'w');
       h5::group g(f);
       h5::h5_write(g, "col", cfg.col); h5::h5_write(g, "outer", cfg.outer);
-      // audit A12: the full configuration (compared by interpolate_sigma_pair)
+      // the full configuration (compared by interpolate_sigma_pair)
       h5::h5_write(g, "cfg_version", interp_cfg_version);
       h5::h5_write(g, "side", cfg.side);
       h5::h5_write(g, "scale", cfg.scale);
@@ -168,7 +167,7 @@ namespace vertex_sigma_interp {
 
 
   /** the fine run: dSigma(tau, k_ibz) on the fine window from the coarse dump (replaces the solve). cfg = THIS run's Sigma-vertex
-   *  configuration (compared with the dump's; audit A12); met, when given, receives the measured residuals (audit C5). */
+   *  configuration (compared with the dump's); met, when given, receives the measured residuals. */
   template<typename comm_t>
   inline nda::array<cplx, 5> interpolate_sigma_pair(mf::MF &mf, projector_t const &proj, std::string const &file,
                                                      nda::array<double, 1> const &tau, double beta, long window_first, long nc, comm_t &comm,
@@ -181,7 +180,7 @@ namespace vertex_sigma_interp {
     nda::array<double, 1> tau_c;
     double beta_c = 0.0, dunit_c = 0.0;
     long M_c = 0, w0_c = -1, nc_c = -1;
-    interp_cfg cc;                    // audit A12: the coarse run's configuration
+    interp_cfg cc;                    // the coarse run's configuration
     nda::array<double, 2> lat_c;
     {
       h5::file f(file, 'r');
@@ -207,7 +206,7 @@ namespace vertex_sigma_interp {
       h5::h5_read(g, "dyn_auto_nodes", cc.dyn_auto_nodes); h5::h5_read(g, "dyn_refit", cc.dyn_refit);
       nda::h5_read(g, "lattv", lat_c);
     }
-    // ---- audit A12: the stored dSigma must be THIS run's object -----------------------------------------------------------
+    // ---- the stored dSigma must be THIS run's object ----------------------------------------------------------------------
     {
       auto same_str = [&](std::string const &a, std::string const &b, const char *key) {
         utils::check(a == b, "interpolate_sigma_pair: {} was written with {} = \"{}\", this run has \"{}\" -- the stored dSigma is a "
@@ -257,7 +256,7 @@ namespace vertex_sigma_interp {
     utils::check(ns == mf.nspin(), "interpolate_sigma_pair: spin count mismatch.");
     // k -> R on the coarse mesh, R -> k on the fine IBZ points
     const long nkf = mf.nkpts_ibz();
-    // audit E: the fine IBZ points are taken as the first nkf points of the full list (kf below, and the caller's dSigma
+    // the fine IBZ points are taken as the first nkf points of the full list (kf below, and the caller's dSigma
     // k axis) -- assert that they ARE the identity-mapped IBZ representatives
     if (mf.nkpts() != mf.nkpts_ibz()) {
       auto k2i = mf.kp_to_ibz();
@@ -268,7 +267,7 @@ namespace vertex_sigma_interp {
                      ik, long(k2i(ik)), int(bool(ktr(ik))));
     }
     nda::array<cplx, 2> f_Rk(nR, nkc), f_kR(nkf, nR);
-    // audit A12: the coarse k are converted with the COARSE lattice (the one they were generated on; checked equal to this
+    // the coarse k are converted with the COARSE lattice (the one they were generated on; checked equal to this
     // run's above, so the R vectors mean the same thing on both sides)
     nda::stack_array<double, 3, 3> lat_cs;
     for (int i = 0; i < 3; ++i)
@@ -293,8 +292,8 @@ namespace vertex_sigma_interp {
             for (long b = 0; b < M; ++b) dSf(it, is, ik, a, b) = Cf(ik, (is * M + a) * M + b);
     }
     // upfold onto the fine window bands: dSigma_ij = sum_ab conj(C_ai) dS_ab C_bj, then (cfg.hermitize) Hermitize.
-    // audit C5: the anti-Hermitian residual is MEASURED before the symmetrization (it used to be hard-wired and reported as 0
-    // by the caller), and the projection honours cfg.hermitize (= the coarse run's, checked above) instead of always applying.
+    // The anti-Hermitian residual is MEASURED before the symmetrization, and the projection honours cfg.hermitize (= the
+    // coarse run's, checked above).
     nda::array<cplx, 5> out(nt, ns, nkf, nc, nc);
     auto C = proj.C_skIai();
     nda::array<cplx, 2> T(M, nc), Y(nc, nc);

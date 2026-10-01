@@ -1,15 +1,14 @@
 // ============================================================================================
 // L0 MINIAPP -- the expensive step of the Gamma_1 vertex, extracted.
 //
-// WHY THIS KERNEL. Measured on the Si 4^3 production runs (notes/vertex_perf_plan.md, 2026-09-24):
-// a chain iteration with Gamma_1 in both P and Sigma spends ~97 % of its wall in the Sigma-side
-// dynamic-vertex "solve", and the solver's own timers put 95.9 % of THAT in t_l0 -- the pair-pole
-// applications (rung applications are 2.4 %, refits 0.6 %). The solve does ONE operator
-// application per RHS block (every unit reports "1 applications, converged true"), so there is no
-// Krylov iteration count to cut: l0_apply IS the cost.
+// WHY THIS KERNEL. With Gamma_1 in both P and Sigma, an iteration's wall time is dominated by the
+// Sigma-side dynamic-vertex "solve", and within the solve by t_l0 -- the pair-pole applications
+// (rung applications and refits are minor). The solve does ONE operator application per RHS block
+// (every unit reports "1 applications, converged true"), so there is no Krylov iteration count to
+// cut: l0_apply IS the cost.
 //
-// WHAT IS REPRODUCED. dynbse.hpp::l0_apply_shift_cols (the inu != 0 twisted {U,T} path, which all
-// but one of the 79 bosonic nodes take), per k-point:
+// WHAT IS REPRODUCED. dynbse.hpp::l0_apply_shift_cols (the inu != 0 twisted {U,T} path, which every
+// bosonic node except nu = 0 takes), per k-point:
 //   A. pack the input into Vt(nc, ncomp, nR, nc), ncomp = 1 + 2 np components (constant + U_a + T_a);
 //   B. for each G pole j: three skinny gemms  Pj = gj^T Vt,  Qj = Pj Ghat_j,  Bj = Pj gkq_j^T
 //      and for each l: two more                Pl = Gtil_l Vt,  Rl = Pl gkq_l^T;
@@ -17,8 +16,8 @@
 //      five node-resolved accumulators AU, AT, M2, A1, A3 of shape (2, np, nc, nR, nc);
 //   D. assemble AU/AT (+ the confluent M2/A1/A3 through the D^2 / D^3 tables) into F and Fsum.
 // Phase B is BLAS3 but tall-and-skinny (K = N = nc = 8); phase C is a pure read-modify-write
-// scatter with no reuse. Production shape per L0 application: ~1.1 TFLOP of gemm and ~0.3 TB of
-// scatter traffic -- which is why it is the target for a GPU port and for CPU re-blocking.
+// scatter with no reuse. At the default (production-sized) dims one L0 application is ~1.1 TFLOP
+// of gemm and ~0.3 TB of scatter traffic -- hence the GPU port and the CPU re-blocking.
 //
 // The arrays are filled with deterministic pseudo-random data of the right shapes and sparsity;
 // the miniapp checks kernels against each other, never against physics.
@@ -37,8 +36,8 @@ namespace l0mini {
 
 using cplx = std::complex<double>;
 
-// production dimensions: Si 4^3, C = [0,8), DLR prec high, the Sigma-side UNION grid
-// (79 vertex nodes + 80 G nodes = 159), RHS blocked at 32 of N_m = 156
+// default dimensions: a production-sized case (Si 4^3, C = [0,8), DLR prec high, the Sigma-side
+// UNION grid of 79 vertex nodes + 80 G nodes = 159, RHS blocked at 32 of N_m = 156)
 struct dims {
   long nk = 64;      // k-points (the OpenMP axis)
   long nc = 8;       // C-window size

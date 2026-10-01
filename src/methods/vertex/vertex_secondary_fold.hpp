@@ -22,28 +22,24 @@
 #define COQUI_VERTEX_SECONDARY_FOLD_HPP
 
 /**
- * Impl 2 -- DISTRIBUTED downfold of the RPA (t, P, Q)-distributed dynamic W to the
- * secondary aux basis (N_m x N_m), WITHOUT ever gathering a full Np x Np block per rank
- * (notes/vertex_parallelization_v2_plan.md section "6b. Impl 2 distributed-downfold
- * DESIGN").
+ * DISTRIBUTED downfold of the RPA (t, P, Q)-distributed dynamic W to the secondary aux
+ * basis (N_m x N_m), WITHOUT ever gathering a full Np x Np block per rank.
  *
  * The dynamic screened interaction mb_state.dW_qtPQ lives on the RPA proc grid
- * {1(q), nt_procs, np_P, np_Q}: the q axis is NOT split, the t/P/Q axes are. The legacy
- * secondary path (eval_Pi_C Step 1b) GATHERED a full (nt_half, Np, Np) tau slab per q
- * (6.4 GB per (t,q) block at production Np = 20000) and folded it with fold_core. This
- * routine instead assembles, PER (P,Q) BLOCK, only that block's full-t slab (a t-pool
- * all_reduce over the disjoint t-partition -- exact), folds it in place with
- * fold_core_block, and sums the (P,Q)-block partials with one final all_reduce. No rank
- * ever holds more than its own (P,Q) block.
+ * {1(q), nt_procs, np_P, np_Q}: the q axis is NOT split, the t/P/Q axes are. Gathering a
+ * full (nt_half, Np, Np) tau slab per q and folding it with fold_core (the replicated path)
+ * needs O(nt_half Np^2) memory per rank. This routine instead assembles, PER (P,Q) BLOCK,
+ * only that block's full-t slab (a t-pool all_reduce over the disjoint t-partition --
+ * exact), folds it in place with fold_core_block, and sums the (P,Q)-block partials with
+ * one final all_reduce. No rank ever holds more than its own (P,Q) block.
  *
- * Correctness (proved in section 6b): at test scale the RPA puts every rank on t
- * (np_P = np_Q = 1) so there is ONE (P,Q) block == the whole array; the t_pool is the
- * whole comm; the block-assembly all_reduce reproduces the exact gathered slab (disjoint
- * partition sum), fold_core_block with the full range == fold_core, and the final comm
- * all_reduce sums one non-zero rank's result with zeros => BIT-IDENTICAL to the
- * replicated fold. At production the (P,Q) split makes the final sum a disjoint-block
- * reduction whose reassociation is O(1e-11) (refinement2 tol). The physics tests never
- * exercise np_P,np_Q > 1 -- test_vertex_dfold does, with a forced 1x1x2x2 grid.
+ * Correctness: with np_P = np_Q = 1 there is ONE (P,Q) block == the whole array; the t_pool
+ * is the whole comm; the block-assembly all_reduce reproduces the exact gathered slab
+ * (disjoint partition sum), fold_core_block with the full range == fold_core, and the final
+ * comm all_reduce sums one non-zero rank's result with zeros => BIT-IDENTICAL to the
+ * replicated fold. With a (P,Q) split the final sum is a disjoint-block reduction that
+ * differs from the replicated fold only by floating-point reassociation. test_vertex_dfold
+ * exercises np_P, np_Q > 1 with a forced 1x1x2x2 grid.
  */
 
 #include <array>
@@ -61,8 +57,8 @@ namespace solvers {
 namespace vertex_secondary_detail {
 
 /**
- * Off-diagonal block fold of the downfold core (theoryB Eq. 36 restricted to a (P,Q)
- * block of the global aux index):
+ * Off-diagonal block fold of the downfold core Wbar = t W t^dag restricted to a (P,Q)
+ * block of the global aux index:
  *   out(m, n) = [ t_qP  A_PQ  t_qQ^dag ](m, n),
  * where t_qP = t(q)(:, P_range) is (N_m x P_bs), t_qQ = t(q)(:, Q_range) is (N_m x Q_bs),
  * and A_PQ is the block (P_bs x Q_bs). tmp_mQ is scratch (N_m x Q_bs). On a DIAGONAL block
@@ -78,8 +74,8 @@ inline void fold_core_block(nda::MemoryArrayOfRank<2> auto const& t_qP,
 }
 
 /**
- * Off-diagonal block UPFOLD (theoryB Eq. 38 restricted to a (P,Q) block of the global aux
- * index -- the ADJOINT of fold_core_block):
+ * Off-diagonal block UPFOLD Pi = t^dag Pibar t restricted to a (P,Q) block of the global
+ * aux index (the ADJOINT of fold_core_block):
  *   out(P, Q) = [ t_qP^dag  Pi_mn  t_qQ ](P, Q),
  * where t_qP = t(q)(:, P_range) is (N_m x P_bs), t_qQ = t(q)(:, Q_range) is (N_m x Q_bs),
  * Pi_mn is the SECONDARY-aux matrix (N_m x N_m), and out is the block (P_bs x Q_bs). tmp_Pn
@@ -97,7 +93,7 @@ inline void upfold_core_block(nda::MemoryArrayOfRank<2> auto const& t_qP,
 }
 
 /**
- * Gamma-head block ADD (Impl 2c): adds weight * H_PQ(P_range, Q_range) into out_block
+ * Gamma-head block ADD: adds weight * H_PQ(P_range, Q_range) into out_block
  * IN PLACE, WITHOUT ever materializing the dense (Np x Np) head. The head factorizes through
  * the single Np-vector chi_g (vertex_head_detail::build_head_rank1):
  *   H_PQ(P, Q) = c * Re[ conj(chi_g(P)) * chi_g(Q) ],   c = N_k * madelung,
@@ -106,14 +102,14 @@ inline void upfold_core_block(nda::MemoryArrayOfRank<2> auto const& t_qP,
  *
  * The `Re` is REQUIRED, not cosmetic: Gamma is a SELF-INVERSE transfer, where the kernel's
  * rung relation W_PQ(q) = W_QP(-q) reduces to W(q) = W(q)^T and, with Hermiticity, forces
- * the block to be REAL. Dropping it makes Sigma^C non-Hermitian; in B-L that error compounds
- * through the Dyson equation (measured on Si: Im(e_corr)/Re(e_corr) growing 3-4x per
- * iteration). Full argument in vertex_t.cpp::build_head_rank1 and notes/rung_pair_symmetry.md.
+ * the block to be REAL. Dropping it makes Sigma^C non-Hermitian, and in a self-consistent
+ * calculation that error compounds through the Dyson equation. Full argument in
+ * vertex_t.cpp::build_head_rank1.
  *
  * Per element this still reproduces the dense-H arithmetic BIT-FOR-BIT: build_head_rank1
  * computes double(nkpts) * xi * std::real(conj(chi(P)) * chi(Q)) and this computes
  * c * std::real(conj(chi_g(P)) * chi_g(Q)) with c == double(nkpts) * xi and the same operand
- * order; the caller applies its weight exactly as the legacy folds did (Z: weight = 1; W:
+ * order; the caller applies its weight exactly as the replicated folds do (Z: weight = 1; W:
  * weight = ComplexType(eps(it).real())).
  *
  *   chi_g   : Np-vector chi(iq_gamma, :) = thc.basis_head()(iq_gamma, all)
@@ -137,7 +133,7 @@ inline void head_block_add(nda::MemoryArrayOfRank<1> auto const& chi_g,
 }
 
 /**
- * Distributed downfold of the dynamic W (section 6b algorithm). Fills Wbar_qwmm
+ * Distributed downfold of the dynamic W (algorithm above). Fills Wbar_qwmm
  * (nq, nw_b, N_m, N_m) with sum over the (P,Q) blocks of t Wdyn(q,nu) t^dag, computed
  * without materializing any full Np x Np slab. Template parameters keep the frequency
  * transform (tau -> nu PH-symmetric) and the Gamma-head insertion out of this header, so
@@ -212,7 +208,7 @@ void fold_dW_distributed(dArray_t const& dW,
     // block partial, which the final comm all_reduce then sums.
     if (t_pool.rank() == 0) {
       // Gamma head into the assembled block BEFORE the tau -> nu transform (same order as
-      // the legacy add_head_tau; block-sliced to my P_range/Q_range).
+      // add_head_tau in the replicated path; block-sliced to my P_range/Q_range).
       if (head_at_gamma and iq == iq_gamma)
         for (long it = 0; it < nt_half; ++it)
           head_add(W_bt(it, all, all), it, P_range, Q_range);
@@ -237,9 +233,9 @@ void fold_dW_distributed(dArray_t const& dW,
 }
 
 /**
- * Impl 2b -- DISTRIBUTED downfold of the BARE Coulomb core Z (theoryB Eq. 36) to the
- * secondary aux (N_m x N_m), WITHOUT ever materializing the replicated (nq, Np, Np) Z_qPQ
- * (320 GB @ production Np = 20000). This is the fold_dW_distributed sibling, but SIMPLER:
+ * DISTRIBUTED downfold of the BARE Coulomb core Z (Zbar = t Z t^dag) to the secondary aux
+ * (N_m x N_m), WITHOUT ever materializing the replicated (nq, Np, Np) Z_qPQ.
+ * This is the fold_dW_distributed sibling, but SIMPLER:
  * Z has NO t axis, so there is no t-pool, no tau -> nu transform, no PH-unfold. The q axis
  * is NOT split ({1, nP, nQ}); each (P,Q) block is owned by exactly one rank, so EVERY rank
  * folds its own block directly (no "t_pool root" guard) and the final comm all_reduce sums
@@ -249,16 +245,15 @@ void fold_dW_distributed(dArray_t const& dW,
  *   t_qmP        : replicated (nq, N_m, Np) downfold maps
  *   iq_gamma     : Gamma q index; head_at_gamma: whether to add the head block there
  *   head_add     : head_add(A_PQ_block, P_range, Q_range) -- adds the head block into the
- *                  gamma (P,Q) block in place, mirroring the legacy Z_qPQ(iq_gamma) += H_PQ
+ *                  gamma (P,Q) block in place, mirroring the replicated Z_qPQ(iq_gamma) += H_PQ
  *                  (bare piece, weight 1). P_range/Q_range are this rank's block ranges into
  *                  the GLOBAL P,Q. Called at iq_gamma only.
  *   Zbar_qmm     : OUTPUT (nq, N_m, N_m); zeroed and filled here (fully replicated on comm).
  *   comm         : the WHOLE communicator dZ is distributed over
  *
- * At Si test scale (nP = nQ = 1) there is ONE (P,Q) block == the whole array; fold_core_block
+ * With nP = nQ = 1 there is ONE (P,Q) block == the whole array; fold_core_block
  * with the full range == fold_core, and the final all_reduce sums one rank's result with zeros
- * => BIT-IDENTICAL to the replicated fold. The forced (P,Q) split is exercised only by
- * test_vertex_dfold.
+ * => BIT-IDENTICAL to the replicated fold. test_vertex_dfold exercises a forced (P,Q) split.
  */
 template<typename dArray_t, typename TArr, typename HeadFn, typename OutArr>
 void fold_Z_distributed(dArray_t const& dZ,
@@ -301,7 +296,7 @@ void fold_Z_distributed(dArray_t const& dZ,
 
   for (long iq = 0; iq < nqpts_ibz; ++iq) {
     A_PQ() = Z_loc(iq, all, all);
-    // Gamma head into my block BEFORE the fold (same order as the legacy
+    // Gamma head into my block BEFORE the fold (same order as the replicated
     // Z_qPQ(iq_gamma) += H_PQ; block-sliced to my P_range/Q_range).
     if (head_at_gamma and iq == iq_gamma)
       head_add(A_PQ(), P_range, Q_range);

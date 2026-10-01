@@ -1,4 +1,4 @@
-// factorize_vertex rung miniapp: shared host code (inputs, dense build_kbig, factorized tables)
+// factorized-vertex rung miniapp: shared host code (inputs, dense build_kbig, factorized tables)
 #pragma once
 #include <complex>
 #include <vector>

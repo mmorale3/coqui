@@ -1,4 +1,4 @@
-# notes/ladder_opt_spec.md increment B0: the standalone SLATE dense-pipeline bench.
+# The standalone SLATE dense-pipeline bench of the pair-space ladder.
 # Its own target, deliberately NOT a unit test -- it is a scan harness (minutes to hours
 # per design point) and a regression bench for the distributed ladder path. It carries no
 # coqui state, so it links only what the distributed dense algebra needs.

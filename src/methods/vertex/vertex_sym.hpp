@@ -22,32 +22,31 @@
 #define COQUI_VERTEX_SYM_HPP
 
 /**
- * IBZ k-point symmetry context for the ISDF-Vertex kernels
- * (notes/vertex_ibz_symmetry.md).
+ * IBZ k-point symmetry context for the ISDF-Vertex kernels.
  *
  * Carries everything the kernels need to source their rung transfers from
  * IBZ-stored W/Z on a symmetry-reduced mesh:
  *   - per full-BZ transfer q': the qsymms position of the mapping symmetry,
  *     the IBZ transfer index, and the time-reversal flag;
- *   - the effective C-window collocation columns Xhat (memo (X-hat)): for a rung
+ *   - the effective C-window collocation columns Xhat: for a rung
  *     mapped by symmetry position js, leg k-point kL and window orbital j,
  *       js = 0        :  Xhat(s,0,kL,:,j)  = X(kL)(:, C0+j)          [stored X]
  *       non-trev kL   :  Xhat(s,js,kL,:,j) = sum_a X(krot(js,kL))(:, C0+a) Dc(a,j)
  *       trev kL       :  Xhat(s,js,kL,:,j) = conj( sum_a X(krot(js, pair(kL)))(:, C0+a) Dc(a,j) )
- *     with Dc the PLAIN C-block of MF->symmetry_rotation (no extra normalization
- *     -- the consumer precedent, projector_boson_t.cpp:108-121; the stored D is
- *     already row-normalized at the nbnd truncation, symmetry.hpp:1067-1092).
+ *     with Dc the PLAIN C-block of MF->symmetry_rotation (no extra normalization,
+ *     as in projector_boson_t.cpp; the stored D is already row-normalized at the
+ *     nbnd truncation, see symmetry.hpp).
  *   - trev TRANSFERS (qp_trev(q')) require NO conjugation anywhere: the rotated
  *     transfer is -qs and the element is read from the qs storage by the exact
- *     dictionary side-swap = a PQ-TRANSPOSE of W/Z (memo (P2)).
+ *     dictionary side-swap = a PQ-TRANSPOSE of W/Z.
  *
  * The kernels receive `sym_ctx const*`; nullptr (or !active) selects the
- * original no-symmetry code paths bit-identically.
+ * no-symmetry code paths.
  *
- * The C-window D-matrix leakage (memo (C-leak)) is a MEASURED DIAGNOSTIC, not a
- * gate (theory-owner ruling 2026-07-17): symmetry-unfolded vertex quantities
- * carry O(leakage) relative error, the C-window analogue of the nbnd-truncation
- * warning in generate_dmatrix.
+ * The C-window D-matrix leakage (the weight a rotated window orbital has outside
+ * the window) is reported as a diagnostic, not enforced: symmetry-unfolded vertex
+ * quantities carry O(leakage) relative error, the C-window analogue of the
+ * nbnd-truncation warning in generate_dmatrix.
  */
 
 #include <memory>
@@ -81,22 +80,20 @@ namespace vertex_sym {
     // momentum rotation map: krot(js, k) = ks_to_k(js, k) (full-BZ, symmetry.hpp:564)
     nda::array<long, 2> krot;
     // time-reversal partner of every full-BZ k (kp_trev_pair) and the -q map of every full-BZ transfer (qminus);
-    // P1, the star fold of the Sigma-side vertex
+    // used by the star fold of the Sigma-side vertex
     nda::array<long, 1> ktrev_pair;   // bz_symmetry's pairs: defined (>= 0) ONLY for the points reached by time reversal alone
     nda::array<long, 1> qminus;
     // the index of -k (mod G) for EVERY full-BZ k (kminus(k) == k at the TRIM points). This, not ktrev_pair, is the map the
-    // star fold needs: on a mesh with time-reversal images ktrev_pair is -1 at every other point (Si 4^3, 6 symmorphic
-    // operations: segfault in minus_transfer_at, 2026-09-21); the LiH fixture has no time-reversal pairs and never saw it.
+    // star fold needs: on a mesh with time-reversal images ktrev_pair is -1 at every point not reached by time reversal
+    // alone.
     nda::array<long, 1> kminus;
 
     // effective C-window collocation columns: (ns, nsym, nk_full, naux, nc).
-    // NODE-SHARED (vertex parallelization M3, change-list item #9): the storage is a
-    // per-NUMA-node shared_array (one copy per node, not per rank -- this is the large
-    // sym member, ns*nsym*nk_full*naux*nc); `Xhat` is a VIEW into that window so all
-    // consumers keep the historic `ctx.Xhat(is, jsym, k, all, all)` access unchanged.
+    // NODE-SHARED: the storage is a per-NUMA-node shared_array (one copy per node, not
+    // per rank -- this is the large sym member, ns*nsym*nk_full*naux*nc); `Xhat` is a
+    // VIEW into that window, accessed as `ctx.Xhat(is, jsym, k, all, all)`.
     // The shared_array lives behind a shared_ptr so its MPI window has a STABLE address
-    // and the view survives the `slot = std::move(ctx)` into the optional. On a single
-    // rank per node this is bit-identical to the former replicated nda::array.
+    // and the view survives the `slot = std::move(ctx)` into the optional.
     std::shared_ptr<math::shm::shared_array<nda::array_view<ComplexType, 5>>> Xhat_shm;
     nda::array_view<ComplexType, 5> Xhat;
 
@@ -106,7 +103,7 @@ namespace vertex_sym {
     nda::array<ComplexType, 4> Dc;
     nda::array<bool, 2> cjg;
 
-    // measured C-window leakage diagnostic (memo section 6)
+    // C-window leakage diagnostic (max / mean over the rotated window orbitals)
     double leak_max = 0.0;
     double leak_mean = 0.0;
     // measured unitarity defect max ||Dc^dag Dc - 1||_F of the C-sector rotation that
@@ -115,7 +112,7 @@ namespace vertex_sym {
   };
 
   /**
-   * P1 (vertex_perf_plan.md, 2026-09-21): the STAR FOLD of a Sigma-side vertex contribution. dSq(t, p, i, j) is the
+   * The STAR FOLD of a Sigma-side vertex contribution. dSq(t, p, i, j) is the
    * contribution of ONE unit -- the ladder solved at the IBZ transfer iq in the identity frame -- to the C-window
    * self-energy at every p of the full mesh, in the mean field's band basis at p. Every image q' of the star of iq
    * (q_star(q') = iq; S_js q' = +qs, or -qs for a time-reversal image, js = q_isym(q')) contributes to the IBZ externals
@@ -135,15 +132,14 @@ namespace vertex_sym {
    * otherwise the (non-conjugated) star image of -qs at p, one level deep. Anything else is refused with a message.
    * n_trev / n_cjg count the time-reversal images and the conjugated rotations applied (the log reports them).
    */
-  /** DIAGNOSTIC (2026-09-22, the Si 4^3 time-reversal finding): vertex_debug sym_trev_notrans = 1 reads the IBZ-stored core
-   *  PLAIN (not PQ-transposed) for a time-reversed transfer at every rung read site. The two differ by W vs conj(W) for a
-   *  Hermitian core, invisible on meshes whose k-points are all TRIM (real collocations: every LiH fixture), decisive on Si 4^3. */
-  /** audit A13 (2026-10-01): the switch alters the answer on any mesh with a non-TRIM time-reversed transfer, so it is
-   *  no longer silent -- the first read logs a level-1 WARNING (it was env-settable via COQUI_SYM_TREV_NOTRANS and never
-   *  logged) -- and EVERY rung / W-bar read site honours it, Sigma included (vertex_sigma.icc q_access and
-   *  vertex_sigma_pair.icc's outer W-bar now; vertex_dynbse.icc / build_kbig already did), so Pi and Sigma never run on
-   *  different rungs. Callers reach this only for a transfer whose q_trev is set (they short-circuit on it), so the
-   *  WARNING appears exactly when the switch changes something. */
+  /** DIAGNOSTIC: vertex_debug sym_trev_notrans = 1 reads the IBZ-stored core PLAIN (not PQ-transposed) for a time-reversed
+   *  transfer at every rung read site. The two differ by W vs conj(W) for a Hermitian core: identical on meshes whose
+   *  k-points are all TRIM (real collocations), different otherwise.
+   *  The switch alters the answer on any mesh with a non-TRIM time-reversed transfer, so the first read logs a level-1
+   *  WARNING. EVERY rung / W-bar read site honours it, Sigma included (vertex_sigma.icc q_access, vertex_sigma_pair.icc's
+   *  outer W-bar, vertex_dynbse.icc / build_kbig), so Pi and Sigma always run on the same rungs. Callers reach this only
+   *  for a transfer whose q_trev is set (they short-circuit on it), so the WARNING appears exactly when the switch changes
+   *  something. */
   inline bool trev_read_transposed() {
     static const bool notrans = [] {
       const bool on = vertex_debug::flag("sym_trev_notrans");   // vertex_debug: sym_trev_notrans (DIAGNOSTIC)
@@ -212,13 +208,12 @@ namespace vertex_sym {
     utils::check(c.qminus.size() == c.nq_full and c.kminus.size() == c.nk_full, "fold_star_into_ibz: the sym context has no qminus / kminus maps.");
     detail::fold_scratch w(nc);
     nda::array<ComplexType, 3> B(nt, nc, nc);
-    // THE C-SECTOR ROTATION CONVENTION OF THE FOLD (fixed 2026-09-22 by measurement, on LiH and at production).
+    // THE C-SECTOR ROTATION CONVENTION OF THE FOLD.
     // A star member's deposit is Y = Dm^dag B Dm with Dm = Dc^T, i.e. Y = conj(Dc) B Dc^T, NOT Dc^dag B Dc. The two agree
-    // wherever Dc is diagonal (a window with no degenerate bands: every gate written before 2026-09-22) and differ inside
-    // degenerate blocks. The discriminator is the anti-Hermitian residual of dSigma BEFORE Hermitization, which the
-    // Hermitization then hides: Si 4^3 noinv C = [0, 8) -- full mesh 1.755e-2, this convention 1.756e-2, the old one
-    // 5.529e-2; LiH [0, 6) IBZ vs full mesh -- 7.5e-4 against 1.7e-2. vertex_debug sym_fold_conv = 0 restores the old form
-    // (1 = this default, 2 = D^*, 3 = D^dag; diagnostic only).
+    // wherever Dc is diagonal (a window with no degenerate bands) and differ inside degenerate blocks. The convention is
+    // fixed by the anti-Hermitian residual of dSigma BEFORE Hermitization (which the Hermitization would otherwise hide):
+    // with Dm = Dc^T the IBZ fold reproduces the full-mesh residual, with Dm = Dc it does not.
+    // vertex_debug sym_fold_conv selects Dm for diagnostics: 1 = Dc^T (default), 0 = Dc, 2 = Dc^*, 3 = Dc^dag.
     const bool fold_dt = vertex_debug::flag("sym_fold_dt") or vertex_debug::flag("sym_dt");
     const long fold_conv = fold_dt ? 1 : long(vertex_debug::number("sym_fold_conv", 1.0));
     for (long qp = 0; qp < c.nq_full; ++qp) {

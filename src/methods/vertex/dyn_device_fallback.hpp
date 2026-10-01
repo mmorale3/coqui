@@ -4,7 +4,7 @@
 #include <string>
 
 namespace methods::solvers {
-  /** factorize-vertex: pol_vertex_dyn_device_fallback (input, default false). A dynamic-vertex device stage that does not fit
+  /** pol_vertex_dyn_device_fallback (input, default false). A dynamic-vertex device stage that does not fit
    *  in device memory (the device-resident unit, the device rung builds, the device Sigma deposits, the device dressed-leg path)
    *  may move to the CPU ONLY when this is true, and then with a WARNING line; false aborts with the reason. Nothing moves
    *  silently. Process-wide: every dynamic-rung pass of the run reads it. */
@@ -12,7 +12,7 @@ namespace methods::solvers {
     static bool v = false;
     return v;
   }
-  /** factorize-vertex: pol_vertex_dyn_device_memory (input, default "stream"). Where the dense rung slab K_d(s) of the
+  /** pol_vertex_dyn_device_memory (input, default "stream"). Where the dense rung slab K_d(s) of the
    *  device-resident unit lives when the unit does not fit in device memory -- the partition is computed at run time per GPU
    *  from the problem size and the free device memory (the later device stages are sized exactly and kept free):
    *    "resident": all device-resident; a unit that does not fit is a device failure (pol_vertex_dyn_device_fallback decides);
@@ -24,8 +24,8 @@ namespace methods::solvers {
     static std::string v = "stream";
     return v;
   }
-  /** factorize-vertex: pol_vertex_dyn_dressed (input, default "auto"). The dressed-leg Gamma_1 readout (exact: the static
-   *  ladder moved onto the frequency-independent legs, notes/dressed_leg_gamma1.pdf):
+  /** pol_vertex_dyn_dressed (input, default "auto"). The dressed-leg Gamma_1 readout (exact: the static ladder is moved
+   *  onto the frequency-independent legs, so the one-dynamic-rung term needs one rung contraction with dressed legs):
    *    "auto": on every dynamic pass that supports it (the Gamma_1-only and one-bare-rung passes, the Sigma columns dyn1 /
    *            dyn1_bare / static_dyn); a pass that does not (the GMRES resummation, the Sigma column dyn) runs the standard
    *            path and logs that it does;
