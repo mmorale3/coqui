@@ -112,12 +112,25 @@ namespace vertex_detail {
    *   symmetrization collapses to a transpose and no -q lookup is required. The
    *   symmetrization is kept for the symmetry-free path, where the identity does not
    *   hold and both terms are genuinely needed.
+   * @param refl - audit D10 (notes/AUDIT.md, 2026-10-01), optional, assume_reflection only: the identity above was
+   *   ASSUMED, never checked on the data actually passed (verify_static_cuts.py measured it for Pi^{C,0}; B-L's
+   *   pi^dyn comes from a different algorithm). When given, it is MEASURED wherever the passed rows allow it:
+   *   a SELF-INVERSE transfer (qminus(q) == q, e.g. every q of a Gamma-centred even mesh) must have Pi(q) = Pi(q)^T,
+   *   and a transfer whose -q partner is a stored row (qminus(q) < nq) must have Pi(-q) = Pi(q)^T. Reported as the max
+   *   over those q of max|violation| / max|Pi(q)|, with the number of checked and uncheckable (-q not stored) q.
+   *   The caller decides (abort / WARNING); the output Dw is unchanged by the check.
    */
+  struct reflection_check {
+    double rel_max = 0.0;   // max_q max|Pi(-q) - Pi(q)^T| / max|Pi(q)| over the checked q
+    long iq_worst = -1;     // the transfer that attains it
+    long n_checked = 0;     // self-inverse + stored-pair transfers checked
+    long n_unchecked = 0;   // transfers whose -q is not a stored row (identity assumed, not verifiable here)
+  };
   template<nda::MemoryArrayOfRank<3> WArr_t, nda::MemoryArrayOfRank<3> PArr_t,
            nda::MemoryArrayOfRank<3> DArr_t>
   void build_delta_w(WArr_t const &W0_qPQ, PArr_t const &Pi0_qPQ,
                      nda::array<long, 1> const &qminus, DArr_t &&Dw_qPQ,
-                     bool assume_reflection = false) {
+                     bool assume_reflection = false, reflection_check *refl = nullptr) {
     decltype(nda::range::all) all;
     const long nq = W0_qPQ.shape(0), N = W0_qPQ.shape(1);
     utils::check(W0_qPQ.shape(2) == N, "build_delta_w: W0 is not square.");
@@ -129,6 +142,24 @@ namespace vertex_detail {
                  "build_delta_w: qminus size {} != nq = {}.", qminus.shape(0), nq);
     utils::check(Dw_qPQ.shape(0) == nq and Dw_qPQ.shape(1) == N and
                  Dw_qPQ.shape(2) == N, "build_delta_w: Dw shape mismatch.");
+
+    // audit D10: measure the reflection identity the assume_reflection path relies on (read-only; see @param refl)
+    if (assume_reflection and refl != nullptr) {
+      *refl = reflection_check{};
+      for (long iq = 0; iq < nq; ++iq) {
+        const long iqm = (iq < qminus.shape(0)) ? qminus(iq) : -1;
+        if (iqm < 0 or iqm >= nq) { ++refl->n_unchecked; continue; }   // -q is not a stored row
+        double viol = 0.0, scale = 0.0;
+        for (long P = 0; P < N; ++P)
+          for (long Q = 0; Q < N; ++Q) {
+            viol = std::max(viol, std::abs(Pi0_qPQ(iqm, P, Q) - Pi0_qPQ(iq, Q, P)));
+            scale = std::max(scale, std::abs(Pi0_qPQ(iq, P, Q)));
+          }
+        ++refl->n_checked;
+        const double rel = (scale > 0.0) ? viol / scale : 0.0;
+        if (rel > refl->rel_max or refl->iq_worst < 0) { refl->rel_max = rel; refl->iq_worst = iq; }
+      }
+    }
 
     nda::array<ComplexType, 2> Psym(N, N), tmp(N, N);
     for (long iq = 0; iq < nq; ++iq) {

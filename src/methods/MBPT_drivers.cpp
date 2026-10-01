@@ -102,6 +102,103 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
 }
 
 /**
+ * audit (notes/AUDIT.md, 2026-10-01): the vertex input checks every driver site that constructs a vertex / knob carrier
+ * runs, so the five sites ([gw] x 2, [evgw], [qpgw] x 2) stay consistent. Rule (user, 2026-10-01): never skip or alter a
+ * requested step silently -- abort when the substitution can change the answer (with an input key re-allowing the old
+ * behaviour where the user decided so), WARN when it only changes performance.
+ */
+namespace mbpt_vertex_audit {
+
+  /** audit D2-D5 / D10: the fallback policies of vertex_t, all default false (= abort). vertex_t's class defaults are
+   *  permissive for library / unit-test callers; THIS is where a user run gets the strict defaults. */
+  inline void set_fallback_keys(solvers::vertex_t &v, ptree const& pt) {
+    const bool head = io::get_value_with_default<bool>(pt,"vertex_allow_missing_head",false);
+    const bool bare = io::get_value_with_default<bool>(pt,"pol_vertex_allow_bare_rung",false);
+    const bool unproj = io::get_value_with_default<bool>(pt,"pol_vertex_allow_unprojected",false);
+    const bool refl = io::get_value_with_default<bool>(pt,"vertex_allow_unchecked_reflection",false);
+    v.set_allow_missing_head(head);
+    v.set_allow_bare_rung(bare);
+    v.set_allow_unprojected(unproj);
+    v.set_allow_unchecked_reflection(refl);
+    if (head or bare or unproj or refl)
+      app_log(1, "  [WARNING] vertex fallbacks re-allowed by input (each continues with a WARNING instead of aborting, and "
+                 "each can change the answer):{}{}{}{}", head ? " vertex_allow_missing_head" : "",
+              bare ? " pol_vertex_allow_bare_rung" : "", unproj ? " pol_vertex_allow_unprojected" : "",
+              refl ? " vertex_allow_unchecked_reflection" : "");
+  }
+
+  /** audit D7 + A15: requests that cannot be honoured as configured. Called AFTER an optional Wannier projector is
+   *  installed (it defines C in Wannier mode). The vertex_t CLASS keeps the exact empty-C no-op (test_vertex_noop). */
+  inline void check_vertex_requests(solvers::vertex_t const &v, ptree const& pt, std::string const& driver) {
+    // D7: a vertex requested with an EMPTY subspace C used to turn into a logged no-op (plain scGW / RPA screening)
+    utils::check(not v.enabled() or v.active(),
+                 "{}: vertex_type = \"{}\" is requested but the vertex subspace C is EMPTY (vertex_band_window = [{}, {})): "
+                 "the vertex would silently contribute nothing (audit D7). Set a non-empty vertex_band_window (or a "
+                 "vertex_wannier_file), or vertex_type = \"none\".", driver, v.vertex_type(), v.band_window().first(),
+                 v.band_window().last());
+    utils::check(not v.pol_vertex_enabled() or v.pol_vertex_active(),
+                 "{}: pol_vertex = \"{}\" (pol_vertex_inject = \"{}\") is requested but the ladder window "
+                 "pol_vertex_band_window = [{}, {}) is EMPTY (it inherits vertex_band_window when absent): the ladder would "
+                 "silently do nothing (audit D7). Set a non-empty pol_vertex_band_window (in Wannier mode: the projector's "
+                 "band window), or pol_vertex = \"none\" and pol_vertex_inject = \"none\".", driver, v.pol_vertex(),
+                 v.pol_vertex_inject(), v.pol_band_window().first(), v.pol_band_window().last());
+    // A15: the Sigma-side vertex (pol_vertex_sigma) is built from the ladder machinery; without the pol vertex the knob
+    // carrier is never attached (or the builders never run) and the requested Sigma vertex was logged as on, never built.
+    auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none");
+    io::tolower(sig_mode);
+    utils::check(sig_mode == "none" or v.pol_vertex_enabled(),
+                 "{}: pol_vertex_sigma = \"{}\" needs the ladder machinery (pol_vertex = \"ladder\" with a non-empty "
+                 "pol_vertex_band_window), but pol_vertex = \"none\": the Sigma vertex would never be built (audit A15).",
+                 driver, sig_mode);
+  }
+
+  /** audit A14: the [evgw] / [qpgw] knob carrier (vertex_type = "none") used to IGNORE the vertex keys the [gw] sites
+   *  parse. The ones the carrier / scr_coulomb path can honour are forwarded exactly like the [gw] pol-vertex-only branch
+   *  does; the Sigma-vertex-only keys ABORT when present in the input (they have no meaning without vertex_type, which these
+   *  drivers do not support). Call after set_pol_vertex and the other carrier setters, before attaching the carrier. */
+  template<typename MF_ptr_t>
+  inline void carrier_vertex_keys(solvers::vertex_t &carrier, solvers::scr_coulomb_t &scr_eri, MF_ptr_t const& mf,
+                                  ptree const& pt, std::string const& driver, std::string const& screen_type) {
+    for (auto const *key : {"vertex_type", "vertex_rung", "vertex_isdf", "vertex_scale", "vertex_ramp_iters",
+                            "vertex_pidyn", "vertex_pidyn_tol", "vertex_bl_head_projection", "vertex_bl_static_head",
+                            "vertex_bl_w0_head_from_w", "vertex_bl_pidyn_const_rung", "vertex_bl_head_static_all"})
+      utils::check(not io::check_child_exists(pt, key),
+                   "{}: {} is not supported in the evgw/qpgw drivers (these drivers carry only the pol-vertex ladder, "
+                   "vertex_type = \"none\"; the key belongs to the Sigma^C / Pi^C vertex of the [gw] driver). Remove it from "
+                   "the input (audit A14).", driver, key);
+    // honoured exactly as in the [gw] sites:
+    //  - vertex_div_treatment: the carrier's q -> 0 policy, which the readout instance now takes (audit A16)
+    auto vertex_div_treatment = io::get_value_with_default<std::string>(pt,"vertex_div_treatment","");
+    io::tolower(vertex_div_treatment);
+    if (not vertex_div_treatment.empty()) carrier.set_div_treatment(vertex_div_treatment);
+    //  - vertex_bl_head_scale (W-int-3): copied onto the readout instance (build_w0 / cache_w heads)
+    carrier.set_bl_head_scale(io::get_value_with_default<double>(pt,"vertex_bl_head_scale",1.0));
+    //  - the eps(q_i, i nu) cuts of the readout (report-only)
+    carrier.set_eps_cut(io::get_value_with_default<long>(pt,"pol_eps_cut",0),
+                        io::get_value_with_default<long>(pt,"pol_eps_cut_dyn_nnu",0));
+    //  - the CVV head's R-shell tolerance (div_treatment = "cvv" only)
+    scr_eri.set_cvv_rspace_tol(io::get_value_with_default<double>(pt,"cvv_rspace_tol",1e-6));
+    //  - the Wannier projector of a pol-vertex-only run (W-int-1), with the same one-projector rule (demand D2)
+    auto vertex_wannier_file = io::get_value_with_default<std::string>(pt,"vertex_wannier_file","");
+    auto vertex_wannier_loewdin = io::get_value_with_default<bool>(pt,"vertex_wannier_loewdin",true);
+    if (not vertex_wannier_file.empty()) {
+      if (screen_type.substr(0,8) == "gw_edmft") {
+        auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
+        utils::check(embed_file == vertex_wannier_file,
+                     "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
+                     "wannier_file = \"{}\": one projector P per run is required (demand "
+                     "D2, notes/wannier_projector_theory.md section 1.5); use the SAME "
+                     "wan.h5 for both.", vertex_wannier_file, embed_file);
+      }
+      auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
+      methods::projector_t proj(*mf, vertex_wannier_file, vtx_trans_home);
+      carrier.set_wannier_projector(proj, vertex_wannier_loewdin);   // aborts if no pol vertex is configured
+    }
+  }
+
+} // namespace mbpt_vertex_audit
+
+/**
  * Many-body perturbation calculations from a given mean-field and ERI objects with arguments in property tree.
  * Optional arguments (with default values):
  *  - beta: "1000" Inverse temperature (a.u.)
@@ -139,10 +236,15 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 all cuts of the selected mode, so mixed half-theories cannot be
  *                 configured. All other vertex_* keys apply to every mode. All three
  *                 modes are fully implemented (plan increments S0-S10 complete); an
- *                 empty window is a no-op in every mode.
+ *                 empty window is a no-op in every mode at the class level, but a USER
+ *                 input requesting a vertex with an empty C ABORTS (audit D7).
  *  - vertex_band_window: [i0, i1) Contiguous 0-based orbital range defining the vertex
  *                 subspace C (gw solver only). Absent/empty window means C is the empty set,
- *                 which reproduces plain scGW exactly.
+ *                 which reproduces plain scGW exactly when no vertex is requested
+ *                 (vertex_type = "none"); with vertex_type set (and no vertex_wannier_file
+ *                 defining C) an empty window ABORTS (audit D7). In Wannier mode an
+ *                 explicitly set window must equal the projector's band window W_rng (an
+ *                 empty one is filled with W_rng and logged; audit D8).
  *                 Requirements with an active vertex: DLR IAFT backend (iaft basis "dlr");
  *                 screen_type "rpa" or "rpa_k". Symmetry-reduced (IBZ) k-meshes are
  *                 supported (notes/vertex_ibz_symmetry.md): external axes stay
@@ -189,7 +291,9 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 without changing the GW/HF divergence treatment -- that head is the one
  *                 piece the Sigma^C-vs-GF2-exchange absolute cross-check does not cover,
  *                 and notes/q0_head_treatment.md measures it at ~2.4x the body scale at
- *                 N_k = 8.
+ *                 N_k = 8. Since audit A16 it also sets the q->0 policy of the pol-vertex
+ *                 ladder's readout instance (pol-vertex-only runs; it used to take the GW
+ *                 div_treatment there), in [gw], [evgw] and [qpgw].
  *  - vertex_pidyn: "factorized" Route for B-L's equal-time dynamic-rung polarization
  *                 pi^dyn (vertex_rung = "linear" only; ignored otherwise).
  *                 {choices: "factorized", "kernel", "check"}. "factorized" evaluates
@@ -243,6 +347,10 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 SCF loop (re-Wannierization = a restart). If a gw_edmft embedding
  *                 projector is also active it must be the SAME file (demand D2). The
  *                 rotated point selection of vertex_isdf = "secondary" is nosym-only.
+ *                 audit D8: an explicitly set (non-empty) vertex_band_window /
+ *                 pol_vertex_band_window must equal the projector's band window W_rng
+ *                 (abort otherwise; it used to be overwritten silently). audit A14: also
+ *                 honoured by the [evgw] / [qpgw] pol-vertex-only knob carrier.
  *  - vertex_wannier_loewdin: "true" Loewdin-orthonormalize U at load so U^dag U = 1_M
  *                 exactly (deterministic, gauge-covariant; the correction norm is
  *                 logged). false = proceed with the raw disentangled U (warn; P then
@@ -259,8 +367,15 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 Phi-derivable (deliberate; user ruling 2026-08-10 -- accurate screening
  *                 over Phi-derivability). Excludes an ACTIVE vertex_type (double-count
  *                 guard, ruling R5) and requires the DLR IAFT backend. An empty ladder
- *                 C-window is an exact no-op. Scaffolded (increment C0); an ACTIVE
- *                 ladder ABORTS until L1-L3 land.
+ *                 C-window ABORTS (audit D7; it used to be a logged no-op).
+ *                 Scaffolded (increment C0); an ACTIVE ladder ABORTS until L1-L3 land.
+ *                 [evgw] / [qpgw] (audit A14): the knob carrier there honours the same
+ *                 pol_vertex_* keys plus vertex_div_treatment, vertex_bl_head_scale,
+ *                 vertex_wannier_file / _loewdin, cvv_rspace_tol, pol_eps_cut /
+ *                 _dyn_nnu; the Sigma^C-vertex keys (vertex_type, vertex_rung,
+ *                 vertex_isdf, vertex_scale, vertex_ramp_iters, vertex_pidyn[_tol],
+ *                 vertex_bl_head_projection / _static_head / _w0_head_from_w /
+ *                 _pidyn_const_rung / _head_static_all) ABORT when present.
  *  - pol_vertex_kernel: "w0_prev" Ladder kernel source (ruling R4). {choices: "w0_prev",
  *                 "w0_frozen"}. "w0_prev" takes K-bar = W-bar_0 from the previous
  *                 iteration's W (matches the static-rung convention); "w0_frozen" keeps
@@ -300,7 +415,8 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 solves feed the Sigma deposits), pol_vertex_sigma_dyn_acc ("split" | "single", P4-C14: one tau-resolved
  *                 accumulator, memory / (2 n_p + 1)), pol_vertex_sigma_interp_dump / _file / _projector (P16: the coarse
  *                 run's Wannier-frame dSigma consumed on a finer mesh).
- *                 {choices: "none", "lff", "pair"}
+ *                 {choices: "none", "lff", "pair"}. audit A15: != "none" with pol_vertex =
+ *                 "none" ABORTS (the Sigma vertex was logged as on and never built).
  *  - pol_vertex_sigma_bub: "window" Pi_0 of the vertex: the dump's window bubble ("Pi_bub") or the loop's RPA Pi folded
  *                 to the frame ("full"). pol_vertex_sigma_scale (1.0) multiplies the correction; pol_vertex_sigma_pinv_tol
  *                 (1e-3) = the relative eigenvalue cutoff of Pi_0^-1 (the vertex is restricted to the bubble's strong modes;
@@ -317,8 +433,8 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 is excluded by construction, NO subtraction is performed). The rung is
  *                 W-bar_0 = [1 - v P^RPA]^-1 v at i.nu = 0 from the SAME iteration
  *                 (ruling R-Q3-1). Auto-enables pol_vertex = "ladder"; excludes an
- *                 ACTIVE vertex_type (double counting); an empty ladder C-window is an
- *                 exact no-op. The run logs ||P^lad||/||P^RPA||, its per-q breakdown,
+ *                 ACTIVE vertex_type (double counting); an empty ladder C-window ABORTS
+ *                 (audit D7; it used to be an exact no-op). The run logs ||P^lad||/||P^RPA||, its per-q breakdown,
  *                 the nu -> tau -> nu round trip r_rt, and the resolvent margin
  *                 lambda_max = rho(chi0 Xi) -- which ABORTS at 1 (particle-hole
  *                 instability) and warns above 0.9.
@@ -351,7 +467,9 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 vertex_debug ("": the vertex code's diagnostic switches as "key=value, key" -- sigdyn_route, sigdyn_families,
  *                 sigdyn_legs, dynbse_union, dynbse_vmask, dynbse_tkeep, dynbse_tfold, dynbse_ritz, sigpair_ibz_diag,
  *                 sigpair_ibz_dump, vertex_rdecay, allreduce_chunk, scf_causality_meter; the historic COQUI_<KEY> environment
- *                 variables remain the fallback -- P23),
+ *                 variables remain the fallback -- P23; audit A17: an unknown key or an unparseable number / switch value
+ *                 ABORTS, true/false/on/off/yes/no read as 1/0, an environment-sourced value is logged as a [WARNING], and
+ *                 each driver section's string REPLACES the previous section's switches),
  *                 pol_vertex_dyn_dump (false: per-unit dump + restart files
  *                 "<prefix>.dynunits.<tag>.g<call>.r<rank>.bin" of the dynamic solves),
  *                 pol_vertex_dyn_dense (true: the dense per-tau rung K_d(s), nt/2 x D^2 per rank;
@@ -372,6 +490,16 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 the reported G fit), pol_vertex_dyn_cut_r1 (true: the cut / all-nu dump also runs the one-bare-rung
  *                 Pi_dyn1 pass; false skips it, Pi_dyn1 = Pi_static -- the production Gamma_1 dump), pol_vertex_dyn_sign (-1 = the derived rung sign, +1 = the
  *                 as-implemented L2 convention). XOR pol_vertex_legs = "ward".
+ *  - the audit fallback keys (notes/AUDIT.md, 2026-10-01; all default false = ABORT, parsed by every gw / evgw / qpgw
+ *    site; true restores the historic behaviour with a [WARNING] -- each one can change the answer):
+ *                 vertex_allow_missing_head (false: a gygi-class vertex q->0 policy whose analytic head cannot be built --
+ *                 madelung == 0 / empty basis_head (D2) -- or whose dynamic head piece has no eps_inv_head (D3) aborts;
+ *                 vertex_bl_head_scale = 0 is an explicit choice and is only logged), pol_vertex_allow_bare_rung (false: the
+ *                 dynamic-rung Pi^C without any screened W -- the bare rung W = Z fallback -- aborts; D4),
+ *                 pol_vertex_allow_unprojected (false: an injected Pi^C with transfers lacking a stored -q partner, which
+ *                 the pair-symmetry projection cannot reach, aborts; D5), vertex_allow_unchecked_reflection (false: the
+ *                 IBZ-mesh response rung's Pi(-q) = Pi(q)^T, now measured on the self-inverse / stored-pair transfers,
+ *                 aborts above a relative 1e-8; D10).
  *  - ladder_solve_grid: 1  Ranks per SOLVE GRID for the ladder's dense resolvent
  *                 (notes/ladder_b_integration_design.md, increment B). 1 (default) is the
  *                 per-rank LAPACK path -- bit-identical to the pre-B tree, and its
@@ -394,7 +522,8 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 the ladder kernel W-bar_0. 1.0 = the committed gygi policy (bitwise),
  *                 0.0 = head-free kernel. It does NOT touch the loop's own RPA W, its
  *                 div_treatment, or the Sigma^C/Pi^C head insertions (vertex_bl_head_scale).
- *                 NOTE finding F-DA-1: vertex_div_treatment does NOT reach this head.
+ *                 NOTE finding F-DA-1: vertex_div_treatment did NOT reach this head; since audit A16
+ *                 it sets the readout instance's q->0 policy, i.e. whether this head is inserted.
  *  - ladder_qnu_meter: false  DIAGNOSTIC (D-7), report-only. Prints the (q, nu)
  *                 decomposition of the injected P^lad, the per-q Dyson-W change it drives
  *                 (||dW_lad(q)||, Delta eps_M(q)), and the pre/post-secondary-fold head
@@ -666,6 +795,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                           pol_vertex_isdf_distr_tol, pol_vertex_inject);
     vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     vertex.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    mbpt_vertex_audit::set_fallback_keys(vertex, pt);   // audit D2-D5 / D10 (default false = abort)
     vertex.set_eps_cut(io::get_value_with_default<long>(pt,"pol_eps_cut",0),      // eps(q_i, i nu) cuts
                        io::get_value_with_default<long>(pt,"pol_eps_cut_dyn_nnu",0));
     scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // P25: eps_inf small-q fit
@@ -801,6 +931,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       }
       scr_eri.set_vertex(&vertex);
     }
+    // audit D7 / A15: a requested vertex / ladder with an empty C (after any Wannier projector) and a Sigma vertex without
+    // the ladder abort here, before the scf loop (they used to be logged no-ops)
+    mbpt_vertex_audit::check_vertex_requests(vertex, pt, "mbpt [gw]");
 
     if (screen_type.substr(0,8)=="gw_edmft") {
 
@@ -1106,6 +1239,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
     pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    mbpt_vertex_audit::set_fallback_keys(pol_vertex_carrier, pt);   // audit D2-D5 / D10 (default false = abort)
     {   // scGW-tilde Tier 1.5: the ladder's leg vertex (default-inert)
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
@@ -1188,6 +1322,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         }
       }
     }
+    // audit A14: the vertex keys of the [gw] sites -- forwarded where the carrier / scr path honours them, abort otherwise
+    mbpt_vertex_audit::carrier_vertex_keys(pol_vertex_carrier, scr_eri, mf, pt, "mbpt [" + solver_type + "]",
+                                           std::string("rpa"));
+    // audit D7 / A15 (as in the [gw] sites)
+    mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     MBState mb_state(mpi, ft, output);
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
@@ -1395,6 +1534,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
     pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    mbpt_vertex_audit::set_fallback_keys(pol_vertex_carrier, pt);   // audit D2-D5 / D10 (default false = abort)
     {   // scGW-tilde Tier 1.5: the ladder's leg vertex (default-inert)
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
@@ -1477,6 +1617,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         }
       }
     }
+    // audit A14: the vertex keys of the [gw] sites -- forwarded where the carrier / scr path honours them, abort otherwise
+    mbpt_vertex_audit::carrier_vertex_keys(pol_vertex_carrier, scr_eri, mf, pt, "mbpt [" + solver_type + "]",
+                                           std::string("rpa"));
+    // audit D7 / A15 (as in the [gw] sites)
+    mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
     // re-QP-ization knobs. Parsed with an EMPTY default -- absent means INERT, i.e. the qp
@@ -1730,6 +1875,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                           pol_vertex_isdf_distr_tol, pol_vertex_inject);
     vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     vertex.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    mbpt_vertex_audit::set_fallback_keys(vertex, pt);   // audit D2-D5 / D10 (default false = abort)
     vertex.set_eps_cut(io::get_value_with_default<long>(pt,"pol_eps_cut",0),      // eps(q_i, i nu) cuts
                        io::get_value_with_default<long>(pt,"pol_eps_cut_dyn_nnu",0));
     scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // P25: eps_inf small-q fit
@@ -1865,6 +2011,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
       }
       scr_eri.set_vertex(&vertex);
     }
+    // audit D7 / A15: a requested vertex / ladder with an empty C (after any Wannier projector) and a Sigma vertex without
+    // the ladder abort here, before the scf loop (they used to be logged no-ops)
+    mbpt_vertex_audit::check_vertex_requests(vertex, pt, "mbpt [gw]");
 
     MBState mb_state(ft, output, mf, projector_ksIai, band_window, kpts_crys, trans_home_cell, false);
     if (local_polarizabilities) {
@@ -2094,6 +2243,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
     pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    mbpt_vertex_audit::set_fallback_keys(pol_vertex_carrier, pt);   // audit D2-D5 / D10 (default false = abort)
     {   // scGW-tilde Tier 1.5: the ladder's leg vertex (default-inert)
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
@@ -2176,6 +2326,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         }
       }
     }
+    // audit A14: the vertex keys of the [gw] sites -- forwarded where the carrier / scr path honours them, abort otherwise
+    mbpt_vertex_audit::carrier_vertex_keys(pol_vertex_carrier, scr_eri, mf, pt, "mbpt [" + solver_type + "]",
+                                           screen_type);
+    // audit D7 / A15 (as in the [gw] sites)
+    mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
 
     // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2

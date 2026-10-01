@@ -648,11 +648,24 @@ namespace solvers {
     if (_pol_vtx) return;
     utils::check(_vertex != nullptr, "ensure_pol_vertex: no knob carrier attached.");
     auto w = _vertex->pol_band_window();
+    // audit A16 (notes/AUDIT.md): the readout instance takes the q -> 0 policy of the KNOB CARRIER, i.e. the user's
+    // vertex_div_treatment when set (it used to take this object's GW _div_treatment, so vertex_div_treatment was silently
+    // ignored by every pol-vertex-only run). Unset, the carrier was constructed with the SAME div_treatment string as this
+    // scr_coulomb_t (every MBPT driver site), so the default path is unchanged.
+    const std::string pol_div = _vertex->div_treatment();
+    if (pol_div != _div_treatment)
+      app_log(1, "  [scGW-tilde L2] readout instance q -> 0 policy = \"{}\" (vertex_div_treatment) -- the GW/W "
+                 "div_treatment \"{}\" is untouched.", pol_div, _div_treatment);
     _pol_vtx = std::make_shared<vertex_t>(
-        _ft, "2nd_exchange", w, thc.MF()->nbnd(), _div_treatment, "secondary",
+        _ft, "2nd_exchange", w, thc.MF()->nbnd(), pol_div, "secondary",
         _vertex->pol_isdf_rank(), _vertex->pol_isdf_svd_tol(),
         _vertex->pol_isdf_thresh(), _vertex->pol_isdf_cond_max(), "static");
     _pol_vtx->set_isdf_distr_tol(_vertex->pol_isdf_distr_tol());
+    // audit D2-D5 / D10: the fallback policies travel with the other knobs (the readout instance runs build_w0 / cache_w).
+    _pol_vtx->set_allow_missing_head(_vertex->allow_missing_head());
+    _pol_vtx->set_allow_bare_rung(_vertex->allow_bare_rung());
+    _pol_vtx->set_allow_unprojected(_vertex->allow_unprojected());
+    _pol_vtx->set_allow_unchecked_reflection(_vertex->allow_unchecked_reflection());
     // W-int-0: if the user vertex is Wannierized, the private readout instance inherits the MLWF state
     // so the pol-vertex/dynbse runs in the mesh-independent Wannier-pair frame (coarse->fine interpolation).
     if (_vertex->wannier()) {
@@ -704,11 +717,15 @@ namespace solvers {
     _pol_vtx->set_pol_interp(_vertex->pol_interp_file(), _vertex->pol_interp_col());
     _pol_vtx->set_pol_chain(_vertex->pol_chain());
     _pol_vtx->set_sigma_share(_vertex->sigma_share());
-    app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
+    // audit D8: print the EFFECTIVE window (after a Wannier adoption it is the projector's W_rng, not pol_vertex_band_window)
+    // and the readout's own q -> 0 policy (audit A16)
+    app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}){}, "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "
                "pol_vertex_kernel = \"w0_prev\" at a fixed point, R4 note).",
-            w.first(), w.last(), _vertex->pol_isdf_rank(), _div_treatment);
+            _pol_vtx->band_window().first(), _pol_vtx->band_window().last(),
+            _pol_vtx->wannier() ? " (the Wannier projector's W_rng)" : "", _vertex->pol_isdf_rank(),
+            _pol_vtx->div_treatment());
     app_log(1, "  [scGW-tilde L2] DA Phase-2 knobs on the readout instance: ladder_tda = "
                "{}, ladder_head_scale = {:.6g}, ladder_qnu_meter = {}.",
             _vertex->ladder_tda() ? "true" : "false", _vertex->ladder_head_scale(),

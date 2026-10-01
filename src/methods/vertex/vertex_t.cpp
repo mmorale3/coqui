@@ -738,6 +738,26 @@ namespace solvers {
     utils::check(M > 0 and M <= nW,
                  "vertex_t::set_wannier_projector: invalid projector rank M = {} "
                  "(window size {}).", M, nW);
+    // audit D8 (notes/AUDIT.md): Wannier mode REPLACES the band window by the projector's W_rng. An explicitly set
+    // (non-empty) window that differs from W_rng is a contradiction in the input -- it used to be overwritten silently
+    // (and the readout log kept printing the old one). An empty (default) window is filled, and the effective window logged.
+    utils::check(_band_window.size() == 0 or
+                     (_band_window.first() == W_rng.first() and _band_window.last() == W_rng.last()),
+                 "vertex_t::set_wannier_projector: vertex_band_window = [{}, {}) differs from the Wannier projector's band "
+                 "window W_rng = [{}, {}) of {} (audit D8): in Wannier mode C is the projector's span on W_rng. Set "
+                 "vertex_band_window = [{}, {}) or leave it empty.", _band_window.first(), _band_window.last(),
+                 W_rng.first(), W_rng.last(), proj.C_file(), W_rng.first(), W_rng.last());
+    // the pol-vertex ladder's window (pol_vertex_band_window, inheriting vertex_band_window) is the C window of the readout
+    // instance that adopts this projector (scr_coulomb_t::ensure_pol_vertex -> adopt_wannier): same contradiction, caught here.
+    utils::check(not pol_vertex_active() or
+                     (_pol_band_window.first() == W_rng.first() and _pol_band_window.last() == W_rng.last()),
+                 "vertex_t::set_wannier_projector: pol_vertex_band_window = [{}, {}) differs from the Wannier projector's band "
+                 "window W_rng = [{}, {}) of {} (audit D8): the ladder readout runs on the projector's span on W_rng. Set "
+                 "pol_vertex_band_window = [{}, {}).", _pol_band_window.first(), _pol_band_window.last(),
+                 W_rng.first(), W_rng.last(), proj.C_file(), W_rng.first(), W_rng.last());
+    if (_band_window.size() == 0)
+      app_log(1, "  [audit D8] vertex_band_window was empty: the effective vertex window is the Wannier projector's W_rng = "
+                 "[{}, {}).", W_rng.first(), W_rng.last());
 
     _wannier = true;
     _M = M;
@@ -1216,9 +1236,14 @@ namespace solvers {
                 (_rung == static_rung ? "Sigma^{C,x} + Sigma^{C,r}"
                                       : "three explicit terms + Sigma^{L,r}"));
     } else {
+      // audit D7 (notes/AUDIT.md): the CLASS keeps the exact empty-C no-op (test_vertex_noop pins it bitwise); a USER input
+      // that requests a vertex with an empty window is rejected by the MBPT drivers (mbpt_vertex_audit::check_vertex_requests)
+      // after an optional Wannier projector has had the chance to define C.
       app_log(1, "\nvertex_t: vertex_type = \"{}\" (vertex_rung = \"{}\") with an empty "
                  "vertex_band_window: C = empty set, so the vertex contributes nothing in "
-                 "ANY rung mode and the calculation reduces to plain scGW exactly.\n",
+                 "ANY rung mode and the calculation reduces to plain scGW exactly\n"
+                 "          (unless a Wannier projector defines C next; the MBPT drivers abort on a vertex request whose C "
+                 "stays empty -- audit D7).\n",
               _vertex_type, rung_str());
     }
   }
@@ -1253,7 +1278,20 @@ namespace solvers {
     // the span of the global THC basis, so it must never request more interpolating vectors
     // than the global basis has (out-ranking it selects near-null directions and makes the
     // secondary metric s = B^dag B ill-conditioned -- the companion guard to sec_thresh below).
+    // audit D9 (notes/AUDIT.md): the cap used to be applied silently and the capped value logged as "requested". Both are
+    // logged now; a [WARNING] when the user gave the rank explicitly (vertex_isdf_rank / pol_vertex_isdf_rank > 0), a plain
+    // line for the auto default (nc^2 nk), which is a target, not a request.
+    const long Nm_asked = Nm_req;
     Nm_req = std::min(Nm_req, (long)thc.Np());
+    if (Nm_req < Nm_asked) {
+      if (_isdf_rank > 0)
+        app_log(1, "  [WARNING] Refinement 2: vertex_isdf_rank = {} exceeds the global THC basis size Np = {}; the secondary "
+                   "basis is capped at N_m = {} (the secondary ISDF lives in the span of the global basis).",
+                Nm_asked, thc.Np(), Nm_req);
+      else
+        app_log(1, "  Refinement 2: auto N_m = nc^2 * nk = {} exceeds the global THC basis size Np = {}; using N_m = {}.",
+                Nm_asked, thc.Np(), Nm_req);
+    }
 
     // Secondary-ISDF point-selection threshold. It DEFAULTS to the SAME thresh used for
     // the GLOBAL THC basis (thc.thresh()) unless vertex_isdf_thresh (>0) overrides it.
@@ -1272,10 +1310,11 @@ namespace solvers {
 
     app_log(1, "\n  Refinement 2: building the secondary ISDF basis on the subspace C "
                "(rank M = {}, {})\n"
-               "  requested N_m = {}, svd_tol(B) = {}, sec_thresh = {} (global THC thresh = {}), "
+               "  requested N_m = {} ({}), used N_m target = {}, svd_tol(B) = {}, sec_thresh = {} (global THC thresh = {}), "
                "N_pair (per q, spin-stacked) = {}\n",
             nc, _wannier ? "Wannier projector" : "band window",
-            Nm_req, _isdf_svd_tol, sec_thresh, thc.thresh(), Npair);
+            Nm_asked, (_isdf_rank > 0 ? "explicit" : "auto = nc^2*nk"), Nm_req, _isdf_svd_tol, sec_thresh, thc.thresh(),
+            Npair);
 
     // ---- restricted-range ISDF point selection (collective on thc.mpi()->comm) --------
     // Private methods::thc builder on the SAME MF/mpi context using sec_thresh above; the
@@ -1317,7 +1356,7 @@ namespace solvers {
         // k-points from the IBZ orbitals exactly as the ISDF selection path does (W-int-4s).
         // (W-int-4s) on a symmetric mesh the gather reproduces the ISDF path's image-k convention (thc::collocation_at_points)
         nda::array<long, 1> mesh_in;
-        long nW_in = 0, W0_in = -1;
+        long nW_in = 0, W0_in = -1, wan_in = -1;
         {
           h5::file f(_isdf_points_file, 'r');
           h5::group g(f);
@@ -1325,7 +1364,27 @@ namespace solvers {
           nda::h5_read(g, "fft_mesh", mesh_in);
           h5::h5_read(g, "window_size", nW_in);
           h5::h5_read(g, "window_first", W0_in);
+          if (g.has_dataset("wannier")) h5::h5_read(g, "wannier", wan_in);   // written by every dump since W-int-1b
         }
+        // audit A19 (notes/AUDIT.md): the points were selected for EITHER the window orbitals OR the Wannier orbitals
+        // (rotated overload); the dump stores which. A mismatch puts the frozen points in the wrong frame.
+        if (wan_in >= 0)
+          utils::check((wan_in != 0) == _wannier,
+                       "vertex_t::build_secondary_basis: the frozen points of {} were selected in {} mode, this run is in {} "
+                       "mode (audit A19): re-dump the points with the same projector setting (vertex_wannier_file).",
+                       _isdf_points_file, wan_in ? "Wannier" : "band-window", _wannier ? "Wannier" : "band-window");
+        else
+          app_log(1, "  [WARNING] the frozen points file {} carries no \"wannier\" flag (an old dump): its window-vs-Wannier "
+                     "selection mode cannot be checked against this run ({} mode).", _isdf_points_file,
+                  _wannier ? "Wannier" : "band-window");
+        // audit A19: frozen points mean NO point selection, so the selection knobs the user set explicitly do nothing here.
+        // (vertex_isdf_svd_tol / _cond_max still act: they regularize the per-q transfer solve t(q) below.)
+        if (_isdf_rank > 0)
+          app_log(1, "  [WARNING] vertex_isdf_rank (pol_vertex_isdf_rank) = {} is IGNORED: the secondary points are frozen "
+                     "from {} (N_m = {} = the stored point count).", _isdf_rank, _isdf_points_file, ipts.extent(0));
+        if (_isdf_thresh > 0.0)
+          app_log(1, "  [WARNING] vertex_isdf_thresh (pol_vertex_isdf_thresh) = {} is IGNORED: the secondary points are frozen "
+                     "from {} (no point selection on this mesh).", _isdf_thresh, _isdf_points_file);
         auto mesh_now = builder.rho_mesh();
         utils::check(mesh_in.size() == 3 and mesh_in(0) == mesh_now(0) and mesh_in(1) == mesh_now(1) and
                      mesh_in(2) == mesh_now(2),
@@ -1416,12 +1475,14 @@ namespace solvers {
       const long Nm = ipts.extent(0);
       utils::check(Nm > 0,
                    "vertex_t::build_secondary_basis: point selection returned 0 points.");
-      if (Nm < Nm_req)
+      // audit D9: the old note quoted "thresh = 1e-13" -- the hard-coded selection thresh retired in favour of sec_thresh
+      // (the global THC thresh unless vertex_isdf_thresh overrides it); and frozen points involve no selection at all.
+      if (Nm < Nm_req and not frozen)
         app_log(1, "  [NOTE] Refinement 2: point selection stopped at N_m = {} "
-                   "(< requested {}):\n"
+                   "(< target {}):\n"
                    "         the C pair-density metric is numerically rank-deficient below "
-                   "thresh = 1e-13;\n"
-                   "         using the returned rank.", Nm, Nm_req);
+                   "the selection thresh = {};\n"
+                   "         using the returned rank.", Nm, Nm_req, sec_thresh);
       // gather the distributed collocation (already assembled into Xa above), then
       // transpose to the kernels' (aux, orb) layout. Any fixed per-point phase/scale
       // convention of the selection output is absorbed by the least-squares transfer.
@@ -1885,7 +1946,7 @@ namespace solvers {
         app_log(1, "  Sigma^C head insertion: madelung = {}, |H|_max = {} (bare piece "
                    "applied to Z(Gamma))", MF->madelung(), h_max);
         }
-      } else {
+      } else if (head_unusable_continue("vertex_t::eval_Sigma_C")) {   // audit D2: abort unless allowed / explicit
         app_log(1, "  [WARNING] Sigma^C: gygi head insertion requested but head data are "
                    "unusable\n"
                    "            (madelung == 0 or empty basis_head) -- proceeding WITHOUT "
@@ -1944,6 +2005,7 @@ namespace solvers {
           app_log(1, "  Sigma^C head insertion: dynamic piece applied to dW(Gamma, tau) "
                      "with eps_inv_head(tau=0) = {}", eps(0).real());
         } else {
+          dyn_head_missing("vertex_t::eval_Sigma_C");   // audit D3: abort unless vertex_allow_missing_head
           app_log(1, "  [WARNING] Sigma^C: dW is present but eps_inv_head is not in MBState "
                      "-- the DYNAMIC head\n"
                      "            piece is skipped (bare piece applied).");
@@ -1984,6 +2046,7 @@ namespace solvers {
                      "with eps_inv_head(tau=0) = {}",
                   mb_state.eps_inv_head.value()(0).real());
         } else {
+          dyn_head_missing("vertex_t::eval_Sigma_C (lean staging)");   // audit D3: abort unless vertex_allow_missing_head
           app_log(1, "  [WARNING] Sigma^C: dW is present but eps_inv_head is not in MBState "
                      "-- the DYNAMIC head\n"
                      "            piece is skipped (bare piece applied).");
@@ -2997,7 +3060,30 @@ namespace solvers {
         }
       }
 
-      vertex_detail::build_delta_w(W0g, Pi0g, qmin, Dw, /*assume_reflection*/ sym_mesh);
+      {
+        // audit D10 (notes/AUDIT.md): on an IBZ mesh build_delta_w replaces Pi(-q) by Pi(q)^T. CHECK it on the rows that
+        // allow it (self-inverse q; stored +-q pairs) and abort above a relative 1e-8 unless
+        // vertex_allow_unchecked_reflection. Pi0g is replicated, so every rank measures the same number.
+        vertex_detail::reflection_check refl;
+        vertex_detail::build_delta_w(W0g, Pi0g, qmin, Dw, /*assume_reflection*/ sym_mesh, sym_mesh ? &refl : nullptr);
+        if (sym_mesh) {
+          constexpr double refl_tol = 1e-8;
+          app_log(1, "  [audit D10] {} reflection identity Pi(-q) = Pi(q)^T on the IBZ mesh: checked on {} of {} transfers "
+                     "(self-inverse or stored +-q pair), max relative violation = {:.3e} (q = {}); {} transfer(s) without a "
+                     "stored -q are not checkable.", (lin ? "Delta_w^L" : "Delta_w"), refl.n_checked, nqpts_ibz,
+                  refl.rel_max, refl.iq_worst, refl.n_unchecked);
+          utils::check(refl.rel_max <= refl_tol or _allow_unchecked_reflection,
+                       "vertex_t::eval_Sigma_C: the response rung on this IBZ mesh assumes Pi(-q) = Pi(q)^T (build_delta_w, "
+                       "assume_reflection), but the {} middle factor violates it by a relative {:.3e} > {:.0e} at q = {} "
+                       "(audit D10): the symmetrized middle factor would be replaced by a plain transpose that is not equal to "
+                       "it. Run on a symmetry-free (nosym) mesh, or set vertex_allow_unchecked_reflection = true to continue.",
+                       (lin ? "Pi^L (pi^dyn - Pi^(C,0))" : "Pi^(C,0)"), refl.rel_max, refl_tol, refl.iq_worst);
+          if (refl.rel_max > refl_tol)
+            app_log(1, "  [WARNING] reflection identity violated by a relative {:.3e} > {:.0e} at q = {}; continuing "
+                       "because vertex_allow_unchecked_reflection = true (the transpose is used as is).",
+                    refl.rel_max, refl_tol, refl.iq_worst);
+        }
+      }
 
       // T6 R-DECAY DIAGNOSTIC, q-side (read-only; env COQUI_VERTEX_RDECAY=1): Delta_w
       // on the full transfer mesh. Full-q only (nosym runs) -- an IBZ-stored aux-frame
@@ -3358,7 +3444,7 @@ namespace solvers {
         }
         app_log(1, "  Pi^C head insertion: madelung = {}, |H|_max = {} (bare piece "
                    "applied to Z(Gamma))", MF->madelung(), h_max);
-      } else {
+      } else if (head_unusable_continue("vertex_t::eval_Pi_C")) {   // audit D2: abort unless allowed / explicit
         app_log(1, "  [WARNING] Pi^C: gygi head insertion requested but head data are "
                    "unusable\n"
                    "            (madelung == 0 or empty basis_head) -- proceeding WITHOUT "
@@ -3412,10 +3498,12 @@ namespace solvers {
         utils::check(mb_state.eps_inv_head.value().shape(0) == nt_half,
                      "vertex_t::eval_Pi_C: eps_inv_head size {} != nt_half = {}.",
                      mb_state.eps_inv_head.value().shape(0), nt_half);
-      else
+      else {
+        dyn_head_missing("vertex_t::eval_Pi_C");   // audit D3: abort unless vertex_allow_missing_head
         app_log(1, "  [WARNING] Pi^C: dW is present but eps_inv_head is not in MBState "
                    "-- the DYNAMIC head\n"
                    "            piece is skipped (bare piece applied).");
+      }
     }
     // adds the dynamic head into the (nt_half, Np, Np) tau slab of q = iq_gamma, in place.
     auto add_head_tau = [&](nda::MemoryArrayOfRank<3> auto&& W_t_gamma) {
@@ -3449,7 +3537,7 @@ namespace solvers {
           Wdyn_qwPQ.value()(iq, l, all, all) = W_wpos(lpos, all, all);
         }
       }
-    } else if (not dyn_src and not use_wcache) {
+    } else if (_rung == dynamic_rung and not dyn_src and not use_wcache) {
       // NO SCREENED RUNG AVAILABLE. This used to happen on the first update of every
       // run and was treated as a harmless startup caveat; it is not (Si kp444 C = [0,8):
       // iteration-1 eps_inf 19.6 against a converged RPA 5.35, and the trajectory never
@@ -3457,6 +3545,16 @@ namespace solvers {
       // vertex-attached pass, so reaching this branch means the bootstrap did NOT run --
       // e.g. a caller invoking eval_Pi_C outside update_w. COUNTED so a test can assert
       // it never happens in a normal scf loop (notes/vertex_divergence_diagnosis.md s3).
+      // audit D4 (notes/AUDIT.md): ABORT unless pol_vertex_allow_bare_rung (the class default keeps the WARNING for the
+      // direct-call unit tests, e.g. test_vertex_wcache's first-iteration semantics; every MBPT driver sets it from the
+      // input, default false). The branch is now restricted to the DYNAMIC rung: B-L (linear) never consumes a dynamic
+      // rung here -- its P^{C,L} rung is W0bar (below) -- yet it used to land in this branch on EVERY call, logging a
+      // false bare-rung WARNING and counting it in bare_rung_uses().
+      utils::check(_allow_bare_rung,
+                   "vertex_t::eval_Pi_C: no dynamic W in MBState{} -- the dynamic-rung Pi^C would fall back to the BARE "
+                   "rung W = Z, a large uncontrolled perturbation (audit D4). The update_w RPA bootstrap was bypassed (a caller "
+                   "outside the scf loop?). Set pol_vertex_allow_bare_rung = true only to reproduce the historic behaviour.",
+                   sec ? " and no cached Wbar" : "");
       ++_bare_rung_uses;
       app_log(1, "  [WARNING] Pi^C: no dynamic W in MBState{} -- falling back to the "
                  "BARE-interaction rung W = Z.\n"
@@ -3897,6 +3995,17 @@ namespace solvers {
       app_log(2, "  Pi^C pair-symmetry projection: {} of {} stored q projected ({} left "
                  "(no stored -q); rank-local |P_PQ(q) - P_QP(-q)| = {:.3e}, scale {:.3e})",
               n_done, nqpts_ibz, n_skip, gl[0], gl[1]);
+      // audit D5 (notes/AUDIT.md): the INJECTION predicate. eval_Pi_C runs only for the rungs that inject P^C into the
+      // Dyson equation (dynamic: Pi^C; linear: P^{C,L}; static is rejected at the top), and its one production caller
+      // (scr_coulomb_t's add_vertex_Pi_C) adds the result to P. So an unprojected transfer here IS injected: abort unless
+      // pol_vertex_allow_unprojected (class default true keeps the WARNING for the direct-call readout / unit tests).
+      const bool pi_c_injected = (_rung == dynamic_rung or _rung == linear_rung);
+      utils::check(n_skip == 0 or not pi_c_injected or _allow_unprojected,
+                   "vertex_t::eval_Pi_C: {} of {} stored transfers have no stored -q partner (IBZ mesh), so the pair-symmetry "
+                   "projection P_PQ(q) = P_QP(-q) cannot be applied there, and this Pi^C (vertex_rung = \"{}\") is injected into "
+                   "the Dyson equation, where the unprojected component is amplified by the self-consistency loop (audit D5). "
+                   "Use a symmetry-free (nosym) k-mesh, or set pol_vertex_allow_unprojected = true to continue with a WARNING.",
+                   n_skip, nqpts_ibz, rung_str());
       if (n_skip > 0)
         app_log(1, "  [WARNING] Pi^C: {} of {} stored transfers have no stored -q partner "
                    "(IBZ mesh), so the\n"
@@ -4224,13 +4333,17 @@ namespace solvers {
       if (not head_ok and _bl_head_scale == 0.0)
         app_log(1, "  [W-int-3] cache_w: vertex_bl_head_scale = 0 -- the dynamic rung W-bar(q, i nu) carries NO analytic "
                    "q -> 0 head (body-only vertex kernel).");
-      else if (not head_ok)
+      else if (not head_ok and head_unusable_continue("vertex_t::cache_w"))   // audit D2: abort unless allowed
         app_log(1, "  [WARNING] cache_w: gygi head insertion requested but head data "
                    "are unusable\n"
                    "            (madelung == 0 or empty basis_head) -- caching WITHOUT "
                    "the analytic head\n"
                    "            (equivalent to policy \"ignore_g0\").");
     }
+    // audit D3: decided HERE, collectively (the per-q head insertion below runs on the owner rank of Gamma only), whether
+    // the dynamic head piece can be built; abort unless vertex_allow_missing_head (then the in-loop WARNING says it).
+    if (head_ok and not (_bl_head_static_all and _rung == linear_rung) and not mb_state.eps_inv_head.has_value())
+      dyn_head_missing("vertex_t::cache_w");
 
     // ---- replicate dW(tau), augment the Gamma head, transform to the half nu mesh ----
     // Identical arithmetic to the legacy fold-at-consumption path (eval_Pi_C):
@@ -4463,12 +4576,71 @@ namespace solvers {
 
     // ---- factorize-vertex: REPLACE the cache by an externally approximated rung (accuracy studies of factorized W-bar) ----
     // vertex_debug wbar_load = <file.h5> reads Wbar_qwmm (nq_ibz, nw_half, N_m, N_m) (the wbar_dump layout) into the cache.
+    // audit A18 (notes/AUDIT.md): the file's METADATA (the datasets wbar_dump writes next to Wbar_qwmm) is validated against
+    // THIS run -- the shape alone cannot tell a rung of another window / basis / temperature / k-mesh. Required: window_first,
+    // window_size, nm, beta, nw_half, kpts (abort when absent: copy them from the wbar_dump file into the approximated one);
+    // Xb_skma is compared when present (the secondary collocation fixes the basis the rung is expressed in).
     if (auto wl = vertex_debug::get("wbar_load"); wl and not wl->empty()) {
       nda::array<ComplexType, 4> Wl;
       {
         h5::file f(*wl, 'r');
         h5::group g(f);
         nda::h5_read(g, "Wbar_qwmm", Wl);
+        for (auto const *key : {"window_first", "window_size", "nm", "beta", "nw_half", "kpts"})
+          utils::check(g.has_dataset(key),
+                       "vertex_t::cache_w: wbar_load {} carries no \"{}\": its W-bar cannot be validated against this run "
+                       "(audit A18). Copy the metadata datasets window_first, window_size, nm, beta, nw_half, kpts (and "
+                       "Xb_skma) of the wbar_dump file into it.", *wl, key);
+        long w0_in = -1, nw_in = -1, nm_in = -1, nwh_in = -1;
+        double beta_in = 0.0;
+        nda::array<double, 2> kpts_in;
+        h5::h5_read(g, "window_first", w0_in);
+        h5::h5_read(g, "window_size", nw_in);
+        h5::h5_read(g, "nm", nm_in);
+        h5::h5_read(g, "beta", beta_in);
+        h5::h5_read(g, "nw_half", nwh_in);
+        nda::h5_read(g, "kpts", kpts_in);
+        utils::check(w0_in == long(_band_window.first()) and nw_in == long(_band_window.size()),
+                     "vertex_t::cache_w: wbar_load {} was dumped on the window [{}, {}), this run's is [{}, {}) (audit A18).",
+                     *wl, w0_in, w0_in + nw_in, _band_window.first(), _band_window.last());
+        utils::check(nm_in == _Nm, "vertex_t::cache_w: wbar_load {} has N_m = {}, this run's secondary basis has N_m = {} "
+                                   "(audit A18).", *wl, nm_in, _Nm);
+        utils::check(std::abs(beta_in - tools.beta) <= 1e-10 * std::max(1.0, std::abs(tools.beta)),
+                     "vertex_t::cache_w: wbar_load {} was dumped at beta = {}, this run's beta = {} (audit A18).",
+                     *wl, beta_in, tools.beta);
+        utils::check(nwh_in == nw_half, "vertex_t::cache_w: wbar_load {} has nw_half = {}, this run's = {} (audit A18).",
+                     *wl, nwh_in, nw_half);
+        nda::array<double, 2> kpts_now(MF->kpts());
+        bool kpts_ok = (kpts_in.shape(0) == kpts_now.shape(0) and kpts_in.shape(1) == kpts_now.shape(1));
+        double kdev = 0.0;
+        if (kpts_ok) {
+          for (long i = 0; i < kpts_now.shape(0); ++i)
+            for (long d = 0; d < kpts_now.shape(1); ++d) kdev = std::max(kdev, std::abs(kpts_in(i, d) - kpts_now(i, d)));
+          kpts_ok = (kdev <= 1e-8);
+        }
+        utils::check(kpts_ok, "vertex_t::cache_w: wbar_load {} was dumped on a different k-mesh ({} k-points vs {}; max "
+                              "|dk| = {:.3e}) (audit A18).", *wl, kpts_in.shape(0), kpts_now.shape(0), kdev);
+        if (g.has_dataset("Xb_skma")) {
+          nda::array<ComplexType, 4> Xb_in;
+          nda::h5_read(g, "Xb_skma", Xb_in);
+          bool xb_ok = (Xb_in.shape() == _Xb_skma.shape());
+          double xdev = 0.0, xsc = 0.0;
+          if (xb_ok) {
+            auto const *a = Xb_in.data();
+            auto const *b = _Xb_skma.data();
+            for (long i = 0; i < long(_Xb_skma.size()); ++i) {
+              xdev = std::max(xdev, std::abs(a[i] - b[i]));
+              xsc = std::max(xsc, std::abs(b[i]));
+            }
+            xb_ok = (xdev <= 1e-8 * std::max(xsc, 1e-300));
+          }
+          utils::check(xb_ok, "vertex_t::cache_w: wbar_load {}: the stored secondary collocation Xb_skma differs from this "
+                              "run's (max |dXb| = {:.3e} vs max |Xb| = {:.3e}, or a different shape): the W-bar is expressed in "
+                              "another secondary basis (audit A18).", *wl, xdev, xsc);
+        } else {
+          app_log(1, "  [WARNING] vertex_t::cache_w: wbar_load {} carries no Xb_skma -- the secondary BASIS of the loaded W-bar "
+                     "cannot be compared with this run's (window / N_m / beta / k-mesh match).", *wl);
+        }
       }
       utils::check(Wl.shape() == Wb.shape(), "vertex_t::cache_w: wbar_load {} has shape ({}, {}, {}, {}) != the cache's.", *wl,
                    Wl.shape(0), Wl.shape(1), Wl.shape(2), Wl.shape(3));
@@ -4479,7 +4651,11 @@ namespace solvers {
       } else {
         Wb() = Wl;
       }
-      app_log(1, "  [factorize-vertex] Wbar cache REPLACED by {} (wbar_load)", *wl);
+      // audit A18: loud. This runs on EVERY cache_w call, so the rung of every iteration is the file's: the dynamic rung is
+      // FROZEN at the loaded W-bar and does not follow this run's W.
+      app_log(1, "  [WARNING] [factorize-vertex] the W-bar cache (the dynamic rung) is REPLACED by the file {} (vertex_debug "
+                 "wbar_load; metadata validated). This happens at EVERY cache fill, so the rung is FROZEN at the file's W-bar "
+                 "and does not follow the self-consistent W of this run.", *wl);
     }
 
     // ---- factorize-vertex: dump the cached rung for offline factorization studies ----------
@@ -4522,7 +4698,10 @@ namespace solvers {
       }
       mpi->comm.barrier();
       if (vertex_debug::flag("wbar_dump_exit")) {
-        app_log(1, "  [factorize-vertex] wbar_dump_exit: ending the run after the Wbar dump.");
+        // audit E: a debug request, kept, but never quiet -- the iteration's readout / Sigma and every later step are skipped
+        app_log(1, "  [WARNING] [factorize-vertex] exiting after the W-bar dump by request (vertex_debug wbar_dump_exit): "
+                   "MPI_Finalize + exit(0) now -- the rest of this iteration (readout, Sigma) and of the run is NOT computed.");
+        app_log_flush();
         MPI_Finalize();
         std::_Exit(0);
       }
@@ -4862,7 +5041,7 @@ namespace solvers {
       } else if (_bl_head_scale == 0.0) {
         app_log(1, "  [W-int-3] W0: vertex_bl_head_scale = 0 -- the static rung W-bar_0 carries NO analytic q -> 0 head "
                    "(body-only vertex kernel; the loop's RPA W keeps its {} head).", _div_treatment);
-      } else {
+      } else if (head_unusable_continue("vertex_t::build_w0")) {   // audit D2: abort unless allowed (scale 0 handled above)
         app_log(1, "  [WARNING] W0: gygi head insertion requested but the head data are "
                    "unusable\n"
                    "            (madelung == 0 or empty basis_head) -- proceeding WITHOUT "

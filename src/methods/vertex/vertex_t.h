@@ -607,6 +607,16 @@ namespace vertex_pi { struct iaft_tools; }
      *  Wannier; the readout instance is created "2nd_exchange"-enabled so active() holds after adoption. */
     void adopt_wannier(vertex_t const &src) {
       utils::check(src._wannier and src._M > 0, "vertex_t::adopt_wannier: source vertex is not in Wannier mode.");
+      // audit D8 (notes/AUDIT.md): the adopting instance's own (non-empty) window -- the readout instance is built on
+      // pol_vertex_band_window -- is REPLACED by the projector's W_rng below. A different explicit window is a contradiction
+      // in the input; it used to be overwritten silently. (set_wannier_projector already rejects it on the knob carrier;
+      // this is the backstop for any other adopter.)
+      utils::check(_band_window.size() == 0 or (_band_window.first() == src._band_window.first() and
+                                                _band_window.last() == src._band_window.last()),
+                   "vertex_t::adopt_wannier: this vertex's window [{}, {}) (pol_vertex_band_window) differs from the Wannier "
+                   "projector's W_rng = [{}, {}) (audit D8). Set pol_vertex_band_window = [{}, {}).", _band_window.first(),
+                   _band_window.last(), src._band_window.first(), src._band_window.last(), src._band_window.first(),
+                   src._band_window.last());
       _wannier = src._wannier; _M = src._M; _U_skia = src._U_skia; _band_window = src._band_window;
       _wannier_file = src._wannier_file; _iso_defect = src._iso_defect;
     }
@@ -774,6 +784,40 @@ namespace vertex_pi { struct iaft_tools; }
     // number of times eval_Pi_C had to fall back to the BARE rung. Must stay 0 in any
     // scf loop that goes through scr_coulomb_t::update_w (which bootstraps an RPA W).
     long _bare_rung_uses = 0;
+    // audit D2-D5 / D10 (notes/AUDIT.md, 2026-10-01): the answer-changing fallbacks ABORT unless the input re-allows them.
+    // CLASS DEFAULTS ARE PERMISSIVE (true = the historic WARNING) so library / unit-test callers that construct vertex_t
+    // directly and deliberately exercise these paths (e.g. eval_Pi_C without a W, test_vertex_wcache) keep working; EVERY
+    // MBPT driver site sets them from the input keys, whose defaults are false (= abort). scr_coulomb_t copies them onto its
+    // private readout instance (ensure_pol_vertex). See the setters below.
+    bool _allow_missing_head = true;          // vertex_allow_missing_head (D2 / D3)
+    bool _allow_bare_rung = true;             // pol_vertex_allow_bare_rung (D4)
+    bool _allow_unprojected = true;           // pol_vertex_allow_unprojected (D5)
+    bool _allow_unchecked_reflection = true;  // vertex_allow_unchecked_reflection (D10)
+    /** audit D2: build_head_rank1 (or its secondary-path replica) found no usable head under a gygi-class policy. Returns
+     *  true when the CALLER should log its historic "[WARNING] ... WITHOUT the analytic head" and continue (allowed by
+     *  vertex_allow_missing_head); false when the head is off by explicit input (vertex_bl_head_scale = 0: logged here,
+     *  the caller logs nothing more). Aborts otherwise. Collective-safe: every rank sees the same madelung / basis_head. */
+    bool head_unusable_continue(std::string_view where) const {
+      if (_bl_head_scale == 0.0) {
+        app_log(1, "  {}: head insertion disabled by input (vertex_bl_head_scale = 0).", where);
+        return false;
+      }
+      utils::check(_allow_missing_head,
+                   "{}: vertex div_treatment = \"{}\" requests the analytic gygi q -> 0 head, but the head data are unusable "
+                   "(madelung == 0 or an empty basis_head). Proceeding would silently run the \"ignore_g0\" policy (audit D2). "
+                   "Set vertex_div_treatment = \"ignore_g0\" (or vertex_bl_head_scale = 0) to run without the head explicitly, or "
+                   "vertex_allow_missing_head = true to continue with a WARNING.", where, _div_treatment);
+      return true;
+    }
+    /** audit D3: the DYNAMIC head piece needs mb_state.eps_inv_head, which is absent. Aborts unless vertex_allow_missing_head
+     *  (then the caller logs its historic WARNING and skips the piece). */
+    void dyn_head_missing(std::string_view where) const {
+      utils::check(_allow_missing_head,
+                   "{}: dW is present but eps_inv_head is not in MBState, so the DYNAMIC piece of the gygi q -> 0 head cannot be "
+                   "built; proceeding would apply the bare piece only (audit D3). This means update_w did not store the head of "
+                   "this W (a caller outside the scf loop?). Set vertex_allow_missing_head = true to continue with a WARNING.",
+                   where);
+    }
     double _scale = 1.0;
     long _ramp_iters = 0;
     long _vertex_iter = 0;
@@ -911,7 +955,8 @@ namespace vertex_pi { struct iaft_tools; }
     //   W-bar_0, and nothing else (not the loop's own RPA W, not the Sigma^C/Pi^C head
     //   insertions, which are vertex_bl_head_scale). Finding F-DA-1
     //   (notes/qsgwhat_discrepancy_results.md section 4c) showed vertex_div_treatment never
-    //   reaches this head, so its contribution to Delta_lad had never been measurable.
+    //   reaches this head, so its contribution to Delta_lad had never been measurable. (audit A16, 2026-10-01: the readout
+    //   instance now takes the knob carrier's div_treatment, so vertex_div_treatment decides WHETHER this head exists.)
     //   1.0 = the committed policy (bitwise), 0.0 = head-free kernel.
     double _ladder_head_scale = 1.0;
     // D-7 _ladder_qnu_meter: the (q, nu) decomposition meters of the injected P^lad and of
@@ -2288,6 +2333,32 @@ namespace vertex_pi { struct iaft_tools; }
                    "\"ignore_g0\".", lambda);
     }
     double bl_head_scale() const { return _bl_head_scale; }
+
+    /** audit D2 / D3 (notes/AUDIT.md): vertex_allow_missing_head (input default false). A gygi-class q -> 0 policy whose
+     *  analytic head cannot be built (madelung == 0 or an empty basis_head; D2) or whose DYNAMIC head piece has no
+     *  eps_inv_head in MBState (D3) used to proceed without it -- equivalent to "ignore_g0" for that piece, i.e. a different
+     *  answer than requested. false: abort (switch the vertex policy explicitly with vertex_div_treatment = "ignore_g0", or
+     *  vertex_bl_head_scale = 0, which is an explicit choice and only logged); true: the historic WARNING. */
+    void set_allow_missing_head(bool on) { _allow_missing_head = on; }
+    bool allow_missing_head() const { return _allow_missing_head; }
+    /** audit D4: pol_vertex_allow_bare_rung (input default false). Pi^C of the DYNAMIC rung without any screened W (no dW,
+     *  no W-bar cache) falls back to the bare rung W = Z -- "a large, uncontrolled perturbation", reached only when the
+     *  update_w RPA bootstrap was bypassed. false: abort; true: the historic WARNING (counted in bare_rung_uses()). */
+    void set_allow_bare_rung(bool on) { _allow_bare_rung = on; }
+    bool allow_bare_rung() const { return _allow_bare_rung; }
+    /** audit D5: pol_vertex_allow_unprojected (input default false). Pi^C transfers without a stored -q partner (IBZ mesh)
+     *  cannot be pair-symmetry projected; when Pi^C is INJECTED into the Dyson equation (dynamic / linear rung: every
+     *  production call of eval_Pi_C, scr_coulomb_t's add_vertex_Pi_C) the unprojected component is amplified by the loop.
+     *  false: abort; true: the historic WARNING. */
+    void set_allow_unprojected(bool on) { _allow_unprojected = on; }
+    bool allow_unprojected() const { return _allow_unprojected; }
+    /** audit D10: vertex_allow_unchecked_reflection (input default false). On an IBZ mesh the B-S / B-L response rung
+     *  (vertex_detail::build_delta_w, assume_reflection) replaces Pi(-q) by Pi(q)^T. That identity is now CHECKED where the
+     *  data allow it (self-inverse transfers: Pi(q) = Pi(q)^T; stored +-q pairs: Pi(-q) = Pi(q)^T); a relative violation
+     *  above 1e-8 aborts unless this is true (then a WARNING with the measured violation). Transfers whose -q is not stored
+     *  cannot be checked and are counted in the log. */
+    void set_allow_unchecked_reflection(bool on) { _allow_unchecked_reflection = on; }
+    bool allow_unchecked_reflection() const { return _allow_unchecked_reflection; }
     // running max relative deviation |factorized - kernel| / |kernel| over this vertex's
     // CHECK-mode evaluations (0 unless vertex_pidyn = "check" has run).
     double pidyn_check_max() const { return _pidyn_check_max; }
