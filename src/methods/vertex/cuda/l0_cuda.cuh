@@ -137,6 +137,8 @@ namespace methods::solvers::dynbse_cuda {
     // runs when it does not fit: 0 = device-resident (default); 1 = managed, preferred on the device (the driver migrates and
     // evicts on demand); 2 = managed, split: the part that fits preferred on the device (prefetched), the rest host-resident
     // and read over the link (AccessedBy device, no migration). The rest of the unit stays device-resident.
+    // 3 = streamed: the reps that fit device-resident, the rest in pinned host memory, copied per application through two device
+    // staging buffers on a copy stream overlapping the gemms (needs the mirror-pair rung).
     int um_mode = 0;
     double um_reserve = 6.0e9;      // device bytes kept free for the later device stages (rung builds, Sigma deposits, dressed)
   };

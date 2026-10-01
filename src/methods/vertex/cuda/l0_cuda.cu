@@ -1482,6 +1482,14 @@ namespace methods::solvers::dynbse_cuda {
     cusolverDnHandle_t cs = nullptr;
     cd *KF = nullptr, *KF2 = nullptr, *Ut = nullptr, *Vs = nullptr, *Kmat = nullptr;                // basis (complex)
     cd *Ks = nullptr, *Kds = nullptr, *Kd0 = nullptr;                                               // (s, q)
+    // factorize-vertex TEST dyn_um = 3 (streamed rung): reps [0, n_dev) device-resident in Kds, reps [n_dev, ndist) in pinned
+    // host memory (Kds_host), streamed per application through two device staging buffers on a copy stream (n_dev = -1: all
+    // device-resident, the default)
+    long n_dev = -1;
+    cd *Kds_host = nullptr, *stage[2] = {nullptr, nullptr};
+    cudaStream_t cps = nullptr;
+    cudaEvent_t ev_ready[2] = {nullptr, nullptr}, ev_free[2] = {nullptr, nullptr};
+    double t_stream_wait = 0.0;
     std::vector<long> trep;
     cd scale = make_cuDoubleComplex(1.0, 0.0);
     cd *Cbk = nullptr, *M = nullptr, *work = nullptr;                                               // (s, q, nu)
@@ -1533,7 +1541,29 @@ namespace methods::solvers::dynbse_cuda {
     e->Ut = dalloc<cd>(size_t(c.n_kept) * nt, "ue Ut"); e->Vs = dalloc<cd>(size_t(c.np_fit) * size_t(c.n_kept), "ue Vs");
     e->Kmat = dalloc<cd>(nt * size_t(c.np_fit), "ue Kc");
     e->Ks = dalloc<cd>(D * D, "ue Ks"); e->Kd0 = dalloc<cd>(D * D, "ue Kd0");
-    if (c.um_mode > 0) {
+    if (c.um_mode == 3) {
+      // factorize-vertex TEST: the streamed rung (see unit_engine::n_dev)
+      const size_t rep_b = D * D * sizeof(cd);
+      const double room = 0.9 * free_bytes - need_dev - c.um_reserve;
+      long nd = (room > 0.0) ? long(room / double(rep_b)) : 0;
+      if (nd < long(c.ndist)) nd = std::max(0l, long((room - 2.0 * double(rep_b)) / double(rep_b)));   // two staging buffers
+      nd = std::min(nd, long(c.ndist));
+      e->n_dev = nd;
+      e->Kds = dalloc<cd>(size_t(std::max(nd, 1l)) * D * D, "ue Kds (device part)");
+      const long nh = long(c.ndist) - nd;
+      if (nh > 0) {
+        cu_check(cudaMallocHost(&e->Kds_host, size_t(nh) * rep_b), "ue Kds (pinned host part)");
+        for (int b = 0; b < 2; ++b) {
+          e->stage[b] = dalloc<cd>(D * D, "ue Kds stage");
+          cu_check(cudaEventCreateWithFlags(&e->ev_ready[b], cudaEventDisableTiming), "ue ev");
+          cu_check(cudaEventCreateWithFlags(&e->ev_free[b], cudaEventDisableTiming), "ue ev");
+        }
+        cu_check(cudaStreamCreateWithFlags(&e->cps, cudaStreamNonBlocking), "ue copy stream");
+      }
+      std::snprintf(why, size_t(why_len), "STREAMED K_d(s) (dyn_um = 3): %ld of %ld reps device-resident (%.1f GB), %ld in pinned host "
+                    "memory (%.1f GB) streamed through 2 device staging buffers", nd, long(c.ndist), double(nd) * double(rep_b) / 1e9,
+                    nh, double(nh) * double(rep_b) / 1e9);
+    } else if (c.um_mode > 0) {
       // factorize-vertex TEST: K_d(s) in managed memory (see ue_config::um_mode)
       const size_t bytes = size_t(c.ndist) * D * D * sizeof(cd);
       cu_check(cudaMallocManaged(&e->Kds, bytes), "ue Kds (managed)");
@@ -1604,6 +1634,13 @@ namespace methods::solvers::dynbse_cuda {
     for (void *p : e->dr.allocs)
       if (p) (void)cudaFree(p);
     if (e->ctr) (void)cudaFree(e->ctr);
+    if (e->Kds_host) (void)cudaFreeHost(e->Kds_host);
+    for (int b = 0; b < 2; ++b) {
+      if (e->stage[b]) (void)cudaFree(e->stage[b]);
+      if (e->ev_ready[b]) (void)cudaEventDestroy(e->ev_ready[b]);
+      if (e->ev_free[b]) (void)cudaEventDestroy(e->ev_free[b]);
+    }
+    if (e->cps) (void)cudaStreamDestroy(e->cps);
     delete e;
   }
 
@@ -1621,7 +1658,12 @@ namespace methods::solvers::dynbse_cuda {
   void ue_set_rung(unit_engine *e, cplx const *Ksh, cplx const *Kdsh, cplx const *Kd0h, long const *treph, cplx scale_k) {
     const size_t D = size_t(e->D);
     h2d_c(e->Ks, Ksh, D * D, "ue Ks"); h2d_c(e->Kd0, Kd0h, D * D, "ue Kd0");
-    h2d_c(e->Kds, Kdsh, size_t(e->c.ndist) * D * D, "ue Kds");
+    if (e->n_dev >= 0 and e->n_dev < e->c.ndist) {               // factorize-vertex dyn_um = 3: split upload
+      h2d_c(e->Kds, Kdsh, size_t(e->n_dev) * D * D, "ue Kds (device part)");
+      std::memcpy(e->Kds_host, Kdsh + size_t(e->n_dev) * D * D, size_t(e->c.ndist - e->n_dev) * D * D * sizeof(cd));
+    } else {
+      h2d_c(e->Kds, Kdsh, size_t(e->c.ndist) * D * D, "ue Kds");
+    }
     e->trep.assign(treph, treph + e->c.nt);
     e->scale = make_cuDoubleComplex(scale_k.real(), scale_k.imag());
     e->unit_ok = false;
@@ -1742,6 +1784,8 @@ namespace methods::solvers::dynbse_cuda {
           launch_check("rung perm");
           const long ld = nt * nR;
           if (e->rr > 0) {
+            if (e->n_dev >= 0 and e->n_dev < e->rr)
+              APP_ABORT(std::string(" ue_kd: dyn_um = 3 with the frequency-factorized rung needs all R matrices on the device."));
             cu_check(cudaMemsetAsync(e->Fs, 0, size_t(nt) * W * sizeof(cd), 0), "rung zero");
             for (long r = 0; r < e->rr; ++r) {
               rung_cscale_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, e->rr, r, dnode, e->ctr, e->rec, e->Ys);
@@ -1750,11 +1794,30 @@ namespace methods::solvers::dynbse_cuda {
                                     e->Kds + size_t(r) * size_t(D) * size_t(D), int(D), &one, e->Fs, int(ld)), "rung K_r");
             }
           } else {
-            for (long rr_ = 0; rr_ < ndist; ++rr_) {
+            const long nd = (e->n_dev >= 0) ? e->n_dev : ndist, nh = ndist - nd;
+            const size_t DD = size_t(D) * size_t(D);
+            // factorize-vertex dyn_um = 3: host rep j (rep nd + j) -> staging buffer j % 2 on the copy stream, once that buffer's
+            // previous gemm is done; the first two copies overlap the device-resident reps' gemms
+            auto issue_copy = [&](long j) {
+              const int b = int(j % 2);
+              cu_check(cudaStreamWaitEvent(e->cps, e->ev_free[b], 0), "stream wait free");
+              cu_check(cudaMemcpyAsync(e->stage[b], e->Kds_host + size_t(j) * DD, DD * sizeof(cd), cudaMemcpyHostToDevice, e->cps),
+                       "stream H2D");
+              cu_check(cudaEventRecord(e->ev_ready[b], e->cps), "stream ready");
+            };
+            for (long j = 0; j < std::min(nh, 2l); ++j) issue_copy(j);
+            auto gemm_rep = [&](long rr_, cd const *K) {
               const long off = first[size_t(rr_)] * nR;
               cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(cnt[size_t(rr_)] * nR), int(D), int(D), &e->scale, e->rec + off,
-                                    int(ld), e->Kds + size_t(rr_) * size_t(D) * size_t(D), int(D), &zero, e->Fs + off, int(ld)),
-                        "rung pair");
+                                    int(ld), K, int(D), &zero, e->Fs + off, int(ld)), "rung pair");
+            };
+            for (long rr_ = 0; rr_ < nd; ++rr_) gemm_rep(rr_, e->Kds + size_t(rr_) * DD);
+            for (long j = 0; j < nh; ++j) {
+              const int b = int(j % 2);
+              cu_check(cudaStreamWaitEvent(0, e->ev_ready[b], 0), "stream wait ready");
+              gemm_rep(nd + j, e->stage[b]);
+              cu_check(cudaEventRecord(e->ev_free[b], 0), "stream free");
+              if (j + 2 < nh) issue_copy(j + 2);
             }
           }
           rung_perm_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, dslot, e->Fs, e->Ys, true);
@@ -1763,6 +1826,8 @@ namespace methods::solvers::dynbse_cuda {
           tim[2] += wnow() - t0; t0 = wnow();
         } else {
         // the dense rung: Ys_i^T (nR x D) = scale Fs_i^T (nR x D) . K_d(rep_i)^T (D x D)
+        if (e->n_dev >= 0 and e->n_dev < e->c.ndist)
+          APP_ABORT(std::string(" ue_kd: dyn_um = 3 (streamed rung) needs the mirror-pair rung (vertex_debug dyn_rung_pair = 1)."));
         std::vector<cd *> hA(static_cast<size_t>(nt)), hB(static_cast<size_t>(nt)), hC(static_cast<size_t>(nt));
         for (long i = 0; i < nt; ++i) {
           hA[size_t(i)] = e->Fs + size_t(i) * W;
@@ -2271,14 +2336,19 @@ namespace methods::solvers::dynbse_cuda {
     h2d(k.kq, kpq_row, size_t(nk), "kb kq");
     cd const *Xs = k.X + size_t(is) * nk * Nm * nc;
     const cd sk = make_cuDoubleComplex(scale_k.real(), scale_k.imag());
+    // factorize-vertex dyn_um = 3: reps [nd_b, nrep) are host-resident -- built one at a time into staging buffer 0 (all k blocks),
+    // then copied to their pinned host slot
+    const long nd_b = (e->n_dev >= 0 and e->n_dev < k.nrep) ? e->n_dev : k.nrep;
+    for (long th = nd_b - 1; th < k.nrep; ++th) {
+    const bool host_pass = (th >= nd_b);
     for (long ik0 = 0; ik0 < nk; ik0 += k.KC) {
       const long nki = std::min(k.KC, nk - ik0), nb = nki * nk;
       kb_legs_kernel<<<grid_for(nb * Nm * nc2), 256>>>(ik0, nki, nk, Nm, nc, Xs, k.kq, k.U1, k.U2);
       launch_check("kb legs");
       // the W tables of this transfer: W0 -> K_s (x scale_k), Wd0 -> K_d0, Wd(rep r) -> K_d(r)
-      for (long t = -2; t < k.nrep; ++t) {
+      for (long t = (host_pass ? th : -2); t < (host_pass ? th + 1 : nd_b); ++t) {
         cd const *Wt = (t == -2) ? k.W0 : ((t == -1) ? k.Wd0 : k.Wds + size_t(t) * k.nq * Nm * Nm);
-        cd *Kt = (t == -2) ? e->Ks : ((t == -1) ? e->Kd0 : e->Kds + size_t(t) * D * D);
+        cd *Kt = (t == -2) ? e->Ks : ((t == -1) ? e->Kd0 : (host_pass ? e->stage[0] : e->Kds + size_t(t) * D * D));
         for (long b = 0; b < nb; ++b) {
           const long ik = ik0 + b / nk, ikp = b % nk;
           k.hA[size_t(b)] = k.U2 + size_t(b) * Nm * nc2;
@@ -2296,6 +2366,10 @@ namespace methods::solvers::dynbse_cuda {
         kb_scatter_kernel<<<grid_for(nb * nc2 * nc2), 256>>>(ik0, nki, nk, nc, (t == -2) ? sk : one, k.wb, Kt);
         launch_check("kb scatter");
       }
+    }
+    if (host_pass)
+      cu_check(cudaMemcpy(e->Kds_host + size_t(th - nd_b) * size_t(D) * size_t(D), e->stage[0], size_t(D) * size_t(D) * sizeof(cd),
+                          cudaMemcpyDeviceToHost), "kb host rep D2H");
     }
     // the Sigma hook's |K_s - K_s^dag| meter
     cu_check(cudaMemsetAsync(e->red, 0, 2 * sizeof(unsigned long long), 0), "kb red");
