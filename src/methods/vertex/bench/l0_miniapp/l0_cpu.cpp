@@ -595,10 +595,10 @@ int main(int argc, char **argv) {
   if (which == "both") {
     std::printf("[check] opt vs ref  : F %.3e, Fsum %.3e\n", rel_diff(opt.Ffam, ref.Ffam), rel_diff(opt.Fsum, ref.Fsum));
     std::printf("[check] prod vs ref : F %.3e, Fsum %.3e\n", rel_diff(prod.Ffam, ref.Ffam), rel_diff(prod.Fsum, ref.Fsum));
-    std::printf("[speedup] opt / prod = %.2fx   (THE portable number: prod == what dynbse.hpp does today)\n", tprod / topt);
+    std::printf("[speedup] opt / prod = %.2fx   (THE portable number: prod == the dynbse.hpp production kernel)\n", tprod / topt);
     std::printf("[check] tiled vs ref: F %.3e, Fsum %.3e\n", rel_diff(tl.Ffam, ref.Ffam), rel_diff(tl.Fsum, ref.Fsum));
     std::printf("[speedup] opt / ref  = %.2fx\n", tref / topt);
-    std::printf("[speedup] tiled / prod = %.2fx   (the traffic restructuring against what dynbse.hpp does today)\n", tprod / ttl);
+    std::printf("[speedup] tiled / prod = %.2fx   (the traffic restructuring against the dynbse.hpp production kernel)\n", tprod / ttl);
   }
   return 0;
 }

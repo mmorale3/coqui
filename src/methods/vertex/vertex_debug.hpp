@@ -88,8 +88,8 @@ namespace vertex_debug {
         const size_t eq = item.find('=');
         const std::string key = lower(trim(eq == std::string::npos ? item : item.substr(0, eq)));
         utils::check(known_keys().count(key) > 0,
-                     "vertex_debug: unknown key \"{}\" in vertex_debug = \"{}\" (audit A17: an unknown key used to be stored and "
-                     "never read, i.e. the requested switch silently did not happen). Fix the spelling; the known keys are: {}.",
+                     "vertex_debug: unknown key \"{}\" in vertex_debug = \"{}\" (an unknown key would be stored and "
+                     "never read, i.e. the requested switch would silently not happen). Fix the spelling; the known keys are: {}.",
                      key, spec, known_keys_list());
         registry()[key] = (eq == std::string::npos) ? std::string("1") : trim(item.substr(eq + 1));
       }
@@ -152,7 +152,7 @@ namespace vertex_debug {
     auto d = parse_number(*v);
     utils::check(d.has_value(),
                  "vertex_debug: \"{}\" = \"{}\" is not a number (true / false, on / off, yes / no are read as 1 / 0). The "
-                 "default {} used to be taken silently here; fix the value.", lower(key), *v, dflt);
+                 "default {} is not substituted for a malformed value; fix the value.", lower(key), *v, dflt);
     return *d;
   }
   /** a string switch with a default */

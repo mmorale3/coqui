@@ -595,7 +595,7 @@ namespace vertex_pi { struct iaft_tools; }
       utils::check(_band_window.size() == 0 or (_band_window.first() == src._band_window.first() and
                                                 _band_window.last() == src._band_window.last()),
                    "vertex_t::adopt_wannier: this vertex's window [{}, {}) (pol_vertex_band_window) differs from the Wannier "
-                   "projector's W_rng = [{}, {}) (audit D8). Set pol_vertex_band_window = [{}, {}).", _band_window.first(),
+                   "projector's W_rng = [{}, {}). Set pol_vertex_band_window = [{}, {}).", _band_window.first(),
                    _band_window.last(), src._band_window.first(), src._band_window.last(), src._band_window.first(),
                    src._band_window.last());
       _wannier = src._wannier; _M = src._M; _U_skia = src._U_skia; _band_window = src._band_window;
@@ -778,7 +778,7 @@ namespace vertex_pi { struct iaft_tools; }
       }
       utils::check(_allow_missing_head,
                    "{}: vertex div_treatment = \"{}\" requests the analytic gygi q -> 0 head, but the head data are unusable "
-                   "(madelung == 0 or an empty basis_head). Proceeding would silently run the \"ignore_g0\" policy (audit D2). "
+                   "(madelung == 0 or an empty basis_head). Proceeding would silently run the \"ignore_g0\" policy. "
                    "Set vertex_div_treatment = \"ignore_g0\" (or vertex_bl_head_scale = 0) to run without the head explicitly, or "
                    "vertex_allow_missing_head = true to continue with a WARNING.", where, _div_treatment);
       return true;
@@ -788,7 +788,7 @@ namespace vertex_pi { struct iaft_tools; }
     void dyn_head_missing(std::string_view where) const {
       utils::check(_allow_missing_head,
                    "{}: dW is present but eps_inv_head is not in MBState, so the DYNAMIC piece of the gygi q -> 0 head cannot be "
-                   "built; proceeding would apply the bare piece only (audit D3). This means update_w did not store the head of "
+                   "built; proceeding would apply the bare piece only. This means update_w did not store the head of "
                    "this W (a caller outside the scf loop?). Set vertex_allow_missing_head = true to continue with a WARNING.",
                    where);
     }
@@ -1433,7 +1433,7 @@ namespace vertex_pi { struct iaft_tools; }
     void set_bl_head_static_all(bool on) {
       _bl_head_static_all = on;
       if (on)
-        app_log(1, "  [ISDF-Vertex] H1 STATIC-HEAD vertex enabled "
+        app_log(1, "  [balanced head] static-head vertex enabled "
                    "(vertex_bl_head_static_all): in B-L, every W input of the vertex "
                    "functional carries W0's STATIC Gamma-head weight\n"
                    "  (instantaneous slot, 1 + eps_inv_head(i.nu=0)); no dynamic-slot "
@@ -1465,7 +1465,7 @@ namespace vertex_pi { struct iaft_tools; }
                    "are \"none\", \"ladder\".", mode);
       utils::check(kernel == "w0_prev" or kernel == "w0_frozen",
                    "vertex_t::set_pol_vertex: unknown pol_vertex_kernel \"{}\". Valid "
-                   "options are \"w0_prev\" (default; ruling R4), \"w0_frozen\".", kernel);
+                   "options are \"w0_prev\" (default), \"w0_frozen\".", kernel);
       utils::check(inject == "none" or inject == "ladder_n2",
                    "vertex_t::set_pol_vertex: unknown pol_vertex_inject \"{}\". Valid "
                    "options are \"none\" (default), \"ladder_n2\".", inject);
@@ -1475,7 +1475,7 @@ namespace vertex_pi { struct iaft_tools; }
       // never turn itself on silently.
       if (inject != "none" and mode == "none") {
         mode = "ladder";
-        app_log(1, "  [qpGW Q3] pol_vertex_inject = \"{}\" auto-enables pol_vertex = "
+        app_log(1, "  [ladder injection] pol_vertex_inject = \"{}\" auto-enables pol_vertex = "
                    "\"ladder\".", inject);
       }
       _pol_vertex = mode;
@@ -1488,7 +1488,7 @@ namespace vertex_pi { struct iaft_tools; }
       _pol_isdf_distr_tol = isdf_distr_tol;
       if (not pol_vertex_active()) {
         if (pol_vertex_enabled())
-          app_log(1, "  [scGW-tilde] pol_vertex = \"ladder\" with an EMPTY C-window: "
+          app_log(1, "  [vertex ladder] pol_vertex = \"ladder\" with an EMPTY C-window: "
                      "the ladder is inert (exact no-op).");
         return;
       }
@@ -1499,7 +1499,7 @@ namespace vertex_pi { struct iaft_tools; }
       utils::check(not active(),
                    "pol_vertex = \"ladder\" cannot be combined with an ACTIVE vertex_type "
                    "(= \"{}\", vertex_rung = \"{}\"): the ladder resums the static-rung "
-                   "Pi^C (double counting on the P side), and scGW-tilde keeps Sigma "
+                   "Pi^C (double counting on the P side), and the ladder scheme keeps Sigma "
                    "GW-form. Disable one of the two.", _vertex_type, rung_str());
       // frequency-diagonal solves + the W-bar_0 kernel live on the DLR nodes
       utils::check(_ft->basis() == imag_axes_ft::dlr_basis,
@@ -1509,18 +1509,18 @@ namespace vertex_pi { struct iaft_tools; }
       // vertex and reports the ladder-corrected eps_M each iteration. Without
       // pol_vertex_inject the loop is untouched (report-only); with it, the injection
       // line below states the actual regime.
-      app_log(1, "  [scGW-tilde] pol_vertex = \"ladder\" READOUT active: C window = "
+      app_log(1, "  [vertex ladder] pol_vertex = \"ladder\" READOUT active: C window = "
                  "[{}, {}), kernel = {}{}", _pol_band_window.first(),
               _pol_band_window.last(), _pol_kernel,
               pol_vertex_inject_enabled()
-                  ? " (L2 readout + the Q3 injection below)."
-                  : " (L2, stance i -- report-only; in-loop injection is off,"
+                  ? " (readout + the ladder injection below)."
+                  : " (report-only; in-loop injection is off,"
                     " knob pol_vertex_inject).");
       if (pol_vertex_inject_enabled())
-        app_log(1, "  [qpGW Q3] pol_vertex_inject = \"{}\": the resummed ladder IS "
-                   "injected into P (P_latt = P^RPA + P^lad, eq 6 of "
-                   "notes/qpgw_bse_edmft_option2.pdf; rung = W-bar_0[RPA] at inu = 0, "
-                   "ruling R-Q3-1). The loop is no longer plain RPA-screened.",
+        app_log(1, "  [ladder injection] pol_vertex_inject = \"{}\": the resummed ladder IS "
+                   "injected into P (P_latt = P^RPA + P^lad; "
+                   "rung = W-bar_0[RPA] at inu = 0). "
+                   "The loop is no longer plain RPA-screened.",
                 _pol_vertex_inject);
     }
     // ladder requested in the input ([gw] pol_vertex)
@@ -1650,7 +1650,7 @@ namespace vertex_pi { struct iaft_tools; }
       _sigma_lff = mode; _sigma_lff_bub = bub; _sigma_lff_scale = scale; _sigma_lff_pinv_tol = pinv_tol;
       _sigma_lff_head_scale = head_scale; _sigma_lff_col = col; _sigma_lff_static = with_static;
       if (mode != "none")
-        app_log(1, "  [LFF-Sigma] pol_vertex_sigma = \"{}\": Sigma = G W~, W~ = W Gamma_eff (Gamma_eff = Pi_0^-1 (Pi_0 + dPi) in the frozen "
+        app_log(1, "  [Sigma vertex] pol_vertex_sigma =\"{}\": Sigma = G W~, W~ = W Gamma_eff (Gamma_eff = Pi_0^-1 (Pi_0 + dPi) in the frozen "
                    "secondary frame; Pi_0 = \"{}\"; scale {}; pinv tol {:.1e}; head scale {}; column \"{}\"; instantaneous part {}).",
                 mode, bub, scale, pinv_tol, head_scale, col.empty() ? std::string("<pol_vertex_interp_col>") : col,
                 with_static ? "-> the static self-energy" : "DROPPED");
@@ -1663,7 +1663,7 @@ namespace vertex_pi { struct iaft_tools; }
                         std::string const &side = "right") {
       utils::check(col == "static" or col == "static1" or col == "static_dyn" or col == "dyn1_bare" or col == "dyn1" or col == "dyn",
                    "vertex_t::set_sigma_pair: unknown pol_vertex_sigma_pair_col \"{}\". Valid options are \"static\" (default), \"static1\" "
-                   "(the static-ladder path) and \"static_dyn\", \"dyn1_bare\", \"dyn1\", \"dyn\" (the dynamic-rung path, L-7).", col);
+                   "(the static-ladder path) and \"static_dyn\", \"dyn1_bare\", \"dyn1\", \"dyn\" (the dynamic-rung path).", col);
       utils::check(outer == "dynamic" or outer == "static",
                    "vertex_t::set_sigma_pair: unknown pol_vertex_sigma_pair_outer \"{}\". Valid options are \"dynamic\" (default), \"static\".", outer);
       utils::check(side == "right" or side == "left" or side == "both",
@@ -1673,7 +1673,7 @@ namespace vertex_pi { struct iaft_tools; }
       _sigma_pair = on; _sigma_pair_col = col; _sigma_pair_outer = outer; _sigma_pair_scale = scale; _sigma_pair_herm = hermitize;
       _sigma_pair_diag = diag; _sigma_pair_side = side;
       if (on)
-        app_log(1, "  [LFF-Sigma pair] pol_vertex_sigma = \"pair\": Sigma = G W-bar Lambda with the pair-resolved {} vertex "
+        app_log(1, "  [Sigma vertex, pair] pol_vertex_sigma = \"pair\": Sigma = G W-bar Lambda with the pair-resolved {} vertex "
                    "(column \"{}\", outer W-bar \"{}\", junction \"{}\", scale {}, Hermitized {}, diagnostics {}).",
                 sigma_pair_dynamic() ? "DYNAMIC-rung ladder" : "static-ladder", col, outer, side, scale, hermitize, diag);
     }
@@ -1829,12 +1829,11 @@ namespace vertex_pi { struct iaft_tools; }
                      "(iaft basis = \"dlr\").");
       _ladder_legs = legs;
       if (legs == "ward")
-        app_log(1, "  [scGW-tilde T1.5] pol_vertex_legs = \"ward\": the ladder's pair "
-                   "propagators carry the discrete-Ward leg vertex Lambda0 (proposal "
-                   "section 4.6, eq 21; notes/tier15_ward_legs_plan.md) built from the "
+        app_log(1, "  [Ward legs] pol_vertex_legs = \"ward\": the ladder's pair "
+                   "propagators carry the discrete-Ward leg vertex Lambda0 built from the "
                    "loop's own stored Sigma;\n  the kernel returns Delta P^Lambda + rungs "
-                   ">= 1 on Lambda-legs (eq 27), (M,N)-Hermitized. Static rungs on Lambda "
-                   "legs XOR a dynamical-rung BSE -- never both (eq 24 cor. ii).");
+                   ">= 1 on Lambda-legs, (M,N)-Hermitized. Static rungs on Lambda "
+                   "legs XOR a dynamical-rung BSE -- never both (they double count).");
     }
     std::string ladder_legs() const { return _ladder_legs; }
     bool ladder_ward_legs() const { return _ladder_legs == "ward"; }
@@ -1861,14 +1860,14 @@ namespace vertex_pi { struct iaft_tools; }
                      "pol_vertex_rung = \"dynamic\" requires the DLR IAFT backend (iaft basis = \"dlr\").");
         utils::check(_ladder_legs != "ward",
                      "pol_vertex_rung = \"dynamic\" and pol_vertex_legs = \"ward\" double count "
-                     "(proposal eq 24 cor. ii): choose one.");
+                     "(dynamical rungs XOR Ward legs): choose one.");
         utils::check(sign_ks == -1.0 or sign_ks == 1.0, "pol_vertex_dyn_sign must be -1 or +1 (got {}).", sign_ks);
       }
       _ladder_rung = rung;
       _dyn_tol = tol; _dyn_maxit = maxit; _dyn_gmres = gmres_m; _dyn_sign = sign_ks;
       if (rung == "dynamic")
-        app_log(1, "  [scGW-tilde T2] pol_vertex_rung = \"dynamic\": the ladder is resummed with the "
-                   "FULL-FREQUENCY screened rung W(inu') (notes/dynbse_plan.md; two-family DLR "
+        app_log(1, "  [dynamic vertex] pol_vertex_rung = \"dynamic\": the ladder is resummed with the "
+                   "FULL-FREQUENCY screened rung W(inu') (two-family DLR "
                    "representation, static part exact, dynamic remainder by GMRES({}) to {:.1e}, "
                    "maxit {}); rung sign convention {:+.0f}.", gmres_m, tol, maxit, sign_ks);
     }

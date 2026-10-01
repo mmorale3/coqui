@@ -264,7 +264,7 @@ int main(int argc, char **argv) {
   auto gcomm = world.split(gid, grank);
   const long px = utils::find_proc_grid_min_diff(o.g, D, D), py = o.g / px;
 
-  app_log(1, "\n=== ladder_slate_bench (notes/ladder_opt_spec.md B0) ===");
+  app_log(1, "\n=== ladder_slate_bench (distributed LU solve of the pair-space ladder) ===");
   app_log(1, "  preset {} : nk = {}, nc2 = {}, D = nk*nc2 = {}, N_m = {}", o.preset, o.nk,
           nc2, D, Nm);
   app_log(1, "  world = {} ranks; g = {} ranks/solve-grid => {} concurrent grids; proc "
@@ -462,8 +462,8 @@ int main(int argc, char **argv) {
                      + 8.0 * double(D) * double(D) * double(Nm);
   app_log(1, "  [bench] MaxRSS GB: entry(min) {:.3f} -> exit(max) {:.3f}", rmin, rmax);
   app_log(1, "  [bench] time per solve = {:.4f} s ; grid Gflop/s = {:.2f} ; per-rank "
-             "Gflop/s = {:.3f} ; sigma_max(XK) as built = {:.6f} (then scaled to 0.5, the "
-             "measured conditioning)",
+             "Gflop/s = {:.3f} ; sigma_max(XK) as built = {:.6f} (then scaled to 0.5, a "
+             "representative conditioning)",
           tsolve, flops / std::max(tsolve, 1e-30) / 1e9,
           flops / std::max(tsolve, 1e-30) / 1e9 / double(o.g), lam_last);
   // ONE machine-parseable row per design point -- this is what the scan table is built

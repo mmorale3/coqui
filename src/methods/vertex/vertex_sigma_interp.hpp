@@ -155,12 +155,12 @@ namespace vertex_sigma_interp {
       h5::h5_write(g, "window_size", nc);
       h5::h5_write(g, "proj_unitarity_defect", dunit);
     }
-    app_log(1, "  [LFF-Sigma pair] P16: the Wannier-frame dSigma ({} tau x {} spins x {} k x {} x {}) written to {} with its R grid ({} vectors); "
+    app_log(1, "  [Sigma vertex, pair] Wannier dump: the Wannier-frame dSigma ({} tau x {} spins x {} k x {} x {}) written to {} with its R grid ({} vectors); "
                "projector unitarity defect on the window {:.2e}; configuration: {} path, col {}, outer {}, junction {}, scale {}, "
                "sign_ks {}, Hermitized {}", nt, ns, nk, M, M, fn, Ridx.shape(0), dunit, cfg.dyn ? "DYNAMIC" : "static", cfg.col,
             cfg.outer, cfg.side, cfg.scale, cfg.sign_ks, cfg.hermitize);
     if (dunit > proj_unitarity_warn_tol)
-      app_log(1, "  [WARNING] P16 dump: the coarse projector is not unitary on the window (defect {:.2e} > {:.0e}): the Wannier-frame "
+      app_log(1, "  [WARNING] Sigma pair Wannier dump: the coarse projector is not unitary on the window (defect {:.2e} > {:.0e}): the Wannier-frame "
                  "dSigma is not an exact image of the band-frame one, and the fine run's upfold will not reproduce it.", dunit,
               proj_unitarity_warn_tol);
   }
@@ -187,7 +187,7 @@ namespace vertex_sigma_interp {
       h5::group g(f);
       utils::check(g.has_dataset("dSigma_wan_tskab"), "interpolate_sigma_pair: {} carries no Wannier-frame dSigma (the coarse run needs pol_vertex_sigma_interp_dump).", file);
       utils::check(g.has_dataset("cfg_version"),
-                   "interpolate_sigma_pair: {} was written before the configuration record (audit A12, 2026-10-01): it stores col / outer "
+                   "interpolate_sigma_pair: {} has no configuration record (an older dump format): it stores col / outer "
                    "only, so it cannot be checked against this run (junction, scale, rung sign, Hermitization, Sigma path, window, "
                    "lattice). Regenerate the dump with the coarse run (pol_vertex_sigma_interp_dump) on this code.", file);
       long ver = 0;
@@ -318,7 +318,7 @@ namespace vertex_sigma_interp {
         }
       }
     const double herm_resid = (ymax > 0.0) ? yherm / ymax : 0.0;
-    app_log(1, "  [LFF-Sigma pair] P16: dSigma interpolated from {} ({} coarse k, {} R vectors, {} Wannier orbitals) onto {} fine IBZ k of the window "
+    app_log(1, "  [Sigma vertex, pair] Wannier interpolation: dSigma interpolated from {} ({} coarse k, {} R vectors, {} Wannier orbitals) onto {} fine IBZ k of the window "
                "[{}, {}); projector unitarity defect coarse {:.2e} fine {:.2e}; anti-Hermitian residual before symmetrization {:.3e} ({}); "
                "configuration matches the dump ({} path, col {}, outer {}, junction {}, scale {}, sign_ks {}{})", file, nkc, nR, M, nkf,
             window_first, window_first + nc, dunit_c, dunit, herm_resid, cfg.hermitize ? "Hermitized" : "NOT Hermitized",
@@ -328,7 +328,7 @@ namespace vertex_sigma_interp {
                     : std::string());
     for (auto [d, who] : {std::pair<double, const char *>{dunit_c, "coarse"}, std::pair<double, const char *>{dunit, "fine"}})
       if (d > proj_unitarity_warn_tol)
-        app_log(1, "  [WARNING] P16 interpolation: the {} projector is not unitary on the window (defect {:.2e} > {:.0e}): the "
+        app_log(1, "  [WARNING] Sigma pair Wannier interpolation: the {} projector is not unitary on the window (defect {:.2e} > {:.0e}): the "
                    "downfold -> upfold round trip is not the identity there, so the interpolated dSigma carries a projector error of "
                    "that order (relative).", who, d, proj_unitarity_warn_tol);
     if (met) { met->herm_resid = herm_resid; met->dunit_fine = dunit; met->dunit_coarse = dunit_c; }

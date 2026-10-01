@@ -148,7 +148,7 @@ namespace vertex_sym {
                    "(NOT PQ-transposed) for every\n"
                    "            time-reversed transfer at every read site (Pi ladder, Pi^C, Sigma^C, the Sigma pair "
                    "vertex, the dynamic rung). DIAGNOSTIC\n"
-                   "            switch (the Si 4^3 time-reversal finding, 2026-09-22): it CHANGES the answer on any "
+                   "            switch (time-reversal convention check): it CHANGES the answer on any "
                    "mesh with non-TRIM k-points; unset it for production.");
       return on;
     }();
