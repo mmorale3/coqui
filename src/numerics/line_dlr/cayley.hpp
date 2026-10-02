@@ -236,7 +236,7 @@ struct upfold_result_t {
  * Python's default nphi is 72 (kept here for parity); the cost is one Schur form of an r_gram x r_gram matrix per phase.
  */
 inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K, double wp, double tol_c0 = 1e-12,
-                                    double tol_gram = 1e-10, double tol_svd = 1e-12, long nphi = 72,
+                                    double tol_gram = 1e-10, double tol_svd = 1e-12, long nphi = 8,
                                     double reject_unity = 1e-6) {
   using nda::range;
   const long n = C.extent(1);
