@@ -231,9 +231,9 @@ namespace solvers {
                   bool reset_input = false)
     -> memory::darray_t<local_Array_t, mpi3::communicator>;
 
-    // P25 / G32: `fit` (optional) = the small-q fit of eps_inf (eps_inf_fit = true), written next to
+    // `fit` (optional) = the small-q fit of eps_inf (eps_inf_fit = true), written next to
     // epsilon_inf as epsilon_inf_fit / epsilon_inf_fit_coeffs / _qabs / _eps / _residual; nullptr = the
-    // historic dataset family only.
+    // standard datasets only.
     template<typename comm_t>
     void dump_eps_inv_head(const nda::ArrayOfRank<2> auto &eps_inv_head_tq,
                            const nda::ArrayOfRank<1> auto &eps_inv_head_t,
@@ -242,7 +242,7 @@ namespace solvers {
                            eps_fit::eps_inf_fit_t const *fit = nullptr);
 
     /**
-     * P25 / G32 (notes/vertex_perf_plan.md): epsilon_inf from the SMALL-q FIT of the loop's own static
+     * epsilon_inf from the SMALL-q FIT of the loop's own static
      * macroscopic dielectric function on the IBZ mesh. eps_inv_head_tq is the q-resolved head
      * (nt_half, nqpts_ibz) in the eval_eps_inv_q convention, eps^-1_{00}(q, tau) - 1; it is taken to the
      * PH-sym bosonic half grid and eps_M(q) = 1 / (1 + Re[eps^-1_{00}(q, i nu = 0) - 1]) at every transfer
@@ -302,7 +302,7 @@ namespace solvers {
     // CVV head (div_treatment = "cvv"): R-shell truncation tolerance handed to
     // cvv_head_t ([gw] cvv_rspace_tol), consumed by the update_w head fill.
     double _cvv_rspace_tol = 1e-6;
-    // P25 / G32 ([gw] eps_inf_fit, default off): report epsilon_inf from the small-q fit of the static
+    // [gw] eps_inf_fit (default off): report epsilon_inf from the small-q fit of the static
     // eps_M(q) on the _eps_inf_fit_npts smallest nonzero |q| next to the stored head (eval_eps_inf_fit).
     bool _eps_inf_fit = false;
     long _eps_inf_fit_npts = 3;
@@ -512,7 +512,7 @@ namespace solvers {
     // CVV head R-shell tolerance; cvv_head_t validates > 0 at construction
     void set_cvv_rspace_tol(double tol) { _cvv_rspace_tol = tol; }
     double cvv_rspace_tol() const { return _cvv_rspace_tol; }
-    // P25 / G32: the small-q eps_inf fit (report-only; npts = the smallest nonzero |q| used, >= 2)
+    // the small-q eps_inf fit (report-only; npts = the smallest nonzero |q| used, >= 2)
     void set_eps_inf_fit(bool on, long npts = 3) { _eps_inf_fit = on; _eps_inf_fit_npts = std::max(npts, 2l); }
     bool eps_inf_fit() const { return _eps_inf_fit; }
     long eps_inf_fit_npts() const { return _eps_inf_fit_npts; }

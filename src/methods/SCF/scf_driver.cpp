@@ -320,10 +320,10 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
               if (gm < -1e-6) ++nviol;
             }
       }
-      // L-9 M1 (notes/lff_aux_plan.md, 2026-09-29): the MATRIX test -- a causal G / Sigma_c has -X(tau) positive semidefinite
-      // at every (tau, s, k), not only non-negative diagonals: lambda_min of the Hermitian part of -X(tau, s, k), X = G and
-      // Sigma_c, with its tau node. vertex_debug scf_causality_matrix = 1 | 0 | auto (default: on while the eigenvalue work
-      // 2 nt ns nk nb^3 stays below ~2e10, e.g. Si 4^3 / 60 bands ~1 s; the 8^3 / 250-band bases skip it).
+      // MATRIX test: a causal G / Sigma_c has -X(tau) positive semidefinite at every (tau, s, k), not only non-negative
+      // diagonals: lambda_min of the Hermitian part of -X(tau, s, k), X = G and Sigma_c, with its tau node.
+      // vertex_debug scf_causality_matrix = 1 | 0 | auto (default: on while the eigenvalue work 2 nt ns nk nb^3 stays
+      // below ~2e10 operations; larger bases skip it).
       double glam = 1e300, slam = 1e300;
       long glam_t = -1, slam_t = -1;
       bool mat_on = false;
@@ -380,8 +380,8 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
                 slam_t >= 0 ? double(tm(slam_t)) : 0.0, (gmin_prev < 0.0) ? gmin / gmin_prev : 0.0,
                 (slam_prev < 0.0) ? slam / slam_prev : 0.0);
       }
-      // L-9 F4: the abort guard -- vertex_debug scf_causality_abort = t > 0 stops the run when the non-causal residue of G
-      // (diagonal or matrix test) passes -t, instead of iterating a non-causal G (the 09-28 auto-window it2 diverged over 3 h)
+      // Abort guard: vertex_debug scf_causality_abort = t > 0 stops the run when the non-causal residue of G (diagonal or
+      // matrix test) passes -t, instead of iterating a non-causal G that a Dyson loop can amplify into divergence.
       if (causality_abort > 0.0) {
         const double worst = mat_on ? std::min(gmin, glam) : gmin;
         if (worst < -causality_abort)

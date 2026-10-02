@@ -65,10 +65,10 @@ TEST_CASE("interpolation", "[utilities]")
 }
 
 
-// P21 (notes/vertex_perf_plan.md, 2026-09-21): the bounded (k, band) processor grid of the orbital readers
+// the bounded (k, band) processor grid of the orbital readers
 TEST_CASE("proc_grid_kb", "[utilities]")
 {
-  // the historic gcd grid is kept whenever it fits (bit-for-bit on every run that worked before)
+  // the gcd grid is kept whenever it fits (bit-for-bit identical to find_proc_grid_max_rows)
   for (long size : {1L, 2L, 4L, 8L, 13L, 26L, 52L, 56L})
     for (long nk : {1L, 3L, 8L, 13L, 64L})
       for (long nb : {8L, 16L, 60L, 128L}) {
@@ -76,10 +76,10 @@ TEST_CASE("proc_grid_kb", "[utilities]")
         auto kb = utils::find_proc_grid_kb(size, nk, nb);
         if (size / pk_old <= nb) { REQUIRE(kb[0] == pk_old); REQUIRE(kb[1] == size / pk_old); }
       }
-  // the production case that aborted (64 ranks, 13 IBZ k, 60 bands: gcd = 1 -> 64 bands per rank) now fits
+  // coprime size and nkpts (64 ranks, 13 IBZ k, 60 bands: gcd = 1 -> 64 bands per rank with the gcd grid) fits
   { auto kb = utils::find_proc_grid_kb(64, 13, 60); REQUIRE(kb[0] == 8); REQUIRE(kb[1] == 8); }
   { auto kb = utils::find_proc_grid_kb(256, 13, 60); REQUIRE(kb[0] == 8); REQUIRE(kb[1] == 32); }
-  { auto kb = utils::find_proc_grid_kb(56, 13, 60); REQUIRE(kb[0] == 1); REQUIRE(kb[1] == 56); }   // the historic grid, unchanged
+  { auto kb = utils::find_proc_grid_kb(56, 13, 60); REQUIRE(kb[0] == 1); REQUIRE(kb[1] == 56); }   // the gcd grid, unchanged
   // no grid at all: every layout puts more than nbnd ranks on the band axis
   { auto kb = utils::find_proc_grid_kb(512, 13, 60); REQUIRE(kb[0] == 0); REQUIRE(kb[1] == 0); }
   // every returned grid is a valid, bounded factorization

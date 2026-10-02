@@ -456,13 +456,12 @@ namespace bdft_tests {
 namespace bdft_tests {
 
   // ====================================================================================
-  // THE q -> 0 HEAD MUST NOT DEPEND ON HOW THE MESH WAS REDUCED (user ruling 2026-09-22:
-  // "we should always use the extrapolated head"; notes/vertex_perf_plan.md, the Si 4^3
-  // time-reversal hunt). eps^-1(q) = eps^-1(-q), so +b_i and -b_i carry the SAME physical
+  // THE q -> 0 HEAD MUST NOT DEPEND ON HOW THE MESH WAS REDUCED.
+  // eps^-1(q) = eps^-1(-q), so +b_i and -b_i carry the SAME physical
   // sample: a head built from the IBZ q LIST with a per-DIRECTION fit order sees different
-  // point counts on differently reduced meshes of the same crystal, and moves (Si 4^3:
-  // 6.78 on the full mesh vs 8.27 with the time-reversal reduction, which the ladder turns
-  // into 7 % of its correction). The axis-folded default merges the two sides and fits once.
+  // point counts on differently reduced meshes of the same crystal, and moves (e.g. between
+  // the full and the time-reversal-reduced Si 4^3 mesh). The axis-folded default merges the
+  // two sides and fits once.
   //
   // Driven on a MODEL eps^-1(q) = -1 + 1/(1 + a |q|^2) evaluated on each mesh's own IBZ q
   // list, so the exact head is known analytically (-1 + 1 = 0 ... the q -> 0 limit is 0 in
@@ -501,15 +500,15 @@ namespace bdft_tests {
       spread_perdir = std::max(spread_perdir, std::abs(head_perdir[i] - head_perdir[0]));
     }
     app_log(1, "gw head: the model eps^-1 head at q -> 0 (exact 0) on {} ({} IBZ q), {} ({}), {} ({}): "
-               "AXIS-FOLDED (the default) {:.6e} / {:.6e} / {:.6e} -> spread {:.2e}; per-direction (historic) "
+               "AXIS-FOLDED (the default) {:.6e} / {:.6e} / {:.6e} -> spread {:.2e}; per-direction "
                "{:.6e} / {:.6e} / {:.6e} -> spread {:.2e}",
             fx[0], nq_ibz[0], fx[1], nq_ibz[1], fx[2], nq_ibz[2],
             head_axis[0], head_axis[1], head_axis[2], spread_axis,
             head_perdir[0], head_perdir[1], head_perdir[2], spread_perdir);
-    REQUIRE(spread_axis < 1e-10);            // the ruling: one head, whatever the reduction
-    REQUIRE(spread_perdir > 1e-4);           // the defect it replaces is real, not a rounding difference
+    REQUIRE(spread_axis < 1e-10);            // one head, whatever the reduction
+    REQUIRE(spread_perdir > 1e-4);           // the per-direction dependence is real, not a rounding difference
     // ... and on a mesh with ONE distinct |q| per axis (every 2x2x2 fixture) the two forms are the SAME fit, so
-    // changing the default cannot move any small-fixture number. Measured, not assumed.
+    // the choice of form cannot move any small-fixture number; checked explicitly here.
     {
       auto mf2 = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_si222_nosym"));
       const long nq2 = mf2->nqpts_ibz();

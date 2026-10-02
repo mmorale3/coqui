@@ -1247,7 +1247,7 @@ namespace vertex_pi { struct iaft_tools; }
      * inside vertex routines. Each is then broken into its high-level stages, and the
      * printer reports the UNATTRIBUTED remainder per entry point rather than silently
      * letting the parts fail to add up -- an unattributed row that is large means a stage
-     * boundary is missing, which is exactly what we want to see.
+     * boundary is missing.
      *
      * The two lazy geometry-fixed builds (secondary ISDF basis, IBZ symmetry context) are
      * INCLUSIVE in whichever entry point first triggered them, so they are printed in a

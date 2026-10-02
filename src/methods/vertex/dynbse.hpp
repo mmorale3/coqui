@@ -91,7 +91,7 @@
 #if defined(ENABLE_CUDA)
 #include "utilities/device_pool.h"        // freemem_device_effective: the k-batch budget of the device L0
 #include "methods/vertex/cuda/l0_cuda.cuh"
-#include "methods/vertex/cuda/rung_cuda.cuh"   // R1(b): the streaming THC rung on the device
+#include "methods/vertex/cuda/rung_cuda.cuh"   // the streaming THC rung on the device
 #endif
 #include "nda/lapack.hpp"
 #include "numerics/nda_functions.hpp"

@@ -1,5 +1,5 @@
 /**
- * scGW-tilde Tier 2 full frequency, increment D1 (notes/dynbse_plan.md): the two-family DLR
+ * Full-frequency dynamic vertex: the two-family DLR
  * algebra of the resummed DYNAMIC-rung BSE (methods/vertex/dynbse.hpp) against a DENSE
  * Matsubara BSE oracle on an exact rational toy.
  *
@@ -10,7 +10,7 @@
  * on an explicit fermionic grid |n| < N by dense LU, with the kernel tail |m| >= N supplied
  * EXACTLY by the closed-form one-rung convolution (Gamma -> D there; the residual truncation
  * error is O(1/N^2) and is removed by Richardson in N), and the bare tail of the readout sum
- * taken from the closed-form T-sums. Gates:
+ * taken from the closed-form T-sums. Checks:
  *   (0) the closed-form rung convolution vs a dense sum (the oracle's own ingredient);
  *   (A) static limit: the solver's y = 0 vertex (the closed-form static resolvent) vs the
  *       oracle with the constant kernel K0 -- machine class;
@@ -19,7 +19,7 @@
  *   (C1) the first iterate Gamma_1 vs the oracle's first-order Dyson term (L_s D + L_s K_d L_s D);
  *   (D) the same toy through the FITTED, shared aux grid (the production pathway: G refit on
  *       the vertex's nodes => confluent products through the double-pole table) -- reported
- *       and gated at fit class.
+ *       and checked at fit class.
  */
 
 #undef NDEBUG
@@ -55,9 +55,9 @@ namespace bdft_tests {
 
   namespace wl = methods::solvers::ward_legs;
   namespace db = methods::solvers::dynbse;
-  /** gpu port 5b: on a CUDA build the L0 kernel runs on the device by default (vertex_debug
+  /** On a CUDA build the L0 kernel runs on the device by default (vertex_debug
    *  dynbse_l0_device), whose scatter accumulates with atomics -- two identical applications then agree to
-   *  a few ulp, not bitwise. The bitwise gates below keep their anchor on the host kernel. */
+   *  a few ulp, not bitwise. The bitwise checks below keep their anchor on the host kernel. */
   inline bool l0_on_device() {
 #if defined(ENABLE_CUDA)
     return db::l0_device_enabled();
@@ -99,10 +99,10 @@ namespace bdft_tests {
 
   inline dyn_toy make_dyn_toy(double zscale, double mscale) {
     dyn_toy T;
-    // larger spaces (2026-09-27): COQUI_DYNBSE_TOY_NC = n runs the toys at nc = n -- a non-power-of-two nc exercises the fused
-    // L0's padded lanes (segment S = 16 > nc = 12, the production C = 12), which nc = 2 / 4 / 8 never reach
-    // the readout width follows: Dc below writes column k nc2 + a nc + b, so nR = nk nc2 (the fixed nR = 8 only fits
-    // nc = 2 -- at nc = 12 / 16 the fill ran 288 / 512 columns past an 8-wide array: the round-13 heap corruption)
+    // larger spaces: COQUI_DYNBSE_TOY_NC = n runs the toys at nc = n -- a non-power-of-two nc exercises the fused
+    // L0's padded lanes (segment S = 16 > nc = 12, a typical production C = 12), which nc = 2 / 4 / 8 never reach.
+    // The readout width follows: Dc below writes column k nc2 + a nc + b, so nR = nk nc2 (a fixed nR = 8 only fits
+    // nc = 2).
     if (auto *e = std::getenv("COQUI_DYNBSE_TOY_NC")) { T.nc = std::max(1l, std::atol(e)); T.nc2 = T.nc * T.nc; }
     T.nR = T.nk * T.nc2;
     T.t = {make_toy(T.nc, {-1.5, 1.5}, {0.3, 0.3}, 41u), make_toy(T.nc, {-1.5, 1.5}, {0.3, 0.3}, 43u)};
@@ -491,7 +491,7 @@ namespace bdft_tests {
       stp = std::addressof(stab.value());
       o.shift_fit_err = stab->fit_err;
     }
-    {   // P7 (vertex_perf_plan.md): the LU form of the static resolvent (factor once, solve per application) == the dense
+    {   // the LU form of the static resolvent (factor once, solve per application) == the dense
         // inverse form, on one L_s application to a random two-family vector
       auto Slu = db::build_static_resolvent(b, P, R, inu, shared, "lu");
       const long nR = T.Dc.shape(3);
@@ -508,7 +508,7 @@ namespace bdft_tests {
       double d = 0.0, n = 0.0;
       for (long i = 0; i < G1.fam.size(); ++i) { d = std::max(d, std::abs(G1.fam.data()[i] - G2.fam.data()[i])); n = std::max(n, std::abs(G1.fam.data()[i])); }
       for (long i = 0; i < Gs1.size(); ++i) { d = std::max(d, std::abs(Gs1.data()[i] - Gs2.data()[i])); n = std::max(n, std::abs(Gs1.data()[i])); }
-      app_log(1, "dynbse P7: static resolvent LU form vs dense inverse (inu = {:.3e}i): max |d| {:.3e} / max {:.3e}", inu.imag(), d, n);
+      app_log(1, "dynbse: static resolvent LU form vs dense inverse (inu = {:.3e}i): max |d| {:.3e} / max {:.3e}", inu.imag(), d, n);
       REQUIRE(d < 1e-11 * std::max(n, 1e-300));
     }
     if (gmres_m > 0) {
@@ -573,7 +573,7 @@ namespace bdft_tests {
       const long np = b.np;
       auto P = db::make_pair_poles(beta, set.epsG, gk, gkq, np_fit);
       const bool nu0 = (inu == cplx(0.0));
-      // family 1 is the twisted pair T_c = U_c S_c at inu != 0 (D2e); at inu = 0 the families coincide
+      // family 1 is the twisted pair T_c = U_c S_c at inu != 0; at inu = 0 the families coincide
       auto eval_tf = [&](db::tf_vector const &V, long k, cplx z, long r, nda::array<cplx, 2> &out) {
         out() = cplx(0.0);
         for (long c = 0; c < np; ++c) {
@@ -719,9 +719,9 @@ namespace bdft_tests {
           }
           db::l0_apply_ref(bb, PP, inu, sh, Xs, Fa, Sa);
           db::l0_apply(bb, PP, inu, sh, Xr, Fb, Sb, nullptr, stGp);
-          // gpu port 5b: the device kernel against the HOST kernel on the same input -- far tighter than
+          // the device kernel against the HOST kernel on the same input -- far tighter than
           // grouped-vs-ref (whose 1e-9 class is the shift tables' fit): the two differ by the atomics' roundoff.
-          // R3 (2026-09-26): at inu = 0 this is the device nu = 0 kernel (l0_apply_cols_device) vs the host one.
+          // At inu = 0 this is the device nu = 0 kernel (l0_apply_cols_device) vs the host one.
           if (l0_on_device()) {
             db::tf_vector Fh(npp, nk, nc, 3);
             nda::array<cplx, 4> Sh(nk, nc, nc, 3);
@@ -739,11 +739,11 @@ namespace bdft_tests {
                        "(scale {:.3e})", inu.imag(), tag, dh, hs, dhs, hss);
             REQUIRE(dh <= 1e-12 * std::max(hs, 1e-3));
             // the frequency sums cancel terms of the size of F (|F| ~ 3.6e3 vs |Fsum| ~ 1.4 at toy nc = 16): their atomic
-            // roundoff scales with |F|, so the bound carries a 1e-14 |F| term (round 13: 1.59e-12 at nc = 16 = 4e-16 |F|)
+            // roundoff scales with |F|, so the bound carries a 1e-14 |F| term
             REQUIRE(dhs <= 1e-12 * std::max(hss, 1e-3) + 1e-14 * hs);
           }
-          // gpu port P-3a: a frequency-CONSTANT input takes the active-component fast path (one packed component
-          // instead of 1 + 2 np) -- it must reproduce the reference at the gate's class and, on a CUDA build, the
+          // a frequency-CONSTANT input takes the active-component fast path (one packed component
+          // instead of 1 + 2 np) -- it must reproduce the reference at the main check's class and, on a CUDA build, the
           // host kernel on the same input to roundoff. (A constant-only input is the same vector in the {U,S} and
           // the twisted bases, so the reference needs no conversion.)
           {
@@ -759,7 +759,7 @@ namespace bdft_tests {
                 sk = std::max(sk, std::abs(Fkr.fam.data()[i]));
               }
             } else {
-              // as the main gate: pointwise values at a few fermionic frequencies, each output in its own basis
+              // as the main check: pointwise values at a few fermionic frequencies, each output in its own basis
               // (the reference's family 1 is S_c, the grouped code's is T_c = U_c S_c)
               for (long k = 0; k < nk; ++k)
                 for (long n : {0l, 2l, 9l, -5l, 40l})
@@ -859,7 +859,7 @@ namespace bdft_tests {
           REQUIRE(ds < (nu0 ? 1e-11 : 1e-7) * std::max(ss, 1e-3));
           REQUIRE(dc < 1e-9 * std::max(ss, 1e-3));
           // the Cb_cst override does not touch F: bitwise on the host kernel; the device kernel's atomics
-          // reorder the scatter between two applications (rusty A100, 2026-09-24: |dF| 3.6e-14 at scale 13.7)
+          // reorder the scatter between two applications (a few ulp of |F|)
           REQUIRE(dfc <= (l0_on_device() ? 1e-12 * sf : 0.0));
         };
         compare(b, P, false, "union set");

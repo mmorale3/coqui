@@ -97,7 +97,7 @@ auto read_distributed_orbital_set(MF& mfobj, comm_t& comm, char OT,
       long sz = comm.size();
       long ps = (sz%nspin==0?nspin:1);
       long n_ = sz/ps;
-      // P21: the bounded (k, band) grid -- the historic gcd grid when it fits, else the repair (see find_proc_grid_kb)
+      // the bounded (k, band) grid: the gcd grid when it fits, else the largest bounded k pool (see find_proc_grid_kb)
       auto kb = utils::find_proc_grid_kb(n_, nkpts, nbnd);
       utils::check(kb[0] > 0, "read_distributed_orbital_set: {} ranks cannot be laid out over {} k-points x {} bands "
                               "(one band per rank at most); use at most {} ranks.", sz, nkpts, nbnd, ps * nkpts * nbnd);

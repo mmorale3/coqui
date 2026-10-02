@@ -799,7 +799,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     mbpt_vertex_audit::set_fallback_keys(vertex, pt);   // the vertex fallback keys (default false = abort)
     vertex.set_eps_cut(io::get_value_with_default<long>(pt,"pol_eps_cut",0),      // eps(q_i, i nu) cuts
                        io::get_value_with_default<long>(pt,"pol_eps_cut_dyn_nnu",0));
-    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // P25: eps_inf small-q fit
+    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
     {   // the ladder's leg vertex (inactive by default)
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
@@ -1007,7 +1007,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                greens_func_source, greens_func_iteration);
     } else {
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", div_treatment);
-      scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // P25: eps_inf small-q fit
+      scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
       scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gf2, &scr_eri),
                iter_solver.get(), niter, restart, conv_thr, const_mu,
                greens_func_source, greens_func_iteration);
@@ -1227,7 +1227,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       iter_solver = nullptr;
     }
     solvers::scr_coulomb_t scr_eri(&ft, "rpa", div_treatment);
-    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // P25: eps_inf small-q fit
+    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
     solvers::gw_t gw(&ft, div_treatment, output);
     // the knob carrier MUST outlive qp_scf_loop -- same stack frame as scr_eri.
     solvers::vertex_t pol_vertex_carrier(&ft, "none", nda::range(0,0), mf->nbnd(),
@@ -1520,7 +1520,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       iter_solver = nullptr;
     }
     solvers::scr_coulomb_t scr_eri(&ft, "rpa", div_treatment);
-    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // P25: eps_inf small-q fit
+    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
     solvers::gw_t gw(&ft, div_treatment, output);
     // the knob carrier MUST outlive qp_scf_loop -- same stack frame as scr_eri.
     solvers::vertex_t pol_vertex_carrier(&ft, "none", nda::range(0,0), mf->nbnd(),
@@ -1866,7 +1866,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     mbpt_vertex_audit::set_fallback_keys(vertex, pt);   // the vertex fallback keys (default false = abort)
     vertex.set_eps_cut(io::get_value_with_default<long>(pt,"pol_eps_cut",0),      // eps(q_i, i nu) cuts
                        io::get_value_with_default<long>(pt,"pol_eps_cut_dyn_nnu",0));
-    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // P25: eps_inf small-q fit
+    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
     {   // the ladder's leg vertex (inactive by default)
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
@@ -2218,7 +2218,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
       iter_solver = nullptr;
     }
     solvers::scr_coulomb_t scr_eri(&ft, screen_type, div_treatment);
-    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // P25: eps_inf small-q fit
+    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
     solvers::gw_t gw(&ft, div_treatment, output);
     // the knob carrier MUST outlive qp_scf_loop -- same stack frame as scr_eri.
     solvers::vertex_t pol_vertex_carrier(&ft, "none", nda::range(0,0), mf->nbnd(),

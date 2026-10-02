@@ -2,7 +2,7 @@
  * ==========================================================================
  * CoQuí: Correlated Quantum ínterface
  *
- * P25 / G32 (notes/vertex_perf_plan.md): the small-q fit of epsilon_inf, the pure
+ * The small-q fit of epsilon_inf, the pure
  * function alone (methods/scr_coulomb/eps_inf_fit.hpp). No fixture, no MPI: synthetic
  * eps(q) = eps_inf + A q^2 (+ B q^4) on a handful of |q| must be recovered to round-off,
  * q = 0 must be excluded, the point selection must be by ascending |q|, and the

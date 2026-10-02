@@ -360,12 +360,12 @@ namespace solvers {
                  "    epsilon_inf = {:.6f}   [eps^-1_head(inu=0) = {:.6e} {:+.6e}i]\n",
               eps_inf, eps_inv_static.real(), eps_inv_static.imag());
     }
-    // P25 / G32 (notes/vertex_perf_plan.md; [gw] eps_inf_fit = true, default off): epsilon_inf from the
+    // [gw] eps_inf_fit = true (default off): epsilon_inf from the
     // SMALL-q FIT eps_M(q) = eps_inf + A |q|^2 (+ B |q|^4) of the loop's OWN static dielectric function
     // on the smallest nonzero |q| of the IBZ mesh -- eps_M(q) = 1 / (1 + Re[eps^-1_{00}(q, i nu = 0) - 1])
     // from eps_inv_head_q (the q-resolved head of THIS dW, div_treatment-independent), reported next to
     // the stored head above as the check of the div_treatment's q -> 0 recipe. Report-only, all ranks
-    // evaluate the same replicated numbers; off = bitwise fallthrough of every existing line and dataset.
+    // evaluate the same replicated numbers; when off, no output line or dataset changes.
     std::optional<eps_fit::eps_inf_fit_t> eps_inf_fit_res;
     if (_eps_inf_fit) {
       eps_inf_fit_res = eval_eps_inf_fit(eps_inv_head_q, *thc.MF());
@@ -492,8 +492,8 @@ namespace solvers {
 
     // wall clock of the vertex-side blocks of update_w (the TEMP_UW timers do not separate them)
     auto uw_wall = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
-    // larger spaces (2026-09-27): the vertex drivers below size their device-resident units (the dense tau rungs, D^2 each)
-    // from the free device memory, and the scGW W (nq nt_half Np^2 / nranks, 11 GB per rank at Si kp444 on 2 ranks) is the
+    // the vertex drivers below size their device-resident units (the dense tau rungs, D^2 each) from the free device
+    // memory, and the scGW W (nq nt_half Np^2 / nranks elements per rank) is the
     // largest other resident -- and none of them reads it (the W-bar caches are filled first). It is PARKED on the host for
     // the drivers and restored at the end of update_w (two bulk copies). vertex_debug park_W_device = 0 keeps it on the device.
     bool W_parked = false;
@@ -3256,7 +3256,7 @@ namespace solvers {
       double epsilon_inf = 1.0 / (1.0 + eps_inv_head_w(0).real());
       nda::h5_write(iter_grp, "eps_head_w", eps_head_w, false);
       h5::h5_write(iter_grp, "epsilon_inf", epsilon_inf);
-      // P25 / G32 (eps_inf_fit = true): the small-q fit next to the stored head -- the constant term,
+      // eps_inf_fit = true: the small-q fit next to the stored head -- the constant term,
       // the coefficients c_k of eps_M(q) = sum_k c_k |q|^{2k}, the |q| and eps_M(q) used, the RMS misfit.
       if (fit != nullptr and fit->ok) {
         const long ncf = static_cast<long>(fit->coeffs.size()), nqa = static_cast<long>(fit->q_used.size());
@@ -3274,10 +3274,10 @@ namespace solvers {
     comm.barrier();
   }
 
-  // P25 / G32: eps_M(q) = 1 / (1 + Re[eps^-1_{00}(q, i nu = 0) - 1]) at every IBZ transfer from the
+  // eps_M(q) = 1 / (1 + Re[eps^-1_{00}(q, i nu = 0) - 1]) at every IBZ transfer from the
   // q-resolved tau head, then eps_fit::fit_eps_inf on the smallest nonzero Cartesian |q|. The |q|-only
   // fit is exact for a cubic cell; for a lower symmetry eps(q -> 0) is direction-dependent and the fit
-  // averages over the directions the smallest IBZ transfers happen to sample (stated in the plan).
+  // averages over the directions the smallest IBZ transfers happen to sample.
   eps_fit::eps_inf_fit_t scr_coulomb_t::eval_eps_inf_fit(const nda::ArrayOfRank<2> auto &eps_inv_head_tq,
                                                           mf::MF &mf) const {
     const long nq = eps_inv_head_tq.shape(1);

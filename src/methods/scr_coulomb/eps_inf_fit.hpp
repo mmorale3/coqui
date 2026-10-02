@@ -22,7 +22,7 @@
 #define COQUI_EPS_INF_FIT_HPP
 
 /**
- * P25 / G32 (notes/vertex_perf_plan.md): epsilon_inf from the SMALL-q FIT of the static
+ * epsilon_inf from the SMALL-q FIT of the static
  * macroscopic dielectric function, reported next to the stored q -> 0 head.
  *
  * The head of W(q) carries the bare 1/q^2 divergence, and every div_treatment (gygi,
