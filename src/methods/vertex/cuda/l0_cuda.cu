@@ -1525,6 +1525,11 @@ namespace methods::solvers::dynbse_cuda {
     double t_copy_est = 0.0, t_rb_est = 0.0;                 // seconds per rep: H2D copy (measured bandwidth), device rebuild
     double t_gemm_est = 0.0;                                 // seconds per rep: the rung gemm (timed on the resident reps)
     long napp_cur = 0, napp_prev = 0;                        // rung passes of the current / previous transfer
+    double t_pass_cur = 0.0, t_hb_cur = 0.0;                 // this transfer: rung-pass wall time, build + D2H of its copied rungs
+    std::vector<std::vector<int>> cand;                      // the candidate copy / rebuild splits (set at the first plan)
+    std::vector<double> cand_sum;                            // their timed cost per pass, summed over the transfers that ran them
+    std::vector<long> cand_n;                                // ... and the number of those transfers
+    long cand_cur = -1;                                      // the split of the current transfer
     cudaEvent_t ev_t0 = nullptr, ev_t1 = nullptr;            // timing events around the resident gemms
     long ncopy = 0;
     double t_copy_wait = 0.0;
@@ -1761,6 +1766,21 @@ namespace methods::solvers::dynbse_cuda {
     *nhost_reps = nh; *ncopies = e->ncopy; *t_copy_est = e->t_copy_est; *t_rb_est = e->t_rb_est;
   }
   void ue_plan_inputs(unit_engine const *e, double *t_gemm_est, long *napp) { *t_gemm_est = e->t_gemm_est; *napp = e->napp_prev; }
+  void ue_plan_report(unit_engine const *e, char *buf, long len) {
+    std::string s;
+    for (size_t i = 0; i < e->cand.size(); ++i) {
+      long nh = 0;
+      for (int v : e->cand[i]) nh += v;
+      char one[96];
+      if (e->cand_n[i] > 0)
+        std::snprintf(one, sizeof(one), "%s%ld copied: %.1f ms per pass (%ld transfers)%s", i ? "; " : "", nh,
+                      1e3 * e->cand_sum[i] / double(e->cand_n[i]), e->cand_n[i], long(i) == e->cand_cur ? " [in use]" : "");
+      else
+        std::snprintf(one, sizeof(one), "%s%ld copied: not timed%s", i ? "; " : "", nh, long(i) == e->cand_cur ? " [in use]" : "");
+      s += one;
+    }
+    std::snprintf(buf, size_t(len), "%s", s.empty() ? "a single source" : s.c_str());
+  }
   void ue_set_stream(unit_engine *e, rung_stream *rs) {
     if (not e->stream) APP_ABORT(std::string(" ue_set_stream: the engine was not created in stream mode."));
     e->rs = rs;
@@ -1910,6 +1930,7 @@ namespace methods::solvers::dynbse_cuda {
         return;
       }
       ++e->napp_cur;
+      const double tpass0 = wnow();
       auto host = [&](long j) { return e->src_host[size_t(j)] != 0; };
       auto issue_copy = [&](long j) {
         const int b = int(j % 2);
@@ -1945,6 +1966,8 @@ namespace methods::solvers::dynbse_cuda {
         cu_check(cudaEventRecord(e->ev_free[b], 0), "staging free");
         if (j + 2 < nnr and host(j + 2)) issue_copy(j + 2);
       }
+      cu_check(cudaDeviceSynchronize(), "rung pass");
+      e->t_pass_cur += wnow() - tpass0;
       if (e->nrebuild > 0) e->t_rb_est = e->t_rebuild / double(e->nrebuild);
       if (e->nres > 0) {
         float ms = 0.0f;
@@ -2664,7 +2687,12 @@ namespace methods::solvers::dynbse_cuda {
   } // namespace
 
   namespace {
-    // the copy / rebuild split of the non-resident rungs for the next transfer, chosen by simulating the rung pass of
+    // the copy / rebuild split of the non-resident rungs for the next transfer. A model ranks the splits (below); the
+    // planner then TIMES a few candidates -- the model's pick, all copied, all rebuilt, half copied -- one transfer each
+    // (the rung-pass wall time plus the build and D2H of the copied rungs, per pass) and keeps the fastest. The model alone
+    // misjudges the overlap on some devices; the timed choice needs no per-device tuning.
+    //
+    // The model simulates the rung pass of
     // ue_rung_dense: the resident gemms run first while the copy stream prefetches the first two copied rungs; then rung j
     // (staging buffer j % 2) either waits for its copy or is rebuilt on the compute stream (serialized with the gemms), and
     // the copy of rung j + 2 starts once rung j's gemm has freed the buffer. Costs per rung: the gemm (timed on the resident
@@ -2690,6 +2718,28 @@ namespace methods::solvers::dynbse_cuda {
       const bool can_rb = e->kb.on and e->c.nonres_src != 2;
       const bool can_cp = (e->Kds_host != nullptr) and e->c.nonres_src != 1;
       if (not can_rb and not can_cp) APP_ABORT(std::string(" ue_plan_sources: no source for the non-resident rungs -- ABORTING."));
+      // close the previous transfer: its split's timed cost per pass
+      if (e->cand_cur >= 0 and e->napp_cur > 0) {
+        e->cand_sum[size_t(e->cand_cur)] += (e->t_pass_cur + e->t_hb_cur) / double(e->napp_cur);
+        ++e->cand_n[size_t(e->cand_cur)];
+      }
+      if (e->napp_cur > 0) e->napp_prev = e->napp_cur;
+      e->napp_cur = 0; e->t_pass_cur = 0.0; e->t_hb_cur = 0.0;
+      if (not e->cand.empty()) {                           // the candidates are set: time the untimed ones, then keep the best
+        long pick = -1;
+        for (size_t i = 0; i < e->cand.size() and pick < 0; ++i)
+          if (e->cand_n[i] == 0) pick = long(i);
+        if (pick < 0) {
+          double best = 1e300;
+          for (size_t i = 0; i < e->cand.size(); ++i) {
+            const double c = e->cand_sum[i] / double(e->cand_n[i]);
+            if (c < best) { best = c; pick = long(i); }
+          }
+        }
+        e->cand_cur = pick;
+        e->src_host = e->cand[size_t(pick)];
+        return;
+      }
       std::vector<int> best_src(size_t(nnr), can_cp ? 1 : 0);
       if (can_rb and can_cp) {
         const double nk = double(e->c.nk), nc2 = double(e->nc2), Nm = double(e->kb.Nm), D = double(e->D);
@@ -2709,7 +2759,22 @@ namespace methods::solvers::dynbse_cuda {
             if (t < best * (1.0 - 1e-9)) { best = t; best_src = src; }
           }
       }
-      e->src_host = best_src;
+      // the candidates: the model's pick first, then all copied, all rebuilt, half copied (those the sources allow)
+      e->cand.push_back(best_src);
+      if (can_rb and can_cp) {
+        const long hmax = std::min(nnr, e->nhost_cap);
+        for (long h : {hmax, 0l, hmax / 2}) {
+          std::vector<int> v(static_cast<size_t>(nnr), 0);
+          for (long jj = 0; jj < nnr; ++jj) v[size_t(jj)] = ((jj + 1) * h / nnr > jj * h / nnr) ? 1 : 0;
+          bool dup = false;
+          for (auto const &c : e->cand) dup = dup or (c == v);
+          if (not dup) e->cand.push_back(v);
+        }
+      }
+      e->cand_sum.assign(e->cand.size(), 0.0);
+      e->cand_n.assign(e->cand.size(), 0);
+      e->cand_cur = 0;
+      e->src_host = e->cand[0];
     }
   } // namespace
 
@@ -2732,10 +2797,9 @@ namespace methods::solvers::dynbse_cuda {
     kb_build_tables(e, ts.data(), Kts.data(), long(ts.size()), sk);
     const long nnr = e->stream ? 0 : e->c.ndist - e->nres;
     if (nnr > 0) {
-      if (e->napp_cur > 0) e->napp_prev = e->napp_cur;
-      e->napp_cur = 0;
-      ue_plan_sources(e);
+      ue_plan_sources(e);                                   // closes the previous transfer's timing, picks this one's split
       const size_t DD = size_t(D) * size_t(D);
+      const double thb0 = wnow();
       double tb_sum = 0.0;
       long nb = 0;
       for (long jj = 0; jj < nnr; ++jj) {
@@ -2750,6 +2814,7 @@ namespace methods::solvers::dynbse_cuda {
         cu_check(cudaMemcpy(e->Kds_host + size_t(jj) * DD, e->stage[0], DD * sizeof(cd), cudaMemcpyDeviceToHost), "kb host rep D2H");
       }
       if (nb > 0) e->t_rb_est = tb_sum / double(nb);
+      e->t_hb_cur = wnow() - thb0;
     }
     // the Sigma hook's |K_s - K_s^dag| meter
     cu_check(cudaMemsetAsync(e->red, 0, 2 * sizeof(unsigned long long), 0), "kb red");

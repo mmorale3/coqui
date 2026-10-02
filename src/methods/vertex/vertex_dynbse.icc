@@ -1610,7 +1610,9 @@ namespace solvers {
             auto const &mpol = dyn_device_memory_state();
             const bool kb_will = not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0;
             uc.nres = long(vertex_debug::number("dynbse_dev_nres", -1.0));   // vertex_debug: dynbse_dev_nres
-            uc.rung_fuse = int(vertex_debug::number("dynbse_dev_rung_fuse", 1.0));   // vertex_debug: dynbse_dev_rung_fuse (two inputs per rung pass)
+            // vertex_debug: dynbse_dev_rung_fuse = 1 packs the one-bare-rung and Gamma_1 inputs into one rung pass (more device
+            // memory; slower than two passes when the rungs are resident and the gemms are compute-bound)
+            uc.rung_fuse = int(vertex_debug::number("dynbse_dev_rung_fuse", 0.0));
             uc.stream = ue_stream ? 1 : 0;
             if (ue_stream) { uc.rung_fuse = 0; uc.nres = 0; }
             uc.partial_ok = kb_will ? 1 : 0;
@@ -2572,12 +2574,14 @@ namespace solvers {
         double tg_e = 0.0;
         long napp_e = 0;
         dynbse_cuda::ue_plan_inputs(ue.get(), &tg_e, &napp_e);
+        char plan_txt[512] = {0};
+        dynbse_cuda::ue_plan_report(ue.get(), plan_txt, 512);
         if (rank == 0)
           app_log(1, "  [dynbse] partial rung residency ({} of {} tau rungs resident; last plan: {} copied from pinned host memory, {} "
                      "rebuilt): rank 0 did {} rebuilds ({:.1f} s, {:.1f} ms each) and {} copies (estimated {:.1f} ms each); planner "
-                     "inputs: rung gemm {:.2f} ms per representative, {} rung passes per transfer",
+                     "inputs: rung gemm {:.2f} ms per representative, {} rung passes per transfer; timed splits: {}",
                   dynbse_cuda::ue_nres(ue.get()), ndist, nhr, ndist - dynbse_cuda::ue_nres(ue.get()) - nhr, nrb_, trb,
-                  nrb_ > 0 ? 1e3 * trb / double(nrb_) : 0.0, ncp, 1e3 * tcp_e, 1e3 * tg_e, napp_e);
+                  nrb_ > 0 ? 1e3 * trb / double(nrb_) : 0.0, ncp, 1e3 * tcp_e, 1e3 * tg_e, napp_e, plan_txt);
       }
 #endif
 #if defined(ENABLE_CUDA)

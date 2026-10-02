@@ -172,6 +172,8 @@ namespace methods::solvers::dynbse_cuda {
   /** the planner's other inputs: the timed rung gemm per representative (seconds) and the rung passes of the last
    *  completed transfer */
   void ue_plan_inputs(unit_engine const *e, double *t_gemm_est, long *napp);
+  /** the timed copy / rebuild splits (copied count, cost per pass, transfers timed; the one in use marked) as text */
+  void ue_plan_report(unit_engine const *e, char *buf, long len);
   /** stream mode: the streaming rung the engine applies (owned by the caller; its (s, q) legs set by the caller, rs_set_sq) */
   void ue_set_stream(unit_engine *e, rung_stream *rs);
 
