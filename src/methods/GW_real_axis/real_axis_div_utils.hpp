@@ -18,18 +18,17 @@
  *     on the bosonic real-frequency grid, plus the q->0 estimate using the
  *     smallest-|q| in the IBZ ("gygi_smallest_q" treatment).
  *
- * What's NOT here yet:
- *   - The Sigma^c divergence correction itself. The imag-axis correction in
+ *   - `apply_sigma_head_correction_real_axis`: real-axis analog of the imag-axis
+ *     Sigma^c head correction. The imag-axis correction in
  *     `methods/GW/thc_gw.icc::Sigma_div_correction` is a tau-pointwise
  *     formula, `Delta(t) = -madelung * eps_inv_head(t) * T G(t) T^dag`,
  *     because in imag-time the Sigma^c convolution collapses to a tau-by-tau
  *     product. On the real axis, the analog is a frequency-domain
  *     convolution between A_T(s,k,i,j,eps) (the T-rotated spectral function)
  *     and B_head(Omega) (a head-channel bosonic kernel built from
- *     eps_inv_head). The exact formula (sign conventions, factor of pi,
- *     interaction with the existing f / n_B kernel structure) needs to be
- *     derived against `notes/isdf_gw_prb_draft_v2.tex` Sec. VII before being
- *     implemented. Until then `evaluate_serial` just zeros iq_gamma.
+ *     eps_inv_head). Its sign conventions, factor of pi and interplay with
+ *     the f / n_B kernel structure are not validated; the W chain does not
+ *     use it.
  */
 
 #ifndef COQUI_REAL_AXIS_DIV_UTILS_HPP
@@ -151,9 +150,8 @@ inline void compute_eps_inv_head_O(
  * fermionic w grid in [-w_max, w_max], using the diagonal-odd extension
  *   B(-Omega) = -B(Omega).
  * Linear interpolation between bosonic grid points; linear extrapolation
- * to 0 inside [0, Omega_min); zero beyond Omega_max. Mirrors the helper
- * in real_axis_sigma.hpp::resample_bosonic_to_fermionic but for a
- * scalar (1D) bosonic input rather than a (Naux, Naux, N_Omega) tensor.
+ * to 0 inside [0, Omega_min); zero beyond Omega_max. Scalar (1D) input,
+ * as opposed to a (Naux, Naux, N_Omega) tensor.
  */
 inline void resample_scalar_bosonic_to_fermionic(
     real_freq_grid_t       const& grid,

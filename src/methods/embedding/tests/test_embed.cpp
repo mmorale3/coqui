@@ -721,16 +721,15 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
   }
 
   /**
-   * Project 2 increment Q4-C3b (notes/q4_c3b_orbital_ladder_dc_spec.md), gate G5: the
-   * CONSUMER leg of the eq-7 ladder DC. pi_lad_dc = "orbital" makes P_dc gain
-   * P^lad_loc,orb (dataset "pi_lad_loc_orb_wabcd" of the screening group), and nothing
-   * else in downfold_2e changes: the default leg below reproduces downfold_2e_edmft's
-   * stored values EXACTLY, on the same fixture, with the new knob code compiled in.
+   * Consumer side of the ladder double counting P_dc = bubble[G_loc] + P^lad_loc.
+   * pi_lad_dc = "orbital" makes P_dc gain P^lad_loc,orb (dataset "pi_lad_loc_orb_wabcd"
+   * of the screening group), and nothing else in downfold_2e changes: the default leg
+   * below reproduces downfold_2e_edmft's stored values exactly, on the same fixture.
    *
    * The ladder object is SYNTHETIC here (a fixed constant tensor injected into the
    * checkpoint). This test is about the consumer wiring -- which dataset is read, that the
    * sum reaches Pi_dc and that a missing object is fatal rather than silent. The physics
-   * object and its convention are pinned in test_methods_qpgw_c3b (gates G2/G3/G4).
+   * object and its convention are tested in test_methods_qpgw_c3b.
    */
   TEST_CASE("downfold_2e_edmft_pi_lad_orbital", "[methods][embed][df_2e]") {
     auto& mpi = utils::make_unit_test_mpi_context();
@@ -795,7 +794,7 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
 
     // ---- the ORBITAL leg: P_dc gains the object ---------------------------------------
     auto [U_orb, Pdc_orb] = run_leg("orbital");
-    // THE GATE: the stored Pi_dc must differ from the default leg by EXACTLY the injected
+    // The check: the stored Pi_dc must differ from the default leg by EXACTLY the injected
     // tensor, element by element -- that pins the dataset selection, the shape check and
     // the sum (a wrong dataset name would have aborted; a wrong slot would show up here).
     double perr = 0.0, pmax = 0.0;
@@ -809,9 +808,9 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
               perr = std::max(perr, std::abs(Pdc_orb(w,a,b,c,d) - Pdc_def(w,a,b,c,d) - inj));
               pmax = std::max(pmax, std::abs(Pdc_def(w,a,b,c,d)));
             }
-    // ... and the Uloc shift, RECORDED not gated (spec G5). On this fixture there is no
+    // ... and the Uloc shift, logged but not checked. On this fixture there is no
     // impurity polarizability at all, so Uloc == Wloc and P_dc does not reach U(i.nu):
-    // the measured shift is 0. The DC path itself is what this leg pins.
+    // the shift is 0. The DC path itself is what this leg tests.
     double dmax = 0.0, umax = 0.0;
     for (long w = 0; w < U_def.shape(0); ++w)
       for (long a = 0; a < n; ++a)
@@ -821,15 +820,15 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
               dmax = std::max(dmax, std::abs(U_orb(w,a,b,c,d) - U_def(w,a,b,c,d)));
               umax = std::max(umax, std::abs(U_def(w,a,b,c,d)));
             }
-    app_log(1, "@@C3B G5 pi_lad_dc = \"orbital\" (synthetic P^lad_loc,orb, amplitude "
+    app_log(1, "[orbital ladder] DC consumer check: pi_lad_dc = \"orbital\" (synthetic P^lad_loc,orb, amplitude "
                "{:.1e}): |Pi_dc(orb) - Pi_dc(def) - injected|_max = {:.3e} on "
                "||Pi_dc||_max = {:.6e}; Uloc shift = {:.6e} on ||Uloc||_max = {:.6e} "
                "(Uloc == Wloc on this fixture -- no impurity polarizability)",
             amp, perr, pmax, dmax, umax);
-    // MEASURED (2026-08-14): perr = 0.000e+00 exactly; Uloc shift = 0. NON-VACUITY of the
-    // perr gate: had the object NOT been added, perr would be the injected amplitude 1e-03
-    // -- 11 orders above the stored bubble P_dc of this fixture, which is itself machine
-    // zero (||Pi_dc||_max = 2.26e-14 on the mf Green's function written by write_mf_data).
+    // Expected: perr = 0 exactly and a zero Uloc shift. The perr check is not vacuous: had
+    // the object not been added, perr would be the injected amplitude 1e-03, many orders
+    // above the stored bubble P_dc of this fixture, which is itself at machine-zero level
+    // on the mf Green's function written by write_mf_data.
     REQUIRE(pmax > 0.0);
     REQUIRE(perr < 1e-14);            // the orbital object landed on Pi_dc exactly
     REQUIRE(umax > 0.0);

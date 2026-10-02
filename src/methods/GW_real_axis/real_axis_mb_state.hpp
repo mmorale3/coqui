@@ -54,8 +54,8 @@ namespace real_axis {
  * FINUFFT-batched kernels (cross_correlate / convolve / Hilbert) that operate
  * on contiguous (P,Q,Omega) slices.
  *
- * Bosonic objects live on the Omega>=0 half-grid (see notes section on BZ
- * symmetries: bosonic Omega->-Omega symmetry is exact at any temperature).
+ * Bosonic objects live on the Omega>=0 half-grid (the bosonic Omega->-Omega
+ * symmetry is exact at any temperature).
  * Fermionic objects span the full window [-w_max, w_max] because at finite T
  * the Fermi factor breaks any reflection symmetry around mu_chem.
  *
@@ -73,7 +73,7 @@ struct real_axis_mb_state_t {
   // the corresponding complex bosonic quantity. The kernels work with
   // complex MEM-side scratch internally (NUFFT / slate) and convert at
   // the boundaries; storing the state as `double` halves the bosonic
-  // memory footprint (memory-redesign step P0').
+  // memory footprint.
   using bosonic_dArray_t = memory::darray_t<
       memory::array<HOST_MEMORY, double, 4>,
       boost::mpi3::communicator>;
@@ -138,7 +138,7 @@ struct real_axis_mb_state_t {
 
   // Diagnostic snapshot: diagonal of {Im,Re}W at q = q_gamma (IBZ index 0),
   // shape (Naux, N_Omega) real. Populated by scr_coulomb_t::update_w
-  // (just before P5* lite would otherwise free ReW) when the SCF driver
+  // (just before free_intermediate_bosonic would free ReW) when the SCF driver
   // sets `collect_W_diag_qg = true`. Written into the chkpt h5 by
   // dump_scf_real_axis as /scf/iter{N}/{ImW_diag_qg, ReW_diag_qg}.
   // Use case: plotting W along the aux-basis diagonal to inspect the
@@ -176,7 +176,7 @@ struct real_axis_mb_state_t {
   /// are not needed downstream of update_w. Only ImW_qPQO is consumed by
   /// gw_t::evaluate; the rest is scratch within update_w (Pi for the Dyson
   /// solve, ReW for eps_inv_head). Called by the SCF/QP-SCF drivers between
-  /// update_w and evaluate (memory-redesign P5* lite). Reduces resident
+  /// update_w and evaluate. Reduces resident
   /// bosonic state from 4 arrays to 1 for the rest of the SCF iteration.
   ///
   /// Tests that inspect ImPi/RePi/ReW directly (e.g. test_real_axis_scr_coulomb)

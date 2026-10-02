@@ -91,8 +91,9 @@ public:
    * The screened interaction as a host darray, materialized from the device
    * copy if that is where it lives. For one-off host consumers after the SCF
    * loop (the optional W h5 dump); keeping the mirror up to date every
-   * iteration instead costs 13.4 s/iter, so use this rather than keep_host_W
-   * unless a consumer really needs it each iteration.
+   * iteration instead costs a full device->host copy and redistribution of W
+   * per iteration, so use this rather than keep_host_W unless a consumer
+   * really needs it each iteration.
    */
   dArray_t<nda::array<ComplexType, 4> >& W_host();
 
@@ -123,8 +124,8 @@ public:
   /**
    * Whether the host mirror dW_qtPQ has to be maintained on the device path.
    * A pure scGW run reads W only through dW_qtPQ_dev, so keeping the mirror
-   * costs 13.4 s and 18.5 GB of host memory per iteration for data nothing
-   * touches. Set this when a host-side consumer needs W every iteration; for a
+   * costs a full copy of W in host memory and its transfer every iteration for
+   * data nothing touches. Set this when a host-side consumer needs W every iteration; for a
    * one-off consumer after the SCF loop, prefer W_host() below.
    */
   bool keep_host_W = false;

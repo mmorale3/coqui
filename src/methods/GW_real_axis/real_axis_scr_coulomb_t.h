@@ -53,11 +53,6 @@ namespace real_axis {
  *     state.ImW_qPQO,  state.ReW_qPQO    -- screened interaction
  *
  * with iq_gamma zeroed when div_treatment == "ignore_g0".
- *
- * Matches Steps 1-4 of `evaluate_serial` in `real_axis_gw_driver.hpp`. The
- * production driver duplicates this logic for now; once the SCF refactor
- * lands the driver collapses to a thin wrapper around update_w + the
- * forthcoming real_axis_gw_t::evaluate.
  */
 template<MEMORY_SPACE MEM = HOST_MEMORY>
 class real_axis_scr_coulomb_base_t {
@@ -111,9 +106,8 @@ private:
   // Lazy caches for SCF iterations:
   //   _conv: (cu)FINUFFT plans + Hilbert sgn(t) buffers — built once on
   //          first update_w call when B_loc (=Naux_loc_P*Naux_loc_Q) is
-  //          known. Reused across all subsequent SCF iterations. (cu)FINUFFT
-  //          plan setup is non-trivial (~10s of ms on host, possibly worse
-  //          on device); avoiding 19+ rebuilds is a real wall-clock win.
+  //          known. Reused across all subsequent SCF iterations, since
+  //          (cu)FINUFFT plan setup is not cheap.
   //   _cached_B_loc: invalidates _conv if the proc-grid changes between calls.
   //   _sX, _skpq, _sf_Rk, _sf_qR, _V_qPQ_loc: marshaled THC / BZ data that
   //          never changes within an SCF run. Built on first call, reused.
@@ -139,8 +133,8 @@ private:
 using real_axis_scr_coulomb_t = real_axis_scr_coulomb_base_t<HOST_MEMORY>;
 
 // --------------------------------------------------------------------------
-// update_w implementation. Header-inline for now (matches the rest of the
-// real-axis module). Body parallels Steps 1-4 of `evaluate_serial`.
+// update_w implementation. Header-inline, like the rest of the real-axis
+// module.
 // --------------------------------------------------------------------------
 template<MEMORY_SPACE MEM>
 template<methods::THC_ERI THC_t>
@@ -187,8 +181,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // state (Pi, W) at IBZ q. The kernel BZ-pair sums still iterate over FBZ
   // (k, q) pairs (Nk, Nq) — star expansion of orbital quantities happens
   // inside the kernel via X(FBZ k) and the orbital rotations from
-  // MF.symmetry_rotation. See feedback_realaxis_thc_x_nonsymmetric.md and
-  // notes/realaxis_symmetry_audit.md.
+  // MF.symmetry_rotation.
   const long Nk      = MF.nkpts();
   const long Nq      = MF.nqpts();
   const long Nk_ibz  = MF.nkpts_ibz();
@@ -266,7 +259,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // The FBZ-k expansion uses kp_to_ibz to look up the IBZ representative.
   // For the symmetry-adapted ISDF (X factor at FBZ k carries the orbital
   // rotation implicitly), this is the correct read. For trivial-IBZ
-  // systems kp_to_ibz is identity → bit-identical to the prior behavior.
+  // systems kp_to_ibz is the identity.
   // For kp_trev-flagged k (TR-pair partners): we project for the non-TR
   // partner only and fill the TR k's aux block by conjugation of the
   // partner's aux block (post-fix below). The orbital A at TR k positions
@@ -274,11 +267,10 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   auto kp_to_ibz_arr   = MF.kp_to_ibz();
   auto kp_trev_arr     = MF.kp_trev();
   auto kp_trev_pair_arr = MF.kp_trev_pair();
-  // P1 (memory-redesign): drop the upfront (ns, Nk, N_w, nbnd, nbnd)
-  // replicated A allocation. The projection loop below builds a per-(s, k)
-  // host scratch on demand and pushes to MEM only for non-TR k's; TR-pair
-  // k positions are filled at the aux level via conj-copy. Saves
-  // ~(ns·Nk·N_w·nbnd²) complex per rank.
+  // No replicated (ns, Nk, N_w, nbnd, nbnd) A is allocated. The projection
+  // loop below builds a per-(s, k) host scratch on demand and pushes to MEM
+  // only for non-TR k's; TR-pair k positions are filled at the aux level via
+  // conj-copy. Saves ~(ns·Nk·N_w·nbnd²) complex per rank.
   nda::array<ComplexType, 3> A_one_k_host(N_w, nbnd, nbnd);
   memory::buffered_array<MEM, ComplexType, 3> A_one_k_mem(
       std::array<long, 3>{N_w, nbnd, nbnd});
@@ -413,7 +405,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // (Naux_loc_P * Naux_loc_Q). Each rank only does the FFTs for its
   // (P_loc, Q_loc) block; the full Naux^2 batch is split across ranks.
   // Cached across SCF iterations: (cu)FINUFFT plan setup is non-trivial
-  // (~10s of ms host, possibly worse on device), and B_loc only changes
+  // and B_loc only changes
   // when the proc grid does. Invalidate if B_loc changes.
   const auto t_conv0 = t_now();
   if (!_conv or _cached_B_loc != B_loc) {
@@ -442,7 +434,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       comm, pgrid_aux, shape_aux, bsize_aux);
   auto A_aux_loc = dA_aux_skPQw.local();  // (ns, Nk, Naux_loc_P, Naux_loc_Q, N_w)
   // Pass 1: project for non-TR k's only. Pass 2: fill TR-pair k's by conj-copy.
-  // P1: build A per-(s, k) on the fly into a 3D scratch instead of a
+  // A is built per-(s, k) on the fly into a 3D scratch, not as a
   // pre-built 5D replicated tensor.
   if constexpr (MEM == HOST_MEMORY) {
     for (long s = 0; s < ns; ++s)
@@ -471,7 +463,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       }
   }
   // Pass 2: TR-pair fix-up. aux-A(k) = conj(aux-A(kp_trev_pair(k))) for
-  // k where kp_trev != 0. Pattern from rpa_pi.icc:122-135.
+  // k where kp_trev != 0 (same treatment as the imag-axis rpa_pi.icc).
   if constexpr (MEM == HOST_MEMORY) {
     for (long s = 0; s < ns; ++s)
       for (long ik = 0; ik < Nk; ++ik) {
@@ -504,49 +496,39 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   const auto t2 = t_now();
 
   // Step 2 distribution model: each rank works on its local (P_loc, Q_loc)
-  // slice for ALL (s, k, q). The (P, Q) partitioning replaces the previous
-  // (s, k, q) partitioning + allreduce. No comm in Step 2.
+  // slice for ALL (s, k, q). With the (P, Q) partitioning there is no
+  // communication in Step 2.
   //
   // ================================================================
-  // RW-1 DEVIATION FROM origin/real_axis (notes/rw1_port_report.md).
-  //
   // SPIN DEGENERACY. accumulate_ImPi_one_kq computes the PER-SPIN bubble,
   // and the loops below sum it over the s axis. For a spin-polarized run
   // (ns == 2) that sum is the whole polarization; for a closed-shell run
   // (ns == 1) the single stored channel stands for BOTH spins and must be
-  // counted twice. The branch has no such factor anywhere in
-  // src/methods/GW_real_axis/ (verified by grep over every file of the
-  // module at 711af68), so on every ns == 1 fixture its Pi -- and hence
-  // its W, its eps_inf, and its Sigma_c -- is a factor of two too small.
+  // counted twice. Without this factor Pi -- and hence W, eps_inf and
+  // Sigma_c -- would be a factor of two too small for ns == 1.
   //
-  // This is exactly the imaginary-axis convention
-  //     methods/scr_coulomb/rpa_pi.icc:46   sp_factor = (ns == 2)? -1 : -2
-  //     methods/scr_coulomb/rpa_pi.icc:312  factor    = (ns == 2)? -1/nk : -2/nk
+  // This is the imaginary-axis convention
+  //     methods/scr_coulomb/rpa_pi.icc   sp_factor = (ns == 2)? -1 : -2
+  //     methods/scr_coulomb/rpa_pi.icc   factor    = (ns == 2)? -1/nk : -2/nk
   // (the -1 there is the fermion-loop sign, carried on the real axis by the
-  // -pi prefactor in real_axis_pi.hpp).
-  //
-  // MEASURED, gate RW-1-a on qe_lih222 (ns = 1): with the branch's weight
-  // the forward-mapped real-axis Pi(i nu = 0) equals the production
-  // Matsubara Pi times 0.4825 / 0.4929 / 0.5072 for eta = 0.05 / 0.025 /
-  // 0.0125 Ha -- i.e. exactly 1/2 in the eta -> 0 limit, with the correct
-  // sign and BZ weight. With the factor below the same series reads
-  // 0.965 / 0.986 / 0.999.
+  // -pi prefactor in real_axis_pi.hpp). test_real_axis_w_lehmann.cpp checks
+  // the forward-mapped real-axis Pi(i nu = 0) against the Matsubara Pi.
   // ================================================================
   const double ns_factor = (ns == 2) ? 1.0 : 2.0;
 
   double dt2_alloc = 0.0, dt2_ftR = 0.0, dt2_kernel = 0.0, dt2_ftq = 0.0;
   if (do_rspace) {
-    // P0 (memory-redesign): per-R streaming. The previous version allocated
-    // 5D A_aux_sRPQw (ns × NR × NP_loc × NQ_loc × N_w) and 4D ImPi_RPQO
-    // (NR × NP_loc × NQ_loc × N_O) scratches. For each iR we now:
+    // Per-R streaming: no 5D A_aux_sRPQw (ns × NR × NP_loc × NQ_loc × N_w)
+    // or 4D ImPi_RPQO (NR × NP_loc × NQ_loc × N_O) scratch is allocated.
+    // For each iR:
     //   (a) build A_aux_one_R via a row-vector × matrix GEMM (rank-1
     //       contraction over k), reusing a 3D scratch.
     //   (b) run the per-R Pi kernel into a 3D ImPi_one_R scratch.
     //   (c) update ImPi_loc via an outer-product GEMM (column vector
     //       sf_qR(:, iR) × row vector ImPi_one_R, accumulate into ImPi_q).
-    // Memory savings at production scale are large (~Nk × per-R-tile
-    // size eliminated). Trade: NR small GEMMs instead of 2 bulk GEMMs;
-    // perf hit acceptable for first cut, can be tuned via R-chunking.
+    // This saves ~Nk × the per-R tile size in memory, at the cost of NR
+    // small GEMMs instead of 2 bulk GEMMs (R-chunking would recover GEMM
+    // efficiency).
     auto t2a = t_now();
     memory::buffered_array<MEM, ComplexType, 3> A_aux_one_R(
         std::array<long, 3>{Naux_loc_P, Naux_loc_Q, N_w});
@@ -590,7 +572,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
         // (b) per-R Pi kernel; accumulates over s.
         auto t2c = t_now();
         accumulate_ImPi_one_kq<MEM>(conv, A_aux_one_R, A_aux_one_R,
-                                     ImPi_one_R, ns_factor);   // RW-1: spin degeneracy
+                                     ImPi_one_R, ns_factor);   // spin degeneracy
         dt2_kernel += sec_since(t2c);
       }
 
@@ -641,7 +623,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
                  "real_axis_scr_coulomb_t::update_w: k-space Pi branch only "
                  "supports IBZ == FBZ (got Nk={}, Nq_ibz={}, Nq={})",
                  Nk, Nq_ibz, Nq);
-    const double k_weight = ns_factor / static_cast<double>(Nk);  // RW-1: spin degeneracy
+    const double k_weight = ns_factor / static_cast<double>(Nk);  // spin degeneracy
     for (long iq = 0; iq < Nq_ibz; ++iq) {
       if (iq == iq_gamma) continue;
       auto ImPi_q_view = ImPi_loc(iq, _, _, _);
@@ -720,8 +702,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     using math::nda::make_distributed_array;
 
     // 4a. Pick the Dyson grid: maximize q_pool, then w_pool, leaving any
-    // residual to (np_P, np_Q). For nproc=1 (Mac unit tests) this collapses
-    // to (1, 1, 1, 1) — bit-identical to the previous single-rank path.
+    // residual to (np_P, np_Q). For nproc=1 this collapses to (1, 1, 1, 1).
     long np = comm.size();
     long q_pool = utils::find_proc_grid_max_npools(np, Nq_ibz, 0.2);
     long np1    = np / q_pool;
@@ -813,8 +794,8 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
 
     // 4d. Slate work arrays on a wq_intra_comm sized (np_P * np_Q). When
     // np_P == np_Q == 1 the intra-comm has size 1 and slate runs as
-    // local LAPACK — eliminating the per-(q, Omega) distributed inverse
-    // comms that dominate the previous implementation.
+    // local LAPACK, with no per-(q, Omega) distributed-inverse
+    // communication.
     auto Pi_dyson_loc = dPi_dyson.local();
     auto V_dyson_loc  = dV_dyson.local();
     auto W_dyson_loc  = dW_dyson.local();
@@ -953,14 +934,13 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // ----------------------------------------------------------------
   // Boundary: copy MEM-side staging buffers (ImPi_loc, RePi_loc, ImW_loc,
   // ReW_loc) back to the host state arrays. For MEM=HOST_MEMORY this is
-  // a single host->host memcpy on each (essentially the same cost as
-  // before since previously kernels wrote directly into these views and
-  // there's no extra allocation thanks to buffered_array). For
+  // a single host->host copy on each (no extra allocation thanks to
+  // buffered_array). For
   // MEM=DEVICE_MEMORY this is one device->host transfer per array. The
   // sizes are (Nq, NP_loc, NQ_loc, N_O) per array; small relative to
   // the kernel work above.
   // ----------------------------------------------------------------
-  // State arrays are real-typed (memory-redesign step P0'); take .real()
+  // State arrays are real-typed; take .real()
   // of the complex MEM-side scratch values. By convention the MEM-side
   // buffers carry .imag()=0 throughout, so .real() captures the data.
   {
@@ -993,16 +973,13 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // unconditionally; gw_t::evaluate only consumes it when div_treatment
   // is not "ignore_g0".
   // Requires the (Nq_ibz, Naux, Naux, N_Omega) W to project through
-  // chi_bar_head; gather from the distributed state on each rank since
-  // the cost is small (Nq_ibz * N_O scalar accumulations of length Naux^2).
-  // TODO: replace gather with a local (P,Q)-contraction + Allreduce of
-  // (Nq_ibz, N_O) reals (memory-redesign P6).
+  // chi_bar_head.
+  // Each rank contracts its local (P, Q) tile; the small (Nq_ibz, N_O)
+  // result is allreduced.
   // ----------------------------------------------------------------
   if (_div_treatment != "ignore_g0") {
-    // P6: per-rank local (P_loc, Q_loc) contraction + Allreduce of the
-    // small (Nq_ibz, N_O) result, replacing the previous all_gather_slow
-    // of the full ImW/ReW state. Saves 2× full bosonic state in flight
-    // per rank when div_treatment != "ignore_g0".
+    // Per-rank local (P_loc, Q_loc) contraction + Allreduce of the
+    // small (Nq_ibz, N_O) result; the full ImW/ReW state is never gathered.
     //
     // Per-q head (formula from compute_eps_inv_head_O):
     //   eps_inv(q, O) = (|q|² / 4π) · Vol ·
@@ -1068,8 +1045,8 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // a (Naux, N_O) array stashed on state. Only fires when the SCF driver
   // sets state.collect_W_diag_qg = true (typically when write_chkpt is on).
   // This must happen BEFORE state.free_intermediate_bosonic() — which the
-  // driver calls AFTER update_w returns — because we need ReW which P5*
-  // lite will drop. Cost: 2 * Naux * N_O reals per rank + one allreduce.
+  // driver calls AFTER update_w returns — because it needs ReW, which that
+  // call frees. Cost: 2 * Naux * N_O reals per rank + one allreduce.
   // -----------------------------------------------------------------------
   if (state.collect_W_diag_qg and iq_gamma >= 0) {
     nda::array<double, 2> ImW_diag(Naux, N_O);

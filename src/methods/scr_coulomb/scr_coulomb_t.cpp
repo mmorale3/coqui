@@ -134,11 +134,9 @@ namespace solvers {
     // Pre-register every timer print_timers() reads: TimerManager::elapsed() aborts on an
     // unregistered name, and these phases are conditional (EVALUATE_W only runs on the THC
     // path, the IMAG_FT pair only when a transform is needed).
-    // T-3b (timers only, notes/coqui_threading_t3a.md section 4.5): the THC-RPA sub-timers
-    // below were being COLLECTED by rpa_pi.icc but never printed on the scr_coulomb path, so
-    // PI_HADPROD_R / PI_PRIM_TO_AUX / PI_FT_R were invisible on the qpGW path and only the
-    // aggregate EVALUATE_PI could be read. Purely additive: measurement, not threading --
-    // row 9 (the Pi Hadamard) stays UNTOUCHED per RULING R-T3-1 item 4.
+    // The THC-RPA sub-timers (EVALUATE_PI_R / _K, PI_ALLOC_*, PI_HADPROD_R, PI_PRIM_TO_AUX,
+    // PI_FT_R) are collected by rpa_pi.icc and printed by print_timers() as a breakdown of
+    // EVALUATE_PI.
     for (auto const &v : {"EVALUATE_PI", "DYSON_W", "EVALUATE_W",
                           "IMAG_FT_TtoW", "IMAG_FT_WtoT", "FT_REDISTRIBUTE",
                           "EVALUATE_PI_R", "PI_ALLOC_R", "PI_HADPROD_R",
@@ -150,8 +148,8 @@ namespace solvers {
     app_log(2, "\n  SCREENED-COULOMB timers");
     app_log(2, "  -----------------------");
     app_log(2, "    Evaluate Pi (RPA + vertex): {0:.3f} sec", _Timer.elapsed("EVALUATE_PI"));
-    // T-3b (t3a section 4.5): the RPA Pi internals, previously collected but never printed.
-    // Zero rows mean that flavour of the RPA kernel did not run on this path.
+    // The RPA Pi internals (collected by rpa_pi.icc). Zero rows mean that flavour of the RPA
+    // kernel did not run on this path.
     app_log(2, "      - RPA Pi, R space:        {0:.3f} sec", _Timer.elapsed("EVALUATE_PI_R"));
     app_log(2, "      - RPA Pi, k space:        {0:.3f} sec", _Timer.elapsed("EVALUATE_PI_K"));
     app_log(2, "        - Gij->Guv:             {0:.3f} sec", _Timer.elapsed("PI_PRIM_TO_AUX"));
@@ -278,17 +276,11 @@ namespace solvers {
     // to the readout below (the bosonic closure calls eval_Pi_qdep outside update_w, and
     // that row must not survive into a later iteration's readout).
     _pol_nu0_row.reset();
-    // T-1 item 2 (notes/coqui_threading_spec.md rev 2): this stage was the largest UNTIMED
-    // block in the code. T-0 could only bound it by subtraction -- 59% of wall on the LiF
-    // kp444 fixture, threading at ~1.42x, with no timer block of its own
-    // (notes/coqui_threading_t0.md section 2.1). Without these meters T-2's "no phase
-    // regresses at t=1" gate cannot be evaluated on the biggest phase in the run.
-    // (TEMP) per-phase GPU timers for update_w. Strip together with
-    // the other TEMP_* timers once the perf hot-spots are identified.
+    // Phase timers of update_w: EVALUATE_PI / DYSON_W feed print_timers(); the TEMP_* timers
+    // give a finer per-phase breakdown (host and device paths).
     // Pre-register every TEMP_* timer referenced in the dump below:
     // elapsed()/number_of_calls() abort on unregistered names, and some
-    // timers only ever start on the DEVICE path (e.g. the dev-alloc ones),
-    // which crashed HOST runs at the first dump.
+    // timers only ever start on the DEVICE path (e.g. the dev-alloc ones).
     for (auto const& name : {"TEMP_UW_TOTAL", "TEMP_UW_eval_Pi_qdep",
          "TEMP_UW_dyson_W_from_Pi", "TEMP_DWFP_tau_to_w",
          "TEMP_DWFP_dyson_W_in_place", "TEMP_DWFP_w_to_tau",
@@ -327,7 +319,7 @@ namespace solvers {
     // same mb_state.eps_inv_head (single-sourced; see the coupling warning in vertex_t.h).
     const bool cvv = (_div_treatment == "cvv");
 
-    // div_utils::eval_eps_inv_q (called inside eps_inv_head_t) is now
+    // div_utils::eval_eps_inv_q (called inside eps_inv_head_t) is
     // MEM-aware; it runs the per-(ix,iq) gemv/dot on whatever MEM the
     // dW darray lives in. No full host copy of dW needed.
     _Timer.start("TEMP_UW_eps_inv_head");
@@ -429,10 +421,10 @@ namespace solvers {
 
     // On the device path the host mirror is only needed by consumers that run
     // on the host (GF2, EDMFT, the optional W h5 dump), and a pure scGW run has
-    // none of them: gw_t::evaluate<DEVICE> reads dW_qtPQ_dev. Materializing it
-    // anyway cost 4.2 s to allocate and zero 18.5 GB plus 9.2 s to copy it back
-    // per iteration, for data nothing read. Skip it here; MBState builds it on
-    // demand from the device array (see MBState::W_host()).
+    // none of them: gw_t::evaluate<DEVICE> reads dW_qtPQ_dev. The mirror is as
+    // large as W itself and costs an allocation plus a bulk device->host copy per
+    // iteration, so it is skipped here; MBState builds it on demand from the
+    // device array (see MBState::W_host()).
     const bool need_host_W = (MEM == HOST_MEMORY) or mb_state.keep_host_W;
     if (need_host_W) {
       _Timer.start("TEMP_UW_dW_qtPQ_alloc");
@@ -543,9 +535,8 @@ namespace solvers {
     if (h5_iter>=0) {
       // This writes the same file, the same scf/iter<N> group and from the same
       // rank as the checkpoint, so it is the one place a background checkpoint
-      // write would collide with certainty. Joining here is also what makes the
-      // overlap worth having: it sits at the end of update_w, ~50 s into a
-      // 141 s iteration, which is long enough to hide a 30 s write.
+      // write would collide with certainty. Joining here, at the end of update_w,
+      // leaves most of the iteration for the background write to overlap with.
       utils::h5_quiesce();
       dump_eps_inv_head(eps_inv_head_q, eps_inv_head,
                         mb_state.coqui_prefix, h5_iter,
@@ -2304,10 +2295,10 @@ namespace solvers {
     utils::device_sync();
     _Timer.stop("TEMP_UW_TOTAL");
 
-    // (TEMP) Phase-by-phase update_w timers. Accumulated across SCF
-    // iterations; divide by iter count or use number_of_calls() to
-    // get per-iter values. Strip when perf hot-spots are nailed.
-    app_log(2, "\n  (TEMP) update_w phase timers (accumulated):");
+    // Phase-by-phase update_w timers (TEMP_* timer keys). Accumulated across SCF
+    // iterations; divide by the call count (number_of_calls()) to get
+    // per-iteration values.
+    app_log(2, "\n  update_w phase timers (accumulated):");
     app_log(2, "    Total:                            {0:.3f} sec  ({1} calls)",
             _Timer.elapsed("TEMP_UW_TOTAL"), _Timer.number_of_calls("TEMP_UW_TOTAL"));
     app_log(2, "      eval_Pi_qdep:                   {0:.3f} sec",
@@ -2394,9 +2385,8 @@ namespace solvers {
     auto t_pgrid = dPi_tqPQ_pos.grid();
     auto t_bsize = dPi_tqPQ_pos.block_size();
 
-    // (TEMP) split dyson_W_from_Pi_tau into its three phases. This is
-    // currently the dominant cost of update_w (~80% per the TEMP_UW_*
-    // breakdown). Strip when perf hot-spots are localized.
+    // Split dyson_W_from_Pi_tau into its three phases (tau -> w, Dyson, w -> tau)
+    // for the update_w phase-timer breakdown.
     _Timer.start("TEMP_DWFP_tau_to_w");
     auto dPi_wqPQ = tau_to_w(dPi_tqPQ_pos, w_pgrid, w_bsize, reset_input);
     utils::device_sync();
@@ -2453,7 +2443,7 @@ namespace solvers {
         ::nda::mem::on_host<Array_4D_t> ? HOST_MEMORY : DEVICE_MEMORY;
     using Array_2D_t = memory::array<MEM, ComplexType, 2>;
     using math::nda::make_distributed_array;
-    // (TEMP) inner-loop perf breakdown of dyson_W_in_place
+    // inner-loop timer breakdown of dyson_W_in_place
     _Timer.start("TEMP_DWiP_alloc");
     auto dPi_PQ = make_distributed_array<Array_2D_t>(wq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]}, true);
     auto dZ_PQ  = make_distributed_array<Array_2D_t>(wq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]}, true);
@@ -3056,9 +3046,9 @@ namespace solvers {
         APP_ABORT("scr_coulomb_t::tau_to_w: Error finding proper pgrid: gshape[2]*gshape[3] < np.");
       }
     }
-    // (TEMP) The redistributes are only part of this phase: each call also
-    // creates three tensor-sized distributed arrays and frees two. Time every
-    // section so the cost is attributed rather than assumed.
+    // The redistributes are only part of this phase: each call also creates
+    // three tensor-sized distributed arrays and frees two. Every section is
+    // timed separately.
     _Timer.start("TEMP_FT_alloc");
     auto buffer_ti  = make_distributed_array<local_Array_t>(
         *comm, b_pgrid, t_gshape, dPi_tqPQ_pos.block_size());

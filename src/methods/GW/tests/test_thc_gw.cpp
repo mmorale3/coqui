@@ -33,7 +33,7 @@
 #include <filesystem>
 
 #include "mean_field/default_MF.hpp"
-#include "methods/GW/g0_div_utils.hpp"   // the q -> 0 head: the reduction-independence gate below
+#include "methods/GW/g0_div_utils.hpp"   // the q -> 0 head: used by the reduction-independence test below
 
 #include "methods/ERI/mb_eri_context.h"
 #include "methods/ERI/eri_utils.hpp"
@@ -466,7 +466,7 @@ namespace bdft_tests {
   // Driven on a MODEL eps^-1(q) = -1 + 1/(1 + a |q|^2) evaluated on each mesh's own IBZ q
   // list, so the exact head is known analytically (-1 + 1 = 0 ... the q -> 0 limit is 0 in
   // this parameterization, i.e. eps_inv(0) = 0) and the three meshes must agree to the fit's
-  // own accuracy. Requires the untracked Si 4^3 fixtures (qe_si444_*); skipped without them.
+  // own accuracy. Requires the optional Si 4^3 fixtures (qe_si444_*); skipped without them.
   // ====================================================================================
   TEST_CASE("gw_head_reduction_independence", "[methods][gw][head]") {
     auto &mpi_context = utils::make_unit_test_mpi_context();

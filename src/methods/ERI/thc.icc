@@ -809,12 +809,11 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
   if(not single_psi)
     utils::check(nproc_per_pool <= b_range.size(), "Error in chol_metric_impl: Too many processors. Decrease # of processors or increase distr_tol. ");
 
-  // B6 diagnostic (COQUI_CHOL_DIAG_DEBUG=1). Measured on H100: max|Psia| is ALREADY 0 by the time
-  // the residual diagonal is built, while sm80 has it at 1.293. That exonerates the cuTENSOR
-  // contractions, max_element_multi and the MPI reduction -- the orbitals themselves arrive empty.
-  // These stage prints split the remaining path: the mean-field read, the custom-grid FFT
-  // (copy_select + fft::backward), the optional C_skai rotation, and the Znorm scale. Whichever
-  // stage first reports 0 is the one to fix.
+  // Debug switch COQUI_CHOL_DIAG_DEBUG=1: prints max|Psia| after each stage of the orbital
+  // preparation -- the mean-field read, the custom-grid FFT (copy_select + fft::backward), the
+  // optional C_skai rotation, and the Znorm scale -- so an orbital set that arrives empty (and
+  // later yields a zero residual diagonal in the Cholesky pivoting) can be traced to the first
+  // stage that reports 0.
   const bool chol_dbg = (std::getenv("COQUI_CHOL_DIAG_DEBUG") != nullptr);
   auto dbg_maxabs = [&](auto const& A, char const* what) {
     if (not chol_dbg) return;
@@ -1011,16 +1010,12 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
   } else {
     memory::device_array<ComplexType,4> Lr(nspins,nkpts,npol,r_range.size());
     nda::tensor::contract(nda::conj(Psia),"skapr",Psia,"skapr",Lr,"skpr");
-    // B6 diagnostic (COQUI_CHOL_DIAG_DEBUG=1). On sm90/H100 this routine aborts at
-    // thc.icc:1073 with nchol=0, meaning max|Diag| is already <= 1e-14 before the first
-    // pivot, while sm80/A100 gives Np=1275 on the same input. With nchol=0 the fault is
-    // upstream of the iteration, and there are exactly four candidates: Psia itself, this
-    // batched-dot contraction, the Diag accumulation below, or max_element_multi /
-    // find_distributed_maximum. Printing max|Psia|, max|Lr| and a HOST-computed max|Diag|
-    // alongside what max_element_multi returned separates all four in a single run -- each
-    // candidate zeroes a different one of these first. Reproduces at 1 rank, so the
-    // distributed reduction is already ruled out and the cycle is cheap.
-    // Keep this: it is the "instrument, do not guess" lesson from the iu_for_Xb hunt.
+    // Debug switch COQUI_CHOL_DIAG_DEBUG=1. If the pivoting stops with nchol = 0, max|Diag|
+    // was already below threshold before the first pivot, and the fault is upstream of the
+    // iteration: Psia itself, this batched-dot contraction, the Diag accumulation below, or
+    // max_element_multi / find_distributed_maximum. Printing max|Psia|, max|Lr| and a
+    // HOST-computed max|Diag| alongside what max_element_multi returned separates the four
+    // candidates in a single run -- each zeroes a different one of these first.
     if (std::getenv("COQUI_CHOL_DIAG_DEBUG") != nullptr) {
       auto Ph = nda::to_host(nda::make_regular(Psia));
       auto Lh = nda::to_host(Lr);
@@ -1058,7 +1053,7 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
       }
     }
   }
-  // B6 diagnostic, second half: max|Diag| computed on the HOST, i.e. independently of
+  // COQUI_CHOL_DIAG_DEBUG, second half: max|Diag| computed on the HOST, i.e. independently of
   // max_element_multi, so the two can be compared. If max|Diag| is healthy here and
   // lmax_res_val comes back ~0 the fault is max_element_multi; if max|Diag| is itself ~0 while
   // max|Lr| above was healthy, it is the Diag accumulation contraction.
@@ -1665,11 +1660,8 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
   Timer.start("LSSolve");
   // ls-solve IVecs = ls_solve( (C^H*C), (C^H*Z) )
   // conjugate and use transposed (e.g. in column-major)
-  // Was forced to unified memory while slate::lu_solve/least_squares_solve seg faulted on
-  // device memory. The cause was in make_slate: it handed slate the device pointer tagged as
-  // a HostNum tile, so slate ran its host-side work and its non-GPU-aware MPI straight on
-  // device memory -- which only survives when the pointer happens to be host-dereferenceable.
-  // Slate is told the correct address space now, so these stay in MEM.
+  // These stay in MEM: make_slate tags device pointers with the device address space, so
+  // slate never runs its host-side work or its non-GPU-aware MPI directly on device memory.
   using lArray_t = memory::array<MEM,ComplexType,2>;
 
   // ---- COQUI_THC_SOLVE_DEBUG: compare the two solve paths on identical input -------------
@@ -1708,7 +1700,6 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
     //    that, which is what aborts in device_regions_build at any grid with np_u*np_v > 1.
     //  - block cyclic is the distribution slate is tuned for, on host as well as device: the
     //    single-large-block layout load-balances a distributed factorization poorly.
-    // See perf_report/slate_array_design.md.
     using ma_t = memory::dmatrix_array_t<MEM,ComplexType,1,mpi3::communicator>;
     Timer.start("LSSolve_REDIST");
     ma_t Cma(mpi->comm, pgrid3D, {C_quv.global_shape()[0],nIpts,nIpts},
@@ -1799,7 +1790,7 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
 
   if constexpr (return_coul_matrix) {
 
-    // The legacy single-block layout cannot be used for these gemms/solves at any grid with
+    // The single-block layout cannot be used for these gemms/solves at any grid with
     // pgrid3D[1]*pgrid3D[2] > 1: its tiles are views into one large local block, so their
     // leading dimension is the block's lld rather than mb, and slate's device_regions_build
     // asserts on the mismatch. Hence the block-cyclic branches below.
@@ -1829,10 +1820,10 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
 
       // One pair of containers carries the whole chain
       //     C = Z Z^H   ->   C := C^{-1}   ->   IquG = C^{-1} Z
-      // so Z is redistributed in exactly once and C only returns to the legacy layout at the
-      // end, where the local element work further down needs it. Doing these three as
+      // so Z is redistributed in exactly once and C only returns to the single-block layout at
+      // the end, where the local element work further down needs it. Doing these three as
       // independent block-cyclic ops instead costs 9 redistributes rather than 3, and nothing
-      // between them reads C_quv or writes Z_quG in the legacy layout.
+      // between them reads C_quv or writes Z_quG in the single-block layout.
       Timer.start("ZBAR_REDIST");
       ma_t Zma(mpi->comm, pgrid3D, Z_quG.global_shape(), {block_size[1],block_size[2]});
       ma_t Cma(mpi->comm, pgrid3D, C_quv.global_shape(), {block_size[1],block_size[1]});
@@ -1842,7 +1833,7 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
       math::nda::slate_ops::multiply(Zma, math::nda::dagger(Zma), Cma);
 
       if (use_least_squares) {
-        // mirror the legacy path exactly: solve C X = I instead of factorizing and inverting
+        // as in the single-block path: solve C X = I instead of factorizing and inverting
         ma_t Bma(mpi->comm, pgrid3D, C_quv.global_shape(), {block_size[1],block_size[1]});
         Bma.set_identity();
         long info = math::nda::slate_ops::least_squares_solve(Cma,Bma);
@@ -1889,7 +1880,7 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
       auto buf_loc = buffer.local();
       // Build the local identity block once on the host and mirror it into MEM. Filling
       // the diagonal element by element is a host store through operator(), which is
-      // invalid on device memory -- the reason this buffer used to be forced to unified.
+      // invalid on device memory.
       memory::array<MEM,ComplexType,2> Id_loc;
       {
         nda::array<ComplexType,2> Id_h(buf_loc.extent(0), buf_loc.extent(1));
@@ -2182,19 +2173,19 @@ auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
       nda::tensor::scale(ComplexType(1.0),ChC_uv.local(),nda::tensor::op::CONJ);
     }
 #if defined(ENABLE_SLATE)
-    // NOTE (2026-08-03): unlike the ISDF intvec_impl above, this LS-THC path still hands slate the
-    // legacy single-block views directly, with no block-cyclic branch. That layout cannot serve
-    // slate's batched DEVICE path at any grid with more than one rank on the matrix axes -- its
-    // tiles are views into one large local block, so their leading dimension is the block's lld
-    // rather than mb, and slate aborts in device_regions_build on `group.ld[m] == Mij.stride()`.
-    // It is safe today only because this overload is instantiated for HOST_MEMORY alone
+    // Unlike the ISDF intvec_impl above, this LS-THC path hands slate the single-block views
+    // directly, with no block-cyclic branch. That layout cannot serve slate's batched DEVICE
+    // path at any grid with more than one rank on the matrix axes -- its tiles are views into
+    // one large local block, so their leading dimension is the block's lld rather than mb, and
+    // slate aborts in device_regions_build on `group.ld[m] == Mij.stride()`.
+    // It is correct because this overload is instantiated for HOST_MEMORY alone
     // (`__eval_ls__(HOST_MEMORY)` at the bottom of thc.cpp; the ISDF `__eval__` is the one
     // instantiated for DEVICE/UNIFIED), and slate's host path handles the layout.
-    // If this is ever instantiated for DEVICE, convert it to distributed_matrix_array the way
-    // intvec_impl was (see use_block_cyclic_slate and matrix_array.hpp) -- the Target::Devices
-    // branches just below will otherwise fail exactly as the ISDF path did at 12 ranks.
+    // To instantiate it for DEVICE, convert it to distributed_matrix_array as intvec_impl does
+    // (see use_block_cyclic_slate and matrix_array.hpp); the Target::Devices branches just
+    // below would otherwise fail on any distributed matrix grid.
     static_assert(MEM == HOST_MEMORY,
-                  "thc::intvec_impl(iq,...): the slate calls here use the legacy single-block "
+                  "thc::intvec_impl(iq,...): the slate calls here use the single-block "
                   "layout, which slate's batched device path rejects for a distributed matrix. "
                   "Port this call site to distributed_matrix_array before instantiating it for "
                   "device memory.");

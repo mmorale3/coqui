@@ -27,13 +27,14 @@ namespace real_axis {
  * auxiliary basis for one (q, k) pair, given the projected fermionic spectral
  * function at k and at k+q.
  *
- * Implements the spectral form (notes Eq. ImPi_correlation_form):
+ * Implements the spectral form:
  *
  *   Im Pi^R_{PQ}(q, Omega)
  *     = -pi  ( (A_<  star A_>)_{PQ}(k, q; Omega)
  *            - (A_>  star A_<)_{PQ}(k, q; Omega) )
  *
- * where the cross-correlation star is defined by Eq. cross_correlation_def
+ * where star is the frequency cross-correlation
+ *   (F star G)(Omega) = int dw conj(F(w)) G(w + Omega),
  * with weighted spectra
  *
  *   A^<_{PQ}(k, w; q) = f(w)        * A_{PQ}(k,   w; q)
@@ -73,8 +74,8 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   // -- which is what the class API feeds into the kernel -- aux A_aux is
   // hermitian: A_aux(Q, P) = conj(A_aux(P, Q)). We therefore replace the
   // "global (Q, P)" read on the second leg with conj of the LOCAL (P, Q)
-  // entry on the same rank. See test_real_axis_hermiticity (commit
-  // 40d91a2) for the round-off-level validation of this identity.
+  // entry on the same rank. test_real_axis_hermiticity validates this
+  // identity to round-off.
   const long Naux_P = ImPi_PQ_O.shape()[0];
   const long Naux_Q = ImPi_PQ_O.shape()[1];
   const long N_w    = A_PQ_k.shape()[2];
@@ -92,27 +93,19 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   auto const& wq_h = grid.w_weights();
 
   // ==================================================================
-  // RW-1 DEVIATION FROM origin/real_axis (notes/rw1_port_report.md).
-  //
   // FERMI FACTOR ENERGY ARGUMENT. real_freq_grid_t::w() is RELATIVE to the
-  // chemical potential -- "Fermionic w_j: full window [-w_max, +w_max],
-  // relative to mu (absolute omega = w + mu_chem)" (real_freq_grid.hpp:
-  // 43-44, 109), which is how every other consumer reads it (e.g. the
-  // QP-pole spectral function: w_abs = grid.w()(iw) + grid.mu_chem(),
-  // real_axis_qp_scf_driver.hpp:263). But real_freq_grid_t::fermi(w)
+  // chemical potential (absolute omega = w + mu_chem), which is how every
+  // other consumer reads it (e.g. the QP-pole spectral function:
+  // w_abs = grid.w()(iw) + grid.mu_chem()). real_freq_grid_t::fermi(w)
   // subtracts mu_chem ITSELF:
-  //     fermi(w, mu, beta) = 1/(exp(beta*(w - mu)) + 1)   (:396-403)
-  // so the branch's  grid.fermi(w(j))  evaluates the occupation at
-  // w_abs - 2*mu_chem: the Fermi edge is displaced by a full mu.
+  //     fermi(w, mu, beta) = 1/(exp(beta*(w - mu)) + 1)
+  // so it must be given the ABSOLUTE energy w(j) + mu_chem; passing w(j)
+  // would displace the Fermi edge by a full mu. With the absolute energy
+  // the occupation of a band at eigenvalue eps flips exactly at eps = mu.
   //
-  // (The same file's other call site, real_axis_div_utils.hpp:368, passes
-  // grid.fermi(wp - mu), which is displaced differently again -- the two
-  // are mutually inconsistent, so at most one of them can be right. That
-  // routine is dead code in the RW-1 slice, so it is left as the branch
-  // has it and only FLAGGED here.)
-  //
-  // Passing the absolute energy is the only reading under which the
-  // occupation of a band at eigenvalue eps flips exactly at eps = mu.
+  // (real_axis_div_utils.hpp passes grid.fermi(wp - mu), which is
+  // inconsistent with this convention; that routine is not used by the
+  // W chain.)
   // ==================================================================
   const double mu_abs = grid.mu_chem();
 
@@ -137,13 +130,13 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
       for (long iQ = 0; iQ < Naux_Q; ++iQ) {
         const long b = iP * Naux_Q + iQ;
         for (long j = 0; j < N_w; ++j) {
-          const double f_w  = grid.fermi(w(j) + mu_abs);   // RW-1: absolute energy
+          const double f_w  = grid.fermi(w(j) + mu_abs);   // absolute energy
           const double fb_w = 1.0 - f_w;
           const double q_j  = wq_h(j);
           Aless_k (b, j) = f_w  * q_j * A_PQ_k (iP, iQ, j);
           Agtr_k  (b, j) = fb_w * q_j * A_PQ_k (iP, iQ, j);
           // Second leg "Q, P" at k+q -> conj of LOCAL (iP, iQ) block via
-          // matrix-hermiticity of the symmetrized A_aux (commit 40d91a2).
+          // matrix-hermiticity of the symmetrized A_aux.
           Aless_kq(b, j) = f_w  * q_j * std::conj(A_PQ_kq(iP, iQ, j));
           Agtr_kq (b, j) = fb_w * q_j * std::conj(A_PQ_kq(iP, iQ, j));
         }
@@ -155,7 +148,7 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
     // we can do the broadcast multiply via cuTENSOR.
     nda::array<ComplexType, 1> f_wq_h(N_w), fb_wq_h(N_w);
     for (long j = 0; j < N_w; ++j) {
-      const double f_w  = grid.fermi(w(j) + mu_abs);   // RW-1: absolute energy
+      const double f_w  = grid.fermi(w(j) + mu_abs);   // absolute energy
       const double fb_w = 1.0 - f_w;
       const double q_j  = wq_h(j);
       f_wq_h(j)  = ComplexType(f_w  * q_j, 0.0);
@@ -287,19 +280,15 @@ inline void RePi_from_ImPi(detail::real_axis_conv_base_t<MEM> & conv,
                               std::array<long,2>{B, N_O});
 
   // ==================================================================
-  // RW-1 DEVIATION FROM origin/real_axis (notes/rw1_port_report.md).
-  //
-  // The branch calls   conv.hilbert(ImBuf, ReBuf, grid_kind::bosonic)
-  // here. That routine is WRONG FOR A BOSONIC QUANTITY on two counts,
-  // and the two compound into a clean factor of -1/2 that the RW-1 gate
-  // measures directly (the Re Pi probe in test_real_axis_w_lehmann.cpp;
-  // qe_lih222, <RePi_code(Omega_1)/KK_full(0)> = -0.477 / -0.506 / -0.512
-  // for eta = 0.05 / 0.025 / 0.0125 Ha, i.e. -1/2 as eta -> 0).
+  // BOSONIC HILBERT TRANSFORM. conv.hilbert(ImBuf, ReBuf, grid_kind::bosonic)
+  // is NOT used here: it is wrong for a bosonic quantity on two counts, which
+  // compound into a factor of -1/2 (the Re Pi probe in
+  // test_real_axis_w_lehmann.cpp checks the Kramers-Kronig relation directly).
   //
   // (1) HALF AXIS. conv.hilbert integrates over the grid points it is
   //     given. The bosonic grid is the POSITIVE half axis by construction
-  //     (real_freq_grid.hpp:81-85 rejects Omega <= 0) and Im Pi is ODD, so
-  //     the Omega' < 0 image contributes an equal amount that is dropped.
+  //     (real_freq_grid_t rejects Omega <= 0) and Im Pi is ODD, so the
+  //     Omega' < 0 image contributes an equal amount that would be dropped.
   //     Correct:
   //       Re Pi(Om) = (1/pi) PV int_{-inf}^{inf} dOm' Im Pi(Om')/(Om'-Om)
   //                 = (2/pi) PV int_0^inf dOm' Om' Im Pi(Om')/(Om'^2-Om^2)
@@ -308,19 +297,16 @@ inline void RePi_from_ImPi(detail::real_axis_conv_base_t<MEM> & conv,
   // (2) SIGN. conv.hilbert's docstring states
   //       Re X(w) = (1/pi) PV int dw' Im X(w') / (w' - w)
   //     but the implementation is the NEGATIVE of that: the kernel is
-  //     prebuilt as +i*sgn(t_k) (real_axis_conv.hpp:147-150) and the final
-  //     scale is +dt/(2pi) (:430), while the stated identity carries a
-  //     leading minus. The branch's own fermionic test pins the
-  //     IMPLEMENTATION, not the docstring: real_axis_conv_lorentzian_hilbert
-  //     feeds Im X = +gamma/((w-x0)^2+gamma^2) and expects
-  //     Re X = +(w-x0)/(...), which is the KK pair of the ADVANCED function
-  //     1/(w-x0-i*gamma), not of the retarded one. Consequence on the branch:
-  //     the Pi handed to the Dyson step is not a causal response function --
-  //     its Re and Im parts are not a Kramers-Kronig pair.
+  //     prebuilt as +i*sgn(t_k) and the final scale is +dt/(2pi), while the
+  //     stated identity carries a leading minus. The fermionic conv test
+  //     (real_axis_conv_lorentzian_hilbert) pins the IMPLEMENTATION: it feeds
+  //     Im X = +gamma/((w-x0)^2+gamma^2) and expects Re X = +(w-x0)/(...),
+  //     the KK pair of the ADVANCED function 1/(w-x0-i*gamma). Used for Pi,
+  //     it would give Re and Im parts that are not a retarded Kramers-Kronig
+  //     pair.
   //
-  // conv.hilbert itself is LEFT UNTOUCHED so the fermionic path and the
-  // branch's conv tests stay bit-identical; the corrected bosonic transform
-  // is rebuilt here from the same public NUFFT primitives:
+  // conv.hilbert is left unchanged for the fermionic path; the bosonic
+  // transform is built here from the same public NUFFT primitives:
   //
   //   F(t)      = sum_j wq_j Im Pi(Om_j) exp(+i Om_j t)      (type 1)
   //   F_odd(t)  = F(t) - conj(F(t)) = 2i Im F(t)             (the Om<0 image)
@@ -330,9 +316,8 @@ inline void RePi_from_ImPi(detail::real_axis_conv_base_t<MEM> & conv,
   // (the -i sgn(t) kernel of the correct identity times the 2i of the odd
   // extension leaves the real weight 2 sgn(t)).
   //
-  // MEM != HOST_MEMORY routes through a host copy: RW-1 is host-only by
-  // ruling, and this keeps the device build compiling without a device on
-  // which to validate a fused kernel.
+  // MEM != HOST_MEMORY routes through a host copy: there is no fused device
+  // kernel for this transform; the copy keeps the device build working.
   // ==================================================================
   const long N_t_ = conv.N_t();
   auto const& grid_ = conv.grid();

@@ -1053,15 +1053,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
                  qp_map=="mode_a" or qp_map=="mode_b",
                  "evgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
-                 "\"mats_gmatch\" (Project 2 increment Q0), \"mode_b\" (increment QM3; "
-                 "\"mode_a\" is ON HOLD, see the spec rev 2).",
+                 "\"mats_gmatch\", \"mode_a\", \"mode_b\".",
                  qp_map);
     qp_params_t qp_params(qp_type, ac_alg, Nfit, eta, conv_thr, "evscf", keep_scr_coulomb_fixed,
                           "fermi", mu_tol, mu_update_alg);
     qp_params.qp_map = qp_map;
     qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
     utils::check(qp_params.qp_map_wpow >= 0.0, "evgw: qp_map_wpow must be >= 0.");
-    // Project 2 increment QM3 (notes/qm3_mode_a_loop_spec.md section 6): mode-A knobs.
+    // knobs of the real-axis quasiparticle maps qp_map = "mode_a" / "mode_b".
     qp_params.qp_modea_route = io::get_value_with_default<std::string>(pt,"qp_modea_route","cd");
     io::tolower(qp_params.qp_modea_route);
     utils::check(qp_params.qp_modea_route=="cd" or qp_params.qp_modea_route=="expansion",
@@ -1072,12 +1071,12 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     qp_params.qp_modea_consist_tol = io::get_value_with_default<double>(pt,"qp_modea_consist_tol",1e-8);
     utils::check(qp_params.qp_modea_consist_tol > 0.0, "evgw: qp_modea_consist_tol must be > 0.");
     qp_params.qp_modea_eta = io::get_value_with_default<double>(pt,"qp_modea_eta",0.0);
-    // spec rev 4: out-of-strip evaluation at eps + i*eta_far (0 = the rev-3.1 mu fallback).
+    // out-of-strip states are evaluated at eps + i*eta_far (0 = evaluate them at z = mu).
     qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
     utils::check(qp_params.qp_modea_eta_far >= 0.0,
-                 "evgw: qp_modea_eta_far must be >= 0 (0 = the mu fallback of spec rev 3.1).");
-    // TC-4: the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset =
-    // the E_PH-derived strip, bit for bit. See qp_params_t.h and notes/tc4_si_tier.md s11.
+                 "evgw: qp_modea_eta_far must be >= 0 (0 = out-of-strip states are evaluated at mu).");
+    // the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset = the
+    // E_PH-derived strip. See qp_params_t.h.
     qp_params.qp_modea_strip_lo =
         io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
     qp_params.qp_modea_strip_hi =
@@ -1088,8 +1087,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
                  "evgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
                  "for an explicit window, both 0 for the E_PH strip).");
-    // TC-5: the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not
-    // the spacing; h is derived from the measured sizing law. 0 = cache off.
+    // the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not the spacing; h is
+    // derived from an empirical error model (see qp_params_t.h). 0 = cache off.
     qp_params.qp_tc_wgrid_mev =
         io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
     utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
@@ -1116,14 +1115,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  or qp_params.qp_modea_wfit=="contour",
                  "evgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
                  "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
-    // TC-2 (notes/tc_coqui_impl_spec.md): the tilted-contour route, a SIBLING of the
-    // RW-2 "spectral" knob family. Every value is documented on qp_params_t.h.
+    // the tilted-contour route (qp_modea_wfit = "contour"), a SIBLING of the "spectral"
+    // knob family. Every value is documented on qp_params_t.h.
     qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
     utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
                  "evgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
     qp_params.qp_tc_delta = io::get_value_with_default<double>(pt,"qp_tc_delta",0.0);
     utils::check(qp_params.qp_tc_delta >= 0.0,
-                 "evgw: qp_tc_delta = {} must be >= 0 (0 selects the eq-8 recipe).",
+                 "evgw: qp_tc_delta = {} must be >= 0 (0 derives it from the target broadening and the k-mesh).",
                  qp_params.qp_tc_delta);
     qp_params.qp_tc_rho = io::get_value_with_default<double>(pt,"qp_tc_rho",0.65);
     utils::check(qp_params.qp_tc_rho >= 0.0 and qp_params.qp_tc_rho < 1.0,
@@ -1156,7 +1155,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         io::get_value_with_default<double>(pt,"qp_tc_batch_mb",64.0);
     utils::check(qp_params.qp_tc_batch_mb > 0.0,
                  "evgw: qp_tc_batch_mb = {} must be > 0.", qp_params.qp_tc_batch_mb);
-    // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
+    // the spectral-quadrature W^c representation (qp_modea_wfit = "spectral").
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
     utils::check(qp_params.qp_modea_spectral_eta > 0.0,
@@ -1169,7 +1168,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     io::tolower(qp_params.qp_modea_spectral_gamma);
     qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
     utils::check(qp_params.qp_modea_wrtol < 1.0,
-                 "evgw: qp_modea_wrtol must be < 1 (negative selects the doctrine default).");
+                 "evgw: qp_modea_wrtol must be < 1 (negative keeps the default pole-fit tolerance).");
     qp_params.qp_modea_wrank = io::get_value_with_default<double>(pt,"qp_modea_wrank",1e-10);
     utils::check(qp_params.qp_modea_wrank < 1.0,
                  "evgw: qp_modea_wrank must be < 1 (<= 0 takes the dense reference sandwich).");
@@ -1346,15 +1345,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
                  qp_map=="mode_a" or qp_map=="mode_b",
                  "qpgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
-                 "\"mats_gmatch\" (Project 2 increment Q0), \"mode_b\" (increment QM3; "
-                 "\"mode_a\" is ON HOLD, see the spec rev 2).",
+                 "\"mats_gmatch\", \"mode_a\", \"mode_b\".",
                  qp_map);
     qp_params_t qp_params("sc", ac_alg, Nfit, eta, 1e-8, "qpscf", false, off_diag_mode,
                           mu_tol, mu_update_alg);
     qp_params.qp_map = qp_map;
     qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
     utils::check(qp_params.qp_map_wpow >= 0.0, "qpgw: qp_map_wpow must be >= 0.");
-    // Project 2 increment QM3 (notes/qm3_mode_a_loop_spec.md section 6): mode-A knobs.
+    // knobs of the real-axis quasiparticle maps qp_map = "mode_a" / "mode_b".
     qp_params.qp_modea_route = io::get_value_with_default<std::string>(pt,"qp_modea_route","cd");
     io::tolower(qp_params.qp_modea_route);
     utils::check(qp_params.qp_modea_route=="cd" or qp_params.qp_modea_route=="expansion",
@@ -1365,12 +1363,12 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     qp_params.qp_modea_consist_tol = io::get_value_with_default<double>(pt,"qp_modea_consist_tol",1e-8);
     utils::check(qp_params.qp_modea_consist_tol > 0.0, "qpgw: qp_modea_consist_tol must be > 0.");
     qp_params.qp_modea_eta = io::get_value_with_default<double>(pt,"qp_modea_eta",0.0);
-    // spec rev 4: out-of-strip evaluation at eps + i*eta_far (0 = the rev-3.1 mu fallback).
+    // out-of-strip states are evaluated at eps + i*eta_far (0 = evaluate them at z = mu).
     qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
     utils::check(qp_params.qp_modea_eta_far >= 0.0,
-                 "qpgw: qp_modea_eta_far must be >= 0 (0 = the mu fallback of spec rev 3.1).");
-    // TC-4: the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset =
-    // the E_PH-derived strip, bit for bit. See qp_params_t.h and notes/tc4_si_tier.md s11.
+                 "qpgw: qp_modea_eta_far must be >= 0 (0 = out-of-strip states are evaluated at mu).");
+    // the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset = the
+    // E_PH-derived strip. See qp_params_t.h.
     qp_params.qp_modea_strip_lo =
         io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
     qp_params.qp_modea_strip_hi =
@@ -1381,8 +1379,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
                  "qpgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
                  "for an explicit window, both 0 for the E_PH strip).");
-    // TC-5: the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not
-    // the spacing; h is derived from the measured sizing law. 0 = cache off.
+    // the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not the spacing; h is
+    // derived from an empirical error model (see qp_params_t.h). 0 = cache off.
     qp_params.qp_tc_wgrid_mev =
         io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
     utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
@@ -1409,14 +1407,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  or qp_params.qp_modea_wfit=="contour",
                  "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
                  "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
-    // TC-2 (notes/tc_coqui_impl_spec.md): the tilted-contour route, a SIBLING of the
-    // RW-2 "spectral" knob family. Every value is documented on qp_params_t.h.
+    // the tilted-contour route (qp_modea_wfit = "contour"), a SIBLING of the "spectral"
+    // knob family. Every value is documented on qp_params_t.h.
     qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
     utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
                  "qpgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
     qp_params.qp_tc_delta = io::get_value_with_default<double>(pt,"qp_tc_delta",0.0);
     utils::check(qp_params.qp_tc_delta >= 0.0,
-                 "qpgw: qp_tc_delta = {} must be >= 0 (0 selects the eq-8 recipe).",
+                 "qpgw: qp_tc_delta = {} must be >= 0 (0 derives it from the target broadening and the k-mesh).",
                  qp_params.qp_tc_delta);
     qp_params.qp_tc_rho = io::get_value_with_default<double>(pt,"qp_tc_rho",0.65);
     utils::check(qp_params.qp_tc_rho >= 0.0 and qp_params.qp_tc_rho < 1.0,
@@ -1449,7 +1447,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         io::get_value_with_default<double>(pt,"qp_tc_batch_mb",64.0);
     utils::check(qp_params.qp_tc_batch_mb > 0.0,
                  "qpgw: qp_tc_batch_mb = {} must be > 0.", qp_params.qp_tc_batch_mb);
-    // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
+    // the spectral-quadrature W^c representation (qp_modea_wfit = "spectral").
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
     utils::check(qp_params.qp_modea_spectral_eta > 0.0,
@@ -1462,7 +1460,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     io::tolower(qp_params.qp_modea_spectral_gamma);
     qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
     utils::check(qp_params.qp_modea_wrtol < 1.0,
-                 "qpgw: qp_modea_wrtol must be < 1 (negative selects the doctrine default).");
+                 "qpgw: qp_modea_wrtol must be < 1 (negative keeps the default pole-fit tolerance).");
     qp_params.qp_modea_wrank = io::get_value_with_default<double>(pt,"qp_modea_wrank",1e-10);
     utils::check(qp_params.qp_modea_wrank < 1.0,
                  "qpgw: qp_modea_wrank must be < 1 (<= 0 takes the dense reference sandwich).");
@@ -1620,9 +1618,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // empty-C / Sigma-vertex-without-ladder requests abort (as in the [gw] sites)
     mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
-    // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
-    // re-QP-ization knobs. Parsed with an EMPTY default -- absent means INERT, i.e. the qp
-    // loop builds its own analytic QP G and the run is bit-identical to the pre-Q5 one. When
+    // re-QP-ization from an external Green's function. Parsed with an EMPTY default --
+    // absent means INERT, i.e. the qp loop builds its own analytic QP G. When
     // set, ITERATION 1 consumes the external G of that checkpoint group (its density matrix
     // drives the HF stage, and update_w / Sigma^GW screen with it); iterations >= 2 revert.
     // Note: the function-scope greens_func_source above defaults to "scf" and belongs to the
@@ -2015,16 +2012,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
 
   } else if (solver_type == "qpgw") {
 
-    // Project 2 increment Q4 (notes/q4_edmft_skeleton_spec.md C2): the qpGW+BSE lattice
-    // stage of the GW+EDMFT skeleton. Same knob surface as the plain [qpgw] branch of the
+    // the qpGW+BSE lattice stage of GW+EDMFT. Same knob surface as the plain [qpgw] branch of the
     // projector-less overload, PLUS the screen_type knob and the projector-carrying
     // MBState -- so the lattice loop screens with
     //   P_latt = P^RPA[G_latt] + P^lad + P_C[P_imp - P_dc]P_C^dag.
-    // FROZEN H_eff (Option 1, ruling R-Q4-4): the qp loop's own update_G supplies the G
-    // that eval_Pi_qdep consumes; the impurity self-energy re-enters the lattice only
-    // through the downfold/embed cycle (dmft_embed), never inside this loop. The
-    // bubble-from-corrected-G of the PDF's principle 3 activates at Q5, when the qpgw
-    // stage moves inside the outer cycle.
+    // FROZEN H_eff: the qp loop's own update_G supplies the G that eval_Pi_qdep consumes;
+    // the impurity self-energy re-enters the lattice only through the downfold/embed cycle
+    // (dmft_embed), never inside this loop. The bubble from the corrected G enters through
+    // greens_func_source (below), when the qpgw stage runs inside the outer cycle.
     auto screen_type = io::get_value_with_default<std::string>(pt,"screen_type", "rpa");
     io::tolower(screen_type);
     utils::check(screen_type == "rpa" or screen_type == "gw_edmft",
@@ -2044,15 +2039,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
                  qp_map=="mode_a" or qp_map=="mode_b",
                  "qpgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
-                 "\"mats_gmatch\" (Project 2 increment Q0), \"mode_b\" (increment QM3; "
-                 "\"mode_a\" is ON HOLD, see the spec rev 2).",
+                 "\"mats_gmatch\", \"mode_a\", \"mode_b\".",
                  qp_map);
     qp_params_t qp_params("sc", ac_alg, Nfit, eta, 1e-8, "qpscf", false, off_diag_mode,
                           mu_tol, mu_update_alg);
     qp_params.qp_map = qp_map;
     qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
     utils::check(qp_params.qp_map_wpow >= 0.0, "qpgw: qp_map_wpow must be >= 0.");
-    // Project 2 increment QM3 (notes/qm3_mode_a_loop_spec.md section 6): mode-A knobs.
+    // knobs of the real-axis quasiparticle maps qp_map = "mode_a" / "mode_b".
     qp_params.qp_modea_route = io::get_value_with_default<std::string>(pt,"qp_modea_route","cd");
     io::tolower(qp_params.qp_modea_route);
     utils::check(qp_params.qp_modea_route=="cd" or qp_params.qp_modea_route=="expansion",
@@ -2063,12 +2057,12 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     qp_params.qp_modea_consist_tol = io::get_value_with_default<double>(pt,"qp_modea_consist_tol",1e-8);
     utils::check(qp_params.qp_modea_consist_tol > 0.0, "qpgw: qp_modea_consist_tol must be > 0.");
     qp_params.qp_modea_eta = io::get_value_with_default<double>(pt,"qp_modea_eta",0.0);
-    // spec rev 4: out-of-strip evaluation at eps + i*eta_far (0 = the rev-3.1 mu fallback).
+    // out-of-strip states are evaluated at eps + i*eta_far (0 = evaluate them at z = mu).
     qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
     utils::check(qp_params.qp_modea_eta_far >= 0.0,
-                 "qpgw: qp_modea_eta_far must be >= 0 (0 = the mu fallback of spec rev 3.1).");
-    // TC-4: the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset =
-    // the E_PH-derived strip, bit for bit. See qp_params_t.h and notes/tc4_si_tier.md s11.
+                 "qpgw: qp_modea_eta_far must be >= 0 (0 = out-of-strip states are evaluated at mu).");
+    // the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset = the
+    // E_PH-derived strip. See qp_params_t.h.
     qp_params.qp_modea_strip_lo =
         io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
     qp_params.qp_modea_strip_hi =
@@ -2079,8 +2073,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
                  "qpgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
                  "for an explicit window, both 0 for the E_PH strip).");
-    // TC-5: the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not
-    // the spacing; h is derived from the measured sizing law. 0 = cache off.
+    // the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not the spacing; h is
+    // derived from an empirical error model (see qp_params_t.h). 0 = cache off.
     qp_params.qp_tc_wgrid_mev =
         io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
     utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
@@ -2107,14 +2101,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                  or qp_params.qp_modea_wfit=="contour",
                  "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
                  "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
-    // TC-2 (notes/tc_coqui_impl_spec.md): the tilted-contour route, a SIBLING of the
-    // RW-2 "spectral" knob family. Every value is documented on qp_params_t.h.
+    // the tilted-contour route (qp_modea_wfit = "contour"), a SIBLING of the "spectral"
+    // knob family. Every value is documented on qp_params_t.h.
     qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
     utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
                  "qpgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
     qp_params.qp_tc_delta = io::get_value_with_default<double>(pt,"qp_tc_delta",0.0);
     utils::check(qp_params.qp_tc_delta >= 0.0,
-                 "qpgw: qp_tc_delta = {} must be >= 0 (0 selects the eq-8 recipe).",
+                 "qpgw: qp_tc_delta = {} must be >= 0 (0 derives it from the target broadening and the k-mesh).",
                  qp_params.qp_tc_delta);
     qp_params.qp_tc_rho = io::get_value_with_default<double>(pt,"qp_tc_rho",0.65);
     utils::check(qp_params.qp_tc_rho >= 0.0 and qp_params.qp_tc_rho < 1.0,
@@ -2147,7 +2141,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         io::get_value_with_default<double>(pt,"qp_tc_batch_mb",64.0);
     utils::check(qp_params.qp_tc_batch_mb > 0.0,
                  "qpgw: qp_tc_batch_mb = {} must be > 0.", qp_params.qp_tc_batch_mb);
-    // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
+    // the spectral-quadrature W^c representation (qp_modea_wfit = "spectral").
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
     utils::check(qp_params.qp_modea_spectral_eta > 0.0,
@@ -2160,7 +2154,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     io::tolower(qp_params.qp_modea_spectral_gamma);
     qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
     utils::check(qp_params.qp_modea_wrtol < 1.0,
-                 "qpgw: qp_modea_wrtol must be < 1 (negative selects the doctrine default).");
+                 "qpgw: qp_modea_wrtol must be < 1 (negative keeps the default pole-fit tolerance).");
     qp_params.qp_modea_wrank = io::get_value_with_default<double>(pt,"qp_modea_wrank",1e-10);
     utils::check(qp_params.qp_modea_wrank < 1.0,
                  "qpgw: qp_modea_wrank must be < 1 (<= 0 takes the dense reference sandwich).");
@@ -2319,10 +2313,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
 
-    // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
-    // re-QP-ization knobs -- SAME surface as the projector-less [qpgw] branch. Absent =>
-    // INERT (the loop's own analytic QP G, bit-identical to the pre-Q5 loop). When set,
-    // ITERATION 1 consumes the external G of that checkpoint group, so the Q3/Q4 screening
+    // re-QP-ization from an external Green's function -- SAME surface as the projector-less
+    // [qpgw] branch. Absent => INERT (the loop's own analytic QP G). When set,
+    // ITERATION 1 consumes the external G of that checkpoint group, so the ladder-injected screening
     // W_corr = W[P^RPA[G_ext] + P^lad + P_C(P_imp - P_dc)P_C^dag] comes for free: update_w
     // consumes the SAME injected mb_state.sG_tskij. The function-scope greens_func_source
     // above defaults to "scf" and belongs to the [gw] dyson-scf branch.

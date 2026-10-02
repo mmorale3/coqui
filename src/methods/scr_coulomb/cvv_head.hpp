@@ -38,8 +38,8 @@ namespace methods {
 namespace solvers {
 
   /**
-   * Covariant-velocity (CVV) q -> 0 head of the polarizability: the R-space engine +
-   * covariant velocity.
+   * Covariant-velocity (CVV) q -> 0 head of the polarizability, evaluated through a
+   * Wigner-Seitz R-space store of the band Hamiltonian and self-energy.
    *
    *   v~_a(k, iw) = d_k_a [ H0 + F + Sigma(k, iw) ]
    *

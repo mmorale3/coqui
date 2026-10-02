@@ -119,10 +119,11 @@ namespace methods {
       bool write_to_hdf5, bool q_dependent_output)
     -> std::tuple<nda::array<ComplexType, 4>, nda::array<ComplexType, 5> >;
 
-    // pi_lad_dc (Project 2 increment Q4, C3): OPT-IN inclusion of the checkpoint's
-    // pi_lad_loc_wabcd in the bosonic double counting. "none" (default) reproduces the
-    // pre-Q4 P_dc exactly; "thc_adjoint_diag" adds the DIAGNOSTIC-convention object -- see
-    // the R-Q4-2 AMENDMENT in notes/q4_edmft_skeleton_spec.md, it is NOT the DC-ready one.
+    // pi_lad_dc: opt-in inclusion of the local lattice ladder polarizability in the bosonic
+    // double counting. "none" (default): bubble[G_loc] only; "orbital": adds the
+    // orbital/chi-convention projection (pi_lad_loc_orb_wabcd); "thc_adjoint_diag": adds the
+    // THC-adjoint projection (pi_lad_loc_wabcd), a diagnostic convention that is not a valid
+    // DC contribution.
     void downfold_edmft_impl(THC_ERI auto &eri, MBState &mb_state,
                              std::string screen_type, std::string permut_symm,
                              std::array<std::string, 2> g_grp,

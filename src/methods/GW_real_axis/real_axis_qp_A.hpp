@@ -22,17 +22,16 @@
 #define COQUI_REAL_AXIS_QP_A_HPP
 
 /**
- * Shared QP-pole inputs of the real-axis W chain (increment RW-2; promoted out of the RW-1
- * gate harness test_real_axis_w_lehmann.cpp, which now calls these).
+ * Shared QP-pole inputs of the real-axis W chain (used by the spectral QP path and by the
+ * real-axis vs imaginary-axis W test, test_real_axis_w_lehmann.cpp).
  *
- *   (1) `size_grids(eta, w_max, Omega_max)` -- the DERIVED grid sizing of RW-1 section 3.
+ *   (1) `size_grids(eta, w_max, Omega_max)` -- grid sizes derived from eta.
  *   (2) `build_A_from_QP_poles(...)`        -- the QP-pole Lorentzian spectral function.
  *
  * Both are pure functions of their arguments; nothing here allocates state or touches MPI.
  *
  * -------------------------------------------------------------------------------------
- * (1) GRID SIZING. Everything is derived from eta, not tuned (RW-1 report section 3,
- *     "Grid sizing (derived, not tuned)"):
+ * (1) GRID SIZING. Everything is derived from eta, not tuned:
  *
  *   * w grid   : A is a sum of Lorentzians of width eta. Trapezoid quadrature of a
  *                Lorentzian with spacing h converges as exp(-2 pi eta / h), so h <= eta/2
@@ -42,25 +41,23 @@
  *                exp(-2 eta |t|), so truncating at |t| = T/2 costs ~exp(-eta T);
  *                T = 9.2/eta gives ~1e-4.
  *   * dt       : real_freq_grid_t enforces max(|w|, Omega) dt <= pi as a HARD error; we take
- *                the branch's own safety factor 2, dt = 0.5 pi / freq_max.
+ *                a safety factor 2, dt = 0.5 pi / freq_max.
  *   * Omega    : the features of Im W^c inherit the ~2 eta width of the bubble and the
  *                forward spectral integral uses the grid's own trapezoid weights, so
- *                dOmega <= eta (again exponential). NOTE the branch's own default
- *                (N_Omega = 64 on [0, 2 w_max]) does NOT satisfy this at production eta --
- *                that is a property of the criterion, not of the ported code.
+ *                dOmega <= eta (again exponential). A fixed default such as
+ *                N_Omega = 64 on [0, 2 w_max] does NOT satisfy this at production eta.
  *
  * -------------------------------------------------------------------------------------
- * (2) THE SPECTRAL FUNCTION. `build_A_from_QP_poles` reproduces the branch recipe
- *     (real_axis_qp_scf_driver.hpp:249-278, which is NOT part of the RW-1 port):
+ * (2) THE SPECTRAL FUNCTION. `build_A_from_QP_poles` builds
  *
  *         A_{ij}(w; s, k) = sum_a C_{i a} * (1/pi) eta / ((w_abs - E_a)^2 + eta^2)
  *                                          * conj(C_{j a}),
  *         w_abs = grid.w()(iw) + grid.mu_chem()          [the grid's w is measured from mu]
  *
  *     with C = the MO coefficients and E_a the ABSOLUTE quasiparticle energies. Passing a
- *     null MO pointer selects the identity-MO fill, which is the RW-1 gate's construction
- *     (licensed there by convention pin P1: H0 + F = diag(eps_KS) and S = 1) and is written
- *     out separately so that path stays bit-for-bit what RW-1 measured.
+ *     null MO pointer selects the identity-MO fill (valid when H0 + F = diag(eps_KS) and
+ *     S = 1, as in the real-axis vs imaginary-axis W test); it is written out separately so
+ *     that path does not depend on the MO contraction.
  *
  *     The array is filled at IBZ k -- real_axis_scr_coulomb_t::update_w hard-checks
  *     A.shape()[2] == MF.nkpts_ibz() and does the FBZ expansion itself.
@@ -140,8 +137,8 @@ namespace real_axis {
     for (long s = 0; s < ns; ++s)
       for (long k = 0; k < nk; ++k) {
         if (MO == nullptr) {
-          // identity MO: the RW-1 gate construction, kept textually separate so that path is
-          // bit-for-bit what the RW-1 eta series measured.
+          // identity MO: diagonal fill, kept separate from the MO contraction so the result
+          // is exactly the diagonal Lorentzian (no rounding from the contraction).
           for (long n = 0; n < nbnd; ++n) {
             const double e_n = std::real(ComplexType(E(s, k, n)));
             for (long iw = 0; iw < N_w; ++iw) {
