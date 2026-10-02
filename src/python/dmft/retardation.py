@@ -19,13 +19,12 @@ limitations under the License.
 """
 
 """
-Retardation handling for the EDMFT impurity problem, plus the Q4-c causality
+Retardation handling for the EDMFT impurity problem, plus the causality
 monitor for the bosonic Weiss field / local interaction U(iν).
 
-This module is deliberately **numpy-only** at import time: it carries the two
-Q4 diagnostics (``casula_werner_zb`` and ``u_causality_metrics``) that must be
-unit-checkable on a host where neither ``triqs`` nor the compiled ``coqui``
-package is importable (gate Q4-p2, notes/q4_edmft_skeleton_spec.md §3 P1).
+This module is **numpy-only** at import time: its two diagnostics
+(``casula_werner_zb`` and ``u_causality_metrics``) are unit-tested on a host
+where neither ``triqs`` nor the compiled ``coqui`` package is importable.
 Only ``app_log`` is imported from CoQuí, and that import is guarded.
 """
 import numpy as np
@@ -111,7 +110,7 @@ def total_density_channel(U_w):
 
 
 # --------------------------------------------------------------------------
-# Casula-Werner bandwidth renormalisation Z_B  (ruling R-Q4-5, gate Q4-p2)
+# Casula-Werner bandwidth renormalisation Z_B
 # --------------------------------------------------------------------------
 
 def casula_werner_exponent(U_w, nu_mesh, *, tail=True, clamp=True, name=""):
@@ -146,7 +145,7 @@ def casula_werner_exponent(U_w, nu_mesh, *, tail=True, clamp=True, name=""):
     (Casula *et al.*, PRB **85**, 035115 (2012)), and it needs neither
     :math:`U_\infty` nor an analytic continuation.
 
-    Properties used as gate Q4-p2:
+    Properties (checked by the unit tests):
 
     * ``U(iν)`` ν-independent  ⇒  every integrand sample is identically zero ⇒
       ``S = 0`` **exactly** (bitwise) ⇒ ``Z_B = 1``.
@@ -168,7 +167,7 @@ def casula_werner_exponent(U_w, nu_mesh, *, tail=True, clamp=True, name=""):
         = (U(i\nu_N)-U(0))/\nu_N` tail beyond the last mesh point.
     clamp : bool, default True
         Clamp a (numerically) negative ``S`` to zero and warn, so the
-        ``0 < Z_B ≤ 1`` contract of R-Q4-5 always holds.
+        ``0 < Z_B ≤ 1`` contract always holds.
     name : str, optional
         Label used in warnings.
 
@@ -182,7 +181,7 @@ def casula_werner_exponent(U_w, nu_mesh, *, tail=True, clamp=True, name=""):
     The ν-integral is evaluated by the trapezoid rule **on the mesh supplied**.
     On the sparse IR/DLR bosonic meshes used by CoQuí this is a quadrature
     approximation, not an exact sum; its accuracy is set by the mesh, and it is
-    exact (identically zero) in the flat-U limit that gate Q4-p2 pins.
+    exact (identically zero) in the flat-U limit.
     """
     nu = np.asarray(nu_mesh, dtype=float).reshape(-1)
     u = total_density_channel(U_w)
@@ -232,7 +231,7 @@ def casula_werner_zb(U_w, nu_mesh, *, tail=True, clamp=True, name=""):
     :math:`Z_B = \exp[-\sum_l \lambda_l^2/\omega_l^2]` of ``U(iν)``.
 
     See :func:`casula_werner_exponent` for the exponent, its exact
-    Matsubara-axis representation, and the gate Q4-p2 properties
+    Matsubara-axis representation, and its properties
     (flat ``U`` ⇒ ``Z_B == 1`` exactly; ``0 < Z_B ≤ 1`` always).
 
     Parameters
@@ -252,7 +251,7 @@ def casula_werner_zb(U_w, nu_mesh, *, tail=True, clamp=True, name=""):
 def apply_impurity_retardation_mode(delta_iw, u_weiss_iw, Vloc, nu_mesh,
                                     mode="dynamic", *, static_u_source="u0", name=""):
     r"""
-    Apply the impurity retardation policy of ruling R-Q4-5 to the solver inputs.
+    Apply the impurity retardation policy to the solver inputs.
 
     Parameters
     ----------
@@ -268,7 +267,7 @@ def apply_impurity_retardation_mode(delta_iw, u_weiss_iw, Vloc, nu_mesh,
         Non-negative bosonic Matsubara frequencies matching ``u_weiss_iw``.
     mode : {"dynamic", "static_u_zb"}, default "dynamic"
         - ``"dynamic"``: pass-through. The solver sees the full retarded
-          ``U(iν)``. This is the pre-Q4 behaviour and the default.
+          ``U(iν)``. This is the default.
         - ``"static_u_zb"``: **impurity mode (a)**. The retarded part is set to
           zero, the solver's static interaction is chosen by
           ``static_u_source``, and the hybridization is renormalised as
@@ -282,15 +281,13 @@ def apply_impurity_retardation_mode(delta_iw, u_weiss_iw, Vloc, nu_mesh,
           ``U(iν = 0) = Vloc + u_weiss_iw[0]``. This is the Casula–Werner
           standard.
         - ``"u_inf"``: the *unscreened* high-frequency limit
-          ``U(iν → ∞) = Vloc``, i.e. the PDF §3.3 literal, kept selectable.
+          ``U(iν → ∞) = Vloc``, kept selectable.
 
-        ⚠ **The default deliberately contradicts the PDF §3.3 text as
-        written** (R-Q4-5 AMENDMENT, ``notes/q4_edmft_skeleton_spec.md`` §2).
-        ``Z_B`` is derived by integrating out the *screening* bosons, so the
-        static interaction that survives that construction is the screened
-        ``U(0)``; pairing the bare ``U(iν → ∞)`` with ``Z_B < 1`` double-counts
-        screening. If ``U(iν → ∞)`` was intended, set
-        ``static_u_source="u_inf"`` explicitly.
+        ⚠ The default is the screened ``U(0)`` on purpose: ``Z_B`` is derived
+        by integrating out the *screening* bosons, so the static interaction
+        that survives that construction is the screened ``U(0)``; pairing the
+        bare ``U(iν → ∞)`` with ``Z_B < 1`` double-counts screening. If
+        ``U(iν → ∞)`` is intended, set ``static_u_source="u_inf"`` explicitly.
     name : str, optional
         Label used in log lines.
 
@@ -299,7 +296,7 @@ def apply_impurity_retardation_mode(delta_iw, u_weiss_iw, Vloc, nu_mesh,
     (delta_out, Vloc_out, u_weiss_out, z_b)
         ``z_b`` is ``None`` in ``"dynamic"`` mode, where all three arrays are
         the **same objects** that were passed in (no copy, so the default path
-        is bit-identical to the pre-Q4 workflow).
+        leaves the solver inputs untouched).
 
     Notes
     -----
@@ -337,7 +334,7 @@ def apply_impurity_retardation_mode(delta_iw, u_weiss_iw, Vloc, nu_mesh,
         static_label = "U(inu = 0) [screened, Casula-Werner standard]"
     else:
         Vloc_out = Vloc
-        static_label = "U(inu -> infty) = Vloc [unscreened, PDF section 3.3 literal]"
+        static_label = "U(inu -> infty) = Vloc [unscreened]"
 
     u_bar = total_density_channel(U_w)
     app_log(1, "Impurity retardation mode (a): static U + Casula-Werner bandwidth factor")
@@ -349,16 +346,15 @@ def apply_impurity_retardation_mode(delta_iw, u_weiss_iw, Vloc, nu_mesh,
     app_log(1, f"  Casula-Werner exponent S   = {-np.log(z_b):.8e}\n")
     if static_u_source == "u_inf":
         app_log(1, "WARNING: static_u_source = \"u_inf\" pairs the UNSCREENED interaction "
-                   "with Z_B < 1, which double-counts screening (R-Q4-5 AMENDMENT). "
+                   "with Z_B < 1, which double-counts screening. "
                    "The Casula-Werner standard is static_u_source = \"u0\".")
 
     # ---- domain-of-validity meters (diagnostic only; nothing below changes the result) ---
-    # R-Q4-5 guarantees 0 < Z_B <= 1, and casula_werner_zb clamps S < 0. Neither guards the
-    # OTHER end: an overscreened U(inu) makes S large and Z_B underflow, and Delta -> Z_B
-    # Delta then annihilates the hybridization -- the impurity silently decouples from the
-    # bath and the QMC solves an atomic-limit problem that looks perfectly healthy (sign
-    # ~ 1). Measured on SVO kp444 beta=1000 with the qpGW lattice stage, 2026-08-17:
-    # Ubar(0) = -0.196 Ha, S = 97.0, Z_B = 8e-43.
+    # casula_werner_zb guarantees 0 < Z_B <= 1 by clamping S < 0. Nothing guards the
+    # OTHER end: an overscreened U(inu) (Ubar(0) < 0) makes S large and Z_B underflow, and
+    # Delta -> Z_B Delta then annihilates the hybridization -- the impurity silently
+    # decouples from the bath and the QMC solves an atomic-limit problem that looks
+    # perfectly healthy (sign ~ 1).
     if z_b < 1e-3:
         app_log(1, f"WARNING: Z_B = {z_b:.3e} for {name or 'this impurity'} is effectively "
                    f"ZERO (Casula-Werner exponent S = {-np.log(z_b):.4g}). Mode (a) hands the "
@@ -366,7 +362,7 @@ def apply_impurity_retardation_mode(delta_iw, u_weiss_iw, Vloc, nu_mesh,
                    f"the impurity solution is an atomic-limit artefact, not an EDMFT solution. "
                    f"This means U(inu) is far outside the weakly-retarded regime mode (a) "
                    f"assumes; use retardation=\"dynamic\", or fix the screening first (see the "
-                   f"Q4-c causality monitor above).")
+                   f"U(inu) causality monitor above).")
     if np.real(u_bar[0]) <= 0.0 and static_u_source == "u0":
         app_log(1, f"WARNING: Ubar(inu = 0) = {np.real(u_bar[0]):.6f} a.u. <= 0 for "
                    f"{name or 'this impurity'}: the SCREENED static interaction handed to the "
@@ -378,7 +374,7 @@ def apply_impurity_retardation_mode(delta_iw, u_weiss_iw, Vloc, nu_mesh,
 
 
 # --------------------------------------------------------------------------
-# Gate Q4-c: causality monitor for U(iν)
+# Causality monitor for U(iν)
 # --------------------------------------------------------------------------
 
 CAUSALITY_TRAIL_LABELS = (
@@ -391,10 +387,10 @@ CAUSALITY_TRAIL_LABELS = (
 
 def u_causality_metrics(U_w, nu_mesh, *, monotonicity_tol=0.0, psd_rtol=1e-10):
     r"""
-    Q4-c causality diagnostics for the local interaction ``U(iν)``.
+    Causality diagnostics for the local interaction ``U(iν)``.
 
-    All three meters of notes/q4_edmft_skeleton_spec.md §3 P1 are **non-fatal**;
-    the caller logs them and stores them in the DMFT checkpoint trail.
+    All three meters are **non-fatal**; the caller logs them and stores them in
+    the DMFT checkpoint trail.
 
     (i)   **Hermiticity in the product basis.** ``U(iν)`` reshaped to the
           ``(norb², norb²)`` pair matrix must be hermitian at every ν;
@@ -521,7 +517,7 @@ def causality_trail(metrics):
 
 def monitor_u_causality(Vloc, u_weiss_iw, nu_mesh, *, imp_index=None, verbose=True):
     """
-    Run the Q4-c causality monitor on ``U(iν) = Vloc + u_weiss_iw(iν)`` and log it.
+    Run the causality monitor on ``U(iν) = Vloc + u_weiss_iw(iν)`` and log it.
 
     Parameters
     ----------
@@ -546,7 +542,7 @@ def monitor_u_causality(Vloc, u_weiss_iw, nu_mesh, *, imp_index=None, verbose=Tr
 
     tag = "" if imp_index is None else f" for impurity {imp_index}"
     if verbose:
-        app_log(1, f"Causality monitor for U(inu){tag} (Q4-c, non-fatal)")
+        app_log(1, f"Causality monitor for U(inu){tag} (non-fatal)")
         app_log(1, "-------------------------------------------------------")
         app_log(1, f"  max_nu |U(nu) - U(nu)^dag|            = {metrics['hermiticity_max']:.6e}")
         app_log(1, f"  max_a #sign changes of dU_aa/dnu      = {metrics['dd_monotonicity_flips']}")

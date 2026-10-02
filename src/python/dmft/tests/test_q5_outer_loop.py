@@ -19,59 +19,58 @@ limitations under the License.
 """
 
 """
-Q5 (the Option-2 outer loop) python gates -- notes/q5_option2_outer_loop_spec.md §3.
+Python tests of the GW+EDMFT outer loop with a re-derived effective Hamiltonian
+(``outer_loop="option2"``).
 
-  * **Q5-g3 (python wiring):** ``outer_loop="option1"`` must leave the Q4 frozen-stage
-    wiring alone (param-level assertion, the P1 pattern), and ``outer_loop="option2"``
-    must emit the per-cycle qpGW stage with the R-Q5-1 damping and the external-G source.
-  * **Q5-b (Mott feedback chain):** every field of the per-cycle trail is present and
-    finite, the layout is fixed, and the diagnostics that feed it (DC staleness, o_C,
-    band reordering, gap(H_eff)) behave.
+  * **Parameter wiring:** ``outer_loop="option1"`` must leave the frozen-stage wiring
+    alone (param-level assertion), and ``outer_loop="option2"`` must emit the per-cycle
+    qpGW stage with the default H_eff damping and the external-G source.
+  * **Mott feedback chain:** every field of the per-cycle trail is present and finite,
+    the layout is fixed, and the diagnostics that feed it (DC staleness, o_C, band
+    reordering, gap(H_eff)) behave.
 
-Two tiers, deliberately separated (the ``test_q4_edmft_skeleton.py`` pattern):
+Two tiers, deliberately separated (as in ``test_q4_edmft_skeleton.py``):
 
   * **numpy-only tier** -- imports ``dmft/outer_loop.py`` by file path, so it runs on a
-    host where neither ``coqui`` nor ``triqs`` is importable. This is where the whole
-    Q5-b field-presence/finiteness gate lives.
+    host where neither ``coqui`` nor ``triqs`` is importable. This tier holds all the
+    trail field-presence/finiteness checks.
   * **coqui tier** -- ``convert_gw_edmft_params`` and ``scf_driver`` need ``coqui`` +
     ``triqs``; guarded with ``importorskip``.
 
 RUN COMMANDS
 ------------
-On a TRIQS host (rusty), from the build/install tree:
+On a TRIQS host, from the build/install tree:
 
     # everything in this file
     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \\
       python3 -m pytest -v src/python/dmft/tests/test_q5_outer_loop.py
 
-    # the Q4 suites must stay green alongside it
+    # the related EDMFT suites
     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \\
       python3 -m pytest -v src/python/dmft/tests/test_q4_edmft_skeleton.py \\
                            src/python/dmft/tests/test_edmft.py
 
-Without pytest, the numpy-only tier runs standalone (this is how it was measured):
+Without pytest, the numpy-only tier runs standalone:
 
     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \\
       python3 src/python/dmft/tests/test_q5_outer_loop.py
 
-MEASURED 2026-08-14 on the implementation host (numpy 2.x, no coqui/triqs): **16/16**
-numpy-only legs pass; the 5 Q5-g3 parameter/stage legs take a pytest fixture
-(``tmp_path``/``monkeypatch``) and need ``coqui`` + ``triqs``, so they are skipped there
-and must be run on a TRIQS host with the pytest command above.
+The parameter/stage tests take a pytest fixture (``tmp_path``/``monkeypatch``) and need
+``coqui`` + ``triqs``; the standalone runner skips them.
 
-ENVIRONMENT-BLOCKED LEG (spec §5, recorded -- NOT gated here)
-------------------------------------------------------------
-The full C = empty-set Option-2 end-to-end run needs a TRIQS host with a QMC impurity
-solver. On rusty, with an existing ``svo.mbpt.h5`` GW checkpoint::
+END-TO-END RUN (not part of this file)
+--------------------------------------
+A full ``outer_loop="option2"`` run needs a TRIQS host with a QMC impurity solver. With
+an existing GW checkpoint (here ``svo.mbpt.h5``)::
 
     params = {
         "niter": 8,
         "lattice_solver": "qpgw",
-        "outer_loop": "option2",       # <-- the Q5 switch
-        "outer_qpgw_niter": 1,         # the pure one-shot re-QP step
+        "outer_loop": "option2",       # <-- re-derive H_eff every cycle
+        "outer_qpgw_niter": 1,         # a single re-QP step per cycle
         "prefix": "svo", "outdir": "./",
         "screen_type": "gw_edmft",
-        "iter_alg": {"alg": "damping", "mixing": 0.3},   # PDF §7, ruling R-Q5-1
+        "iter_alg": {"alg": "damping", "mixing": 0.3},   # conservative H_eff damping
         "wannier_file": ".../svo.mlwf.h5",
         "qpgw": {"qp_map": "mode_a", "pol_vertex": "ladder",
                  "pol_vertex_inject": "ladder_n2", "pol_vertex_band_window": [...]},
@@ -81,7 +80,7 @@ solver. On rusty, with an existing ``svo.mbpt.h5`` GW checkpoint::
 
 The C = empty-set check is the same run with the impurity corrections switched off: its
 H_eff trail must reproduce the ``outer_loop="option1"`` trail, which is the python-level
-statement of the C++ gate Q5-g2 (``test_methods_qpgw_q5.cpp``).
+statement of the C++ test ``test_methods_qpgw_q5.cpp``.
 """
 
 import importlib.util
@@ -96,7 +95,7 @@ import numpy as np
 
 def _load_outer_loop():
     path = pathlib.Path(__file__).resolve().parents[1] / "outer_loop.py"
-    spec = importlib.util.spec_from_file_location("_q5_outer_loop_standalone", path)
+    spec = importlib.util.spec_from_file_location("_outer_loop_standalone", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -106,11 +105,11 @@ ol = _load_outer_loop()
 
 
 # ==========================================================================
-# Gate Q5-b -- the Mott feedback chain trail (numpy only)
+# The Mott feedback chain trail (numpy only)
 # ==========================================================================
 
 def _full_trail_fields():
-    """One physically-shaped value for every Q5-b field of spec §3."""
+    """One physically-shaped value for every trail field."""
     return {
         "gap_eV": 1.85,
         "epsilon_inf": 4.21,
@@ -123,7 +122,7 @@ def _full_trail_fields():
         "dc_pi_staleness": 9.8e-6,
         "band_reorder_count": 0.0,
         "o_c": 0.9997,
-        # Q6 §1.1 appended the cancellation-load columns to this same trail
+        # the appended cancellation-load columns
         "r_nu0": 4.2e-2,
         "r_mid": 7.8e-2,
         "r_top": 1.3e-1,
@@ -133,12 +132,12 @@ def _full_trail_fields():
 
 def test_mott_chain_trail_layout_is_the_q5b_field_list():
     """
-    The trail layout IS the gate's field list -- spec §3, gate Q5-b.
+    The trail layout IS the documented field list.
 
-    The Q5-b prefix is pinned FIRST and separately: the layout is documented "append only,
-    never reorder" (outer_loop.py:68-69), so a later increment adding columns must leave the
-    Q5-b slots exactly where they were, and this asserts that rather than just the total.
-    Increment Q6 §1.1 appended the four cancellation-load columns.
+    The original prefix is pinned FIRST and separately: the layout is documented "append
+    only, never reorder" (``MOTT_CHAIN_TRAIL_LABELS`` in outer_loop.py), so added columns
+    must leave the earlier slots exactly where they were, and this asserts that rather
+    than just the total. The four cancellation-load columns are appended after them.
     """
     q5b = (
         "gap_eV", "epsilon_inf", "lambda_nu0",
@@ -153,7 +152,7 @@ def test_mott_chain_trail_layout_is_the_q5b_field_list():
 
 
 def test_mott_chain_trail_fields_present_and_finite():
-    """Gate Q5-b proper: every field present, in order, and FINITE."""
+    """Every field present, in order, and FINITE."""
     fields = _full_trail_fields()
     trail = ol.mott_chain_trail(**fields)
 
@@ -161,7 +160,7 @@ def test_mott_chain_trail_fields_present_and_finite():
     assert np.all(np.isfinite(trail)), f"non-finite entries: {trail}"
     for i, name in enumerate(ol.MOTT_CHAIN_TRAIL_LABELS):
         assert trail[i] == fields[name], f"{name}: {trail[i]} != {fields[name]}"
-    print(f"    [Q5-b] trail = {dict(zip(ol.MOTT_CHAIN_TRAIL_LABELS, trail))}")
+    print(f"    [Mott chain] trail = {dict(zip(ol.MOTT_CHAIN_TRAIL_LABELS, trail))}")
 
 
 def test_mott_chain_trail_missing_fields_stay_finite():
@@ -215,7 +214,7 @@ def test_dc_staleness_measures_the_max_abs_move():
 
 
 def test_dc_staleness_honours_the_tau_transform():
-    """The tau-metric hook is the dmft_state.py:267-289 pattern: transform the DIFFERENCE."""
+    """The tau-metric hook is the dmft_state.py pattern: transform the DIFFERENCE."""
     a = np.arange(12.0).reshape(6, 2)
     b = a + 1.0
     seen = {}
@@ -230,7 +229,7 @@ def test_dc_staleness_honours_the_tau_transform():
 
 
 def test_imp_minus_dc_vanishes_in_the_clean_limit():
-    """Q4-b's clean limit read through the Q5-b meter: imp == dc => exactly 0."""
+    """The clean limit read through the imp - dc meter: imp == dc => exactly 0."""
     x = np.arange(24.0).reshape(4, 3, 2) + 1j
     assert ol.imp_minus_dc({"imp": x, "dc": x.copy()}) == 0.0
     assert ol.imp_minus_dc({"imp": x, "dc": x - 0.5}) == 0.5
@@ -239,7 +238,7 @@ def test_imp_minus_dc_vanishes_in_the_clean_limit():
 
 
 # ==========================================================================
-# R-Q5-2 -- subspace tracking as a diagnostic (numpy only)
+# Subspace tracking as a diagnostic (numpy only)
 # ==========================================================================
 
 def _mo_fixture(ns=1, nk=3, nbnd=4, seed=5):
@@ -257,7 +256,7 @@ def _mo_fixture(ns=1, nk=3, nbnd=4, seed=5):
 
 
 def test_band_window_slice_is_the_coqui_one_based_convention():
-    """projector_t.h:87-88: range(bw(I,0,0) - 1, bw(I,0,1)) -- 1-based, inclusive."""
+    """projector_t.h: range(bw(I,0,0) - 1, bw(I,0,1)) -- 1-based, inclusive."""
     assert ol.band_window_slice(np.array([[[2, 5]]])) == slice(1, 5)
     assert ol.band_window_slice(np.array([[2, 5]])) == slice(1, 5)
     assert ol.band_window_slice(np.array([2, 5])) == slice(1, 5)
@@ -283,7 +282,7 @@ def test_band_reorder_count_catches_a_swapped_pair():
 
 def test_c_window_overlap_is_one_for_a_fixed_projector_and_unchanged_mos():
     """
-    R-Q5-2: under a FIXED projector, an unchanged MO set retains its C character
+    Under a FIXED projector, an unchanged MO set retains its C character
     exactly -- o_C == 1 at machine precision. That is the baseline the production
     meter is read against.
     """
@@ -337,8 +336,8 @@ def test_project_mo_on_c_rejects_a_window_mismatch():
 def test_heff_gap_matches_the_qpgw_suite_convention():
     """
     ``min_k E_lumo - max_k E_homo`` with homo = nelec/2 - 1 -- the convention of
-    test_methods_qpgw_bse.cpp:150-158, so the python trail and the C++ gates quote the
-    same number.
+    test_methods_qpgw_bse.cpp, so the python trail and the C++ tests quote the same
+    number.
     """
     e = np.zeros((1, 3, 4), dtype=complex)
     e[0, :, 0] = [-1.0, -0.9, -1.1]
@@ -355,13 +354,13 @@ def test_heff_gap_matches_the_qpgw_suite_convention():
 
 
 # ==========================================================================
-# Gate Q5-g3 -- the parameter wiring (needs coqui + triqs)
+# The parameter wiring (needs coqui + triqs)
 # ==========================================================================
 
 def _base_params(tmpdir, **extra):
     p = {
         'niter': 4,
-        'prefix': 'q5probe',
+        'prefix': 'olprobe',
         'outdir': str(tmpdir),
         'lattice_solver': 'qpgw',
         'screen_type': 'gw_edmft',
@@ -372,21 +371,20 @@ def _base_params(tmpdir, **extra):
 
 
 def _touch_checkpoint(tmpdir):
-    """convert_gw_edmft_params requires the GW checkpoint to EXIST (io.py:90-94)."""
-    path = pathlib.Path(tmpdir) / "q5probe.mbpt.h5"
+    """convert_gw_edmft_params requires the GW checkpoint to EXIST."""
+    path = pathlib.Path(tmpdir) / "olprobe.mbpt.h5"
     path.touch()
     return path
 
 
 def test_option1_wiring_is_unchanged_by_the_q5_switch(tmp_path):
     """
-    Q5-g3, option1 leg: the Q4 frozen-stage parameter wiring must be untouched. Absent
-    ``outer_loop`` and an explicit ``"option1"`` must agree on EVERY forwarded block, and
-    the qpGW stage must keep its Q4 defaults (niter = 10 = run once to its own qp fixed
-    point, restart = True).
+    option1: the frozen-stage parameter wiring. Absent ``outer_loop`` and an explicit
+    ``"option1"`` must agree on EVERY forwarded block, and the qpGW stage must keep its
+    defaults (niter = 10 = run once to its own qp fixed point, restart = True).
     """
     import pytest
-    pytest.importorskip("coqui", reason="gate Q5-g3 needs the coqui python package")
+    pytest.importorskip("coqui", reason="the parameter-wiring tests need the coqui python package")
     pytest.importorskip("triqs", reason="coqui.dmft.io imports triqs")
     from coqui.dmft.io import convert_gw_edmft_params
 
@@ -400,22 +398,22 @@ def test_option1_wiring_is_unchanged_by_the_q5_switch(tmp_path):
                 'niter', 'gw_iter_per_loop', 'edmft_iter_per_loop', 'lattice_solver'):
         assert absent[key] == explicit[key], f"option1 wiring moved for {key!r}"
 
-    # the Q4 defaults themselves (q4_edmft_skeleton_spec.md P1)
+    # the frozen-stage defaults themselves
     assert absent['qpgw']['niter'] == 10
     assert absent['qpgw']['restart'] is True
     assert absent['qpgw']['screen_type'] == 'gw_edmft'
     # ... and NO external-G injection: absent knob == the C++ inert default
     assert 'greens_func_source' not in absent['qpgw']
-    print(f"    [Q5-g3 option1] qpgw block = {absent['qpgw']}")
+    print(f"    [wiring option1] qpgw block = {absent['qpgw']}")
 
 
 def test_option2_emits_the_per_cycle_stage(tmp_path):
     """
-    Q5-g3, option2 leg: the stage becomes per-cycle (``niter = outer_qpgw_niter``, default
-    1 = the pure one-shot re-QP step) and carries the R-Q5-1 damping default of 0.3.
+    option2: the stage becomes per-cycle (``niter = outer_qpgw_niter``, default
+    1 = a single re-QP step per cycle) and carries the H_eff damping default of 0.3.
     """
     import pytest
-    pytest.importorskip("coqui", reason="gate Q5-g3 needs the coqui python package")
+    pytest.importorskip("coqui", reason="the parameter-wiring tests need the coqui python package")
     pytest.importorskip("triqs", reason="coqui.dmft.io imports triqs")
     from coqui.dmft.io import convert_gw_edmft_params
 
@@ -425,8 +423,8 @@ def test_option2_emits_the_per_cycle_stage(tmp_path):
     assert out['outer_qpgw_niter'] == 1
     assert out['qpgw']['niter'] == 1
     assert out['qpgw']['restart'] is True
-    assert out['qpgw']['iter_alg']['mixing'] == 0.3          # R-Q5-1 / PDF §7
-    print(f"    [Q5-g3 option2] qpgw block = {out['qpgw']}")
+    assert out['qpgw']['iter_alg']['mixing'] == 0.3          # workflow default damping
+    print(f"    [wiring option2] qpgw block = {out['qpgw']}")
 
     # outer_qpgw_niter propagates ...
     out3 = convert_gw_edmft_params(
@@ -442,7 +440,7 @@ def test_option2_emits_the_per_cycle_stage(tmp_path):
 
 def test_option2_requires_the_qpgw_lattice_solver(tmp_path):
     import pytest
-    pytest.importorskip("coqui", reason="gate Q5-g3 needs the coqui python package")
+    pytest.importorskip("coqui", reason="the parameter-wiring tests need the coqui python package")
     pytest.importorskip("triqs", reason="coqui.dmft.io imports triqs")
     from coqui.dmft.io import convert_gw_edmft_params
 
@@ -459,13 +457,12 @@ def test_option2_requires_the_qpgw_lattice_solver(tmp_path):
 
 def test_option2_greens_func_source_falls_back_on_the_first_cycle(tmp_path):
     """
-    Q5-g3: the per-cycle stage injects the previous cycle's lattice G through the
-    ``embed`` group; before one exists it must inject NOTHING (spec §1: "first cycle
-    falls back to the frozen-stage behavior"), which is the C = empty-set limit the C++
-    gates pin.
+    The per-cycle stage injects the previous cycle's lattice G through the ``embed``
+    group; before one exists it must inject NOTHING (the first cycle falls back to the
+    frozen-stage behaviour), which is the C = empty-set limit the C++ tests check.
     """
     import pytest
-    pytest.importorskip("coqui", reason="gate Q5-g3 needs the coqui python package")
+    pytest.importorskip("coqui", reason="the parameter-wiring tests need the coqui python package")
     pytest.importorskip("triqs", reason="coqui.dmft.scf_driver imports triqs")
     pytest.importorskip("h5", reason="the source picker reads an h5 archive")
     from h5 import HDFArchive
@@ -502,18 +499,18 @@ class _StubState:
 
 def test_qpgw_lattice_stage_forwards_the_external_g(tmp_path, monkeypatch):
     """
-    Q5-g3, the stage itself (stub level): what ``_qpgw_lattice_stage`` actually hands to
+    The stage itself (stub level): what ``_qpgw_lattice_stage`` actually hands to
     ``coqui.run_qpgw``.
 
       * option1 (no ``coqui_chkpt_h5``): NO ``greens_func_*`` key ever -- the C++ knob
-        stays inert and the loop is bit-identical to Q4;
+        stays inert and the frozen stage is unchanged;
       * option2, first cycle (no ``embed`` group): still no key -- the documented
         frozen-stage fallback;
       * option2, later cycles: ``greens_func_source = "embed"`` at that group's
         ``final_iter``.
     """
     import pytest
-    pytest.importorskip("coqui", reason="gate Q5-g3 needs the coqui python package")
+    pytest.importorskip("coqui", reason="the parameter-wiring tests need the coqui python package")
     pytest.importorskip("triqs", reason="coqui.dmft.scf_driver imports triqs")
     pytest.importorskip("h5", reason="the stage reads an h5 archive")
     from h5 import HDFArchive
@@ -558,7 +555,7 @@ def test_qpgw_lattice_stage_forwards_the_external_g(tmp_path, monkeypatch):
                            coqui_chkpt_h5=path, cycle=2, niter=3)
     assert captured['params']['greens_func_source'] == "embed"
     assert captured['params']['greens_func_iteration'] == 2
-    print(f"    [Q5-g3 stage] cycle 2 forwarded {captured['params']}")
+    print(f"    [lattice stage] cycle 2 forwarded {captured['params']}")
 
     # the caller's dict must not have been mutated by the option2 branch
     assert 'greens_func_source' not in qpgw_params
@@ -586,6 +583,6 @@ if __name__ == "__main__":
             print(f"FAIL {name}")
             traceback.print_exc()
     print(f"\n{len(numpy_only) - failures}/{len(numpy_only)} numpy-only legs passed "
-          f"(the Q5-g3 param legs take a tmp_path fixture and need coqui; run them "
+          f"(the parameter-wiring legs take a tmp_path fixture and need coqui; run them "
           f"with pytest on a coqui host).")
     sys.exit(1 if failures else 0)

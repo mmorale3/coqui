@@ -19,35 +19,35 @@ limitations under the License.
 """
 
 """
-Q4 (EDMFT skeleton) python gates -- notes/q4_edmft_skeleton_spec.md §3 P1.
+Python tests of the EDMFT impurity-retardation layer and the GW double counting.
 
 Two tiers, deliberately separated:
 
-  * **numpy-only tier** (gate Q4-p2 + the causality monitor): imports
-    ``dmft/retardation.py`` by file path, so it runs on a host where neither
-    ``coqui`` nor ``triqs`` is importable.
-  * **coqui tier** (gate Q4-b, the clean limit): needs ``coqui`` + ``h5``
+  * **numpy-only tier** (the Casula-Werner Z_B checks + the causality monitor):
+    imports ``dmft/retardation.py`` by file path, so it runs on a host where
+    neither ``coqui`` nor ``triqs`` is importable.
+  * **coqui tier** (the clean limit): needs ``coqui`` + ``h5``
     (``coqui.dmft.weiss`` imports ``h5``); it needs **no** QMC and no
     ``triqs_modest`` -- the "GW impurity" is ``solve_gw_dc`` itself and the
     embedding maps are deterministic stand-ins.
 
 RUN COMMANDS
 ------------
-On a TRIQS host (rusty), from the build/install tree:
+On a TRIQS host, from the build/install tree:
 
     # everything in this file
     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \\
       python3 -m pytest -v src/python/dmft/tests/test_q4_edmft_skeleton.py
 
-    # gate Q4-b only (clean limit)
+    # clean-limit tests only
     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \\
       python3 -m pytest -v src/python/dmft/tests/test_q4_edmft_skeleton.py -k clean_limit
 
-    # gate Q4-p2 only (Z_B unit check); runs anywhere numpy is available
+    # Z_B unit checks only; runs anywhere numpy is available
     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \\
       python3 -m pytest -v src/python/dmft/tests/test_q4_edmft_skeleton.py -k zb
 
-    # the pre-existing EDMFT python suite must stay green alongside it
+    # the general EDMFT python suite
     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \\
       python3 -m pytest -v src/python/dmft/tests/test_edmft.py
 
@@ -69,7 +69,7 @@ import numpy as np
 
 def _load_retardation():
     path = pathlib.Path(__file__).resolve().parents[1] / "retardation.py"
-    spec = importlib.util.spec_from_file_location("_q4_retardation_standalone", path)
+    spec = importlib.util.spec_from_file_location("_retardation_standalone", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -109,11 +109,11 @@ def _product_basis_u(nu, v_abcd, retarded_ab, omega, sign=-1.0):
 
 
 # ==========================================================================
-# Gate Q4-p2 -- Casula-Werner Z_B unit checks (numpy only)
+# Casula-Werner Z_B unit checks (numpy only)
 # ==========================================================================
 
 def test_zb_is_exactly_one_for_flat_u():
-    """R-Q4-5 / Q4-p2: U(i nu) nu-independent  =>  Z_B == 1 at machine precision."""
+    """U(i nu) nu-independent  =>  Z_B == 1 at machine precision."""
     nu = _uniform_bosonic_mesh(50.0, 201)
     u_flat = np.full(nu.shape, 3.7)
 
@@ -168,7 +168,7 @@ def test_zb_two_pole_superposition_is_additive_in_the_exponent():
 
 
 def test_zb_is_bounded_for_causal_random_baths():
-    """0 < Z_B <= 1 for any non-negative bath spectral weight (R-Q4-5 contract)."""
+    """0 < Z_B <= 1 for any non-negative bath spectral weight."""
     rng = np.random.default_rng(20260814)
     nu = _uniform_bosonic_mesh(300.0, 3001)
     worst = 1.0
@@ -221,7 +221,7 @@ def _mode_a_fixture(norb=2, nu_max=300.0, nnu=3001):
 
 def test_retardation_mode_static_u_zb_default_source_is_screened_u0():
     """
-    Impurity mode (a), R-Q4-5 AMENDMENT default: static U = U(inu = 0) (screened,
+    Impurity mode (a), default static_u_source: static U = U(inu = 0) (screened,
     the Casula-Werner standard), Delta -> Z_B Delta.
     """
     nu, v, u_weiss, delta = _mode_a_fixture()
@@ -252,7 +252,7 @@ def test_retardation_mode_static_u_zb_default_source_is_screened_u0():
 
 
 def test_retardation_mode_static_u_zb_u_inf_source_is_the_bare_interaction():
-    """static_u_source="u_inf": the PDF section 3.3 literal, U(inu -> infty) = Vloc."""
+    """static_u_source="u_inf": the bare interaction, U(inu -> infty) = Vloc."""
     nu, v, u_weiss, delta = _mode_a_fixture()
     delta_ref = delta.copy()
 
@@ -315,7 +315,7 @@ def test_retardation_mode_rejects_unknown_modes():
 
 
 # ==========================================================================
-# Gate Q4-c -- causality monitor (numpy only)
+# Causality monitor (numpy only)
 # ==========================================================================
 
 def _causal_u(nu, norb=3, omega=1.1, scale=0.3):
@@ -435,14 +435,14 @@ def test_causality_trail_layout():
 
 
 # ==========================================================================
-# Gate Q4-b -- the clean limit (needs coqui + h5; no QMC, no modest)
+# The clean limit (needs coqui + h5; no QMC, no modest)
 # ==========================================================================
 
 class _LinearEmbedding1e:
     """
     Deterministic stand-in for ``modest.embedding.merge_embed_block_by_imp``:
     a single fixed linear map ``A -> R A R^dag`` per spin block. Any fixed linear
-    map is enough for the clean-limit statement -- the gate is that ``imp`` and
+    map is enough for the clean-limit statement -- what matters is that ``imp`` and
     ``dc`` traverse the SAME map, so identical inputs cancel exactly.
     """
 
@@ -465,8 +465,7 @@ class _LinearEmbedding2e(_LinearEmbedding1e):
 
 def _clean_limit_solver_results(norb=2, nw_f=8, nw_b=5):
     """
-    The survey's §5 mapping (spec §3 P1 gate Q4-b): the "GW impurity" IS the DC,
-    so ``Sigma_iw_data := Sigma_iw_dc_data``, ``Pi_iw_data := Pi_iw_dc_data`` and
+    The clean limit: the "GW impurity" IS the DC, so ``Sigma_iw_data := Sigma_iw_dc_data``, ``Pi_iw_data := Pi_iw_dc_data`` and
     ``Sigma_infty := Sigma_infty_dc``.
     """
     rng = np.random.default_rng(4242)
@@ -493,12 +492,12 @@ def _clean_limit_solver_results(norb=2, nw_f=8, nw_b=5):
 
 def test_clean_limit_embed_impurities_cancels_exactly():
     """
-    Gate Q4-b: with the "GW impurity" solved by ``solve_gw_dc`` itself,
+    Clean limit: with the "GW impurity" solved by ``solve_gw_dc`` itself,
     ``local_sigma_w["imp"] - ["dc"]`` and ``local_pi_w["imp"] - ["dc"]`` must be
     identically zero at machine precision, i.e. the lattice correction vanishes.
     """
     import pytest
-    pytest.importorskip("coqui", reason="gate Q4-b needs the coqui python package")
+    pytest.importorskip("coqui", reason="the clean-limit test needs the coqui python package")
     pytest.importorskip("h5", reason="coqui.dmft.weiss imports h5")
     from coqui.dmft.weiss import embed_impurities
 
@@ -517,25 +516,25 @@ def test_clean_limit_embed_impurities_cancels_exactly():
     d_sigma = np.max(np.abs(local_sigma_w['imp'] - local_sigma_w['dc']))
     d_hf = np.max(np.abs(local_hf['imp'] - local_hf['dc']))
     d_pi = np.max(np.abs(local_pi_w['imp'] - local_pi_w['dc']))
-    print(f"    [Q4-b] |Sigma_imp - Sigma_dc| = {d_sigma:.3e}   "
+    print(f"    [clean limit] |Sigma_imp - Sigma_dc| = {d_sigma:.3e}   "
           f"|Vhf_imp - Vhf_dc| = {d_hf:.3e}   |Pi_imp - Pi_dc| = {d_pi:.3e}")
 
     assert d_sigma == 0.0
     assert d_hf == 0.0
     assert d_pi == 0.0
-    # the embedding must not be trivial, otherwise the gate is vacuous
+    # the embedding must not be trivial, otherwise the test is vacuous
     assert np.max(np.abs(local_sigma_w['imp'])) > 0.0
     assert np.max(np.abs(local_pi_w['imp'])) > 0.0
 
 
 def test_clean_limit_from_solve_gw_dc_outputs():
     """
-    Gate Q4-b, end to end: build the DC with the production ``solve_gw_dc``
-    (weiss.py:490-511) from a synthetic (Gloc, Wloc, u_weiss), feed its outputs
+    Clean limit, end to end: build the DC with the production ``solve_gw_dc``
+    (weiss.py) from a synthetic (Gloc, Wloc, u_weiss), feed its outputs
     back as the impurity solution, and require exact cancellation.
     """
     import pytest
-    pytest.importorskip("coqui", reason="gate Q4-b needs the coqui python package")
+    pytest.importorskip("coqui", reason="the clean-limit test needs the coqui python package")
     pytest.importorskip("h5", reason="coqui.dmft.weiss imports h5")
     from coqui.utils.imag_axes_ft import IAFT
     from coqui.dmft.weiss import solve_gw_dc, embed_impurities
@@ -548,7 +547,7 @@ def test_clean_limit_from_solve_gw_dc_outputs():
 
     # A synthetic non-interacting G(tau) on the IAFT fermionic tau mesh, and a
     # W(tau) on the ph-symmetric half mesh that eval_pi_rpa/eval_gw_dc_t assume
-    # (weiss.py:419-438 / :467-487: nts_half = nt_f//2 + nt_f%2).
+    # (weiss.py: nts_half = nt_f//2 + nt_f%2).
     nts = iaft.nt_f
     nts_half = nts // 2 + nts % 2
     tau = np.asarray(iaft.tau_mesh('f'), dtype=float)
@@ -566,7 +565,7 @@ def test_clean_limit_from_solve_gw_dc_outputs():
     W_t = np.zeros((nts_half, norb, norb, norb, norb), dtype=complex)
     for t in range(nts_half):
         W_t[t] = -0.5 * V * np.exp(-3.0 * t / max(nts_half - 1, 1))
-    # solve_gw_dc reads only u_weiss_iw[0] (the static limit, weiss.py:494).
+    # solve_gw_dc reads only u_weiss_iw[0] (the static limit).
     u_weiss = np.zeros((1,) + V.shape, dtype=complex)
 
     dc = solve_gw_dc(G_t, V, W_t, u_weiss, iaft, density_only=True, gf_struct=gf_struct)
@@ -591,7 +590,7 @@ def test_clean_limit_from_solve_gw_dc_outputs():
     d_sigma = np.max(np.abs(local_sigma_w['imp'] - local_sigma_w['dc']))
     d_hf = np.max(np.abs(local_hf['imp'] - local_hf['dc']))
     d_pi = np.max(np.abs(local_pi_w['imp'] - local_pi_w['dc']))
-    print(f"    [Q4-b e2e] |dSigma| = {d_sigma:.3e}  |dVhf| = {d_hf:.3e}  |dPi| = {d_pi:.3e}")
+    print(f"    [clean limit e2e] |dSigma| = {d_sigma:.3e}  |dVhf| = {d_hf:.3e}  |dPi| = {d_pi:.3e}")
 
     assert d_sigma == 0.0 and d_hf == 0.0 and d_pi == 0.0
     assert np.max(np.abs(local_pi_w['dc'])) > 0.0
