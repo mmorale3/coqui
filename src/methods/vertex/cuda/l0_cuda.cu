@@ -1675,7 +1675,6 @@ namespace methods::solvers::dynbse_cuda {
       e->dslot = dalloc<long>(nt, "ue slot_of");
     }
     if (e->fuse) { e->yfam1 = dalloc<cd>(2 * np * W, "ue yfam1"); e->ycst1 = dalloc<cd>(W, "ue ycst1"); }
-    }
     e->Cbk = dalloc<cd>(size_t(c.nk) * e->nc2 * e->nc2, "ue Cbk"); e->M = dalloc<cd>(D * D, "ue M");
     e->ipiv = dalloc<int>(D, "ue ipiv"); e->dinfo = dalloc<int>(1, "ue info");
     if (cusolverDnZgetrf_bufferSize(e->cs, int(D), int(D), e->M, int(D), &e->lwork) != CUSOLVER_STATUS_SUCCESS)
@@ -2038,7 +2037,7 @@ namespace methods::solvers::dynbse_cuda {
         } else {
           // the frequency-factorized rung: P (D, nt, nR) = the tau slices in node order (P in rec), Y = sum_r K_r (c_r . P) into
           // Fs, unpermuted into Ys
-          std::vector<long> slot_of(size_t(nt)), node_of(size_t(nt));
+          std::vector<long> slot_of(static_cast<size_t>(nt)), node_of(static_cast<size_t>(nt));
           for (long i = 0; i < nt; ++i) { slot_of[size_t(i)] = i; node_of[size_t(i)] = i; }
           long *dslot = reinterpret_cast<long *>(e->g), *dnode = dslot + nt;   // (the refit scratch g is free here)
           h2d(dslot, slot_of.data(), size_t(nt), "rung slot_of"); h2d(dnode, node_of.data(), size_t(nt), "rung node_of");
@@ -3044,7 +3043,7 @@ namespace methods::solvers::dynbse_cuda {
       cd *co[2] = {e->ycst, e->ycst1};
       double fes[2] = {0.0, 0.0};
       ue_kd_multi(e, nR, 2, gin, sin, yo, co, fes, tim);
-      fe = std::max(fes[0], fes[1]);
+      fe = fes[0];                                        // the one-bare-rung input's refit error is not reported (as unfused)
     } else {
       fe = ue_kd(e, nR, e->Ffam, e->Fsum, e->yfam, e->ycst, tim);
     }

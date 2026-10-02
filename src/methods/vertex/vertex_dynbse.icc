@@ -1615,6 +1615,7 @@ namespace solvers {
             if (ue_stream) { uc.rung_fuse = 0; uc.nres = 0; }
             uc.partial_ok = kb_will ? 1 : 0;
             uc.nonres_src = (mpol == "auto") ? 0 : (mpol == "rebuild" ? 1 : (mpol == "host" ? 2 : 3));
+            if (rrank > 0) uc.nonres_src = 3;   // the frequency-factorized rung keeps all R slots resident
             utils::check(not (mpol == "rebuild" and not kb_will and not ue_stream),
                          "pair_space_ladder_dyn: pol_vertex_dyn_device_memory = rebuild needs the device rung builds ({}). ABORTING: use "
                          "auto or host.", sym ? "a symmetry-reduced mesh has none" : "vertex_debug dynbse_dev_kbig = 0");
