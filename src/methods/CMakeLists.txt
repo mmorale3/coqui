@@ -17,6 +17,7 @@ add_subdirectory(pproc)
 # ENABLE_FINUFFT is ON (its own CMakeLists returns early otherwise), so with the flag
 # OFF (the default in this tree) nothing here changes the build at all.
 add_subdirectory(GW_real_axis)
+add_subdirectory(GW_line)
 add_subdirectory(tests)
 
 SET(SRCS
