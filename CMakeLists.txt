@@ -315,7 +315,7 @@ if(COQUI_MKL_THREADED_LINK)
       target_link_libraries(coqui_blas_threading INTERFACE ${COQUI_MKL_GNU_THREAD})
     endif()
     message(STATUS "MKL threading layer placed ahead of the sequential layer: ${COQUI_MKL_GNU_THREAD}")
-    message(STATUS "  -> MKL_NUM_THREADS / blas_threads are live WITHOUT preload_wrap.sh")
+    message(STATUS "  -> MKL_NUM_THREADS / blas_threads take effect without LD_PRELOAD")
   else()
     message(STATUS "MKL threading layer not found (MKLROOT unset, or a non-MKL BLAS is in "
                    "use): BLAS threading follows whatever slate/blaspp linked.")

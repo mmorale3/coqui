@@ -31,8 +31,7 @@ if(ENABLE_FINUFFT)
 
   set(TEST_ID math_finufft_nda)
 
-  # RW-1 deviation: test_finufft_t3.cpp is NOT ported (type-3 has no consumer in the
-  # W chain -- survey section 5 "Type-3 is unused by the physics").
+  # Only type-1 / type-2 transforms are tested: the type-3 transform has no consumer in the code.
   set(TEST_SRCS
     test_finufft_nda.cpp
   )

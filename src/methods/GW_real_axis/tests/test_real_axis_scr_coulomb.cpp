@@ -34,11 +34,8 @@
 #include "methods/GW_real_axis/real_axis_mb_state.hpp"
 #include "methods/GW_real_axis/real_axis_scr_coulomb_t.h"
 
-// RW-1 DEVIATION: real_axis_gw_t.h / real_axis_gw_thc.hpp are NOT part of the
-// ported leaf slice (Sigma machinery is out of scope), so the branch's fourth
-// case, real_axis_scr_coulomb_matches_driver_lih222 -- which compared update_w +
-// gw_t::evaluate against evaluate_thc_serial at the SIGMA level -- is dropped.
-// The three W-level cases below are ported verbatim.
+// The cases below test the real-axis screened interaction at the W level; the real-axis self-energy
+// (Sigma) is not part of this module.
 
 #include <cmath>
 #include <complex>

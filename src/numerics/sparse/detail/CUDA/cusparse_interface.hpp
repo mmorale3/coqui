@@ -150,9 +150,8 @@ void csrmm(char oper_A, char oper_B, typename A::value_type alpha, A const& a, B
 
   // allocate an external buffer if needed. CSR_ALG2 (deterministic) is preferred; should cuSPARSE reject it
   // for an (op, layout) combination with CUSPARSE_STATUS_INVALID_VALUE / NOT_SUPPORTED at the bufferSize
-  // query, fall back to ALG_DEFAULT for that call. (The INVALID_VALUE test_sparse hit on rusty, CUDA 12.5,
-  // was the conjugate transpose of a REAL matrix -- fixed in get_operation<value_type>, not by the
-  // algorithm; the fallback stays as a safety net and its diagnostics name the call.)
+  // query, fall back to ALG_DEFAULT for that call (a safety net; its diagnostics name the call). A conjugate
+  // transpose of a REAL matrix is mapped to a plain transpose by get_operation<value_type>.
   size_t bufferSize = 0;
   cusparseSpMMAlg_t alg = CUSPARSE_SPMM_CSR_ALG2;
   {
