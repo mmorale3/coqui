@@ -40,5 +40,6 @@ if (BUILD_UNIT_TESTS)
   endif(ENABLE_SLATE)
 
   add_subdirectory(tests)
+  add_subdirectory(line_dlr/tests)
 endif()
 
