@@ -30,11 +30,12 @@ def lehmann_from_sigma(Hstat_rel, w, g, wp, K, tol_gram=1e-10, nphi=72):
     return e, V[:nb, :], dict(npoles=len(d), **info)
 
 
-def chemical_potential(e, v, nk, nelec, k_weight=None, qp_weight=0.1):
+def chemical_potential(e, v, nk, nelec, k_weight=None, qp_weight=0.1, ntol=0.5):
     """T=0 chemical potential for an approximate (moment-truncated) Lehmann G: the spectral weight below the physical gap is
-    N_el only up to the moment/fit error, so exact filling would push mu across the gap. Instead: among the gaps between
-    consecutive quasiparticle-like poles (total weight > qp_weight), choose the one whose midpoint gives the electron count
-    closest to nelec. Returns (mu_shift, e_homo, e_lumo, N(mu))."""
+    N_el only up to the moment/fit error, so exact filling would push mu across the gap. Candidate gaps are the intervals between
+    consecutive quasiparticle-like poles (total weight > qp_weight) whose midpoint gives an electron count within ntol of nelec;
+    among them the WIDEST gap is chosen (a near-degenerate multiplet split by noise must not be mistaken for the gap).
+    Returns (mu_shift, e_homo, e_lumo, N(mu))."""
     nk_ = len(e)
     wk = np.full(nk_, 1.0 / nk_) if k_weight is None else np.asarray(k_weight) / np.sum(k_weight)
     E = np.concatenate([e[k] for k in range(nk_)])
@@ -42,13 +43,14 @@ def chemical_potential(e, v, nk, nelec, k_weight=None, qp_weight=0.1):
     Wtot = np.concatenate([(np.abs(v[k]) ** 2).sum(0) for k in range(nk_)])                   # weight per pole (sum over orbitals)
     order = np.argsort(E); Es, Ws = E[order], Wt[order]; cum = np.cumsum(Ws)
     qp_idx = np.where(Wtot[order] > qp_weight)[0]
-    best = None
+    cands = []
     for a, b in zip(qp_idx[:-1], qp_idx[1:]):
         mid = 0.5 * (Es[a] + Es[b]); N = cum[np.searchsorted(Es, mid) - 1]
-        score = abs(N - nelec)
-        if best is None or score < best[0] - 1e-12 or (abs(score - best[0]) < 1e-12 and Es[b] - Es[a] > best[3] - best[2]):
-            best = (score, mid, Es[a], Es[b], N)
-    _, mu, e_homo, e_lumo, N = best
+        cands.append((Es[b] - Es[a], abs(N - nelec), mid, Es[a], Es[b], N))
+    ok = [c for c in cands if c[1] <= ntol]
+    if not ok:                                   # fall back to the best electron count
+        ok = [min(cands, key=lambda c: c[1])]
+    width, dn, mu, e_homo, e_lumo, N = max(ok, key=lambda c: c[0])
     return mu, e_homo, e_lumo, N
 
 
