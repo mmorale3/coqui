@@ -75,7 +75,7 @@ void csrmv(char oper_A,typename A::value_type alpha, A const& a, X const &x, typ
                   CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize) 
   // cuSPARSE reports bufferSize = 0 for small problems; a zero-length device array is a null
   // pointer and nda's value-init then calls cudaMemset(nullptr, 0, 0) -> cudaErrorInvalidValue
-  // (test_csr_blas on rusty, CUDA 12.5). Always allocate at least one byte.
+  // (seen with CUDA 12.5). Always allocate at least one byte.
   memory::buffered_array<MEM,char,1> buffer(std::max<size_t>(bufferSize, size_t(1)),char(0));
 
   // execute preprocess (optional)
