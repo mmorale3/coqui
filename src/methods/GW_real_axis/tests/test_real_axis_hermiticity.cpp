@@ -2,18 +2,11 @@
  * ==========================================================================
  * CoQuí: Correlated Quantum ínterface
  *
- * RW-1 ADAPTED PORT of origin/real_axis's test_real_axis_hermiticity.cpp.
- *
- * DEVIATION FROM THE BRANCH (flagged, notes/rw1_port_report.md): the branch
- * version obtains its spectral function from TEN real-axis scGW iterations
- * (real_axis_scf_loop + real_axis_gw_t + real_axis_hf_t + real_axis_dyson_t),
- * none of which are in the ported leaf slice. Reproducing it verbatim would
- * mean porting the whole Sigma/SCF half of the module, which RW-1 explicitly
- * excludes. What is preserved here is the IDENTITY THE PI KERNEL DEPENDS ON --
- * the one the branch test exists to certify (real_axis_pi.hpp:70-79: the second
- * leg of the bare bubble is taken as conj of the LOCAL (P,Q) block instead of
- * the transposed peer, which is legal only if the aux-projected spectral
- * function is hermitian in (P,Q)):
+ * Hermiticity of the aux-projected spectral function. This is the identity
+ * the Pi kernel depends on (accumulate_ImPi_one_kq in real_axis_pi.hpp: the
+ * second leg of the bare bubble is taken as conj of the LOCAL (P,Q) block
+ * instead of the transposed peer, which is legal only if the aux-projected
+ * spectral function is hermitian in (P,Q)):
  *
  *     A_phys_{ij}   = 1/2 (A_{ij} + conj(A_{ji}))          hermitian by construction
  *     A_aux_{PQ}    = sum_{mu,nu} X_{P mu} A_phys_{mu nu} conj(X_{Q nu})
@@ -21,16 +14,13 @@
  *
  * The spectral function here is a QP-pole Lorentzian sum through a NON-TRIVIAL
  * unitary MO rotation (so A is not diagonal and the (P,Q) check has content),
- * plus a deliberately injected anti-hermitian component that reproduces the
- * branch's "storage convention is componentwise non-hermitian" situation:
+ * plus a deliberately injected anti-hermitian component that mimics the
+ * componentwise non-hermitian storage convention of A_wskij:
  * A_store = A_phys + iD with D real symmetric is O(1) non-hermitian
  * componentwise, and the kernel-input symmetrization must remove it exactly.
- *
- * Branch reference numbers (LiH222, 10 SCF iters, 2026-04-28) for context:
- *   A_wskij (storage, componentwise)          rel = 1.0e+00   (storage convention)
- *   A_phys  (matrix-hermitian symmetrized)    rel = 0.0       (exact)
- *   A_aux   (from storage, componentwise)     rel = 1.2e+00   (storage convention)
- *   A_aux   (from symmetrized A_phys)         rel = 6.9e-16   (machine eps)
+ * (The spectral function of a self-consistent real-axis GW calculation shows the
+ * same pattern: O(1) componentwise non-hermiticity in storage, and machine-epsilon
+ * (P,Q) hermiticity of A_aux built from the symmetrized A_phys.)
  *
  * Single-rank only; numbers are logged.
  * ==========================================================================
@@ -142,7 +132,7 @@ namespace bdft_tests {
       }
 
     // QP-pole spectral function through those orbitals (the
-    // build_A_from_QP_poles recipe, real_axis_qp_scf_driver.hpp:249-278).
+    // build_A_from_QP_poles recipe of real_axis_qp_A.hpp).
     const double eta = 0.05;
     nda::array<cval_t, 5> A_skwij(ns, Nk, N_w, nbnd, nbnd);
     A_skwij() = cval_t(0.0, 0.0);
@@ -164,7 +154,7 @@ namespace bdft_tests {
       }
 
     // "Storage convention" surrogate: add i * (real symmetric) so the stored
-    // tensor is O(1) non-hermitian componentwise, exactly like the branch's
+    // tensor is O(1) non-hermitian componentwise, like the
     // A_wskij = (i/pi) G^R storage.
     nda::array<cval_t, 5> A_store(A_skwij);
     for (long s = 0; s < ns; ++s)
@@ -241,7 +231,7 @@ namespace bdft_tests {
     const double rel_aux_phys  = check_aux(A_skwij,  "A_aux (from symmetrized A_phys)");
 
     // THE LOAD-BEARING ASSERT: this is what licenses the conj-second-leg
-    // shortcut in real_axis_pi.hpp:70-79.
+    // shortcut in accumulate_ImPi_one_kq (real_axis_pi.hpp).
     REQUIRE(rel_aux_phys < 1e-12);
     // Positive control: the un-symmetrized storage does NOT satisfy it.
     REQUIRE(rel_aux_store > 1e-2);

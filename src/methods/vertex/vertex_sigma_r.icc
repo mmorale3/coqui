@@ -22,35 +22,29 @@
 #define COQUI_VERTEX_SIGMA_R_ICC
 
 /**
- * INCREMENT S5 -- the SCREENING-RESPONSE cut Sigma^{C,r} of the static-vertex theories
- * (notes/static_vertex_implementation_plan.md section 2; theoryB_static.pdf
- * section "The response cut"). This is the term that makes B-S conserving: within the
- * self-consistent theory W0 is rebuilt from the current G every iteration, so
- * Sigma^{C,x} alone is not the derivative of any functional. The invariant is
- * "Sigma^{C,x} and Sigma^{C,r} TOGETHER or neither".
+ * The SCREENING-RESPONSE cut Sigma^{C,r} of the static-rung vertex theories. This is the
+ * term that makes the static-rung theory conserving: within the self-consistent theory
+ * W0 is rebuilt from the current G every iteration, so Sigma^{C,x} alone is not the
+ * derivative of any functional. The invariant is "Sigma^{C,x} and Sigma^{C,r} TOGETHER
+ * or neither".
  *
  * It arises purely by the chain rule through W0[G]:
  *
  *   Sigma^r_cd = sum_q sum_{AB} (dP0_AB(q)/dG_cd) . [W0(q)^T X(q) W0(q)^T]_AB ,
  *   X(q) := dPhi/dW0(q).
  *
- * ROUTING -- verified mechanically, NOT transcribed from the notes
- * (verification/static_vertex_routing_report.md sections 3.1-3.2; the arbiter is
- * verification/verify_static_cuts.py, 97 checks). Two corrections to the notes' boxed
- * equations, both of which survive the crystal symmetries and are therefore real:
+ * Index routing (checked against a finite-difference derivative of the functional):
  *
  *  (1) the W0 sandwiches are TRANSPOSED -- the chain rule contracts the OUTER indices
- *      of the two W0's, not the inner ones. The notes' W0 . Pi . W0 fails the
- *      finite-difference oracle by 56 %.
+ *      of the two W0's, not the inner ones; W0 . Pi . W0 is wrong.
  *  (2) the middle factor is the SYMMETRIZED tau=0 polarization. dPhi/dW0(q) is
  *      -(1/4)[PiBar(q)^T + PiBar(-q)], not -(1/2) PiBar(q): Phi's rung slot is
  *      ((a,b),(c,d)) while the Pi kernel emits (M,N) = ((c,d),(a,b)) -- the opposite
- *      order -- so one transpose is the price of the pinned (M,N) convention.
+ *      order -- so one transpose is the price of the fixed (M,N) convention.
  *
- *  It is a TRANSPOSE, not a dagger: on generic complex data ^dag is rejected (6.9e-01)
- *  while ^T is exact. NOTE that under the crystal symmetries ^T and conj become
+ *  It is a TRANSPOSE, not a dagger. Under the crystal symmetries ^T and conj become
  *  DEGENERATE (W0 and PiBar are Hermitian there), so only asymmetric data separates
- *  them -- which is why the FD oracle test must not use a fully symmetric toy.
+ *  them; a finite-difference test of this routing must not use a fully symmetric toy.
  *
  * Hence, with beta cancelling between PiBar = beta Pi^{C,0}(tau=0) and the explicit
  * 1/beta of dP0/dG:
@@ -60,22 +54,20 @@
  *   Sigma^{r,s}_cd(k,tau) = -(1/(2 Nk)) sum_q [ X^T(k) M_q(k,tau) X^*(k) ]_cd ,
  *   M_q = Dw(q) (.) Gt^s(k-q,tau)^T  +  ( Dw(q) (.) Gt^s(k+q,tau) )^T      [(.) = Hadamard]
  *
- * Structural properties (each verified by the arbiter):
+ * Structural properties:
  *  - FREQUENCY-DIAGONAL: Sigma^r(k,iw) depends on iw only through G(k-+q,iw), so in
  *    imaginary time it is tau-LOCAL -- one GW-class static Hadamard per q. No
- *    convolution, no pole algebra, nothing two-scale. This is why B-S is cheap.
+ *    convolution, no pole algebra, nothing two-scale; the response cut is cheap.
  *  - FULL-SPACE externals and full-space Gt: the differentiated G's live in W0's RPA
  *    bubble, which carries no projector. Unlike Sigma^{C,x} (strict C-C), c and d here
  *    run over the whole band range.
- *  - BOTH +-q terms are kept explicit: they are independent objects for generic data
- *    (measured), term 2 being term 1 at -q with the sandwich transposed.
+ *  - BOTH +-q terms are kept explicit: they are independent objects for generic data,
+ *    term 2 being term 1 at -q with the sandwich transposed.
  *  - SPIN: dP0/dG^{s'} selects the s' bubble, so Sigma^r is per-spin with a
  *    SPIN-INDEPENDENT Dw. The spin sum of P0 lives inside Pi^{C,0}/W0 already.
  *
- * SCOPE OF THIS FILE (S5): replicated (per-rank) arrays, mirroring the no-symmetry
- * entry point of vertex_sigma.icc. The production (P,Q)-distributed sandwich is a
- * separate concern -- plan section 3 leaves the choice (SLATE on the RPA grid vs the
- * fold_core_block pattern) to be made on whichever grid the consumer sits on.
+ * The kernels in this file work on replicated (per-rank) arrays, mirroring the
+ * no-symmetry entry point of vertex_sigma.icc.
  */
 
 #include <complex>
@@ -108,16 +100,29 @@ namespace vertex_detail {
    *   1/2[Pi(q)^T + Pi(-q)] needs Pi at -q, which an IBZ-stored Pi does not carry (a
    *   rotated transfer relates to its IBZ representative through the collocation
    *   rotation, not a plain index map). Under the crystal symmetries Pi(-q) = Pi(q)^T
-   *   EXACTLY (measured 2e-15 by verify_static_cuts.py), so on an IBZ mesh the
+   *   holds exactly, so on an IBZ mesh the
    *   symmetrization collapses to a transpose and no -q lookup is required. The
    *   symmetrization is kept for the symmetry-free path, where the identity does not
    *   hold and both terms are genuinely needed.
+   * @param refl - optional, assume_reflection only: checks the identity above on the data actually passed
+   *   (it holds for Pi^{C,0}, but a polarization produced by a different algorithm, e.g. the linear-rung
+   *   pi^dyn, need not satisfy it). When given, it is MEASURED wherever the passed rows allow it:
+   *   a SELF-INVERSE transfer (qminus(q) == q, e.g. every q of a Gamma-centred even mesh) must have Pi(q) = Pi(q)^T,
+   *   and a transfer whose -q partner is a stored row (qminus(q) < nq) must have Pi(-q) = Pi(q)^T. Reported as the max
+   *   over those q of max|violation| / max|Pi(q)|, with the number of checked and uncheckable (-q not stored) q.
+   *   The caller decides (abort / WARNING); the output Dw is unchanged by the check.
    */
+  struct reflection_check {
+    double rel_max = 0.0;   // max_q max|Pi(-q) - Pi(q)^T| / max|Pi(q)| over the checked q
+    long iq_worst = -1;     // the transfer that attains it
+    long n_checked = 0;     // self-inverse + stored-pair transfers checked
+    long n_unchecked = 0;   // transfers whose -q is not a stored row (identity assumed, not verifiable here)
+  };
   template<nda::MemoryArrayOfRank<3> WArr_t, nda::MemoryArrayOfRank<3> PArr_t,
            nda::MemoryArrayOfRank<3> DArr_t>
   void build_delta_w(WArr_t const &W0_qPQ, PArr_t const &Pi0_qPQ,
                      nda::array<long, 1> const &qminus, DArr_t &&Dw_qPQ,
-                     bool assume_reflection = false) {
+                     bool assume_reflection = false, reflection_check *refl = nullptr) {
     decltype(nda::range::all) all;
     const long nq = W0_qPQ.shape(0), N = W0_qPQ.shape(1);
     utils::check(W0_qPQ.shape(2) == N, "build_delta_w: W0 is not square.");
@@ -129,6 +134,24 @@ namespace vertex_detail {
                  "build_delta_w: qminus size {} != nq = {}.", qminus.shape(0), nq);
     utils::check(Dw_qPQ.shape(0) == nq and Dw_qPQ.shape(1) == N and
                  Dw_qPQ.shape(2) == N, "build_delta_w: Dw shape mismatch.");
+
+    // measure the reflection identity the assume_reflection path relies on (read-only; see @param refl)
+    if (assume_reflection and refl != nullptr) {
+      *refl = reflection_check{};
+      for (long iq = 0; iq < nq; ++iq) {
+        const long iqm = (iq < qminus.shape(0)) ? qminus(iq) : -1;
+        if (iqm < 0 or iqm >= nq) { ++refl->n_unchecked; continue; }   // -q is not a stored row
+        double viol = 0.0, scale = 0.0;
+        for (long P = 0; P < N; ++P)
+          for (long Q = 0; Q < N; ++Q) {
+            viol = std::max(viol, std::abs(Pi0_qPQ(iqm, P, Q) - Pi0_qPQ(iq, Q, P)));
+            scale = std::max(scale, std::abs(Pi0_qPQ(iq, P, Q)));
+          }
+        ++refl->n_checked;
+        const double rel = (scale > 0.0) ? viol / scale : 0.0;
+        if (rel > refl->rel_max or refl->iq_worst < 0) { refl->rel_max = rel; refl->iq_worst = iq; }
+      }
+    }
 
     nda::array<ComplexType, 2> Psym(N, N), tmp(N, N);
     for (long iq = 0; iq < nq; ++iq) {
@@ -269,7 +292,7 @@ namespace vertex_detail {
 
   /**
    * Sigma^{C,r} from the FOLDED rung: one Hadamard, one transfer. Must reproduce
-   * eval_sigma_C_response exactly (pinned by test_vertex_fdoracle).
+   * eval_sigma_C_response exactly (covered by test_vertex_fdoracle).
    */
   template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<4> XArr_t,
            nda::MemoryArrayOfRank<3> DArr_t, nda::MemoryArrayOfRank<5> SArr_t>
@@ -314,7 +337,7 @@ namespace vertex_detail {
 
   /**
    * SYMMETRY-ADAPTED Sigma^{C,r} (IBZ meshes), following gw_t::eval_Sigma_all_k_impl
-   * (thc_gw.icc:341-397) and the symmetry-adapted ISDF construction of
+   * (thc_gw.icc) and the symmetry-adapted ISDF construction of
    * "Low-Scaling algorithms for GW and constrained RPA using symmetry-adapted ISDF".
    *
    * The design goal of that construction is that NO two-body object (W, Pi, v, and here
@@ -393,7 +416,7 @@ namespace vertex_detail {
           const long ks = MF->ks_to_k(isym, ik);
           M() = ComplexType(0.0);
           // BOTH +-q terms are kept explicit here. The nosym path may fold them into one
-          // effective rung Dw(q) + Dw(-q)^T (verified identical, test_vertex_fdoracle),
+          // effective rung Dw(q) + Dw(-q)^T (identical result),
           // but that fold is NOT available under symmetry: it needs Dw at -q, and the
           // IBZ-stored rung relates to a rotated transfer only through the collocation
           // rotation, not a plain index map. The sector loop already carries the transfer

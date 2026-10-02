@@ -433,10 +433,10 @@ class distributed_array_view
     A(A_.indexmap(),A_.data())
   {
     // OwningPolicy (and hence everything downstream that dispatches on address space) comes from
-    // the *template argument*, while all we do here is take A_.data(). Nothing tied the two
-    // together, so naming a different address space than the pointer actually lives in compiled
-    // silently and produced a view that lies about its own memory -- which is how the unified-memory
-    // slate workaround was written, and how a device pointer could reach host BLAS and MPI. Tie them.
+    // the *template argument*, while all we do here is take A_.data(). Without this check, naming
+    // a different address space than the pointer actually lives in would compile silently and
+    // produce a view that lies about its own memory, e.g. letting a device pointer reach host
+    // BLAS and MPI. Tie them.
     static_assert(::nda::mem::get_addr_space<std::decay_t<decltype(A_)>> ==
                   ::nda::mem::get_addr_space<Base_t>,
                   "distributed_array_view: the address space of the local array does not match the "

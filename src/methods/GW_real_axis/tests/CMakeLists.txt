@@ -1,10 +1,8 @@
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
-# RW-1: only the W-chain subset of the branch's 23 test files is ported (the rest
-# exercise Sigma / HF / Dyson-G / the SCF driver / the dispatcher / the QP solver,
-# none of which are in the ported slice). See notes/rw1_port_report.md for the
-# per-file deviations.
+# Tests of the real-axis W chain: grids, convolutions, Pi, update_w, the hermiticity of the
+# aux-projected spectral function, and the real-axis vs imaginary-axis W cross-check.
 if(ENABLE_FINUFFT)
   set(TEST_ID methods_gw_real_axis)
 

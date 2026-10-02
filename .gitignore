@@ -34,8 +34,3 @@
 .idea/
 *build*/
 .cache/
-vertex_memory_parallelization_report.pdf
-
-# OMC plugin scratch state
-.omc/
-.claude/

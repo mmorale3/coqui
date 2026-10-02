@@ -22,93 +22,73 @@
 #define COQUI_WC_BAND_ELEMENTS_HPP
 
 /**
- * Project 2 increment QM3: the state-resolved W^c band elements and the mode-A evaluator
- * context. Sibling of qp_modea.hpp -- read ITS header first: the momentum/spin/prefactor
- * routing, the fit-linearity argument and the trev rule are derived there, and this file is
- * their implementation.
+ * State-resolved W^c band elements and the mode-A evaluator context. Companion of
+ * qp_modea.hpp, whose header derives the momentum/spin/prefactor routing, the fit-linearity
+ * argument and the time-reversal (trev) rule; this file implements them.
  *
- * The build runs ONCE per outer iteration, inside the only window where W is live
+ * The build runs once per outer iteration, inside the window where W is live
  * (qp_scf_common.cpp: between update_w and the dW reset), and produces
  *
  *     M(a, b, J*npk + p)     per external (s,k) held by this rank,   J = (q', n)
  *
- * the residues of Sigma^c_ab in the pole representation of spec section 1, with the +1/nk
- * prefactor folded in. Two stages:
+ * the residues of Sigma^c_ab in the pole representation, with the +1/nk prefactor folded in.
+ * Stages:
  *
- *  STAGE 1 (collective, per IBZ q): gather the distributed dW(q, tau) into a NODE-SHARED
+ *  STAGE 1 (collective, per IBZ q): gather the distributed dW(q, tau) into a node-shared
  *    buffer, augment the Gamma head if the divergence treatment asks for it, transform to
- *    the bosonic Matsubara mesh, and run the SUPPORT-CONSTRAINED pole fit
- *    (imag_axes_ft::masked_pole_fit -- the promoted QM2-b chain) with the auxiliary-node
- *    columns of |eps_p| < gap_edge removed. Result: node-shared residue slabs
- *    W^(p)_PQ(q), p over the retained nodes. The Np^2 right-hand sides are partitioned over
- *    the node's ranks; the fit is elementwise in that batch axis.
+ *    the bosonic Matsubara mesh, and run the support-constrained pole fit
+ *    (imag_axes_ft::masked_pole_fit) with the auxiliary-node columns of |eps_p| < gap_edge
+ *    removed. Result: node-shared residue slabs W^(p)_PQ(q), p over the retained nodes. The
+ *    Np^2 right-hand sides are partitioned over the node's ranks; the fit is elementwise in
+ *    that batch axis.
  *
- *  STAGE 1b (collective, per (q,p)): the LOW-RANK FACTORIZATION of those slabs,
- *    W^(p)_PQ = sum_r V(P,r) s_r conj(V(Q,r)) with |s_r| >= wrank * max|s|. See
- *    "WHY STAGE 1b EXISTS" below -- this is what makes the production sizes reachable.
+ *  STAGE 1b (collective, per (q,p)): low-rank factorization of those slabs,
+ *    W^(p)_PQ = sum_r V(P,r) s_r conj(V(Q,r)) with |s_r| >= wrank * max|s|. See "WHY STAGE 1b
+ *    EXISTS" below.
  *
- *  STAGE 1c (collective, per q): the UNION SUBSPACE -- ONE orthonormal basis Q_q for all npk
- *    slab ranges of that q, and the (r_p, R_q) coefficient blocks of every slab in it. This
- *    takes the Np axis out of the p loop of stage 2; see "THE UNION SUBSPACE" below for what
- *    it is worth, which is a MEASURED function of the truncation and not a free win. The
- *    dense slabs (and, here, the per-slab factors) are released as soon as they are dead.
+ *  STAGE 1c (collective, per q, optional): the union subspace -- one orthonormal basis Q_q for
+ *    all npk slab ranges of that q, and the (r_p, R_q) coefficient blocks of every slab in it.
+ *    This takes the Np axis out of the p loop of stage 2; its benefit depends on the truncation
+ *    (see "THE UNION SUBSPACE" below). The dense slabs (and the per-slab factors) are released
+ *    as soon as they are no longer needed.
  *
  *  STAGE 2 (distributed): for each external (s,k), loop the qsymms/star structure of thc_gw
  *    verbatim and accumulate the sandwich
  *        B(P,a) = conj(XCe(P,a)) u(P,n),    M^(n,p) += (1/nk) B^T W^(p) conj(B),
  *    densely (wrank <= 0: the reference path), through the stage-1b factors, or through the
- *    stage-1c union basis. The block STORAGE is owned by rank sk % size as before, but the
- *    flops are split over the whole congruence class of that rank on the (isym, q) pair axis
- *    -- with 8 blocks on 32 ranks the single-owner loop left 24 ranks idle.
+ *    stage-1c union basis. Block storage is owned by rank sk % size, while the flops are split
+ *    over the whole congruence class of that rank on the (isym, q) pair axis, so that ranks
+ *    which own no block still contribute.
  *
- * Nothing here re-materializes W at (a,n,b,nu); the working set is one q's residue slab
+ * W is never re-materialized at (a,n,b,nu); the working set is one q's residue slab
  * (node-shared) plus this rank's (a,b,J,p) slabs.
  *
  * =====================================================================================
- * THE GATE'S NORMALIZATION -- A DOCUMENTED GATE-SEMANTICS CORRECTION (2026-08-13)
- * [spec-author ruling, recorded; notes/qm3_mode_a_loop_spec.md rev 4. NOT a silent edit:
- *  the numbers every fixture reports for the tau anchor CHANGE with it, and the tables in
- *  this header and in test_qp_map_ab.cpp were re-measured on the same day.]
+ * THE TAU-ANCHOR NORMALIZATION
  * =====================================================================================
- * The tau anchor replaced the i w anchor as THE gate (spec rev 2) but, until this date,
- * inherited its threshold without its NORMALIZATION. The i w anchor divides by the largest
- * |Sigma^GW| of the whole probed set (one number per (s,k) block, qp_scf_common.cpp:270-283);
- * the tau oracle divided each probed element by ITS OWN magnitude. On a symmetry-reduced
- * production mesh those two differ by orders, and the gate fired on the difference:
+ * The tau anchor compares Sigma_B (this map) against the reference Sigma^GW on the probed
+ * elements on the tau mesh. Its deviation is normalized per block, with the same denominator
+ * convention as the i w anchor (which divides by the largest |Sigma^GW| of the whole probed
+ * set of an (s,k) block):
  *
- *   MEASURED [Si kp444, 13 IBZ k of 64, first symmetry-reduced production run, block (0,0)]:
- *     gap-window diagonals (2,2) (3,3) (4,4) (5,5):  tau rel dev 3.0-3.6e-08
- *     largest gap-window OFF-diagonal (2,5):         tau rel dev 6.6e-05      <- fired
- *     absolute deviation of the whole probed set:    5.5556e-09 a.u. (0.15 ueV), UNIFORM
- *     max|Sigma^GW| of the block:                    1.5648e-01 a.u.
- *     => max|Sigma^GW_(2,5)| = 5.5556e-09 / 6.6e-05 = 8.4e-05 a.u., i.e. the largest
- *        off-diagonal of that window is 1860x BELOW the diagonal (symmetry-suppressed in the
- *        MO basis), and its "relative deviation" measures the smallness of the element, not
- *        an error. The same element read 7.8e-04 in the oracle's per-element i w column while
- *        the BLOCK-normalized i w anchor on the same data read 3.5e-08 -- same numbers, two
- *        denominators, four orders apart. That is the whole effect.
- *   The run's own evidence agreed: per-isym breakdown <= 1.4e-06 for every class, W error
- *   budget 1.586e-07, and 5.5556e-09/1.5648e-01 = 3.55e-08 = exactly the diagonal readings.
- *
- * THE GATE QUANTITY IS THEREFORE, since 2026-08-13,
  *     tau_dev(s,k) = max_{probed elements, tau} |Sigma_B - Sigma^GW|
- *                    / max_{SAME set, tau} |Sigma^GW|,
- * one denominator per block, and the gate is its max over blocks -- reduced together with the
- * (s,k,a,b) where it is attained, because only the ROOT rank's oracle rows reach the log while
- * the gate maxes over every rank's blocks (that is why the kp444 fire was unnameable). The
- * per-element ratios remain as log lines: they are diagnostics, and they are what identified
- * this. The per-isym census keys on the largest ABSOLUTE deviation, which under this
- * normalization IS the element that sets the gate.
+ *                    / max_{same set, tau} |Sigma^GW|,
+ *
+ * and the check uses its max over blocks, reduced together with the (s,k,a,b) where it is
+ * attained (only the root rank's per-element rows reach the log, while the check maxes over
+ * every rank's blocks). A per-element normalization is NOT used: on a symmetry-reduced mesh
+ * the gap-window off-diagonals can be orders of magnitude below the diagonals (symmetry-
+ * suppressed in the MO basis), and dividing by an element's own magnitude then measures its
+ * smallness, not an error. The per-element ratios remain as diagnostic log lines. The
+ * per-isym census keys on the largest absolute deviation, which under this normalization is
+ * the element that sets the check.
  *
  * =====================================================================================
- * THE SYMMETRY PATH -- WHAT THE PRODUCTION DOES TO THE ORBITAL INDICES, AND WHY THIS MAP
+ * THE SYMMETRY PATH -- WHAT THE PRODUCTION GW DOES TO THE ORBITAL INDICES, AND WHY THIS MAP
  * IS EXACT AGAINST IT FOR ANY D (INCLUDING A NON-SYMMORPHIC GROUP)
- * [verified: re-derived mechanically from thc_gw.icc:287-322 (the isym loop and the D
- *  application), thc_solver_comm.hpp:537-590 (aux_to_primary) and :459-517 / the
- *  primary_to_aux impl (:384-450), mf::MF::symmetry_rotation -> bdft_readonly.hpp:571-585,
- *  and utils::generate_dmatrix, symmetry.hpp:764-1092.
- *  MEASURED: the lih223 symmetry ladder, test_qp_map_ab.cpp "qp_map_modea_sym_ladder",
- *  2026-08-13 -- the table below.]
+ * [see thc_gw.icc (the isym loop and the D application), thc_solver_comm.hpp
+ *  (aux_to_primary, primary_to_aux), mf::MF::symmetry_rotation -> bdft_readonly.hpp, and
+ *  utils::generate_dmatrix in symmetry.hpp]
  * =====================================================================================
  * For an external IBZ point k and symmetry class isym, the production assembles Sigma in the
  * auxiliary basis AT THE ROTATED POINT ks = ks_to_k(isym, k), sums that class's transfers
@@ -117,24 +97,24 @@
  *   Sigma^(isym)_ab(ks) = sum_PQ conj(X_ks(P,a)) [ sum_{q in star} -(1/nk) G_PQ(ks-qs)
  *                                                  W_PQ(qs) ] X_ks(Q,b)
  *                                                  [aux_to_primary, kp_map = ks_to_k(isym)]
- *   Sigma_ij(k)        += sum_ab conj(D(a,i)) Sigma^(isym)_ab(ks) D(b,j)   [thc_gw.icc:310-317]
+ *   Sigma_ij(k)        += sum_ab conj(D(a,i)) Sigma^(isym)_ab(ks) D(b,j)   [thc_gw.icc]
  *
  * with D = MF->symmetry_rotation(isym, k): ROWS are bands at ks, COLUMNS bands at k, and the
- * conjugation flag cjg is false for every k of the IBZ (it is kp_trev(k), bdft_readonly.hpp:
- * 579-584 -- it marks a stored D that itself composes with time reversal, which only happens
- * at a trev image k, never at an IBZ k). The internal leg carries NO D at all: primary_to_aux
- * pairs X(k') with G_ab(kp_to_ibz(k')) directly.
+ * conjugation flag cjg is false for every k of the IBZ (it is kp_trev(k): it marks a stored D
+ * that itself composes with time reversal, which only happens at a trev image k, never at an
+ * IBZ k). The internal leg carries NO D at all: primary_to_aux pairs X(k') with
+ * G_ab(kp_to_ibz(k')) directly.
  *
  * NO FRACTIONAL-TRANSLATION PHASE APPEARS ANYWHERE IN THIS CHAIN, symmorphic or not:
  *   * the D matrices are overlaps of the ROTATED IBZ orbital set against the stored one, and
- *     generate_dmatrix builds them with Xft = nullptr (symmetry.hpp:839 and the
- *     transform_k2g call at :1016), i.e. the e^{-i sg Rinv (G+k) T} factor that transform_k2g
- *     CAN return is deliberately not applied;
+ *     generate_dmatrix builds them with Xft = nullptr (and in its transform_k2g call), i.e.
+ *     the e^{-i sg Rinv (G+k) T} factor that transform_k2g CAN return is deliberately not
+ *     applied;
  *   * the orbitals at an image k-point -- hence the collocation columns X(ks) -- are DEFINED
  *     by the same index rotation with the canonical operation kp_symm(ks). That is why
  *     generate_dmatrix stores the IDENTITY at (kp_symm(ks), k) ("by convention,
- *     d(kp_symm(k), kp_to_ibz(k)) = delta", symmetry.hpp:906-921) and why primary_to_aux may
- *     use the IBZ G matrix at an image k with no rotation at all.
+ *     d(kp_symm(k), kp_to_ibz(k)) = delta") and why primary_to_aux may use the IBZ G matrix
+ *     at an image k with no rotation at all.
  * Whatever phase convention the stored orbitals carry is therefore COMMON to both sides, and
  * this map never re-derives a rotation: it calls the same MF->symmetry_rotation and reads the
  * same thc.X(is, 0, ks) columns the GW assembly does.
@@ -143,61 +123,38 @@
  * (qp_modea.hpp): XCe = X(ks) . D . C(k) and XCi = X(k') . C(kp_to_ibz(k')). Note the ORDER:
  * D multiplies C from the LEFT -- csrmm<'N'>(1, D, C) -- contracting D's COLUMN index against C's
  * primary index, which is the order both in-tree consumers use
- * (projector_boson_t.cpp:108-121; vertex_sym.hpp:36-42, Xhat = X(krot) . Dc).
+ * (projector_boson_t.cpp; vertex_sym.hpp, Xhat = X(krot) . Dc).
  *
  * EXACTNESS, AND WHY D-MATRIX LEAKAGE CANNOT REACH THE ANCHOR. Since
  * conj(XCe(P,n)) = sum_a conj(X_ks(P,a)) conj([D C](a,n)), this map's per-(isym, q) term is
  * the production's per-(isym, q) term with C^dag (.) C applied -- and C^dag (.) C is exactly
- * the MO transform the reference receives before the comparison (qp_scf_common.cpp:1283-1295).
+ * the MO transform the reference receives before the comparison (qp_scf_common.cpp).
  * The two sides are identical TERM BY TERM for ANY D, unitary or not. The nbnd-truncation
- * leakage of the stored D (row normalization, symmetry.hpp:1067-1092; the "accuracy floor of
- * the symmetry path" of vertex_sym.hpp:52-56) is a property of the shared data, cancels in
- * the difference, and is REPORTED by the symmetry census below, never gated. The only object
+ * leakage of the stored D (row normalization in generate_dmatrix; the accuracy floor of the
+ * symmetry path discussed in vertex_sym.hpp) is a property of the shared data, cancels in the
+ * difference, and is REPORTED by the symmetry census below, never checked. The only object
  * the two sides do NOT share is the W REPRESENTATION (the support-constrained pole fit and
  * the stage-1b/1c truncations) -- so any tau-anchor deviation is either that or the head.
+ * Accordingly, the same cell and k mesh reduced with and without symmetry (e.g. the lih223
+ * fixture family in test_qp_map_ab.cpp, "qp_map_modea_sym_ladder") give tau-anchor
+ * deviations that agree to far below the deviation itself, while the census confirms that
+ * the D rotation is non-trivial.
  *
- * MEASURED [qp_map_modea_sym_ladder, mode_b, one outer iteration; three reductions of the
- * SAME cell and the SAME 2x2x3 mesh, so the W-fit class is common and the deviation is
- * attributable]:
- *
- *     fixture          nk  nk_ibz  nqsym  ntrev     tau dev    W-fit class   ratio
- *     qe_lih223        12    12      1      0     4.1824e-04   3.8581e-03    0.108
- *     qe_lih223_inv    12     8      1      4     4.1824e-04   3.8581e-03    0.108
- *     qe_lih223_sym    12     6      2      4     4.1827e-04   3.8581e-03    0.108
- *
- * [re-measured 2026-08-13 under the block normalization above; the same three rows read
- *  6.3697 / 6.3697 / 6.3703e-04 (ratio 0.165) under the retired per-element one. The fixture
- *  moves by only 1.5x because its largest gap-window off-diagonal is of the same order as the
- *  diagonal -- which is exactly why no fixture ever caught the normalization, and kp444, where
- *  that off-diagonal is 1860x smaller, did.]
- *
- * Turning on the star loop, the trev branches and the D rotation moves the tau anchor by
- * 3e-09 ABSOLUTE on a deviation of 4.2e-04. The sym row is not vacuous: its census reads
- * "D-rotation exercised on 4 of 6 (isym > 0, k) pairs, worst max|D - 1| = 2.0e+00, worst
- * max|D^dag D - 1| = 5.3e-16", i.e. the rotation really is non-trivial there (and exactly
- * unitary on this fixture, whose 16 bands close every multiplet).
- *
- * WHAT THE LADDER DOES NOT COVER, and it is worth knowing before blaming symmetry again:
- * (i) a NON-SYMMORPHIC group -- every symmetry fixture in tests/unit_test_files has ft = 0
- * (checked 2026-08-13: lih222_sym, lih223_sym, svo222_sym, GaAs, all Si; the only
- * non-symmorphic cells in the tree are unreduced meshes, nsym = 1), so a fractional
- * translation is untested LOCALLY -- though by the paragraph above it cannot enter;
- * (ii) a LEAKY D (max|D^dag D - 1| >> 0), which needs a fixture whose band window cuts a
- * degenerate multiplet; (iii) more than two symmetry classes.
+ * Not covered by the fixtures: (i) a NON-SYMMORPHIC group -- the symmetry fixtures in
+ * tests/unit_test_files all have zero fractional translations (by the paragraph above a
+ * fractional translation cannot enter); (ii) a LEAKY D (max|D^dag D - 1| >> 0), which needs a
+ * fixture whose band window cuts a degenerate multiplet; (iii) more than two symmetry classes.
  *
  * =====================================================================================
  * WHY STAGE 1b EXISTS -- THE FLOP MODEL OF THE SANDWICH
- * [measured: rusty, Si kp222, nbnd = 60, Np = 2918, nq = 8, ~60 retained poles, 32 ranks
- *  -> ~45 min per outer iteration, i.e. two orders over budget]
  * =====================================================================================
  * The dense sandwich is two gemms per (n,p): (Np,Np)x(Np,nbnd) then (nbnd,Np)x(Np,nbnd),
  * and the (isym, q-in-star) loops cover the FULL q mesh exactly once, so per owned (s,k)
  *
  *     F_dense = nqpts * nbnd * npk * 8 * Np * nbnd * (Np + nbnd)     [real flops]
  *
- * = 1.2e14 for the numbers above -- at ~40 GFLOP/s of complex-gemm throughput on one core
- * that is ~50 min, and only ns*nk_ibz of the ranks carry a block at all (owner = sk % size),
- * so the wall time is ONE block's cost. That is the measurement, explained.
+ * For production sizes (Np in the thousands, nbnd ~ 60, ~60 retained poles) this is of order
+ * 1e14 flops per block, and the wall time is one block's cost.
  *
  * With W^(p) = V S V^dag (V: Np x r) the SAME sandwich becomes, for g_r(a) = sum_P B(P,a) V(P,r),
  *
@@ -209,36 +166,22 @@
  *     F_lowrank = nqpts * npk * r * 8 * Np * nbnd^2   +   nqpts * npk * nbnd * 8 * nbnd^2 * r
  *               = F_dense * (r / Np) * (1 + O(nbnd/Np)).
  *
- * The speedup is r/Np -- exactly the compression ratio of the slab, with NO crossover to
- * worry about below r = Np (the low-rank path is never slower in flops; at r ~ Np it merely
- * stops helping).
+ * The speedup is r/Np -- exactly the compression ratio of the slab, with no crossover below
+ * r = Np (the low-rank path is never slower in flops; at r ~ Np it merely stops helping).
  *
- * IS r SMALL? [measured, qe_lih222, test_qp_map_ab "qp_map_modea_np_scan": mean retained rank
- *  over the (q,p) slabs at a FIXED tolerance, with only the THC basis size swept]
+ * The retained rank r at a fixed tolerance saturates as the THC basis grows: it counts
+ * screening modes of the CELL, not basis functions, so r/Np falls as 1/Np (scan:
+ * test_qp_map_ab.cpp, "qp_map_modea_np_scan"). Every context build logs the rank at each
+ * tolerance of detail::wrank_ladder.
  *
- *      Np        96     192     288     384          <- auxiliary basis
- *      1e-4    35.4    36.3    37.5    37.3
- *      1e-6    65.9    72.3    72.7    72.2
- *      1e-8    90.0   105.5   107.0   106.9
- *      1e-10   95.9   135.0   140.0   139.4
- *
- * r SATURATES: past Np ~ 200 the retained rank is flat to a few percent while Np quadruples,
- * i.e. it counts screening modes of the CELL, not basis functions, and r/Np falls as 1/Np.
- * That is the property the whole increment rests on -- the compression is not a fixture
- * artifact, it improves as the basis grows toward the production Np = 2918. (What r is for a
- * given SYSTEM is a different question, and cannot be measured on a fixture; every context
- * build logs the ladder, so the first production run reports it directly.)
- *
- * Setup: one dense heev is 9*Np^3 per (q,p), which at Np = 2918 is 1.1e14 over the whole
- * (q,p) set and would REPLACE the bottleneck it removes, so above detail::wslab_dense_max the
- * factorization uses a randomized Nystrom sketch instead: 3 passes of (Np,Np)x(Np,l) =
- * 24*Np^2*l per (q,p), and the (q,p) axis is partitioned over ALL of the node's ranks (unlike
- * stage 2, which only parallelizes over owned (s,k) blocks). At l = 512 that is 5e13 over the
- * whole set, ~40 s on 32 ranks against the several minutes stage 2 still costs. Subdominant,
- * as required.
+ * Setup: one dense heev is 9*Np^3 per (q,p), which at production Np would replace the
+ * bottleneck it removes, so above detail::wslab_dense_max the factorization uses a randomized
+ * Nystrom sketch instead: 3 passes of (Np,Np)x(Np,l) = 24*Np^2*l per (q,p), and the (q,p)
+ * axis is partitioned over ALL of the node's ranks. This keeps stage 1b subdominant to
+ * stage 2.
  *
  * =====================================================================================
- * THE UNION SUBSPACE (stage 1c) -- AND WHY IT IS A TRUNCATION TRADE, NOT A FREE WIN
+ * THE UNION SUBSPACE (stage 1c) -- A TRUNCATION TRADE, NOT A FREE WIN
  * =====================================================================================
  * Stage 1b contracts the Np axis once per (q,p,r), i.e. sum_p r_p times per (k,q): the npk
  * slabs of one q are npk DIFFERENT bases. Let ONE orthonormal basis Q_q (R_q vectors) span
@@ -253,77 +196,42 @@
  *     F_union / F_1b  =  R/(npk*r)  +  (R + nbnd)/(Np + nbnd)   ~   R/Np.
  *
  * Np is replaced by R in the dominant term and the one-time projection costs 1/(npk*r) of it.
- * The whole increment is therefore worth exactly what R is -- and R is set by the TRUNCATION,
- * not by the cell:
+ * The gain is therefore set by R, and R is set by the TRUNCATION, not by the cell:
  *
- * MEASURED [qe_lih222, "qp_map_modea_np_scan"; rank of the npk = 28 slab stack of q = 0, i.e.
- *  of sum_p W^(p) W^(p)dag, at |sigma| >= tol * max|sigma|; per-slab mean r for scale]
+ *  (a) at a loose cut (1e-8 or looser) R saturates in Np at a small multiple of max_p r_p:
+ *      the slabs of one q share a subspace, and R/Np falls as 1/Np;
+ *  (b) at a tight cut (1e-10) the sharing is gone and R = Np: the directions the slab cut
+ *      retains there are mutually orthogonal noise tails that fill the space, and the
+ *      restructure is break-even (Np*R + npk*r*R against npk*r*Np) at the price of one extra
+ *      (nq, Np, R) window and the stage-1c build.
  *
- *      Np           96     192     288     384        mean r at Np = 384
- *      1e-4         41      43      49      49              37.3
- *      1e-6         76      86      89      89              72.2
- *      1e-8         95     133     139     143             106.9
- *      1e-10        96     192     288     384             139.4     <- FULL RANK
+ * R >= max_p r_p always (the basis must at least span one slab), so the ceiling of the
+ * restructure is R/Np >= r/Np.
  *
- * Two things are measured there, and only one of them is good news.
- *
- *  (a) AT A FIXED CUT OF 1e-8 OR LOOSER, R SATURATES IN Np (143 at Np = 384 against 133 at
- *      192) and sits at ~1.2 x max_p r_p: the slabs of one q really do share a subspace, so
- *      R/Np falls as 1/Np and the restructure improves as the basis grows.
- *  (b) AT THE DEFAULT CUT 1e-10 THE SHARING IS GONE: R = Np at every Np. The directions the
- *      slab cut retains down there are mutually orthogonal noise tails, they fill the space,
- *      and the restructure is then break-even (Np*R + npk*r*R against npk*r*Np) at the price
- *      of one extra (nq, Np, R) window and the stage-1c build.
- *
- * DO NOT read the absolute numbers above as production numbers: R >= max_p r_p ALWAYS (the
- * basis must at least span one slab), so the ceiling of the restructure is R/Np >= r/Np, and
- * the production kp222 cell measures r_mean = 520 of Np = 2918 at 1e-10. Even in the best case
- * -- a cut where R falls to ~1.2 max_p r_p -- that is R/Np ~ 0.2, i.e. a 5x stage-2 speedup,
- * not the 20-30x the fixture's r/Np would suggest. lih222 has 16 bands and ~140 screening
- * modes; the production cell has ~4x that, and r is a property of the CELL.
- *
- * So qp_modea_wunion is a knob: a column of V^(p) is dropped from the basis only when
+ * qp_modea_wunion is therefore a knob: a column of V^(p) is dropped from the basis only when
  * |s_r| * ||(1-P) v_r|| < wunion * max_p max|s^(p)|, i.e. only when it moves the RESIDUE SUM
  * of that q by less than wunion of its largest slab (the normalization is discussed at
- * detail::union_build -- it is the absolute one, and it is what the ladder above measures).
- * R, R/Np and the worst projection residual in both norms are logged on every build, the cut
- * is interlocked by the SAME tau anchor that aborts an over-aggressive wrank, and its default
- * is chosen by the scan in test_qp_map_ab.cpp ("qp_map_modea_wunion_scan"). It is never a
- * silent accuracy change.
+ * detail::union_build). R, R/Np and the worst projection residual in both norms are logged on
+ * every build, and the cut is checked by the same tau anchor that aborts an over-aggressive
+ * wrank. It is never a silent accuracy change.
  *
- * THE DEFAULT IS OFF, and this is why [measured, qe_lih222 / mode_a / qpscf, 20 outer
- * iterations, Np = 192; "R" is what the incremental basis of union_build actually achieves,
- * "gap" is the converged fundamental gap against the per-slab reference]:
- *
- *      wunion       R/Np    gap (eV)     d vs OFF   proj resid   anchor     1c / stage 2 wall
- *      OFF          --      11.856870     --         --          4.26e-3    0.00 s / 1.70 s
- *      1e-10        1.000   11.856870    -1.7e-11    1.8e-12     4.26e-3    0.47 s / 1.41 s
- *      1e-8         0.859   11.856872    +1.7e-06    9.8e-09     4.28e-3    0.36 s / 1.23 s
- *      1e-6         0.818   11.856873    +2.6e-06    6.7e-08     4.28e-3    0.34 s / 1.17 s
- *
- * At the cut the QM3 gates are pinned to, the basis IS the whole space; loosening it by FOUR
- * orders still leaves R = 0.82 Np and has already moved the sixth decimal of the gap. Stage 2
- * does get faster even at R = Np (1.70 -> 1.41 s) but that is BLAS SHAPE, not compression --
- * the union path builds B once per (k,q,n) where the per-slab path rebuilds an (Np,nbnd)
- * Hadamard product once per (k,q,p,r) -- and stage 1c eats it.
- *
- * OPEN, and where to look if this is ever revisited: the ACHIEVED R (0.82 Np at 1e-6) is far
- * above the SVD-optimal stack rank the union probe reports on comparable data (0.45 Np). The
- * probe diagonalizes sum_p W^(p) W^(p)dag, which costs 8*Np^2*r per (q,p) -- more than the
- * stage 2 it would save -- so the incremental basis is what is affordable, and it is the
- * incremental basis that does not pay. Closing that factor of two is the only route left to a
- * compression-based speedup; what scales without it is stage 2's parallelism, below.
+ * THE DEFAULT IS OFF: at the tight cut the basis is the whole space, and loosening the cut
+ * enough to make R appreciably smaller than Np already shifts the converged gap at the
+ * micro-eV level (scan: test_qp_map_ab.cpp, "qp_map_modea_wunion_scan"). Even at R = Np stage
+ * 2 runs faster through the union path because B is built once per (k,q,n) instead of once
+ * per (k,q,p,r) -- a BLAS-shape effect, not compression -- but stage 1c costs about as much.
+ * The incremental basis of union_build reaches a larger R than the SVD-optimal rank of the
+ * slab stack (diagonalizing sum_p W^(p) W^(p)dag costs 8*Np^2*r per (q,p), more than the stage
+ * 2 it would save); a cheaper near-optimal basis is the remaining route to a
+ * compression-based speedup.
  *
  * =====================================================================================
- * WHAT ACTUALLY REACHES kp444: THE PARALLEL CEILING, NOT THE COMPRESSION
+ * PARALLEL SCALING OF STAGE 2
  * =====================================================================================
- * Np is set by the CELL (nbnd x the ISDF prefactor) and not by the k mesh, so kp222 -> kp444
- * multiplies the stage-2 work of ONE block by nqpts (8 -> 64) and leaves Np, npk and r where
- * they were. The old loop gave a block to exactly one rank, so it could use ns*nk_ibz ranks
- * (8 at kp222, of 32) and the iteration cost was ONE block's serial time. The pair split
- * raises that ceiling to ns*nk_ibz*nqpts ranks -- 64 at kp222, 512 at kp444 -- and a kp444
- * iteration costs (8 x the kp222 block) / (ranks per block). At the 1e-10 accuracy class,
- * where R = Np and the union restructure is break-even, THAT is the whole increment.
+ * Np is set by the CELL (nbnd x the ISDF prefactor) and not by the k mesh, so refining the
+ * mesh multiplies the stage-2 work of ONE block by nqpts and leaves Np, npk and r unchanged.
+ * Assigning each block to one rank would limit the usable ranks to ns*nk_ibz; the (isym, q)
+ * pair split raises that ceiling to ns*nk_ibz*nqpts ranks.
  */
 
 #include <chrono>
@@ -338,17 +246,16 @@
 #include "numerics/shared_array/nda.hpp"
 #include "methods/SCF/qp_modea.hpp"
 #include "methods/SCF/wc_spectral.hpp"
-// TC-2 (notes/tc_coqui_impl_spec.md): P on the tilted contour, reachable only through
-// qp_modea_wfit = "contour". ENABLE-flag-free -- plain complex arithmetic in the existing
-// THC kernels -- and inert for every other wfit (gate TC-2-b).
+// P on the tilted contour, reachable only through qp_modea_wfit = "contour". Needs no build
+// flag (plain complex arithmetic in the existing THC kernels) and is inert for every other
+// wfit.
 #include "methods/SCF/p_contour.hpp"
 #include "methods/mb_state/mb_state.hpp"
 
 #ifdef ENABLE_FINUFFT
-// RW-2: the spectral-quadrature W^c path. Only reachable with qp_modea_wfit = "spectral";
-// with the flag OFF the knob value is rejected with a clear message at parse time and this
-// translation unit is byte-identical in behavior to pre-RW-2 (gate RW-2-b / the RW-1-c
-// flag-off inertness class).
+// The spectral-quadrature W^c path. Only reachable with qp_modea_wfit = "spectral"; without
+// ENABLE_FINUFFT that value is rejected with a clear message at parse time and none of the
+// spectral code is compiled.
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 #include "methods/GW_real_axis/real_axis_mb_state.hpp"
 #include "methods/GW_real_axis/real_axis_scr_coulomb_t.h"
@@ -386,8 +293,8 @@ namespace qp_modea {
     /**
      * One residue slab, factored:  W^(p)_PQ ~= sum_r V(P,r) s_r conj(V(Q,r)),  s real.
      *
-     * HERMITICITY. The stored W(tau) is Hermitian in (P,Q) to ~1e-9 relative (measured every
-     * build, logged as w_herm_rel), and the tau -> nu -> fit chain is a REAL linear map in the
+     * HERMITICITY. The stored W(tau) is Hermitian in (P,Q) to numerical precision (measured
+     * every build, logged as w_herm_rel), and the tau -> nu -> fit chain is a REAL linear map in the
      * frequency index once the +nu/-nu mirror pairs are summed (Ttw_bb entries are complex but
      * T(t,-nu) = conj(T(t,+nu)), and the mirrored mesh always contains both), so Hermiticity
      * transfers to the residues. `anti` measures it per slab anyway; nothing branches on it.
@@ -569,17 +476,17 @@ namespace qp_modea {
      *     Sigma^c is sum_p ||(1-P) W^(p)||, an ABSOLUTE quantity. A slab whose norm is 1e-6
      *     of the largest one may be projected badly in its OWN relative terms and still not
      *     move the answer;
-     *   - measured (qe_lih222, wunion = 1e-8, Np = 192): the per-slab-relative criterion
-     *     needs R = 186 of 192 -- the restructure buys nothing -- while this one needs 143,
-     *     the same number the independent stack-rank probe reports at that tolerance;
-     *   - it is also the criterion the "W^c union subspace" probe measures, so the ladder in
-     *     this file's header IS the prediction for this basis.
+     *   - a per-slab-relative criterion keeps nearly the whole space at a cut where this one
+     *     gives about the rank the independent stack-rank probe reports, i.e. the per-slab
+     *     criterion makes the restructure useless;
+     *   - it is also the criterion the "W^c union subspace" probe measures, so that probe
+     *     predicts the size of this basis.
      *
      * The price is that the tolerance is NOT a per-slab relative accuracy (qp_modea_wrank
      * is); the per-slab residual is measured and logged separately so the difference is never
      * hidden. With tol below the slab cut the basis spans every retained direction and the
-     * restructure is EXACT -- but then R is the rank of the whole stack, which is Np at the
-     * production cut (again, the ladder). That is the trade.
+     * restructure is EXACT -- but then R is the rank of the whole stack, which is Np at a
+     * tight cut. That is the trade.
      */
     template<typename Vfn, typename Sfn>
     inline long union_build(long NP, long npk, double tol, nda::array<long, 1> const &rk,
@@ -654,7 +561,7 @@ namespace qp_modea {
     }
 
     // -------------------------------------------------------------------------------------
-    //  RW-2: the SPECTRAL-QUADRATURE W^c representation
+    //  the SPECTRAL-QUADRATURE W^c representation
     //  (derivation + sign convention: methods/SCF/wc_spectral.hpp)
     // -------------------------------------------------------------------------------------
 
@@ -689,10 +596,10 @@ namespace qp_modea {
 
 #ifdef ENABLE_FINUFFT
     /**
-     * Run the RW-1 real-axis chain on the CURRENT QP spectrum and leave Im W^c(q,P,Q,Omega)
+     * Run the real-axis W chain on the CURRENT QP spectrum and leave Im W^c(q,P,Q,Omega)
      * plus the quadrature grid in `sp`. Called once per mode-A context build.
      *
-     * Convention pins, all inherited from the RW-1 gate and re-asserted here:
+     * Conventions, shared with the imaginary-axis side so the two are directly comparable:
      *   - the SAME THC eri as the imaginary-axis side (`thc`), so the factorization is common
      *     mode and cancels out of every comparison;
      *   - the SAME beta and the SAME mu (grid.mu_chem() is the loop's mu);
@@ -700,7 +607,7 @@ namespace qp_modea {
      *     axes: under ignore_g0 both zero it, otherwise both solve the Dyson equation there
      *     with the regularized auxiliary V. (The q -> 0 HEAD is NOT taken from this chain --
      *     see the head sector in build_modea_context.)
-     *   - eta enters ONLY through A; the grids are sized from eta by the RW-1 rules
+     *   - eta enters ONLY through A; the grids are sized from eta by size_grids
      *     (real_axis_qp_A.hpp), and real_freq_grid_t enforces Nyquist as a hard error.
      */
     template<typename thc_t>
@@ -744,16 +651,15 @@ namespace qp_modea {
       sp.N_w = gs.N_w; sp.N_t = gs.N_t; sp.N_O = gs.N_Omega;
       sp.dw = gs.dw; sp.dOmega = gs.dOmega; sp.dt = gs.dt; sp.T_window = gs.T_window;
 
-      app_log(lvl, "  - SPECTRAL W^c (RW-2):         eta = {:.4e} a.u. ({:.4g} eV); eps range "
+      app_log(lvl, "  - SPECTRAL W^c:                eta = {:.4e} a.u. ({:.4g} eV); eps range "
                    "[{:+.4f}, {:+.4f}] Ha -> w_max = {:.4f}, Omega_max = {:.4f}",
               sp.eta, sp.eta * 27.211386245988, e_min, e_max, sp.w_max, sp.Omega_max);
       // THE CHEMICAL POTENTIAL. real_freq_grid_t::mu_chem is set once at construction and has
       // no setter, and it feeds BOTH the absolute-energy Fermi factors inside the fixed Pi
       // kernel AND the w_abs = w + mu convention of the A builder. It must therefore be the
-      // LIVE loop mu at every rebuild -- on a metal it moves iteration to iteration. (The
-      // branch's own dispatcher instead sets it once to the KS direct-gap midpoint; that is
-      // defect #7 of notes/real_axis_refs_audit.md section 8.7a and it cannot occur here
-      // because the context build is handed the loop's mu, but it is asserted and logged.)
+      // LIVE loop mu at every rebuild -- on a metal it moves iteration to iteration. A mu
+      // frozen at construction (e.g. the KS direct-gap midpoint) would be wrong here; the
+      // context build is handed the loop's mu, and that is asserted and logged.
       utils::check(std::isfinite(mu), "qp_modea (spectral): non-finite mu.");
       app_log(lvl, "  - SPECTRAL mu (LIVE):          grid.mu_chem() = {:.12f} a.u. -- the "
                    "CURRENT loop mu, rebuilt every outer iteration", mu);
@@ -764,13 +670,11 @@ namespace qp_modea {
               sp.dt, sp.N_O, sp.dOmega, sp.eta / sp.dOmega);
 
       // GUARD. Every grid size is DERIVED from the QP spectrum through
-      // w_max = max|eps| + 2, so a spectrum that has run away makes them run away with it:
-      // measured on the RW-2-d leg, after a first map that left dmax(H_eff) at 1.7e+04 a.u.
-      // the second map's sizing came out N_w = 1366129, N_t = 4194304, N_Omega = 683064 and
-      // the job died of resources instead of saying why. A physics divergence must not
-      // present as an OOM, so it is turned into a diagnosable abort here. The cap is far
-      // above any converged case (SVO at eta = 0.05 needs N_w = 381, N_t = 2048,
-      // N_Omega = 190; lih222 at eta = 0.0125 needs 1187 / 4096 / 657).
+      // w_max = max|eps| + 2, so a spectrum that has run away makes them run away with it
+      // (grids of millions of points, and a job that dies of resources instead of saying
+      // why). A physics divergence must not present as an OOM, so it is turned into a
+      // diagnosable abort here. The cap is far above any converged case (typical grids are
+      // a few hundred to a few thousand points).
       {
         constexpr long grid_cap = 1L << 17;      // 131072
         utils::check(sp.N_w <= grid_cap and sp.N_t <= grid_cap and sp.N_O <= grid_cap,
@@ -803,16 +707,16 @@ namespace qp_modea {
       const bool use_rspace = (MF->nkpts() > 1);
 
       // THE q = Gamma BODY. The real-axis chain zeroes Pi AND W at Gamma when and only when
-      // it is constructed with div_treatment == "ignore_g0" (real_axis_scr_coulomb_t.h:341,
-      // :634, :875) -- the RW-1 gate's known structural difference D1. The IMAGINARY-axis
+      // it is constructed with div_treatment == "ignore_g0" (see real_axis_scr_coulomb_t.h)
+      // -- a known structural difference between the two chains. The IMAGINARY-axis
       // chain never does that: it solves the Dyson equation at Gamma with the regularized
       // auxiliary V = thc.Z(0) whatever div_treatment says, and the stored dW_qtPQ that the
       // LS routes fit therefore HAS a Gamma body. Zeroing it here would drop one q of nq
-      // from Sigma^c and is measurable: on qe_lih222 it left the Lehmann meter at exactly
-      // 1.0 (100 % relative) at q = 0. So the solver is always constructed with a
+      // from Sigma^c and is measurable (the Lehmann meter reads a 100 % relative error at
+      // q = 0). So the solver is always constructed with a
       // non-ignore_g0 string and the two axes treat the Gamma BODY identically.
       // This does NOT touch the q -> 0 HEAD, which stays the production Matsubara
-      // eps_inv_head (spec item 3); the module's own eps_inv_head_O is computed as a side
+      // eps_inv_head; the module's own eps_inv_head_O is computed as a side
       // effect of this choice and is never read.
       real_axis_scr_coulomb_t scr_re(&grid, "rpa", "gygi", 1e-9);
       (void)div_treatment;
@@ -906,8 +810,8 @@ namespace qp_modea {
     // POSITIVE half of the bosonic Matsubara mesh (its own index convention:
     // full index nw_b/2 + n). W^c(i nu) is EVEN in nu -- that is exactly what the PH-sym
     // transform pair encodes -- so the full mesh is recovered by mirroring. Both fit routes
-    // then see the FULL bosonic mesh, which is what the QM2-b chain measured and what lets
-    // the fit reproduce an even function on a NONSYM auxiliary node set.
+    // then see the FULL bosonic mesh, which is what lets the fit reproduce an even function
+    // on a NONSYM auxiliary node set.
     // [verified: W(tau) = W(beta - tau) and e^{i nu beta} = 1 give W(-i nu) = W(i nu);
     //  IAFT.icc:48-72 is built on the same identity]
     const long nwb_full = FT.nw_b();
@@ -928,15 +832,15 @@ namespace qp_modea {
       }
     }
 
-    // RW-2: the pole set itself is built AFTER the stage-1 preamble below, because the
+    // The pole set itself is built AFTER the stage-1 preamble below, because the
     // spectral route needs the Gamma-head decision (and the head's own Matsubara data) to
     // size its appended head sector. Nothing between here and there depends on npk.
     const bool spectral = (opts.wfit == "spectral");
-    // TC-2: the tilted-contour route. Inert for every other wfit -- nothing above or
-    // below this flag reads it except the one branch in THE POLE SET block.
+    // The tilted-contour route. Inert for every other wfit -- nothing above or below this
+    // flag reads it except the one branch in THE POLE SET block.
     const bool contour = (opts.wfit == "contour");
-    // TC-3: the contour route needs BOTH halves of eq 1. Its imaginary-axis term is the
-    // EXISTING pole representation (blk.M / ctx.om), so the pole set below is built by the
+    // The contour route needs BOTH terms of the contour-deformation formula
+    // (sigma_cd_line.hpp). Its imaginary-axis term is the EXISTING pole representation (blk.M / ctx.om), so the pole set below is built by the
     // production tau route exactly as wfit = "tau" would; only the RESIDUE W-source is
     // replaced. `use_nu_fit` therefore selects nu-vs-tau, and "contour" reads as "tau".
     const bool use_nu_fit = (opts.wfit == "nu");
@@ -980,8 +884,7 @@ namespace qp_modea {
                                            mpi->node_comm.rank());
     const long nc = c1 - c0;
 
-    // the Gamma head (spec section 3). ignore_g0 -> absent on BOTH sides by construction,
-    // which is the convention of every QM3 gate and of the QM3-c judge protocol.
+    // the Gamma head. ignore_g0 -> absent on BOTH sides (map and reference) by construction.
     bool head_on = (div_treatment.find("gygi") != std::string::npos or div_treatment == "cvv");
     if (head_on and MF->nqpts_ibz() == 1) {
       app_log(lvl, "  - Gamma head:                  nqpts_ibz == 1 with div_treatment = {} "
@@ -992,7 +895,7 @@ namespace qp_modea {
     if (head_on and not mb_state.eps_inv_head.has_value()) {
       app_warning("qp_modea: div_treatment = {} but mb_state.eps_inv_head is absent; the "
                   "mode-A Sigma^c is built WITHOUT the long-wavelength head while the "
-                  "reference GW Sigma has it. The anchor gate will show the difference.",
+                  "reference GW Sigma has it. The tau-anchor check will show the difference.",
                   div_treatment);
       head_on = false;
     }
@@ -1003,17 +906,10 @@ namespace qp_modea {
       //  whose Delta_ij = -madelung * eps_inv_head(tau) * sum_PQ conj(X_Pi) X_Qj G_PQ(k)
       //  conj(chi_P) chi_Q is exactly the q = Gamma term of the main sum with this W added --
       //  the -1/nk prefactor cancels the nk here.]
-      // [verified -- gate: test_qp_map_ab "qp_map_modeb_head_anchor" (2026-08-13), the tau
-      //  anchor on qe_lih223 with div_treatment = gygi. MEASURED (block-normalized, the
-      //  2026-08-13 semantics): head ON gives anchor 3.4578e-04, ratio 0.158 of its gate,
-      //  from an ABSOLUTE deviation of 7.11e-05 a.u. over a block scale of 2.057e-01;
-      //  the same fixture with the head OFF gives 4.1824e-04 from 6.77e-05 a.u. over
-      //  1.620e-01. Turning the head on adds ~27% to |Sigma| and leaves the map-vs-reference
-      //  ABSOLUTE deviation within 5% -- i.e. this augmentation and gw_t::Sigma_div_correction
-      //  are the same physics to well inside the W-fit scale they share, and the head carries
-      //  no error of its own that the anchor can resolve. Before that gate this was the ONE
-      //  unexercised branch of the map (both QM3-b fixtures and the QM3-c judge run
-      //  div_treatment = ignore_g0, where the head is absent on both sides).]
+      // [tested: test_qp_map_ab "qp_map_modeb_head_anchor", the tau anchor on qe_lih223 with
+      //  div_treatment = gygi. Turning the head on changes |Sigma| appreciably but leaves the
+      //  map-vs-reference ABSOLUTE deviation essentially unchanged, i.e. this augmentation and
+      //  gw_t::Sigma_div_correction agree to well inside the W-fit scale they share.]
       auto chi = thc.basis_head()(0, all);
       const double mad = MF->madelung();
       for (long j = 0; j < nc; ++j) {
@@ -1021,7 +917,7 @@ namespace qp_modea {
         Hcol(j) = double(nkpts) * mad * std::conj(chi(P)) * chi(Q);
       }
       app_log(lvl, "  - Gamma head:                  ON (div_treatment = {}, madelung = "
-                   "{:.6g}) -- gated by test_qp_map_ab \"qp_map_modeb_head_anchor\"",
+                   "{:.6g}) -- tested by test_qp_map_ab \"qp_map_modeb_head_anchor\"",
               div_treatment, mad);
     } else {
       app_log(lvl, "  - Gamma head:                  OFF (div_treatment = {})", div_treatment);
@@ -1050,10 +946,8 @@ namespace qp_modea {
               gap_edge, gap_edge * 27.211386245988, npk, pf.np, mpf_opt->n_kept);
       app_log(lvl, "  - W^c pole-fit route:          {} ({} rows), SVD cut rel_tol = {:.2g}",
               opts.wfit, mpf_opt->nrow, mpf_opt->rel_tol);
-      // RW-2 spec item 5: on a metal E_PH is the k-mesh level spacing, not a physical gap,
-      // so the support constraint strips REAL low-omega weight from W^c. Measured on SVO
-      // (notes/qpgw_metal_mode_m0.md section 8a): 12 of 74 nodes, i.e. everything below
-      // 0.52 eV, gone at the first map and 1 of 74 at the second -- set by the k mesh.
+      // On a metal E_PH is the k-mesh level spacing, not a physical gap, so the support
+      // constraint strips REAL low-omega weight from W^c, by an amount set by the k mesh.
       if (gap_edge > 0.0 and gap_edge < 10.0 * M_PI / ctx.beta)
         app_warning("qp_modea: the W^c support constraint is active at gap_edge = {:.4g} a.u. "
                     "({:.4g} eV), which is INSIDE the Matsubara mesh-spacing class 10 pi/beta "
@@ -1067,8 +961,8 @@ namespace qp_modea {
 #ifndef ENABLE_FINUFFT
       utils::check(false,
                    "qp_modea: qp_modea_wfit = \"spectral\" needs the real-axis W chain, which "
-                   "is only compiled with -DENABLE_FINUFFT=ON. Rebuild with that flag (see "
-                   "notes/rw1_port_report.md section 8) or use qp_modea_wfit = tau|nu.");
+                   "is only compiled with -DENABLE_FINUFFT=ON. Rebuild with that flag (it needs "
+                   "the FINUFFT library) or use qp_modea_wfit = tau|nu.");
 #else
       // ---- (a) the computed Im W^c(q, P, Q, Omega) ----------------------------------
       detail::build_spectral_W(sp, thc, sMO_skia, sE_ska, mu, ctx.beta, opts,
@@ -1120,23 +1014,22 @@ namespace qp_modea {
       sp.neg_frac = sp.plan.neg_frac;
       sp.width_worst = sp.plan.width_worst;
 
-      // ---- (d) THE q = GAMMA SLOT (per-q HYBRID; Fable ruling, 2026-08-20) -------------
-      // The ported real-axis chain is asked here to Dyson Gamma like the Matsubara side
-      // does (see the div_treatment note in build_spectral_W), but the Gamma column is
-      // special on three counts -- it carries the 1/q^2 head, it is the largest |W| of the
-      // mesh, and it is the one q whose real-axis treatment on the branch is a hard-coded
-      // zero rather than a computed object. The RULING is therefore a PER-Q HYBRID: the
-      // spectral quadrature represents q != Gamma, and Gamma keeps the EXISTING LS
-      // representation of its whole Matsubara column (body + eps_inv_head augmentation),
-      // on an APPENDED pole set. Every q's representation is logged.
+      // ---- (d) THE q = GAMMA SLOT (per-q HYBRID) ---------------------------------------
+      // The real-axis chain is asked here to Dyson Gamma like the Matsubara side does (see
+      // the div_treatment note in build_spectral_W), but the Gamma column is special on
+      // three counts -- it carries the 1/q^2 head, it is the largest |W| of the mesh, and
+      // its real-axis treatment in the real-axis module is a hard-coded zero rather than a
+      // computed object. The default is therefore a PER-Q HYBRID: the spectral quadrature
+      // represents q != Gamma, and Gamma keeps the EXISTING LS representation of its whole
+      // Matsubara column (body + eps_inv_head augmentation), on an APPENDED pole set. Every
+      // q's representation is logged.
       //
-      // [DEVIATIONS, flagged: (i) this sector is NOT sign-definite -- it is exactly the LS
-      //  object the body used to be, on 1 of nq transfers, and the Sabs probe reports its
-      //  share of Sabs separately so any residual cancellation is measured; (ii) the fit is
-      //  the "nu" route rather than the production "tau" default, which the QM3-b survey
-      //  measured as the better-conditioned of the two at REAL z by an order in the residue
-      //  ratio (qp_params_t.h: nu 1e-8 -> 4.3e2 vs tau 1e-8 -> 6.0e3); (iii) it carries the
-      //  SAME support constraint gap_edge the production LS path uses.]
+      // Caveats: (i) this sector is NOT sign-definite -- it is the LS object, on 1 of nq
+      // transfers, and the Sabs probe reports its share of Sabs separately so any residual
+      // cancellation is measured; (ii) the fit is the "nu" route rather than the "tau"
+      // default, because nu is the better-conditioned of the two at REAL z by about an
+      // order of magnitude in the residue ratio (see qp_params_t.h); (iii) it carries the
+      // SAME support constraint gap_edge the LS path uses.
       sp.iq_gamma = 0;                 // the Gamma transfer, div_utils / embed_eri_t convention
       sp.gamma_ls = (opts.spectral_gamma != "spectral");
       if (sp.gamma_ls) {
@@ -1148,17 +1041,14 @@ namespace qp_modea {
         // "spectral" Gamma: the BODY comes from the quadrature like every other q, and only
         // the SCALAR eps_inv_head rides appended LS poles.
         //
-        // RW-2 FOLLOW-UP (report section 7 item 1, second half; the first implementation
-        // fit this UNCONSTRAINED with a comment claiming the support constraint "does not
-        // apply" to the head -- WRONG on both counts). eps_inv_head - 1 is built from the
-        // particle-hole polarization, so its spectral support obeys the same E_PH bound as
-        // the body; and on a metal under gygi_metal the head DATA is the enforced metallic
-        // zero plus noise, so an unconstrained fit resolves NOISE into sub-mesh-spacing
-        // poles whose n_B ~ 1/(beta*omega_p) weights are exactly the M-0b amplification
-        // class. Measured on SVO (rw2 leg 6917684): 6 poles below 3 pi/beta, down to
-        // |om_p| = 1.57e-06 a.u., carrying 86.7% of Sum|n_B| -- contaminating the eta = 0
-        // probe rows. The constrained fit removes them; the Gamma-head reconstruction
-        // meter (sp.gamma_rec, logged every build) reports what the constraint costs.
+        // The head fit carries the SAME support constraint as the body. eps_inv_head - 1 is
+        // built from the particle-hole polarization, so its spectral support obeys the same
+        // E_PH bound as the body; and on a metal under gygi_metal the head DATA is the
+        // enforced metallic zero plus noise, so an unconstrained fit resolves NOISE into
+        // sub-mesh-spacing poles whose n_B ~ 1/(beta*omega_p) weights amplify it (on a metal
+        // such poles can carry most of Sum|n_B| and contaminate the eta = 0 probe rows). The
+        // Gamma-head reconstruction meter (sp.gamma_rec, logged every build) reports what
+        // the constraint costs.
         auto const &eih = mb_state.eps_inv_head.value();
         utils::check(eih.shape(0) == nt_half,
                      "qp_modea (spectral): eps_inv_head has {} nodes, dW(tau) has {}.",
@@ -1215,7 +1105,7 @@ namespace qp_modea {
       app_log(lvl, "  - SPECTRAL Im W^c symmetry:    max|ImW_PQ - ImW_QP| / max|ImW| = {:.3e} "
                    "(REPORTED, not required: the -Omega residue is the TRANSPOSE -A^T, so a "
                    "non-symmetric Im W^c is handled exactly; a value near 0 only means the "
-                   "transpose happens to be a no-op on this fixture); real-axis chain wall "
+                   "transpose happens to be a no-op on this system); real-axis chain wall "
                    "{:.2f} s", sp.imw_sym, sp.t_wall);
       app_log(lvl, "  - SPECTRAL Gamma slot:         q = {} carries {} appended LS poles "
                    "representing {}; the eps_inv_head augmentation is unchanged from the "
@@ -1241,12 +1131,11 @@ namespace qp_modea {
     sWres.win().fence();
 
     nda::array<ComplexType, 2> Wt(nt_half, nc), Whalf(nw_half, nc), Ww(nwb, nc);
-    // NOTE the `not spectral` guard: the spectral path never touches Wf and used to
-    // allocate it empty. use_nu_fit alone would start allocating it there -- harmless but
-    // a behaviour change, and the no-op gate compares memory-sensitive diagnostics.
+    // NOTE the `not spectral` guard: the spectral path never touches Wf, so it is allocated
+    // empty there (use_nu_fit alone would allocate it).
     const bool need_Wf = (not use_nu_fit) and (not spectral);
     nda::array<ComplexType, 2> Wf(need_Wf ? ntf : 0, need_Wf ? nc : 0);
-    // RW-2: the spectral fill needs an internode all_reduce of sWres before the rep can be
+    // The spectral fill needs an internode all_reduce of sWres before the rep can be
     // read back, so its Lehmann meter runs in a second pass and the per-q reference is kept.
     nda::array<ComplexType, 3> Ww_all(spectral ? nq_ibz : 0, spectral ? nwb : 0,
                                       spectral ? nc : 0);
@@ -1294,12 +1183,12 @@ namespace qp_modea {
         continue;
       }
       if (spectral) {
-        // ---- SPECTRAL FILL (RW-2, wc_spectral.hpp eq. B) -----------------------------
+        // ---- SPECTRAL FILL (wc_spectral.hpp eq. B) ------------------------------------
         // Poles 0..nbin-1 sit at +Omega_b with residue A_b = -(1/pi) sum_{j in b} w_j
         // Im W^c(Omega_j); poles nbin..2nbin-1 sit at -Omega_b with residue -A_b^T -- the
         // TRANSPOSE, because the bosonic reflection of a MATRIX response is
         // Im W_PQ(-Omega) = -Im W_QP(Omega) and Im W^c is NOT (P,Q)-symmetric in general
-        // (measured 5.3e-01 on SVO against 1.1e-13 on qe_lih222). The transpose is applied
+        // (strongly asymmetric on some systems, symmetric to rounding on others). The transpose is applied
         // by writing the -Omega element at the SWAPPED global position, which keeps every
         // access inside this rank's own tile: the union of the tiles covers all (P,Q), so
         // the union of the swapped writes covers all (Q,P).
@@ -1343,8 +1232,7 @@ namespace qp_modea {
       for (long p = 0; p < npk; ++p)
         for (long j = 0; j < nc; ++j) cfit(p, j) *= mpf.residue_scale(p);
 
-      // QUALITY METRIC (binding requirement 3): the bosonic-mesh reconstruction of the
-      // FITTED representation. NEVER the tau-space fit residual.
+      // QUALITY METRIC: the bosonic-mesh reconstruction of the FITTED representation. NEVER the tau-space fit residual.
       {
         double num = 0.0, den = 0.0;
         for (long m = 0; m < nwb; ++m) {
@@ -1357,7 +1245,7 @@ namespace qp_modea {
           }
         }
         if (den > 0.0 and num / den > rec_worst) { rec_worst = num / den; rec_q = iq; }
-        // ... and the ABSOLUTE error of the same reconstruction. The gate's class is the
+        // ... and the ABSOLUTE error of the same reconstruction. The accuracy class is the
         // RELATIVE number above, normalized per q by max|W_q| -- but Sigma sums the q mesh
         // with band factors of a common scale, so what reaches the tau anchor is the
         // ABSOLUTE error, and the two orderings differ by orders once the mesh resolves the
@@ -1465,11 +1353,11 @@ namespace qp_modea {
                 sp.iq_gamma, sp.npole_gamma, sp.gamma_rec);
       }
 
-      // ---- THE PRODUCTION METER (spec item 4) --------------------------------------
+      // ---- THE RECONSTRUCTION METER --------------------------------------------------
       // The Lehmann forward map of the quadrature representation, evaluated at the bosonic
       // Matsubara nodes, against the STORED W^c(i nu) of the imaginary-axis solver. This is
       // the two-sided anchor: it is the same number the LS routes report as
-      // rec_rel_worst, so the tau-anchor gate downstream scales with it unchanged.
+      // rec_rel_worst, so the tau-anchor check downstream scales with it unchanged.
       // The STATIC node nu = 0 sits ON the real axis, where the dispersion relation carries
       // an extra boundary term i Im W^c(Omega -> 0). That term is ANTISYMMETRIC in (P,Q)
       // (section 2 of wc_spectral.hpp) and is a logarithm, not a pole, so no real-residue
@@ -1519,7 +1407,7 @@ namespace qp_modea {
       // Eq. (C) says the SYMMETRIC part of A_b is positive semi-definite; its diagonal is
       // the diagonal of A_b itself, which is the cheap necessary condition probed here
       // (diagonalizing a (Np x Np) slab per (q, b) is what stage 1b does anyway).
-      // Reported, never gated: a violation means the computed Im W^c does not have a
+      // Reported, never checked: a violation means the computed Im W^c does not have a
       // negative semi-definite symmetric part, which is a statement about the real-axis
       // chain, not about this representation.
       {
@@ -1806,11 +1694,11 @@ namespace qp_modea {
                      "Np = {})  {}", nqp, NP, lad);
       }
       // ---- UNION-SUBSPACE probe on q = 0 (small Np only; diagnostics, root-only) ----------
-      // The per-slab rank r bounds the compression of the CURRENT restructure (stage 2 costs
-      // r/Np of dense). The next one available -- a basis shared by all npk slabs of one q,
-      // so that the Np axis is contracted once per q instead of once per (q,p) -- is bounded
-      // instead by R = rank of [W^(0) | ... | W^(npk-1)], i.e. of sum_p W^(p) W^(p)^dag.
-      // R << npk*r is what would make that restructure worth writing; measure it here.
+      // The per-slab rank r bounds the compression of the per-slab restructure (stage 2
+      // costs r/Np of dense). The union restructure (stage 1c) -- a basis shared by all npk
+      // slabs of one q, so that the Np axis is contracted once per q instead of once per
+      // (q,p) -- is bounded instead by R = rank of [W^(0) | ... | W^(npk-1)], i.e. of
+      // sum_p W^(p) W^(p)^dag. R << npk*r is what makes that restructure pay; measure it.
       if (NP <= detail::wslab_dense_max and mpi->node_comm.root()) {
         nda::matrix<ComplexType> G(NP, NP), Wc(NP, NP);
         G() = ComplexType(0.0);
@@ -1891,7 +1779,7 @@ namespace qp_modea {
     // ---- the dense slabs are DEAD once the factors exist (only the wrank <= 0 reference
     // path reads them in stage 2). At the production sizes this window is the single biggest
     // allocation of the whole build -- (nq_ibz, npk, Np, Np) complex, node-shared -- and
-    // holding it through stage 2 was measured at +9 GB per node for nothing. Likewise the
+    // holding it through stage 2 can cost several GB per node for nothing. Likewise the
     // per-slab factors, once every slab has been expressed in its q's union basis.
     if (lowrank) {
       mpi->node_comm.barrier();
@@ -1904,7 +1792,7 @@ namespace qp_modea {
 
     // ---------------- MO collocation columns ------------------------------------------
     // internal leg: XCi(s, k_full) = X(k_full) . C(kp_to_ibz(k_full))   [derivation 1]
-    // TC-4 F5: held by shared_ptr because the band-factor RECOMPUTE path keeps it alive
+    // Held by shared_ptr because the band-factor RECOMPUTE path keeps it alive
     // inside the context -- ONE copy per rank, shared by every owned block, against
     // nJ x Np x nbnd PER BLOCK for the store it replaces.
     auto pXCi = std::make_shared<nda::array<ComplexType, 3>>(ns * nkpts, NP, nbnd);
@@ -1944,7 +1832,7 @@ namespace qp_modea {
     auto qp_trev = MF->qp_trev();
     auto qminus = MF->qminus();
     const double pref = 1.0 / double(nkpts);
-    // TC-3/TC-4: the eq-1 residue source's band factors, in one of two representations
+    // The band factors of the CD residue source (sigma_cd_line.hpp), in one of two representations
     // (modea_ctx::cd_band_store). The bookkeeping is filled for the block's WHOLE star
     // below, independently of the stage-2 work split, so neither representation cares
     // about the rank/group layout.
@@ -1976,11 +1864,11 @@ namespace qp_modea {
       const double xci_mb = double(ns) * double(nkpts) * double(NP) * double(nbnd) * 16.0
                             / 1.048576e6;
       if (cd_bstore_on)
-        app_log(lvl, "  - band factors (eq-1):         STORE, {:.3f} GB per owned (s,k) block "
+        app_log(lvl, "  - band factors (CD residue):   STORE, {:.3f} GB per owned (s,k) block "
                      "(nJ = {} x Np = {} x nbnd = {}); cd_bfactor = {}, cap {:.2f} GB",
                 bstore_gb, nJ, NP, nbnd, opts.cd_bfactor, opts.cd_bstore_cap_gb);
       else
-        app_log(lvl, "  - band factors (eq-1):         RECOMPUTE, {:.1f} MB per owned (s,k) "
+        app_log(lvl, "  - band factors (CD residue):   RECOMPUTE, {:.1f} MB per owned (s,k) "
                      "block (XCe: nsym {} x Np {} x nbnd {}) + {:.1f} MB shared per rank "
                      "(XCi: ns*nkpts {} x Np x nbnd); the store it replaces would be "
                      "{:.3f} GB PER BLOCK. cd_bfactor = {}, cap {:.2f} GB",
@@ -1988,8 +1876,8 @@ namespace qp_modea {
                 opts.cd_bstore_cap_gb);
     }
 
-    // ---------------- the SYMMETRY CENSUS (permanent, level 2) -------------------------
-    // Two things the kp444 post-mortem needed and no log carried:
+    // ---------------- the SYMMETRY CENSUS (log level 2) --------------------------------
+    // Two diagnostics for symmetry-reduced meshes:
     //  (1) q_isym: which symmetry class handles each full-BZ transfer. The (isym, q-in-star)
     //      pairs partition the full mesh (the coverage tripwire below re-checks it), so the
     //      flat internal label J = q'*nbnd + n inherits a class and the tau oracle can split
@@ -1997,12 +1885,12 @@ namespace qp_modea {
     //  (2) whether the D-matrix external rotation is EXERCISED AT ALL, and its unitarity
     //      defect. generate_dmatrix stores the IDENTITY for the symmetry that defines the
     //      image k-point's orbitals ("by convention, d(kp_symm(k), kp_to_ibz(k)) = delta",
-    //      symmetry.hpp:906-921), so a symmetry-reduced mesh can run the whole isym loop with
+    //      symmetry.hpp), so a symmetry-reduced mesh can run the whole isym loop with
     //      D = 1 everywhere: the star structure is then tested and the ROTATION is not. The
     //      defect max|D^dag D - 1| is the accuracy floor of the symmetry path in the sense of
-    //      vertex_sym.hpp:52-56 (nbnd-truncated degenerate multiplets, row-normalized rows).
+    //      vertex_sym.hpp (nbnd-truncated degenerate multiplets, row-normalized rows).
     //      It cancels between this map and the reference -- both apply the SAME D to the same
-    //      object (see DERIVATION 1) -- so it is reported, never gated.
+    //      object (see DERIVATION 1) -- so it is reported, never checked.
     ctx.nsym = nsym;
     ctx.q_isym = nda::array<long, 1>(nqpts);
     ctx.q_isym() = 0;
@@ -2084,16 +1972,15 @@ namespace qp_modea {
     nda::array<ComplexType, 2> Gt(union_on ? rc : 1, union_on ? nbnd : 1);
 
     // ---- WHO DOES THE WORK (and who stores it) ----------------------------------------
-    // The ctx layout is unchanged: block sk lives on rank sk % size, and every consumer of
-    // ctx.blocks still finds it there. What changes is that the FLOPS of a block are spread
-    // over the whole congruence class {r : r % nblk == sk}: with ns*nk_ibz = 8 blocks on 32
-    // ranks the old loop left 24 ranks idle for the entire sandwich stage. The split axis is
+    // Block sk lives on rank sk % size, and every consumer of ctx.blocks finds it there. The
+    // FLOPS of a block are spread over the whole congruence class {r : r % nblk == sk}, so
+    // ranks that own no block still take part in the sandwich stage. The split axis is
     // the (isym, q-in-star) PAIR, which the star loop visits exactly once per full-mesh q, so
     // every member gets a disjoint slice of both the M accumulation and the (eps_J, f_J)
     // writes -- nothing is computed twice and the plus-reduce of eps_J/f_J stays exact.
     // [multi-node caveat: the class is congruence-based, so on more than one node a group can
     //  straddle nodes and the per-pair reduction crosses the network. Its volume is one
-    //  block's worth per outer iteration -- seconds at the production sizes.]
+    //  block's worth per outer iteration, which is small next to the sandwich stage.]
     const long nblk = ns * nk_ibz;
     const int csize = mpi->comm.size(), crank = mpi->comm.rank();
     const bool helpers_on = (csize > nblk);
@@ -2126,7 +2013,7 @@ namespace qp_modea {
       if (own) {
         blk.alloc_poles(nbnd, nP_flat);
       }
-      // ---- TC-3/TC-4: the eq-1 residue source's band factors -------------------------
+      // ---- the band factors of the CD residue source ---------------------------------
       // Built here for the block's WHOLE star, in its own loop over (isym, q). It does
       // NOT ride on the stage-2 work split below: the split hands different (isym, q)
       // pairs to different members of a helper group, and the residue evaluator needs
@@ -2298,7 +2185,7 @@ namespace qp_modea {
               const long r = rk_qp(qs, p);
               if (r == 0) continue;
               // the trev-q rule is conj(W_PQ) elementwise, i.e. V -> conj(V) with S real
-              // (an (Np,r) copy, not the (Np,Np) one the dense path used to make per (n,p))
+              // (an (Np,r) copy per (q,p), never an (Np,Np) one per (n,p))
               if (wconj) Vw(all, nda::range(0, r)) = nda::conj(sWv.local()(qs, p, all, nda::range(0, r)));
               else       Vw(all, nda::range(0, r)) = sWv.local()(qs, p, all, nda::range(0, r));
               for (long rr = 0; rr < r; ++rr) {
@@ -2330,8 +2217,8 @@ namespace qp_modea {
             }
           } else {
             // reference path: the dense Np^2 sandwich. p is the OUTER loop so that the slab
-            // is used through a view -- the (Np,Np) copy this loop used to make per (n,p) was
-            // pure memory traffic. The trev-q conj is moved off the big matrix through
+            // is used through a view, with no (Np,Np) copy per (n,p). The trev-q conj is
+            // moved off the big matrix through
             //     B^T conj(W) conj(B) = conj( conj(B)^T W B ),
             // an (nbnd,nbnd) conjugation instead of an (Np,Np) one.
             for (long p = 0; p < npk; ++p) {
@@ -2376,7 +2263,7 @@ namespace qp_modea {
       // COVERAGE TRIPWIRE for the split above. Every (isym, q) pair of the star must have been
       // computed by exactly ONE member of the group, and the pairs must cover the full q mesh
       // -- the two assumptions the whole distribution rests on. Both are cheap to verify and
-      // neither is reachable by the single-rank gates (a helper group needs more ranks than
+      // neither is exercised by single-rank tests (a helper group needs more ranks than
       // there are (s,k) blocks), so they are checked at run time instead.
       {
         const long tot = (gsize > 1) ? wcomm.all_reduce_value(npair_mine, std::plus<>{})
@@ -2402,18 +2289,18 @@ namespace qp_modea {
     if (need_diag)
       mpi->comm.all_reduce_in_place_n(ctx.Mdiag.data(), ctx.Mdiag.size(), std::plus<>{});
 
-    // ================= TC-3: THE CONTOUR RESIDUE SOURCE ==============================
-    // Everything above ran the production tau route, so blk.M / ctx.om carry the eq-1
-    // IMAGINARY-AXIS term. What is added here is the residue term's W-source: the tilted
+    // ================= THE CONTOUR RESIDUE SOURCE ====================================
+    // Everything above ran the tau route, so blk.M / ctx.om carry the IMAGINARY-AXIS term
+    // of the CD formula (sigma_cd_line.hpp). What is added here is the residue term's W-source: the tilted
     // contour, its sampled Pi, a reusable transform factorization, and the closure that
     // turns (J, z) into <aJ|W^c(q_J, z)|Jb>. The closure OWNS its inputs through
     // shared_ptr, so the context is self-contained afterwards.
     if (contour) {
-      // TC-4 F5: the band factors are always available here -- `cd_band_on` is true
-      // whenever `contour` is, and the representation (store or recompute) was chosen
-      // above. No cap and no rank/group layout can turn this route off any more.
+      // The band factors are always available here -- `cd_band_on` is true whenever
+      // `contour` is, and the representation (store or recompute) was chosen above. No
+      // cap and no rank/group layout can turn this route off.
       utils::check(ctx.have_bstore,
-                   "qp_modea: qp_modea_wfit = \"contour\" has no eq-1 band factors; this is "
+                   "qp_modea: qp_modea_wfit = \"contour\" has no CD band factors; this is "
                    "an internal inconsistency (cd_band_on must follow `contour`).");
       const long nk_lin = [&]() {
         auto kg = MF->kp_grid();
@@ -2440,9 +2327,9 @@ namespace qp_modea {
           std::chrono::steady_clock::now() - t_pc).count();
       auto tf = std::make_shared<tilted_contour::transform_factor_t>(
           tilted_contour::factor_transform(pctx->c));
-      // ⚠ TC-4 LIVELOCK FIX. thc_reader_t::Z(iq) is an MPI COLLECTIVE over the THC
+      // ⚠ DEADLOCK HAZARD. thc_reader_t::Z(iq) is an MPI COLLECTIVE over the THC
       // array's communicator; the evaluator runs where every rank has different work, so
-      // calling it from there deadlocks (m3d SVO, 60 ranks, 19 h at 100 % CPU). Acquire
+      // calling it from there deadlocks (ranks spin indefinitely at full CPU). Acquire
       // every tile HERE instead -- this point is reached by all ranks in lockstep -- and
       // hand the evaluator a plain node-shared table. See the invariant on
       // p_contour::gather_Z_tiles.
@@ -2461,20 +2348,19 @@ namespace qp_modea {
       clo.delta = pctx->geom.delta;
       qp_modea::cd_line_prepare(*ctx.cdl, ctx, clo);
       ctx.cdl->route = "contour";
-      // TC-4: how many residue targets one batched call carries. The two buffers it sizes
+      // How many residue targets one batched call carries. The two buffers it sizes
       // are the (nt x Np^2) transform buffer inside the source (twice, for the mirror
       // rows) and the (nt x nbnd^2) sandwich buffer in the assembly.
       const double per_target = 16.0 * (double(nbnd) * double(nbnd)
                                         + 2.0 * double(NP) * double(NP));
       const long batch_max = std::max(1L, long(opts.cd_batch_mb * 1.048576e6 / per_target));
       ctx.cdl->batch_max = batch_max;
-      // ================= TC-5: THE AMORTIZED W^c TILE CACHE ======================
+      // ================= THE AMORTIZED W^c TILE CACHE ===========================
       // W^c(omega + i delta) is delta-smooth, so build it ONCE on a target-line
       // grid and interpolate, instead of one Np^3 Dyson per scattered residue
-      // target. Sized from the MEASURED law (notes/tilted_contour_validation_
-      // results.md section 8), filled HERE -- the lockstep point next to
-      // gather_Z_tiles -- and AUDITED, because section 8.7 showed the law's
-      // constant is not universal.
+      // target. Sized from an empirical error law (wc_grid::size_wc_grid), filled
+      // HERE -- the lockstep point next to gather_Z_tiles -- and AUDITED, because
+      // the law's constant is system dependent.
       std::shared_ptr<wc_grid::wc_grid_t> wgrid;
       wc_grid::wgrid_audit_t waudit;
       if (opts.wgrid_mev > 0.0) {
@@ -2500,7 +2386,7 @@ namespace qp_modea {
         const double zmax = std::max(std::abs(eJhi - wlo), std::abs(eJlo - whi));
         auto geom = wc_grid::size_wc_grid(opts.wgrid_mev, pctx->geom.delta, zmax,
                                           opts.wgrid_h);
-        app_log(lvl, "  - TC-5 grid window:            in-strip omega in [{:.6g}, {:.6g}] "
+        app_log(lvl, "  - W^c grid window:             in-strip omega in [{:.6g}, {:.6g}] "
                      "a.u. ({}), eps_J in [{:.6g}, {:.6g}] -> |Re z| <= {:.6g} a.u. "
                      "({:.4g} eV)", wlo, whi,
                 strip.active ? "STRIP-BOUNDED" : "strip inactive: full QP range",
@@ -2522,9 +2408,8 @@ namespace qp_modea {
           //
           // ⚠ COVERAGE SEMANTICS: `qp_tc_wgrid_audit` is the number of samples PER
           // IBZ TRANSFER, not in total, so every q is covered even when the total is
-          // partitioned thinly across many ranks. The old reading (a global total,
-          // chunked over ranks) degenerated to ONE sample on a 60-rank run and its
-          // coverage statement was therefore close to vacuous.
+          // partitioned thinly across many ranks (a global total chunked over ranks
+          // would degenerate to a single sample on large runs).
           auto sampler = [&](long b0, long b1, std::vector<double> &zs,
                              std::vector<long> &qs) {
             if (not can_sample) return;               // owns no block: contributes none
@@ -2555,7 +2440,7 @@ namespace qp_modea {
                        "is vacuous. Either the target set is empty (no in-strip state "
                        "contributes) or the sampler's predicate disagrees with the "
                        "evaluator's. Do not trust the grid until this is understood.");
-          // carried into the [Q6] summary line as `wgrid_aud` so a breach is
+          // carried into the per-map summary line as `wgrid_aud` so a breach is
           // harvestable per map, not only visible in the banner
           auto &LRw = last_run();
           LRw.wgrid_meas_mev = waudit.meas_mev;
@@ -2570,18 +2455,18 @@ namespace qp_modea {
       ctx.cdl->stats = sstat;
       ctx.have_cdl = true;
 
-      app_log(lvl, "  - TC-3 CONTOUR ROUTE:          eq-1 CD assembly; imaginary-axis term "
+      app_log(lvl, "  - CONTOUR ROUTE:               CD assembly; imaginary-axis term "
                    "from the tau pole set ({} poles, CLOSED FORM), residue term from the "
                    "contour ({} nodes, delta = {:.6g} a.u. = {:.4g} eV); transform "
                    "factorization cond = {:.3e}; P sampling wall {:.2f} s; line solver = {}",
               npk, pctx->c.rank, clo.delta, clo.delta * 27.211386245988, tf->cond,
               t_sample, opts.tc_krylov ? "warm-started GMRES" : "dense");
-      app_log(lvl, "  - TC-4 Z tiles pre-gathered:   {} x Np {} x Np, {:.1f} MB per NODE, "
+      app_log(lvl, "  - Z tiles pre-gathered:        {} x Np {} x Np, {:.1f} MB per NODE, "
                    "{:.2f} s. The evaluator is COLLECTIVE-FREE: thc.Z(q) is a collective "
-                   "and the per-rank work loop must never reach one (the m3d 60-rank "
-                   "livelock).",
+                   "and the per-rank work loop must never reach one (it would "
+                   "deadlock).",
               nq_ibz, NP, double(nq_ibz) * NP * NP * 16.0 / 1.048576e6, t_zgather);
-      app_log(lvl, "  - TC-4 residue batching:       {} targets per call ({:.0f} MB budget, "
+      app_log(lvl, "  - residue batching:            {} targets per call ({:.0f} MB budget, "
                    "{:.2f} MB/target: 2 x Np^2 transform + nbnd^2 sandwich; the transform "
                    "buffer is allocated ONCE by the source, not per call); band factors "
                    "{}", batch_max, opts.cd_batch_mb, per_target / 1.048576e6,
@@ -2603,7 +2488,7 @@ namespace qp_modea {
     const double m_mq = any_work ? double(nbnd) * double(nbnd) * double(nbnd) * double(npk) * sz
                                  : 0.0;
     const double m_dia = need_diag ? double(ns) * nk_ibz * nbnd * nP_flat * sz : 0.0;
-    // TC-4: the eq-1 band factors, which OUTLIVE the build (the residue source reads them
+    // the CD band factors, which OUTLIVE the build (the residue source reads them
     // for the whole inner loop). This is the term the recompute path exists to shrink:
     // nJ x Np x nbnd PER OWNED BLOCK stored, against nsym x Np x nbnd per block plus ONE
     // shared ns*nkpts x Np x nbnd recomputed.
@@ -2678,7 +2563,7 @@ namespace qp_modea {
     LR.wfit = opts.wfit;
     LR.res_ratio = ctx.diag.res_ratio_worst;
     LR.wrtol = mpf_opt.has_value() ? mpf_opt->rel_tol : opts.wrtol;
-    // RW-2 spectral census (all zero on the tau/nu routes)
+    // spectral-route census (all zero on the tau/nu routes)
     LR.sp_eta = ctx.diag.sp_eta;
     LR.sp_NO = ctx.diag.sp_NO;
     LR.sp_nbin = ctx.diag.sp_nbin;

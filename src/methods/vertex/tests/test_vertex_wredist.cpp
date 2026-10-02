@@ -19,20 +19,18 @@
  */
 
 /**
- * Vertex parallelization MILESTONE 1, change-list item #1 -- the W-redistribution
- * round-trip test (notes/vertex_parallelization_analysis.md section 4.2 #4;
- * notes/vertex_parallelization_M1.md).
+ * Vertex parallel infrastructure: the W-redistribution round trip and the
+ * reduce-scatter of partial Pi^C contributions.
  *
  * The dynamic screened interaction dW lives on the RPA (t,q,P,Q) proc grid
- * (MBState::dW_qtPQ; the vertex slab has axis order (q,t,P,Q)). M2 (change-list items
- * #3/#4) will consume dW as a q-OWNED layout via the proven math::nda::redistribute
- * (nda_utils.hpp:866 -> redistribute_alltoallv). This test pins that the redistribution
- * is PURE DATA MOVEMENT and therefore BIT-IDENTICAL:
+ * (MBState::dW_qtPQ; the vertex slab has axis order (q,t,P,Q)). The vertex kernels can
+ * consume dW in a q-OWNED (or t-pooled) layout via math::nda::redistribute
+ * (redistribute_alltoallv). This test pins that the redistribution is PURE DATA
+ * MOVEMENT and therefore BIT-IDENTICAL:
  *
  *   dW on (q,t,P,Q)  --redistribute-->  q-owned  --redistribute-->  back
  *
  * must reproduce the original array element-for-element (exact ==), on any rank count.
- * This is the infrastructure guarantee the M2 kernel re-parallelization rests on.
  */
 
 #undef NDEBUG
@@ -137,7 +135,7 @@ TEST_CASE("vertex_wredist_roundtrip", "[methods][vertex][wredist]") {
   }
 
   SECTION("t_pooled_roundtrip") {
-    // an alternative M2 target -- t-pooled (axis 1). Also pure data movement.
+    // alternative target layout: t-pooled (axis 1). Also pure data movement.
     shape_t<4> tgrid{1, P, 1, 1};
     auto B = make(tgrid);
     B.local() = ComplexType(0.0);
@@ -156,14 +154,15 @@ TEST_CASE("vertex_wredist_roundtrip", "[methods][vertex][wredist]") {
     REQUIRE(ndiff == 0);
   }
 
-  // ---- M3 item #8: reduce-scatter of a PARTIAL into the RPA grid ---------------------
+  // ---- reduce-scatter of a PARTIAL into the RPA grid ---------------------------------
   // The Pi^C kernel produces a PARTIAL replicated array on every rank (its round-robin
   // tuple/q_ext contribution to the WHOLE (t,q,P,Q) array). reduce_scatter_into sums the
   // partials and lands each output block ONLY on its owner. This test replicates that
   // exact composition (per-owner MPI_Reduce over gathered block boxes) and pins it against
   // the serial reference: sum over all ranks of the partials == all_reduce of the partial.
   // At P=1 it is a bit-identical copy; at P>1 the reduce-scatter must reproduce the
-  // all_reduce result on the owned block (a pure integer/exact-sum data movement here).
+  // all_reduce result on the owned block; the 1e-11 relative tolerance only absorbs the
+  // summation-order rounding of the MPI reduction.
   SECTION("reduce_scatter_into_rpa_grid") {
     // rank-dependent PARTIAL: part_r(q,t,P,Q) = wref(...) * (r+1). The true sum over all
     // ranks is wref * sum_{r=0}^{P-1}(r+1) = wref * P*(P+1)/2 -- an exact reference.

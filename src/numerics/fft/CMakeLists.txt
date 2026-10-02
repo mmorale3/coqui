@@ -40,27 +40,18 @@ target_link_libraries(fft_lib PUBLIC utils nda_c)
 if(ENABLE_FFTW)
   target_link_libraries(fft_lib PUBLIC FFTW::Double)
   # ------------------------------------------------------------------------------------
-  # T-3b item 3.3 (notes/coqui_threading_t3a.md section 2.3 row 8 / section 3.3): actually
-  # LINK a threaded FFTW so init_threads() in fftw.cpp has something to drive. The root
-  # CMakeLists has been asking find_package for the threaded double library since the FFTW
-  # block was written; only FFTW::Double was ever linked, so fftw_init_threads() /
-  # fftw_plan_with_nthreads() had no implementation behind them.
+  # Link a threaded FFTW so init_threads() in fftw.cpp has something to drive: with only
+  # FFTW::Double linked, fftw_init_threads() / fftw_plan_with_nthreads() have no
+  # implementation behind them.
   #
-  # WHY THE PTHREADS FLAVOUR AND NOT THE OpenMP ONE. Measured on a rusty genoa node with
-  # fftw/3.3.10 (job 6912051, 128^3 c2c, 20 executes, OMP_NUM_THREADS=1):
-  #
-  #     libfftw3_omp      nthreads = 1 / 2 / 4 / 8  ->  0.213 / 0.214 / 0.213 / 0.256 s
-  #     libfftw3_threads  nthreads = 1 / 2 / 4 / 8  ->  0.208 / 0.102 / 0.067 / 0.041 s
-  #     libfftw3_omp at OMP_NUM_THREADS=8, nthreads = 8 -> 0.041 s
-  #
-  # i.e. FFTW's OpenMP backend takes its TEAM SIZE from the ambient OpenMP thread count, not
-  # from fftw_plan_with_nthreads (confirmed in the disassembly: it calls GOMP_parallel with
-  # num_threads = 0). CoQui's threading contract pins OMP_NUM_THREADS at 1 forever, because
-  # raising it activates SLATE's libgomp task layer and its tasks issue MPI
-  # (notes/coqui_threading_spec.md rev 3 section 7.2 item 1) -- so FFTW::DoubleOpenMP would be
-  # a knob that silently does nothing, or an OMP_NUM_THREADS dependence the spec forbids.
+  # WHY THE PTHREADS FLAVOUR AND NOT THE OpenMP ONE. FFTW's OpenMP backend takes its TEAM
+  # SIZE from the ambient OpenMP thread count, not from fftw_plan_with_nthreads (it calls
+  # GOMP_parallel with num_threads = 0): at OMP_NUM_THREADS=1 libfftw3_omp runs serially
+  # whatever nthreads is requested. CoQui keeps OMP_NUM_THREADS at 1, because raising it
+  # activates SLATE's libgomp task layer, whose tasks issue MPI -- so FFTW::DoubleOpenMP
+  # would be a knob that silently does nothing, or an OMP_NUM_THREADS dependence.
   # The pthreads flavour honours fftw_plan_with_nthreads exactly, with zero OpenMP
-  # involvement, which is precisely the decoupling this increment is built on.
+  # involvement.
   #
   # If the pthreads flavour is absent we link NO threaded flavour and say so: silently
   # falling back to the OpenMP one would produce an inert `omp_threads` knob for FFTs.
@@ -78,8 +69,7 @@ endif()
 if(ENABLE_CUDA)
   target_link_libraries(fft_lib PUBLIC CUDA::cufft)
 endif()
-# RW-1: the finufft link block, merged in ALONGSIDE the T-3b FFTW::DoubleThreads block
-# above (both live in this file; neither replaces the other).
+# FINUFFT (and, optionally, cuFINUFFT) for the non-uniform FFT backend.
 if(ENABLE_FINUFFT)
   target_link_libraries(fft_lib PUBLIC FINUFFT::finufft)
   if(ENABLE_CUFINUFFT)

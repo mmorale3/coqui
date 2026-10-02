@@ -23,19 +23,19 @@
 
 /**
  * ===========================================================================
- * P ON THE TILTED CONTOUR  (increment TC-2 / spec M3, notes/tc_coqui_impl_spec.md)
+ * P ON THE TILTED CONTOUR
  * ===========================================================================
  *
  * The ISDF space-time polarization kernel evaluated at COMPLEX times
  * t_j = s_j e^{-i theta} on the tilted contour of
  * numerics/tilted_contour/tilted_contour.hpp, from the CURRENT QP spectrum and
- * MO coefficients -- the same G provenance as the RW-2 spectral path's
- * A builder (rw2_report.md section 1.3).
+ * MO coefficients -- the same QP Green's function the real-axis spectral
+ * path (wc_spectral.hpp) is built from.
  *
  * ---------------------------------------------------------------------------
  * 1. THE CONTRACTION IS THE tau CODE'S, WITH A COMPLEX ARGUMENT
  * ---------------------------------------------------------------------------
- * scr_coulomb_t::eval_Pi_rpa_Rspace (methods/scr_coulomb/rpa_pi.icc:102-176) is
+ * scr_coulomb_t::eval_Pi_rpa_Rspace (methods/scr_coulomb/rpa_pi.icc) is
  *
  *   Gp_PQ(k)  = X_Pa(k) G_ab(tau; k_ibz) conj(X_Qb(k))         [primary_to_aux]
  *   Gn_PQ(k)  = the same at G(beta - tau)
@@ -47,7 +47,7 @@
  * e^{-xi_n tau} -> e^{-i xi_n t}, and with TWO conjugations replaced by
  * TRANSPOSES:
  *
- *   (a) THE TIME-REVERSAL FILL. rpa_pi.icc:110 writes the trev-paired FBZ point
+ *   (a) THE TIME-REVERSAL FILL. rpa_pi.icc writes the trev-paired FBZ point
  *       as conj(G_PQ(k')). The general relation is
  *
  *           G_PQ(-k) = G_QP(k)                                             (T)
@@ -56,18 +56,17 @@
  *       coincide only because G(k) is HERMITIAN in (P,Q) at imaginary time,
  *       where the pole weights are real. At complex t the weights are complex,
  *       G(k,t) is not Hermitian, and the conjugation is WRONG.
- *   (b) THE HADAMARD PARTNER. rpa_pi.icc:156 forms Gp_PQ(R) conj(Gn_PQ(R)); the
+ *   (b) THE HADAMARD PARTNER. rpa_pi.icc forms Gp_PQ(R) conj(Gn_PQ(R)); the
  *       object it means is Gn_QP(-R), i.e.
  *
  *           Gnt_PQ(R) = sum_k conj(f_Rk(R,k)) Gn_QP(k,t)                   (H)
  *
  *       which equals conj(Gn_PQ(R)) again only through the same Hermiticity.
  *
- * This is the RW-2 transpose finding (rw2_report.md section 3.7) in a second
- * place, and for the same reason. Both reductions are EXACT at t = -i tau, so
- * this module and the tau code are algebraically the same object there -- which
- * is gate TC-2-a(i), a direct numerical check that costs nothing extra.
- * [verified -- gate: TC-2-a(i), test_methods_tc_contour.cpp]
+ * The real-frequency spectral path needs the same transposes for the same
+ * reason. Both reductions are EXACT at t = -i tau, so this module and the tau
+ * code are algebraically the same object there; test_methods_tc_contour.cpp
+ * checks that identity numerically.
  *
  * ---------------------------------------------------------------------------
  * 2. THE POLE WEIGHTS, AND WHY THE OCCUPATION SITS IN THE EXPONENT
@@ -96,13 +95,13 @@
  * Delta > 0 for the physical particle-hole pairs -- the RESONANT half, which is
  * exactly what the contour transform represents. The thermally-occupied
  * "wrong-way" pairs are present too, with weight e^{-beta|Delta|}; at the beta
- * of any production run that is 1e-40 and below, and it is reported.
+ * of a typical run that is 1e-40 and below, and it is reported.
  *
  * ---------------------------------------------------------------------------
  * 3. THE ANTI-RESONANT HALF *AND* THE OVERALL SIGN
  * ---------------------------------------------------------------------------
  * What `sample_P_at_times` returns is the analytic continuation of the CODE'S
- * Pi(tau) -- so that the t = -i tau check of gate TC-2-a(i) is a bare identity:
+ * Pi(tau) -- so that the t = -i tau check against the tau code is a bare identity:
  *
  *      Pi(t) = sum_p c_p e^{-i Delta_p t},
  *
@@ -125,36 +124,34 @@
  *
  * TWO things are load-bearing there and neither is optional:
  *   * THE MINUS SIGN is the Jacobian of dtau = i dt between the two transform
- *     conventions (the campaign's P(z) = sum w/(z-D) versus the code's
+ *     conventions (the contour transform's P(z) = sum w/(z-D) versus the code's
  *     Pi(i nu) = sum w/(D - i nu)). It propagates straight into
- *     W^c = v[1 - v Pi]^{-1} v Pi v at TC-3.
- *     MEASURED: dropping it makes gate TC-2-a(ii) read a relative error of
- *     exactly 2.0000 at every target -- got = -exact.
+ *     W^c = v[1 - v Pi]^{-1} v Pi v. Dropping it returns exactly -Pi at every
+ *     target (relative error 2 against the imaginary-axis result).
  *   * THE DAGGER on the mirror row, for the same reason as (a)/(b) above.
  * `polarization_from_contour` below is that combination; on the imaginary axis
  * z = i nu the mirror target -conj(z) IS z, so Pi(i nu) = -[R + R^dag] and the
  * transform needs no extra row there. Off the imaginary axis the conjugate-
- * mirror rows of BINDING 2 in tilted_contour.hpp supply R(-conj z).
+ * mirror rows of tilted_contour.hpp (choice 2 there) supply R(-conj z).
  *
  * ---------------------------------------------------------------------------
  * 4. THE GEOMETRY, FROM THE CURRENT QP SPECTRUM
  * ---------------------------------------------------------------------------
- * Ported from tc_validation/spectra.py (the campaign's own conventions, section
- * 1 of notes/tilted_contour_validation_results.md):
+ * All contour parameters are derived from the spectrum:
  *   Delta support   the q-INTEGRATED particle-hole support,
  *                   Dmin = min(empty) - max(occupied),
  *                   Dmax = max(empty) - min(occupied);
  *   W_band          the frontier valence cluster: pool the occupied eigenvalues,
  *                   walk down from mu until a gap > 2 eV;
  *   target window   W_target = zeta_max - Dmin with zeta_max the QP half-window;
- *   delta           eq 8 with the MEASURED mesh constant,
- *                   delta_mesh = 1.2 W_band / N_k   <-- FLAGGED: the spec writes
- *                   0.7; results section 5.4 measured the 1 %-crossing at
- *                   0.81-3.99 x the 0.7 prediction, median 1.69, i.e. a fitted
- *                   constant of ~1.2. And delta = eta_targ, NOT 3.5 eta_targ
- *                   (results section 7.2 item 5, the adopted sub-meV tier).
- *   N_k             cbrt(nkpts) -- exact for the cubic meshes the campaign and
- *                   the fixtures use; FLAGGED for anisotropic meshes.
+ *   delta           the k-mesh resolution floor of the transition energies,
+ *                   delta_mesh = 1.2 W_band / N_k. The constant 1.2 is
+ *                   empirical: it is fitted to the broadening at which the
+ *                   k-discretization error crosses 1 % on cubic meshes (a
+ *                   simple estimate gives 0.7, which is too small). delta is
+ *                   used as the target broadening itself, not a multiple of it.
+ *   N_k             the linear k-mesh count (the caller passes min(kp_grid));
+ *                   the delta law is calibrated on cubic meshes only.
  */
 
 #include <algorithm>
@@ -189,9 +186,9 @@ namespace p_contour {
   namespace tc = tilted_contour;
 
   inline constexpr double ha_to_eV = 27.211386245988;
-  /** the campaign's frontier-cluster separator, 2 eV (tc_validation/spectra.py GAP_CUT) */
+  /** energy gap that separates the frontier valence cluster from deeper bands, 2 eV */
   inline constexpr double gap_cut_eV = 2.0;
-  /** the MEASURED k-mesh constant (results section 5.4); the spec writes 0.7. FLAGGED. */
+  /** empirical k-mesh constant of the delta recipe (calibrated on cubic meshes) */
   inline constexpr double delta_mesh_const = 1.2;
 
   // =========================================================================
@@ -203,7 +200,7 @@ namespace p_contour {
     double rho = 0.65;             ///< qp_tc_rho
     std::string profile = "flat";  ///< qp_tc_profile: "flat" | "growing"
     bool trunc = false;            ///< qp_tc_trunc: band truncation along the contour
-    double zeta_max = 10.0 / ha_to_eV;  ///< QP half-window (a.u.); the campaign's JUDGE_SPAN
+    double zeta_max = 10.0 / ha_to_eV;  ///< QP half-window (a.u.)
     long   nx = 2500;              ///< adapted Delta-grid resolution
     int    level = 2;              ///< logging level
   };
@@ -222,9 +219,8 @@ namespace p_contour {
   };
 
   /**
-   * Delta support, W_band and the eq-8 delta from the CURRENT QP spectrum.
+   * Delta support, W_band and the recipe delta from the CURRENT QP spectrum.
    * `E` is (ns, nk_ibz, nbnd) ABSOLUTE quasiparticle energies in a.u.
-   * [port of tc_validation/spectra.py::Fixture._derive]
    */
   template<typename E_t>
   geom_t analyze_spectrum(E_t const &E, double mu, long nk_lin, opts_t const &o) {
@@ -234,9 +230,9 @@ namespace p_contour {
     g.zeta_max = o.zeta_max;
     // nk_lin is the LINEAR mesh count of delta_mesh = 1.2 W_band / N_k. The caller
     // supplies min(kp_grid) -- the coarsest direction, which is where transition
-    // energies move most between neighbouring k -- and that reduces to N_k on the
-    // cubic meshes the campaign measured. FLAGGED for strongly anisotropic meshes:
-    // the campaign never measured one (results section 5.4 is a cubic-mesh law).
+    // energies move most between neighbouring k -- and that reduces to N_k on cubic
+    // meshes. The delta law is calibrated on cubic meshes; strongly anisotropic meshes
+    // are outside that calibration.
     g.nk_lin = std::max(1L, nk_lin);
 
     std::vector<double> occ, emp;
@@ -270,20 +266,17 @@ namespace p_contour {
     g.W_band = mu - occ[std::size_t(lo)];
 
     g.delta_mesh = delta_mesh_const * g.W_band / double(g.nk_lin);
-    g.delta = (o.delta > 0.0) ? o.delta : g.delta_mesh;   // eq 8 at eta_targ, no 3.5x
-    // ⚠ W_target's FLOOR. The campaign's convention is W_target = zeta_max - Dmin, with
-    // the residue targets running over w in [Dmin, Dmin + W_target] -- which silently
-    // assumes Dmin < zeta_max, i.e. that the particle-hole edge lies INSIDE the QP
-    // window. On a wide-gap insulator it does not: LiH's converged mode-A gap is
-    // 12.9 eV against zeta_max = 10 eV, W_target hit its 1e-6 guard, tan(theta) =
-    // rho*delta/W_target exploded and S sin(theta) reached 5.1e+07 -- the beta guard
-    // below fired, correctly, at the second outer iteration.
+    g.delta = (o.delta > 0.0) ? o.delta : g.delta_mesh;   // delta is the target broadening itself
+    // ⚠ W_target's FLOOR. W_target = zeta_max - Dmin, with the residue targets running
+    // over w in [Dmin, Dmin + W_target], assumes Dmin < zeta_max, i.e. that the
+    // particle-hole edge lies INSIDE the QP window. On a wide-gap insulator (gap larger
+    // than zeta_max) it does not: W_target would collapse to ~0, tan(theta) =
+    // rho*delta/W_target would explode and S sin(theta) would trip the beta guard below.
     // The regime is actually the EASY one: when Dmin > zeta_max every residue target
     // sits BELOW the particle-hole edge, where a(D) = (D - w) sin th + d cos th is large
-    // for every transition, so eq 3 imposes no real constraint. What it must not do is
-    // divide by zero. Flooring W_target at delta bounds tan(theta) <= rho and leaves S
-    // finite, without touching the Dmin < zeta_max case the campaign measured.
-    // [FLAGGED: the campaign never ran a fixture with Dmin > zeta_max.]
+    // for every transition, so tan(theta) < delta/W imposes no real constraint. What it
+    // must not do is divide by zero. Flooring W_target at delta bounds tan(theta) <= rho
+    // and leaves S finite, without touching the Dmin < zeta_max case.
     g.W_target = std::max(g.zeta_max - g.dmin, g.delta);
     g.window_floored = (g.zeta_max - g.dmin) < g.delta;
     utils::check(g.delta > 0.0,
@@ -293,14 +286,11 @@ namespace p_contour {
   }
 
   /**
-   * The growing-delta profile (spec eq 8 behind the qp_tc_profile knob).
+   * The growing-delta profile (qp_tc_profile = "growing").
    *   delta(zeta) = max(delta_mesh, 0.05 |zeta|)
    *   tan th      = rho * min_{zeta > dmin} delta(zeta)/(zeta - dmin)
    *   a(x)        = min_zeta [ (dmin + x - zeta) sin th + delta(zeta) cos th ]
-   * [port of tc_validation/spectra.py::{delta_profile, growing_tilt, a_growing},
-   *  with delta = eta_targ rather than the campaign's 3.5 eta_targ -- results
-   *  section 7.2 item 5 adopts eta_targ. FLAGGED: the campaign measured the
-   *  growing profile's 1.0-2.8x gain at 3.5 eta_targ.]
+   * with delta_mesh the flat recipe value as the floor.
    */
   struct growing_profile_t {
     std::vector<double> zeta, dz;
@@ -655,7 +645,7 @@ namespace p_contour {
     p.delta = ctx.geom.delta;
     p.rho  = o.rho;
     p.eps  = o.eps;
-    p.eps_tr = -1.0;                    // BINDING 3: eps_tr = eps^2
+    p.eps_tr = -1.0;                    // eps_tr = eps^2 (tilted_contour.hpp, choice 3)
     p.nx   = o.nx;
 
     if (o.profile == "growing") {
@@ -663,14 +653,14 @@ namespace p_contour {
       // The growing profile fixes theta itself (the binding tilt over the whole
       // target window); feed it back through rho so derive_geometry reproduces the
       // same tilt, and override gamma with the profile's OWN worst case a(0) --
-      // eq 4's flat closed form is not it, and gamma sets the contour length.
-      // [the campaign does exactly this: tc_validation/tests/common.py::Geom]
+      // the flat closed form delta cos(theta) (1 - rho) is not it, and gamma sets the
+      // contour length.
       p.rho = std::min(0.999, gp.tan_theta * p.W / p.delta);
       auto a_fun = [gp](double x) { return gp(x); };
       p.gamma_override = a_fun(0.0);
       utils::check(p.gamma_override > 0.0,
                    "p_contour: the growing delta profile gives a(0) = {} <= 0 at "
-                   "rho = {}; the tilt violates eq 3.", p.gamma_override, o.rho);
+                   "rho = {}; the tilt violates tan(theta) < delta/W.", p.gamma_override, o.rho);
       ctx.c = tc::build_contour(p, a_fun);
     } else {
       utils::check(o.profile == "flat",
@@ -706,7 +696,7 @@ namespace p_contour {
 
   /**
    * ===========================================================================
-   * THE eq-1 RESIDUE SOURCE, FED BY THE CONTOUR  (TC-3, batched at TC-4)
+   * THE CONTOUR-DEFORMATION RESIDUE SOURCE, FED BY THE CONTOUR
    * ===========================================================================
    *
    * Answers, for a LIST of internal states J at their targets z, the sandwiches
@@ -719,22 +709,23 @@ namespace p_contour {
    *      transfer q is the single gemm (n_z x rank) x (rank x Np^2);
    *   3. eq (SIGN):  Pi(z) = -[ R(z) + R(-conj z)^dag ];
    *   4. CoQuI's own Dyson chain, W^c = ([I - Z.Pi]^{-1} - I).Z with Z = thc.Z(q_J);
-   *   5. the trev-q rule and the band sandwich, EXACTLY as stage 2 does it:
+   *   5. the trev-q rule and the band sandwich, EXACTLY as stage 2 of
+   *      build_modea_context does it:
    *          wconj : T = W.B ,  Ms = conj( Bc^T . T )
    *          else  : T = W.Bc,  Ms = B^T . T
-   *      times the 1/nkpts prefactor stage 2 folds in.
+   *      times the 1/nkpts prefactor stage 2 folds in (ctx.cd_pref).
    *
    * STEPS 1 AND 2 ARE THE BATCHED ONES and they are the reason the batching exists: at
-   * rank r and grid nD both were BLAS-2 passes per target, r*nD and r*Np^2, which at the
-   * fixture sizes outweigh the Np^3 Dyson solve they feed. Steps 4-5 stay per target --
+   * rank r and grid nD, done per target they are BLAS-2 passes, r*nD and r*Np^2, which at
+   * typical sizes outweigh the Np^3 Dyson solve they feed. Steps 4-5 stay per target --
    * different z means a different dielectric matrix, and there is nothing to share.
    * Grouping by q is a pure REORDERING of independent targets: each one still gets its
    * own row of F and its own solve, and the results are written back in the caller's
-   * order. [gate: the [TC-4 batch] leg of tc3b1_identity_lih222 (batched vs per-target,
-   *  0.000e+00) and tc_contour_batch_scaling (the same two primitives at Np = 364)]
+   * order. test_methods_tc_contour.cpp checks the batched evaluator against the
+   * per-target path.
    *
    * The band factors B and the (IBZ q, trev) pair come from `modea_ctx::cd_band_store`,
-   * which supplies them from its store or recomputes them (TC-4 F5); either way the
+   * which supplies them from its store or recomputes them; either way the
    * evaluator re-derives no symmetry bookkeeping.
    */
   // ===========================================================================
@@ -749,19 +740,18 @@ namespace p_contour {
    * different set of q-transfers. Any collective reached from there has a call sequence
    * that differs across ranks, and MPI deadlocks -- as a spin, not a crash.
    *
-   * MEASURED: the m3d SVO run (60 ranks) hung for 19 h at 100 % CPU on every rank, in
+   * The symptom of a violation is every rank spinning at 100 % CPU in
    *   PMPI_Gather <- boost::mpi3 gather <- math::nda::gather_sub_matrix
    *   <- thc_reader_t::Z(int, bool) <- p_contour::detail::contour_residue_batch.
    *
-   * `thc_reader_t::Z(iq)` (thc_reader_t.hpp:720) is that collective: in the `incore`
+   * `thc_reader_t::Z(iq)` (thc_reader_t.hpp) is such a collective: in the `incore`
    * path it loops over EVERY rank of the THC array's communicator, broadcasting the
    * requested iq from each in turn and gathering that rank's tile. It supports
    * different iq per rank, but ONLY if every rank calls it the same number of times, in
-   * lockstep. The repository already knew this -- scr_coulomb_t.cpp:1341 pads its own
-   * call count with the comment "prevent dead block in thc.Z() in case nq_loc is not
-   * the same for all processors".
+   * lockstep; scr_coulomb_t.cpp pads its own call count for the same reason ("prevent
+   * dead block in thc.Z() in case nq_loc is not the same for all processors").
    *
-   * THE FIX is to acquire every tile ONCE, here, where all ranks are in lockstep, and
+   * Every tile is therefore acquired ONCE, here, where all ranks are in lockstep, and
    * hand the evaluator a plain node-shared array. `contour_residue_batch` therefore
    * takes NO reader handle at all -- not `thc`, not an ERI object, nothing that can
    * reach a communicator. That is the invariant made structural rather than remembered:
@@ -770,8 +760,8 @@ namespace p_contour {
    * Cost: nq_ibz collectives per context build (once per SCF iteration), against the
    * O(n_eval x nJ) it replaces. Memory: nq_ibz x Np^2 complex, ONE COPY PER NODE.
    *
-   * [gate: tc_contour_multirank_zseq, which runs deliberately divergent per-rank target
-   *  lists under mpiexec -- it hangs on the pre-fix code and completes on this one.]
+   * test_methods_tc_contour.cpp runs deliberately divergent per-rank target lists under
+   * mpiexec; a collective inside the evaluator would hang it.
    */
   template<typename thc_t>
   std::shared_ptr<sArray_t<Array_view_3D_t>> gather_Z_tiles(thc_t &thc) {
@@ -863,7 +853,7 @@ namespace p_contour {
       auto const &bs = ctx.bstore[std::size_t(bi)];
 
       // ===================================================================
-      //  TC-5: THE AMORTIZED PATH. W^c was built ONCE on the target-line
+      //  THE AMORTIZED PATH. W^c was built ONCE on the target-line
       //  grid (wc_grid::fill_wc_grid, at the lockstep point next to
       //  gather_Z_tiles), so a residue read is a local interpolation: no
       //  transform rows, no Pi contraction, no Dyson, and -- as with the Z
@@ -1018,7 +1008,7 @@ namespace p_contour {
       std::shared_ptr<methods::wc_line::solve_opts_t> sopt,
       std::shared_ptr<methods::wc_line::solve_stats_t> sstat,
       long nchunk,
-      std::shared_ptr<wc_grid::wc_grid_t> wg = nullptr) {   // TC-5 cache; null = per-target
+      std::shared_ptr<wc_grid::wc_grid_t> wg = nullptr) {   // W^c grid cache; null = per-target
     utils::check(ctx.have_bstore,
                  "p_contour::make_contour_residue_batch_owning: no band factors.");
     auto sc = std::make_shared<detail::residue_scratch_t>();
@@ -1030,7 +1020,7 @@ namespace p_contour {
     };
   }
 
-  /** The non-owning batched variant (the unit gates hold their own inputs). */
+  /** The non-owning batched variant (the unit tests hold their own inputs). */
   inline qp_modea::cd_residue_batch_fn make_contour_residue_batch(
       qp_modea::modea_ctx const &ctx,
       ctx_t const &pctx,
@@ -1092,13 +1082,13 @@ namespace p_contour {
   inline void log_contour(ctx_t const &ctx, opts_t const &o, int lvl) {
     auto const &g = ctx.geom;
     auto const &c = ctx.c;
-    app_log(lvl, "  - TILTED CONTOUR (TC-2):       Delta in [{:.6g}, {:.6g}] a.u. "
+    app_log(lvl, "  - TILTED CONTOUR:              Delta in [{:.6g}, {:.6g}] a.u. "
                  "([{:.4g}, {:.4g}] eV) from {} occupied x {} empty QP states; "
                  "W_band = {:.4g} eV ({} valence cluster(s)); N_k = {}",
             g.dmin, g.dmax, g.dmin * ha_to_eV, g.dmax * ha_to_eV, g.n_occ, g.n_emp,
             g.W_band * ha_to_eV, g.n_valence_clusters, g.nk_lin);
     app_log(lvl, "  - TC geometry:                 delta = {:.6g} a.u. ({:.4g} eV; "
-                 "recipe floor {:.4g} eV = {} W_band/N_k -- FLAGGED constant), "
+                 "recipe floor {:.4g} eV = {} W_band/N_k -- empirical constant), "
                  "W_target = {:.4g} eV{}, rho = {:.3g}, profile = {}",
             g.delta, g.delta * ha_to_eV, g.delta_mesh * ha_to_eV, delta_mesh_const,
             g.W_target * ha_to_eV,
@@ -1110,7 +1100,7 @@ namespace p_contour {
             c.g.theta, c.g.tan_theta, c.g.gamma, c.g.S,
             c.g.S / ha_to_eV * tc::hbar_eV_fs, o.eps, c.g.eps_tr);
     app_log(lvl, "  - TC rank:                     {} nodes at lambda > eps^2 lambda_max "
-                 "(spec-convention rank {}, conditioning ceiling {}); eq-6 estimate "
+                 "(eps-threshold rank {}, conditioning ceiling {}); semiclassical estimate "
                  "{:.1f}; s in [{:.4g}, {:.4g}] of S",
             c.rank, c.rank_eps, c.rank_ceil,
             tc::eq6_Ns(g.dmin, g.dmax, g.W_target, g.delta, o.rho, o.eps),

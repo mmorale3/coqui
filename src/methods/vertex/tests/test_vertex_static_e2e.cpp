@@ -1,5 +1,5 @@
 /**
- * INCREMENT S6 -- Formulation B-S end to end on a real system (LiH-222, symmetry-free).
+ * Formulation B-S end to end on a real system (LiH-222, symmetry-free).
  *
  * B-S is the Phi-derivable second-order-exchange functional with statically screened
  * (i.nu = 0) rungs. This target runs the WHOLE loop with vertex_rung = "static":
@@ -10,7 +10,7 @@
  * What this pins that the unit tests cannot:
  *   - the update_w SEAM: W0 is built from the SAME-ITERATION RPA polarizability, before
  *     any vertex piece runs, so a physically screened rung exists from iteration 1 and
- *     the parent's bare-rung bootstrap is structurally unnecessary (plan section 2.2);
+ *     no bare-rung bootstrap is needed;
  *   - that P really stays RPA (B-S has NO polarization injection -- the forbidden hybrid
  *     is unrepresentable, and eval_Pi_C carries a tripwire);
  *   - that BOTH self-energy cuts are present (Phi-derivability) and that the run is not
@@ -47,7 +47,7 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/SCF/scf_driver.hpp"
 #include "methods/vertex/vertex_t.h"
-// P0 (vertex_bl_mixed_term_split) reaches the kernel's TEST-ONLY S1/S2/S3 term gate,
+// vertex_bl_mixed_term_split uses the kernel's test-only S1/S2/S3 term selector,
 // vertex_detail::sigma_C_slot_probe.only_term. Header-only; the probe is an inline global.
 #include "methods/vertex/vertex_sigma.icc"
 
@@ -91,7 +91,7 @@ namespace bdft_tests {
                             "global", -1, 1e-8, -1.0, -1.0,
                             with_vertex ? rung : "dynamic");
       if (vtx.enabled()) {
-        // BOTH cuts, as production does (MBPT_drivers.cpp:372-373). For B-S the
+        // BOTH cuts, as the production driver does. For B-S the
         // scr_coulomb attachment is what builds W0 inside update_w; the gw attachment is
         // what evaluates Sigma^{C,x} + Sigma^{C,r}.
         scr_eri.set_vertex(&vtx);
@@ -122,12 +122,12 @@ namespace bdft_tests {
       REQUIRE(std::isfinite(bs.e_corr));
       // e_hf is evaluated on the SELF-CONSISTENT G, so adding a correlation term does
       // move it -- through the density, not through the functional. It must move only
-      // slightly (measured: ~7e-5 relative), never by a correlation-sized amount.
+      // slightly (well below 1e-3 relative), never by a correlation-sized amount.
       REQUIRE(std::abs(bs.e_hf - ref.e_hf) < 1e-3 * std::abs(ref.e_hf));
       // ... and the vertex must actually DO something.
       REQUIRE(std::abs(bs.e_corr - ref.e_corr) > 1e-9);
       // sanity band: a subspace vertex on 2 of 16 bands must not swamp the correlation
-      // energy (an uncontrolled run in the parent theory reached O(1e15)).
+      // energy (an uncontrolled vertex can diverge by many orders of magnitude).
       REQUIRE(std::abs(bs.e_corr - ref.e_corr) < 0.5 * std::abs(ref.e_corr));
     }
 
@@ -147,14 +147,14 @@ namespace bdft_tests {
       REQUIRE(std::abs(bl.e_corr - ref.e_corr) < 0.5 * std::abs(ref.e_corr));
     }
 
-    // ---- THE PRODUCTION-SCALE REFACTOR GATE for eq:pibardynfact --------------------------
+    // ---- pi^dyn: factorized route vs full-kernel route at production scale ----------------
     // B-L again with vertex_pidyn = "check": BOTH pi^dyn routes -- the factorized single
-    // bosonic pairing and the historic full-dynamic-Pi^C-then-tau=0 kernel -- run on
-    // IDENTICAL inputs every iteration, and vertex_t gates their agreement internally.
+    // bosonic pairing and the full-dynamic-Pi^C-then-tau=0 kernel -- run on
+    // IDENTICAL inputs every iteration, and vertex_t checks their agreement internally.
     // test_vertex_pibardynfact pins the algebra on a toy; this pins it on the real LiH path
     // (real DLR grid, real Zbar/W0bar rungs, the real response chain, both scf iterations),
     // which is where a representability failure of either integrand would first show. The
-    // timer table this run prints carries the measured speedup (both rows present).
+    // timer table this run prints has a row for each route.
     {
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
@@ -176,21 +176,18 @@ namespace bdft_tests {
       app_log(1, "vertex_static_e2e: B-L pidyn CHECK  e_corr = {:.12f}, "
                  "max rel |pi^dyn(factorized) - pi^dyn(kernel)| = {:.4e}", e_corr, dev);
       // liveness: both routes really ran and really are different code. Exact zero here
-      // would mean one route silently supplied the other's answer -- and in this project
-      // suspiciously exact agreement across a supposed code change has twice been the tell
-      // for a stale artifact, so it is a failure, not a pass.
+      // would mean one route silently supplied the other's answer, so it is a failure.
       REQUIRE(dev > 0.0);
-      // MEASURED 2026-07-30 at this grid (beta = 1000, wmax = 6, prec = "low", eps = 1e-6):
-      // 3.58e-03 in scf iteration 1 and 2.11e-02 in iteration 2. That is the DLR
-      // representability floor of reading two different exact Matsubara sums through the same
-      // tau = 0 row, and it is DATA DEPENDENT -- which is exactly why vertex_t warns on it
-      // instead of aborting, and why the abort bar is an O(1) routing bar. It is NOT the pole
-      // algebra: test_vertex_pibardynfact/production_grid_attribution measures the pole
-      // contribution at a factor 0.80, i.e. none.
+      // At this grid (beta = 1000, wmax = 6, prec = "low", eps = 1e-6) the deviation is of
+      // order 1e-2. That is the DLR representability floor of reading two different exact
+      // Matsubara sums through the same tau = 0 row, and it is DATA DEPENDENT -- which is why
+      // vertex_t warns on it instead of aborting, and why the abort bar is an O(1) routing
+      // bar. It is NOT the pole algebra (test_vertex_pibardynfact/production_grid_attribution
+      // shows the pole contribution is negligible).
       //
-      // So gate here only on what is meaningful: the deviation must stay far below the O(1)
-      // scale at which a mis-routing would show (the closest control the routing pin rejects
-      // is 1.24). The PHYSICS statement is the shift assertion in the next block.
+      // So check here only what is meaningful: the deviation must stay far below the O(1)
+      // scale at which a mis-routing would show (the closest control the routing test rejects
+      // is O(1)). The PHYSICS statement is the shift assertion in the next block.
       REQUIRE(dev < 0.25);
       // ... and record when pi^dyn is grid-limited, which at prec = "low" it is.
       if (dev > 1e2 * ft.eps())
@@ -203,11 +200,11 @@ namespace bdft_tests {
       REQUIRE(e_hf == bl.e_hf);
     }
 
-    // ---- and the historic route must land on the same physics ----------------------------
-    // vertex_pidyn = "kernel" is what every B-L number before 2026-07-30 was computed with.
-    // It must agree with the factorized route to the same floor -- this is the statement
-    // "the switch-over did not move B-L's answer", made as an assertion on e_corr rather
-    // than an assertion on an intermediate.
+    // ---- and the full-kernel route must land on the same physics -------------------------
+    // vertex_pidyn = "kernel" evaluates pi^dyn from the full dynamic Pi^C at tau = 0.
+    // It must agree with the factorized route to the same floor -- the statement that the
+    // two routes give the same B-L answer, made as an assertion on e_corr rather than
+    // an assertion on an intermediate.
     {
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
@@ -232,17 +229,16 @@ namespace bdft_tests {
               std::abs(shift_k - shift_f) / std::max(std::abs(shift_k), 1e-30));
       REQUIRE(std::isfinite(e_corr));
       // BOTH bars are relative to the VERTEX SHIFT, never to e_corr's own magnitude. e_corr
-      // is ~84x the shift here (0.095 vs 1.13e-03), so an e_corr-relative bar is a bar three
-      // orders TIGHTER on the quantity actually under test -- tighter than the measured DLR
-      // floor of the object feeding it, hence meaningless. MEASURED 2026-07-30:
-      //   e_corr  -0.095078681891 (kernel) vs -0.095078649549 (factorized) => 3.23e-08
-      //   vertex shift  +1.1343e-03 both ways => rel diff of the SHIFT = 2.85e-05
+      // is ~84x the shift here (0.095 vs 1.13e-03), so an e_corr-relative bar would be far
+      // tighter on the quantity actually under test -- tighter than the DLR floor of the
+      // object feeding it, hence meaningless. The relative difference of the shift is
+      // typically a few 1e-5.
       REQUIRE(std::abs(e_corr - bl.e_corr) <= 1e-3 * std::abs(shift_k));
       REQUIRE(std::abs(shift_k - shift_f) <= 1e-4 * std::abs(shift_k));
     }
 
     // ---- C = empty set must reproduce plain scGW EXACTLY in static mode -----------------
-    // (the primary regression of the whole project: with no subspace the vertex is inert)
+    // (the primary regression: with no subspace the vertex is inert)
     {
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
@@ -268,38 +264,27 @@ namespace bdft_tests {
   }
 
   // ======================================================================================
-  // P1 of the B-L plan: DOES THE Gamma HEAD-CHANNEL PROJECTION DO ANYTHING ON LiH?
+  // B-L Gamma head-channel projection on LiH: what does vertex_bl_head_projection move?
   //
-  // Everything ever measured about vertex_bl_head_projection was measured on Si -- where
-  // B-S and B-L disagree in the SIGN of d(e_corr) (+7.118e-03 vs -6.850e-03). On LiH they
-  // AGREE, in sign and to 1.7 % (+1.153e-03 vs +1.134e-03). So the discriminating question
-  // is what the projection is worth HERE. If it is ~a no-op on LiH and worth 1.17e-02 on Si
-  // (1.6x the entire B-S vertex correction), the B-S/B-L discrepancy localises to the Gamma
-  // head channel and the search narrows to one rank-1 object.
-  //
-  // Both arms are COLD and differ ONLY in the knob. That is deliberate: confounding the
-  // projection with the starting point is exactly what produced the retracted 2026-07-30
-  // conclusion (notes/bl_head_channel_diagnosis.md, "2026-07-31 RETRACTION").
+  // Runs plain scGW, B-S, and B-L with the projection OFF and ON, and reports the change in
+  // e_corr together with the head-channel meters. Both B-L arms start COLD and differ ONLY
+  // in the knob, so the projection is not confounded with the starting point.
   //
   // The meters are READ FROM vertex_t, not scraped from the log, and the head meters are
-  // chi-channel projections <H,.> -- never max-norms. Three independent max-norm gates have
-  // already been passed by objects differing ~10x in the only channel that matters.
+  // chi-channel projections <H,.> -- never max-norms, which can miss a large difference in
+  // the one channel that matters.
   //
-  // ⚠ THE POLICY MUST BE "gygi". The projection acts on the rank-1 Gamma head, and the head
+  // THE POLICY MUST BE "gygi". The projection acts on the rank-1 Gamma head, and the head
   // only EXISTS under a gygi-class div treatment: eval_Sigma_C sets
   // head_insertion = (_div_treatment contains "gygi"), and head_ok gates the projection on
-  // it. A first run of this A/B used "ignore_g0" (the default elsewhere in this file) and
-  // reported a perfectly bit-identical ON/OFF pair -- because the knob was STRUCTURALLY
-  // INERT, not because the projection does nothing. That measured null is kept as a fact
-  // (at ignore_g0 the projection is exactly inert on LiH, e_corr -0.095078649549 both ways,
-  // resp share 0.0260 both ways), and the liveness REQUIREs below exist so that failure mode
-  // can never again be misread as a physics result. Every Si number on file is gygi.
+  // it. Under "ignore_g0" the knob is structurally inert and ON/OFF are bit-identical; the
+  // liveness REQUIREs below make sure that case is never misread as a physics result.
   //
   // HIDDEN ([.]): a diagnostic A/B, not coverage -- an unfiltered ctest run skips it.
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blheadab]"
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blheadab]"
   //
-  // 🚨 The projection is NOT physical: it breaks Phi-derivability (see vertex_t.h,
+  // The projection is NOT physical: it breaks Phi-derivability (see vertex_t.h,
   // _bl_head_projection). This measures what it MOVES; it does not endorse using it.
   TEST_CASE("vertex_bl_head_projection_lih_ab", "[.][methods][vertex][static][blheadab]") {
 #ifndef ENABLE_DLR
@@ -319,7 +304,7 @@ namespace bdft_tests {
       double hl, hs, removed, resp_share;   // the four A/B meters, last iteration
     };
 
-    // The head-carrying policy -- see the ⚠ above. Not a parameter: at any other value the
+    // The head-carrying policy -- see above. Not a parameter: at any other value the
     // A/B measures nothing.
     const std::string policy = "gygi";
 
@@ -372,37 +357,36 @@ namespace bdft_tests {
             (std::abs(off.e_corr - ref.e_corr) > 0.0
                  ? 100.0 * std::abs(on.e_corr - off.e_corr)
                        / std::abs(off.e_corr - ref.e_corr) : 0.0));
-    app_log(1, "  Si reference for the same quantity: 1.17e-02, i.e. 1.6x the whole B-S "
+    app_log(1, "  Si reference value for the same quantity: 1.17e-02, i.e. 1.6x the B-S "
                "vertex correction (+7.118e-03).");
     app_log(1, "  ---- head meters (last iteration) ----");
     app_log(1, "    |<H, Pi^L(Gamma)>|      OFF {:.6e}   ON {:.6e}", off.hl, on.hl);
     app_log(1, "    |<H, Pi^{{C,0}}(Gamma)>|  OFF {:.6e}   ON {:.6e}", off.hs, on.hs);
     app_log(1, "    max|removed|/max|Pi^L|  OFF {:.4f}         ON {:.4f}   "
-               "(Si: 0.6590 at the converged solution)", off.removed, on.removed);
+               "(Si reference value: 0.6590, converged)", off.removed, on.removed);
     app_log(1, "    resp share |S^(C,r)|/|S^(C,x)|  OFF {:.4f}   ON {:.4f}   "
-               "(Si: 1.0126 OFF / 0.1037 ON; LiH range on file 0.12-0.24)",
+               "(Si reference values: 1.0126 OFF / 0.1037 ON; LiH reference range 0.12-0.24)",
             off.resp_share, on.resp_share);
     app_log(1, "  ---- THE SIGN QUESTION, at ONE policy on ONE system ----");
-    app_log(1, "    d(e_corr):  B-S {:+.4e}   B-L(honest, projection OFF) {:+.4e}   "
+    app_log(1, "    d(e_corr):  B-S {:+.4e}   B-L (projection OFF) {:+.4e}   "
                "-> signs {}",
             bs.e_corr - ref.e_corr, off.e_corr - ref.e_corr,
             (((bs.e_corr - ref.e_corr) * (off.e_corr - ref.e_corr)) > 0.0
                  ? "AGREE" : "DISAGREE"));
-    app_log(1, "    Si at the same policy: B-S +7.118e-03, B-L OFF -6.850e-03 -> DISAGREE.");
-    app_log(1, "    The +1.153e-03 / +1.134e-03 LiH pair on file that motivated \"LiH "
-               "agrees, Si does not\"");
-    app_log(1, "    was measured at div_treatment = \"ignore_g0\", i.e. WITH NO GAMMA HEAD "
-               "AT ALL.");
+    app_log(1, "    Si reference values, same policy: B-S +7.118e-03, B-L OFF -6.850e-03 -> DISAGREE.");
+    app_log(1, "    LiH reference values B-S +1.153e-03 / B-L +1.134e-03 (signs agree) "
+               "belong to");
+    app_log(1, "    div_treatment = \"ignore_g0\", i.e. to the policy with NO Gamma head "
+               "at all.");
     app_log(1, "==========================================================================\n");
 
     REQUIRE(std::isfinite(ref.e_corr));
     REQUIRE(std::isfinite(off.e_corr));
     REQUIRE(std::isfinite(on.e_corr));
-    // LIVENESS -- without these the A/B reports "no effect" whenever the knob never fired,
-    // which is exactly what happened on the first attempt (div_treatment = "ignore_g0" =>
-    // no Gamma head => head_ok false => the projection block never entered, and the two arms
-    // came out bit-identical). A failure of `on.removed > 0` means THE CONFIG IS WRONG, not
-    // that the projection is harmless.
+    // LIVENESS -- without these the A/B reports "no effect" whenever the knob never fired
+    // (e.g. div_treatment = "ignore_g0" => no Gamma head => head_ok false => the projection
+    // block is never entered and the two arms are bit-identical). A failure of
+    // `on.removed > 0` means THE CONFIG IS WRONG, not that the projection is harmless.
     REQUIRE(off.removed == 0.0);   // OFF really did not touch Pi^L
     REQUIRE(on.removed > 0.0);     // ON really did -- and the head really exists
     // ... and the head meters really were measured (-1 = never evaluated != a clean head).
@@ -413,15 +397,15 @@ namespace bdft_tests {
   }
 
   // ======================================================================================
-  // THE CONSTANT-RUNG ABSOLUTE PIN (P3): is pi^dyn's Gamma-head violation retarded-rung
-  // PHYSICS, or a DEFECT in the equal-time path that Pi^{C,0} does not share?
+  // CONSTANT-RUNG PIN: is pi^dyn's Gamma-head violation retarded-rung PHYSICS, or a DEFECT
+  // in the equal-time path that Pi^{C,0} does not share?
   //
-  // X^L = pi^dyn - Pi^{C,0}(tau=0) is supposed to vanish for a genuinely static screen. It
-  // does not: on LiH at gygi it sits at X^L/Pi^0 = 0.34, and |<H,pi^dyn>| exceeds
-  // |<H,Pi^{C,0}>| by 7.7e+04 at iteration 1. Nothing so far separates "the rung really is
-  // retarded" from "the two objects are computed by paths that differ in more than the rung".
+  // X^L = pi^dyn - Pi^{C,0}(tau=0) vanishes for a genuinely static screen. On LiH at gygi
+  // it is O(0.1-1) relative to Pi^0, and |<H,pi^dyn>| exceeds |<H,Pi^{C,0}>| by orders of
+  // magnitude. That alone does not separate "the rung really is retarded" from "the two
+  // objects are computed by paths that differ in more than the rung".
   //
-  // ⚠ WHY NOT "just zero the dynamic rung". The two paths do NOT share an instantaneous
+  // WHY NOT "just zero the dynamic rung". The two paths do NOT share an instantaneous
   // rung: Pi^{C,0} = pi_c_accumulate_w(rung = W0bar, Wdyn = nullptr), while
   // pi^dyn = pi_dyn_factorized(rung = Z (BARE), Wdyn = Wdyn_w). Zeroing Wdyn_w leaves
   // pi^dyn on the bare rung, so X^L stays O(1) for a reason that says nothing about the
@@ -431,12 +415,12 @@ namespace bdft_tests {
   // routes, and X^L must collapse.
   //
   // FLOOR: the DLR representability of the two integrands, ~1e-10 on the toy
-  // (test_vertex_pibardynfact/static_rung), NOT machine epsilon. The gate is set far above
-  // that floor and far below the 0.34 it must destroy.
+  // (test_vertex_pibardynfact/static_rung), NOT machine epsilon. The bar is set far above
+  // that floor and far below the control value of X^L.
   //
   // HIDDEN ([.]): diagnostic. Run with:
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[construng]"
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[construng]"
   TEST_CASE("vertex_bl_pidyn_const_rung_pin", "[.][methods][vertex][static][construng]") {
 #ifndef ENABLE_DLR
     SUCCEED("vertex_bl_pidyn_const_rung_pin skipped: build has ENABLE_DLR=OFF.");
@@ -476,7 +460,7 @@ namespace bdft_tests {
     };
 
     // THE DISCRIMINATOR is a PRECISION SCAN, not a single number. pi^dyn is known to be
-    // grid-limited at prec = "low" (~1e-3 by either route -- test_vertex_pibardynfact's
+    // grid-limited at prec = "low" (by either route -- see test_vertex_pibardynfact's
     // production_grid_attribution and the pidyn CHECK in vertex_static_e2e above), so an
     // absolute value alone cannot tell "representability floor" from "defect". What can:
     //   - the PINNED X^L must FALL with eps          (=> it is representability)
@@ -523,10 +507,9 @@ namespace bdft_tests {
     REQUIRE(std::isfinite(pin_hi.e_corr));
     // LIVENESS: the control must actually show the violation this pin exists to explain.
     REQUIRE(ctl_lo.xl > 1e-2);
-    // The head overlap of the DIFFERENCE must dominate Pi^{C,0}'s own. MEASURED at the
-    // LAST iteration: 16.2 (eps 1e-6) / 16.9 (eps 1e-10). ⚠ The 7.7e+04 on file is an
-    // ITERATION-1 number -- these meters carry the last iteration, and a bar set from the
-    // wrong iteration is what first failed this test.
+    // The head overlap of the DIFFERENCE must dominate Pi^{C,0}'s own. These meters carry
+    // the LAST iteration, where the ratio is O(10); at iteration 1 it is far larger, so a
+    // bar must be set from the last-iteration value.
     REQUIRE(ctl_lo.hl > 10.0 * ctl_lo.hs);
     // THE PIN, part 1: forcing the rung static must destroy X^L at BOTH grids.
     REQUIRE(pin_lo.xl < 1e-2 * ctl_lo.xl);
@@ -534,7 +517,7 @@ namespace bdft_tests {
     // THE PIN, part 2 -- the part with teeth: the residue must be REPRESENTABILITY, i.e.
     // it must FALL when the DLR tolerance is tightened by four orders. A residue that
     // plateaus is a defect in the equal-time path, and that is the finding this test
-    // exists to produce.
+    // exists to detect.
     REQUIRE(pin_hi.xl < 0.1 * pin_lo.xl);
     // ... while the CONTROL's X^L must NOT fall -- it is the retarded rung, not the grid.
     REQUIRE(ctl_hi.xl > 0.5 * ctl_lo.xl);
@@ -544,31 +527,27 @@ namespace bdft_tests {
   }
 
   // ======================================================================================
-  // P2: WHICH TERM CARRIES B-L's NEGATIVE SIGN?
+  // B-L TERM ABLATION: which term carries B-L's negative sign?
   //
-  // B-L's d(e_corr) is negative where B-S's is positive (LiH gygi: -3.8642e-03 vs
-  // +1.1986e-03). B-L's self-energy is Sigma^(C,x) + Sigma^(L,r), and the strong prior is
-  // Sigma^(L,r): its response share ||Sigma^(C,r)||/||Sigma^(C,x)|| is 0.64 here (Si: 1.01),
-  // i.e. the "linear correction" is comparable to the term it corrects.
+  // On LiH at gygi B-L's d(e_corr) is negative where B-S's is positive. B-L's self-energy
+  // is Sigma^(C,x) + Sigma^(L,r) (+ the P^{C,L} injection seen through Sigma_GW); this test
+  // switches the terms off one at a time (vertex_bl_drop) and reports each share.
   //
-  // ⚠ THESE SHARES ARE ABLATIONS WITH FEEDBACK -- THEY DO NOT ADD UP, AND THAT IS CORRECT.
+  // THESE SHARES ARE ABLATIONS WITH FEEDBACK -- THEY DO NOT ADD UP, AND THAT IS CORRECT.
   // eval_corr_energy is (-0.5 * spin_factor) * sum k_weight <Sigma, G>, linear in Sigma at
-  // FIXED G -- but scf_driver runs update_G (the Dyson step) BEFORE evaluating it
-  // (scf_driver.cpp:188 vs :200), so each arm's energy is taken at its OWN post-Dyson G.
-  // The arms therefore never share a G, not even at iteration 1, and no additivity identity
-  // holds. Two earlier versions of this test asserted one and failed:
-  //   two-way   sum -8.7380e-03 vs d(full) -6.6760e-03   residual 2.062e-03
-  //   three-way sum -7.7916e-03 vs d(full) -6.6760e-03   residual 1.116e-03
-  // The three-way residual (1.116e-03, ~17 % of d(full)) is the MEASURED nonlinearity of
-  // G's response to Sigma. It is reported, not asserted away.
+  // FIXED G -- but scf_driver runs update_G (the Dyson step) BEFORE evaluating it, so each
+  // arm's energy is taken at its OWN post-Dyson G. The arms therefore never share a G, not
+  // even at iteration 1, and no additivity identity holds. The residual of the sum of the
+  // pieces against d(full) (O(10 %) here) is the nonlinearity of G's response to Sigma; it
+  // is reported, not asserted.
   //
   // WHAT IS ASSERTED INSTEAD is assumption-free and needs no additivity: removing
-  // Sigma^(C,x) FLIPS THE SIGN of d(e_corr), and removing Sigma^(L,r) does not. That is the
-  // whole question P2 asks, and it survives the nonlinearity.
+  // Sigma^(C,x) FLIPS THE SIGN of d(e_corr), and removing Sigma^(L,r) does not. That
+  // statement survives the nonlinearity.
   //
   // HIDDEN ([.]). Run with:
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[bldecomp]"
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[bldecomp]"
   TEST_CASE("vertex_bl_term_decomposition", "[.][methods][vertex][static][bldecomp]") {
 #ifndef ENABLE_DLR
     SUCCEED("vertex_bl_term_decomposition skipped: build has ENABLE_DLR=OFF.");
@@ -607,8 +586,7 @@ namespace bdft_tests {
     auto run   = [&](bool vertex, int drop, long niter) {
       return run_impl(vertex, drop, niter, "linear");
     };
-    // B-S at the SAME policy and iteration count -- the like-for-like sign comparison. The
-    // +1.1986e-03 on file is a 2-iteration number and must not be compared to niter = 1.
+    // B-S at the SAME policy and iteration count -- the like-for-like sign comparison.
     auto runBS = [&](long niter) { return run_impl(true, 0, niter, "static"); };
 
     auto report = [&](long niter, bool exact) {
@@ -619,7 +597,7 @@ namespace bdft_tests {
       const double dropK = run(true,  2, niter);   // no Sigma^(C,x)
       const double dropB = run(true,  3, niter);   // neither -- P^{C,L} via Sigma_GW alone
       const double d_full = full  - ref;
-      const double d_b    = dropB - ref;           // the P^{C,L} share, MEASURED
+      const double d_b    = dropB - ref;           // the P^{C,L} share
       const double x      = dropR - dropB;         // Sigma^(C,x), clean of d_b
       const double r      = dropK - dropB;         // Sigma^(L,r), clean of d_b
       app_log(1, "\n===== B-L TERM ABLATION, niter = {} ({}) =====", niter,
@@ -677,7 +655,7 @@ namespace bdft_tests {
     // (b) ... removing Sigma^(C,x) FLIPS it positive => that term carries the sign ...
     REQUIRE(e1[4] > 0.0);
     // (c) ... while removing Sigma^(L,r) leaves it negative, i.e. the response term is NOT
-    // the carrier -- it partially CANCELS the sign. This refutes the standing prior.
+    // the carrier -- it partially CANCELS the sign.
     REQUIRE(e1[5] < 0.0);
     // and the kernel term is the dominant piece by magnitude.
     REQUIRE(std::abs(e1[2]) > std::abs(e1[3]));
@@ -690,11 +668,11 @@ namespace bdft_tests {
   }
 
   // ======================================================================================
-  // P0: WHICH OF THE THREE MIXED REDUCTIONS S1/S2/S3 FLIPS THE SIGN?
+  // B-L MIXED-TERM SPLIT: which of the three mixed reductions S1/S2/S3 flips the sign?
   //
-  // WHERE P2 LEFT THE INVESTIGATION. Sigma^(C,x) carries B-L's negative d(e_corr) (removing
-  // it flips the sign; removing Sigma^(L,r) does not). But B-S's Sigma^(C,x) is POSITIVE for
-  // the SAME DIAGRAM. The two differ ONLY in the rung combination:
+  // Sigma^(C,x) carries B-L's negative d(e_corr) (see vertex_bl_term_decomposition), but
+  // B-S's Sigma^(C,x) is POSITIVE for the SAME DIAGRAM. The two differ ONLY in the rung
+  // combination:
   //
   //     B-S:  W0_x W0_y
   //     B-L:  W0_x W_y + W_x W0_y - W0_x W0_y
@@ -702,38 +680,37 @@ namespace bdft_tests {
   //         =      S3     +      S1     +      S2           of the kernel's own reductions
   //
   // so the flip must live in S1/S2, the DYNAMIC-FLUCTUATION mixed terms -- or S3 is not what
-  // it is claimed to be. This test decides which, by gating the kernel to ONE reduction at a
-  // time through vertex_detail::sigma_C_slot_probe.only_term (vertex_sigma.icc:992: the gate
-  // is already there, hoisted out of the fill loops, and needs no production code).
+  // it is claimed to be. This test decides which, by restricting the kernel to ONE reduction
+  // at a time through vertex_detail::sigma_C_slot_probe.only_term (a test-only selector in
+  // vertex_sigma.icc, hoisted out of the fill loops).
   //
   // THE POSITIVE CONTROL that makes the whole reading trustworthy: S3 is, term for term, the
   // rung combination B-S evaluates -- both feed Z_qPQ = W0bar into the doubly-instantaneous
   // reduction. So "B-L restricted to S3" and "B-S's kernel term" must agree in SIGN. If they
   // do not, the premise above is wrong and nothing else here means anything.
   //
-  // ⚠ ABLATIONS WITH FEEDBACK, exactly as in [bldecomp]: update_G precedes the energy
-  // evaluation (scf_driver.cpp:188 vs :200), so every arm is measured at its OWN post-Dyson
-  // G and the pieces do NOT add. Only SIGN-level statements survive the ~17 % nonlinearity.
+  // ABLATIONS WITH FEEDBACK, exactly as in [bldecomp]: update_G precedes the energy
+  // evaluation, so every arm is measured at its OWN post-Dyson G and the pieces do NOT add.
+  // Only SIGN-level statements survive the O(10 %) nonlinearity.
   // Each kernel share is therefore taken against the drop = 3 arm (P^{C,L} via Sigma_GW
   // alone), which is the ONE baseline common to every B-L arm, and Sigma^(L,r) is switched
   // off (drop = 1) so the isolated object really is the kernel term.
   //
-  // AND THEN THE GAMMA-HEAD A/B. The split is run at BOTH div_treatment policies, because
-  // the split alone raises a question it cannot answer: the mixed terms are FIRST order in
-  // dW and S3 is ZEROTH, yet |S1+S2|/|S3| = 3.23 while the expansion parameter
-  // max_nu|dW|/|W0| is 0.28 -- naive power counting predicts 0.56, so something amplifies
-  // dW ~6x beyond its magnitude. The standing suspect is the Gamma head (coherent, rank-1,
-  // invisible to a max-norm -- trap 2), and "gygi" vs "ignore_g0" toggles exactly that: the
-  // former augments the Gamma cell with the analytic rank-1 head insertion, the latter has
-  // no head at all. gw and scr_coulomb stay at "ignore_g0" in BOTH halves, so the two
-  // differ in one thing and share one plain-scGW reference.
+  // GAMMA-HEAD A/B. The split is run at BOTH div_treatment policies: the mixed terms are
+  // FIRST order in dW and S3 is ZEROTH, so naive power counting predicts
+  // |S1+S2|/|S3| ~ 2 max_nu|dW|/|W0|; a ratio well above that means something amplifies dW
+  // beyond its magnitude. A natural suspect is the Gamma head (coherent, rank-1, invisible
+  // to a max-norm), and "gygi" vs "ignore_g0" toggles exactly that: the former augments the
+  // Gamma cell with the analytic rank-1 head insertion, the latter has no head at all. gw
+  // and scr_coulomb stay at "ignore_g0" in BOTH halves, so the two differ in one thing and
+  // share one plain-scGW reference.
   //
-  // Protocol: LiH-222, C = [1,3), 2 COLD iterations -- the same protocol as P1/P2, so these
-  // numbers are directly comparable to the -3.8642e-03 / +1.1986e-03 pair on file.
+  // Protocol: LiH-222, C = [1,3), 2 COLD iterations -- the same protocol as the B-L tests
+  // above, so the numbers are directly comparable.
   //
   // HIDDEN ([.]). Run with:
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blmixed]"
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blmixed]"
   TEST_CASE("vertex_bl_mixed_term_split", "[.][methods][vertex][static][blmixed]") {
 #ifndef ENABLE_DLR
     SUCCEED("vertex_bl_mixed_term_split skipped: build has ENABLE_DLR=OFF.");
@@ -860,7 +837,7 @@ namespace bdft_tests {
                  "frequencies", s.dw_rel);
       app_log(1, "    NAIVE power counting predicts |S1+S2|/|S3| ~ 2 * {:.4f} = {:.3f}; "
                  "measured {:.3f}\n"
-                 "    -> UNEXPLAINED AMPLIFICATION {:.2f}x",
+                 "    -> amplification over power counting {:.2f}x",
               s.dw_rel, 2.0 * s.dw_rel, s.ratio,
               (s.dw_rel > 0.0 ? s.ratio / (2.0 * s.dw_rel) : 0.0));
       app_log(1, "    d(e_corr) signs:  B-S {}   B-L {}   -> {}",
@@ -900,10 +877,9 @@ namespace bdft_tests {
       REQUIRE(std::isfinite(s->k_S1));
       REQUIRE(std::isfinite(s->k_S2));
       REQUIRE(std::isfinite(s->k_S3));
-      // LIVENESS -- the term gate must actually have FIRED, at BOTH policies. A structurally
-      // inert knob returns identical arms and reads as "no effect"; that is trap 7 of the
-      // plan, and it is exactly how the head projection behaved at ignore_g0. Three distinct
-      // restrictions of a nonzero kernel cannot coincide with each other or with the
+      // LIVENESS -- the term selector must actually have FIRED, at BOTH policies. A
+      // structurally inert knob returns identical arms and reads as "no effect". Three
+      // distinct restrictions of a nonzero kernel cannot coincide with each other or with the
       // unrestricted kernel.
       REQUIRE(std::abs(s->x_all) > 1e-12);
       REQUIRE(std::abs(s->k_S1 - s->k_all) > 1e-12);
@@ -914,24 +890,22 @@ namespace bdft_tests {
 
       // ---- THE POSITIVE CONTROL, at both policies ------------------------------------
       // S3 IS B-S's rung combination, so it must not merely share B-S's sign -- it must
-      // reproduce its VALUE. At gygi: +1.9648e-03 vs +1.9517e-03, 0.67 %. The residual is
-      // the G-response feedback (the B-L arm's G additionally carries P^{C,L}), not a
-      // difference of diagram. Every reading here rests on this.
+      // reproduce its VALUE, to within ~1 % at gygi. The residual is the G-response feedback
+      // (the B-L arm's G additionally carries P^{C,L}), not a difference of diagram; the 5 %
+      // bar leaves room for that. Every reading here rests on this.
       REQUIRE(s->x_BS * s->x_S3 > 0.0);
       REQUIRE(std::abs(s->x_S3 - s->x_BS) < 0.05 * std::abs(s->x_BS));
       // ... and S3, being B-S, is positive at both policies.
       REQUIRE(s->x_S3 > 0.0);
 
-      // ---- THE PAIR-SYMMETRY DEGENERACY (a new gate, not a restatement) --------------
+      // ---- THE PAIR-SYMMETRY DEGENERACY ----------------------------------------------
       // S1 = W0_x dW_y and S2 = dW_x W0_y are the two orderings of ONE rung pair, so the
       // self-inverse-transfer relation W_PQ(q) = W_QP(-q) (see rung_pair_symmetry) forces
-      // them to contribute EQUALLY to the energy. Measured |S1 - S2| = 2.6e-14 on an
-      // |S1 + S2| of 6.3e-03 -- 4e-12 relative, i.e. FP accumulation, not a coincidence.
-      // ⚠ Agreement this exact is normally the stale-artifact tell (trap 6). It is not one
-      // here, and the LIVENESS block above carries the burden of proof: the same gate that
-      // leaves S1 and S2 degenerate moves S3 by 5.1e-03. A break here means the mixed-term
-      // routing has lost the pair symmetry -- the exact failure mode behind the retracted
-      // "eq:mixgw is wrong".
+      // them to contribute EQUALLY to the energy: |S1 - S2| is at FP-accumulation level
+      // (~1e-14 on an |S1 + S2| of ~1e-2). Agreement this exact could also indicate that one
+      // arm reused the other's result; the LIVENESS block above rules that out, since the
+      // same selector that leaves S1 and S2 degenerate moves S3 substantially. A break here
+      // means the mixed-term routing has lost the pair symmetry.
       REQUIRE(std::abs(s->x_S1 - s->x_S2) < 1e-9);
     }
 
@@ -946,24 +920,23 @@ namespace bdft_tests {
 
     // ---- THE EXPANSION PARAMETER IS NOT THE WHOLE STORY -------------------------------
     // B-L is FIRST order in dW and S3 is ZEROTH, so naive power counting predicts
-    // |S1+S2|/|S3| ~ 2 * max_nu|dW|/|W0|. At gygi that is 2 * 0.2775 = 0.56 against a
-    // measured 3.23 -- a ~6x amplification that magnitude alone does not explain. (The
-    // i.nu = 0 meter the log has always carried reads 0.02-0.06 and would have made this
-    // look like ~100x; it is measured at the one frequency where dW vanishes by
-    // construction, which is why diag_dw_rel exists.) Recorded, not explained here.
+    // |S1+S2|/|S3| ~ 2 * max_nu|dW|/|W0|. At gygi the ratio is several times larger than
+    // that -- an amplification that magnitude alone does not explain (see
+    // vertex_bl_dw_head_channel). diag_dw_rel takes the max over ALL i.nu; an i.nu = 0 meter
+    // would be misleading, since dW vanishes there by construction.
     REQUIRE(g.dw_rel > 0.0);
     REQUIRE(g.ratio > 2.0 * g.dw_rel);
 #endif
   }
 
   // ======================================================================================
-  // P0.1: DOES THE GAMMA HEAD CANCEL IN  dW = W - W0  ?
+  // B-L dW HEAD CHANNEL: does the Gamma head cancel in  dW = W - W0  ?
   //
-  // vertex_bl_mixed_term_split (above) located the B-S/B-L sign flip in the MIXED (first-
-  // order) reductions S1/S2 and showed the gygi Gamma head is what flips them: it moves
-  // |S1+S2|/|S3| from 0.035 to 3.228 (93x) while moving the max-norm expansion parameter
-  // max_nu|dW|/|W0| by only 1.81x (0.153 -> 0.278). So MAGNITUDE does not explain it, and
-  // "the head does it" is still a correlation, not a mechanism.
+  // vertex_bl_mixed_term_split (above) locates the B-S/B-L sign flip in the MIXED (first-
+  // order) reductions S1/S2, and switching the gygi Gamma head on raises |S1+S2|/|S3| by
+  // about two orders of magnitude while the max-norm expansion parameter max_nu|dW|/|W0|
+  // changes by less than 2x. So MAGNITUDE does not explain it; this test looks for the
+  // mechanism in the head channel itself.
   //
   // THE METERS: h_A := chi^dag A(Gamma) chi / ||chi||^2 with chi = thc.basis_head(), i.e.
   // the G = 0 direction the rank-1 head is BUILT from, so this is its own channel.
@@ -973,29 +946,27 @@ namespace bdft_tests {
   //   diag_dw_head_abs() = max_nu |h_dW| in a.u.           (comparable across policies)
   //   diag_dw_head_coh() = that over max|dW(Gamma)|        (alignment with the rank-1 dir)
   //
-  // ⚠ THE RATIO IS NOT THE ANSWER, AND THE FIRST READING OF THIS TEST SAID SO. The prior was
-  // that the head enters W with weight eps^-1_00(q->0,i.nu) and W0 with only its static
-  // weight, so the ratio would run to eps_M - 1 >> 1. Measured: 0.408 at Gamma with the head,
-  // 0.016 without -- but the head-free q != Gamma control reads 0.39-0.41 at BOTH policies.
-  // ~0.4 is just what dW/W0 looks like in the G = 0 channel anywhere on this mesh, so the
-  // head does not make the RATIO anomalous; ignore_g0 makes Gamma anomalously QUIET (0.016),
-  // because with v(G = 0) zeroed there is hardly any G = 0 content there to fluctuate.
+  // THE RATIO IS NOT THE ANSWER. One might expect the head to enter W with weight
+  // eps^-1_00(q->0,i.nu) and W0 with only its static weight, so that the ratio runs to
+  // eps_M - 1 >> 1. Instead the ratio at Gamma with the head is ~0.4, which is also what the
+  // head-free q != Gamma control reads at BOTH policies: ~0.4 is just what dW/W0 looks like
+  // in the G = 0 channel anywhere on this mesh. Without the head, Gamma is anomalously QUIET
+  // (ratio ~0.02), because with v(G = 0) zeroed there is hardly any G = 0 content there to
+  // fluctuate.
   //
   // WHAT THE HEAD DOES CHANGE is the ABSOLUTE content of that one coherent rank-1 direction
   // (madelung ~ 1/q^2) and hence the COHERENCE of dW -- and the kernel sums that direction
-  // over N_p^2 terms IN PHASE. That is the same mechanism as the [SANDWICH] and head-
-  // projection findings, and it is exactly what a max-norm gate cannot see (trap 2): between
-  // the two policies max|dW|/|W0| moves 1.81x while |S1+S2|/|S3| moves 93x.
+  // over N_p^2 terms IN PHASE. A max-norm meter cannot see this.
   //
   // THREE ARMS, so the reading cannot be an artifact of the meter itself:
   //   B-L @ gygi      -- the head is present
   //   B-L @ ignore_g0 -- no head at all (the policy A/B of [blmixed], same protocol)
   //   B-S @ gygi      -- no dW exists, so both meters must stay at -1 (NEVER MEASURED,
-  //                      deliberately distinct from a measured 0; trap 7 in reverse)
+  //                      deliberately distinct from a measured 0)
   //
   // HIDDEN ([.]). Run with:
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[bldwhead]"
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[bldwhead]"
   TEST_CASE("vertex_bl_dw_head_channel", "[.][methods][vertex][static][bldwhead]") {
 #ifndef ENABLE_DLR
     SUCCEED("vertex_bl_dw_head_channel skipped: build has ENABLE_DLR=OFF.");
@@ -1016,7 +987,7 @@ namespace bdft_tests {
       double head_bg;    // ... and at the worst q != Gamma (no head there)
       double head_abs;   // max_nu |chi^dag dW(Gamma) chi| / ||chi||^2 in a.u.
       double head_coh;   // alignment with the rank-1 direction, 1 = dW(Gamma) IS chi chi^dag
-      double head_nu0;   // the same channel at i.nu = 0 -- where the log's old meter looked
+      double head_nu0;   // the same channel at i.nu = 0
     };
 
     // Same protocol as [blmixed]: LiH-222, C = [1,3), 2 COLD iterations, gw and scr_coulomb
@@ -1046,7 +1017,7 @@ namespace bdft_tests {
     const auto n = run("linear", "ignore_g0");
     const auto s = run("static", "gygi");
 
-    app_log(1, "\n========== P0.1: DOES THE GAMMA HEAD CANCEL IN dW = W - W0? ==========");
+    app_log(1, "\n========== B-L dW HEAD CHANNEL: DOES THE GAMMA HEAD CANCEL IN dW = W - W0? ==========");
     app_log(1, "  LiH-222, C = [1,3), 2 COLD iterations, meters from the LAST eval_Sigma_C.");
     app_log(1, "  chi = thc.basis_head() (the G = 0 components of the aux basis) -- the");
     app_log(1, "  direction the rank-1 head is built from, so this is ITS channel.");
@@ -1067,7 +1038,7 @@ namespace bdft_tests {
     app_log(1, "    COHERENCE (1 = pure chi chi^dag)      {:11.3f}   {:11.3f}   -> {:.1f}x",
             g.head_coh, n.head_coh,
             (n.head_coh > 0.0 ? g.head_coh / n.head_coh : 0.0));
-    app_log(1, "  ---- and why the log's i.nu = 0 meter could never see any of it ----");
+    app_log(1, "  ---- the same channel at i.nu = 0 (where dW vanishes by construction) ----");
     app_log(1, "    |h_dW| at i.nu = 0    [a.u.]          {:11.4e}   {:11.4e}",
             g.head_nu0, n.head_nu0);
     app_log(1, "    the nu = 0 slice understates by       {:11.1f}x  {:11.1f}x",
@@ -1078,7 +1049,7 @@ namespace bdft_tests {
     app_log(1, "  B-S control @ gygi: dw_rel = {:.4f}, head_rel = {:.4f}, head_bg = {:.4f} "
                "(-1 = NEVER MEASURED, as it must be: B-S has no dW)",
             s.dw_rel, s.head_rel, s.head_bg);
-    app_log(1, "  Reference from [blmixed] on the same protocol: |S1+S2|/|S3| = 3.228 "
+    app_log(1, "  Reference values from [blmixed], same protocol: |S1+S2|/|S3| = 3.228 "
                "(gygi) vs 0.035 (ignore_g0).");
     app_log(1, "======================================================================\n");
 
@@ -1096,7 +1067,7 @@ namespace bdft_tests {
     REQUIRE(s.head_coh == -1.0);
     REQUIRE(s.head_nu0 == -1.0);
 
-    // ---- LIVENESS: the meter really ran on both B-L arms (trap 7) -------------------------
+    // ---- LIVENESS: the meter really ran on both B-L arms -----------------------------------
     // basis_head can be absent on some ERI read paths, in which case the meter silently
     // skips and returns -1 -- which would make every comparison below vacuous.
     REQUIRE(g.head_rel > 0.0);
@@ -1127,24 +1098,23 @@ namespace bdft_tests {
 
     // ---- WHAT THE HEAD ACTUALLY CHANGES: the ABSOLUTE coherent content -------------------
     // Same system, same basis, same iteration count -- so these two are directly comparable
-    // and the ratio between them is the head's whole effect on the rung B-L expands in.
-    // Measured 8.3877e-03 vs 4.9288e-06 = 1702x, against 1.81x for max|dW|/|W0| and 93x for
-    // |S1+S2|/|S3|. Gated at 100x: far above any plausible drift, far below the measurement.
+    // and the ratio between them is the head's whole effect on the rung B-L expands in. The
+    // head raises it by three orders of magnitude; the 100x bar is far above any plausible
+    // drift and far below the observed effect.
     REQUIRE(g.head_abs > 100.0 * n.head_abs);
     // ... and it is COHERENT. 1 means dW(Gamma) IS the chi-aligned rank-1 matrix c chi
-    // chi^dag; 1/N_p means no alignment at all. Measured 0.980 vs 0.009 -- i.e. WITH the
-    // head, dW(Gamma) is 98 % that rank-1 object, and the head therefore does not cancel in
-    // W - W0 in any meaningful sense. This is the number no max-norm gate can see (trap 2),
-    // and it is the mechanism the mixed terms S1/S2 amplify by summing N_p^2 terms in phase.
+    // chi^dag; 1/N_p means no alignment at all. WITH the head, dW(Gamma) is almost entirely
+    // that rank-1 object (coherence ~0.98, vs ~0.01 without), so the head does not cancel in
+    // W - W0 in any meaningful sense. A max-norm meter cannot see this, and it is the
+    // mechanism the mixed terms S1/S2 amplify by summing N_p^2 terms in phase.
     REQUIRE(g.head_coh > 0.9);
     REQUIRE(n.head_coh < 0.05);
-    // ---- AND WHY EVERY EARLIER METER MISSED IT ------------------------------------------
+    // ---- AND WHY AN i.nu = 0 METER MISSES IT --------------------------------------------
     // The head channel is smallest at i.nu = 0 -- dW vanishes there by construction, W0 IS
     // that slice -- and grows monotonically to the mesh cutoff, where W -> v (bare,
-    // unscreened). So the |W(q,0) - W0(q)| line the run log has carried since the beginning
-    // was looking at the one frequency where the effect is absent: it understates the head
-    // channel by 13.6x at gygi and 428x at ignore_g0. Same defect as the max-norm dw meter
-    // that diag_dw_rel replaced, in the other axis.
+    // unscreened). So |W(q,0) - W0(q)| looks at the one frequency where the effect is absent
+    // and understates the head channel by one to several orders of magnitude; hence the
+    // factor-5 bars below.
     REQUIRE(g.head_nu0 > 0.0);
     REQUIRE(n.head_nu0 > 0.0);
     REQUIRE(g.head_abs > 5.0 * g.head_nu0);
@@ -1153,31 +1123,30 @@ namespace bdft_tests {
   }
 
   // ======================================================================================
-  // GATE 0 OF THE H1 REPAIR (notes/bl_head_balance_theory_and_plan.md section 5):
-  // vertex_bl_head_static_all gives every W input of the B-L functional W0's STATIC
-  // Gamma-head weight (instantaneous slot; no dynamic-slot head), so the fluctuation
-  // dW = W - W0 carries NO analytic head. The theory analysis says the whole gygi B-L
-  // anomaly is that head: a first-order functional handed an O(1) coherent rank-1
-  // fluctuation. Falsifiable predictions asserted here:
-  //   P1  dW(Gamma)'s coherent head content COLLAPSES (diag_dw_head_abs ~1702x down,
-  //       coherence 0.98 -> ignore_g0 class ~0.01);
+  // B-L WITH A STATIC HEAD IN EVERY W INPUT (vertex_bl_head_static_all, "H1" below):
+  // the knob gives every W input of the B-L functional W0's STATIC Gamma-head weight
+  // (instantaneous slot; no dynamic-slot head), so the fluctuation dW = W - W0 carries NO
+  // analytic head. Hypothesis under test: the gygi B-L anomaly is that head -- a
+  // first-order functional handed an O(1) coherent rank-1 fluctuation. Falsifiable
+  // predictions checked here (P3 does NOT hold -- see below):
+  //   P1  dW(Gamma)'s coherent head content COLLAPSES (diag_dw_head_abs drops by orders of
+  //       magnitude, coherence falls to the ignore_g0 class ~0.01);
   //   P2  B-S is BIT-IDENTICAL under the knob (its only W input is W0);
   //   P3  B-L's vertex shift returns to the healthy class: POSITIVE, B-S-magnitude,
-  //       sign-AGREEING with B-S (the sign disagreement was the head's doing);
+  //       sign-AGREEING with B-S (the sign disagreement is the head's doing);
   //   P4  the max-norm expansion parameter dw_rel falls toward its head-free value.
-  // If P1 or P3 fail, the imbalance mechanism of the theory note is WRONG -- stop and
-  // re-derive from the failing meter (that is what makes this a gate).
+  // P1 and P2 hold; P3 failing shows that the fluctuation head is not the mechanism.
   //
-  // HIDDEN ([.]), 4 runs, ~10 min. Run with:
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blh1]"
-  TEST_CASE("vertex_bl_head_static_all_gate0", "[.][methods][vertex][static][blh1]") {
+  // HIDDEN ([.]), 4 runs. Run with:
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blstatichead]"
+  TEST_CASE("vertex_bl_head_static_all", "[.][methods][vertex][static][blstatichead]") {
 #ifndef ENABLE_DLR
-    SUCCEED("vertex_bl_head_static_all_gate0 skipped: build has ENABLE_DLR=OFF.");
+    SUCCEED("vertex_bl_head_static_all skipped: build has ENABLE_DLR=OFF.");
 #else
     auto &mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
-    std::string output = "coqui_vertex_blh1";
+    std::string output = "coqui_vertex_blstatichead";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
@@ -1213,8 +1182,8 @@ namespace bdft_tests {
       return {e_corr, vtx.diag_dw_rel(), vtx.diag_dw_head_abs(), vtx.diag_dw_head_coh()};
     };
 
-    // The plain-scGW reference and the two gygi baselines of this exact protocol, on file
-    // since [blheadab]/[blmixed] and re-pinned by [blhlambda] (lambda = 1 pin).
+    // Reference energies for this exact protocol (plain scGW, and B-S / B-L at gygi without
+    // the knob), as produced by [blheadab]/[blmixed]/[blhlambda] at lambda = 1.
     const double E_SCGW = -0.096212991792;
     const double E_BS_G = -0.095014419061;   // B-S @ gygi     -> d = +1.1986e-03
     const double E_BL_G = -0.100077224200;   // B-L @ gygi     -> d = -3.8642e-03
@@ -1228,28 +1197,28 @@ namespace bdft_tests {
     const double d_off = bl_off.e_corr - E_SCGW;
     const double d_on  = bl_on.e_corr - E_SCGW;
 
-    app_log(1, "\n========== GATE 0: THE H1 STATIC-HEAD VERTEX (delta W_head == 0) ==========");
+    app_log(1, "\n========== B-L WITH THE STATIC HEAD IN EVERY W INPUT (delta W_head == 0) ==========");
     app_log(1, "  LiH-222, C = [1,3), 2 COLD iterations, meters from the LAST eval_Sigma_C.");
-    app_log(1, "  arm                      e_corr          d(e_corr)      dw_rel   head_abs     head_coh");
-    app_log(1, "    B-S gygi   H1 off   {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
+    app_log(1, "  arm (static head)        e_corr          d(e_corr)      dw_rel   head_abs     head_coh");
+    app_log(1, "    B-S gygi   off      {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
             bs_off.e_corr, d_bs, bs_off.dw_rel, bs_off.head_abs, bs_off.head_coh);
-    app_log(1, "    B-S gygi   H1 ON    {:.12f}   {:+.4e}   (must be bit-identical to the row above)",
+    app_log(1, "    B-S gygi   ON       {:.12f}   {:+.4e}   (must be bit-identical to the row above)",
             bs_on.e_corr, bs_on.e_corr - E_SCGW);
-    app_log(1, "    B-L gygi   H1 off   {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
+    app_log(1, "    B-L gygi   off      {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
             bl_off.e_corr, d_off, bl_off.dw_rel, bl_off.head_abs, bl_off.head_coh);
-    app_log(1, "    B-L gygi   H1 ON    {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
+    app_log(1, "    B-L gygi   ON       {:.12f}   {:+.4e}   {:7.4f}  {:10.4e}  {:8.3f}",
             bl_on.e_corr, d_on, bl_on.dw_rel, bl_on.head_abs, bl_on.head_coh);
-    app_log(1, "  head_abs collapse: {:.1f}x   coherence: {:.3f} -> {:.3f}   d(B-L,H1)/d(B-S) = {:.3f}",
+    app_log(1, "  head_abs collapse: {:.1f}x   coherence: {:.3f} -> {:.3f}   d(B-L,static head)/d(B-S) = {:.3f}",
             (bl_on.head_abs > 0.0 ? bl_off.head_abs / bl_on.head_abs : -1.0),
             bl_off.head_coh, bl_on.head_coh, (d_bs != 0.0 ? d_on / d_bs : 0.0));
-    app_log(1, "  References: B-L @ ignore_g0 d = +1.1343e-03; [blmixed] |S1+S2|/|S3| = 3.228 (gygi).");
+    app_log(1, "  Reference values (same protocol): B-L @ ignore_g0 d = +1.1343e-03; [blmixed] |S1+S2|/|S3| = 3.228 (gygi).");
     app_log(1, "============================================================================\n");
 
-    // ---- HARNESS INTEGRITY: the H1-off arms reproduce the numbers on file ----------------
+    // ---- HARNESS INTEGRITY: the H1-off arms reproduce the reference energies -------------
     REQUIRE(std::abs(bs_off.e_corr - E_BS_G) < 1e-8);
     REQUIRE(std::abs(bl_off.e_corr - E_BL_G) < 1e-8);
     // ... and the baseline pathology is present in the off arm (else the collapse below is
-    // vacuous -- trap 7, assert the knob HAD something to remove).
+    // vacuous -- assert the knob HAD something to remove).
     REQUIRE(bl_off.head_abs > 5.0e-3);
     REQUIRE(bl_off.head_coh > 0.9);
 
@@ -1263,67 +1232,60 @@ namespace bdft_tests {
 
     // ---- P1: THE COHERENT HEAD CONTENT OF dW(Gamma) COLLAPSES ----------------------------
     // With the head part of the expansion point instead of the fluctuation, dW's chi channel
-    // must fall to the head-free (body) class. MEASURED 2026-08-01: 8.3877e-03 -> 4.7662e-06
-    // (1759.8x, right at ignore_g0's 4.9288e-06), coherence 0.980 -> 0.009. The knob
-    // controls the channel COMPLETELY. Gates far from both sides.
+    // must fall to the head-free (body) class: head_abs drops from O(1e-2) to O(1e-6) (the
+    // ignore_g0 level) and the coherence from ~0.98 to ~0.01. The bars sit far from both
+    // sides.
     REQUIRE(bl_on.head_abs >= 0.0);                       // measured, not the -1 sentinel
     REQUIRE(bl_on.head_abs < 1.0e-4);
     REQUIRE(bl_off.head_abs > 50.0 * bl_on.head_abs);
     REQUIRE(bl_on.head_coh < 0.15);
 
-    // ---- 🚨 THE GATE-0 VERDICT (2026-08-01): THE ENERGY DOES NOT CARE -------------------
-    // The theory note's section-2 prediction (P3: "remove the fluctuation head and the
-    // vertex shift returns to the B-S class, positive") is REFUTED BY THIS MEASUREMENT:
-    //     d(B-L, H1 on)  = -3.8835e-03     d(B-L, H1 off) = -3.8642e-03
-    // i.e. with dW's coherent head channel PROVABLY EMPTY (the P1 gates above), the energy
-    // stays at the anomalous sign-flipped value. The fluctuation head is worth -1.9e-05 of
-    // a -5.0e-03 effect; the damage is carried by the STATIC head weight eps^-1(0) in
-    // B-L's W0-consuming structures (H1-vs-ignore_g0 = -5.02e-03 = the whole lambda-scan
-    // damage). The lambda scan could not separate the two -- both are linear in lambda --
-    // and P0.1's coherence spotlight was on the wrong object. Localization: [blh1split].
-    // These gates now pin the MEASURED behavior so the falsification stays on record; if
-    // the energy ever starts responding to the fluctuation head, this fires and the
-    // investigation reopens.
+    // ---- THE ENERGY DOES NOT RESPOND TO THE FLUCTUATION HEAD ---------------------------
+    // Prediction P3 does NOT hold: with dW's coherent head channel provably empty (the P1
+    // checks above), d(B-L) stays at the anomalous, sign-flipped value -- removing the
+    // fluctuation head moves it by well under 1 % of the gygi-vs-ignore_g0 difference. The
+    // damage is carried by the STATIC head weight eps^-1(0) in B-L's W0-consuming
+    // structures, which a lambda scan cannot separate from the fluctuation head (both are
+    // linear in lambda); see vertex_bl_static_head_split. These checks pin that
+    // behavior: if the energy ever starts responding to the fluctuation head, they fire.
     REQUIRE(std::abs(bl_on.e_corr - bl_off.e_corr) < 1.0e-3);   // energy-insensitive
     REQUIRE(d_on < 0.0);                                        // still sign-flipped
     REQUIRE(std::abs(d_on - d_off) < 0.2 * std::abs(d_off));    // same anomaly class
     (void) d_bs;
 
     // ---- P4: THE EXPANSION PARAMETER FALLS TOWARD ITS HEAD-FREE VALUE --------------------
-    // Directional gate only (the max-norm is body-dominated; ignore_g0 measured 0.1533
-    // against gygi's 0.2775; H1 measured 0.0948).
+    // Directional check only: the max-norm is body-dominated, so it falls by a modest
+    // factor, not by the orders of magnitude of the chi channel.
     REQUIRE(bl_on.dw_rel > 0.0);
     REQUIRE(bl_on.dw_rel < 0.9 * bl_off.dw_rel);
 #endif
   }
 
   // ======================================================================================
-  // GATE 0.5: WHERE DOES THE STATIC-HEAD DAMAGE LIVE? The [blh1] measurement moved the
-  // question: the -5.0e-03 gygi damage is NOT dW's coherent head (removing it moves the
-  // energy -1.9e-05); it is proportional to the STATIC head weight eps^-1(0) carried by
-  // B-L's W0-consuming structures. Under H1 those are, exhaustively:
+  // B-L STATIC-HEAD SPLIT: where does the static-head damage live? With the knob of
+  // [blstatichead], the gygi damage is NOT dW's coherent head (removing it barely moves the
+  // energy); it is proportional to the STATIC head weight eps^-1(0) carried by B-L's
+  // W0-consuming structures. Under H1 those are, exhaustively:
   //   (i)   S1/S2's static rung  (W0(Gamma) head x the dW BODY convolution),
-  //   (ii)  S3 = B-S's own kernel term (known healthy, +1.9e-03 class),
+  //   (ii)  S3 = B-S's own kernel term (positive, B-S class),
   //   (iii) P^{C,L} = Pi^{C,0}[W0-head rung] injected into the Dyson (enters every arm
   //         through Sigma_GW; the drop knob never touches it),
   //   (iv)  Sigma^{L,r} via the W0(Gamma)-head sandwich Delta w^L = W0 [X^L] W0.
   // This case decomposes the H1 theory with the SAME machinery as [blmixed]/[bldecomp]:
   // the S1/S2/S3 slot probe x the bl_drop knob, all arms at gygi + H1. Ablations with
-  // feedback (trap 8): SIGN-level statements only, ~17 % nonlinearity.
-  // On-file comparison columns ([blmixed], same protocol, no H1):
-  //   gygi      : S3 +1.9648e-03, S1 = S2 = -3.1708e-03, |S1+S2|/|S3| = 3.228
-  //   ignore_g0 : S3 +1.8911e-03, S1 = S2 = +3.2730e-05, |S1+S2|/|S3| = 0.035
+  // feedback: SIGN-level statements only, O(10 %) nonlinearity. The log prints the
+  // corresponding [blmixed] values (same protocol, no H1) for comparison.
   //
-  // HIDDEN ([.]), 7 runs, ~18 min. Run with:
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blh1split]"
-  TEST_CASE("vertex_bl_h1_static_head_split", "[.][methods][vertex][static][blh1split]") {
+  // HIDDEN ([.]), 7 runs. Run with:
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blstaticheadsplit]"
+  TEST_CASE("vertex_bl_static_head_split", "[.][methods][vertex][static][blstaticheadsplit]") {
 #ifndef ENABLE_DLR
-    SUCCEED("vertex_bl_h1_static_head_split skipped: build has ENABLE_DLR=OFF.");
+    SUCCEED("vertex_bl_static_head_split skipped: build has ENABLE_DLR=OFF.");
 #else
     auto &mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
-    std::string output = "coqui_vertex_blh1split";
+    std::string output = "coqui_vertex_blstaticheadsplit";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
@@ -1354,8 +1316,8 @@ namespace bdft_tests {
       return e_corr;
     };
 
-    const double E_SCGW  = -0.096212991792;   // plain scGW, this protocol, on file
-    const double E_FULL0 = -0.100096475753;   // [blh1]'s bl_on: full B-L @ gygi + H1
+    const double E_SCGW  = -0.096212991792;   // plain scGW, this protocol
+    const double E_FULL0 = -0.100096475753;   // [blstatichead]'s bl_on: full B-L @ gygi + H1
 
     const double e_full = run(0, 0);   // everything
     const double e_d3   = run(3, 0);   // P^{C,L} via Sigma_GW alone (the shares' baseline)
@@ -1370,9 +1332,9 @@ namespace bdft_tests {
     const double sh_cx  = e_d1 - e_d3;      // full Sigma^{C,x} share
     const double S1 = e_s1 - e_d3, S2 = e_s2 - e_d3, S3 = e_s3 - e_d3;
 
-    app_log(1, "\n========== GATE 0.5: THE STATIC-HEAD DAMAGE, LOCALIZED (all arms H1) ==========");
-    app_log(1, "  B-L @ gygi + H1, LiH-222, C = [1,3), 2 COLD iterations. Shares are");
-    app_log(1, "  ABLATIONS WITH FEEDBACK (trap 8): signs and orders only.");
+    app_log(1, "\n========== B-L STATIC-HEAD SPLIT: THE DAMAGE, LOCALIZED (all arms static head) ==========");
+    app_log(1, "  B-L @ gygi + static head, LiH-222, C = [1,3), 2 COLD iterations. Shares are");
+    app_log(1, "  ABLATIONS WITH FEEDBACK (the pieces do not add): signs and orders only.");
     app_log(1, "    full theory            e = {:.12f}   d = {:+.4e}", e_full, e_full - E_SCGW);
     app_log(1, "    P^(C,L) alone (drop 3) e = {:.12f}   share = {:+.4e}", e_d3, sh_pcl);
     app_log(1, "    Sigma^(L,r)  share (drop2 - drop3)   = {:+.4e}", sh_lr);
@@ -1382,10 +1344,10 @@ namespace bdft_tests {
     app_log(1, "    S3 = W0_x W0_y share                 = {:+.4e}", S3);
     app_log(1, "    |S1 + S2| / |S3|                     = {:.4f}",
             (S3 != 0.0 ? std::abs(S1 + S2) / std::abs(S3) : -1.0));
-    app_log(1, "  On-file columns, same protocol, NO H1 ([blmixed]):");
+    app_log(1, "  Reference values from [blmixed], same protocol, NO static head:");
     app_log(1, "    gygi:      S3 +1.9648e-03, S1 = S2 = -3.1708e-03, ratio 3.228");
     app_log(1, "    ignore_g0: S3 +1.8911e-03, S1 = S2 = +3.2730e-05, ratio 0.035");
-    app_log(1, "  READ:  S1/S2 still ~ -3e-03 -> the damage is W0's STATIC head x the dW BODY");
+    app_log(1, "  Reading: S1/S2 still ~ -3e-03 -> the damage is W0's STATIC head x the dW BODY");
     app_log(1, "         (the mixed terms' Gamma_x cell). S1/S2 collapsed to +3e-05 class ->");
     app_log(1, "         the damage lives in P^(C,L) injection and/or Sigma^(L,r) instead.");
     app_log(1, "===============================================================================\n");
@@ -1397,45 +1359,43 @@ namespace bdft_tests {
     REQUIRE(std::isfinite(e_s1));
     REQUIRE(std::isfinite(e_s2));
     REQUIRE(std::isfinite(e_s3));
-    // Harness integrity: the full arm reproduces [blh1]'s bl_on number.
+    // Harness integrity: the full arm reproduces [blstatichead]'s bl_on number.
     REQUIRE(std::abs(e_full - E_FULL0) < 1e-8);
-    // Liveness of the slot probe (trap 7): restricting to S3 must differ from full Sig^{C,x}.
+    // Liveness of the slot probe: restricting to S3 must differ from full Sig^{C,x}.
     REQUIRE(std::abs(e_s3 - e_d1) > 1e-6);
-    // The pair-symmetry gate: the two orderings of one rung pair contribute equally
-    // (W_PQ(q) = W_QP(-q) end to end; [blmixed] measured 2.6e-14).
+    // Pair symmetry: the two orderings of one rung pair contribute equally
+    // (W_PQ(q) = W_QP(-q) end to end; the difference is at FP-accumulation level).
     REQUIRE(std::abs(e_s1 - e_s2) < 1e-9);
 #endif
   }
 
   // ======================================================================================
-  // GATE 1 OF THE H1 REPAIR: THE PARENT DISCRIMINATOR
-  // (notes/bl_head_balance_theory_and_plan.md section 5, Gate 1.)
+  // PARENT (DYNAMIC-RUNG) HEAD GAP
   //
   // The PARENT theory (dynamic rung) = B-L + Phi^(2), with the IDENTICAL gygi head
-  // treatment. The theory note's order counting (its section 2.2) shows the Phi^(2) that
-  // B-L discards contains head x body cross terms that are ALSO first order in the head
-  // -- the lambda scan cannot separate them from B-L's kept O(lambda) terms -- so B-L's
-  // anomalous linear head response says nothing about the parent until the parent is
-  // measured. The discriminating number is the head GAP at fixed everything,
+  // treatment. By order counting, the Phi^(2) that B-L discards contains head x body cross
+  // terms that are ALSO first order in the head -- a lambda scan cannot separate them from
+  // B-L's kept O(lambda) terms -- so B-L's anomalous linear head response says nothing about
+  // the parent until the parent is evaluated. The discriminating number is the head GAP at
+  // fixed everything,
   //     gap := d(e_corr)[gygi] - d(e_corr)[ignore_g0],
-  // which partially cancels the parent's known pole-fit defect (the same-binary,
-  // same-protocol difference). Two outcomes, both informative:
+  // in which systematic errors of the dynamic path that do not depend on the head policy
+  // partially cancel. Two outcomes, both informative:
   //   (a) gap is B-S-class (small):  the cross terms CANCEL B-L's kept head term; the
-  //       gygi B-L anomaly is pure truncation; H1 is not merely balanced but ACCURATE,
-  //       and H2's value is only the (small) retarded-head content.
+  //       gygi B-L anomaly is pure truncation, and the static-head (H1) treatment is
+  //       accurate, not merely balanced.
   //   (b) gap is large/negative (B-L-like):  head dominance of the Gamma cell is REAL
-  //       parent physics at N_k = 8 (the 2026-07-16 caveat measured the head flipping
-  //       Phi_2^C's sign at this mesh) -- a program-wide coarse-mesh issue; production
-  //       stays on H1/ignore_g0 and any retarded-head claim needs H2 + the rusty ladder.
+  //       parent physics at N_k = 8 (the head can flip Phi_2^C's sign at this mesh) --
+  //       a coarse-mesh issue that needs denser k meshes to resolve.
   //
   // This is a MEASUREMENT, not a prediction: no outcome assertion beyond finiteness and
   // liveness. Read the verdict from the logged table. CAVEATS: 2 cold iterations (signs
-  // and orders only, trap 10), and the parent's dynamic path carries the pre-existing
-  // pole-fit defect (notes/pole_fit_repair_STATUS.md) -- do not quote absolute energies.
+  // and orders only), and the dynamic path's pole fit adds its own error -- do not quote
+  // absolute energies.
   //
   // HIDDEN ([.]), 2 parent runs (the dconv kernel makes these the slow ones). Run with:
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blparent]"
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blparent]"
   TEST_CASE("vertex_parent_head_gap", "[.][methods][vertex][static][blparent]") {
 #ifndef ENABLE_DLR
     SUCCEED("vertex_parent_head_gap skipped: build has ENABLE_DLR=OFF.");
@@ -1449,7 +1409,7 @@ namespace bdft_tests {
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
 
-    // Same protocol as [blmixed]/[bldwhead]/[blh1]: LiH-222, C = [1,3), 2 COLD
+    // Same protocol as [blmixed]/[bldwhead]/[blstatichead]: LiH-222, C = [1,3), 2 COLD
     // iterations, gw and scr_coulomb pinned at ignore_g0.
     auto run = [&](std::string const &rung, std::string const &policy) -> double {
       solvers::hf_t hf;
@@ -1470,15 +1430,15 @@ namespace bdft_tests {
       return e_corr;
     };
 
-    const double E_SCGW = -0.096212991792;   // plain scGW, this protocol, on file
+    const double E_SCGW = -0.096212991792;   // plain scGW, this protocol
     const double p_g  = run("dynamic", "gygi");
     const double p_n  = run("dynamic", "ignore_g0");
     const double d_g  = p_g - E_SCGW;
     const double d_n  = p_n - E_SCGW;
     const double gap  = d_g - d_n;
 
-    app_log(1, "\n========== GATE 1: THE PARENT (DYNAMIC-RUNG) HEAD GAP ==========");
-    app_log(1, "  LiH-222, C = [1,3), 2 COLD iterations. On-file companions, same protocol:");
+    app_log(1, "\n========== THE PARENT (DYNAMIC-RUNG) HEAD GAP ==========");
+    app_log(1, "  LiH-222, C = [1,3), 2 COLD iterations. Reference values, same protocol:");
     app_log(1, "    B-S  d = +1.1986e-03 (gygi) / +1.1529e-03 (ig0)  -> gap = +4.57e-05");
     app_log(1, "    B-L  d = -3.8642e-03 (gygi) / +1.1343e-03 (ig0)  -> gap = -5.00e-03");
     app_log(1, "  PARENT:");
@@ -1486,22 +1446,23 @@ namespace bdft_tests {
     app_log(1, "    e_corr(ignore_g0) = {:.12f}   d = {:+.4e}", p_n, d_n);
     app_log(1, "    gap               = {:+.4e}   gap/gap_BS = {:+.1f}   gap/gap_BL = {:+.3f}",
             gap, gap / 4.57e-05, gap / -5.00e-03);
-    app_log(1, "  VERDICT KEY: |gap| ~ 5e-05 class -> (a) B-L's anomaly is pure truncation");
-    app_log(1, "               (H1 accurate; the Phi^(2) cross terms cancel the head).");
+    app_log(1, "  Interpretation: |gap| ~ 5e-05 class -> (a) B-L's anomaly is pure truncation");
+    app_log(1, "               (static head accurate; the Phi^(2) cross terms cancel the head).");
     app_log(1, "               gap ~ -5e-03 class  -> (b) head dominance is REAL parent");
-    app_log(1, "               physics at N_k = 8 (program-wide coarse-mesh issue).");
+    app_log(1, "               physics at N_k = 8 (a coarse-mesh effect).");
     app_log(1, "================================================================\n");
 
     REQUIRE(std::isfinite(p_g));
     REQUIRE(std::isfinite(p_n));
-    // LIVENESS (trap 7): the two arms must differ -- at ignore_g0 there is no head at all,
+    // LIVENESS: the two arms must differ -- at ignore_g0 there is no head at all,
     // so equality would mean the gygi arm never inserted one (a config null, not physics).
     REQUIRE(std::abs(p_g - p_n) > 1.0e-9);
 #endif
   }
 
   // ======================================================================================
-  // P0.2: IS THE Gamma HEAD A LEGITIMATE ACCELERATOR, OR DOES IT MOVE THE N_k -> inf LIMIT?
+  // B-L HEAD N_k CONVERGENCE: is the Gamma head a legitimate accelerator, or does it move
+  // the N_k -> inf limit?
   //
   // The analytic head insertion is a FINITE-SIZE device: "gygi" and "ignore_g0" differ only in
   // how the q = Gamma microcell of a q-sum is treated, and both must converge to the SAME
@@ -1509,45 +1470,43 @@ namespace bdft_tests {
   // watch is not either arm but the GAP between them,
   //     gap(N_k) := d(e_corr)[gygi] - d(e_corr)[ignore_g0],
   // which MUST SHRINK with N_k for a legitimate accelerator. On LiH-222 the B-L gap is
-  // -5.0e-03, LARGER than either arm's own vertex shift, while the B-S gap is 4.6e-05 (3.9 %).
+  // LARGER than either arm's own vertex shift, while the B-S gap is a few % of its shift.
   //
   // WHY B-L IS THE SUSPECT -- ORDER COUNTING. The head is derived for the SINGLE-rung q -> 0
   // limit of Sigma_GW, where the Gamma microcell contributes int_cell d^3q / q^2 ~ O(N_k^-1/3):
   // slowly vanishing, which is exactly why an analytic accelerator is worth having. B-L's
   // Sigma^{C,x} is a TWO-rung kernel in which the same Gamma cell can sit on BOTH transfers,
-  // giving int d^3q / q^4 -- which DIVERGES in 3D (notes/head_corrections.pdf sections 2-3,
-  // the same non-integrability that forces the response middle factor to have a q^2-suppressed
-  // head). P0.1 then measured that the leg carrying the pathology, dW(Gamma), is 98 % a
-  // coherent rank-1 chi chi^dag. B-S has the same two rungs but both STATIC, so it is the
-  // built-in control: its gap is known to be small and must stay small.
+  // giving int d^3q / q^4 -- which DIVERGES in 3D (the same non-integrability that forces the
+  // response middle factor to have a q^2-suppressed head). The leg carrying the pathology,
+  // dW(Gamma), is almost entirely a coherent rank-1 chi chi^dag (see
+  // vertex_bl_dw_head_channel). B-S has the same two rungs but both STATIC, so it is the
+  // built-in control: its gap is small and must stay small.
   //
   // THREE OUTCOMES, ALL INFORMATIVE:
-  //   (1) the B-L gap SHRINKS with N_k  -> the head is fine; P0.2 refuted, look elsewhere.
+  //   (1) the B-L gap SHRINKS with N_k  -> the head is fine.
   //   (2) it stays FLAT or GROWS        -> the head insertion is biased in a two-rung kernel:
   //                                        the two policies do not share an N_k -> inf limit.
   //   (3) ignore_g0 B-L itself DRIFTS   -> the coincident-Gamma cell is genuinely
   //       systematically with N_k          non-integrable and B-L needs a real q -> 0
   //                                        treatment, not a different head.
   //
-  // ⚠ WHAT THIS LOCAL LADDER CAN AND CANNOT DO. The unit-test meanfields give N_k = 1, 2 (Si)
+  // WHAT THIS LOCAL LADDER CAN AND CANNOT DO. The unit-test meanfields give N_k = 1, 2 (Si)
   // and 8, 12 (LiH) -- two materials, two rungs each. That is enough to measure the DIRECTION
   // of gap(N_k) within a material; it is NOT enough for a convergence exponent, and Si and LiH
   // numbers must never be compared to each other. A real convergence statement needs larger
-  // grids on rusty. ⚠ And the vertex does not scale well: 32 ranks is the measured ceiling,
-  // upfold+reduce anti-scales, build_delta_w is fully replicated (see the parallel-scaling
-  // section of notes/bl_head_channel_diagnosis.md).
+  // k grids.
   //
-  // 🚨 `qe_si111` (N_k = 1) WOULD BE THE FREE CONTROL -- nqpts_ibz == 1 is where eval_Sigma_C
+  // `qe_si111` (N_k = 1) WOULD BE THE FREE CONTROL -- nqpts_ibz == 1 is where eval_Sigma_C
   // DOWNGRADES gygi to ignore_g0 by itself, so the two arms must come out bit-identical, a
   // positive test of the downgrade path. IT CANNOT BE RUN HERE: on a Gamma-only mesh at 2
   // ranks the ISDF fit leaves one rank with no work and aborts in
-  // math::fft::create_plan_many ("howmany=0", numerics/fft/nda.hpp:174) before the vertex is
-  // ever reached. That is a pre-existing THC/ISDF limitation, NOT a vertex defect, and it is
-  // fatal (APP_ABORT), so it cannot be guarded around from here. Excluded deliberately.
+  // math::fft::create_plan_many ("howmany=0") before the vertex is ever reached. That is a
+  // THC/ISDF limitation, NOT a vertex defect, and it is fatal (APP_ABORT), so it cannot be
+  // guarded around from here. Excluded deliberately.
   //
-  // HIDDEN ([.]), ~40 min. Run with:
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blnkconv]"
+  // HIDDEN ([.]), long-running. Run with:
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blnkconv]"
   TEST_CASE("vertex_bl_head_nk_convergence", "[.][methods][vertex][static][blnkconv]") {
 #ifndef ENABLE_DLR
     SUCCEED("vertex_bl_head_nk_convergence skipped: build has ENABLE_DLR=OFF.");
@@ -1560,7 +1519,7 @@ namespace bdft_tests {
       long nkpts;
       double ref;
       double bs_g, bs_n, bl_g, bl_n;        // e_corr per arm
-      double head_abs, head_coh;            // the P0.1 meters, gygi arm
+      double head_abs, head_coh;            // the [bldwhead] meters, gygi arm
       double madelung;
       double d_bs_g, d_bs_n, d_bl_g, d_bl_n, gap_bs, gap_bl;
     };
@@ -1623,7 +1582,7 @@ namespace bdft_tests {
     for (auto const *sys : {"qe_si211", "qe_lih222", "qe_lih223"})
       res.push_back(measure(sys));
 
-    app_log(1, "\n===== P0.2: DOES THE Gamma HEAD MOVE THE N_k -> inf LIMIT? =====");
+    app_log(1, "\n===== B-L HEAD N_k CONVERGENCE: DOES THE Gamma HEAD MOVE THE N_k -> inf LIMIT? =====");
     app_log(1, "  C = [1,3), 2 COLD iterations per arm, 5 arms per system.");
     app_log(1, "  gap := d(e_corr)[gygi] - d(e_corr)[ignore_g0]. A legitimate finite-size");
     app_log(1, "  accelerator must have gap -> 0 as N_k grows. B-S is the control (same two");
@@ -1635,13 +1594,13 @@ namespace bdft_tests {
                  "{:8.2f}",
               r.sys, r.nkpts, r.d_bs_g, r.d_bs_n, r.gap_bs, r.d_bl_g, r.d_bl_n, r.gap_bl,
               (std::abs(r.d_bl_n) > 0.0 ? std::abs(r.gap_bl) / std::abs(r.d_bl_n) : 0.0));
-    app_log(1, "  ---- the P0.1 head-channel meters on the B-L gygi arm ----");
+    app_log(1, "  ---- the dW head-channel meters on the B-L gygi arm ----");
     app_log(1, "  system      N_k   madelung      |h_dW(Gamma)|   coherence (1 = pure "
                "chi chi^dag)");
     for (auto const &r : res)
       app_log(1, "  {:<10} {:4}  {:+.4e}   {:.4e}      {:.3f}",
               r.sys, r.nkpts, r.madelung, r.head_abs, r.head_coh);
-    app_log(1, "  ---- ⭐ WITHOUT THE HEAD, DOES B-L TRACK B-S? ----");
+    app_log(1, "  ---- WITHOUT THE HEAD, DOES B-L TRACK B-S? ----");
     app_log(1, "  system      N_k   d_BS(ig0)    d_BL(ig0)    |difference|   relative");
     for (auto const &r : res)
       app_log(1, "  {:<10} {:4}  {:+.4e}  {:+.4e}  {:.4e}   {:8.2f} %",
@@ -1664,7 +1623,7 @@ namespace bdft_tests {
                    ? "B-L gap SHRINKS (accelerator behaving)"
                    : "B-L gap DOES NOT SHRINK (the two policies are not converging together)"));
     }
-    app_log(1, "  ⚠ Two rungs per material only -- this measures the DIRECTION of gap(N_k),");
+    app_log(1, "  NOTE Two rungs per material only -- this measures the DIRECTION of gap(N_k),");
     app_log(1, "    NOT a convergence exponent. Si and LiH numbers are not comparable.");
     app_log(1, "===============================================================\n");
 
@@ -1678,125 +1637,107 @@ namespace bdft_tests {
     // ---- LIVENESS: on every mesh here the Gamma head really fired --------------------
     // Every system in the ladder has nqpts_ibz > 1, so none of them takes the Gamma-only
     // downgrade and the head must be live in all of them. Without this a config null reads
-    // exactly like a physics null (trap 7) -- which is how the head projection first
-    // "showed no effect".
+    // exactly like a physics null.
     for (size_t i = 0; i < res.size(); ++i) {
       REQUIRE(res[i].nkpts > 1);
       REQUIRE(res[i].head_abs > 0.0);
       REQUIRE(res[i].head_coh > 0.0);
-      // ⭐ P0.1 GENERALIZES. dW(Gamma) is a near-pure rank-1 chi chi^dag on BOTH materials and
-      // every mesh here (0.939 / 0.980 / 0.976), so the coherence finding is not a LiH-222
-      // accident and does not wash out as the mesh is refined.
+      // dW(Gamma) is a near-pure rank-1 chi chi^dag (coherence above ~0.9) on BOTH materials
+      // and every mesh here, so the [bldwhead] coherence result is not specific to LiH-222
+      // and does not wash out as the mesh is refined.
       REQUIRE(res[i].head_coh > 0.85);
     }
 
-    // ---- ⚠ si211 IS EXCLUDED FROM THE PHYSICS GATES, AND THAT IS ITSELF A FINDING --------
+    // ---- si211 IS EXCLUDED FROM THE PHYSICS CHECKS ------------------------------------
     // At N_k = 2 the Gamma cell is HALF the mesh, so every arm is Gamma-dominated and the
-    // whole vertex shift is ~1e-05/1e-06 -- three orders below LiH. There B-S's own gap is
-    // 7.3x its own shift. So **B-S is not intrinsically head-insensitive**: its 3-4 %
-    // insensitivity on LiH is a statement about the MESH, not about the diagram, and any
-    // future argument of the form "B-S proves the head is harmless" must say at which N_k.
+    // whole vertex shift is orders of magnitude below LiH; there B-S's own gap exceeds its
+    // own shift. So B-S is not intrinsically head-insensitive: its few-% insensitivity on
+    // LiH is a statement about the MESH, not about the diagram. The check below records it.
     REQUIRE(res[0].nkpts == 2);
     REQUIRE(std::abs(res[0].gap_bs) > std::abs(res[0].d_bs_n));
 
-    // ---- THE GATES, on the LiH pair (N_k = 8, 12) ---------------------------------------
+    // ---- THE CHECKS, on the LiH pair (N_k = 8, 12) --------------------------------------
     for (size_t i = 1; i < res.size(); ++i) {
-      // (a) the B-S control holds where the mesh is not Gamma-dominated: 4.0 % / 2.7 %.
+      // (a) the B-S control holds where the mesh is not Gamma-dominated (gap of a few %).
       REQUIRE(std::abs(res[i].gap_bs) < 0.15 * std::abs(res[i].d_bs_n));
-      // (b) and B-L's gap dwarfs it -- 109x / 123x. Same head, same mesh, same q-sum; the
-      //     ONLY difference is that B-L's kernel has a dynamic rung leg for the head to
-      //     survive into (P0.1: that leg is 98 % rank-1).
+      // (b) and B-L's gap dwarfs it (by two orders of magnitude). Same head, same mesh, same
+      //     q-sum; the ONLY difference is that B-L's kernel has a dynamic rung leg for the
+      //     head to survive into (and that leg is almost entirely rank-1, see [bldwhead]).
       REQUIRE(std::abs(res[i].gap_bl) > 20.0 * std::abs(res[i].gap_bs));
-      // (c) ⭐ WITHOUT THE HEAD, B-L TRACKS B-S: 1.6 % at N_k = 8, 3.1 % at N_k = 12, and
-      //     both drift a well-behaved +14-15 % over the refinement. So the head-free B-L is
-      //     an ordinary, convergent quantity -- outcome (3) is NOT what is happening, and
-      //     B-L is not intrinsically sick. Only the head-corrected arm is anomalous.
+      // (c) WITHOUT THE HEAD, B-L TRACKS B-S to a few %, and both drift similarly over the
+      //     refinement. So the head-free B-L is an ordinary, convergent quantity -- outcome
+      //     (3) does not occur, and B-L is not intrinsically sick. Only the head-corrected
+      //     arm is anomalous.
       REQUIRE(std::abs(res[i].d_bl_n - res[i].d_bs_n) < 0.20 * std::abs(res[i].d_bs_n));
       REQUIRE(res[i].d_bl_n * res[i].d_bs_n > 0.0);
       // (d) ... while WITH the head, B-L takes the OPPOSITE SIGN from B-S at both meshes.
       REQUIRE(res[i].d_bl_g * res[i].d_bs_g < 0.0);
       // (e) ... and the disagreement is still LARGER than the signal at the finest mesh
-      //     available here: |gap_BL| / |d_BL(ig0)| = 4.41 (N_k = 8), 3.44 (N_k = 12).
+      //     available here (|gap_BL| / |d_BL(ig0)| is several).
       REQUIRE(std::abs(res[i].gap_bl) > 2.0 * std::abs(res[i].d_bl_n));
     }
 
     // ---- THE TREND -- AND WHAT IT CANNOT SETTLE -----------------------------------------
-    // gap_BL goes -4.9986e-03 -> -4.4343e-03, i.e. 0.89x over N_k 8 -> 12. A legitimate
-    // O(N_k^-1/3) finite-size residual would predict 0.87x, and "flat" would be 1.00x --
-    // and this ladder CANNOT TELL THOSE APART: 8 -> 12 is only 1.5x in N_k (and 222 -> 223
-    // refines ONE direction, not three), against a ~7 % run-to-run spread on a 2-cold-
-    // iteration delta (trap 10). So the honest assertion is only that the gap does not GROW.
-    // Distinguishing outcome (1) from (2) needs 2x2x2 -> 3x3x3 -> 4x4x4 on rusty, where
-    // N_k^1/3 doubles. ⚠ Do not quote the 0.89x as evidence of convergence.
+    // Over N_k 8 -> 12, a legitimate O(N_k^-1/3) finite-size residual predicts a ratio
+    // gap_BL(12)/gap_BL(8) of ~0.87, and "flat" would be 1.00 -- and this ladder CANNOT TELL
+    // THOSE APART: 8 -> 12 is only 1.5x in N_k (and 222 -> 223 refines ONE direction, not
+    // three), against a spread of several % on a 2-cold-iteration delta. So the only honest
+    // assertion is that the gap does not GROW (5 % allowance for that spread).
+    // Distinguishing outcome (1) from (2) needs e.g. 2x2x2 -> 3x3x3 -> 4x4x4, where
+    // N_k^1/3 doubles.
     REQUIRE(std::abs(res[2].gap_bl) < 1.05 * std::abs(res[1].gap_bl));
-    // Meanwhile the head's own channel content does NOT fall with the mesh -- |h_dW(Gamma)|
-    // goes 8.3877e-03 -> 1.3066e-02 (1.56x) while madelung falls 0.2971 -> 0.2505. Recorded,
-    // not interpreted: the contribution to the energy carries a 1/N_k cell weight that this
-    // meter does not include, so 1.56x against 1.5x in N_k is suggestive of a FLAT
-    // contribution, not proof of one.
+    // Meanwhile the head's own channel content does NOT fall with the mesh, while madelung
+    // does. Recorded, not interpreted: the contribution to the energy carries a 1/N_k cell
+    // weight that this meter does not include.
     REQUIRE(res[2].head_abs > res[1].head_abs);
 #endif
   }
 
   // ======================================================================================
-  // P0.3: SEPARATE THE ONE-RUNG Gamma TERM FROM THE COINCIDENT-Gamma ONE, BY SCALING THE HEAD
+  // B-L HEAD LAMBDA SCAN: separate the one-rung Gamma term from the coincident-Gamma one by
+  // scaling the head.
   //
-  // The N_k ladder ([blnkconv]) could not settle whether the head moves the N_k -> inf limit:
-  // its leverage is only N_k^1/3, and over 8 -> 12 a legitimate O(N_k^-1/3) residual (0.87x)
-  // and a flat one (1.00x) are indistinguishable against a ~7 % delta spread. Scaling the
-  // HEAD ITSELF has full leverage at FIXED mesh, FIXED G and FIXED cost.
+  // An N_k ladder ([blnkconv]) has only N_k^1/3 leverage. Scaling the HEAD ITSELF
+  // (vertex_bl_head_scale = lambda) has full leverage at FIXED mesh, FIXED G and FIXED cost.
   //
   // THE SEPARATION. Sigma^{C,x} is a TWO-rung kernel, so the Gamma cell enters it two ways:
   //   * ONE rung transfer at Gamma, the other elsewhere  -> scales as lambda
   //   * BOTH rung transfers at Gamma (the coincident cell) -> scales as lambda^2
   // so fitting  d(e_corr)(lambda) = a*lambda + b*lambda^2  over lambda in {0, 1/4, 1/2,
   // 3/4, 1} SEPARATES them. `b` is the coefficient of the coincident-Gamma cell -- the
-  // int d^3q/q^4 that sections 2-3 of notes/head_corrections.pdf show is NON-INTEGRABLE in
-  // 3D, unlike the single-rung int d^3q/q^2 the analytic head is actually derived for. P0.1
-  // says the leg carrying the pathology (dW(Gamma)) is 98 % a coherent rank-1 chi chi^dag.
+  // int d^3q/q^4 that is NON-INTEGRABLE in 3D, unlike the single-rung int d^3q/q^2 the
+  // analytic head is actually derived for.
   //
-  // B-S IS THE CONTROL, and it is a sharp one: B-S has the SAME two rungs and the same
-  // Gamma cell, but both rungs are STATIC W0. If a large |b|/|a| showed up in B-S too, then
-  // quadratic-in-head behaviour is just what a two-rung kernel does and it says nothing about
-  // B-L. If B-S is essentially linear and B-L is not, the coincident-Gamma cell is entering
-  // B-L through the DYNAMIC leg specifically -- which is exactly what P0/P0.1 measured.
+  // B-S IS THE CONTROL: B-S has the SAME two rungs and the same Gamma cell, but both rungs
+  // are STATIC W0. If a large |b|/|a| showed up in B-S too, quadratic-in-head behaviour is
+  // just what a two-rung kernel does and says nothing about B-L. If B-S is essentially
+  // linear and B-L is not, the coincident-Gamma cell enters B-L through the DYNAMIC leg.
   //
-  // 🚨 MEASURED 2026-08-01 -- AND THE COINCIDENT-Gamma HYPOTHESIS IS REFUTED. The damage is
-  // LINEAR in the head, not quadratic:
-  //     B-L :  a = -7.1978e-03   b = +2.1677e-03   |b|/|a| = 0.301   (2-term resid 1.3 %)
-  //     B-S :  a = +4.0045e-05   b = +5.7883e-06   |b|/|a| = 0.145   (2-term resid 0.5 %)
-  // The lambda^2 term is only 30 % of the linear one AND CARRIES THE OPPOSITE SIGN (it
-  // partially cancels), and B-L's curvature ratio is a mere 2x B-S's -- no qualitative
-  // difference. So the int d^3q/q^4 coincident-Gamma cell is NOT the mechanism.
+  // RESULT ASSERTED BELOW: the B-L response is LINEAR in the head, not quadratic. The
+  // lambda^2 term is a fraction of the linear one AND CARRIES THE OPPOSITE SIGN (it
+  // partially cancels), and B-L's curvature ratio |b|/|a| is comparable to B-S's. So the
+  // coincident-Gamma cell is NOT the mechanism. What is anomalous is `a`, the ordinary
+  // one-rung-at-Gamma term: B-L's linear response to the head is two orders of magnitude
+  // larger than B-S's, with the opposite sign -- consistent with ONE head entering ONE leg
+  // (the dynamic rung dW) and surviving the W - W0 subtraction (see [bldwhead]).
   //
-  // ⭐ WHAT IS ANOMALOUS IS `a` -- THE ORDINARY ONE-RUNG-AT-Gamma TERM. B-L's linear
-  // response to the head is **180x B-S's, with the opposite sign**. That is precisely what
-  // P0.1 predicts: ONE head, entering ONE leg (the dynamic rung dW), surviving the W - W0
-  // subtraction with near-full bare weight and leaving that leg 98 % rank-1. A single-head
-  // effect is a LINEAR effect. P0.1 and P0.3 agree.
+  // THE FIT IS DESCRIPTIVE, NOT A DECOMPOSITION. e_corr is not evaluated at a common G
+  // (update_G precedes it), so a/b absorb some G-response nonlinearity, and the curve need
+  // not be exactly quadratic. The claim to draw is the SHAPE -- is B-L's lambda-dependence
+  // strongly curved where B-S's is not -- not the value of b. The residual of the 2-term
+  // fit is reported so that curvature beyond lambda^2 is visible rather than absorbed.
   //
-  // ⇒ the open question is no longer "is the two-rung order counting wrong" but "why does a
-  // SINGLE head insertion move B-L 180x more than B-S", and P0.1 has already named the
-  // answer's ingredients: it survives into dW, and it is coherent.
-  //
-  // ⚠ THE FIT IS DESCRIPTIVE, NOT A DECOMPOSITION. e_corr is not evaluated at a common G
-  // (update_G precedes it, scf_driver.cpp:188 vs :200), so a/b absorb some G-response
-  // nonlinearity, and the curve need not be exactly quadratic. The claim to draw is the
-  // SHAPE -- is B-L's lambda-dependence strongly curved where B-S's is not -- not the value
-  // of b. The residual of the 2-term fit is reported so that curvature beyond lambda^2
-  // (which would mean the picture is incomplete) is visible rather than absorbed.
-  //
-  // ⭐ TWO PINS MAKE THE KNOB TRUSTWORTHY, and they are the first thing this test asserts:
-  //   lambda = 1  ==  today's gygi           (the knob is inert at its default)
+  // TWO PINS MAKE THE KNOB TRUSTWORTHY, and they are the first thing this test asserts:
+  //   lambda = 1  ==  plain gygi             (the knob is inert at its default)
   //   lambda = 0  ==  div_treatment ignore_g0 (it really is the head being removed, and
   //                   nothing else -- xi * 0 trips the same `xi == 0` guard every head site
-  //                   already has, so lambda = 0 takes the no-head branch STRUCTURALLY)
+  //                   has, so lambda = 0 takes the no-head branch STRUCTURALLY)
   // Without both, a lambda scan measures an unknown mixture of the head and whatever else
   // the knob perturbed.
   //
-  // HIDDEN ([.]), ~25 min. Run with:
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blhlambda]"
+  // HIDDEN ([.]), long-running. Run with:
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blhlambda]"
   TEST_CASE("vertex_bl_head_lambda_scan", "[.][methods][vertex][static][blhlambda]") {
 #ifndef ENABLE_DLR
     SUCCEED("vertex_bl_head_lambda_scan skipped: build has ENABLE_DLR=OFF.");
@@ -1846,11 +1787,11 @@ namespace bdft_tests {
     const double bl_g0 = run("linear", "gygi", 0.0);        // lambda = 0 at gygi
     const double bl_ig = run("linear", "ignore_g0", 1.0);   // the real ignore_g0
 
-    app_log(1, "\n===== P0.3: THE Gamma-HEAD STRENGTH SCAN =====");
+    app_log(1, "\n===== THE Gamma-HEAD STRENGTH SCAN =====");
     app_log(1, "  LiH-222, C = [1,3), 2 COLD iterations. plain scGW e_corr = {:.12f}", ref);
     app_log(1, "  ---- the two pins ----");
-    app_log(1, "    lambda = 1 @ gygi      e_corr = {:.12f}   (must equal the -3.8642e-03 "
-               "shift on file)", bl_g1);
+    app_log(1, "    lambda = 1 @ gygi      e_corr = {:.12f}   (reference value: shift "
+               "-3.8642e-03)", bl_g1);
     app_log(1, "    lambda = 0 @ gygi      e_corr = {:.12f}", bl_g0);
     app_log(1, "    div_treatment ignore_g0 e_corr = {:.12f}   |difference| = {:.3e}",
             bl_ig, std::abs(bl_g0 - bl_ig));
@@ -1860,7 +1801,7 @@ namespace bdft_tests {
     // scan below is measuring a mixture.
     REQUIRE(std::abs(bl_g0 - bl_ig) < 1e-12);
     // ... and lambda = 1 must NOT equal it -- otherwise the knob is inert and every point
-    // below is the same run (trap 7).
+    // below is the same run.
     REQUIRE(std::abs(bl_g1 - bl_ig) > 1e-6);
 
     // ---- THE SCAN ------------------------------------------------------------------------
@@ -1923,29 +1864,30 @@ namespace bdft_tests {
     REQUIRE(std::abs(d_bl.back() - d_bl.front()) > 1e-4);
     // the 2-term fit must actually describe the curve -- if the residual is a large fraction
     // of the swing, d(lambda) is not lambda + lambda^2 and the one-rung/two-rung reading
-    // does not hold. Measured 1.3 % (B-L) and 0.5 % (B-S).
+    // does not hold. The observed residuals are ~1 %; the 25 % bar flags only a clear
+    // failure of the 2-term form.
     REQUIRE(fbl[2] < 0.25);
     REQUIRE(fbs[2] < 0.25);
 
-    // ---- 🚨 THE COINCIDENT-Gamma HYPOTHESIS IS REFUTED ---------------------------------
+    // ---- THE RESPONSE IS NOT DOMINATED BY THE COINCIDENT-Gamma CELL ---------------------
     // If the int d^3q/q^4 cell (BOTH rung transfers at Gamma) were the mechanism, B-L would
-    // be dominated by lambda^2. It is not: |b|/|a| = 0.301, the quadratic term carries the
-    // OPPOSITE sign from the linear one (it partially cancels), and B-S -- which has the very
-    // same two-rung Gamma cell -- shows a comparable 0.145. Two-rung order counting is not
-    // what distinguishes them.
+    // be dominated by lambda^2. It is not: |b|/|a| is well below 1, the quadratic term
+    // carries the OPPOSITE sign from the linear one (it partially cancels), and B-S -- which
+    // has the very same two-rung Gamma cell -- shows a comparable ratio. Two-rung order
+    // counting is not what distinguishes them.
     REQUIRE(std::abs(fbl[1]) < 0.6 * std::abs(fbl[0]));
     REQUIRE(fbl[0] * fbl[1] < 0.0);
     REQUIRE(std::abs(fbl[1] / fbl[0]) < 4.0 * std::abs(fbs[1] / fbs[0]));
 
-    // ---- ⭐ WHAT IS ANOMALOUS IS THE ONE-RUNG (LINEAR) TERM ------------------------------
-    // B-L's linear response to the head is 180x B-S's and of OPPOSITE SIGN, on the same mesh,
-    // the same Gamma cell and the same q-sum. A single head insertion is a LINEAR effect, so
-    // this is the same object P0.1 measured: the head survives W - W0 into the dynamic rung
-    // leg with near-full bare weight and leaves it 98 % rank-1.
+    // ---- WHAT IS ANOMALOUS IS THE ONE-RUNG (LINEAR) TERM -------------------------------
+    // B-L's linear response to the head is two orders of magnitude larger than B-S's and of
+    // OPPOSITE SIGN, on the same mesh, the same Gamma cell and the same q-sum. A single head
+    // insertion is a LINEAR effect: the head survives W - W0 into the dynamic rung leg with
+    // near-full bare weight and leaves it almost entirely rank-1 (see [bldwhead]).
     REQUIRE(std::abs(fbl[0]) > 50.0 * std::abs(fbs[0]));
     REQUIRE(fbl[0] * fbs[0] < 0.0);
     // ... and B-S stays positive and nearly head-independent across the whole scan, so the
-    // sign flip is B-L's alone: +1.1529e-03 -> +1.1986e-03, a 4 % drift over the full range.
+    // sign flip is B-L's alone (a drift of a few % over the full range; 10 % bar).
     REQUIRE(d_bs.front() > 0.0);
     REQUIRE(d_bs.back() > 0.0);
     REQUIRE(std::abs(d_bs.back() - d_bs.front()) < 0.10 * std::abs(d_bs.front()));
@@ -1955,8 +1897,8 @@ namespace bdft_tests {
     REQUIRE(d_bl.back() < 0.0);
 
     // ---- the coherence rises with the head, and is already high at QUARTER strength ------
-    // 0.881 at lambda = 0.25, 0.960 at 0.50, 0.973 at 0.75 (vs 0.009 with no head at all).
-    // The rank-1 alignment of dW(Gamma) is not something that only switches on at full
+    // The coherence is ~0.9 already at lambda = 0.25 and rises with lambda (vs ~0.01 with
+    // no head at all). The rank-1 alignment of dW(Gamma) does not only switch on at full
     // strength -- a quarter of the head already produces most of it.
     REQUIRE(coh[1] > 0.75);
     REQUIRE(coh[3] > coh[1]);
@@ -1964,23 +1906,21 @@ namespace bdft_tests {
   }
 
   // ======================================================================================
-  // P4 SCOPING: does the COLD-START divergence reproduce on LiH at gygi -- and does damping
-  // fix it without touching a cut?
+  // B-L COLD START WITH DAMPING: does the cold-start divergence of B-L at gygi (seen on Si
+  // after a few iterations) reproduce on LiH -- and does damping fix it without touching a
+  // cut?
   //
-  // The divergence has only ever been seen on Si (e_corr -2.46 / -2.02 / -5.97 at iterations
-  // 4-8 of three cold runs). Every LiH run in this file stops at 2 iterations, which is too
-  // early to see it. Now that LiH at gygi reproduces the head pathology, the first question
-  // is whether it reproduces the INSTABILITY too -- because if it does, P4 becomes a local
-  // problem like P1-P3, and if it does not, a remedy cannot be developed here at all.
+  // The other LiH tests in this file stop at 2 iterations, which is too early to see such
+  // an instability; this one runs 10.
   //
-  // The head projection is the one knob known to control the basin, and it is Phi-BREAKING
-  // (vertex_t.h). P4 asks for a remedy that does NOT modify a cut; damping is the cheapest
-  // such option, since it changes only the ITERATION MAP, never Phi or either cut, so a
-  // converged fixed point is unchanged by construction.
+  // The head projection is a knob that controls the basin, but it is Phi-BREAKING
+  // (vertex_t.h). Damping is the cheapest remedy that does NOT modify a cut: it changes only
+  // the ITERATION MAP, never Phi or either cut, so a converged fixed point is unchanged by
+  // construction.
   //
   // HIDDEN ([.]). Run with:
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blcold]"
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blcold]"
   TEST_CASE("vertex_bl_cold_start_damping", "[.][methods][vertex][static][blcold]") {
 #ifndef ENABLE_DLR
     SUCCEED("vertex_bl_cold_start_damping skipped: build has ENABLE_DLR=OFF.");
@@ -1994,7 +1934,7 @@ namespace bdft_tests {
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
 
-    const long NIT = 10;   // Si diverged at iterations 4-8, so 10 is enough to see it
+    const long NIT = 10;   // long enough for a cold-start divergence to show (iterations 4-8 on Si)
 
     auto run = [&](double mixing, bool projection) -> double {
       solvers::hf_t hf;
@@ -2017,14 +1957,14 @@ namespace bdft_tests {
     };
 
     const double m07 = run(0.7, false);   // the production map, projection OFF (the honest one)
-    const double m03 = run(0.3, false);   // P4's cheapest legal remedy
+    const double m03 = run(0.3, false);   // stronger damping: the cheapest cut-preserving remedy
     const double proj = run(0.7, true);   // the Phi-breaking knob, for reference only
 
     // ---- DOES THE SIGN SURVIVE ITERATION COUNT? -----------------------------------------
-    // Everything concluded about the B-S/B-L sign was measured at 2 COLD iterations, but the
-    // trajectory above moves e_corr by 2.6e-02 between iterations 1 and 10 -- seven times the
-    // vertex shift itself. So the 2-iteration d(e_corr) is a snapshot on a moving curve, and
-    // the sign has to be re-checked against a MATCHED reference at the same iteration count.
+    // The other B-S/B-L sign comparisons in this file use 2 COLD iterations, but e_corr keeps
+    // moving between iterations 1 and 10 by several times the vertex shift itself. So a
+    // 2-iteration d(e_corr) is a snapshot on a moving curve, and the sign has to be
+    // re-checked against a MATCHED reference at the same iteration count.
     auto run_plain = [&](std::string const &rung) -> double {
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
@@ -2049,13 +1989,13 @@ namespace bdft_tests {
     const double ref10 = run_plain("");
     const double bs10  = run_plain("static");
 
-    app_log(1, "\n===== P4: COLD B-L ON LiH AT gygi, {} ITERATIONS =====", NIT);
+    app_log(1, "\n===== COLD-START B-L ON LiH AT gygi, {} ITERATIONS =====", NIT);
     app_log(1, "  mixing 0.7, projection OFF   e_corr = {:.9f}", m07);
     app_log(1, "  mixing 0.3, projection OFF   e_corr = {:.9f}   <- damping only; touches "
                "the ITERATION MAP, not Phi", m03);
     app_log(1, "  mixing 0.7, projection ON    e_corr = {:.9f}   <- Phi-BREAKING, reference "
                "only", proj);
-    app_log(1, "  Si cold reference: e_corr reached -2.46 / -2.02 / -5.97 at iterations 4-8.");
+    app_log(1, "  Si reference values (cold start): e_corr -2.46 / -2.02 / -5.97 at iterations 4-8.");
     app_log(1, "  plain-scGW scale here is ~-0.096, so |e_corr| >> 1 means DIVERGED.");
     app_log(1, "  --> LiH cold at mixing 0.7 {} reproduce the Si instability.",
             (std::abs(m07) > 1.0 or not std::isfinite(m07)) ? "DOES" : "does NOT");
@@ -2067,7 +2007,7 @@ namespace bdft_tests {
     app_log(1, "    plain scGW  e_corr = {:.9f}", ref10);
     app_log(1, "    B-S         e_corr = {:.9f}   d = {:+.4e}", bs10, bs10 - ref10);
     app_log(1, "    B-L         e_corr = {:.9f}   d = {:+.4e}", m07, m07 - ref10);
-    app_log(1, "    at 2 iterations these were  B-S +1.1986e-03 / B-L -3.8642e-03 -> DISAGREE");
+    app_log(1, "    reference values at 2 iterations:  B-S +1.1986e-03 / B-L -3.8642e-03 -> DISAGREE");
     app_log(1, "    at {} iterations they {}.", NIT,
             (((bs10 - ref10) * (m07 - ref10)) > 0.0 ? "AGREE -- the 2-iteration reading "
                                                       "does NOT survive"
@@ -2164,41 +2104,41 @@ namespace bdft_tests {
   }
 
   // ======================================================================================
-  // T1 STEP 1 -- THE PER-q_x-RESOLVED S1 METER (the qx_diag analogue on the Sigma side)
+  // THE PER-q_x-RESOLVED S1 METER (the qx_diag analogue on the Sigma side)
   //
-  // P0.4's verdict (notes/bl_head_balance_theory_and_plan.md section 5b-5e) localized the
-  // gygi damage to the mixed terms' coupling of W0's STATIC Gamma-head (static rung, q_x)
-  // to the RETARDED dW-body convolution (dynamic rung, all q_y). The new theory target is
-  // the validity of the rank-1 microcell estimate xi_M eps^-1 chi chi^dag when the Gamma
-  // cell couples coherently to a retarded second-order kernel -- and its FIRST step is to
-  // measure the S1 integrand's q_x profile directly, not infer it from energy ablations.
+  // The gygi damage in B-L sits in the mixed terms' coupling of W0's STATIC Gamma-head
+  // (static rung, q_x) to the RETARDED dW-body convolution (dynamic rung, all q_y). The
+  // relevant theory question is the validity of the rank-1 microcell estimate
+  // xi_M eps^-1 chi chi^dag when the Gamma cell couples coherently to a retarded
+  // second-order kernel; this test measures the S1 integrand's q_x profile directly
+  // instead of inferring it from energy ablations.
   //
   // The meter: sigma_C_slot_probe.qx_St -- the kernel's own per-(q_x, external s,k)
-  // decomposition of the instantaneous reductions, gated to S1 by only_term = 1, captured
-  // from the LAST eval (iteration NIT's kernel, trap 9) together with the exact G it
-  // consumed (gA -- NOT the post-update_G G, trap 8). Each q_x slice is contracted
+  // decomposition of the instantaneous reductions, restricted to S1 by only_term = 1,
+  // captured from the LAST eval (iteration NIT's kernel) together with the exact G it
+  // consumed (gA -- NOT the post-update_G G). Each q_x slice is contracted
   // against gA in the eval_corr_energy convention (same pipeline, same k weights, same
   // -0.5*spin prefactor, times the kernel's 1/N_k^2), giving T(q_x): the q_x-resolved
   // S1 contribution to Tr[Sigma G] in e_corr-like units.
   //
-  // THREE ARMS, one knob (the VERTEX div policy; gw/scr stay ignore_g0 as in every gate):
+  // THREE ARMS, one knob (the VERTEX div policy; gw/scr stay ignore_g0 as elsewhere):
   //   gygi      -- the analytic rank-1 head augments the Gamma cell of W0_x AND W(Gamma)
   //   ignore_g0 -- no head anywhere: the pure body integrand
   //   v1_skip   -- the STRUCTURAL pin: the combo loop drops q_x = Gamma entirely, so the
-  //                meter's Gamma row must be EXACTLY zero (attribution gate: if anything
+  //                meter's Gamma row must be EXACTLY zero (attribution check: if anything
   //                lands there, the meter's q_x bookkeeping is wrong)
   //
   // WHAT THE PROFILE DECIDES: the head enters the S1 kernel at the q_x = Gamma cell (the
-  // static-rung W0_x head) and at q_y = Gamma inside every q_x row (the dW_y head, proven
-  // energetically irrelevant by [blh1]). So the gygi-vs-ignore_g0 difference profile
-  // should be CONCENTRATED at q_x = Gamma -- the per-q_x replication of the H1
-  // falsification by an entirely different meter -- and the ignore_g0 body profile is the
-  // first direct look at the integrand's q_x -> 0 behavior under a retarded partner,
-  // the quantity the microcell comparison (T1 step 2) needs.
+  // static-rung W0_x head) and at q_y = Gamma inside every q_x row (the dW_y head, which is
+  // energetically irrelevant, see [blstatichead]). So the gygi-vs-ignore_g0 difference profile
+  // should be CONCENTRATED at q_x = Gamma -- the per-q_x counterpart of the [blstatichead] result
+  // by an entirely different meter -- and the ignore_g0 body profile shows the integrand's
+  // q_x -> 0 behavior under a retarded partner, the quantity a fine-q microcell
+  // integration has to be compared against.
   //
   // HIDDEN ([.]). Run with:
-  //   cd build/tests/bin && OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
-  //     mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blqx]"
+  //   cd build/tests/bin
+  //   OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE mpiexec -n 2 --oversubscribe ./test_methods_vertex_static_e2e "[blqx]"
   TEST_CASE("vertex_bl_s1_qx_profile", "[.][methods][vertex][static][blqx]") {
 #ifndef ENABLE_DLR
     SUCCEED("vertex_bl_s1_qx_profile skipped: build has ENABLE_DLR=OFF.");
@@ -2212,7 +2152,7 @@ namespace bdft_tests {
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
 
-    const long NIT = 2;   // the standing gate protocol: 2 COLD iterations
+    const long NIT = 2;   // the common protocol of these tests: 2 COLD iterations
 
     // one (qx_St, gA) pair per arm; resized by the kernel, all_reduced here
     nda::array<ComplexType, 5> qxS_g, qxS_n, qxS_v, gA_g, gA_n, gA_v;
@@ -2316,7 +2256,7 @@ namespace bdft_tests {
     auto T_v = trace_qx(qxS_v, gA_v);
 
     // ---- the table -------------------------------------------------------------------
-    app_log(1, "\n========== T1 STEP 1: THE PER-q_x S1 PROFILE (iteration-{} kernel) ==========", NIT);
+    app_log(1, "\n========== THE PER-q_x S1 PROFILE (iteration-{} kernel) ==========", NIT);
     app_log(1, "  LiH-222, C = [1,3), S1 = W0_x dW_y only (only_term = 1); gw/scr at ignore_g0.");
     app_log(1, "  T(q_x) = the q_x slice of Tr[Sigma^(S1) G] in the eval_corr_energy convention.");
     app_log(1, "  e_corr(S1-only arms): gygi {:.9f}, ignore_g0 {:.9f}, v1_skip {:.9f}", e_g, e_n, e_v);
@@ -2346,8 +2286,8 @@ namespace bdft_tests {
                "= {:+.4e}", T_n(iq_gamma).real(), iq_body, T_n(iq_body).real());
     app_log(1, "==============================================================================\n");
 
-    // ---- gates -----------------------------------------------------------------------
-    // liveness (trap 7): all three arms produced a meter, and the policy knob FIRED
+    // ---- checks ----------------------------------------------------------------------
+    // liveness: all three arms produced a meter, and the policy knob FIRED
     REQUIRE(nda::max_element(nda::abs(qxS_g)) > 0.0);
     REQUIRE(nda::max_element(nda::abs(qxS_n)) > 0.0);
     REQUIRE(nda::max_element(nda::abs(qxS_v)) > 0.0);
@@ -2358,21 +2298,20 @@ namespace bdft_tests {
     REQUIRE(nda::max_element(nda::abs(qxS_v(iq_gamma, nda::ellipsis{}))) == 0.0);
 
     // the policy difference is where the theory says it is: concentrated at q_x = Gamma
-    // (the q_y = Gamma dW-head leakage into the body rows is the [blh1]-irrelevant piece)
+    // (the q_y = Gamma dW-head leakage into the body rows is the [blstatichead]-irrelevant piece)
     REQUIRE(std::abs(dT_gamma) > body_absdiff);
 
-    // ---- MEASURED 2026-08-01 (first run of this meter) -- pinned as regressions ------
-    //   T(Gamma): gygi -1.96123e-03 vs ignore_g0 -7.75672e-06  -> the head multiplies
-    //   the Gamma-cell S1 integrand 253x, while the neighbouring BODY cells sit at
-    //   1.2e-05/4.5e-05 -- single-rung 1/q^2 microcell counting would put the Gamma
-    //   cell at a few x the neighbouring cells for this mesh, not 2.5e+02. That excess
-    //   weight is the integrand-level face of the static-head x retarded-partner
-    //   mechanism, and it is exactly what T1 step 2's fine-q microcell integration
-    //   must compare against the analytic insertion.
-    //   Gamma-concentration of the A/B: |dT(Gamma)| / sum_body |dT| = 54.3 (98.2 %) --
-    //   the [blh1] falsification (dW-head irrelevant) replicated per-q_x.
-    REQUIRE(std::abs(dT_gamma) > 20.0 * body_absdiff);                    // measured 54.3
-    REQUIRE(std::abs(T_g(iq_gamma).real() / T_n(iq_gamma).real()) > 100.0);  // measured 253
+    // ---- regression values for this protocol ----------------------------------------
+    //   T(Gamma): the head multiplies the Gamma-cell S1 integrand by more than two orders of
+    //   magnitude (gygi ~ -1.96e-03 vs ignore_g0 ~ -7.76e-06), while the neighbouring BODY
+    //   cells are O(1e-5). Single-rung 1/q^2 microcell counting would put the Gamma cell at
+    //   a few x the neighbouring cells for this mesh. That excess weight is the
+    //   integrand-level face of the static-head x retarded-partner mechanism.
+    //   Gamma-concentration of the A/B: |dT(Gamma)| / sum_body |dT| is ~50 (about 98 % of
+    //   the difference sits at Gamma) -- the [blstatichead] result (dW-head irrelevant) per q_x.
+    //   The bars below sit well inside the observed values (ratios ~54 and ~253).
+    REQUIRE(std::abs(dT_gamma) > 20.0 * body_absdiff);
+    REQUIRE(std::abs(T_g(iq_gamma).real() / T_n(iq_gamma).real()) > 100.0);
     REQUIRE(std::abs(T_g(iq_gamma).real() - (-1.96123e-03)) < 2e-4);
     REQUIRE(std::abs(T_n(iq_gamma).real() - (-7.75672e-06)) < 2e-6);
     // e_corr of the S1-only arms, same protocol class as [blmixed] (loose 1e-5 bars:

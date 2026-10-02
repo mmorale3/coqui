@@ -22,16 +22,14 @@
 #define COQUI_QP_MAPS_MATSUBARA_HPP
 
 /**
- * Project 2 (qpGW+BSE+EDMFT on the imaginary axis) increment Q1
- * (notes/qpgw_edmft_implementation_plan.md; spec notes/qpgw_bse_edmft_option2.pdf
- * section 4): MATSUBARA-NATIVE quasiparticle maps -- the AC-free alternatives to
- * the Pade route of solve_qp_eqn / qp_approx (qp_scf_common.cpp:275/489). Both
- * consume Sigma_c(iw_n) in the MO basis on the fermionic Matsubara mesh; neither
- * touches the real axis. V_ref^xc is handled STRUCTURALLY: the qp loop recomputes
+ * MATSUBARA-NATIVE quasiparticle maps -- the AC-free alternatives to the Pade
+ * route of solve_qp_eqn / qp_approx (qp_scf_common.cpp). Both consume
+ * Sigma_c(iw_n) in the MO basis on the fermionic Matsubara mesh; neither touches
+ * the real axis. V_ref^xc is handled STRUCTURALLY: the qp loop recomputes
  * HF each iteration and feeds these maps the correlation-only Sigma (the
  * add_qpscf_vcorr convention), so no explicit V_ref subtraction appears.
  *
- * map (i) "mats_lin" -- omega ~ 0 linearization (spec eq 13, Kutepov-type):
+ * map (i) "mats_lin" -- omega ~ 0 linearization (Kutepov-type):
  *   Zt = [1 - dSigma/d(iw)|_0]^{-1}, the derivative from the FIRST Matsubara node
  *   via the exact odd-part identity Sigma(-iw) = Sigma(iw)^dag:
  *       S1 = [Sigma(iw0) - Sigma(iw0)^dag] / (2 i w0)          (Hermitian);
@@ -43,7 +41,7 @@
  *   window; clamps are counted and reported). Resolution floor = pi*T (the first
  *   node), documented and inherent to the map.
  *
- * map (ii) "mats_gmatch" -- variational Green's-function matching (spec eq 14):
+ * map (ii) "mats_gmatch" -- variational Green's-function matching:
  *   H = argmin_{H = H^dag} sum_n w_n || G_n - (iw_n + mu - H)^{-1} ||_F^2.
  *   Projected, Levenberg-damped Gauss-Newton. Writing M = K^{-1},
  *   K = (iw + mu) I - H, the first-order change of M under H -> H + d is
@@ -53,7 +51,7 @@
  *       b[(ij)]       = sum_n w_n [ M^dag (G_n - M) M^dag ]_{ij},
  *   solve A d = b (A is Hermitian PSD; + Levenberg lambda), Hermitize the step,
  *   backtracking line search on the true residual. Weights w_n = (w_min/w_n)^wpow
- *   (reportable; spec section 4 "the weights are an explicit, reportable choice").
+ *   are an explicit, reportable choice (qp_map_wpow).
  *
  * Both maps return the QP-ized CORRELATION matrix V (map i) / the full static
  * H_eff block (map ii) in the MO basis; the callers compose with the static part
@@ -169,7 +167,7 @@ namespace qp_matsubara {
 
   /**
    * map (ii): per-(s,k) block. G_wab = the TARGET Green's function on the positive
-   * fermionic nodes (ascending), built from Sigma^GW only (spec principle 2);
+   * fermionic nodes (ascending), built from Sigma^GW only;
    * H = Hermitian initial guess in, the matched static H_eff out.
    */
   inline gmatch_info qp_gmatch_block(nda::MemoryArrayOfRank<3> auto const &G_wab,

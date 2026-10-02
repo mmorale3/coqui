@@ -19,16 +19,16 @@
  */
 
 /**
- * Impl 2 -- DISTRIBUTED downfold unit test (notes/vertex_parallelization_v2_plan.md
- * section "6b. Impl 2 distributed-downfold DESIGN").
+ * Distributed downfold unit test.
  *
  * fold_dW_distributed folds the RPA (t,P,Q)-distributed dynamic W to the secondary aux
- * (N_m x N_m) WITHOUT gathering any full Np x Np block. The physics tests never exercise
- * the (P,Q) split -- at Si scale the RPA puts every rank on t (np_P = np_Q = 1). THIS test
- * FORCES a np_P,np_Q > 1 grid (4 ranks = 1 x 1 x 2 x 2) so the (P,Q)-block assembly and the
- * off-diagonal fold_core_block path are actually driven, and compares the distributed
- * result to a fully-REPLICATED reference (gather dW, tau->nu transform, PH-unfold, fold
- * each (q,l) with fold_core on the full Np x Np). The two must agree to <= 1e-12.
+ * (N_m x N_m) without gathering any full Np x Np block. The physics tests rarely exercise
+ * the (P,Q) split -- for small systems the RPA puts every rank on t (np_P = np_Q = 1). This
+ * test forces np_P,np_Q > 1 grids (4 ranks = 1 x 1 x 2 x 2) so the (P,Q)-block assembly and
+ * the off-diagonal fold_core_block path are actually driven, and compares the distributed
+ * result to a fully replicated reference (gather dW, tau->nu transform, PH-unfold, fold
+ * each (q,l) on the full Np x Np). Both compute the same sums in a different order, so
+ * they agree to <= 1e-12.
  *
  * At 1 rank the grid is 1x1x1x1 (one (P,Q) block == the whole array) -- the distributed
  * path reduces to the replicated fold and must be bit-identical. At 4 ranks the forced
@@ -56,7 +56,7 @@
 #include "utilities/test_common.hpp"
 
 #include "methods/vertex/vertex_secondary_fold.hpp"
-#include "methods/vertex/vertex_t.h"   // S2: vertex_w0_detail::extract_nu0_row
+#include "methods/vertex/vertex_t.h"   // vertex_w0_detail::extract_nu0_row
 
 namespace bdft_tests {
 
@@ -192,7 +192,7 @@ TEST_CASE("vertex_dfold_distributed", "[methods][vertex][dfold]") {
 
   // --- run the DISTRIBUTED downfold on several forced grids, compare to the reference ---
   // The q axis is never split (grid[0] = 1). We exercise, for the current rank count P:
-  //   - the mandated 1x1xnp_Pxnp_Q "(P,Q)-split" grid (the whole point of Impl 2), and
+  //   - the 1x1xnp_Pxnp_Q "(P,Q)-split" grid, and
   //   - grids that ALSO split t (grid[1] > 1), driving the t-pool block-assembly all_reduce
   //     together with the (P,Q) fold.
   // Each grid axis must divide P and be <= its global extent (t <= nt_half, P/Q <= Np).
@@ -240,7 +240,7 @@ TEST_CASE("vertex_dfold_distributed", "[methods][vertex][dfold]") {
     }
   }
   REQUIRE(not grids.empty());   // at least the fully-P-split grid is always legal here
-  // the mandated (P,Q)-split grid (t unsplit) must be present for P a product of <= Np^2.
+  // the (P,Q)-split grid (t unsplit) is present whenever P factors into nP*nQ with nP,nQ <= Np.
   bool worst_ok = true;
   for (auto const& g : grids) worst_ok = worst_ok and (run_grid(g) <= 1e-12);
   REQUIRE(worst_ok);
@@ -267,14 +267,14 @@ TEST_CASE("vertex_dfold_distributed", "[methods][vertex][dfold]") {
 static ComplexType zref(long q, long P, long Q, long Np) { return dwref(q, 0, P, Q, Np); }
 
 /**
- * Impl 2b -- DISTRIBUTED downfold of the BARE core Z (fold_Z_distributed) unit test.
- * fold_Z_distributed folds the (q,P,Q)-distributed Z to the secondary aux (N_m x N_m) WITHOUT
- * gathering any full Np x Np block. The physics tests never exercise the (P,Q) split (at Si
- * scale the dZ grid is {1,1,1}). THIS test FORCES {1, nP, nQ} grids that split P and Q (4
- * ranks: 1x2x2, 1x1x4, 1x4x1) so the (P,Q)-block off-diagonal fold_core_block path is driven,
- * and compares to a fully-REPLICATED reference (gather Z, fold_core each q on the full Np x Np).
- * The two must agree to <= 1e-12. At 1 rank the grid is 1x1x1 (one (P,Q) block == the whole
- * array) and the distributed path reduces to the replicated fold BIT-IDENTICALLY.
+ * Distributed downfold of the bare core Z (fold_Z_distributed) unit test.
+ * fold_Z_distributed folds the (q,P,Q)-distributed Z to the secondary aux (N_m x N_m) without
+ * gathering any full Np x Np block. The physics tests rarely exercise the (P,Q) split (for
+ * small systems the dZ grid is {1,1,1}). This test forces {1, nP, nQ} grids that split P and Q
+ * (4 ranks: 1x2x2, 1x1x4, 1x4x1) so the (P,Q)-block off-diagonal fold_core_block path is
+ * driven, and compares to a fully replicated reference (gather Z, fold each q on the full
+ * Np x Np). The two must agree to <= 1e-12. At 1 rank the grid is 1x1x1 (one (P,Q) block ==
+ * the whole array) and the distributed path reduces to the replicated fold bit-identically.
  */
 TEST_CASE("vertex_zfold_distributed", "[methods][vertex][dfold]") {
   using methods::solvers::vertex_secondary_detail::fold_Z_distributed;
@@ -346,7 +346,7 @@ TEST_CASE("vertex_zfold_distributed", "[methods][vertex][dfold]") {
   };
 
   // enumerate legal grids {1, nP, nQ} with nP*nQ == P, nP,nQ <= Np. At 4 ranks this is
-  // exactly {1,2,2}, {1,1,4}, {1,4,1} -- the mandated (P,Q)-split coverage.
+  // exactly {1,2,2}, {1,1,4}, {1,4,1}.
   std::vector<shape_t<3>> grids;
   for (long nP = 1; nP <= P; ++nP) {
     if (P % nP != 0) continue;
@@ -361,16 +361,14 @@ TEST_CASE("vertex_zfold_distributed", "[methods][vertex][dfold]") {
 }
 
 /**
- * STATIC VERTEX increment S2 -- GATE (iii): the W0 ONE-ROW distributed build + fold
- * (notes/static_vertex_implementation_plan.md sections 2.2, 4 "S2", 5 "vertex_dfold (W0
- * fold forced-(P,Q)-split case)").
+ * Static vertex: the W0 one-row distributed build + fold.
  *
- * The W0 build has to bridge two DIFFERENT (P,Q) block layouts: the RPA polarizability
- * lives on {nt_procs, 1, np_P, np_Q} (rpa_pi.icc:66), whose (P,Q) partition covers only
- * np_P*np_Q ranks, while W0 must be (P,Q)-block-distributed over ALL ranks with q unsplit
+ * The W0 build has to bridge two different (P,Q) block layouts: the RPA polarizability
+ * lives on {nt_procs, 1, np_P, np_Q} (see rpa_pi.icc), whose (P,Q) partition covers only
+ * np_P*np_Q ranks, while W0 must be (P,Q)-block-distributed over all ranks with q unsplit
  * (the thc.dZ({1,nP,nQ}) layout fold_Z_distributed and the slate 2D ops both take). The
- * physics tests never split (P,Q) at all -- at Si/LiH scale the RPA puts every rank on t.
- * THIS case FORCES both splits:
+ * physics tests rarely split (P,Q) -- for small systems the RPA puts every rank on t.
+ * This case forces both splits:
  *   (a) vertex_w0_detail::extract_nu0_row on every legal SOURCE grid {1, nt, nP, nQ} into
  *       every legal OUTPUT grid {1, 1, nP', nQ'} vs a replicated sum_t R(t) Pi(t,q,P,Q);
  *   (b) fold_Z_distributed of that i.nu = 0 row (the "one-row variant" of the dW fold --
@@ -390,7 +388,7 @@ TEST_CASE("vertex_w0_row_fold_distributed", "[methods][vertex][dfold][w0]") {
   const long iq_gamma = 1;
 
   // deterministic i.nu = 0 transform row (stands in for nu0_transform_row; the identity
-  // "that row == index 0 of tau_to_w_PHsym" is pinned separately by
+  // "that row == index 0 of tau_to_w_PHsym" is tested separately by
   // test_vertex_w0.cpp::vertex_w0_transform_row).
   nda::array<ComplexType, 1> R_t(nt_half);
   for (long t = 0; t < nt_half; ++t) R_t(t) = twtref(0, t);
@@ -535,15 +533,15 @@ static void ref_upfold(nda::array_view<ComplexType, 2> t_mP,
 }
 
 /**
- * DISTRIBUTED block-UPFOLD unit test (adjoint of vertex_dfold_distributed; eval_Pi_C secondary
- * path). upfold_core_block upfolds the SECONDARY-aux Pi (N_m x N_m) to the global aux (Np x Np)
- * ONE (P,Q) block at a time, so the full Np x Np upfold partial is never materialized. The
- * physics tests never exercise the (P,Q) split; THIS test FORCES {1(w), 1(q), nP, nQ} grids
+ * Distributed block-upfold unit test (adjoint of vertex_dfold_distributed; eval_Pi_C secondary
+ * path). upfold_core_block upfolds the secondary-aux Pi (N_m x N_m) to the global aux (Np x Np)
+ * one (P,Q) block at a time, so the full Np x Np upfold partial is never materialized. The
+ * physics tests rarely exercise the (P,Q) split; this test forces {1(w), 1(q), nP, nQ} grids
  * (4 ranks: 1x1x2x2, 1x1x1x4, 1x1x4x1) that split P and Q, upfolds each rank's owned block from
- * the replicated Pibar with upfold_core_block, and compares the gathered distributed result to a
- * fully-REPLICATED reference (upfold_core on the full Np x Np). The two must agree to <= 1e-12.
+ * the replicated Pibar with upfold_core_block, and compares the distributed result to a fully
+ * replicated reference (two-gemm upfold on the full Np x Np). The two must agree to <= 1e-12.
  * At 1 rank the grid is 1x1x1x1 (one (P,Q) block == the whole array) and the distributed block
- * path reduces to the replicated upfold BIT-IDENTICALLY.
+ * path reduces to the replicated upfold bit-identically.
  */
 TEST_CASE("vertex_upfold_distributed", "[methods][vertex][dfold]") {
   using methods::solvers::vertex_secondary_detail::upfold_core_block;
@@ -616,7 +614,7 @@ TEST_CASE("vertex_upfold_distributed", "[methods][vertex][dfold]") {
   };
 
   // enumerate legal grids {1, 1, nP, nQ} with nP*nQ == P, nP,nQ <= Np. At 4 ranks this is
-  // {1,1,2,2}, {1,1,1,4}, {1,1,4,1} -- the mandated (P,Q)-split coverage.
+  // {1,1,2,2}, {1,1,1,4}, {1,1,4,1}.
   std::vector<shape_t<4>> grids;
   for (long nP = 1; nP <= P; ++nP) {
     if (P % nP != 0) continue;

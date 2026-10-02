@@ -115,8 +115,7 @@ auto make_slate(DMat& A_)
   // device pointer as a host tile makes slate skip those copies and hand the raw device
   // pointer to CPU BLAS/LAPACK and to MPI -- which "works" only with unified memory,
   // where the host can dereference it anyway. Only ::nda::mem::Device needs the tag;
-  // Unified is host-dereferenceable, so leaving it on the host is both valid and what
-  // the working unified path has always done.
+  // Unified is host-dereferenceable, so leaving it on the host is valid.
   constexpr bool tiles_on_device = ::nda::mem::on_device<Array_t>;
 
   slate::Matrix<value_type> R(A.global_shape()[row_index], A.global_shape()[col_index],
@@ -130,11 +129,10 @@ auto make_slate(DMat& A_)
     // iterates device = 0 .. num_devices()-1 and picks tiles by `device == tileDevice(i,j)`. That
     // is only self-consistent when the process sees exactly one GPU. With several visible, each
     // rank's cudaSetDevice(local_rank % num_devices) gives a different `dev` while every rank
-    // reports the same num_devices(), and slate's per-device workspace and the tiles disagree:
-    // measured as a cudaErrorIllegalAddress at 12 ranks x 3 nodes with --gpus-per-node=4, and as
-    // a clean run the moment --gpu-bind=single:1 collapses it to one visible device per rank.
-    // `dev < num_devices()` was the old test and it passes in exactly that broken case, so it
-    // never fired. Demand the assumption the code actually makes.
+    // reports the same num_devices(), and slate's per-device workspace and the tiles disagree,
+    // which shows up as cudaErrorIllegalAddress; binding one visible device per rank
+    // (--gpu-bind=single:1) avoids it. A check of `dev < num_devices()` would pass in exactly
+    // that broken case, so demand the assumption the code actually makes.
     utils::check(R.num_devices() == 1,
                  "make_slate: this rank sees {} GPUs (using device {}), but slate's tile->device "
                  "map here assumes exactly one GPU per rank. Bind one GPU per rank at launch "
@@ -144,7 +142,7 @@ auto make_slate(DMat& A_)
   if constexpr (not view) {
     // to_slate() copies into tiles slate owns. Only the host case is implemented: the
     // copy below goes through an nda host view of the tile. to_slate_view() is what
-    // every caller uses and it handles device memory, so this was never finished.
+    // every caller uses, and it handles device memory.
     static_assert(::nda::mem::on_host<Array_t>,
                   "to_slate(): owning copy is only implemented for host memory, "
                   "use to_slate_view().");

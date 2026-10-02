@@ -23,7 +23,7 @@
 #include <vector>
 #include <stdexcept>
 #include <stack>
-#include <cstdlib>       // getenv: the COQUI_MPI_THREAD_MULTIPLE init knob (increment B)
+#include <cstdlib>       // getenv: the COQUI_MPI_THREAD_MULTIPLE init knob
 #include <cctype>
 #include <optional>
 #include <string>
@@ -53,8 +53,7 @@
 namespace mpi3 = boost::mpi3;
 
 #if defined(ENABLE_FFTW)
-// T-3b item 3.3 (notes/coqui_threading_t3a.md section 2.3 row 8): defined in
-// numerics/fft/fftw.cpp. Forward-declared rather than included so main.cpp does not need
+// Defined in numerics/fft/fftw.cpp. Forward-declared rather than included so main.cpp does not need
 // fftw3.h on its include path.
 namespace math::fft::impl::host { void init_threads(long nthreads); }
 #endif
@@ -64,11 +63,10 @@ void run(mpi3::communicator & comm, InputParser &parser);
 
 /** @file main.cpp
  */
-/** notes/ladder_b_integration_design.md section 5: the MPI thread level has to be chosen at
- *  MPI_Init, which happens BEFORE any TOML is parsed -- so the knob is an ENVIRONMENT
- *  variable. Threaded SLATE (any slate_ops path with OMP_NUM_THREADS > 1) issues
- *  concurrent MPI calls from its OpenMP tasks and segfaults inside UCX without
- *  MPI_THREAD_MULTIPLE (measured, notes/ladder_opt_results.md section 2.9.6). */
+/** The MPI thread level has to be chosen at MPI_Init, which happens BEFORE any TOML is
+ *  parsed -- so the knob is an ENVIRONMENT variable. Threaded SLATE (any slate_ops path with
+ *  OMP_NUM_THREADS > 1) issues concurrent MPI calls from its OpenMP tasks and can segfault
+ *  inside the MPI transport (e.g. UCX) without MPI_THREAD_MULTIPLE. */
 /// Tri-state environment flag: +1 = explicitly on, 0 = explicitly off, -1 = unset.
 static int coqui_env_flag(const char *name) {
   const char *v = std::getenv(name);
@@ -89,35 +87,25 @@ static long coqui_omp_threads_env() {
   return 1;
 }
 
-/** THREAD-LEVEL POLICY (notes/coqui_threading_spec.md rev 2, T-1 item 3).
+/** THREAD-LEVEL POLICY.
  *
- *  Previously MULTIPLE was opt-in only, on the theory that its locking might cost
- *  something. T-0 settled that: measured on the full LiF kp444 fixture -- THC build, RPA,
- *  W Dyson, GW Sigma, shm windows and HDF5 included -- MULTIPLE vs single at t = 1 is
- *  181 s vs 180 s, with every phase above 1 s inside +/-1% (notes/coqui_threading_t0.md
- *  section 3). At t = 1 it is free; on SLATE-dense paths the B0-ext bench puts the
- *  locking overhead at ~4-5% (notes/ladder_opt_results.md section 2.9.7-8) -- near-free,
- *  which is why it stays CONDITIONAL rather than unconditional.
+ *  MPI_THREAD_MULTIPLE is requested when a code path will actually need it, i.e. whenever
+ *  OMP_NUM_THREADS > 1 -- exactly the condition under which SLATE's task layer goes parallel
+ *  and issues MPI calls from worker threads. Its locking overhead is negligible at one
+ *  thread and small on SLATE-dense paths, but not zero, so the request stays conditional.
  *
- *  So the policy is now: request MULTIPLE when a code path will actually need it, i.e.
- *  whenever OMP_NUM_THREADS > 1 -- that is exactly the condition under which SLATE's task
- *  layer goes parallel and starts issuing MPI from worker threads. The configuration that
- *  used to be an unexplained UCX SIGSEGV 36 s in (job 6890365) now simply works.
- *
- *  Deliberately NOT triggered by `blas_threads`: MKL-only threading makes no MPI calls,
+ *  Deliberately NOT triggered by `blas_threads`: BLAS-only threading makes no MPI calls,
  *  so it neither needs nor pays for MULTIPLE. That is the recommended recipe
- *  (OMP_NUM_THREADS=1 + blas_threads=N) and it keeps the historic thread-single init.
+ *  (OMP_NUM_THREADS=1 + blas_threads=N) and it keeps the thread-single init.
  *
- *  The env knob is now TRI-STATE:
+ *  The env knob is TRI-STATE:
  *    unset  => auto (MULTIPLE iff OMP_NUM_THREADS > 1)   <- the safe default
  *    =1     => force MULTIPLE even at OMP_NUM_THREADS = 1
  *    =0     => force thread-single even at OMP_NUM_THREADS > 1
- *  The explicit-off state exists for two reasons: it is the only way to reach the old
- *  (crashing) configuration deliberately, which is what the guard's NEGATIVE TEST needs
- *  (spec rev 2 section 4); and it lets a site whose MPI has a pathological MULTIPLE
- *  implementation opt out knowingly. It is not a foot-gun -- slate_ops' guard turns the
- *  resulting configuration into a loud abort at the first distributed solve rather than
- *  the UCX segfault it used to be. */
+ *  The explicit-off state lets a test reach the unsupported configuration deliberately (to
+ *  check slate_ops' guard), and lets a site whose MPI has a pathological MULTIPLE
+ *  implementation opt out knowingly. slate_ops' guard turns that configuration into a loud
+ *  abort at the first distributed solve instead of a crash inside MPI. */
 static bool coqui_want_thread_multiple() {
   const int knob = coqui_env_flag("COQUI_MPI_THREAD_MULTIPLE");
   if (knob >= 0) return knob == 1;             // explicit on/off both honoured
@@ -222,9 +210,9 @@ int main(int argc, char** argv)
                   " |  Correlated Quantum Interface  |\n" +
                   "  --------------------------------");
   app_log(1, welcome);
-  // increment B: every run states the MPI thread support it actually got, so a threaded
-  // SLATE configuration proves its own support instead of assuming it (the fda0fd5 bench
-  // pattern). Scalars only -- rusty's bundled fmt cannot format containers or enums.
+  // Every run states the MPI thread support it actually got, so a threaded SLATE
+  // configuration reports its own support instead of assuming it. Scalars only -- some
+  // bundled fmt versions cannot format containers or enums.
   app_log(2, "  MPI thread level: requested {} (COQUI_MPI_THREAD_MULTIPLE = {}, where "
              "-1 = unset/auto, OMP_NUM_THREADS = {}), provided {} (MPI_THREAD_MULTIPLE = "
              "{}, MPI_THREAD_SINGLE = {})",
@@ -235,11 +223,10 @@ int main(int argc, char** argv)
           static_cast<int>(mpi3::environment::thread_support()),
           static_cast<int>(mpi3::thread_level::multiple),
           static_cast<int>(mpi3::thread_level::single));
-  // T-1 item 3: if OMP > 1 forced the MULTIPLE request but the MPI library could not
-  // provide it, say so HERE -- slate_ops' guard will abort at the first distributed solve,
-  // and this line is what explains why.
-  // root-only: app_warning is not rank-gated, and every rank reaches this check -- the
-  // negative-test run printed 24 identical copies before this guard was added.
+  // If OMP > 1 forced the MULTIPLE request but the MPI library could not provide it, say so
+  // HERE -- slate_ops' guard will abort at the first distributed solve, and this line is
+  // what explains why.
+  // Root-only: app_warning is not rank-gated, and every rank reaches this check.
   if (root and coqui_omp_threads_env() > 1 and
       static_cast<int>(mpi3::environment::thread_support()) <
           static_cast<int>(mpi3::thread_level::multiple)) {
@@ -264,30 +251,26 @@ int main(int argc, char** argv)
     exit(1);	
   }
 
-  // T-2 option (c) (notes/coqui_threading_spec.md rev 2 section 3): the `blas_threads`
-  // knob. It is read HERE -- top level of the input, before any calculation block runs --
+  // The `blas_threads` knob. It is read HERE -- top level of the input, before any calculation block runs --
   // for two reasons: it is genuinely global (there is one BLAS layer per process, not one
   // per solver), and the THC/ISDF build is one of the phases it pays for, which happens
-  // before any solver block is entered. Absent or 0 => untouched, i.e. exactly today's
-  // behaviour for every existing input file.
+  // before any solver block is entered. Absent or 0 => the BLAS thread count is left
+  // untouched.
   utils::set_blas_threads(
       io::get_value_with_default<long>(parser.get_root(), "blas_threads", 0l));
 
-  // T-3b (notes/coqui_threading_spec.md rev 3 section 7.2 item 1, FABLE RULING R-T3-1):
-  // the `omp_threads` knob. Read at the same place and for the same two reasons as
+  // The `omp_threads` knob. Read at the same place and for the same two reasons as
   // blas_threads -- it is a per-process setting, and the THC/ISDF build (which FFTW's plan
   // thread count below belongs to) runs before any solver block is entered. Absent or <= 1
-  // => every T-3b region takes its serial path, i.e. exactly today's behaviour for every
-  // existing input file. NOTE: this deliberately never touches OMP_NUM_THREADS.
+  // => every omp_threads-gated region takes its serial path. NOTE: this deliberately never
+  // touches OMP_NUM_THREADS.
   utils::set_omp_threads(
       io::get_value_with_default<long>(parser.get_root(), "omp_threads", 1l));
 
 #if defined(ENABLE_FFTW)
-  // T-3a section 2.3 row 8 / section 3.3: CMake has been requesting FFTW's threaded double
-  // library all along (CMakeLists.txt find_package(FFTW ... DOUBLE_OPENMP_LIB)) while the
-  // FFT target linked only the serial one and fftw_init_threads() was called nowhere in the
-  // tree. Both are fixed; the plan thread count comes from the SAME knob, so FFTW never
-  // reads the OpenMP environment either. One-shot, before any plan is created.
+  // FFTW's threaded double library (find_package(FFTW ... DOUBLE_OPENMP_LIB)) is linked and
+  // initialized here; the plan thread count comes from the SAME omp_threads knob, so FFTW
+  // never reads the OpenMP environment. One-shot, before any plan is created.
   math::fft::impl::host::init_threads(utils::omp_threads());
 #endif
 
@@ -613,7 +596,7 @@ void run(mpi3::communicator &comm, InputParser &parser)
     } else if (cname == "blas_threads" or cname == "omp_threads") {
 
       // Global run settings, not calculation blocks: consumed in main() before dispatch
-      // (blas_threads = T-2 option (c), omp_threads = T-3b). Named here only so they do not
+      // (see blas_threads / omp_threads above). Named here only so they do not
       // trip the unknown-block abort. THIS IS THE SECOND OF THE TWO PARSE SITES -- a new
       // top-level key must be added both where it is read (main(), above) and here.
 

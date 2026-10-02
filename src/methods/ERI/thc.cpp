@@ -549,20 +549,20 @@ void thc::write_meta_data(h5::group& gh5, std::string format)
 #include "methods/ERI/thc.icc"
 #include "utilities/symmetry.hpp"
 
-// W-int-1b: defined AFTER the .icc bodies (load_basis_subset_fft_grid has a deduced return type)
+// defined AFTER the .icc bodies (load_basis_subset_fft_grid has a deduced return type)
 nda::array<ComplexType,4> methods::thc::collocation_at_points(nda::array<long,1> const& IPts, nda::range kp_rg, nda::range a_rg)
 {
   decltype(nda::range::all) all;
   const long nkpts = mf->nkpts(), nkpts_ibz = mf->nkpts_ibz(), ntrev = mf->nkpts_trev_pairs();
   if (nkpts == nkpts_ibz) {
     // nosym: load_basis_subset_fft_grid returns Psia(s, k, a, u) = u_{a k}(r_u) e^{i k.r_u} = psi_{a k}(r_u), which IS the
-    // interpolating_points (chol_metric_impl) collocation convention at the selected points -- verified to 7e-14
-    // against the selection output on the same points (W-int-1b gate).
+    // interpolating_points (chol_metric_impl) collocation convention at the selected points (agrees with the
+    // selection output on the same points to machine precision).
     auto [Psia, Psib] = load_basis_subset_fft_grid<HOST_MEMORY>(IPts, 0, kp_rg, a_rg, nda::range(0, 0));
     (void)Psib;
     return nda::array<ComplexType,4>(Psia);
   }
-  // SYMMETRIC mesh (W-int-4s): the orbitals exist for the IBZ k only. chol_metric_impl_ibz builds the image
+  // SYMMETRIC mesh: the orbitals exist for the IBZ k only. chol_metric_impl_ibz builds the image
   // k = S k_ibz columns as P(k, a, u) = conj(u_{a k_ibz}(S^-1 r_u)) (the point rotated by the INVERSE symmetry,
   // find_inverse_symmetry / transform_r, no fractional translation), then X = conj(P) e^{i k.r_u} for k below
   // nkpts - ntrev_pairs and X = P e^{i k.r_u} for the time-reversal images (the last ntrev_pairs k). Reproduced here
@@ -582,7 +582,7 @@ nda::array<ComplexType,4> methods::thc::collocation_at_points(nda::array<long,1>
   const long nu = IPts.shape(0), ns = mf->nspin_in_basis(), na = a_rg.size();
   // the SYMMETRY INDEX (0-based row of the inverse-symmetry list, -1 = identity) of every full-mesh k, exactly as the
   // ISDF path assigns it: image i of IBZ point kib is Ks(kib, i) and uses symmetry Skibz(kib, i) (NOT "the i-th
-  // symmetry": stars have different sizes, so the two differ on general meshes -- the Si kp444 sym trap 2026-09-16);
+  // symmetry": stars have different sizes, so the two differ on general meshes);
   // a time-reversal image shares its partner's symmetry.
   nda::array<long, 1> sym_of_k(nkpts); sym_of_k() = -1;
   for (long k = 0; k < nkpts_ibz; ++k) {

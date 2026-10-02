@@ -19,33 +19,32 @@ limitations under the License.
 """
 
 """
-Option-2 outer-loop diagnostics (Project 2 increment Q5,
-``notes/q5_option2_outer_loop_spec.md`` §1 piece 2, R-Q5-2 and gate Q5-b).
+Diagnostics of the GW+EDMFT outer loop with a re-derived effective Hamiltonian
+(``outer_loop="option2"``), where H_eff is rebuilt every outer cycle from the qpGW
+lattice stage.
 
-Three things live here, and nothing else:
+Contents:
 
   * the **DC staleness meters** ``||Sigma_dc^(n) - Sigma_dc^(n-1)||`` and
-    ``||P_dc^(n) - P_dc^(n-1)||`` that Q5 adds to the cycle order
-    ``gloc/wloc -> solve_gw_dc -> impurity`` (which already re-evaluates both
-    DCs after every lattice/W change -- the meter reports how much that
-    re-evaluation actually moved);
-  * the **R-Q5-2 subspace-tracking diagnostic** ``o_C``: the projectors
-    ``P_B``/``P_C`` are FIXED run inputs, so character continuation is automatic
-    and "maximal-overlap continuation" reduces to *watching* the C-window
-    MO character per outer cycle. Full per-cycle re-wannierization is out of
-    scope (revisit only if ``o_C`` degrades in production);
-  * the **Q5-b Mott-feedback-chain trail**: one consolidated per-cycle log block
-    and a fixed-layout float array for the checkpoint;
-  * the **Q6 R(inu) cancellation load** (increment Q6,
-    ``notes/q6_diagnostics_closeout_spec.md`` §1.1, PDF §8.3):
+    ``||P_dc^(n) - P_dc^(n-1)||`` for the cycle order
+    ``gloc/wloc -> solve_gw_dc -> impurity`` (which re-evaluates both DCs after
+    every lattice/W change -- the meter reports how much that re-evaluation
+    actually moved);
+  * the **subspace-tracking diagnostic** ``o_C``: the projectors ``P_B``/``P_C``
+    are fixed run inputs, so character continuation is automatic and
+    "maximal-overlap continuation" reduces to *watching* the C-window MO character
+    per outer cycle. Per-cycle re-wannierization is not implemented; a degrading
+    ``o_C`` is the signal that it would be needed;
+  * the **Mott-feedback-chain trail**: one consolidated per-cycle log block and a
+    fixed-layout float array for the checkpoint;
+  * the **R(inu) cancellation load**
     ``R(inu) = ||P_imp - P_dc||_max / ||P_dc||_max`` per bosonic node, aggregated
-    into three nu bands and APPENDED to the same trail and log block, with the
-    C3b ladder column ``||P^lad_loc,orb||/||P_dc||`` alongside it.
+    into three nu bands and appended to the same trail and log block, with the
+    orbital-ladder column ``||P^lad_loc,orb||/||P_dc||`` alongside it.
 
-This module is deliberately **numpy-only** at import time, following
-``retardation.py``: the Q5-b/Q5-g3 unit checks must run on a host where neither
-``triqs`` nor the compiled ``coqui`` package is importable. Only ``app_log`` is
-imported from CoQuí, and that import is guarded.
+This module is **numpy-only** at import time, like ``retardation.py``: its unit
+tests run on a host where neither ``triqs`` nor the compiled ``coqui`` package is
+importable. Only ``app_log`` is imported from CoQuí, and that import is guarded.
 """
 import numpy as np
 
@@ -60,17 +59,17 @@ except ImportError:  # pragma: no cover
 Hartree_eV = 27.211386245988
 
 #: Sentinel for "this cycle did not measure that field". It is a FINITE float on
-#: purpose -- the Q5-b gate requires every trail entry to be finite, and this is the
-#: same "never populated" convention the C++ readouts use (``scr_coulomb_t.h:317``
-#: initialises the lambda meters to ``-1.0``).
+#: purpose -- every trail entry must be finite, and this is the same "never
+#: populated" convention the C++ readouts use (``scr_coulomb_t`` initialises its
+#: lambda meters to ``-1.0``).
 MISSING = -1.0
 
-#: Fixed layout of the Q5-b checkpoint trail (spec §3, gate Q5-b). Order is part of
-#: the on-disk format: append only, never reorder.
+#: Fixed layout of the Mott-chain checkpoint trail. Order is part of the on-disk
+#: format: append only, never reorder.
 MOTT_CHAIN_TRAIL_LABELS = (
     "gap_eV",               # gap(H_eff) of the re-derived quasiparticle Hamiltonian
     "epsilon_inf",          # eps_infinity of the lattice screening
-    "lambda_nu0",           # lambda_max(nu = 0), the eq-6 ladder watchdog
+    "lambda_nu0",           # lambda_max(nu = 0) of the ladder kernel (stability watchdog)
     "pi_imp_minus_dc",      # ||P_imp - P_dc||
     "sigma_imp_minus_dc",   # ||Sigma_imp - Sigma_dc||   (tau metric)
     "u_bar_0",              # Ubar(0)   -- impurity mode (a) only
@@ -78,12 +77,12 @@ MOTT_CHAIN_TRAIL_LABELS = (
     "dc_sigma_staleness",   # ||Sigma_dc^(n) - Sigma_dc^(n-1)||
     "dc_pi_staleness",      # ||P_dc^(n)     - P_dc^(n-1)||
     "band_reorder_count",   # qp-loop band-reordering events this cycle
-    "o_c",                  # C-window MO-character overlap (R-Q5-2)
-    # ---- Q6 §1.1 (APPENDED, never reordered): the R(inu) cancellation load ----
+    "o_c",                  # C-window MO-character overlap
+    # ---- appended columns: the R(inu) cancellation load ----
     "r_nu0",                # R(inu) at the nu = 0 node
     "r_mid",                # max R(inu) over the middle third of the nu axis
     "r_top",                # max R(inu) over the top third of the nu axis
-    "lad_over_dc",          # ||P^lad_loc,orb||_max / ||P_dc||_max (C3b column)
+    "lad_over_dc",          # ||P^lad_loc,orb||_max / ||P_dc||_max (orbital ladder)
 )
 
 #: Fixed ordering of the R(inu) nu-band aggregates returned by
@@ -101,7 +100,7 @@ def field_distance(a, b, transform=None):
 
     ``transform`` is the tau-metric hook: pass ``lambda d: iaft.w_to_tau(d, stats='f')``
     (or ``w_to_tau_phsym`` for a bosonic field) to reproduce the convergence metric of
-    ``dmft_state.py:267-289``, which measures Matsubara differences on the imaginary-time
+    ``dmft_state.py``, which measures Matsubara differences on the imaginary-time
     axis. ``None`` measures on the axis the arrays are already on.
 
     Returns ``MISSING`` when either operand is ``None`` (nothing to compare yet).
@@ -118,7 +117,7 @@ def field_distance(a, b, transform=None):
 
 def dc_staleness(curr, prev, transform=None):
     """
-    DC re-evaluation meter of spec §1: how far the double counting moved between two
+    DC re-evaluation meter: how far the double counting moved between two
     consecutive outer cycles.
 
     ``curr``/``prev`` are the ``"dc"`` entries of ``dmft_state.local_sigma_w`` /
@@ -143,12 +142,12 @@ def imp_minus_dc(local_field, transform=None):
 
 
 # --------------------------------------------------------------------------
-# Q6 §1.1: the R(inu) cancellation load (PDF §8.3)
+# The R(inu) cancellation load
 # --------------------------------------------------------------------------
 
 def nu_band_slices(n_nu):
     """
-    The three nu bands of Q6 spec §1.1: the ``nu = 0`` NODE alone, the MIDDLE third and the
+    The three nu bands of the cancellation load: the ``nu = 0`` NODE alone, the MIDDLE third and the
     TOP third of the bosonic axis. Thirds are cut with floor division, so ``n_nu = 3m``
     gives exactly ``m`` nodes per third and any leftover node lands in the top band. The
     nu = 0 node is index 0 and is reported SEPARATELY (it also sits inside the bottom third,
@@ -164,15 +163,16 @@ def nu_band_slices(n_nu):
 
 def r_cancellation_load(local_pi_w, eps=1e-30):
     """
-    PDF §8.3 adapted to the implemented DC conventions (bubble[G_loc]-based, ruling R-Q4-2):
-    per bosonic node,
+    Cancellation load of the polarization double counting (the DC is the
+    bubble[G_loc]-based one), per bosonic node:
 
         ``R(inu) = ||P_imp(inu) - P_dc(inu)||_max / ||P_dc(inu)||_max``
 
     i.e. how much of the impurity polarization the double counting FAILS to cancel.
     ``R << 1`` is a healthy cancellation -- the outer loop feeds back a small correction on
     top of a large common part. ``R ~ 1`` or above says the two objects have stopped
-    describing the same physics and the eq-7 subtraction has nothing left to cancel.
+    describing the same physics and the ``P_imp - P_dc`` subtraction has nothing left to
+    cancel.
 
     ``local_pi_w`` is the ``{"imp": ..., "dc": ...}`` dict ``weiss.embed_impurities``
     returns, bosonic frequency on axis 0 (the same layout :func:`imp_minus_dc` consumes).
@@ -211,13 +211,14 @@ def r_cancellation_load(local_pi_w, eps=1e-30):
 
 def ladder_over_dc(pi_lad_orb, pi_dc, eps=1e-30):
     """
-    The C3b column of the same cancellation block: ``||P^lad_loc,orb||_max / ||P_dc||_max``.
+    The orbital-ladder column of the same cancellation block:
+    ``||P^lad_loc,orb||_max / ||P_dc||_max``.
 
-    This is the python-side twin of ``scr_coulomb_t::pol_lad_loc_orb_ratio()``
-    (``scr_coulomb_t.h:355-360``), which measures the eq-7 ladder DC against the SAME bubble
-    ``P_dc``. ``pi_lad_orb`` is the ``pi_lad_loc_orb_wabcd`` dataset of the ``scf/iterN``
-    checkpoint group (written by ``scr_coulomb_t.cpp``'s Q4 checkpoint block); it is absent
-    whenever the ladder was not injected, and the meter then reports :data:`MISSING`.
+    This is the python-side twin of ``scr_coulomb_t::pol_lad_loc_orb_ratio()``, which
+    measures the local orbital ladder polarization against the SAME bubble ``P_dc``.
+    ``pi_lad_orb`` is the ``pi_lad_loc_orb_wabcd`` dataset of the ``scf/iterN``
+    checkpoint group (written by ``scr_coulomb_t.cpp``); it is absent whenever the ladder
+    was not injected, and the meter then reports :data:`MISSING`.
     """
     if pi_lad_orb is None or pi_dc is None:
         return MISSING
@@ -232,7 +233,7 @@ def ladder_over_dc(pi_lad_orb, pi_dc, eps=1e-30):
 
 
 # --------------------------------------------------------------------------
-# R-Q5-2: subspace tracking as a diagnostic
+# Subspace tracking as a diagnostic
 # --------------------------------------------------------------------------
 
 def band_window_slice(band_window, imp=0, spin=0):
@@ -240,7 +241,7 @@ def band_window_slice(band_window, imp=0, spin=0):
     0-based half-open slice of the correlated band window.
 
     ``band_window`` follows the CoQuí/Wannier90 convention: shape ``(nImp, nspin, 2)``,
-    **1-based inclusive** bounds (``projector_t.h:87-88`` converts it with
+    **1-based inclusive** bounds (``projector_t.h`` converts it with
     ``range(bw(I,0,0) - 1, bw(I,0,1))``). A ``(nImp, 2)`` array is accepted too.
     """
     bw = np.asarray(band_window)
@@ -292,7 +293,8 @@ def project_mo_on_c(mo_skia, proj_mat, band_window, states=None, imp=0):
 
 def c_window_overlap(proj_new, proj_old, eps=1e-30):
     """
-    R-Q5-2 diagnostic ``o_C``: the WORST C-character retention over the judge states,
+    Subspace-tracking diagnostic ``o_C``: the WORST C-character retention over the judge
+    states,
 
     ``o_C = min_{s,k,a}  || P_C |MO_new(s,k,a)> ||  /  || P_C |MO_old(s,k,a)> ||``
 
@@ -301,7 +303,7 @@ def c_window_overlap(proj_new, proj_old, eps=1e-30):
 
     ``o_C ~ 1`` means the correlated subspace kept its character across the outer cycle,
     which under a FIXED projector is the expected behaviour; a drop is the signal that
-    would motivate re-wannierization (out of scope per R-Q5-2). Returns ``MISSING`` when
+    would motivate re-wannierization (not implemented). Returns ``MISSING`` when
     there is no predecessor or no state carries C character.
     """
     if proj_new is None or proj_old is None:
@@ -320,12 +322,12 @@ def c_window_overlap(proj_new, proj_old, eps=1e-30):
 
 
 # --------------------------------------------------------------------------
-# Gate Q5-b: the Mott feedback chain, one block per outer cycle
+# The Mott feedback chain, one block per outer cycle
 # --------------------------------------------------------------------------
 
 def mott_chain_trail(**fields):
     """
-    Assemble the Q5-b trail as a fixed-layout ``float`` array ordered by
+    Assemble the Mott-chain trail as a fixed-layout ``float`` array ordered by
     :data:`MOTT_CHAIN_TRAIL_LABELS`. Unknown keys are rejected (a typo must not
     silently vanish into a ``MISSING`` slot); absent keys and ``None`` become
     :data:`MISSING`, which is finite by construction.
@@ -347,10 +349,10 @@ def mott_chain_trail(**fields):
 
 def log_mott_chain(cycle, niter, trail, verbose=True):
     """
-    ONE consolidated log block per outer cycle (gate Q5-b). ``trail`` is the array from
-    :func:`mott_chain_trail`. The PHYSICS of the chain -- gap opens => Drude weight lost
-    => eps_inf falls => Ubar grows => gap opens further (PDF §5.3) -- is read off this
-    block across cycles; it is a production observable, not a local gate.
+    ONE consolidated log block per outer cycle. ``trail`` is the array from
+    :func:`mott_chain_trail`. The physics of the Mott feedback chain -- gap opens =>
+    Drude weight lost => eps_inf falls => Ubar grows => gap opens further -- is read off
+    this block across cycles; it is a production observable, not a pass/fail check.
     """
     if not verbose:
         return
@@ -360,7 +362,7 @@ def log_mott_chain(cycle, niter, trail, verbose=True):
         x = v[name]
         return "not measured" if x == MISSING else (fmt.format(x) + unit)
 
-    app_log(1, f"\n[GW+EDMFT cycle {cycle}/{niter}] Mott feedback chain (Q5-b)")
+    app_log(1, f"\n[GW+EDMFT cycle {cycle}/{niter}] Mott feedback chain")
     app_log(1,   "-------------------------------------------------------")
     app_log(1, f"  gap(H_eff)                     = {_f('gap_eV', ' eV')}")
     app_log(1, f"  epsilon_inf                    = {_f('epsilon_inf')}")
@@ -373,9 +375,9 @@ def log_mott_chain(cycle, niter, trail, verbose=True):
     app_log(1, f"  DC staleness, P_dc             = {_f('dc_pi_staleness', '', '{:.6e}')}")
     app_log(1, f"  band-reorder events            = {_f('band_reorder_count', '', '{:.0f}')}")
     app_log(1, f"  o_C (C-window MO character)    = {_f('o_c')}")
-    # Q6 §1.1: the cancellation load rides in the SAME block -- it is read across cycles
-    # together with ||P_imp - P_dc|| above, which is its own numerator at a single node.
-    app_log(1,   "  R(inu) = ||P_imp - P_dc||/||P_dc||   (Q6, cancellation load)")
+    # The cancellation load rides in the SAME block -- it is read across cycles together
+    # with ||P_imp - P_dc|| above, which is its own numerator at a single node.
+    app_log(1,   "  R(inu) = ||P_imp - P_dc||/||P_dc||   (cancellation load)")
     app_log(1, f"    nu = 0 node                  = {_f('r_nu0', '', '{:.6e}')}")
     app_log(1, f"    middle third (max)           = {_f('r_mid', '', '{:.6e}')}")
     app_log(1, f"    top third (max)              = {_f('r_top', '', '{:.6e}')}")
@@ -390,8 +392,8 @@ def heff_gap_eV(e_ska, nelec, spin=0):
     """
     Indirect gap of the re-derived quasiparticle Hamiltonian, in eV, from the
     checkpointed ``E_ska`` of the qpGW stage: ``min_k E_lumo - max_k E_homo`` with
-    ``homo = nelec/2 - 1`` (the qpGW suites' convention,
-    ``test_methods_qpgw_bse.cpp:150-158``).
+    ``homo = nelec/2 - 1`` (the convention of the C++ qpGW tests,
+    ``test_methods_qpgw_bse.cpp``).
 
     Returns ``MISSING`` for a metal-shaped input (the band indices do not exist) rather
     than raising -- this is a diagnostic, and it must not take a production run down.
@@ -410,10 +412,10 @@ def heff_gap_eV(e_ska, nelec, spin=0):
 
 def count_band_reorderings(mo_new, mo_old, ovlp):
     """
-    R-Q5-2 diagnostic (i): how many quasiparticle states swapped index between two outer
-    cycles -- maximal-overlap continuation used as a METER, not as a re-ordering.
+    Subspace-tracking diagnostic: how many quasiparticle states swapped index between two
+    outer cycles -- maximal-overlap continuation used as a METER, not as a re-ordering.
 
-    ``update_MOs`` (``qp_scf_common.cpp:876-893``) returns eigenvalues in ascending order,
+    ``update_MOs`` (``qp_scf_common.cpp``) returns eigenvalues in ascending order,
     so a level crossing does NOT show up in the energies: it shows up as the character of
     slot ``a`` moving to slot ``b``. With the generalised eigenvectors satisfying
     ``C^dag S C = 1``, the continuation matrix is

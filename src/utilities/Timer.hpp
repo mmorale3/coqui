@@ -142,8 +142,7 @@ public:
     id2pos.clear();
   }
 
-  // (TEMP) iterate over registered timer names; used by TEMP_* timer
-  // dumps. Returns a copy because id2pos is private.
+  // The registered timer names (used by the TEMP_* timer dumps). Returns a copy because id2pos is private.
   std::vector<std::string> timer_names() const {
     std::vector<std::string> names;
     names.reserve(id2pos.size());

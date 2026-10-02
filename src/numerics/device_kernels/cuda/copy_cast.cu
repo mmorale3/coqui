@@ -110,7 +110,7 @@ _inst_(device_array_view,float,device_array_view,double)
 _inst_(device_array_view,std::complex<double>,device_array_view,std::complex<float>)
 _inst_(device_array_view,std::complex<float>,device_array_view,std::complex<double>)
 _inst_(device_array_view,double,device_array_view,std::complex<double>)
-// what else???
+// add further (source, target) type pairs here as needed
 
 
 } // namespace kernels::device::detail

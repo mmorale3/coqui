@@ -25,7 +25,7 @@
  * distributed_matrix_array: a 2D block-cyclic "array of matrices", laid out the way SLATE
  * wants, for use ONLY as an operand of SLATE's distributed linear algebra.
  *
- * See perf_report/slate_array_design.md. Summary of why this exists:
+ * Why this exists:
  *
  *  - math::nda::distributed_array gives each rank one large contiguous local block, which is
  *    the right layout for the local tensor work done through .local(). It is NOT block
@@ -77,20 +77,15 @@ namespace math::nda
  * `COQUI_SLATE_BLOCK_CYCLIC=1` forces block cyclic, `=0` forces legacy, unset selects
  * automatically -- see use_block_cyclic_slate(np_row, np_col).
  *
- * SOLVE ORIENTATION -- SETTLED 2026-08-03, the two paths are equivalent.
+ * SOLVE ORIENTATION -- the two paths are equivalent.
  * The legacy path stores A in C order, so `hermitian=true` conjugates A in place and hands slate
- * the transposed view (slate_ops.hpp:187-196, slate_aux.hpp:60-68): slate sees conj(A)^T = A^H.
+ * the transposed view (see slate_ops.hpp and slate_aux.hpp): slate sees conj(A)^T = A^H.
  * The block-cyclic container is natively column major and hands slate A. For the hermitian A
  * these call sites solve against (C_quv = Z Z^H) those are the same matrix, so both paths solve
- * the same system.
- * The 2026-07-31 note here claimed otherwise -- ERI differing by ~6e1 and the energy by ~8e-5 at
- * 4 ranks (job 6719571) -- and was wrong about the cause. That measurement predates the
- * `iu_for_Xb` fix (6d85ff4), and the corrupted C it ran on had a duplicated interpolating point,
- * hence a duplicated row *and* column: exactly rank deficient, cond(C) = 1.4e19. On a singular
- * matrix the two factorization orders pick different solutions out of the null space, which is
- * where ~6e1 came from. With C correct (cond 4.5e11) job 6743779 measures 4-rank legacy vs
- * block-cyclic energies agreeing to 5.8e-13, and the raw ERI differing by 1.4e-07 -- the
- * eps*cond(C) ~ 1e-4 ill-conditioning bound, not an orientation error. Pinned by
+ * the same system. Results agree to the eps*cond(C) ill-conditioning bound. On an exactly
+ * singular C (e.g. a duplicated interpolating point, hence a duplicated row and column) the
+ * two factorization orders legitimately pick different solutions out of the null space, which
+ * can look like an orientation error but is not. Pinned by
  * `matrix_array_hermitian_solve_orientation` in tests/test_matrix_array_ops.cpp.
  */
 inline std::optional<bool> forced_block_cyclic_slate()
@@ -110,12 +105,12 @@ inline std::optional<bool> forced_block_cyclic_slate()
  * the legacy single-block layout cannot serve: slate's batched device path needs one leading
  * dimension per operand inside each (mb,nb) region, and tiles that are views into one large local
  * block do not satisfy it, so any grid with np_row*np_col > 1 aborts in slate's
- * device_regions_build on `group.ld[m] == Mij.stride()` (measured at 12 ranks, job 6743779; the
- * same job completes on the block-cyclic path). It is also the layout slate is tuned for on host.
+ * device_regions_build on `group.ld[m] == Mij.stride()` (the block-cyclic path does not). It is
+ * also the layout slate is tuned for on host.
  *
  * When the matrix grid is trivial the legacy path takes its serial shortcut -- a local getrf/getri
  * with no slate and no redistribute -- which is both correct and cheaper, so it stays the default
- * there. Every validated number at 4 and 8 ranks was produced that way and is unchanged by this.
+ * there.
  */
 inline bool use_block_cyclic_slate(long np_row, long np_col)
 {
@@ -202,8 +197,8 @@ class distributed_matrix_array
   long tile_rank_(long i, long j) const { return (i % _p) * _q + (j % _q); }
 
   /// this rank's index within the matrix communicator; must use the same grid order as
-  /// tile_rank_ above (row-major). Keeping these in one place: having two spellings of it
-  /// agreed only when p==1 or q==1 and silently broke at p=q=2.
+  /// tile_rank_ above (row-major). Keep these in one place: two independent spellings can
+  /// agree when p==1 or q==1 and still silently disagree at p=q=2.
   long my_matrix_rank_() const { return _pr * _q + _qr; }
 
   public:
@@ -228,7 +223,7 @@ class distributed_matrix_array
     utils::check(_M >= _p and _N >= _q,
         "distributed_matrix_array: matrix ({},{}) too small for grid ({},{}).", _M,_N,_p,_q);
 
-    // SLATE's tile counts use ceil. NOTE: slate_aux.hpp:90 uses floor, which mis-assigns
+    // SLATE's tile counts use ceil. NOTE: slate_aux.hpp uses floor, which mis-assigns
     // the last partial tile row whenever M % mb != 0. Do not copy that.
     _mt = ceildiv(_M, _mb);
     _nt = ceildiv(_N, _nb);
@@ -336,7 +331,7 @@ class distributed_matrix_array
   std::array<long, batch_rank> local_batch_extents() const { return _lbatch; }
 
   // ---- decomposition, exposed so converters do not re-derive it -----------------------
-  // (re-deriving the grid order in a second place is exactly what broke this class once)
+  // (re-deriving the grid order in a second place risks an inconsistent ownership map)
   long matrix_grid_rows() const { return _p; }
   long matrix_grid_cols() const { return _q; }
   long n_batch_cells()    const { return _comm->size() / (_p * _q); }

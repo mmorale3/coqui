@@ -22,9 +22,8 @@
 #define COQUI_SIGMA_ROUTE_B_HPP
 
 /**
- * Project 2 (qpGW+BSE+EDMFT) increment QM2 -- ROUTE B: the contour-deformation (CD)
- * self-energy kernel (spec notes/qm2_route_b_finite_t_spec.md; parent
- * notes/qsgw_matsubara_plan.pdf section 3). Third sibling of qp_maps_matsubara.hpp
+ * ROUTE B: the contour-deformation (CD) self-energy kernel. Third sibling of
+ * qp_maps_matsubara.hpp
  * (AC-free Matsubara-native maps) and sigma_real_axis.hpp (route A, Taylor
  * re-expansion from imaginary-direction samples): this file evaluates Sigma^c at
  * ARBITRARY complex z -- real quasiparticle energies included -- in CLOSED FORM,
@@ -32,15 +31,14 @@
  *
  * THIS IS THE FINITE-TEMPERATURE FORMULA, NOT THE TEXTBOOK T=0 ONE
  * ----------------------------------------------------------------
- * CoQuí is finite-T exclusively (user ruling 2026-08-12), so the deliverable is the
- * exact closed form of the BOSONIC MATSUBARA SUM at temperature 1/beta. The T = 0
- * contour-deformation expression of the parent plan (its eq 5: an imaginary-axis
- * quadrature plus the residues of the G poles swept by the deformation) is only the
- * beta -> infinity LIMIT of what is implemented here, and appears in this increment
- * solely as gate QM2-a(iii). Nothing in the code path below deforms a contour at
+ * CoQuí works at finite temperature, so what is implemented is the exact closed form
+ * of the BOSONIC MATSUBARA SUM at temperature 1/beta. The T = 0 contour-deformation
+ * expression (an imaginary-axis quadrature plus the residues of the G poles swept by
+ * the deformation) is only the beta -> infinity LIMIT of what is implemented here and
+ * appears only as a test limit. Nothing in the code path below deforms a contour at
  * run time; the contour argument is what DERIVES the formula, once, on paper.
  *
- * DEFINITION AND DERIVATION (verify mechanically; the gates pin every sign)
+ * DEFINITION AND DERIVATION (verify mechanically; the tests pin every sign)
  * ------------------------------------------------------------------------
  *     Sigma^c(z) = -(1/beta) sum_m G(z + i nu_m) W^c(i nu_m),     nu_m = 2 pi m / beta
  *
@@ -74,7 +72,7 @@
  * the real axis and evaluable anywhere, including at real QP energies -- which is the
  * whole point of route B. Being rational with the right decay, agreement with the
  * directly summed Sigma^c at the fermionic nodes IS uniqueness of the continuation;
- * that is what gate QM2-a(i) measures (rel < 1e-10 at beta = 100, 1000, 10000).
+ * the unit tests check it (rel < 1e-10 at beta = 100, 1000, 10000).
  *
  * CONVENTION FOR mu (matters, and the mu = 0 fixtures cannot see it). The pole
  * energies eps_l are ABSOLUTE, so the Matsubara evaluation point is z = i w_n + mu:
@@ -94,9 +92,9 @@
  * SMALL-|omega_j| GUARD (cd_opts::bw_floor)
  * -----------------------------------------
  * n_B(omega_j) diverges as 1/(beta omega_j), so |beta omega_j| is checked against a
- * floor. Production pole grids satisfy this by construction (imag_axes_ft::dlr_pole_fit
+ * floor. DLR pole grids satisfy this by construction (imag_axes_ft::dlr_pole_fit
  * asserts min |hw_l| > 1e-12 at build), and fixtures with explicit +/- pairs must keep
- * Omega away from zero. Worth knowing WHY the production convention is safe rather than
+ * Omega away from zero. Worth knowing WHY the DLR convention is safe rather than
  * merely legal: the bosonic residues of iaft_dconv.hpp carry a tanh factor,
  * w_l = tanh(hw_l/2) * coeff_l, and
  *
@@ -106,17 +104,17 @@
  * divergence that survives at small nodes is not this one but the DENOMINATOR
  * z - (eps_l - omega_j) when z is real; see the caveat below.
  *
- * FITTED W^c AT REAL z -- THE STANDING CAVEAT (measured, gate QM2-b)
- * -----------------------------------------------------------------
+ * FITTED W^c AT REAL z -- THE STANDING CAVEAT
+ * -------------------------------------------
  * When (w_j, omega_j) come from a DLR pole fit of W^c rather than from exact poles, the
- * fit is exact-to-eps ON THE IMAGINARY AXIS only (the QM1-e lesson, recorded in
- * test_qp_maps_matsubara.cpp). This kernel at real z evaluates the fitted measure at the
+ * fit is exact-to-eps ON THE IMAGINARY AXIS only (see test_qp_maps_matsubara.cpp). This
+ * kernel at real z evaluates the fitted measure at the
  * REAL arguments eps_l - z: the f-weighted part of the sum is exactly -f(eps_l) W^c_fit(eps_l - z).
  * If the fit has spurious residues on auxiliary nodes near eps_l - z, they are divided by
- * a vanishing gap. The cure, pinned by gate QM2-b, is to fit on the SUPPORT of W^c
+ * a vanishing gap. The cure, pinned by the unit tests, is to fit on the SUPPORT of W^c
  * (auxiliary nodes inside the PH gap dropped), which is legitimate because it is prior
- * physical information about W^c, not a tuned regularization. QM3 must carry that
- * constraint into the production fit.
+ * physical information about W^c, not a tuned regularization. Any caller that feeds a
+ * fitted W^c to this kernel at real z must apply that support constraint to the fit.
  */
 
 #include <cmath>
@@ -161,10 +159,10 @@ namespace sigma_route_b {
    * eps(l), P(l): energies and weights of the G poles (eps ABSOLUTE, see the header note
    * on mu). om(j): the W^c pole energies, REAL. w(l,j): the W^c residues seen by internal
    * state l -- l-independent for the unit-level toys, the fitted residues of
-   * W^c_{il,lj}(i nu) in production (QM3). w may be real or complex.
+   * W^c_{il,lj}(i nu) for a real system. w may be real or complex.
    *
    * A weighted double loop by design: this is a scalar / per-matrix-element kernel and
-   * the production contraction over (i, j, l) is QM3's business, not this file's.
+   * the full contraction over (i, j, l) belongs to the caller, not this file.
    */
   inline ComplexType sigma_cd(ComplexType z,
                               nda::MemoryArrayOfRank<1> auto const &eps,
@@ -184,7 +182,7 @@ namespace sigma_route_b {
     for (long j = 0; j < nj; ++j) {
       utils::check(std::abs(beta * om(j)) >= opt.bw_floor,
                    "sigma_route_b::sigma_cd: |beta*omega_j| = {:.3e} at j = {} (omega_j = "
-                   "{:.6e}) is below the floor {:.1e}; n_B(omega_j) diverges there. Production "
+                   "{:.6e}) is below the floor {:.1e}; n_B(omega_j) diverges there. DLR "
                    "pole grids guarantee a nonzero node; fixtures must keep Omega off zero.",
                    std::abs(beta * om(j)), j, om(j), opt.bw_floor);
       nb(j) = stable_nB(beta, om(j));
@@ -200,7 +198,7 @@ namespace sigma_route_b {
   }
 
   /** Convenience overload for an l-INDEPENDENT residue vector w(j) (the toys, and any
-   *  diagonal production case where W^c does not resolve the internal state). */
+   *  diagonal case where W^c does not resolve the internal state). */
   inline ComplexType sigma_cd(ComplexType z,
                               nda::MemoryArrayOfRank<1> auto const &eps,
                               nda::MemoryArrayOfRank<1> auto const &P,

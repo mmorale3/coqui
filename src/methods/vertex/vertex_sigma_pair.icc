@@ -5,9 +5,8 @@
 #include <cstdlib>
 
 /**
- * LFF-aux L-6, ROUTE 2 (notes/lff_aux_plan.md, 2026-09-19): the PAIR-RESOLVED static-ladder vertex in the
- * SELF-ENERGY, built from the same pair-space machinery as the polarization ladder (dynbse.hpp /
- * vertex_dynbse.icc) in the frozen secondary frame of the readout instance.
+ * The PAIR-RESOLVED static-ladder vertex in the SELF-ENERGY, built from the same pair-space machinery as the
+ * polarization ladder (dynbse.hpp / vertex_dynbse.icc) in the frozen secondary frame of the readout instance.
  *
  * Conventions (all inherited from the P side; nothing new is defined here):
  *   pair space P = (k, a, b), D = nk nc^2, row k nc^2 + a nc + b;  D_N(k,a,b) = Xb(k,N,a) Xb(k+q,N,b)^*
@@ -15,18 +14,18 @@
  *   K_s = (sign_ks / nk) Kbig[W-bar_0]  (build_kbig),  T_s = K_s (1 - Cb K_s)^-1  (static_resolvent)
  *   P side:  Pi = (spin/nk) D^dag Cb (1 + T_s Cb) D  =  Lambda(-nu)^dag Cb D  with the LEFT vertex
  *            Lambda(-nu)^dag = D^dag (1 + Cb T_s)(nu).
- * Sigma side (MEASURED against the B-S Sigma^{C,x} kernel, section M of test_vertex_dynbse_gate, 2026-09-19): in the
- * code's THC collocation convention the LEFT GW leg is X_i(k) X_c(k')^* = D_M(k',c,i)^* and the RIGHT leg is
- * X_c'(k') X_j(k)^* = D_N(k',c',j), a RIGHT-type pair density, so its ladder dressing is the P side's own right vertex,
+ * Sigma side: in the code's THC collocation convention the LEFT GW leg is X_i(k) X_c(k')^* = D_M(k',c,i)^* and the
+ * RIGHT leg is X_c'(k') X_j(k)^* = D_N(k',c',j), a RIGHT-type pair density, so its ladder dressing is the P side's own
+ * right vertex,
  *            D_N  ->  D_N + A_N,     A(q, i nu) = T_s(nu) Cb(nu) D     (one rung: K_s Cb D)
- * at +nu with no conjugation, and W enters as W_NM (N on the dressed leg). The four other assignments were measured:
- * the left-vertex form [Cb T_s]^T D^* misses the diagram by 39 % (Frobenius), its conjugate by 59 %; the right vertex
- * with W_MN agrees to 1.5e-10 (W-bar_0's own anti-Hermitian part), with W_NM to 3e-12 = the exact identity.
+ * at +nu with no conjugation, and W enters as W_NM (N on the dressed leg). With these choices the one-rung term
+ * reproduces the static-rung Sigma^{C,x} kernel (vertex_sigma.icc) exactly; the left-vertex form [Cb T_s]^T D^* and
+ * its conjugate do not (W_MN instead of W_NM differs only by the anti-Hermitian part of W-bar_0).
  * Then, with the loop's bosonic nu -> tau transform Ttw (the same rows the dynamic rung uses for W),
  *     dSigma_ij(k, tau) = -(scale/nk) sum_q sum_cc' G_cc'(k', tau) [Ttw . H](tau; k', (c,i), (c',j)),
  *     H(nu; k', ci, c'j) = sum_MN D_M(k',c,i)^* W-bar_NM(q, nu) A_N(k',c',j; nu),
  * W-bar(q, nu) = W-bar_0 + [W_dyn(nu) - W_dyn(0)] (the cache _Wb_qwmm, even in nu as in the dynamic rung) or
- * W-bar_0 alone ("outer static"). Externals i, j and the internal c, c' all in the C window (the B-S
+ * W-bar_0 alone ("outer static"). Externals i, j and the internal c, c' all in the C window (the
  * "C-restricted externals" convention); the result is Hermitized in (i, j) and the residual metered.
  *
  * Every (s, q) unit is independent (all bosonic nodes of the unit are evaluated inside it: one D x D LU + an Nm-column
@@ -70,33 +69,33 @@ namespace solvers {
      * THE DRIVER. dSig (nt, ns, nk, nc, nc) is ZEROED here and accumulated by the units this rank owns (the caller
      * all-reduces and Hermitizes). Wbh = the cache _Wb_qwmm (nq, nw_half, Nm, Nm), read only for outer = "dynamic".
      * opt.Pi_check (nw_b, nq, Nm, Nm), when non-null, receives (spin/nk) D^dag Cb A = the static-ladder correction
-     * of Pi in the P side's own normalization (gate G1: == the dump's Pi_static column at the +nu half nodes).
+     * of Pi in the P side's own normalization (equals the P-side static-ladder Pi at the +nu half nodes).
      * opt.nu_diag: the Gram spectrum over nu of A per unit (max over units, normalized, descending) -> met->nu_spec.
      */
     inline void eval_pair_sigma(nda::MemoryArrayOfRank<5> auto const &G_CC,    // (nt,ns,nk,nc,nc) full BZ
                                 nda::array<cplx, 4> const &Xb,                 // (ns,nk,Nm,nc)
                                 nda::array<cplx, 3> const &W0b,                // (nq,Nm,Nm)
-                                nda::array_view<cplx, 4> const *Wbh,           // (nq,nw_half,Nm,Nm) or nullptr (a view: P19)
+                                nda::array_view<cplx, 4> const *Wbh,           // (nq,nw_half,Nm,Nm) or nullptr (a view, no copy)
                                 nda::array<long, 2> const &kmq, nda::array<long, 2> const &kpq,
                                 vertex_pi::iaft_tools const &tools, long rank, long nproc,
                                 vertex_t::sigma_pair_opts const &opt, nda::array<cplx, 5> &dSig,
                                 vertex_t::sigma_pair_meter *met, vertex_sym::sym_ctx const *symc = nullptr,
                                 nda::array<cplx, 5> const *G_close = nullptr) {
-      // G_close (L-6c, Wannier frame): the G of the tau CLOSURE sum_cc' G_cc'(k', tau) H(ci, c'j). The closure pairs the
-      // CONJUGATED collocation with G's first index (the validated band-frame pattern), the ladder's pair bubble pairs the
+      // G_close (Wannier frame): the G of the tau CLOSURE sum_cc' G_cc'(k', tau) H(ci, c'j). The closure pairs the
+      // CONJUGATED collocation with G's first index (the band-frame pattern), the ladder's pair bubble pairs the
       // unconjugated one -- so under a unitary change of the window basis the ladder wants G-bar = U^dag G U (the P side's
-      // Wannier inputs, G_CC here) while the closure wants U^T G U^* (measured: a complex V gave rel 0.83 with G-bar;
+      // Wannier inputs, G_CC here) while the closure wants U^T G U^* (using G-bar there is wrong for a complex U;
       // the two coincide for real U, for U = 1 and for time-reversal images, where the transpose is the conjugate).
       decltype(nda::range::all) all;
       vertex_ladder_detail::prof_watch watch;
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3);
       const long Nm = Xb.shape(2), nc2 = nc * nc, D = nc2 * nk, nq = W0b.shape(0), nw_b = tools.nw_b;
-      // L-6c (2026-09-20): the SYMMETRIC mesh. W0b / the cache carry nq_ibz rows; kmq / kpq the FULL transfer mesh; the units
+      // The SYMMETRIC mesh: W0b / the cache carry nq_ibz rows; kmq / kpq the FULL transfer mesh; the units
       // run over the FULL mesh of external transfers q (every k' + q must reach the IBZ externals), the rung and the outer
       // W-bar are read at q_star(q) (PQ-TRANSPOSED for a time-reversal transfer, as build_kbig does), the legs are the full-BZ
       // collocations, and dSigma is accumulated for the IBZ representatives only (the first nk_ibz points of the full list).
       const bool sym = (symc != nullptr and symc->active);
-      // P1 (2026-09-21): the IBZ solve. With opt.ibz the units run over the IBZ transfers only (identity-frame legs, W-bar read
+      // The IBZ solve: with opt.ibz the units run over the IBZ transfers only (identity-frame legs, W-bar read
       // directly), each unit deposits its contribution for EVERY k of the full mesh into a scratch, and the star fold
       // (vertex_sym::fold_star_into_ibz) rotates it onto the IBZ externals -- nq_ibz solves instead of nq_full.
       const bool ibz = sym and opt.ibz;
@@ -106,7 +105,7 @@ namespace solvers {
       const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
       const bool dyn_outer = (opt.outer == "dynamic");
       const bool one_rung = (opt.col == "static1");
-      // L-6b (2026-09-20): the dressed JUNCTION. "right" = the ladder on the right GW leg (A = T_s Cb D, the L-6 object);
+      // The dressed JUNCTION. "right" = the ladder on the right GW leg (A = T_s Cb D, see the file header);
       // "left" = the ladder on the LEFT leg, the P side's left vertex D^dag (1 + Cb T_s): A~ = [Cb T_s]^T D^* (one rung
       // [Cb K_s]^T D^*), contracted as H(ci, c'j) = sum_MN A~_M(ci) W_NM D_N(c'j); "both" = the average of the two
       // one-sided insertions (the diagram set whose mirror image is its own Hermitian conjugate).
@@ -124,6 +123,16 @@ namespace solvers {
         utils::check(kmq.shape(0) == nq and kpq.shape(0) == nq and kmq.shape(1) == nk,
                      "vertex_sigma_pair: nosym mesh expected (nq = {}, kmq {} x {}).", nq, kmq.shape(0), kmq.shape(1));
       utils::check(nt == tools.nt_f, "vertex_sigma_pair: G tau axis {} != nt_f {}.", nt, tools.nt_f);
+      // The full-mesh symmetric path writes Pi_check for the external transfers iq < nq (= nq_ibz) and dSigma for
+      // the external k < nk_ext (= nk_ibz) as if those leading points of the FULL lists were the IBZ representatives
+      // themselves (identity-mapped). Assert it instead of assuming it (the k side is asserted by the caller, which owns
+      // the k maps: vertex_t::eval_sigma_pair).
+      if (sym)
+        for (long q = 0; q < nq; ++q)
+          utils::check(symc->q_star(q) == q and not symc->q_trev(q) and symc->q_isym(q) == 0,
+                       "vertex_sigma_pair: the full transfer list does not start with the IBZ transfers (q = {}: star {}, "
+                       "trev {}, isym {}); the IBZ-first layout this kernel indexes by is violated.", q, symc->q_star(q),
+                       int(symc->q_trev(q)), symc->q_isym(q));
       if (dyn_outer) {
         utils::check(Wbh != nullptr and Wbh->shape(0) == nq and Wbh->shape(1) == nw_half and Wbh->shape(2) == Nm and
                      Wbh->shape(3) == Nm, "vertex_sigma_pair: the W-bar cache is absent or mis-shaped (outer = dynamic).");
@@ -167,9 +176,9 @@ namespace solvers {
       nda::array<cplx, 3> Astore;
       if (opt.Pi_check != nullptr) { CbA = nda::array<cplx, 2>(D, Nm); Pchk = nda::array<cplx, 2>(Nm, Nm); }
       if (opt.nu_diag) Astore = nda::array<cplx, 3>(nw_b, D, Nm);
-      nda::array<cplx, 4> dSq;                                            // P1: one unit's contribution on the full k mesh
+      nda::array<cplx, 4> dSq;                                            // IBZ solve: one unit's contribution on the full k mesh
       if (ibz) dSq = nda::array<cplx, 4>(nt, nk, nc, nc);
-      // P1 diagnostic dump (COQUI_SIGPAIR_IBZ_DUMP=<file prefix>): every unit's deposit -- the full-k object of the IBZ path,
+      // diagnostic dump (vertex_debug sigpair_ibz_dump = <file prefix>): every unit's deposit -- the full-k object of the IBZ path,
       // the IBZ-k deposit of the full-mesh path -- and the symmetry tables, for the offline per-image check of the fold
       const auto dump_opt = sym ? vertex_debug::get("sigpair_ibz_dump") : std::nullopt;   // vertex_debug: sigpair_ibz_dump = <file prefix>
       const char *dump_env = dump_opt ? dump_opt->c_str() : nullptr;
@@ -197,7 +206,9 @@ namespace solvers {
       for (long u = rank; u < nunits; u += nproc) {
         const long is = u / nq_units, iq = u % nq_units;
         const long qsx = (sym and not ibz) ? symc->q_star(iq) : iq;            // the stored (IBZ) transfer of this unit's external q
-        const bool trx = (sym and not ibz) ? bool(symc->q_trev(iq)) : false;   // read W-bar(q) PQ-transposed for a time-reversal transfer
+        // read W-bar(q) PQ-transposed for a time-reversal transfer; honours vertex_debug sym_trev_notrans like
+        // the rung read of this same unit (build_kbig) and every Pi-side read
+        const bool trx = (sym and not ibz) ? (bool(symc->q_trev(iq)) and vertex_sym::trev_read_transposed()) : false;
         // ---- the external legs (pair densities) of this transfer ------------------------------------
         // symmetric mesh: W-bar(q) is stored at q_star in the aux frame of the mapping symmetry q_isym(q), so the legs
         // that couple the pair to it are the EFFECTIVE columns Xhat(is, jsym, k) (rotation into that frame + the trev
@@ -248,7 +259,7 @@ namespace solvers {
           Cb_k() = Cb_all(l, all, all, all);
           // Cb D (block-diagonal Cb: nk gemms) and the dressed amplitude A = (T_s | K_s) . Cb D  (D x Nm):
           //   T_s Cb D = K_s (1 - Cb K_s)^-1 Cb D  ->  ONE LU of M = 1 - Cb K_s and a solve with Nm right-hand sides
-          //   (not the inverse + a D x D gemm of build_static_resolvent: 4-5x cheaper at D = 4096; identical to rounding)
+          //   (cheaper than the explicit inverse + a D x D gemm of build_static_resolvent; identical to rounding)
           for (long k = 0; k < nk; ++k) {
             auto Ck = Cb_k(k, all, all);
             auto Dk = Dm(nda::range(k * nc2, (k + 1) * nc2), all);
@@ -378,7 +389,7 @@ namespace solvers {
         if (ibz) vertex_sym::fold_star_into_ibz(*symc, iq, dSq, dSig(all, is, all, all, all), &n_trev_images, &n_cjg_rot);
         if (dump_env != nullptr) dump_unit(is, iq, ibz ? dSq : dS_unit);
         if (ibz and vertex_debug::flag("sigpair_ibz_diag")) {   // vertex_debug: sigpair_ibz_diag
-          // P1 diagnostic: the Hermiticity of this unit's deposit at the IBZ and the non-IBZ externals, and its star
+          // IBZ-solve diagnostic: the Hermiticity of this unit's deposit at the IBZ and the non-IBZ externals, and its star
           double ah_ibz = 0.0, ah_out = 0.0, mx = 0.0;
           for (long k = 0; k < nk; ++k)
             for (long it = 0; it < nt; ++it)
@@ -396,7 +407,7 @@ namespace solvers {
               star += " (" + std::to_string(qp) + ", js " + std::to_string(symc->q_isym(qp)) + (symc->q_trev(qp) ? ", trev" : "") +
                       ", cjg at " + std::to_string(ncj) + " IBZ k)";
             }
-          app_log(1, "  [P1 diag] unit is {} iq {}: max |dSq| {:.3e}, anti-Hermitian at the IBZ k {:.3e}, at the other k {:.3e}; qminus {}; star:{}",
+          app_log(1, "  [Sigma vertex, pair] IBZ diagnostic, unit is {} iq {}: max |dSq| {:.3e}, anti-Hermitian at the IBZ k {:.3e}, at the other k {:.3e}; qminus {}; star:{}",
                   is, iq, mx, ah_ibz, ah_out, symc->qminus(iq), star);
         }
         if (opt.nu_diag) {
@@ -438,7 +449,7 @@ namespace solvers {
     auto MF = thc.MF();
     auto mpi = thc.mpi();
     if (opt.outer == "dynamic" and not has_cached_w()) {
-      app_log(1, "  [LFF-Sigma pair] outer W = dynamic: folding this iteration's W into the W-bar cache (cache_w on demand).");
+      app_log(1, "  [Sigma vertex, pair] outer W = dynamic: folding this iteration's W into the W-bar cache (cache_w on demand).");
       cache_w(mb_state, thc);
     }
     nda::array<ComplexType, 5> G_CC;
@@ -447,6 +458,17 @@ namespace solvers {
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);   // full-BZ G_CC / kmq / kpq (MLWF frame in Wannier mode) + symc on a sym mesh
     const bool sym = (symc != nullptr and symc->active);
     utils::check(sym or MF->nkpts() == MF->nkpts_ibz(), "vertex_t::eval_sigma_pair: a symmetry-reduced mesh without a symmetry context.");
+    if (sym) {
+      // dSigma's external k axis is the first nk_ibz points of the FULL list (eval_pair_sigma's `k >= nk_ext`
+      // skip and the dSig(., ., k) writes) -- valid only if those points ARE the IBZ representatives, identity-mapped
+      auto k2i = MF->kp_to_ibz();
+      auto ktr = MF->kp_trev();
+      for (long k = 0; k < MF->nkpts_ibz(); ++k)
+        utils::check(long(k2i(k)) == k and not bool(ktr(k)),
+                     "vertex_t::eval_sigma_pair: the full k list does not start with the IBZ points (k = {}: kp_to_ibz {}, "
+                     "trev {}); the IBZ-first layout the Sigma pair vertex indexes its externals by is violated.", k,
+                     long(k2i(k)), int(bool(ktr(k))));
+    }
     utils::check(not sym or opt.Pi_check == nullptr or opt.Pi_check->shape(1) == MF->nqpts_ibz(),
                  "vertex_t::eval_sigma_pair: Pi_check must carry nq_ibz rows on a symmetric mesh.");
     vertex_pi::iaft_tools tools(*_ft);                 // the LOOP's grid: Sigma(tau) lives there
@@ -482,10 +504,10 @@ namespace solvers {
                         G_close.has_value() ? std::addressof(G_close.value()) : nullptr);
     mpi->comm.all_reduce_in_place_n(dSig.data(), dSig.size(), std::plus<>{});
     if (_wannier) {
-      // L-6c: the contraction ran in the MLWF frame (X_bar = X U; the closure with U^T G U^*, see eval_pair_sigma), so the
+      // The contraction ran in the MLWF frame (X_bar = X U; the closure with U^T G U^*, see eval_pair_sigma), so the
       // block it produces carries the closure's TRANSPOSED convention, dSigma_bar = U^T dSigma U^* (it transforms as V^T . V^*
       // under U -> U V, like its closure G): back to the band window with U^* dSigma_bar U^T (the inverse of that map; NOT
-      // U dSigma_bar U^dag, which is the inverse of the P side's U^dag G U convention -- measured rel 0.83 with a complex V),
+      // U dSigma_bar U^dag, which is the inverse of the P side's U^dag G U convention and is wrong for a complex U),
       // nW = |C| bands, U(s, k) = _U_skia(s, k, :, :)
       const long M = nc, nW = long(_band_window.size());
       utils::check(_U_skia.shape(0) == ns and _U_skia.shape(1) >= nk and _U_skia.shape(2) == nW and _U_skia.shape(3) == M,
@@ -505,7 +527,7 @@ namespace solvers {
           }
         }
       dSig = std::move(dSb);
-      app_log(1, "  [LFF-Sigma pair] Wannier mode: dSigma rotated from the MLWF frame (M = {}) to the band window [{}, {}) (nW = {}).",
+      app_log(1, "  [Sigma vertex, pair] Wannier mode: dSigma rotated from the MLWF frame (M = {}) to the band window [{}, {}) (nW = {}).",
               M, _band_window.first(), _band_window.last(), nW);
     }
     const long ncb = dSig.shape(3);
@@ -554,7 +576,7 @@ namespace solvers {
                     mloc.nu_spec.size() > 2 ? mloc.nu_spec(2) : 0.0, mloc.nu_spec.size() > 3 ? mloc.nu_spec(3) : 0.0);
       spec = buf;
     }
-    app_log(1, "  [LFF-Sigma pair] col {} outer {} junction {} scale {}: {} (s, q) units on {} bosonic nodes (C = [{}, {}), N_m = {}): "
+    app_log(1, "  [Sigma vertex, pair] col {} outer {} junction {} scale {}: {} (s, q) units on {} bosonic nodes (C = [{}, {}), N_m = {}): "
                "max |dSigma(tau)| = {:.4e}, anti-Hermitian residual {:.3e} ({}), |K_s - K_s^dag|/|K_s| = {:.2e}; wall {:.1f} s "
                "(slowest rank: rung {:.1f}, Cb {:.1f}, LU {:.1f}, amplitude {:.1f}, contraction {:.1f}), RSS {:.2f} GB{}",
             opt.col, opt.outer, opt.side, opt.scale, mloc.nunits, tools.nw_b, _band_window.first(), _band_window.last(), _Xb_skma.shape(2),

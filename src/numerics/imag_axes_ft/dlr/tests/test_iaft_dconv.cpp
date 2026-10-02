@@ -19,7 +19,7 @@
  */
 
 // Unit tests for imag_axes_ft::double_boson_conv (DLR double bosonic Matsubara
-// convolution). See notes/double_convolution_design.md for the algorithm.
+// convolution). See iaft_dconv.hpp for the algorithm.
 
 #undef NDEBUG
 
@@ -95,7 +95,7 @@ namespace bdft_tests {
       }
     }
 
-    // ---- closed-form T(iw, ivx) [stage-1 formula, test-local implementation] ----
+    // ---- closed-form T(iw, ivx) [inner (vy) sum, test-local implementation] ----
     // T = -sum_rho v_rho n_B(rho) B(iw+rho) C(iw-ivx+rho)
     //     +sum_{p,q} b_p c_q DD,  DD = [nF(ep) Wy(ep-iw) - nF(eq) Wy(eq+ivx-iw)]/(ep-eq-ivx)
     inline cplx eval_T_closed(double beta, FModel const &B, FModel const &C, BModel const &Wy,
@@ -178,7 +178,7 @@ namespace bdft_tests {
       REQUIRE(std::abs(dense - closed) < 1e-8);
     }
 
-    // --- pin the stage-1 closed form T(iw,ivx) against dense vy sums,
+    // --- pin the inner-sum closed form T(iw,ivx) against dense vy sums,
     //     including a shared-pole B/C variant at vx=0 (divided-difference limit)
     {
       FModel B{{-1.3, 0.7}, {0.6, 0.4}};

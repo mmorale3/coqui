@@ -23,51 +23,47 @@
 
 /**
  * ===========================================================================
- * TC-5 -- THE AMORTIZED W^c TILE CACHE
+ * THE AMORTIZED W^c TILE CACHE
  * ===========================================================================
- * notes/tc_coqui_impl_spec.md "TC-5"; validation in
- * notes/tilted_contour_validation_results.md sections 8 (Axis D) and 8.7.
  *
  * ---------------------------------------------------------------------------
- * THE FORMULATION GAP
+ * WHY A GRID
  * ---------------------------------------------------------------------------
- * The eq-1 residue term needs <aJ|W^c(q_J, eps_J - omega + i delta)|Jb> at
- * targets SCATTERED along the line Im z = delta. CoQuI answered each with its
- * own dense Np^3 Dyson solve -- ~2.5 s x 10^4..10^5 per map at Np ~ 1269, which
- * is what made the route "too slow to be useful".
+ * The residue term needs <aJ|W^c(q_J, eps_J - omega + i delta)|Jb> at targets
+ * SCATTERED along the line Im z = delta. Answering each target with its own
+ * dense Np^3 Dyson solve costs 10^4-10^5 solves per map.
  *
  * W^c(omega + i delta) is delta-SMOOTH by construction: its nearest
  * singularities are the plasmon poles, which sit at distance delta BELOW the
  * line. So it can be built ONCE on a shared grid of spacing h and read off by
- * local interpolation. MEASURED (Axis D, 9 fixtures, exact closed-form
- * reference):
+ * local interpolation. Against an exact closed-form reference the
+ * interpolation error follows
  *
  *      dSigma [meV]  =  K (h/delta)^p / delta[eV]        p = 2.81
  *
- * 29-170 grid points replace 10^4-10^5 solves: 272x-668x on the residue tier.
+ * so a few tens to a few hundred grid points replace 10^4-10^5 solves.
  *
- * ⚠ THIS IS NOT THE UNIFORM GRID THE CAMPAIGN REJECTED. TCV section 5.2
- * rejected a uniform grid as the REPRESENTATION of P (it loses the 123-1584x
- * the ID buys). This is the CONSUMPTION of an already-built W^c. P still comes
- * from the tilted contour on its ID nodes and the Dyson chain is unchanged;
- * only the number of TARGETS at which that chain runs changes.
+ * This grid is not a representation of P (a uniform grid would lose the
+ * compression the interpolative decomposition provides). It is the
+ * CONSUMPTION of an already-built W^c: P still comes from the tilted contour
+ * on its ID nodes and the Dyson chain is unchanged; only the number of
+ * TARGETS at which that chain runs changes.
  *
  * ---------------------------------------------------------------------------
  * ⚠ THE LAW'S CONSTANT IS NOT UNIVERSAL -- WHICH IS WHY THERE IS AN AUDIT
  * ---------------------------------------------------------------------------
- * Axis D section 8.7 measured K/|Sigma| spanning 1.3 to 417 across plasmon
+ * K/|Sigma| varies by more than two orders of magnitude across plasmon
  * densities. The outlier is a spectrum whose weight is CONCENTRATED on a single
  * in-range pole -- and NOTHING in the sizing inputs (W_band, N_k, delta) reveals
- * it. A silently under-resolved grid then produces a plausible-looking Sigma,
- * which is the failure mode this project has been burned by twice.
+ * it. A silently under-resolved grid then produces a plausible-looking Sigma.
  *
  * So the law SIZES the grid and a SAMPLE PROVES it: `audit_wc_grid` evaluates
- * W^c EXACTLY at a handful of real residue targets and compares. Under 3 % of
- * the fill, ~0.005 % of the scheme it replaces. See `wgrid_audit_t` for the
- * defined failure behaviour (warn <= 10x, hard abort above).
+ * W^c EXACTLY at a handful of real residue targets and compares, at a small
+ * fraction of the fill cost. See `wgrid_audit_t` for the defined failure
+ * behaviour (warn <= 10x, hard abort above).
  *
  * ---------------------------------------------------------------------------
- * COLLECTIVE DISCIPLINE (the 46f9dfc invariant, one level up)
+ * COLLECTIVE DISCIPLINE
  * ---------------------------------------------------------------------------
  * The FILL is collective and lives at a lockstep point next to
  * `p_contour::gather_Z_tiles`: the flat (iq, j) index over nq_ibz x N is
@@ -103,51 +99,43 @@ namespace wc_grid {
   inline constexpr double ha_to_eV = 27.211386245988;
 
   // =========================================================================
-  //  (a) THE SIZING LAW  -- notes/tilted_contour_validation_results.md 8.2/8.3
+  //  (a) THE SIZING LAW
   // =========================================================================
   /**
-   * The measured constants. K is SVO's -- the largest of the three materials --
-   * used for EVERY system by ruling: do NOT auto-detect metallicity, be
-   * conservative and let the audit catch what conservatism misses.
+   * The fitted constants. K is the largest of the fitted materials (a metal,
+   * SrVO3) and is used for EVERY system: metallicity is not auto-detected; the
+   * sizing is conservative and the audit catches what conservatism misses.
    */
-  inline constexpr double wgrid_K = 32.4;        ///< meV.eV  (Axis D 8.2, SVO)
-  inline constexpr double wgrid_p = 2.81;        ///< the exponent (SVO)
-  inline constexpr double wgrid_safety = 3.0;    ///< the measured fit spread is x1.4-2.5
+  inline constexpr double wgrid_K = 32.4;        ///< meV.eV
+  inline constexpr double wgrid_p = 2.81;        ///< the exponent
+  inline constexpr double wgrid_safety = 3.0;    ///< covers the fit spread (x1.4-2.5)
   /** past h = delta/2 the 3-point stencil overshoots and can be worse than
-   *  linear (Axis D 8.1) -- the validity clamp, not a tuning choice. */
+   *  linear -- the validity clamp, not a tuning choice. */
   inline constexpr double wgrid_hmax_over_delta = 0.5;
   /**
-   * ⚠⚠ THE delta-CREDIT CEILING (Axis D3, 2026-08-26) -- the constant that stops
-   * the law promising accuracy it does not deliver at large delta.
+   * ⚠⚠ THE delta-CREDIT CEILING -- stops the law promising accuracy it does not
+   * deliver at large delta.
    *
    * The law carries a 1/delta prefactor: at fixed h/delta it claims the Sigma error
-   * falls as 1/delta. MEASURED (tests/run_D3_absh.py, si444 + si222, delta swept
-   * 2.4 -> 16 eV at matched h/delta) that is FALSE above ~2 eV -- the error is FLAT
-   * or RISING where the law predicts a 0.15-0.23x fall:
-   *
-   *     h/delta ~ 0.49 :  delta = 2.4 -> 16 eV,  measured 0.987 -> 3.230 meV
-   *                       (the law predicts a factor 0.15; measured 3.27)
+   * falls as 1/delta. Above ~2 eV that is FALSE: with delta swept from 2.4 to 16 eV
+   * at matched h/delta the error stays flat or rises where the law predicts a
+   * 0.15-0.23x fall.
    *
    * MECHANISM: delta buys smoothness only while it is the SMALLEST scale in the
    * problem. Once delta exceeds the spectral feature spacing, the curvature of W
    * along the line is set by the SPECTRUM's own structure, not by delta, and
-   * further delta buys nothing. So the credit must stop -- at the scale where it
-   * stopped being earned.
+   * further delta buys nothing. So the credit stops at that scale.
    *
-   * THE COST OF NOT HAVING THIS: tc4_444nb60_d35_w, at delta = 0.476 a.u. =
-   * 12.95 eV, was sized to h = 6.32 eV (N = 16 over 78 eV) because the law divided
-   * by 12.95. The run-time audit measured 14.93 meV against a 0.333 meV prediction
-   * and hard-aborted -- the audit's first legitimate kill. Across the whole D3
-   * envelope this ceiling cuts the worst under-prediction from 11.45x to 2.09x,
-   * i.e. back inside the 3x safety factor the law was always meant to carry.
+   * Without the ceiling a large-delta run is sized to a grid far too coarse
+   * (the law divides by delta) and the run-time audit aborts it; with it the
+   * worst under-prediction stays inside the 3x safety factor.
    *
-   * ⚠ Legs with delta <= this value are BIT-IDENTICAL: min() is the identity there,
-   * and every result validated at small delta (section 8.2's 1/delta growth, which
-   * this does NOT touch) stands unchanged.
+   * For delta <= this value min() is the identity, so small-delta sizing (where
+   * the 1/delta law holds) is unaffected.
    */
   inline constexpr double wgrid_delta_sat_eV = 2.4;
   /** the RELATIVE-error constant of the same fit, for the audit's conversion
-   *  from a measured |dW|/|W| back to a Sigma-equivalent meV (Axis D 8.1). */
+   *  from a measured |dW|/|W| back to a Sigma-equivalent meV. */
   inline constexpr double wgrid_Crel = 1.1e-3;
 
   struct wc_grid_geom_t {
@@ -160,7 +148,7 @@ namespace wc_grid {
     double h_over_delta = 0.0;
     bool   clamped = false;    ///< h/delta hit the 1/2 validity bound
     bool   expert = false;     ///< h came from qp_tc_wgrid_h, not the law
-    bool   delta_sat = false;  ///< delta exceeded the credit ceiling (Axis D3)
+    bool   delta_sat = false;  ///< delta exceeded the credit ceiling
     double omega(long j) const { return double(j) * h; }
   };
 
@@ -221,8 +209,8 @@ namespace wc_grid {
     double refl_scale = 0.0;
     /**
      * max |W^c| over the WHOLE filled grid. ⚠ THE AUDIT NORMALIZES BY THIS, not by
-     * the sample's own max|W|. |W^c| varies by orders of magnitude across (q, omega)
-     * -- MEASURED 40x on qe_lih222 alone -- so a per-sample ratio can read enormous
+     * the sample's own max|W|. |W^c| varies by orders of magnitude across (q, omega),
+     * so a per-sample ratio can read enormous
      * with no wrong value anywhere, purely because that sample sits where screening
      * is weak. What reaches Sigma is the absolute error against the scale that
      * actually contributes, which is this one.
@@ -239,20 +227,17 @@ namespace wc_grid {
      *
      *      W^c(z) = W^c(-conj z)^dagger          (CONJUGATE TRANSPOSE)
      *
-     * ⚠ IT IS THE DAGGER, NOT ELEMENTWISE CONJUGATION -- and the offline model
-     * could not tell the difference. Derivation: the contour supplies
+     * ⚠ IT IS THE DAGGER, NOT ELEMENTWISE CONJUGATION. Derivation: the contour supplies
      * Pi(z) = -[R(z) + R(-conj z)^dag], so elementwise
      *      Pi(-conj z)_PQ = -[R(-conj z)_PQ + conj(R(z)_QP)] = Pi(z)^dag_PQ,
      * i.e. Pi(-conj z) = Pi(z)^dag -- NOT Pi(z)^*, because R is not symmetric in
-     * (P,Q) at complex t (p_contour.hpp section 1: "Pi is NOT Hermitian at
-     * complex t"). Pushing that through the Dyson chain, with Z Hermitian and
+     * (P,Q) at complex t (Pi itself is not Hermitian at complex t, see
+     * p_contour.hpp). Pushing that through the Dyson chain, with Z Hermitian and
      * the push-through identity Z[I - Pi^dag Z]^-1 = [I - Z Pi^dag]^-1 Z,
      *      W^c(-conj z) = ([I - Z Pi^dag]^-1 - I) Z = W^c(z)^dag.
-     * The offline model (Axis D 8.4a) measured plain conjugation as exact to
-     * 7.9e-16 only because ITS residues g_p g_p^T are real SYMMETRIC, so the
-     * transpose is a no-op there. CoQuI's are not.
-     * [caught by the fill's assert on live data, 2026-08-25 -- which is why the
-     *  assert lands before the read path is trusted.]
+     * Plain conjugation is exact only for a model whose residues g_p g_p^T are
+     * real SYMMETRIC, where the transpose is a no-op; CoQuI's are not. The fill
+     * asserts the identity on live data before the read path is trusted.
      */
     void at(long qs, ComplexType z, nda::matrix<ComplexType> &out) const {
       const double w = z.real();
@@ -291,7 +276,7 @@ namespace wc_grid {
   };
 
   namespace detail {
-    /** Pi(z) from the contour samples: eq (SIGN) of p_contour.hpp. */
+    /** Pi(z) from the contour samples, with the sign convention of p_contour.hpp. */
     inline void pi_at(tc::transform_factor_t const &tf,
                       sArray_t<Array_view_4D_t> const &sPi, long qs, long r, long NP,
                       ComplexType z, nda::matrix<ComplexType> &Pi,
@@ -424,7 +409,7 @@ namespace wc_grid {
                    dev, sc, (sc > 0.0 ? dev / sc : 0.0), geom.omega(jt));
     }
 
-    app_log(lvl, "  - TC-5 W^c GRID:               target {:.3g} meV -> h/delta = {:.4f}{}, "
+    app_log(lvl, "  - W^c GRID:                    target {:.3g} meV -> h/delta = {:.4f}{}, "
                  "h = {:.6g} a.u. ({:.4g} eV), N = {} points (omega >= 0; bosonic half), "
                  "nq = {}; PREDICTED error {:.4g} meV; interpolant = local quadratic, "
                  "pad 1; fill {} solves in {:.2f} s; reflection identity {:.2e} rel",
@@ -439,10 +424,10 @@ namespace wc_grid {
   //  (d) THE RUN-TIME AUDIT
   // =========================================================================
   /**
-   * ⚠ WHY THIS EXISTS. Axis D 8.7 measured K/|Sigma| spanning 1.3 to 417: on a
-   * spectrum whose spectral weight is CONCENTRATED on one in-range pole a fixed
-   * constant is wrong by 75x, and nothing in the sizing inputs reveals it. The
-   * law sizes the grid; this proves it.
+   * ⚠ WHY THIS EXISTS. K/|Sigma| varies by more than two orders of magnitude:
+   * on a spectrum whose spectral weight is CONCENTRATED on one in-range pole a
+   * fixed constant can be wrong by well over 10x, and nothing in the sizing
+   * inputs reveals it. The law sizes the grid; this proves it.
    *
    * FAILURE BEHAVIOUR (defined, not discretionary):
    *   * ALWAYS log predicted vs measured and the worst (q, Re z);
@@ -456,7 +441,7 @@ namespace wc_grid {
     double dW_abs = 0.0;          ///< measured max |dW| -- the raw quantity
     double w_local = 0.0;         ///< max|W| AT the worst sample (diagnostic only)
     double dW_rel = 0.0;          ///< dW_abs / grid-global max|W|  <- THE measure
-    double meas_mev = 0.0;        ///< Sigma-equivalent, via the Axis-D relation
+    double meas_mev = 0.0;        ///< Sigma-equivalent, via the sizing-law relation
     double pred_mev = 0.0;
     long   worst_q = -1;
     double worst_z = 0.0;
@@ -530,7 +515,7 @@ namespace wc_grid {
     A.breached = (A.meas_mev > geom.target_mev);
     auto const &G = geom;
 
-    app_log(lvl, "  - TC-5 GRID AUDIT:             {} samples: max |dW| = {:.3e} ABS; "
+    app_log(lvl, "  - W^c GRID AUDIT:              {} samples: max |dW| = {:.3e} ABS; "
                  "/ grid-global max|W| = {:.3e} -> {:.3e} rel (predicted {:.3e}) -> "
                  "Sigma-equivalent {:.4g} meV against a target of {:.4g} meV and a law "
                  "prediction of {:.4g} meV. Worst at q = {}, Re z = {:+.6g} a.u., where "
@@ -545,8 +530,8 @@ namespace wc_grid {
                    "wc_grid AUDIT: the measured residue-tier error is {:.4g} meV, MORE "
                    "THAN 10x the requested qp_tc_wgrid_mev = {:.4g} meV (law predicted "
                    "{:.4g} meV; worst at q = {}, Re z = {:+.6g} a.u., |dW|/|W| = {:.3e}). "
-                   "An order-of-magnitude breach is the CONCENTRATED-SPECTRUM case of "
-                   "notes/tilted_contour_validation_results.md 8.7 -- the sizing law's "
+                   "An order-of-magnitude breach is the CONCENTRATED-SPECTRUM case (spectral "
+                   "weight on a single in-range pole) -- the sizing law's "
                    "constant does not describe this system and every downstream number is "
                    "untrustworthy. Lower qp_tc_wgrid_mev (h shrinks as target^(1/{:.2f})), "
                    "or set qp_tc_wgrid_h directly, or set qp_tc_wgrid_audit_hard = false "
@@ -560,7 +545,7 @@ namespace wc_grid {
       app_warning("wc_grid AUDIT: the measured residue-tier error is {:.4g} meV against "
                   "the requested qp_tc_wgrid_mev = {:.4g} meV (law predicted {:.4g}). "
                   "Within 10x, so the run continues, but the sizing law is optimistic for "
-                  "this spectrum -- see notes/tilted_contour_validation_results.md 8.7. "
+                  "this spectrum (spectral weight concentrated on few poles). "
                   "Lower qp_tc_wgrid_mev if the residue tier carries the physics.",
                   A.meas_mev, G.target_mev, A.pred_mev);
     }
@@ -571,15 +556,13 @@ namespace wc_grid {
    * the audit is enabled -- the guard at the call site may test ONLY quantities
    * that are uniform across ranks (`wgrid_audit > 0`), never rank-local ownership.
    *
-   * WHY IT IS A SEPARATE FUNCTION. The first version of this code inlined the
-   * reduces under `ctx.bstore.size() > 0`, i.e. under "does THIS rank own a
-   * block". On the si444 _w leg (nblk = 13, 60 ranks) 47 ranks never entered,
-   * the reduces did not pair up, and the run hard-aborted on a garbage sample
-   * count (-4.4e18) and a garbage |dW| (9.0e+02 against a grid whose global
-   * max|W| is 2.5e-03 -- arithmetically impossible for bounded Lagrange weights,
-   * which is what identified the reduce rather than the physics). Owning no
-   * block is NORMAL and must cost nothing but an empty sample list: `sample`
-   * simply appends nothing, and this function still reduces.
+   * WHY IT IS A SEPARATE FUNCTION. Guarding the reduces with a rank-local
+   * condition such as `ctx.bstore.size() > 0` ("does THIS rank own a block")
+   * leaves ranks without blocks outside the collective; the reduces then do not
+   * pair up and yield garbage (a negative sample count, a |dW| larger than the
+   * grid's max|W|, impossible for bounded Lagrange weights). Owning no block is
+   * NORMAL and must cost nothing but an empty sample list: `sample` simply
+   * appends nothing, and this function still reduces.
    *
    * @param sample  called once, collective-free, to append this rank's local
    *                samples; it may append none.
@@ -615,10 +598,9 @@ namespace wc_grid {
     A.dW_abs = comm.all_reduce_value(A.dW_abs, boost::mpi3::max<>{});
     // ⚠ THE LOCATION MUST COME FROM THE RANK THAT HOLDS THE MAX. Reducing w_local by
     // an independent max, and printing worst_q/worst_z from whichever rank happens to
-    // log, attributes the worst error to a sample that is not the worst one -- the
-    // leg-1 banner did exactly that ("worst at q = 3 ... LOCAL max|W| = 4.184e+01")
-    // and the plausible-looking location sent the investigation after the physics.
-    // Elect the owner, then broadcast ITS triple.
+    // log, attributes the worst error to a sample that is not the worst one, and a
+    // plausible-looking location misdirects the diagnosis. Elect the owner, then
+    // broadcast ITS triple.
     long owner = (dloc == A.dW_abs) ? long(comm.rank()) : long(comm.size());
     owner = comm.all_reduce_value(owner, boost::mpi3::min<>{});
     if (owner >= long(comm.size())) owner = 0;          // no samples anywhere
@@ -629,8 +611,8 @@ namespace wc_grid {
     A.w_local = loc[2];
     // ⚠ THE BOUNDS CHECK LANDS BEFORE THE VERDICT. A count outside [0, ntot] proves
     // the reduce itself is invalid, and then the |dW| beside it is invalid too --
-    // reporting a physics breach from it (as the leg-1 abort did) points the
-    // investigation at the wrong subsystem entirely.
+    // reporting a physics breach from it points the diagnosis at the wrong
+    // subsystem entirely.
     utils::check(A.n_sample >= 0 and A.n_sample <= ntot,
                  "wc_grid AUDIT: reduced sample count {} is outside its own bound "
                  "[0, {}] (= qp_tc_wgrid_audit x nq_ibz). The reduce did not pair up "

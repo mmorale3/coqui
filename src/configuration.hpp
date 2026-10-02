@@ -252,7 +252,7 @@ namespace detail
     // Bytes currently served from the pool, and pool hit/miss counts.
     // Approximate to within the pool's internal alignment rounding, which
     // is not visible through dynamic_bucket's interface. Not atomic: the
-    // allocator itself is not thread-safe (one rank per device today).
+    // allocator itself is not thread-safe (one rank per device).
     inline static std::size_t _live   = 0;
     inline static std::size_t _hits   = 0;
     inline static std::size_t _misses = 0;

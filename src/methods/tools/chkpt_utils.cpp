@@ -34,9 +34,8 @@ namespace methods {
 /**
  * Off by default: the background writer is only correct as long as every other
  * HDF5 call in the process joins it first (see h5_background_writer.hpp), so it
- * is opt-in until it has been exercised on the configurations that matter.
- * COQUI_ASYNC_CHKPT=1 turns it on, which also makes it directly A/B-able
- * against the synchronous path in one job.
+ * is opt-in. COQUI_ASYNC_CHKPT=1 turns it on; the synchronous path is used
+ * otherwise.
  */
 bool async_checkpoint_enabled() {
   static const bool on = []() {
@@ -81,18 +80,16 @@ void write_metadata(communicator_t &comm, const mf::MF &mf, const imag_axes_ft::
     auto mf_grp = grp.create_group("mean_field");
     nda::h5_write(mf_grp, "eigvals", mf.eigval(), false);
 
-    // T-2 option (c) (notes/coqui_threading_spec.md rev 2 section 3): the threading
-    // setting travels with the results, so a checkpoint is self-describing about how it
-    // was produced. This is the first run-parameter group in the checkpoint; the setting
-    // is read through the accessor rather than widened into write_metadata's signature,
-    // which would touch all five call sites for one scalar.
-    // blas_threads = 0 means "never requested" -- the library/environment default was in
-    // force, which is what every pre-T-2 checkpoint implicitly recorded.
+    // Run parameters: the threading settings travel with the results, so a checkpoint is
+    // self-describing about how it was produced. The settings are read through their
+    // accessors rather than passed through write_metadata's signature.
+    // blas_threads = 0 means "never requested": the library/environment default was in
+    // force (also the implicit setting of checkpoints without this group).
     auto run_grp = grp.create_group("run_parameters");
     h5::h5_write(run_grp, "blas_threads", utils::blas_threads());
     h5::h5_write(run_grp, "blas_threads_backend", utils::blas_threads_backend_name());
-    // T-3b: same reasoning for CoQui's own thread count. omp_threads = 1 is both the
-    // default and what every pre-T-3b checkpoint implicitly recorded.
+    // CoQui's own OpenMP thread count. omp_threads = 1 is the default (also the implicit
+    // setting of checkpoints without this dataset).
     h5::h5_write(run_grp, "omp_threads", utils::omp_threads());
 
     auto iaft_grp = grp.create_group("imaginary_fourier_transform");
@@ -142,10 +139,9 @@ void dump_scf(communicator_t &comm, long iter,
       h5::h5_write(iter_grp, "greens_func_source", input_grp);
       h5::h5_write(iter_grp, "greens_func_iteration", input_iter);
 
-      // ~8.9 GB per iteration at Si 2x2x2/500b, serial on this rank. Report the
-      // per-dataset bandwidth so any further attempt at it is aimed rather than
-      // guessed. app_log is not called from the background thread -- it is not
-      // safe to assume the logger is reentrant -- so the timings are only
+      // The write is serial on this rank and can be large; the per-dataset bandwidth is
+      // reported at log level 3. app_log is not called from the background thread -- it
+      // is not safe to assume the logger is reentrant -- so the timings are only
       // printed on the synchronous path.
       auto timed_write = [&](const char* name, auto const& A) {
         auto t0 = std::chrono::steady_clock::now();
@@ -164,10 +160,10 @@ void dump_scf(communicator_t &comm, long iter,
     };
 
     if (async_checkpoint_enabled() and not force_sync) {
-      // Snapshot, then write off the critical path. The copy is ~8.9 GB of
-      // memcpy (a couple of seconds) against ~30 s of ceph, and it is what lets
-      // the solvers overwrite G/Sigma in the next iteration while the previous
-      // one is still on its way to disk.
+      // Snapshot, then write off the critical path. The in-memory copy is much
+      // cheaper than the file-system write, and it is what lets the solvers
+      // overwrite G/Sigma in the next iteration while the previous one is still
+      // on its way to disk.
       nda::array<ComplexType, 4> Dm_c = Dm.local();
       nda::array<ComplexType, 5> G_c  = G.local();
       nda::array<ComplexType, 4> F_c  = F.local();

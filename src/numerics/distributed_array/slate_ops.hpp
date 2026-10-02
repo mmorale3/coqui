@@ -44,25 +44,22 @@ namespace math::nda::slate_ops
 {
 
 /** ---------------------------------------------------------------------------------
- *  SLATE THREAD-SAFETY GUARD  (notes/coqui_threading_spec.md rev 2, T-1 item 1)
+ *  SLATE THREAD-SAFETY GUARD
  *
  *  SLATE's host paths run at its default Target::HostTask, so its OpenMP tasks issue
  *  MPI calls directly (Tile::recv -> MPI_Wait, reached through listBcast). With
  *  OMP_NUM_THREADS > 1 and MPI initialized below MPI_THREAD_MULTIPLE that is an
- *  immediate SIGSEGV inside UCX: job 6890365 died 36 s in, on the THC/ISDF build path
- *  (least_squares_solve, thc.icc:1621), and the only diagnostic was a wall of
- *  "event_base_loop: reentrant invocation". Backtrace and attribution:
- *  notes/coqui_threading_t0.md section 1.3.
+ *  immediate SIGSEGV inside UCX (e.g. on the THC/ISDF build path, least_squares_solve),
+ *  whose only diagnostic is a wall of "event_base_loop: reentrant invocation".
  *
- *  Until now only the ladder carried a guard (vertex_ladder.icc); the THC path -- the
- *  one that actually crashed -- was uncovered. The predicate lives here so every
- *  slate_ops entry point shares ONE definition of "unsafe", and the ladder's own
- *  richer message delegates to it rather than re-deriving it.
+ *  The predicate lives here so every slate_ops entry point shares ONE definition of
+ *  "unsafe", and the vertex ladder's own richer message (vertex_ladder.icc) delegates
+ *  to it rather than re-deriving it.
  *
  *  Scope of the hazard: every slate_ops entry point short-circuits to serial
  *  LAPACK/BLAS when the operand's communicator has size 1, so only comm.size() > 1
  *  can reach SLATE at all -- which is exactly what is tested here. The recommended
- *  production recipe (OMP_NUM_THREADS=1 + blas_threads/MKL_NUM_THREADS=N) never trips
+ *  recipe (OMP_NUM_THREADS=1 + blas_threads/MKL_NUM_THREADS=N) never trips
  *  it: MKL's threading layer makes no MPI calls and SLATE's task layer stays serial.
  * ---------------------------------------------------------------------------------- */
 namespace detail {
@@ -94,7 +91,7 @@ inline void slate_thread_guard(long comm_size, const char *op) {
                "slate_ops::{}: OMP_NUM_THREADS = {} on a {}-rank operand, with MPI "
                "initialized below MPI_THREAD_MULTIPLE (provided level {}, required {}). "
                "SLATE's OpenMP tasks issue concurrent MPI calls and WILL segfault inside "
-               "UCX (job 6890365). Fix, in order of preference: (1) run with "
+               "UCX. Fix, in order of preference: (1) run with "
                "OMP_NUM_THREADS=1 and thread the BLAS layer instead -- set blas_threads "
                "in the TOML (or MKL_NUM_THREADS in the environment), which needs no MPI "
                "thread support at all; or (2) set COQUI_MPI_THREAD_MULTIPLE=1 to request "
@@ -182,12 +179,10 @@ long lu_solve(DistributedMatrix auto&& A, DistributedMatrix auto&& B)
 
     // `hermitian` means: A is stored in C order and the solve is to be done against A^H. The
     // distributed branch below implements that by conjugating A in place and handing slate the
-    // transposed view, and least_squares_solve's serial shortcut does the same. This shortcut did
-    // neither, so at one rank it solved A X = B while every other path solved A^H X = B. Invisible
-    // in production -- every caller passes a hermitian A, where the two coincide -- but it made the
-    // flag mean different things at different rank counts. Pinned by
-    // `matrix_array_hermitian_solve_orientation` in tests/test_matrix_array_ops.cpp, which caught
-    // this at 1 rank while passing at 2 and 4.
+    // transposed view, and least_squares_solve's serial shortcut does the same. This serial
+    // shortcut must match, or the flag would mean A X = B at one rank and A^H X = B at several
+    // (indistinguishable for a hermitian A, which every caller passes). Pinned at every rank
+    // count by `matrix_array_hermitian_solve_orientation` in tests/test_matrix_array_ops.cpp.
     constexpr bool conj_transpose = hermitian and not dA_t::is_stride_order_Fortran();
 
     // the factorized operand: A^H when conj_transpose, otherwise A as stored

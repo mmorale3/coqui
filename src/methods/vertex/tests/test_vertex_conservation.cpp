@@ -19,18 +19,17 @@
  */
 
 /**
- * ISDF-Vertex Phase 3: conservation validation (notes/conservation_validation.md).
+ * Conservation validation of the ISDF vertex kernels.
  *
  * Sigma^C (G^3 W^2) and Pi^C (G^4 W) are the two cuts of ONE generating functional
- * Phi_2^C. With the discrete pairings (derivation: conservation notes section 1;
- * q->0 v2 re-inclusion rule: notes/q0_head_treatment.md section 2.6)
+ * Phi_2^C. With the discrete pairings
  *
  *   S_SigmaG = (1/(Nk beta)) sum_{s,k,w,ab} Sigma^C_ab(k,iw) G~_ba(k,iw)   = +4 Phi^
  *   S_PW     = (1/(Nk beta)) sum_{q,nu} Tr[ Pi^C(q,inu) W^(q,inu) ]        = -4 Phi^
  *
  * (G~ = P_C G P_C fed to BOTH kernels; W^ = the EXACT rung arrays the kernels consume
- * -- under the v2 q->0 policy ALL q including Gamma, with the head-augmented
- * W^(Gamma) under the gygi-class policy; under the v1_skip fallback the rung Gamma
+ * -- under the default q->0 policy ALL q including Gamma, with the head-augmented
+ * W^(Gamma) under the gygi-class policy; under the v1_skip policy the rung Gamma
  * cells are skipped and the external q = Gamma cell is excluded from the trace),
  * the identity S_SigmaG + S_PW = 0 must hold to kernel accuracy. It pins the
  * RELATIVE sign and normalization of the two kernels independently of the dense
@@ -41,13 +40,13 @@
  *    fully analytic Matsubara sums. Guards only the NEW numerics of this test.
  *  - toy identity: the sigma test's synthetic THC model, both kernels evaluated for
  *    real, residual |S_SigmaG + S_PW| asserted at the kernels' accuracy class.
- *    Alternate trace orientations (conservation notes section 1.8) are computed and
- *    reported: the identity discriminates them on the asymmetric toy.
+ *    Alternate trace orientations are computed and reported: the identity
+ *    discriminates them on the asymmetric toy.
  *  - positive controls: (a) flipped relative sign breaks by O(2|S|); (b) the RPA
  *    bubble substituted for Pi^C breaks the identity. Both asserted LARGE.
  *  - lih_conservation: same identity on LiH-222 (nosym), physical G from one scGW
- *    iteration and the real RPA-screened W, looser tolerance (DLR "low", [A-comp]
- *    composite fits at wmax = 6), with the sign-flip and RPA controls at scale.
+ *    iteration and the real RPA-screened W, looser tolerance (DLR "low", composite
+ *    tau-product fits at wmax = 6), with the sign-flip and RPA controls at scale.
  */
 
 #undef NDEBUG
@@ -88,7 +87,7 @@ namespace bdft_tests {
 
   namespace cons {
 
-    // ---------------- pairing primitives (conservation notes, section 1.6) ----------
+    // ---------------- pairing primitives ---------------------------------------------
     //
     //   fermionic: (1/beta) sum_w A(iw)B(iw) = - int_0^beta dtau A(tau) B(beta-tau)
     //   bosonic:   (1/beta) sum_nu A(inu)B(inu) = + int_0^beta dtau A(tau) B(beta-tau)
@@ -96,11 +95,11 @@ namespace bdft_tests {
     // int_0^beta dtau e^{i nu_m tau} (.) = row m of Twt_bb (pinned by pin_rpa_bubble);
     // the m0 row is the plain integral. beta-tau = exact index mirror on the
     // PH-symmetric mesh. The tau=0 value of a bosonic-class DLR function is the exact
-    // interpolation row at x = -1 (dlr_driver.hpp:134-178).
+    // interpolation row at x = -1 (see dlr_driver.hpp).
 
-    // S_SigmaG in ALL FOUR trace orientations (conservation notes, section 1.8):
-    //   [0] same-index    sum_ab Sig_ab G_ab        <- the conserving pairing (measured)
-    //   [1] matrix-trace  sum_ab Sig_ab G_ba        (the notes' Eq.-4 labeling)
+    // S_SigmaG in ALL FOUR trace orientations:
+    //   [0] same-index    sum_ab Sig_ab G_ab        <- the conserving pairing
+    //   [1] matrix-trace  sum_ab Sig_ab G_ba
     //   [2] conj same     sum_ab Sig_ab conj(G_ab)
     //   [3] conj matrix   sum_ab Sig_ab conj(G_ba)
     // On hermitian G, [0]==[3] and [1]==[2]; the non-hermitian-G control breaks the
@@ -133,11 +132,11 @@ namespace bdft_tests {
     }
 
     // S_PW in BOTH aux-trace directions {sum_MN Pi_MN W_NM, sum_MN Pi_MN W_MN}.
-    // Pi_wqMN: notes-convention Pi(inu) on the full bosonic mesh (kernel output);
+    // Pi_wqMN: Pi(inu) in the kernel's convention on the full bosonic mesh (kernel output);
     // Z_qPQ + Wt_qtPQ (dynamic W on the FULL tau mesh): the rung exactly as consumed
     // (head-AUGMENTED arrays under the gygi-class policy);
-    // iq_skip: external q cell excluded from the trace (-1 = include all q, the v2
-    // policy; = iq_gamma for the v1_skip fallback, conservation notes 1.4).
+    // iq_skip: external q cell excluded from the trace (-1 = include all q, the default
+    // policy; = iq_gamma for the v1_skip policy).
     template<typename ZArr>
     std::pair<cplx, cplx> trace_pi_W(imag_axes_ft::IAFT const& ft, iaft_tools const& tools,
                                      nda::array<cplx, 2> const& T0row,
@@ -176,7 +175,7 @@ namespace bdft_tests {
       return {S1 / double(nk_norm), S2 / double(nk_norm)};
     }
 
-    // notes-convention RPA aux bubble of the SAME (projected) G, on the full bosonic
+    // RPA aux bubble (kernel convention) of the SAME (projected) G, on the full bosonic
     // mesh -- the "wrong Pi" for the positive control. Built with the pin_rpa_bubble
     // primitive (test_vertex_pi.cpp): Pi_w(m,q,M,N) = -(spin/Nk) sum_k Twt_bb(m,:) .
     // [ Gt(k+q, s)_MN Gt(k, beta-s)_NM ](s).
@@ -288,8 +287,8 @@ namespace bdft_tests {
       // nonherm = true replaces the hermitian pole matrices U_r U_r^dag by U_r V_r^dag
       // with an independent unitary V: G(k,tau) keeps its exact DLR pole structure but
       // loses orbital hermiticity -- this breaks the G_ab = conj(G_ba) degeneracy and
-      // pins the trace orientation AND the conjugation convention of the pairing
-      // (conservation notes, section 1.8). The rung data (X, Z, M) are identical.
+      // pins the trace orientation AND the conjugation convention of the pairing.
+      // The rung data (X, Z, M) are identical.
       explicit model_t(bool nonherm = false)
                 : eps(nk, nbnd), Pr(nk, nbnd, nbnd, nbnd), X_skPa(ns, nk, Np, nbnd),
                   Z_qPQ(nk, Np, Np), M_qPQ(nk, Np, Np), kmq(nk, nk), kpq(nk, nk), qmin(nk) {
@@ -474,7 +473,7 @@ namespace bdft_tests {
       auto Wt = mdl.Wdyn_tau(ft);
       auto Ww = mdl.Wdyn_w(tools);
 
-      // G~ = P_C G P_C (conservation notes section 1.2)
+      // G~ = P_C G P_C
       nda::array<cplx, 5> Gproj(nt, ns, nk, nbnd, nbnd);
       Gproj() = cplx(0.0);
       for (long it = 0; it < nt; ++it)
@@ -483,8 +482,8 @@ namespace bdft_tests {
             Gproj(it, is, ik, C(), C()) = G(it, is, ik, C(), C());
 
       // ---- Sigma^C via the actual kernel, on G and on G~ (invariance check) --------
-      // v2 q->0 policy: rung Gamma cells INCLUDED (skip = false) and the external
-      // q = Gamma cell re-included in S_PW (notes/q0_head_treatment.md section 2.6).
+      // default q->0 policy: rung Gamma cells INCLUDED (skip = false) and the external
+      // q = Gamma cell included in S_PW.
       nda::array<cplx, 5> Sig(nt, ns, nk, nbnd, nbnd), Sig_p(nt, ns, nk, nbnd, nbnd);
       solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), G, mdl.X_skPa, Wt,
                                                       mdl.Z_qPQ, mdl.kmq, mdl.qmin,
@@ -502,7 +501,7 @@ namespace bdft_tests {
       REQUIRE(s_scale > 1e-10);
       REQUIRE(d_inv < 1e-12 * s_scale);
 
-      // ---- Pi^C via the actual kernel on G~, notes convention, all rung q included --
+      // ---- Pi^C via the actual kernel on G~, all rung q included --------------------
       nda::array<cplx, 4> Pi_w(tools.nw_b, nk, Np, Np);
       Pi_w() = cplx(0.0);
       vertex_pi::pi_c_accumulate_w(ft, tools, Gproj, mdl.X_skPa, mdl.Z_qPQ, &Ww,
@@ -513,7 +512,7 @@ namespace bdft_tests {
       auto S_SG_o = cons::trace_sigma_G(tools, Sig_p, Gproj);
       auto [S_PW, S_PW_alt] = cons::trace_pi_W(ft, tools, T0row, Pi_w, mdl.Z_qPQ, Wt,
                                                /*iq_skip=*/-1, nk);
-      cplx S_SG = S_SG_o[0];   // same-index pairing: the conserving one (notes 1.8)
+      cplx S_SG = S_SG_o[0];   // same-index pairing: the conserving one
 
       double scale = std::max(std::abs(S_SG), std::abs(S_PW));
       double rel = cons::rel_residual(S_SG, S_PW);
@@ -521,8 +520,8 @@ namespace bdft_tests {
       app_log(1, "conservation_toy: S_PW        = ({}, {})", S_PW.real(), S_PW.imag());
       app_log(1, "conservation_toy: |S_SG + S_PW| = {}, scale = {}, rel = {}",
               std::abs(S_SG + S_PW), scale, rel);
-      // alternate-reading diagnostics (conservation notes section 1.8); on this
-      // hermitian-G toy [1](matrix-trace) == [2](conj same-index) and [0] == [3]
+      // alternate-reading diagnostics; on this hermitian-G toy
+      // [1](matrix-trace) == [2](conj same-index) and [0] == [3]
       double rel_mat = cons::rel_residual(S_SG_o[1], S_PW);
       double rel_altW = cons::rel_residual(S_SG, S_PW_alt);
       app_log(1, "conservation_toy: alternate readings: rel(matrix-trace G_ba) = {}, "
@@ -533,10 +532,10 @@ namespace bdft_tests {
 
       REQUIRE(scale > 1e-8);
       REQUIRE(std::isfinite(rel));
-      // tolerance: kernels are pinned at ~3e-12 (Sigma) / ~1e-13 abs (Pi) on these
-      // grids; the pairing adds only DLR-eps-class transforms of [A-comp]-representable
-      // products (>= 2x wmax headroom). 1e-8 keeps the fused_vs_batched safety-margin
-      // style (assert 1e-8 vs measured ~1e-11).
+      // tolerance: the kernels are accurate to ~3e-12 (Sigma) / ~1e-13 abs (Pi) on these
+      // grids; the pairing adds only DLR-eps-class transforms of composite tau products
+      // that are representable on the grid (>= 2x wmax headroom). 1e-8 leaves a wide
+      // safety margin over the expected ~1e-11 residual.
       REQUIRE(rel < 1e-8);
       // the asymmetric toy discriminates the readings: the matrix-trace orientation
       // and the transposed aux contraction must NOT satisfy the identity
@@ -559,8 +558,8 @@ namespace bdft_tests {
       REQUIRE(rel_rpa > 1e3 * std::max(rel, 1e-14));
       REQUIRE(rel_rpa > 1e-2);
 
-      // ---- v1_skip fallback consistency: rung Gamma skipped on both cuts AND the
-      //      external q = Gamma excluded from the trace (conservation notes 1.4) -------
+      // ---- v1_skip policy consistency: rung Gamma skipped on both cuts AND the
+      //      external q = Gamma excluded from the trace --------------------------------
       {
         nda::array<cplx, 5> Sig_v1(nt, ns, nk, nbnd, nbnd);
         solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), Gproj, mdl.X_skPa,
@@ -580,16 +579,16 @@ namespace bdft_tests {
                 S_SG_v1.real(), S_SG_v1.imag(), S_PW_v1.real(), S_PW_v1.imag(), rel_v1);
         REQUIRE(std::max(std::abs(S_SG_v1), std::abs(S_PW_v1)) > 1e-8);
         REQUIRE(rel_v1 < 1e-8);
-        // cross-policy discrimination: pairing the v2 kernels' Phi^ cut against the
-        // v1-truncated trace (or vice versa) must NOT cancel
+        // cross-policy discrimination: pairing the default-policy Phi^ cut against the
+        // v1_skip-truncated trace (or vice versa) must NOT cancel
         double rel_x = cons::rel_residual(S_SG, S_PW_v1);
-        app_log(1, "conservation_toy: cross-policy control rel(v2 Sigma vs v1 trace) = {}",
+        app_log(1, "conservation_toy: cross-policy control rel(default-policy Sigma vs v1_skip trace) = {}",
                 rel_x);
         REQUIRE(rel_x > 1e3 * std::max(rel, 1e-14));
       }
 
       // ---- gygi-rule pin: rank-1 head-augmented W^ at the Gamma cell -----------------
-      // (notes/q0_head_treatment.md section 2.6). The insertion here is synthetic
+      // The insertion here is synthetic
       // (arbitrary chi, xi, and a frequency profile independent of the toy W): the
       // identity is algebraic in (G, W^), so it must hold for ANY augmented arrays fed
       // consistently to both kernels and to the trace -- including at the external
@@ -681,7 +680,7 @@ namespace bdft_tests {
 
       auto Wt = mdl_nh.Wdyn_tau(ft);
       auto Ww = mdl_nh.Wdyn_w(tools);
-      // v2 q->0 policy (all q included, external Gamma traced)
+      // default q->0 policy (all q included, external Gamma traced)
       nda::array<cplx, 5> Sig(nt, ns, nk, nbnd, nbnd);
       solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), Gproj, mdl_nh.X_skPa,
                                                       Wt, mdl_nh.Z_qPQ, mdl_nh.kmq,
@@ -709,8 +708,8 @@ namespace bdft_tests {
               cons::rel_residual(S_SG_o[3], S_PW));
       REQUIRE(scale > 1e-8);
       // the non-hermitian |S| is ~40x smaller than the hermitian toy's while the
-      // absolute residual floor (kernel/DLR eps class) is unchanged -- measured
-      // rel = 7.7e-9 (abs 6e-13); assert with the same margin style
+      // absolute residual floor (kernel/DLR eps class) is unchanged, so the relative
+      // tolerance is one decade looser
       REQUIRE(rel < 1e-7);
       for (int o = 1; o < 4; ++o)
         REQUIRE(cons::rel_residual(S_SG_o[o], S_PW) > 1e5 * std::max(rel, 1e-14));
@@ -724,9 +723,9 @@ namespace bdft_tests {
 #else
     decltype(nda::range::all) all;
     auto& mpi_context = utils::make_unit_test_mpi_context();
-    // wmax = 6.0: the vertex kernels' [A-comp] intermediates need ~3x headroom over the
-    // LiH spectral range (~1.2) -- the pi-design section 4b requirement; wmax = 1.2
-    // (the plain-GW choice) destroys the dynamic-rung cancellations.
+    // wmax = 6.0: the vertex kernels' composite tau-product intermediates need ~3x
+    // headroom over the LiH spectral range (~1.2); wmax = 1.2 (the plain-GW choice)
+    // destroys the dynamic-rung cancellations.
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_conservation_smoke";
 
@@ -745,7 +744,7 @@ namespace bdft_tests {
     // one plain scGW iteration -> physical G; then rebuild the real RPA-screened W from
     // it. The identity is algebraic in (G, W): any pair fed CONSISTENTLY to both kernels
     // and both pairings is valid; the pure-RPA W isolates this test from the in-loop
-    // vertex state (same isolation choice as the sigma smoke's rebuild).
+    // vertex state (as in the sigma smoke test's rebuild).
     auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                    solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
                                    1, false, 1e-9, true);
@@ -806,7 +805,7 @@ namespace bdft_tests {
         Wt_qtPQ(all, it, all, all) = W_half(all, ith, all, all);
       }
     }
-    // dynamic W on the full bosonic mesh (Pi^C kernel input), vertex_t.cpp:298-322
+    // dynamic W on the full bosonic mesh (Pi^C kernel input), as in vertex_t.cpp
     nda::array<cplx, 4> Wdyn_qwPQ(nqpts, tools.nw_b, Np, Np);
     {
       long nw_b = tools.nw_b;
@@ -822,7 +821,7 @@ namespace bdft_tests {
       }
     }
 
-    // momentum maps and Gamma (vertex_t.cpp:161-189)
+    // momentum maps and Gamma (as in vertex_t.cpp)
     nda::array<long, 2> kmq(nqpts, nkpts), kpq(nqpts, nkpts);
     nda::array<long, 1> qmin(nqpts);
     for (long iq = 0; iq < nqpts; ++iq) {
@@ -844,7 +843,7 @@ namespace bdft_tests {
       utils::check(iq_gamma >= 0, "vertex_conservation_lih: no Gamma q-point found.");
     }
 
-    // ------------- the two cuts via the actual kernels (v2: all q included) -----------
+    // ------------- the two cuts via the actual kernels (all q included) --------------
     nda::array<cplx, 5> Sig(nt, ns, nkpts, nbnd, nbnd);
     solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, mpi_context->comm, Crng, Gproj,
                                                     X_skPa, Wt_qtPQ, Z_qPQ, kmq, qmin,
@@ -865,7 +864,7 @@ namespace bdft_tests {
     auto S_SG_o = cons::trace_sigma_G(tools, Sig, Gproj);
     auto [S_PW, S_PW_alt] = cons::trace_pi_W(ft, tools, T0row, Pi_w, Z_qPQ, Wt_qtPQ,
                                              /*iq_skip=*/-1, nkpts);
-    cplx S_SG = S_SG_o[0];   // same-index pairing (conserving; notes section 1.8)
+    cplx S_SG = S_SG_o[0];   // same-index pairing (the conserving one)
 
     double scale = std::max(std::abs(S_SG), std::abs(S_PW));
     double rel = cons::rel_residual(S_SG, S_PW);
@@ -882,10 +881,10 @@ namespace bdft_tests {
 
     REQUIRE(scale > 1e-12);
     REQUIRE(std::isfinite(rel));
-    // tolerance (conservation notes section 3): DLR "low" (eps = 1e-6; measured pole-fit
-    // error ~2.4e-5 at this setting), [A-comp] composite fits at wmax = 6 -- the residual
-    // is a cancellation of two O(|S|) numbers each carrying those representation errors.
-    // Measured: rel = 7.1e-6 (2026-07-16, 2 ranks); assert with ~100x headroom.
+    // tolerance: DLR "low" (eps = 1e-6; pole-fit error ~2e-5 at this setting) and
+    // composite tau-product fits at wmax = 6 -- the residual is a cancellation of two
+    // O(|S|) numbers each carrying those representation errors (expected ~1e-5);
+    // 1e-3 leaves ~100x headroom.
     REQUIRE(rel < 1e-3);
 
     // positive control (a): flipped relative sign
@@ -908,8 +907,8 @@ namespace bdft_tests {
     // ------------- gygi-class variant: the REAL analytic head insertion ----------------
     // W^(Gamma) = stored body + (H1): Z^(Gamma) += Nk*madelung*conj(chi)chi^T,
     // dW^(Gamma,tau) += Nk*madelung*Re[eps_inv_head(tau)]*conj(chi)chi^T
-    // (notes/q0_head_treatment.md sections 1.5/2.6). Both kernels and the trace consume
-    // the SAME augmented arrays: the identity must hold at the same tolerance class.
+    // Both kernels and the trace consume the SAME augmented arrays: the identity must
+    // hold at the same tolerance class.
     {
       REQUIRE(mb_state.eps_inv_head.has_value());
       auto& eps = mb_state.eps_inv_head.value();

@@ -108,28 +108,27 @@ namespace methods {
                                 std::string grp_name="scf", long iter=-1);
 
     /**
-     * scGW-tilde increment C3 (notes/scgwt_implementation_plan.md; the T-c probe):
-     * covariant-velocity dielectric readout on a STORED checkpoint. Loads
+     * Covariant-velocity (CVV) dielectric readout on a STORED checkpoint. Loads
      * (F, Sigma(tau), mu) of the requested iteration, rebuilds G by Dyson, builds the
      * CVV R-space store, evaluates the head tensor and the SUBTRACTED head coefficient
      * Phead_ab(inu) = [Pi^jj(inu) - Pi^jj(0)]/(inu)^2 (cvv_detail::head_subtract), and
      * reports eps_inf(q^) = 1 - 4 pi q^ q^ : Phead(inu = 0) per cartesian direction --
      * an explicit O(q^2) coefficient, NO q -> 0 extrapolation, so the
-     * stored-vs-quadratic convention split does not arise (gate C3-a / PDF G-b).
+     * stored-vs-quadratic convention split of the extrapolated heads does not arise.
      * Results are written to {grp_name}/iter{N}/cvv_eps in the checkpoint.
      */
     void cvv_eps(mf::MF &mf, ptree const& pt, std::string grp_name="scf", long iter=-1);
 
     /**
-     * P24 / G31 (notes/vertex_perf_plan.md): Wannier interpolation of the quasiparticle Hamiltonian
+     * Wannier interpolation of the quasiparticle Hamiltonian
      * of {grp_name}/iter{N} (qp_approx/Heff_skij when present, Heff_skij otherwise) onto a UNIFORM
      * fine k mesh -- all n1*n2*n3 points of the mesh in crystal coordinates, not the IBZ -- with the
      * "quasiparticle" machinery of wannier_interpolation (IBZ -> full-BZ unfold, projector downfold,
      * k -> R on the Wigner-Seitz R grid of the mean-field mesh, R -> k on the fine mesh), followed by
      * a per-k Hermitization and diagonalization (interpolate_qp_bands_on_mesh). Unlike the band-path
      * route, the imaginary part of H(R) is KEPT, so the interpolation is exact on the mean-field mesh:
-     * at a mesh k the interpolated bands are the eigenvalues of the downfolded Heff(k) (the identity
-     * gate of test_methods_pproc). Consumed by the qp_gaps post-processing (qp_gaps_interp = true).
+     * at a mesh k the interpolated bands are the eigenvalues of the downfolded Heff(k) (checked by
+     * test_methods_pproc). Consumed by the qp_gaps post-processing (qp_gaps_interp = true).
      * Writes nothing to the checkpoint.
      * @param mf - [INPUT] mean-field instance (mesh, lattice, symmetry maps)
      * @param project_file - [INPUT] h5 file with the Wannier projection matrices (dft_input/proj_mat)

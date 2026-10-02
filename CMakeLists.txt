@@ -104,13 +104,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(ENABLE_ROCM " Build device code with ROCM backend" OFF)
 option(ENABLE_OPENMP " Build device code with OPENMP backend" OFF)
 option(ENABLE_FFTW "Build using FFTW3 library." ON)
-# RW-1 (notes/rw_real_axis_w_spec.md "Build ruling"): DELIBERATE DEVIATION from
-# origin/real_axis, where this option defaults ON. cmake/finufft.cmake pulls FINUFFT
-# with FetchContent at CONFIGURE time, i.e. it needs the network. Rusty compute nodes
-# configure without network and the production trees (coqui_scgwt / coqui_prof /
-# coqui_thread) must not grow a silent network dependency. RW builds turn it ON
-# explicitly; with it OFF the real-axis module and every finufft target vanish from
-# the build and the tree behaves exactly as it did pre-RW (gate RW-1-c).
+# ENABLE_FINUFFT defaults OFF: cmake/finufft.cmake pulls FINUFFT with FetchContent at
+# CONFIGURE time, i.e. it needs network access, which cluster compute nodes often lack.
+# Builds that need the real-axis module turn it ON explicitly; with it OFF the real-axis
+# module and every finufft target are left out of the build.
 option(ENABLE_FINUFFT "Enable FINUFFT non-uniform FFT backend" OFF)
 option(ENABLE_CUFINUFFT "Enable cuFINUFFT (GPU NUFFT) backend. Requires CUDA + ENABLE_FINUFFT." OFF)
 option(ENABLE_HEFFTE "Build using heFFTe library." OFF)
@@ -157,14 +154,11 @@ endif()
 set(ENABLE_NCCL FALSE)
 if(ENABLE_CUDA)
   enable_language(CUDA)
-  # Architecture selection. This used to be `if(DEFINED CUDA_ARCH) ... else() set(... 80)`, which
-  # silently OVERWROTE a user-supplied -DCMAKE_CUDA_ARCHITECTURES with 80 -- the standard CMake
-  # variable everyone reaches for first. That is how build/gpu90 (configured with
-  # -DCMAKE_CUDA_ARCHITECTURES=90) came to contain sm_80 code only, with no PTX to JIT from: on an
-  # H100 every device kernel then failed to launch with cudaErrorNoKernelImageForDevice, and because
-  # CUB's launch status was being discarded (see device_kernels/cuda/cuda_aux.hpp) the failures were
-  # silent and the ERI came out as zeros. That was defect B6. Honour either spelling, prefer the
-  # standard one, and say out loud what was chosen.
+  # Architecture selection. Honour both the standard CMAKE_CUDA_ARCHITECTURES and the legacy
+  # CUDA_ARCH spelling, prefer the standard one, default to 80 only when neither is set, and
+  # report the choice. A user-supplied CMAKE_CUDA_ARCHITECTURES must never be overwritten: a
+  # binary built for the wrong architecture (e.g. sm_80 only, no PTX) cannot launch its kernels
+  # on a newer GPU (cudaErrorNoKernelImageForDevice).
   if(DEFINED CUDA_ARCH AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
   elseif(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -281,37 +275,28 @@ cmake_print_properties(TARGETS MPI::MPI_CXX PROPERTIES INTERFACE_LINK_LIBRARIES 
 
 ######################################################################
 # MKL threading layer link order
-#   T-2 option (a) -- notes/coqui_threading_spec.md rev 2 section 3
 #
 # Because find_package(BLAS) is commented out just above, MKL enters the link ONLY through
-# the slate / blaspp / lapackpp imported targets -- and those were configured against
+# the slate / blaspp / lapackpp imported targets, which may have been configured against
 # libmkl_sequential. ELF first-definition-wins then hands every MKL entry point to the
-# SEQUENTIAL layer, so MKL_NUM_THREADS (and the new `blas_threads` knob) are silently
-# inert. Verified on the production binary: DT_NEEDED listed mkl_sequential ahead of
-# mkl_gnu_thread (notes/coqui_threading_t0.md section 1.4), and the measured cost was a
-# 933 s -> 215 s solve left on the table.
-#
-# The only workaround so far was to LD_PRELOAD libmkl_gnu_thread at the application exec
-# (runs/ladder_prof/preload_wrap.sh) -- which poisons every non-CoQui process in the job
-# script and therefore cannot live in the harness shell. This puts the threading layer on
-# the link line AHEAD of the imported targets that drag in the sequential one, retiring
-# the preload for new builds.
+# SEQUENTIAL layer, so MKL_NUM_THREADS (and the `blas_threads` knob) are silently inert.
+# This puts the GNU OpenMP threading layer on the link line AHEAD of the imported targets
+# that drag in the sequential one, so no LD_PRELOAD of libmkl_gnu_thread is needed.
 #
 # IT MUST BE A LINK *OPTION*, NOT A LINK LIBRARY. The obvious spelling --
 #   target_link_libraries(... "-Wl,--no-as-needed" <path> "-Wl,--as-needed")
 # -- does NOT work: CMake treats a full-path library as a reorderable/dedupable item and
-# hoists it to the END of the link line (verified on the generated link.txt: the two bare
-# -Wl flags stayed put at positions 53-54 while libmkl_gnu_thread.so was moved to 73,
-# still behind -lmkl_sequential at 62). Link OPTIONS are emitted verbatim, ahead of both
-# the objects and the whole library list, so passing the library THROUGH -Wl, makes it the
-# first shared-object input and therefore the first MKL entry in DT_NEEDED.
+# hoists it towards the END of the link line, behind -lmkl_sequential, while the bare -Wl
+# flags stay put. Link OPTIONS are emitted verbatim, ahead of both the objects and the whole
+# library list, so passing the library THROUGH -Wl, makes it the first shared-object input
+# and therefore the first MKL entry in DT_NEEDED.
 #
 # --push-state/--no-as-needed ... --pop-state is required because the layer is placed
 # before anything that references an MKL symbol, so a default --as-needed linker would
 # drop it again; pop-state restores the previous setting so no other dependency changes.
 #
-# This is a NO-OP wherever MKL is not the BLAS in use -- the Mac dev tree links OpenBLAS,
-# finds nothing, and the interface target stays empty.
+# This is a NO-OP wherever MKL is not the BLAS in use (e.g. an OpenBLAS build): the library
+# is not found and the interface target stays empty.
 ######################################################################
 option(COQUI_MKL_THREADED_LINK
        "Link MKL's GNU OpenMP threading layer ahead of the sequential layer" ON)
@@ -330,7 +315,7 @@ if(COQUI_MKL_THREADED_LINK)
       target_link_libraries(coqui_blas_threading INTERFACE ${COQUI_MKL_GNU_THREAD})
     endif()
     message(STATUS "MKL threading layer placed ahead of the sequential layer: ${COQUI_MKL_GNU_THREAD}")
-    message(STATUS "  -> MKL_NUM_THREADS / blas_threads are live WITHOUT preload_wrap.sh")
+    message(STATUS "  -> MKL_NUM_THREADS / blas_threads take effect without LD_PRELOAD")
   else()
     message(STATUS "MKL threading layer not found (MKLROOT unset, or a non-MKL BLAS is in "
                    "use): BLAS threading follows whatever slate/blaspp linked.")
@@ -338,12 +323,12 @@ if(COQUI_MKL_THREADED_LINK)
 endif()
 
 ######################################################################
-# Host OpenMP -- increment T-3b, notes/coqui_threading_spec.md rev 3 section 7.2 item 5
+# Host OpenMP
 #
 # This is CoQui's OWN threading of its OWN loops (the `omp_threads` knob, see
-# src/utilities/omp_threads.hpp). It is NOT the pre-existing ENABLE_OPENMP option a few
-# dozen lines above -- that one selects an OpenMP *device offload* backend and turns on
-# ENABLE_DEVICE. Do not conflate them.
+# src/utilities/omp_threads.hpp). It is NOT the ENABLE_OPENMP option a few dozen lines
+# above -- that one selects an OpenMP *device offload* backend and turns on ENABLE_DEVICE.
+# Do not conflate them.
 #
 # The flag is applied to the `utils` target PUBLICly, and every CoQui library reaches utils
 # transitively, so all C++ TUs are compiled with the same -fopenmp state. That uniformity is
@@ -352,10 +337,9 @@ endif()
 # instantiation with OpenMP and another without would be an ODR violation whose symptom is
 # a region that silently does not thread.
 #
-# DEFAULT: ON on Linux, OFF on Apple. The Mac trap is documented in
-# notes/coqui_threading_t0.md section 5 -- duplicate OpenMP runtimes make any t>1 run die
-# with OMP Error #179, so all threaded validation happens on Linux and Mac work runs at
-# omp_threads = 1 anyway.
+# DEFAULT: ON on Linux, OFF on Apple. On macOS a typical toolchain mixes two OpenMP
+# runtimes (e.g. libomp and the BLAS's own), and any run with more than one thread then
+# aborts with OMP Error #179; macOS builds therefore run CoQui's loops serially.
 ######################################################################
 if(APPLE)
   set(COQUI_HOST_OPENMP_DEFAULT OFF)
@@ -382,12 +366,10 @@ endif()
 # FFTW: not using MKL's FFTW yet, figure out how if requested
 ######################################################################
 if(ENABLE_FFTW)
-  # T-3a section 2.3 row 8: DOUBLE_OPENMP_LIB was already requested here but never linked
-  # (src/numerics/fft/CMakeLists.txt linked FFTW::Double only). The component list is left
-  # exactly as it was -- FindFFTW searches for every flavour unconditionally and exports
-  # FFTW::DoubleThreads / FFTW::DoubleOpenMP whenever it finds them, so nothing has to be
-  # promoted to a REQUIRED component to pick one. See src/numerics/fft/CMakeLists.txt for
-  # WHICH one gets linked and why.
+  # The component list only names DOUBLE_OPENMP_LIB, but FindFFTW searches for every
+  # flavour unconditionally and exports FFTW::DoubleThreads / FFTW::DoubleOpenMP whenever it
+  # finds them, so nothing has to be promoted to a REQUIRED component to pick one. See
+  # src/numerics/fft/CMakeLists.txt for WHICH one gets linked and why.
   find_package(FFTW REQUIRED DOUBLE_OPENMP_LIB)
   add_compile_definitions(ENABLE_FFTW)
 endif()
@@ -602,7 +584,7 @@ if(COQUI_PYTHON_SUPPORT)
   # Fetch the c2py library.
   #
   # h5 -- pulled in transitively by nda once PythonSupport=ON, see the nda block above --
-  # now fetches c2py ITSELF through nda's external_dependency(), which add_subdirectory()s
+  # may fetch c2py ITSELF through nda's external_dependency(), which add_subdirectory()s
   # it under _deps/nda-build/deps/h5/deps/c2py_src and thereby defines the c2py,
   # c2py_warnings and c2py::c2py targets. FetchContent has no record of that population,
   # so an unconditional FetchContent_MakeAvailable(c2py) here aborts the configure with

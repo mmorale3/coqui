@@ -19,37 +19,34 @@
  */
 
 /**
- * Vertex parallelization rank-cap-lift smoke + rank-invariance at the KERNEL entry
- * point (notes/vertex_parallelization_analysis.md section 4.2 #1/#2;
- * notes/vertex_parallelization_M1.md, notes/vertex_parallelization_M2.md).
+ * Vertex kernels at rank counts above the band dimension, and rank-invariance at the
+ * KERNEL entry point.
  *
- * The vertex kernels (pi_c_accumulate_w, eval_sigma_C_g3w2) already run on the FULL
- * communicator and round-robin their work tuples over (rank, nproc) -- there is NO
- * kernel-side rank cap; the ~12-rank wall is entirely in the THC READER BUILD (see the
- * M1 note). This test exercises the decoupled kernel directly on a toy model whose band
- * dimension nbnd is TINY (nbnd = 3, Np = 4), so ANY run at P >= 4 already puts the
- * kernel at P > nbnd -- the exact regime that trips the reader's make_distributed_array
- * / nproc_per_pool cap -- and shows the kernel itself does NOT abort and stays
- * rank-invariant.
+ * The vertex kernels (pi_c_accumulate_w, eval_sigma_C_g3w2) run on the FULL communicator
+ * and round-robin their work tuples over (rank, nproc) -- there is NO kernel-side rank
+ * cap; the rank limit of a full run comes from the THC reader build. This test exercises
+ * the decoupled kernel directly on a toy model whose band dimension nbnd is TINY
+ * (nbnd = 3, Np = 4), so ANY run at P >= 4 already puts the kernel at P > nbnd -- the
+ * regime that trips the reader's make_distributed_array / nproc_per_pool cap -- and
+ * shows the kernel itself does NOT abort and stays rank-invariant.
  *
- *   (a) rank-cap-lift smoke: the kernel runs to completion at P > nbnd (no abort).
+ *   (a) smoke: the kernel runs to completion at P > nbnd (no abort).
  *   (b) Pi^C rank-invariance:  Pi^C(distributed over P ranks) all_reduced == Pi^C
  *                              computed serially (rank 0, nproc 1) to <= 1e-11 relative
  *                              (the FP-reassociation floor of a reordered complex
- *                              reduction, notes section 4.1a). At P = 1 this is exact.
+ *                              reduction). At P = 1 this is exact.
  *
- * M2 (items #3/#4) additionally distributes the INNER loops (Sigma^C qy, Pi^C q_ext) via
- * a 2D rank split inside each kernel, and recomputes the Pi^C pair caches per tile. This
- * test is EXTENDED for M2 (notes/vertex_parallelization_M2.md deliverable #2/#3):
+ * The kernels also distribute their INNER loops (Sigma^C qy, Pi^C q_ext) via a 2D rank
+ * split, and recompute the Pi^C pair caches per tile:
  *
  *   (c) Sigma^C rank-invariance: the fused G3W2 kernel run on the FULL comm (combo x qy
  *                              split active) vs a size-1 self-comm (serial), <= 1e-11 rel
  *                              (P=1 exact) -- pins the qy-axis distribution against serial.
  *   (d) Pi^C q_ext distribution at nq_ext > 1 (the toy has nk = nq_ext = 3) so at
  *                              P >= 4 the q_ext axis IS split; still reproduces serial.
- *   (e) pair-cache memory footprint: assert the NEW per-tile live pair-cache bytes are
- *                              << the OLD replicated (ns*nk*nq_ext*...) store (guard
- *                              against silently reintroducing the #1 memory wall).
+ *   (e) pair-cache memory footprint: the per-tile live pair-cache bytes are << a
+ *                              store replicated over (ns*nk*nq_ext*...) (guards against
+ *                              reintroducing the replicated store).
  */
 
 #undef NDEBUG
@@ -197,8 +194,8 @@ namespace bdft_tests {
     auto Wdyn = mdl.Wdyn(tools);
     const long nw_b = tools.nw_b;
 
-    // (a) rank-cap-lift smoke: the kernel runs at P (= world.size) > nbnd = 3 without the
-    //     make_distributed_array / nproc_per_pool abort (the reader-side wall). Reaching
+    // (a) smoke: the kernel runs at P (= world.size) > nbnd = 3 without the
+    //     make_distributed_array / nproc_per_pool abort (the reader-side limit). Reaching
     //     the assertions below at all IS the smoke pass.
     if (world.root())
       app_log(1, "vertex_rankinv: kernel at P = {} ranks, nbnd = {}, Np = {} "
@@ -232,17 +229,16 @@ namespace bdft_tests {
                  "{}, rel = {}", P, num, den, num / den);
 
     // (b) rank-invariance: reordered complex reduction over the (s,k,qx,q_ext) space.
-    // With M2 (item #4) the inner q_ext loop is ALSO split at P >= 4 (nq_ext = nk = 3),
-    // so this now pins BOTH the tuple and the q_ext distribution against serial.
-    // Exact at P = 1; <= 1e-11 relative otherwise (notes section 4.1a).
+    // The inner q_ext loop is ALSO split at P >= 4 (nq_ext = nk = 3), so this pins BOTH
+    // the tuple and the q_ext distribution against serial.
+    // Exact at P = 1; <= 1e-11 relative otherwise (FP reassociation of the reduction).
     if (P == 1)
       REQUIRE(num == 0.0);
     else
       REQUIRE(num <= 1e-11 * den);
 
-    // (e) pair-cache memory footprint (M2 item #4; notes deliverable #3). The OLD kernel
-    // stored T0/T1/M0/M1 replicated over ALL (is,ik,q_ext): 4*ns*nk*nq_ext*nt*Nb2*Np
-    // complex on EVERY rank (the #1 memory wall, analysis section 1.2b). The NEW kernel
+    // (e) pair-cache memory footprint. Storing T0/T1/M0/M1 replicated over ALL
+    // (is,ik,q_ext) would take 4*ns*nk*nq_ext*nt*Nb2*Np complex on EVERY rank; the kernel
     // holds only the current tile's four components: 4*nt*Nb2*Np -- ONE TILE LIVE. Assert
     // the reduction factor is exactly ns*nk*nq_ext (guards against reintroducing the
     // replicated store). nq_ext = nk here (full external mesh).
@@ -253,7 +249,7 @@ namespace bdft_tests {
       const double new_bytes = 4.0 * double(nt) * Nb2 * Np * 16.0;
       const double factor = old_bytes / new_bytes;
       if (world.root())
-        app_log(1, "vertex_rankinv pair-cache footprint: OLD (replicated) = {} B, NEW "
+        app_log(1, "vertex_rankinv pair-cache footprint: replicated store = {} B, tiled "
                    "(one tile live) = {} B, reduction factor = {} (= ns*nk*nq_ext = {}).",
                 old_bytes, new_bytes, factor, ns * nk * nq_ext);
       REQUIRE(factor == Approx(double(ns * nk * nq_ext)));
@@ -263,7 +259,7 @@ namespace bdft_tests {
   }
 
   // ============================ Sigma^C rank-invariance ================================
-  // M2 item #3 (qy-axis distribution). Self-contained toy G3W2 model; the fused Sigma^C
+  // qy-axis distribution. Self-contained toy G3W2 model; the fused Sigma^C
   // kernel run on the FULL comm (combo x qy split active) must reproduce the size-1
   // self-comm (serial) result -- pins the qy distribution + the final all_reduce.
   namespace sig_rank_toy {

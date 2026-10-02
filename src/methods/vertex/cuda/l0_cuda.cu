@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -33,6 +35,7 @@
 #include <cuda_runtime.h>
 #include "IO/AppAbort.hpp"
 #include "methods/vertex/cuda/l0_cuda.cuh"
+#include "methods/vertex/cuda/rung_cuda.cuh"
 
 namespace methods::solvers::dynbse_cuda {
 
@@ -66,7 +69,7 @@ namespace methods::solvers::dynbse_cuda {
       atomicAdd(reinterpret_cast<double *>(p) + 1, v.y);
     }
 
-    // nca = the number of ACTIVE input components packed into Vt (P-3a); act[il] = their global component index
+    // nca = the number of ACTIVE input components packed into Vt; act[il] = their global component index
     // c (0 = the constant, 1 + f np + a = node a of family f). A frequency-constant input packs one component.
     struct kdims { long nc, nR, np, ng, nca, blk, nk, np_fit; long const *act; };
 
@@ -163,7 +166,7 @@ namespace methods::solvers::dynbse_cuda {
           const long nj = gnode[pole];
           const double ej = epsG[pole];
           const cd q = Qk[pole * W + src];
-          // the vectors the production multiplications act on
+          // the vectors dynbse.hpp's mulU / mulT act on
           const cd vU = (which_pass == 0) ? q : neg(q);                   // U_j . Q_j   |  - U_l . R_l
           const cd vT = (which_pass == 0) ? Bk[pole * W + src] : inu * q;  // T_j . B_j   |  i nu T_l . R_l
           cd *AUnj = &AU[abase + nj * blk + e], *ATnj = &AT[abase + nj * blk + e];
@@ -428,7 +431,7 @@ namespace methods::solvers::dynbse_cuda {
       }
     }
 
-    // ---- the small-nu fold (D2f): T_a with |eps_a| >= ratio |nu| folded into the U family ------------
+    // ---- the small-nu fold: T_a with |eps_a| >= ratio |nu| folded into the U family ------------
     // grid (np, K): after the assembly of this batch (a separate launch, so every contribution to
     // F.fam(1, a) is in). Reads family 1, writes family 0 (atomics) and zeroes its own family-1 slot.
     __global__ void tfold_kernel(kdims d, long ik0, long K, cd inu, double tfold,
@@ -457,13 +460,12 @@ namespace methods::solvers::dynbse_cuda {
     }
 
     // =================================================================================================================
-    // THE FUSED OUTPUT-STATIONARY L0 PASSES (gpu port 2026-09-27; notes/gpu_port_plan.md section 4e). The nsys / ncu
-    // profile of the batched-gemm + scatter passes: the per-pole 8 x 8 gemms are memory-bound on the materialized
-    // Pj / Qj / Bj (ng K W elements each, ~260 GB of traffic per expensive application) and the scatter kernels are
-    // L2-atomic-bound (every component adds into the same pole-indexed targets). Here one block per (r, k) owns every
+    // THE FUSED OUTPUT-STATIONARY L0 PASSES. In the batched-gemm + scatter passes the per-pole nc x nc gemms are
+    // memory-bound on the materialized Pj / Qj / Bj (ng K W elements each) and the scatter kernels are L2-atomic-bound
+    // (every component adds into the same pole-indexed targets). Here one block per (r, k) owns every
     // accumulator element e = (x', r, y') of its slice -- no atomics -- and forms the per-pole products in registers:
     //   pass 0: P(y, x') = sum_x V(x, y) gk_j(x, x'),  Q(x', y') = sum_y Ghat_j(y, y') P(y, x'),
-    //           B(x', y') = sum_y gkq_j(y', y) P(y, x')                      (the gemms Pj, Qj, Bj of the old pass)
+    //           B(x', y') = sum_y gkq_j(y', y) P(y, x')                      (the gemms Pj, Qj, Bj of the batched pass)
     //   pass 1: P(y, x') = sum_x V(x, y) Gtil_j(x', x),  R(x', y') = sum_y gkq_j(y', y) P(y, x')   (Pl, Rl)
     // Threads: G groups of S x nc slots (S = the power of two >= nc, the shuffle segment); thread (x', y') of a group
     // computes P(y = y', x') and gets P(y, x') for every y from its segment by shuffles. The groups split the
@@ -472,7 +474,7 @@ namespace methods::solvers::dynbse_cuda {
     // (at nj = gnode[j]) accumulate over the group's components in registers, are summed over the groups in shared
     // memory and added once; the component-indexed targets (at the component's node a) accumulate over the poles in
     // registers and are added once per chunk, the groups in turn. Every term is the scatter's product with the
-    // scatter's coefficient; only the summation order differs from the old passes (rounding class).
+    // scatter's coefficient; only the summation order differs from the batched-gemm passes (rounding level).
     // =================================================================================================================
     constexpr int FZ_NCOEF = 6;
 
@@ -524,8 +526,8 @@ namespace methods::solvers::dynbse_cuda {
     template <bool NU0>
     struct fz_acc { static constexpr int n = NU0 ? 5 : 7; };
 
-    // MINB blocks of 256 threads per SM: the register budget (ncu p1gpu_ncu9: at 176 registers / thread ONE block fitted,
-    // 12.5 % occupancy, 75 % of the cycles without an eligible warp -- latency-bound, not FP64-bound)
+    // MINB blocks of 256 threads per SM: caps the register budget. The kernel is latency-bound, not FP64-bound; without the
+    // cap a high register count leaves one resident block per SM and most cycles without an eligible warp.
     template <bool NU0, int CHG, int MINB>
     __global__ void __launch_bounds__(256, MINB)
     fused_pass_kernel(kdims d, long ik0, long K, int pass, cd inu, bool skip_cst, int S, int G,
@@ -768,9 +770,9 @@ namespace methods::solvers::dynbse_cuda {
       const long nc2 = nc * nc, CH = long(G) * CHG, nacc = nu0 ? 5 : 7;
       return size_t(CH * nc2 + 4 * nc2 + CH * FZ_NCOEF + nacc * long(G) * S * nc) * sizeof(cd);
     }
-    // the fused kernel's variants: cfg = 10 CHG + MINB (components per thread x minimum 256-thread blocks per SM). H100 PCIe,
-    // Si kp444 C = 8 (p1gpu_n3w / n3x): 81 34 ms, 82 25 ms, 42 11.6 ms, 43 9.9 ms, 44 9.3 ms per k-batch; the Sigma-side L0
-    // 68.8 s at 42 vs 65.0 s at 44 over a run -> 44 (4 blocks / SM, 80 registers, spills) is the default
+    // the fused kernel's variants: cfg = 10 CHG + MINB (components per thread x minimum 256-thread blocks per SM). The
+    // default 44 (4 blocks / SM, at the price of register spills) is the fastest variant on H100-class devices; the
+    // fz_bench switch times every variant on the current device.
     template <bool NU0, int CHG, int MINB>
     void fz_launch(dim3 grid, unsigned threads, kdims kd, long ik0, long Kb, int pass, cd inu, bool skip_cst, int S, int G,
                    cd const *Vt, cd const *gk, cd const *gkq, cd const *Ghat, cd const *Gtil, cd const *coef, long const *gnode,
@@ -815,7 +817,7 @@ namespace methods::solvers::dynbse_cuda {
         }
       };
       static bool benched[2] = {false, false};
-      // a representative batch: >= 16 active components (the first batch of a run can be constant-only; p1gpu_n3w benched nca 1)
+      // a representative batch: >= 16 active components (the first batch of a run can be constant-only)
       if (bench and not benched[nu0 ? 1 : 0] and kd.nca >= std::min<long>(16, 1 + kd.np)) {
         benched[nu0 ? 1 : 0] = true;
         const size_t accb = size_t(Kb) * size_t(2 * kd.np * kd.blk) * sizeof(cd);
@@ -952,9 +954,8 @@ namespace methods::solvers::dynbse_cuda {
     if (budget < per_k) K = 1;                           // one k must fit; the allocation will say if not
 
     // The per-batch working set, allocated with a RETRY: the budget above assumes an exclusive device, but
-    // several ranks may share one GPU (P-1 of the gpu port, 2026-09-25: two ranks sized their batches from
-    // the same cudaMemGetInfo at the same instant and the second cudaMalloc of Pj failed with
-    // cudaErrorMemoryAllocation). On a failed allocation everything of the attempt is freed and K is halved,
+    // several ranks may share one GPU (ranks that size their batches from the same cudaMemGetInfo at the same
+    // instant can over-commit it). On a failed allocation everything of the attempt is freed and K is halved,
     // down to K = 1, which must fit (abort otherwise).
     cd *dVt = nullptr, *dPj = nullptr, *dQj = nullptr, *dBj = nullptr, *dgjT = nullptr, *dglT = nullptr, *dGh = nullptr;
     cd *dAU = nullptr, *dAT = nullptr, *dM2 = nullptr, *dA1 = nullptr, *dA3 = nullptr, *dT = nullptr;
@@ -1119,7 +1120,7 @@ namespace methods::solvers::dynbse_cuda {
 
 
   // =====================================================================================================================
-  // THE DEVICE-RESIDENT UNIT (l0_cuda.cuh, gpu port plan section 4d). Part 1: the resident L0 plan -- the kernels above,
+  // THE DEVICE-RESIDENT UNIT (l0_cuda.cuh). Part 1: the resident L0 plan -- the kernels above,
   // driven on DEVICE buffers with the tables uploaded once per unit and the working set allocated once per engine.
   // =====================================================================================================================
   namespace {
@@ -1142,6 +1143,45 @@ namespace methods::solvers::dynbse_cuda {
     __global__ void conj_kernel(long n, cd *__restrict__ x) {
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) x[e] = cuConj(x[e]);
     }
+    // tau-slice permutation Fs (nt, D, nR) <-> P (D, nt, nR) with slot order slot_of[i]
+    __global__ void rung_perm_kernel(long nt, long D, long nR, long const *__restrict__ slot_of, cd const *__restrict__ Fs,
+                                     cd *__restrict__ P, bool inverse) {
+      const long tot = nt * D * nR;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long N = e % nR;
+        long t = e / nR;
+        const long y = t % D, i = t / D;                 // e indexes Fs (i, y, N)
+        const long pe = (y * nt + slot_of[i]) * nR + N;
+        if (inverse) P[e] = Fs[pe]; else P[pe] = Fs[e];    // inverse: P := unpermuted(Fs)
+      }
+    }
+    // Pr[(y nt + slot) nR + N] = c(node_of[slot], r) P[...]   (c: (nt, R) row-major)
+    __global__ void rung_cscale_kernel(long nt, long D, long nR, long R, long r, long const *__restrict__ node_of,
+                                       cd const *__restrict__ c, cd const *__restrict__ P, cd *__restrict__ Pr) {
+      const long tot = nt * D * nR;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long slot = (e / nR) % nt;
+        Pr[e] = cuCmul(c[node_of[slot] * R + r], P[e]);
+      }
+    }
+    // the unified rung pass's packing: slot-ordered (mirror pairs adjacent) and (input, family) columns side by side,
+    // Fbig[(y nt + slot_of[i]) ncol + off + N] = Fs[(i D + y) nR + N]; unpack is the inverse into Ys
+    __global__ void pack_slots_kernel(long nt, long D, long nR, long ncol, long off, long const *__restrict__ slot_of,
+                                      cd const *__restrict__ Fs, cd *__restrict__ Fbig) {
+      const long tot = nt * D * nR;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long N = e % nR, t = e / nR, y = t % D, i = t / D;
+        Fbig[(y * nt + slot_of[i]) * ncol + off + N] = Fs[e];
+      }
+    }
+    __global__ void unpack_slots_kernel(long nt, long D, long nR, long ncol, long off, long const *__restrict__ slot_of,
+                                        cd const *__restrict__ Ybig, cd *__restrict__ Ys) {
+      const long tot = nt * D * nR;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long N = e % nR, t = e / nR, y = t % D, i = t / D;
+        Ys[e] = Ybig[(y * nt + slot_of[i]) * ncol + off + N];
+      }
+    }
     __global__ void add2_kernel(long n, cd const *__restrict__ a, cd const *__restrict__ b, cd *__restrict__ out) {
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) out[e] = a[e] + b[e];
     }
@@ -1149,7 +1189,6 @@ namespace methods::solvers::dynbse_cuda {
       for (long i = blockIdx.x * long(blockDim.x) + threadIdx.x; i < D; i += long(gridDim.x) * blockDim.x)
         M[i * D + i] = M[i * D + i] + real(1.0);
     }
-    // max |a - b| and max |a| over n elements into red[0], red[1] (non-negative doubles: the bit patterns order like the values)
     // the max over a block (blockDim.x a multiple of 32, <= 1024); valid in thread 0. Non-negative doubles order like their
     // bit patterns, so the grid-wide max is an atomicMax on the bits (one per block).
     __device__ inline double block_max(double v) {
@@ -1164,11 +1203,15 @@ namespace methods::solvers::dynbse_cuda {
         for (int o = 16; o > 0; o >>= 1) v = fmax(v, __shfl_down_sync(0xffffffffu, v, o));
       return v;
     }
+    // fmax drops NaN -- the meters map a non-finite entry to +inf (kept by fmax / atomicMax on the bit pattern), and
+    // the host readback (meter_value) aborts on a non-finite meter
+    __device__ inline double nan_inf(double x) { return isfinite(x) ? x : __longlong_as_double(0x7ff0000000000000LL); }
+    // max |a - b| and max |a| over n elements into red[0], red[1] (non-negative doubles: the bit patterns order like the values)
     __global__ void maxdiff_kernel(long n, cd const *__restrict__ a, cd const *__restrict__ b, unsigned long long *__restrict__ red) {
       double num = 0.0, den = 0.0;
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) {
-        num = fmax(num, cuCabs(a[e] - b[e]));
-        den = fmax(den, cuCabs(a[e]));
+        num = fmax(num, nan_inf(cuCabs(a[e] - b[e])));
+        den = fmax(den, nan_inf(cuCabs(a[e])));
       }
       num = block_max(num);
       den = block_max(den);
@@ -1179,13 +1222,20 @@ namespace methods::solvers::dynbse_cuda {
     }
     __global__ void maxabs_kernel(long n, cd const *__restrict__ x, unsigned long long *__restrict__ slot) {
       double m = 0.0;
-      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) m = fmax(m, cuCabs(x[e]));
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) m = fmax(m, nan_inf(cuCabs(x[e])));
       m = block_max(m);
       if (threadIdx.x == 0) atomicMax(slot, (unsigned long long)__double_as_longlong(m));
     }
     inline unsigned grid_for(long n) { return unsigned(std::min<long>((n + 255) / 256, 65535)); }
     inline unsigned grid_red(long n) { return unsigned(std::max<long>(1, std::min<long>((n + 255) / 256, 1024))); }
 
+    /** a device meter's value; a non-finite one (NaN / inf in the reduced data) aborts with what was measured */
+    inline double meter_value(unsigned long long u, char const *what) {
+      double d = 0.0;
+      std::memcpy(&d, &u, sizeof(d));
+      if (not std::isfinite(d)) APP_ABORT(std::string(" dynbse device: non-finite values (NaN / inf) in ") + what + " -- ABORTING.");
+      return d;
+    }
     template <typename T>
     T *dalloc(size_t n, char const *what) {
       T *p = nullptr;
@@ -1402,7 +1452,7 @@ namespace methods::solvers::dynbse_cuda {
 
   // ---- Part 2: the engine (l0_cuda.cuh). Column-major cuBLAS on the host's ROW-MAJOR memory: a row-major (r x c) block is the
   // column-major (c x r) transpose, so the host's C = A B is issued as C^T = B^T A^T on the same buffers.
-  // D-3: the Sigma deposits' device state (ue_sd_*); every buffer is in `allocs` (freed by ue_destroy)
+  // the Sigma deposits' device state (ue_sd_*); every buffer is in `allocs` (freed by ue_destroy)
   struct sd_state {
     bool on = false, has_T = false;
     sd_config c;
@@ -1420,7 +1470,7 @@ namespace methods::solvers::dynbse_cuda {
     std::vector<void *> allocs;
   };
 
-  // D-1b: the rung builds' device state (ue_kb_*)
+  // the rung builds' device state (ue_kb_*)
   struct kb_state {
     bool on = false;
     long ns = 0, nq = 0, Nm = 0, nrep = 0, KC = 0;
@@ -1431,12 +1481,29 @@ namespace methods::solvers::dynbse_cuda {
     std::vector<cd *> hA, hB, hC;
     std::vector<long> qx;
     std::vector<void *> allocs;
+    long is = 0;                                             // the transfer whose legs / kq are set (ue_kb_build)
+    long legs_ik0 = -1;                                      // the k chunk whose legs U1 / U2 hold (-1: none valid)
+  };
+
+  // the dressed-leg Gamma_1 readout on the device (ue_dressed_prepare / ue_gamma1_dressed)
+  struct dressed_state {
+    bool on = false;
+    long ng = 0, nR_max = 0;
+    cd *H = nullptr, *Gh = nullptr, *Gt = nullptr, *gk = nullptr, *gkq = nullptr;   // (2ng, 2np); (ng, nk, nc, nc) x 4
+    cd *Etj = nullptr;                                     // conj(e~) (D, nout) row-major (the Dcj layout)
+    cd *Z = nullptr, *Zc = nullptr, *Sa = nullptr, *Sbc = nullptr, *Zt = nullptr;   // (2ng, W); (ng, W) x 3; (W)
+    std::vector<void *> allocs;
   };
 
   struct unit_engine {
     ue_config c;
     sd_state sd;
     kb_state kb;
+    dressed_state dr;
+    // the mirror-pair rung (rung_pair) and the frequency-factorized rung (rr = R > 0: Kds holds K_r, ctr (nt, R))
+    bool rung_pair = true;
+    long rr = 0;
+    cd *ctr = nullptr;
     cd *Gs0 = nullptr;                                       // Gsum0 of the last block (the Sigma columns static_dyn / dyn1_bare)
     cd *Gr1 = nullptr;                                       // the one-bare-rung Gsum of the last block (when requested)
     cd *Dcj = nullptr, *CbD = nullptr, *Vr = nullptr, *Pr = nullptr;   // conj(legs) (D, nout); the readout scratch
@@ -1446,6 +1513,26 @@ namespace methods::solvers::dynbse_cuda {
     cusolverDnHandle_t cs = nullptr;
     cd *KF = nullptr, *KF2 = nullptr, *Ut = nullptr, *Vs = nullptr, *Kmat = nullptr;                // basis (complex)
     cd *Ks = nullptr, *Kds = nullptr, *Kd0 = nullptr;                                               // (s, q)
+    // non-resident dense rungs (partial residency): K_d(s_r) for r >= nres reach the device per rung application through two
+    // staging buffers, each either REBUILT on the device from the W tables (src_host[r - nres] = 0) or COPIED from pinned host
+    // memory (= 1, Kds_host slot r - nres) on the copy stream cps, overlapping the compute stream; ev_ready / ev_free order the
+    // staging buffers. The split between the two sources is re-planned at every transfer from the measured costs.
+    cd *Kds_host = nullptr, *stage[2] = {nullptr, nullptr};
+    long nhost_cap = 0;                                      // pinned slots allocated (non-resident reps that may be copied)
+    std::vector<int> src_host;                               // per non-resident rep: 1 = copy, 0 = rebuild
+    cudaStream_t cps = nullptr;
+    cudaEvent_t ev_ready[2] = {nullptr, nullptr}, ev_free[2] = {nullptr, nullptr};
+    double t_copy_est = 0.0, t_rb_est = 0.0;                 // seconds per rep: H2D copy (measured bandwidth), device rebuild
+    double t_gemm_est = 0.0;                                 // seconds per rep: the rung gemm (timed on the resident reps)
+    long napp_cur = 0, napp_prev = 0;                        // rung passes of the current / previous transfer
+    double t_pass_cur = 0.0, t_hb_cur = 0.0;                 // this transfer: rung-pass wall time, build + D2H of its copied rungs
+    std::vector<std::vector<int>> cand;                      // the candidate copy / rebuild splits (set at the first plan)
+    std::vector<double> cand_sum;                            // their timed cost per pass, summed over the transfers that ran them
+    std::vector<long> cand_n;                                // ... and the number of those transfers
+    long cand_cur = -1;                                      // the split of the current transfer
+    cudaEvent_t ev_t0 = nullptr, ev_t1 = nullptr;            // timing events around the resident gemms
+    long ncopy = 0;
+    double t_copy_wait = 0.0;
     std::vector<long> trep;
     cd scale = make_cuDoubleComplex(1.0, 0.0);
     cd *Cbk = nullptr, *M = nullptr, *work = nullptr;                                               // (s, q, nu)
@@ -1459,14 +1546,32 @@ namespace methods::solvers::dynbse_cuda {
     unsigned long long *red = nullptr;
     l0_plan *l0 = nullptr;
     std::vector<int> hflags;
+    // partial residency: K_d(s_r) resident for r < nres (the rest: see Kds_host / stage above)
+    long nres = 0;
+    long nrebuild = 0;
+    double t_rebuild = 0.0;
+    // the rung pass: the packed (D, slot, inputs x families x nR) buffers; fuse = two inputs (the one-bare-rung and the Gamma_1
+    // input of a block) in one pass, with the one-bare-rung y in yfam1 / ycst1
+    bool fuse = false;
+    long ncol_max = 0;
+    cd *yfam1 = nullptr, *ycst1 = nullptr, *Fbig = nullptr, *Ybig = nullptr;
+    long *dslot = nullptr;                                   // slot_of (nt) on the device
+    // stream mode: the rung through the caller's streaming engine; slot i = tau node i, slot nt = W_d0
+    bool stream = false;
+    rung_stream *rs = nullptr;
   };
 
   double ue_bytes(ue_config const &c) {
     const double D = double(c.nk * c.nc * c.nc), W = D * double(c.nR_max), np = double(c.np);
     const double fam = 2.0 * np * W, cst = W;
+    const long nres = c.stream ? 0 : ((c.nres < 0 or c.nres >= c.ndist) ? c.ndist : c.nres);
+    const bool partial = (not c.stream and nres < c.ndist);
     double b = 0.0;
-    b += (3.0 + double(c.ndist)) * D * D;                                   // K_s, K_d0, M, K_d(s_r)
-    b += 3.0 * fam + 10.0 * cst + D * double(c.nR_max);                     // Ffam, F2fam, Gfam, yfam + csts + Y + Gs0 / Gr1 / CbD / Vr
+    if (c.stream) b += 2.0 * D * D;                                        // K_s, M (the rung streams: no K_d on the device)
+    else b += (3.0 + double(std::max(nres, 1l)) + (partial ? 2.0 : 0.0)) * D * D;   // K_s, K_d0, M, K_d(s_r) (>= 1 slot) [+ 2 staging]
+    if (not c.stream) b += 2.0 * (c.rung_fuse ? 4.0 : 2.0) * double(c.nt) * W;   // Fbig, Ybig (inputs x families x nR columns)
+    if (c.rung_fuse) b += fam + cst;                                       // yfam1, ycst1
+    b += 3.0 * fam + 13.0 * cst;                                            // Ffam, F2fam, Gfam + the 13 (D, nR) column buffers
     b += D * double(c.nout) + double(c.nout * c.nR_max);                    // the legs, the readout block
     b += fam;                                                               // yfam
     b += 2.0 * double(c.nt) * W + double(c.nt) * W + double(c.n_kept) * W + np * W;   // Fs, Ys, rec, g, coef
@@ -1477,14 +1582,71 @@ namespace methods::solvers::dynbse_cuda {
     return b * 1.05 + 512.0e6;                                              // cuSOLVER / cuBLAS workspaces
   }
 
-  unit_engine *ue_create(ue_config const &c, double free_bytes, char *why, long why_len) {
-    const double need = ue_bytes(c);
-    if (need > 0.9 * free_bytes) {
-      std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB free", need / 1e9, free_bytes / 1e9);
+
+  // the device bytes of the stages created after the unit (one source of truth for their own checks and for
+  // the unit's memory partition, which keeps exactly this much free for them)
+  double ue_kb_bytes(long ns, long nq, long Nm, long nk, long nc, long nrep) {
+    const long nc2 = nc * nc;
+    const double tables = double(ns * nk * Nm * nc) + double(nq * Nm * Nm) * (2.0 + double(nrep));
+    const double per_k = double(nk) * (3.0 * double(Nm * nc2) + double(nc2 * nc2));
+    return 16.0 * (tables + per_k) + 64.0e6;
+  }
+  double ue_sd_bytes(sd_config const &c, long R) {
+    const long nt = c.nt, nw = c.nw_f, ns = c.ns, nk = c.nk, nc2 = c.nc * c.nc, np = c.np, ng = c.ng, Nm = c.Nm, D = nk * nc2;
+    const double W = double(D) * double(R);
+    const double acc = double(nt * ns * nk * nc2) * (1.0 + 2.0 * double(np));
+    const double blk = W * (3.0 + 2.0 * double(nw) + double(nt)) + double(R * Nm) + double(ng * nk * nc2) +
+                       double(ns * nw * nk * nc2) + 2.0 * double(nt * nw) + 2.0 * double(nw * np) + 2.0 * double(np * ng * nt);
+    const double per_a = double(nk) * (2.0 * double(nc2 * nc2) + double(ng * nc2));
+    return 16.0 * (acc + blk + per_a) + 64.0e6;
+  }
+  double ue_dressed_bytes(long ng, long np, long nk, long nc, long nout, long R) {
+    const long nc2 = nc * nc, D = nk * nc2;
+    const double W = double(D) * double(R);
+    return 16.0 * (double(4 * ng * np) + 4.0 * double(ng * nk * nc2) + double(D * nout) * 3.0 + W * (2.0 * ng + 3.0 * ng + 1.0));
+  }
+
+  unit_engine *ue_create(ue_config const &c_in, double free_bytes, char *why, long why_len) {
+    // the budget: 90 % of the free memory minus the bytes the caller keeps for the later device stages (rung builds, Sigma
+    // deposits, dressed legs). Candidates in order: every rung resident (two-input pass if asked, then one input), then the
+    // partial residencies (the most resident first) when a source for the non-resident rungs exists (device rebuild with the
+    // device rung builds, or a pinned-host copy); an explicit nres only tries that residency.
+    ue_config c = c_in;
+    const double avail = 0.9 * free_bytes - std::max(0.0, c_in.reserve_bytes);
+    const bool can_rebuild = (c_in.partial_ok != 0) and c_in.nonres_src != 2 and c_in.nonres_src != 3;
+    const bool can_copy = (c_in.nonres_src == 0 or c_in.nonres_src == 2);
+    const bool partial_allowed = (c_in.nonres_src != 3) and (can_rebuild or can_copy);
+    std::vector<std::pair<long, int>> cand;
+    auto add = [&](long n) {
+      if (c_in.rung_fuse) cand.push_back({n, 1});
+      cand.push_back({n, 0});
+    };
+    if (c_in.stream) cand.push_back({0l, 0});           // stream mode: no rung residency, no packed pass
+    else if (c_in.nres >= 0) add(std::min(c_in.nres, c_in.ndist));
+    else {
+      add(c_in.ndist);
+      if (partial_allowed) for (long n = c_in.ndist - 1; n >= 0; --n) add(n);
+    }
+    bool found = false;
+    for (auto const &[n, f] : cand) {
+      if (not c_in.stream and n < c_in.ndist and not partial_allowed) continue;
+      c.nres = n; c.rung_fuse = f;
+      if (ue_bytes(c) <= avail) { found = true; break; }
+    }
+    if (not found) {
+      c.nres = (c_in.nres < 0) ? c_in.ndist : std::min(c_in.nres, c_in.ndist); c.rung_fuse = 0;
+      std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB available (%.1f GB free, %.1f GB reserved)%s",
+                    ue_bytes(c) / 1e9, avail / 1e9, free_bytes / 1e9, c_in.reserve_bytes / 1e9,
+                    partial_allowed ? " even with the least rung residency"
+                                    : "; a partial rung residency is not allowed by pol_vertex_dyn_device_memory = resident");
       return nullptr;
     }
     auto *e = new unit_engine;
     e->c = c;
+    e->stream = (c.stream != 0);
+    if (e->stream) { c.ndist = 0; c.nres = 0; c.rung_fuse = 0; e->c = c; }
+    e->nres = c.nres;
+    e->fuse = (c.rung_fuse != 0);
     e->nc2 = c.nc * c.nc;
     e->D = c.nk * e->nc2;
     const size_t D = size_t(e->D), W = D * size_t(c.nR_max), np = size_t(c.np), nt = size_t(c.nt);
@@ -1493,8 +1655,35 @@ namespace methods::solvers::dynbse_cuda {
     e->KF = dalloc<cd>(nt * np, "ue KF"); e->KF2 = dalloc<cd>(nt * np, "ue KF2");
     e->Ut = dalloc<cd>(size_t(c.n_kept) * nt, "ue Ut"); e->Vs = dalloc<cd>(size_t(c.np_fit) * size_t(c.n_kept), "ue Vs");
     e->Kmat = dalloc<cd>(nt * size_t(c.np_fit), "ue Kc");
-    e->Ks = dalloc<cd>(D * D, "ue Ks"); e->Kd0 = dalloc<cd>(D * D, "ue Kd0");
-    e->Kds = dalloc<cd>(size_t(c.ndist) * D * D, "ue Kds");
+    e->Ks = dalloc<cd>(D * D, "ue Ks"); e->Kd0 = dalloc<cd>(e->stream ? 1 : D * D, "ue Kd0");
+    e->Kds = dalloc<cd>(e->stream ? 1 : size_t(std::max(e->nres, 1l)) * D * D, "ue Kds");
+    const long nnr = e->stream ? 0 : c.ndist - e->nres;
+    if (nnr > 0) {
+      for (int bb = 0; bb < 2; ++bb) {
+        e->stage[bb] = dalloc<cd>(D * D, "ue K staging");
+        cu_check(cudaEventCreateWithFlags(&e->ev_ready[bb], cudaEventDisableTiming), "ue ev");
+        cu_check(cudaEventCreateWithFlags(&e->ev_free[bb], cudaEventDisableTiming), "ue ev");
+        cu_check(cudaEventRecord(e->ev_free[bb], 0), "ue ev free");
+      }
+      cu_check(cudaStreamCreateWithFlags(&e->cps, cudaStreamNonBlocking), "ue copy stream");
+      cu_check(cudaEventCreate(&e->ev_t0), "ue ev t0"); cu_check(cudaEventCreate(&e->ev_t1), "ue ev t1");
+      const bool can_copy_e = (c.nonres_src == 0 or c.nonres_src == 2 or (c.partial_ok == 0));
+      if (can_copy_e) {
+        e->nhost_cap = nnr;
+        cu_check(cudaMallocHost(&e->Kds_host, size_t(nnr) * D * D * sizeof(cd)), "ue K (pinned host slots)");
+        // the H2D bandwidth for the source planner: one staging-buffer copy, timed
+        const double tb = wnow();
+        cu_check(cudaMemcpy(e->stage[0], e->Kds_host, D * D * sizeof(cd), cudaMemcpyHostToDevice), "ue bw probe");
+        e->t_copy_est = std::max(1.0e-6, wnow() - tb);
+      }
+      e->src_host.assign(size_t(nnr), (c.partial_ok == 0 or c.nonres_src == 2) ? 1 : 0);
+    }
+    if (not e->stream) {
+      e->ncol_max = (e->fuse ? 4 : 2) * c.nR_max;
+      e->Fbig = dalloc<cd>(size_t(e->ncol_max) * nt * D, "ue Fbig"); e->Ybig = dalloc<cd>(size_t(e->ncol_max) * nt * D, "ue Ybig");
+      e->dslot = dalloc<long>(nt, "ue slot_of");
+    }
+    if (e->fuse) { e->yfam1 = dalloc<cd>(2 * np * W, "ue yfam1"); e->ycst1 = dalloc<cd>(W, "ue ycst1"); }
     e->Cbk = dalloc<cd>(size_t(c.nk) * e->nc2 * e->nc2, "ue Cbk"); e->M = dalloc<cd>(D * D, "ue M");
     e->ipiv = dalloc<int>(D, "ue ipiv"); e->dinfo = dalloc<int>(1, "ue info");
     if (cusolverDnZgetrf_bufferSize(e->cs, int(D), int(D), e->M, int(D), &e->lwork) != CUSOLVER_STATUS_SUCCESS)
@@ -1512,7 +1701,14 @@ namespace methods::solvers::dynbse_cuda {
     e->red = dalloc<unsigned long long>(2, "ue red");
     size_t fr = 0, tot = 0;
     cu_check(cudaMemGetInfo(&fr, &tot), "ue memgetinfo");
-    e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, double(fr), c.l0_fused != 0, c.l0_asm_gemm != 0, c.l0_fused == 2);
+    // size the resident L0 k-batch from what is left AFTER the bytes kept for the later device stages (rung builds,
+    // Sigma deposits, dressed legs: c.reserve_bytes, computed by the caller)
+    const double l0_room = std::max(0.0, double(fr) - c.reserve_bytes);
+    e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, l0_room, c.l0_fused != 0, c.l0_asm_gemm != 0, c.l0_fused == 2);
+    {
+      const size_t used = std::strlen(why);
+      std::snprintf(why + used, size_t(why_len) - used, "%sresident L0 k-batch K = %ld of %ld", used ? "; " : "", e->l0->K, long(c.nk));
+    }
     e->l0->fz_cfg = c.l0_fz_cfg;
     e->l0->fz_bench = (c.l0_fz_bench != 0);
     return e;
@@ -1529,12 +1725,24 @@ namespace methods::solvers::dynbse_cuda {
                     (void *)e->yfam, (void *)e->ycst, (void *)e->Dblk, (void *)e->Y, (void *)e->csb, (void *)e->cbb, (void *)e->Fs,
                     (void *)e->Ys, (void *)e->g, (void *)e->coef, (void *)e->rec, (void *)e->pA, (void *)e->pB, (void *)e->pC,
                     (void *)e->flags, (void *)e->red, (void *)e->Gs0, (void *)e->Gr1, (void *)e->Dcj, (void *)e->CbD, (void *)e->Vr,
-                    (void *)e->Pr})
+                    (void *)e->Pr, (void *)e->yfam1, (void *)e->ycst1, (void *)e->Fbig, (void *)e->Ybig, (void *)e->dslot})
       if (p) (void)cudaFree(p);
     for (void *p : e->sd.allocs)
       if (p) (void)cudaFree(p);
     for (void *p : e->kb.allocs)
       if (p) (void)cudaFree(p);
+    for (void *p : e->dr.allocs)
+      if (p) (void)cudaFree(p);
+    if (e->ctr) (void)cudaFree(e->ctr);
+    if (e->Kds_host) (void)cudaFreeHost(e->Kds_host);
+    for (int b = 0; b < 2; ++b) {
+      if (e->stage[b]) (void)cudaFree(e->stage[b]);
+      if (e->ev_ready[b]) (void)cudaEventDestroy(e->ev_ready[b]);
+      if (e->ev_free[b]) (void)cudaEventDestroy(e->ev_free[b]);
+    }
+    if (e->cps) (void)cudaStreamDestroy(e->cps);
+    if (e->ev_t0) (void)cudaEventDestroy(e->ev_t0);
+    if (e->ev_t1) (void)cudaEventDestroy(e->ev_t1);
     delete e;
   }
 
@@ -1549,10 +1757,51 @@ namespace methods::solvers::dynbse_cuda {
     h2d_c(e->Ut, Uth, nk_ * nt, "ue Ut"); h2d_c(e->Vs, Vsh, npf * nk_, "ue Vs"); h2d_c(e->Kmat, Kch, nt * npf, "ue Kc");
   }
 
+  long ue_nres(unit_engine const *e) { return e->nres; }
+  bool ue_rung_fused(unit_engine const *e) { return e->fuse; }
+  void ue_rebuild_stats(unit_engine const *e, long *n, double *seconds) { *n = e->nrebuild; *seconds = e->t_rebuild; }
+  void ue_source_stats(unit_engine const *e, long *nhost_reps, long *ncopies, double *t_copy_est, double *t_rb_est) {
+    long nh = 0;
+    for (int v : e->src_host) nh += v;
+    *nhost_reps = nh; *ncopies = e->ncopy; *t_copy_est = e->t_copy_est; *t_rb_est = e->t_rb_est;
+  }
+  void ue_plan_inputs(unit_engine const *e, double *t_gemm_est, long *napp) { *t_gemm_est = e->t_gemm_est; *napp = e->napp_prev; }
+  void ue_plan_report(unit_engine const *e, char *buf, long len) {
+    std::string s;
+    for (size_t i = 0; i < e->cand.size(); ++i) {
+      long nh = 0;
+      for (int v : e->cand[i]) nh += v;
+      char one[96];
+      if (e->cand_n[i] > 0)
+        std::snprintf(one, sizeof(one), "%s%ld copied: %.1f ms per pass (%ld transfers)%s", i ? "; " : "", nh,
+                      1e3 * e->cand_sum[i] / double(e->cand_n[i]), e->cand_n[i], long(i) == e->cand_cur ? " [in use]" : "");
+      else
+        std::snprintf(one, sizeof(one), "%s%ld copied: not timed%s", i ? "; " : "", nh, long(i) == e->cand_cur ? " [in use]" : "");
+      s += one;
+    }
+    std::snprintf(buf, size_t(len), "%s", s.empty() ? "a single source" : s.c_str());
+  }
+  void ue_set_stream(unit_engine *e, rung_stream *rs) {
+    if (not e->stream) APP_ABORT(std::string(" ue_set_stream: the engine was not created in stream mode."));
+    e->rs = rs;
+  }
+
   void ue_set_rung(unit_engine *e, cplx const *Ksh, cplx const *Kdsh, cplx const *Kd0h, long const *treph, cplx scale_k) {
     const size_t D = size_t(e->D);
-    h2d_c(e->Ks, Ksh, D * D, "ue Ks"); h2d_c(e->Kd0, Kd0h, D * D, "ue Kd0");
-    h2d_c(e->Kds, Kdsh, size_t(e->c.ndist) * D * D, "ue Kds");
+    h2d_c(e->Ks, Ksh, D * D, "ue Ks");
+    if (not e->stream) {                                     // stream mode: Kds / Kd0 are the caller's empty arrays
+      h2d_c(e->Kd0, Kd0h, D * D, "ue Kd0");
+      h2d_c(e->Kds, Kdsh, size_t(e->nres) * D * D, "ue Kds (resident)");
+      // host-built rungs: the non-resident ones are copied per application (no device rebuild without the W tables)
+      const long nnr = e->c.ndist - e->nres;
+      if (nnr > 0) {
+        if (e->Kds_host == nullptr)
+          APP_ABORT(std::string(" ue_set_rung: host-built rungs with a partial residency need the pinned-host source (no device "
+                                "rung builds to rebuild them) -- ABORTING."));
+        std::memcpy(e->Kds_host, Kdsh + size_t(e->nres) * D * D, size_t(nnr) * D * D * sizeof(cd));
+        e->src_host.assign(size_t(nnr), 1);
+      }
+    }
     e->trep.assign(treph, treph + e->c.nt);
     e->scale = make_cuDoubleComplex(scale_k.real(), scale_k.imag());
     e->unit_ok = false;
@@ -1581,7 +1830,7 @@ namespace methods::solvers::dynbse_cuda {
   }
 
   namespace {
-    // the active component list of an L0 input (the host kernels' P-3a scan): flags over (cst, fam) on the device, the
+    // the active component list of an L0 input (the host kernels' active-component scan): flags over (cst, fam) on the device, the
     // list on the host. nu0: component 1 + a is the FOLDED family (fam0 or fam1 of node a non-zero).
     long ue_active(unit_engine *e, long nR, cd const *cst, cd const *fam, std::vector<long> &act) {
       const long np = e->c.np, n = e->D * nR, ncomp = (fam == nullptr) ? 1 : 1 + 2 * np;
@@ -1607,7 +1856,7 @@ namespace methods::solvers::dynbse_cuda {
                                           X, int(nR), (long long)(nc2 * nR), e->Cbk, int(nc2), (long long)(nc2 * nc2), &beta,
                                           out, int(nR), (long long)(nc2 * nR), int(nk)), "ue Cb . X");
     }
-    // L0 of (fam, cst) into (F, Fs), then the constant part's frequency sum through Cb (the production Cb_cst route)
+    // L0 of (fam, cst) into (F, Fs), then the constant part's frequency sum through Cb (the host's Cb_cst route)
     void ue_l0(unit_engine *e, long nR, cd const *fam, cd const *cst, cd *F, cd *Fs, double *tl0) {
       std::vector<long> act;
       const double t0 = wnow();
@@ -1627,6 +1876,11 @@ namespace methods::solvers::dynbse_cuda {
                 "ue transpose Fs");
       if (cusolverDnZgetrs(e->cs, CUBLAS_OP_T, int(D), int(nR), e->M, int(D), e->ipiv, e->Y, int(D), e->dinfo) != CUSOLVER_STATUS_SUCCESS)
         APP_ABORT(std::string(" ue_ts: cusolverDnZgetrs failed."));
+      {   // getrs' devInfo (an illegal argument is reported there, not in the status)
+        int info = 0;
+        cu_check(cudaMemcpy(&info, e->dinfo, sizeof(int), cudaMemcpyDeviceToHost), "ue_ts getrs info");
+        if (info != 0) APP_ABORT(" ue_ts: cusolverDnZgetrs devInfo = " + std::to_string(info) + " -- ABORTING.");
+      }
       cub_check(cublasZgemm(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(nR), int(D), int(D), &one, e->Y, int(D), e->Ks, int(D), &zero,
                             e->csb, int(nR)), "ue K_s z");
       ue_cb_times(e, nR, e->csb, e->cbb, false);
@@ -1635,12 +1889,178 @@ namespace methods::solvers::dynbse_cuda {
     }
     // y = K_d(Gamma, Gsum): the families to tau (DLR), the dense rung per tau node, the refit, the constant part. Returns the
     // worst refit error (the host's max over families of max|Ys - rec| / max|Ys|).
-    double ue_kd(unit_engine *e, long nR, cd const *Gfam, cd const *Gs, cd *yfam, cd *ycst, double *tim) {
+    void kb_build_tables(unit_engine *e, long const *ts, cd *const *Kts, long nts, cd sk);   // below, with the rung builds
+
+    // the slot order of the dense pass: the tau nodes grouped by representative (mirror pairs adjacent), first / cnt per rep
+    void rung_slots(unit_engine *e, std::vector<long> &slot_of, std::vector<long> &first, std::vector<long> &cnt) {
+      const long nt = e->c.nt, ndist = e->c.ndist;
+      slot_of.assign(size_t(nt), -1); first.assign(size_t(ndist), -1); cnt.assign(size_t(ndist), 0);
+      long ns = 0;
+      for (long r = 0; r < ndist; ++r)
+        for (long i = 0; i < nt; ++i)
+          if (e->trep[size_t(i)] == r) {
+            if (first[size_t(r)] < 0) first[size_t(r)] = ns;
+            ++cnt[size_t(r)];
+            slot_of[size_t(i)] = ns++;
+          }
+      if (ns != nt) APP_ABORT(std::string(" rung_slots: a tau node has no representative."));
+    }
+
+    // the dense rung over the packed columns: Ybig rows of rep r (its slots x ncol) = scale K_d(r) Fbig rows. Resident reps
+    // first (they overlap the first copies); then the non-resident ones in order, each through staging buffer j % 2, either
+    // copied from pinned host memory on the copy stream (prefetched two ahead) or rebuilt on the device from the W tables.
+    void ue_rung_dense(unit_engine *e, long ncol, std::vector<long> const &first, std::vector<long> const &cnt) {
+      const long D = e->D, nt = e->c.nt, ndist = e->c.ndist, ld = nt * ncol;
+      const size_t DD = size_t(D) * size_t(D);
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      auto gemm_rep = [&](long r, cd const *K) {
+        const long s0 = first[size_t(r)], ns = cnt[size_t(r)];
+        if (e->rung_pair) {                                 // one gemm per representative (both mirror nodes)
+          cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(ns * ncol), int(D), int(D), &e->scale, e->Fbig + s0 * ncol,
+                                int(ld), K, int(D), &zero, e->Ybig + s0 * ncol, int(ld)), "rung (rep)");
+        } else {
+          for (long sl = s0; sl < s0 + ns; ++sl)
+            cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(ncol), int(D), int(D), &e->scale, e->Fbig + sl * ncol,
+                                  int(ld), K, int(D), &zero, e->Ybig + sl * ncol, int(ld)), "rung (node)");
+        }
+      };
+      const long nnr = ndist - e->nres;
+      if (nnr <= 0) {
+        for (long r = 0; r < e->nres; ++r) gemm_rep(r, e->Kds + size_t(r) * DD);
+        return;
+      }
+      ++e->napp_cur;
+      const double tpass0 = wnow();
+      auto host = [&](long j) { return e->src_host[size_t(j)] != 0; };
+      auto issue_copy = [&](long j) {
+        const int b = int(j % 2);
+        cu_check(cudaStreamWaitEvent(e->cps, e->ev_free[b], 0), "copy wait free");
+        cu_check(cudaMemcpyAsync(e->stage[b], e->Kds_host + size_t(j) * DD, DD * sizeof(cd), cudaMemcpyHostToDevice, e->cps),
+                 "copy H2D");
+        cu_check(cudaEventRecord(e->ev_ready[b], e->cps), "copy ready");
+        ++e->ncopy;
+      };
+      for (long j = 0; j < std::min(nnr, 2l); ++j)
+        if (host(j)) issue_copy(j);
+      if (e->nres > 0) {                                    // the resident gemms (timed: the planner's per-rep gemm cost)
+        cu_check(cudaEventRecord(e->ev_t0, 0), "rung t0");
+        for (long r = 0; r < e->nres; ++r) gemm_rep(r, e->Kds + size_t(r) * DD);
+        cu_check(cudaEventRecord(e->ev_t1, 0), "rung t1");
+      }
+      for (long j = 0; j < nnr; ++j) {
+        const int b = int(j % 2);
+        const long r = e->nres + j;
+        if (host(j)) {
+          cu_check(cudaStreamWaitEvent(0, e->ev_ready[b], 0), "wait copy");
+        } else {
+          if (not e->kb.on) APP_ABORT(std::string(" ue_rung_dense: a rebuilt rung needs the device rung builds."));
+          cu_check(cudaStreamSynchronize(0), "rebuild sync");
+          const double tb = wnow();
+          cd *K = e->stage[b];
+          kb_build_tables(e, &r, &K, 1, one);
+          cu_check(cudaStreamSynchronize(0), "rebuild");
+          e->t_rebuild += wnow() - tb;
+          ++e->nrebuild;
+        }
+        gemm_rep(r, e->stage[b]);
+        cu_check(cudaEventRecord(e->ev_free[b], 0), "staging free");
+        if (j + 2 < nnr and host(j + 2)) issue_copy(j + 2);
+      }
+      cu_check(cudaDeviceSynchronize(), "rung pass");
+      e->t_pass_cur += wnow() - tpass0;
+      if (e->nrebuild > 0) e->t_rb_est = e->t_rebuild / double(e->nrebuild);
+      if (e->nres > 0) {
+        float ms = 0.0f;
+        cu_check(cudaEventSynchronize(e->ev_t1), "rung t1 sync");
+        cu_check(cudaEventElapsedTime(&ms, e->ev_t0, e->ev_t1), "rung gemm time");
+        e->t_gemm_est = 1.0e-3 * double(ms) / double(e->nres);
+      }
+    }
+
+    // THE RUNG PASS: nin inputs (1, or 2 = the one-bare-rung and the Gamma_1 input of a block), every frequency family, in one
+    // pass over the dense rungs -- each K_d(s_r) is read (or brought to the device) once for nin x nfam x nR packed columns and
+    // both mirror nodes; then the refit per (input, family) and the constant part per input. fe_out: the refit error per input.
+    void ue_kd_multi(unit_engine *e, long nR, long nin, cd const *const *Gfam, cd const *const *Gs, cd *const *yfam,
+                     cd *const *ycst, double *fe_out, double *tim);
+    double ue_kd_single(unit_engine *e, long nR, cd const *Gfam, cd const *Gs, cd *yfam, cd *ycst, double *tim);
+    void ue_kd_multi(unit_engine *e, long nR, long nin, cd const *const *Gfam, cd const *const *Gs, cd *const *yfam,
+                     cd *const *ycst, double *fe_out, double *tim) {
+      if (e->stream or e->rr > 0) {
+        for (long x = 0; x < nin; ++x) fe_out[x] = ue_kd_single(e, nR, Gfam[x], Gs[x], yfam[x], ycst[x], tim);
+        return;
+      }
+      const long D = e->D, np = e->c.np, nt = e->c.nt, nk_ = e->c.n_kept, W = D * nR;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      const cd mscale = make_cuDoubleComplex(-e->scale.x, -e->scale.y);
+      const long nfam = e->nu0 ? 1 : 2, ncol = nin * nfam * nR;
+      if (ncol > e->ncol_max) APP_ABORT(" ue_kd_multi: " + std::to_string(ncol) + " packed columns exceed the engine's " +
+                                        std::to_string(e->ncol_max) + ".");
+      std::vector<long> slot_of, first, cnt;
+      rung_slots(e, slot_of, first, cnt);
+      h2d(e->dslot, slot_of.data(), size_t(nt), "rung slot_of");
+      double t0 = wnow();
+      for (long x = 0; x < nin; ++x) {
+        cu_check(cudaMemsetAsync(yfam[x], 0, size_t(2 * np) * W * sizeof(cd), 0), "ue memset y");
+        for (long fam = 0; fam < nfam; ++fam) {
+          for (long ff = fam; ff < (e->nu0 ? 2 : fam + 1); ++ff) {
+            const cd beta = (ff == fam) ? zero : one;
+            cd const *KFx = (ff == 1 and e->nu0) ? e->KF2 : e->KF;
+            cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nt), int(np), &one, Gfam[x] + size_t(ff) * np * W, int(W),
+                                  KFx, int(np), &beta, e->Fs, int(W)), "ue Fs = KF fam");
+          }
+          pack_slots_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, ncol, (x * nfam + fam) * nR, e->dslot, e->Fs, e->Fbig);
+          launch_check("ue pack");
+        }
+      }
+      cu_check(cudaDeviceSynchronize(), "ue dlr");
+      tim[7] += wnow() - t0; t0 = wnow();
+      ue_rung_dense(e, ncol, first, cnt);
+      cu_check(cudaDeviceSynchronize(), "ue rung");
+      tim[2] += wnow() - t0;
+      for (long x = 0; x < nin; ++x) {
+        double fe = 0.0;
+        for (long fam = 0; fam < nfam; ++fam) {
+          t0 = wnow();
+          unpack_slots_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, ncol, (x * nfam + fam) * nR, e->dslot, e->Ybig, e->Ys);
+          launch_check("ue unpack");
+          // the refit: g^T = Ys^T Ut^T, c^T = g^T Vs^T, rec^T = c^T Kmat^T; err = max|Ys - rec| / max|Ys|
+          cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nk_), int(nt), &one, e->Ys, int(W), e->Ut, int(nt), &zero,
+                                e->g, int(W)), "ue g");
+          const long npf = e->c.np_fit;
+          cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(npf), int(nk_), &one, e->g, int(W), e->Vs, int(nk_), &zero,
+                                e->coef, int(W)), "ue coef");
+          cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nt), int(npf), &one, e->coef, int(W), e->Kmat, int(npf), &zero,
+                                e->rec, int(W)), "ue rec");
+          cu_check(cudaMemsetAsync(e->red, 0, 2 * sizeof(unsigned long long), 0), "ue red");
+          maxdiff_kernel<<<grid_red(nt * W), 256>>>(nt * W, e->Ys, e->rec, e->red);
+          launch_check("ue maxdiff");
+          unsigned long long rr[2] = {0, 0};
+          cu_check(cudaMemcpy(rr, e->red, sizeof(rr), cudaMemcpyDeviceToHost), "ue red d2h");
+          const double num = meter_value(rr[0], "the rung output / its DLR refit"), den = meter_value(rr[1], "the rung output");
+          fe = std::max(fe, (den > 0.0) ? num / den : num);
+          cu_check(cudaMemcpy(yfam[x] + size_t(fam) * np * W, e->coef, size_t(npf) * W * sizeof(cd), cudaMemcpyDeviceToDevice),
+                   "ue scatter");
+          cu_check(cudaDeviceSynchronize(), "ue refit");
+          tim[3] += wnow() - t0;
+        }
+        fe_out[x] = fe;
+        t0 = wnow();
+        cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), int(D), &mscale, Gs[x], int(nR), e->Kd0, int(D), &zero,
+                              ycst[x], int(nR)), "ue y.cst");
+        cu_check(cudaDeviceSynchronize(), "ue kd0");
+        tim[2] += wnow() - t0;
+      }
+    }
+
+    // the rung of ONE input for the paths outside the packed dense pass: the frequency-factorized rung (rr > 0) and the
+    // streaming THC rung (stream mode); per family: the tau expansion, the rung, the refit; then the constant part
+    double ue_kd_single(unit_engine *e, long nR, cd const *Gfam, cd const *Gs, cd *yfam, cd *ycst, double *tim) {
       const long D = e->D, np = e->c.np, nt = e->c.nt, nk_ = e->c.n_kept, W = D * nR;
       const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
       const cd mscale = make_cuDoubleComplex(-e->scale.x, -e->scale.y);
       double fe = 0.0;
       cu_check(cudaMemsetAsync(yfam, 0, size_t(2 * np) * W * sizeof(cd), 0), "ue memset y");
+      if (not e->stream and e->rr <= 0) APP_ABORT(std::string(" ue_kd_single: only the factorized and the streaming rungs run here."));
       const long nfam = e->nu0 ? 1 : 2;
       for (long fam = 0; fam < nfam; ++fam) {
         double t0 = wnow();
@@ -1653,16 +2073,31 @@ namespace methods::solvers::dynbse_cuda {
         }
         cu_check(cudaDeviceSynchronize(), "ue dlr");
         tim[7] += wnow() - t0; t0 = wnow();
-        // the dense rung: Ys_i^T (nR x D) = scale Fs_i^T (nR x D) . K_d(rep_i)^T (D x D)
-        std::vector<cd *> hA(static_cast<size_t>(nt)), hB(static_cast<size_t>(nt)), hC(static_cast<size_t>(nt));
-        for (long i = 0; i < nt; ++i) {
-          hA[size_t(i)] = e->Fs + size_t(i) * W;
-          hB[size_t(i)] = e->Kds + size_t(e->trep[size_t(i)]) * size_t(D) * size_t(D);
-          hC[size_t(i)] = e->Ys + size_t(i) * W;
+        if (e->stream) {
+          // Ys_i (D, nR) = scale K[W_d(s_i)] Fs_i through the streaming rung (slot i = tau node i)
+          if (e->rs == nullptr) APP_ABORT(std::string(" ue_kd: stream mode without a rung_stream (ue_set_stream)."));
+          for (long i = 0; i < nt; ++i)
+            rs_apply_dev(e->rs, i, cplx(e->scale.x, e->scale.y), e->Fs + size_t(i) * W, e->Ys + size_t(i) * W, nR, nullptr);
+        } else {
+          // the frequency-factorized rung: P (D, nt, nR) = the tau slices in node order (P in rec), Y = sum_r K_r (c_r . P) into
+          // Fs, unpermuted into Ys
+          std::vector<long> slot_of(static_cast<size_t>(nt)), node_of(static_cast<size_t>(nt));
+          for (long i = 0; i < nt; ++i) { slot_of[size_t(i)] = i; node_of[size_t(i)] = i; }
+          long *dslot = reinterpret_cast<long *>(e->g), *dnode = dslot + nt;   // (the refit scratch g is free here)
+          h2d(dslot, slot_of.data(), size_t(nt), "rung slot_of"); h2d(dnode, node_of.data(), size_t(nt), "rung node_of");
+          rung_perm_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, dslot, e->Fs, e->rec, false);
+          launch_check("rung perm");
+          const long ld = nt * nR;
+          cu_check(cudaMemsetAsync(e->Fs, 0, size_t(nt) * W * sizeof(cd), 0), "rung zero");
+          for (long r = 0; r < e->rr; ++r) {
+            rung_cscale_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, e->rr, r, dnode, e->ctr, e->rec, e->Ys);
+            launch_check("rung cscale");
+            cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(ld), int(D), int(D), &e->scale, e->Ys, int(ld),
+                                  e->Kds + size_t(r) * size_t(D) * size_t(D), int(D), &one, e->Fs, int(ld)), "rung K_r");
+          }
+          rung_perm_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, dslot, e->Fs, e->Ys, true);
+          launch_check("rung unperm");
         }
-        h2d(e->pA, hA.data(), size_t(nt), "ue pA"); h2d(e->pB, hB.data(), size_t(nt), "ue pB"); h2d(e->pC, hC.data(), size_t(nt), "ue pC");
-        cub_check(cublasZgemmBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), int(D), &e->scale, (const cd **)e->pA, int(nR),
-                                     (const cd **)e->pB, int(D), &zero, e->pC, int(nR), int(nt)), "ue rung");
         cu_check(cudaDeviceSynchronize(), "ue rung");
         tim[2] += wnow() - t0; t0 = wnow();
         // the refit: g^T = Ys^T Ut^T, c^T = g^T Vs^T, rec^T = c^T Kmat^T; err = max|Ys - rec| / max|Ys|
@@ -1678,8 +2113,7 @@ namespace methods::solvers::dynbse_cuda {
         launch_check("ue maxdiff");
         unsigned long long r[2] = {0, 0};
         cu_check(cudaMemcpy(r, e->red, sizeof(r), cudaMemcpyDeviceToHost), "ue red d2h");
-        double num = 0.0, den = 0.0;
-        std::memcpy(&num, &r[0], sizeof(double)); std::memcpy(&den, &r[1], sizeof(double));
+        const double num = meter_value(r[0], "the rung output / its DLR refit"), den = meter_value(r[1], "the rung output");
         fe = std::max(fe, (den > 0.0) ? num / den : num);
         // the scatter: y.fam(fam, p < np_fit) = c(p): the same row-major layout, one copy
         cu_check(cudaMemcpy(yfam + size_t(fam) * np * W, e->coef, size_t(e->c.np_fit) * W * sizeof(cd), cudaMemcpyDeviceToDevice), "ue scatter");
@@ -1688,10 +2122,19 @@ namespace methods::solvers::dynbse_cuda {
       }
       // the constant part: y.cst = -scale K_d(0) Gsum
       const double t0 = wnow();
+      if (e->stream)
+        rs_apply_dev(e->rs, nt, cplx(mscale.x, mscale.y), Gs, ycst, nR, nullptr);   // slot nt = W_d0
+      else
       cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), int(D), &mscale, Gs, int(nR), e->Kd0, int(D), &zero,
                             ycst, int(nR)), "ue y.cst");
       cu_check(cudaDeviceSynchronize(), "ue kd0");
       tim[2] += wnow() - t0;
+      return fe;
+    }
+
+    double ue_kd(unit_engine *e, long nR, cd const *Gfam, cd const *Gs, cd *yfam, cd *ycst, double *tim) {
+      double fe = 0.0;
+      ue_kd_multi(e, nR, 1, &Gfam, &Gs, &yfam, &ycst, &fe, tim);
       return fe;
     }
   } // namespace
@@ -1730,13 +2173,64 @@ namespace methods::solvers::dynbse_cuda {
     h2d_c(e->Dblk, Dblkh, size_t(W), "ue Dblk");
     e->cbd_ok = false;
     tim[5] += wnow() - t0;
+    if (e->fuse) {
+      // THE FUSED FLOW (larger spaces): ls_apply(D) first, then ONE rung pass for the one-bare-rung input (F, Fsum of L0 D)
+      // and the Gamma_1 input (Gamma, Gsum) -- the same operations as below, in another order (the one-rung input and its
+      // second L0 only read / write scratch the Gamma_1 path does not use until after the rung)
+      ue_l0(e, nR, nullptr, e->Dblk, e->Ffam, e->Fsum, &tim[0]);
+      e->r1_ok = want_r1;
+      ue_ts(e, nR, e->Fsum, &tim[1]);
+      ue_l0(e, nR, nullptr, e->csb, e->F2fam, e->F2sum, &tim[0]);
+      t0 = wnow();
+      add2_kernel<<<grid_for(2 * np * W), 256>>>(2 * np * W, e->Ffam, e->F2fam, e->Gfam);
+      add2_kernel<<<grid_for(W), 256>>>(W, e->Fsum, e->cbb, e->Gsum);
+      launch_check("ue gamma");
+      cu_check(cudaDeviceSynchronize(), "ue gamma");
+      cu_check(cudaMemcpy(e->Gs0, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToDevice), "ue Gs0");
+      tim[4] += wnow() - t0; t0 = wnow();
+      if (Gsum0h != nullptr) cu_check(cudaMemcpy(Gsum0h, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum0");
+      tim[6] += wnow() - t0;
+      cd const *gin[2]; cd const *sin[2]; cd *yo[2]; cd *co[2];
+      long nin = 0;
+      if (want_r1) { gin[nin] = e->Ffam; sin[nin] = e->Fsum; yo[nin] = e->yfam1; co[nin] = e->ycst1; ++nin; }
+      const long ig = nin;
+      gin[nin] = e->Gfam; sin[nin] = e->Gsum; yo[nin] = e->yfam; co[nin] = e->ycst; ++nin;
+      double fes[2] = {0.0, 0.0};
+      ue_kd_multi(e, nR, nin, gin, sin, yo, co, fes, tim);
+      if (want_r1) {                                      // Gsum_r1 = Fsum[L0(y_r1; D + y_r1.cst)]
+        t0 = wnow();
+        add2_kernel<<<grid_for(W), 256>>>(W, e->Dblk, e->ycst1, e->Xcst);
+        launch_check("ue r1 X.cst");
+        cu_check(cudaDeviceSynchronize(), "ue r1 xcst");
+        tim[4] += wnow() - t0;
+        ue_l0(e, nR, e->yfam1, e->Xcst, e->F2fam, e->F2sum, &tim[0]);
+        cu_check(cudaMemcpy(e->Gr1, e->F2sum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToDevice), "ue Gr1");
+      }
+      t0 = wnow();
+      add2_kernel<<<grid_for(W), 256>>>(W, e->Dblk, e->ycst, e->Xcst);
+      launch_check("ue X.cst");
+      cu_check(cudaDeviceSynchronize(), "ue xcst");
+      tim[4] += wnow() - t0;
+      ue_l0(e, nR, e->yfam, e->Xcst, e->Ffam, e->Fsum, &tim[0]);
+      ue_ts(e, nR, e->Fsum, &tim[1]);
+      t0 = wnow();
+      add2_kernel<<<grid_for(W), 256>>>(W, e->Fsum, e->cbb, e->Gsum);
+      launch_check("ue gsum1");
+      cu_check(cudaDeviceSynchronize(), "ue gsum1");
+      tim[4] += wnow() - t0; t0 = wnow();
+      if (Gsum1h != nullptr) cu_check(cudaMemcpy(Gsum1h, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum1");
+      if (y1famh != nullptr) cu_check(cudaMemcpy(y1famh, e->yfam, size_t(2 * np) * W * sizeof(cd), cudaMemcpyDeviceToHost), "ue y1 fam");
+      if (y1csth != nullptr) cu_check(cudaMemcpy(y1csth, e->ycst, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue y1 cst");
+      tim[6] += wnow() - t0;
+      return fes[ig];
+    }
     // ---- ls_apply(D, y = 0): F = L0 D, c = T_s Fsum, Gamma = F + L0 c, Gsum = Fsum + Cb c
     ue_l0(e, nR, nullptr, e->Dblk, e->Ffam, e->Fsum, &tim[0]);
     e->r1_ok = want_r1;
     if (want_r1) {
       // the ONE BARE dynamic rung (T_s = 0, one application): y_r1 = K_d(F, Fsum) of L0 D, Gsum_r1 = Fsum[L0(y_r1; D + y_r1.cst)].
       // F / Fsum are only read; y and F2 are scratch here (both are rewritten below). Its refit error is not reported (the
-      // host pass's meter was discarded too).
+      // host pass discards that meter as well).
       (void)ue_kd(e, nR, e->Ffam, e->Fsum, e->yfam, e->ycst, tim);
       t0 = wnow();
       add2_kernel<<<grid_for(W), 256>>>(W, e->Dblk, e->ycst, e->Xcst);
@@ -1781,7 +2275,7 @@ namespace methods::solvers::dynbse_cuda {
   }
 
   // =====================================================================================================================
-  // D-3: the Sigma deposits on the device (l0_cuda.cuh). Row-major host layouts throughout; cuBLAS sees their column-major
+  // The Sigma deposits on the device (l0_cuda.cuh). Row-major host layouts throughout; cuBLAS sees their column-major
   // transposes. Index conventions (D = nk nc2, W = D nR, row = k nc2 + x nc + y):
   //   Acst / DW (D, nR); DWp (nk, i, c, nR) = DW(k; c nc + i, r); Aw (nw_f, D, nR); Fw / Ft (nw_f | nt, nk, y, c, nR)
   //   Y (a, k) col-major (nc2 x nc2): Y(c i, x j); Ym (a, k) col-major: Ym(i j, c x); Mb (a, k, j, q = i nc + j)
@@ -1813,23 +2307,21 @@ namespace methods::solvers::dynbse_cuda {
         Ym[e] = Y[b * nc4 + (c * nc + i) + (x * nc + j) * nc2];
       }
     }
-    double bits_to_double(unsigned long long u) { double d = 0.0; std::memcpy(&d, &u, sizeof(d)); return d; }
+    double bits_to_double(unsigned long long u) { return meter_value(u, "the device Sigma deposit meters"); }
   } // namespace
 
   bool ue_sd_init(unit_engine *e, sd_config const &c, cplx const *Ttwh, cplx const *Uwh, cplx const *Gwh, double const *eps,
                   double const *epsG, double free_bytes, char *why, long why_len) {
     auto &s = e->sd;
     if (c.nk != e->c.nk or c.nc != e->c.nc or c.np != e->c.np or c.nt != e->c.nt or c.ng != e->c.ng) {
+      APP_ABORT(std::string(" ue_sd_init: the Sigma deposit sizes differ from the engine's (internal inconsistency) -- ABORTING."));
       std::snprintf(why, size_t(why_len), "the deposit sizes differ from the engine's");
       return false;
     }
     const long nt = c.nt, nw = c.nw_f, ns = c.ns, nk = c.nk, nc2 = e->nc2, np = c.np, ng = c.ng, Nm = c.Nm, D = e->D, R = e->c.nR_max;
-    const double W = double(D) * double(R);
-    const double acc = double(nt * ns * nk * nc2) * (1.0 + 2.0 * double(np));
-    const double blk = W * (3.0 + 2.0 * double(nw) + double(nt)) + double(R * Nm) + double(ng * nk * nc2) +
-                       double(ns * nw * nk * nc2) + 2.0 * double(nt * nw) + 2.0 * double(nw * np) + 2.0 * double(np * ng * nt);
+    (void)nt; (void)nw; (void)ns; (void)Nm; (void)D; (void)R;
     const double per_a = double(nk) * (2.0 * double(nc2 * nc2) + double(ng * nc2));
-    const double need = 16.0 * (acc + blk + per_a) + 64.0e6;
+    const double need = ue_sd_bytes(c, e->c.nR_max);
     if (need > 0.9 * free_bytes) {
       std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB free", need / 1e9, free_bytes / 1e9);
       return false;
@@ -1981,7 +2473,7 @@ namespace methods::solvers::dynbse_cuda {
           for (long j = 0; j < ng; ++j)
             if (std::abs(s.eps[size_t(a)] - s.epsG[size_t(j)]) <= 1e-10)
               APP_ABORT(std::string(" sigma_dyn_accumulate (device): confluent U_j T_a (e_a = e_j = ") + std::to_string(s.eps[size_t(a)]) +
-                        ") is not supported (R1).");
+                        ") is not supported.");
         }
       for (long a0 = 0; a0 < a_hi; a0 += s.AC) {
         const long na = std::min(s.AC, a_hi - a0), nb = na * nk;
@@ -2069,7 +2561,7 @@ namespace methods::solvers::dynbse_cuda {
 
 
   // =====================================================================================================================
-  // D-1b: the rung builds (l0_cuda.cuh). b = (k - k0) nk + k' over a chunk of k; U1 / U2 / WU2 (b, Nm, nc2) and wb (b, nc2, nc2)
+  // The rung builds (l0_cuda.cuh). b = (k - k0) nk + k' over a chunk of k; U1 / U2 / WU2 (b, Nm, nc2) and wb (b, nc2, nc2)
   // row-major; X is the spin slice (nk, Nm, nc).
   // =====================================================================================================================
   namespace {
@@ -2102,8 +2594,8 @@ namespace methods::solvers::dynbse_cuda {
       const long tot = D * D;
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
         const long i = e / D, j = e % D;
-        num = fmax(num, cuCabs(K[e] - cuConj(K[j * D + i])));
-        den = fmax(den, cuCabs(K[e]));
+        num = fmax(num, nan_inf(cuCabs(K[e] - cuConj(K[j * D + i]))));
+        den = fmax(den, nan_inf(cuCabs(K[e])));
       }
       num = block_max(num);
       den = block_max(den);
@@ -2119,16 +2611,20 @@ namespace methods::solvers::dynbse_cuda {
     auto &k = e->kb;
     const long nk = e->c.nk, nc2 = e->nc2;
     if (nrep != e->c.ndist) {
+      APP_ABORT(" ue_kb_init: rep count " + std::to_string(nrep) + " differs from the engine's ndist " + std::to_string(e->c.ndist) +
+                " (internal inconsistency) -- ABORTING.");
       std::snprintf(why, size_t(why_len), "rep count %ld differs from the engine's ndist %ld", nrep, e->c.ndist);
       return false;
     }
-    const double tables = double(ns * nk * Nm * e->c.nc) + double(nq * Nm * Nm) * (2.0 + double(nrep));
     const double per_k = double(nk) * (3.0 * double(Nm * nc2) + double(nc2 * nc2));
-    const double need = 16.0 * (tables + per_k) + 64.0e6;
+    const double need = ue_kb_bytes(ns, nq, Nm, nk, e->c.nc, nrep);
     if (need > 0.9 * free_bytes) {
       std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB free", need / 1e9, free_bytes / 1e9);
       return false;
     }
+    for (long v = 0; v < nk * nk; ++v)   // an invariant, checked before any allocation
+      if (qx_of[v] < 0 or qx_of[v] >= nq)
+        APP_ABORT(" ue_kb_init: transfer index " + std::to_string(qx_of[v]) + " out of range [0, " + std::to_string(nq) + ") -- ABORTING.");
     k.ns = ns; k.nq = nq; k.Nm = Nm; k.nrep = nrep;
     k.KC = long(std::min<double>(double(nk), std::max(1.0, std::floor(std::min(0.5 * (0.9 * free_bytes - need), 4.0e9) / (16.0 * per_k)))));
     auto al = [&](size_t n, char const *what) { cd *p = dalloc<cd>(n, what); k.allocs.push_back(p); return p; };
@@ -2146,46 +2642,179 @@ namespace methods::solvers::dynbse_cuda {
     h2d_c(k.W0, W0h, size_t(nq * Nm * Nm), "kb W0"); h2d_c(k.Wd0, Wd0h, size_t(nq * Nm * Nm), "kb Wd0");
     h2d_c(k.Wds, Wdsh, size_t(nrep * nq * Nm * Nm), "kb Wds");
     k.qx.assign(qx_of, qx_of + nk * nk);
-    for (long v : k.qx)
-      if (v < 0 or v >= nq) { std::snprintf(why, size_t(why_len), "qx_of out of range"); return false; }
     k.on = true;
     return true;
   }
+
+  namespace {
+    // the rung tables ts (-2: K_s (x sk), -1: K_d0, r >= 0: K_d(s_r)) of the transfer set by ue_kb_build, into Kts
+    void kb_build_tables(unit_engine *e, long const *ts, cd *const *Kts, long nts, cd sk) {
+      auto &k = e->kb;
+      const long nk = e->c.nk, nc = e->c.nc, nc2 = e->nc2, Nm = k.Nm;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      cd const *Xs = k.X + size_t(k.is) * nk * Nm * nc;
+      for (long ik0 = 0; ik0 < nk; ik0 += k.KC) {
+        const long nki = std::min(k.KC, nk - ik0), nb = nki * nk;
+        if (k.legs_ik0 != ik0) {                           // the legs of this k chunk (kept while one chunk covers the mesh)
+          kb_legs_kernel<<<grid_for(nb * Nm * nc2), 256>>>(ik0, nki, nk, Nm, nc, Xs, k.kq, k.U1, k.U2);
+          launch_check("kb legs");
+          k.legs_ik0 = ik0;
+        }
+        // the W tables of this transfer: W0 -> K_s (x scale_k), Wd0 -> K_d0, Wd(rep r) -> K_d(r)
+        for (long it = 0; it < nts; ++it) {
+          const long t = ts[it];
+          cd const *Wt = (t == -2) ? k.W0 : ((t == -1) ? k.Wd0 : k.Wds + size_t(t) * k.nq * Nm * Nm);
+          cd *Kt = Kts[it];
+          for (long b = 0; b < nb; ++b) {
+            const long ik = ik0 + b / nk, ikp = b % nk;
+            k.hA[size_t(b)] = k.U2 + size_t(b) * Nm * nc2;
+            k.hB[size_t(b)] = const_cast<cd *>(Wt) + size_t(k.qx[size_t(ik * nk + ikp)]) * Nm * Nm;
+            k.hC[size_t(b)] = k.WU2 + size_t(b) * Nm * nc2;
+          }
+          h2d(k.pA, k.hA.data(), size_t(nb), "kb pA"); h2d(k.pB, k.hB.data(), size_t(nb), "kb pB"); h2d(k.pC, k.hC.data(), size_t(nb), "kb pC");
+          // WU2 = W(qx) U2: column-major (nc2 x Nm) = U2^T-view (nc2 x Nm) . W^T-view (Nm x Nm)
+          cub_check(cublasZgemmBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nc2), int(Nm), int(Nm), &one, (const cd **)k.pA, int(nc2),
+                                       (const cd **)k.pB, int(Nm), &zero, k.pC, int(nc2), int(nb)), "kb W U2");
+          // wb = U1^T WU2: column-major (nc2 x nc2) = WU2-view (nc2 x Nm) . U1-view^T (Nm x nc2)
+          cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_T, int(nc2), int(nc2), int(Nm), &one, k.WU2, int(nc2),
+                                              (long long)(Nm * nc2), k.U1, int(nc2), (long long)(Nm * nc2), &zero, k.wb, int(nc2),
+                                              (long long)(nc2 * nc2), int(nb)), "kb U1^T W U2");
+          kb_scatter_kernel<<<grid_for(nb * nc2 * nc2), 256>>>(ik0, nki, nk, nc, (t == -2) ? sk : one, k.wb, Kt);
+          launch_check("kb scatter");
+        }
+      }
+    }
+  } // namespace
+
+  namespace {
+    // the copy / rebuild split of the non-resident rungs for the next transfer. A model ranks the splits (below); the
+    // planner then TIMES a few candidates -- the model's pick, all copied, all rebuilt, half copied -- one transfer each
+    // (the rung-pass wall time plus the build and D2H of the copied rungs, per pass) and keeps the fastest. The model alone
+    // misjudges the overlap on some devices; the timed choice needs no per-device tuning.
+    //
+    // The model simulates the rung pass of
+    // ue_rung_dense: the resident gemms run first while the copy stream prefetches the first two copied rungs; then rung j
+    // (staging buffer j % 2) either waits for its copy or is rebuilt on the compute stream (serialized with the gemms), and
+    // the copy of rung j + 2 starts once rung j's gemm has freed the buffer. Costs per rung: the gemm (timed on the resident
+    // rungs), the H2D copy (timed at creation) and the rebuild (timed). For every copied count nh two orders are simulated
+    // (copied rungs spread evenly, copied rungs first). The cost of a split is napp simulated passes (napp = the previous
+    // transfer's pass count) plus, once per transfer, the device build and the D2H copy of every copied rung.
+    // pol_vertex_dyn_device_memory picks the sources (auto: both; rebuild; host); host-built rungs (no device builds) are copied.
+    double ue_sim_pass(long nres, std::vector<int> const &src, double tg, double tc, double trb) {
+      const long nnr = long(src.size());
+      double T = double(nres) * tg, ce = 0.0;               // compute-stream time, copy-engine free time
+      std::vector<double> done(size_t(nnr), 0.0);
+      for (long j = 0; j < std::min(nnr, 2l); ++j)
+        if (src[size_t(j)]) { ce += tc; done[size_t(j)] = ce; }
+      for (long j = 0; j < nnr; ++j) {
+        T = src[size_t(j)] ? std::max(T, done[size_t(j)]) + tg : T + trb + tg;
+        if (j + 2 < nnr and src[size_t(j + 2)]) { ce = std::max(ce, T) + tc; done[size_t(j + 2)] = ce; }
+      }
+      return T;
+    }
+    void ue_plan_sources(unit_engine *e) {
+      const long nnr = e->c.ndist - e->nres;
+      if (nnr <= 0) return;
+      const bool can_rb = e->kb.on and e->c.nonres_src != 2;
+      const bool can_cp = (e->Kds_host != nullptr) and e->c.nonres_src != 1;
+      if (not can_rb and not can_cp) APP_ABORT(std::string(" ue_plan_sources: no source for the non-resident rungs -- ABORTING."));
+      // close the previous transfer: its split's timed cost per pass
+      if (e->cand_cur >= 0 and e->napp_cur > 0) {
+        e->cand_sum[size_t(e->cand_cur)] += (e->t_pass_cur + e->t_hb_cur) / double(e->napp_cur);
+        ++e->cand_n[size_t(e->cand_cur)];
+      }
+      if (e->napp_cur > 0) e->napp_prev = e->napp_cur;
+      e->napp_cur = 0; e->t_pass_cur = 0.0; e->t_hb_cur = 0.0;
+      if (not e->cand.empty()) {                           // the candidates are set: time the untimed ones, then keep the best
+        long pick = -1;
+        for (size_t i = 0; i < e->cand.size() and pick < 0; ++i)
+          if (e->cand_n[i] == 0) pick = long(i);
+        if (pick < 0) {
+          double best = 1e300;
+          for (size_t i = 0; i < e->cand.size(); ++i) {
+            const double c = e->cand_sum[i] / double(e->cand_n[i]);
+            if (c < best) { best = c; pick = long(i); }
+          }
+        }
+        e->cand_cur = pick;
+        e->src_host = e->cand[size_t(pick)];
+        return;
+      }
+      std::vector<int> best_src(size_t(nnr), can_cp ? 1 : 0);
+      if (can_rb and can_cp) {
+        const double nk = double(e->c.nk), nc2 = double(e->nc2), Nm = double(e->kb.Nm), D = double(e->D);
+        // before the first timings: flop counts at an assumed 10 TF/s (replaced by the timed costs afterwards)
+        if (e->t_rb_est <= 0.0) e->t_rb_est = nk * nk * 8.0 * (nc2 * Nm * Nm + nc2 * nc2 * Nm) / 1.0e13;
+        const double tg = (e->t_gemm_est > 0.0)
+            ? e->t_gemm_est : 8.0 * D * D * double(e->c.nt * e->c.nR_max) / double(std::max(e->c.ndist, 1l)) / 1.0e13;
+        const double napp = double(e->napp_prev > 0 ? e->napp_prev : 4);
+        double best = 1e300;
+        std::vector<int> src(static_cast<size_t>(nnr));
+        for (long h = 0; h <= std::min(nnr, e->nhost_cap); ++h)
+          for (int order = 0; order < 2; ++order) {
+            for (long jj = 0; jj < nnr; ++jj)
+              src[size_t(jj)] = (order == 0) ? (((jj + 1) * h / nnr > jj * h / nnr) ? 1 : 0) : (jj < h ? 1 : 0);
+            const double t = napp * ue_sim_pass(e->nres, src, tg, e->t_copy_est, e->t_rb_est) +
+                             double(h) * (e->t_rb_est + e->t_copy_est);
+            if (t < best * (1.0 - 1e-9)) { best = t; best_src = src; }
+          }
+      }
+      // the candidates: the model's pick first, then all copied, all rebuilt, half copied (those the sources allow)
+      e->cand.push_back(best_src);
+      if (can_rb and can_cp) {
+        const long hmax = std::min(nnr, e->nhost_cap);
+        for (long h : {hmax, 0l, hmax / 2}) {
+          std::vector<int> v(static_cast<size_t>(nnr), 0);
+          for (long jj = 0; jj < nnr; ++jj) v[size_t(jj)] = ((jj + 1) * h / nnr > jj * h / nnr) ? 1 : 0;
+          bool dup = false;
+          for (auto const &c : e->cand) dup = dup or (c == v);
+          if (not dup) e->cand.push_back(v);
+        }
+      }
+      e->cand_sum.assign(e->cand.size(), 0.0);
+      e->cand_n.assign(e->cand.size(), 0);
+      e->cand_cur = 0;
+      e->src_host = e->cand[0];
+    }
+  } // namespace
 
   void ue_kb_build(unit_engine *e, long is, long const *kpq_row, long const *trep, cplx scale_k, double *herm, double *timing) {
     auto &k = e->kb;
     if (not k.on) APP_ABORT(std::string(" ue_kb_build: the rung builds were not initialized."));
     const double t0 = wnow();
-    const long nk = e->c.nk, nc = e->c.nc, nc2 = e->nc2, Nm = k.Nm, D = e->D;
-    const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+    const long nk = e->c.nk, D = e->D;
     h2d(k.kq, kpq_row, size_t(nk), "kb kq");
-    cd const *Xs = k.X + size_t(is) * nk * Nm * nc;
+    k.is = is;
+    k.legs_ik0 = -1;
     const cd sk = make_cuDoubleComplex(scale_k.real(), scale_k.imag());
-    for (long ik0 = 0; ik0 < nk; ik0 += k.KC) {
-      const long nki = std::min(k.KC, nk - ik0), nb = nki * nk;
-      kb_legs_kernel<<<grid_for(nb * Nm * nc2), 256>>>(ik0, nki, nk, Nm, nc, Xs, k.kq, k.U1, k.U2);
-      launch_check("kb legs");
-      // the W tables of this transfer: W0 -> K_s (x scale_k), Wd0 -> K_d0, Wd(rep r) -> K_d(r)
-      for (long t = -2; t < k.nrep; ++t) {
-        cd const *Wt = (t == -2) ? k.W0 : ((t == -1) ? k.Wd0 : k.Wds + size_t(t) * k.nq * Nm * Nm);
-        cd *Kt = (t == -2) ? e->Ks : ((t == -1) ? e->Kd0 : e->Kds + size_t(t) * D * D);
-        for (long b = 0; b < nb; ++b) {
-          const long ik = ik0 + b / nk, ikp = b % nk;
-          k.hA[size_t(b)] = k.U2 + size_t(b) * Nm * nc2;
-          k.hB[size_t(b)] = const_cast<cd *>(Wt) + size_t(k.qx[size_t(ik * nk + ikp)]) * Nm * Nm;
-          k.hC[size_t(b)] = k.WU2 + size_t(b) * Nm * nc2;
-        }
-        h2d(k.pA, k.hA.data(), size_t(nb), "kb pA"); h2d(k.pB, k.hB.data(), size_t(nb), "kb pB"); h2d(k.pC, k.hC.data(), size_t(nb), "kb pC");
-        // WU2 = W(qx) U2: column-major (nc2 x Nm) = U2^T-view (nc2 x Nm) . W^T-view (Nm x Nm)
-        cub_check(cublasZgemmBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nc2), int(Nm), int(Nm), &one, (const cd **)k.pA, int(nc2),
-                                     (const cd **)k.pB, int(Nm), &zero, k.pC, int(nc2), int(nb)), "kb W U2");
-        // wb = U1^T WU2: column-major (nc2 x nc2) = WU2-view (nc2 x Nm) . U1-view^T (Nm x nc2)
-        cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_T, int(nc2), int(nc2), int(Nm), &one, k.WU2, int(nc2),
-                                            (long long)(Nm * nc2), k.U1, int(nc2), (long long)(Nm * nc2), &zero, k.wb, int(nc2),
-                                            (long long)(nc2 * nc2), int(nb)), "kb U1^T W U2");
-        kb_scatter_kernel<<<grid_for(nb * nc2 * nc2), 256>>>(ik0, nki, nk, nc, (t == -2) ? sk : one, k.wb, Kt);
-        launch_check("kb scatter");
+    // K_s, K_d0 and the RESIDENT K_d(s_r); the non-resident ones: the copy / rebuild split is planned for this transfer and the
+    // copied ones are built now (timed: the rebuild estimate) and stored in their pinned host slots
+    const cd one = make_cuDoubleComplex(1.0, 0.0);
+    std::vector<long> ts = {-2, -1};
+    std::vector<cd *> Kts = {e->Ks, e->Kd0};
+    if (e->stream) { ts.pop_back(); Kts.pop_back(); }        // stream mode: K_s only (the rung streams)
+    for (long r = 0; r < e->nres; ++r) { ts.push_back(r); Kts.push_back(e->Kds + size_t(r) * size_t(D) * size_t(D)); }
+    kb_build_tables(e, ts.data(), Kts.data(), long(ts.size()), sk);
+    const long nnr = e->stream ? 0 : e->c.ndist - e->nres;
+    if (nnr > 0) {
+      ue_plan_sources(e);                                   // closes the previous transfer's timing, picks this one's split
+      const size_t DD = size_t(D) * size_t(D);
+      const double thb0 = wnow();
+      double tb_sum = 0.0;
+      long nb = 0;
+      for (long jj = 0; jj < nnr; ++jj) {
+        if (not e->src_host[size_t(jj)]) continue;
+        const long r = e->nres + jj;
+        cd *K = e->stage[0];
+        cu_check(cudaDeviceSynchronize(), "kb host-rep sync");
+        const double tb = wnow();
+        kb_build_tables(e, &r, &K, 1, one);
+        cu_check(cudaDeviceSynchronize(), "kb host-rep build");
+        tb_sum += wnow() - tb; ++nb;
+        cu_check(cudaMemcpy(e->Kds_host + size_t(jj) * DD, e->stage[0], DD * sizeof(cd), cudaMemcpyDeviceToHost), "kb host rep D2H");
       }
+      if (nb > 0) e->t_rb_est = tb_sum / double(nb);
+      e->t_hb_cur = wnow() - thb0;
     }
     // the Sigma hook's |K_s - K_s^dag| meter
     cu_check(cudaMemsetAsync(e->red, 0, 2 * sizeof(unsigned long long), 0), "kb red");
@@ -2193,7 +2822,7 @@ namespace methods::solvers::dynbse_cuda {
     launch_check("kb herm");
     unsigned long long r[2] = {0, 0};
     cu_check(cudaMemcpy(r, e->red, sizeof(r), cudaMemcpyDeviceToHost), "kb herm d2h");
-    std::memcpy(&herm[0], &r[0], sizeof(double)); std::memcpy(&herm[1], &r[1], sizeof(double));
+    herm[0] = meter_value(r[0], "K_s (rung build)"); herm[1] = meter_value(r[1], "K_s (rung build)");
     e->trep.assign(trep, trep + e->c.nt);
     e->scale = sk;
     e->unit_ok = false;
@@ -2230,9 +2859,7 @@ namespace methods::solvers::dynbse_cuda {
     unsigned long long r = 0;
     cu_check(cudaMemcpy(&r, slot, sizeof(r), cudaMemcpyDeviceToHost), "dev_maxabs d2h");
     cu_check(cudaFree(slot), "dev_maxabs free");
-    double m = 0.0;
-    std::memcpy(&m, &r, sizeof(double));
-    return m;
+    return meter_value(r, "dev_maxabs");
   }
 
   void dev_add_rows(cplx *y, long ldy, cplx const *x, long ldx, long rows, long n) {
@@ -2306,7 +2933,7 @@ namespace methods::solvers::dynbse_cuda {
       fin_scale_kf_kernel<<<grid_for(nt * nb), 256>>>(nt, nsk, np, nc2, dKF, dE);
       launch_check("fin E");
       // ec (npf x nb) = Vs (npf x nkept) . [Ut (nkept x nt) . E (nt x nb)]: the fit's two factors applied in turn, as on the
-      // host -- the explicit product Vs Ut carries rounding ~eps / s_min whatever the data (p1gpu_n3s: E_corr moved 2.6e-8)
+      // host -- the explicit product Vs Ut carries rounding ~eps / s_min whatever the data
       cd *dU = upload_c(Ut, size_t(nkept * nt), "fin Ut");
       cd *dV = upload_c(Vs, size_t(npf * nkept), "fin Vs");
       cd *dg = dalloc<cd>(size_t(nkept * nb), "fin g");
@@ -2329,9 +2956,7 @@ namespace methods::solvers::dynbse_cuda {
       launch_check("fin fit error");
       unsigned long long r[2] = {0, 0};
       cu_check(cudaMemcpy(r, red, sizeof(r), cudaMemcpyDeviceToHost), "fin red d2h");
-      double num = 0.0, den = 0.0;
-      std::memcpy(&num, &r[0], sizeof(double));
-      std::memcpy(&den, &r[1], sizeof(double));
+      const double num = meter_value(r[0], "the Sigma finish fit"), den = meter_value(r[1], "the Sigma finish fit");
       *fit_err = (den > 0.0) ? num / den : num;
       cu_check(cudaFree(red), "fin free red");
       cu_check(cudaFree(drec), "fin free rec");
@@ -2363,5 +2988,216 @@ namespace methods::solvers::dynbse_cuda {
     cub_check(cublasDestroy(h), "fin handle destroy");
   }
 
+
+  // =====================================================================================================================
+  // THE DRESSED-LEG GAMMA_1 READOUT ON THE DEVICE (the host twin: vertex_dynbse.icc dyn_dressed branch,
+  // dynbse.hpp build_dressed_grams / dressed_zt). Per block: d~ = D + T_s Cb D, r = L0 d~, y1 = K_d(r), then
+  //   Zt = sum_n [ g_n^T Z^U_n Gh_n^T + (Gt_n^T (inu Z^T_n - Z^U_n) + g_n^T Z^T_n) g'_n^T ] + Cb y1.cst,  Z = H y1.fam,
+  //   Pd (nout, nR) = e~^dag Zt.   e~ is built once per unit in conjugate space: conj(e~) = conj(D) + M^-T K_s^T Cb^T conj(D)
+  //   (the device LU is of the column-major M^T, so the solve is getrs OP_N). No L0 on the frequency-dependent y1.
+  // =====================================================================================================================
+  namespace {
+    __global__ void dr_zc_kernel(long n, cd iv, cd const *__restrict__ ZT, cd const *__restrict__ ZU, cd *__restrict__ Zc) {
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x)
+        Zc[e] = cuCsub(cuCmul(iv, ZT[e]), ZU[e]);
+    }
+    // Zt[k][a'][b'][N] = sum_n sum_b Sa[n][k][a'][b][N] Gh[n][k][b'][b] + Sbc[n][k][a'][b][N] gkq[n][k][b'][b]
+    __global__ void dr_rsand_kernel(long ng, long nk, long nc, long nR, cd const *__restrict__ Sa, cd const *__restrict__ Sbc,
+                                    cd const *__restrict__ Gh, cd const *__restrict__ gkq, cd *__restrict__ Zt) {
+      const long tot = nk * nc * nc * nR;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long N = e % nR;
+        long t = e / nR;
+        const long bp = t % nc;
+        t /= nc;
+        const long ap = t % nc, k = t / nc;
+        cd acc = make_cuDoubleComplex(0.0, 0.0);
+        for (long n = 0; n < ng; ++n) {
+          const long bs = (((n * nk + k) * nc + ap) * nc) * nR + N, bb = ((n * nk + k) * nc + bp) * nc;
+          for (long b = 0; b < nc; ++b) {
+            acc = cuCadd(acc, cuCmul(Sa[bs + b * nR], Gh[bb + b]));
+            acc = cuCadd(acc, cuCmul(Sbc[bs + b * nR], gkq[bb + b]));
+          }
+        }
+        Zt[e] = acc;
+      }
+    }
+    // Zt (D, nR) from y1 = (fam, cst) of width nR
+    void dr_zt(unit_engine *e, long nR, cplx inu, cd const *yfam, cd const *ycst) {
+      auto &d = e->dr;
+      const long ng = d.ng, np = e->c.np, nk = e->c.nk, nc = e->c.nc, nc2 = e->nc2, W = e->D * nR;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      // Z (2ng, W) = H (2ng, 2np) . yfam (2np, W)   [row-major; column-major Z^T = yfam^T H^T]
+      cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(2 * ng), int(2 * np), &one, yfam, int(W), d.H, int(2 * np),
+                            &zero, d.Z, int(W)), "dr Z = H y");
+      cd const *ZU = d.Z, *ZT = d.Z + size_t(ng) * W;
+      dr_zc_kernel<<<grid_for(ng * W), 256>>>(ng * W, make_cuDoubleComplex(inu.real(), inu.imag()), ZT, ZU, d.Zc);
+      launch_check("dr Zc");
+      // S[n][k] (nc x nc nR) = A[n][k]^T Z[n][k] over the (n, k) batch: column-major S^T = Z^T A (A's storage = A^T -> OP_T)
+      const long bnk = ng * nk, sz = nc2 * nR;
+      auto sbatch = [&](cd const *Zx, cd const *A, cd beta, cd *S, char const *what) {
+        cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_T, int(nc * nR), int(nc), int(nc), &one, Zx, int(nc * nR),
+                                            (long long)sz, A, int(nc), (long long)nc2, &beta, S, int(nc * nR), (long long)sz,
+                                            int(bnk)), what);
+      };
+      sbatch(ZU, d.gk, zero, d.Sa, "dr Sa = g^T ZU");
+      sbatch(ZT, d.gk, zero, d.Sbc, "dr Sbc = g^T ZT");
+      sbatch(d.Zc, d.Gt, one, d.Sbc, "dr Sbc += Gt^T (inu ZT - ZU)");
+      dr_rsand_kernel<<<grid_for(W), 256>>>(ng, nk, nc, nR, d.Sa, d.Sbc, d.Gh, d.gkq, d.Zt);
+      launch_check("dr rsand");
+      ue_cb_times(e, nR, ycst, d.Zt, true);                  // + Cb y1.cst
+    }
+    // Ph (nout, nR) row-major = Lj^dag-collapse: P^T (nR x nout) = Zt^T-view . Lj (the ue_readout arithmetic with the legs Lj)
+    void dr_collapse(unit_engine *e, long nR, cd const *Zt, cd const *Lj, cplx *Ph) {
+      const long D = e->D, nout = e->c.nout;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_T, int(nR), int(nout), int(D), &one, Zt, int(nR), Lj, int(nout), &zero,
+                            e->Pr, int(nR)), "dr collapse");
+      cu_check(cudaMemcpy(Ph, e->Pr, size_t(nout * nR) * sizeof(cd), cudaMemcpyDeviceToHost), "dr collapse d2h");
+    }
+  } // namespace
+
+  bool ue_dressed_prepare(unit_engine *e, long ng, cplx const *Hh, cplx const *Ghh, cplx const *Gth, cplx const *gkh,
+                          cplx const *gkqh, bool ts_zero, char *why, long why_len) {
+    auto &d = e->dr;
+    const long np = e->c.np, nk = e->c.nk, nc2 = e->nc2, D = e->D, nout = e->c.nout, R = e->c.nR_max;
+    const size_t W = size_t(D) * size_t(R);
+    if (not e->legs_ok) { std::snprintf(why, size_t(why_len), "the legs are not set"); return false; }
+    if (not d.on or d.ng != ng) {
+      for (void *p : d.allocs) if (p) (void)cudaFree(p);
+      d.allocs.clear();
+      const double need = ue_dressed_bytes(ng, np, nk, e->c.nc, nout, R);
+      (void)W;
+      size_t fr = 0, tot = 0;
+      cu_check(cudaMemGetInfo(&fr, &tot), "dr memgetinfo");
+      if (need > 0.9 * double(fr)) {
+        std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB free", need / 1e9, double(fr) / 1e9);
+        return false;
+      }
+      auto al = [&](size_t n, char const *w) { cd *p = dalloc<cd>(n, w); d.allocs.push_back(p); return p; };
+      d.H = al(size_t(4 * ng * np), "dr H");
+      d.Gh = al(size_t(ng * nk * nc2), "dr Gh"); d.Gt = al(size_t(ng * nk * nc2), "dr Gt");
+      d.gk = al(size_t(ng * nk * nc2), "dr gk"); d.gkq = al(size_t(ng * nk * nc2), "dr gkq");
+      d.Etj = al(size_t(D * nout), "dr Etj");
+      d.Z = al(2 * size_t(ng) * W, "dr Z"); d.Zc = al(size_t(ng) * W, "dr Zc");
+      d.Sa = al(size_t(ng) * W, "dr Sa"); d.Sbc = al(size_t(ng) * W, "dr Sbc"); d.Zt = al(W, "dr Zt");
+      d.ng = ng; d.nR_max = R; d.on = true;
+    }
+    h2d_c(d.H, Hh, size_t(4 * ng * np), "dr H"); h2d_c(d.Gh, Ghh, size_t(ng * nk * nc2), "dr Gh");
+    h2d_c(d.Gt, Gth, size_t(ng * nk * nc2), "dr Gt"); h2d_c(d.gk, gkh, size_t(ng * nk * nc2), "dr gk");
+    h2d_c(d.gkq, gkqh, size_t(ng * nk * nc2), "dr gkq");
+    if (ts_zero) {
+      cu_check(cudaMemcpy(d.Etj, e->Dcj, size_t(D * nout) * sizeof(cd), cudaMemcpyDeviceToDevice), "dr Etj = Dcj");
+      return true;
+    }
+    if (not e->unit_ok) { std::snprintf(why, size_t(why_len), "the unit's LU is not set"); return false; }
+    // conjugate space, column-major (D x nout): X0 = Dcj^T; w = blockdiag(Cb^T) X0; u = K_s^T w; u <- M^-T u; X0 += u; Etj = X0^T
+    const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+    cd *X0 = dalloc<cd>(size_t(D * nout), "dr X0"), *w = dalloc<cd>(size_t(D * nout), "dr w"), *u = dalloc<cd>(size_t(D * nout), "dr u");
+    cub_check(cublasZgeam(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(D), int(nout), &one, e->Dcj, int(nout), &zero, X0, int(D), X0, int(D)),
+              "dr X0");
+    cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nc2), int(nout), int(nc2), &one, e->Cbk, int(nc2),
+                                        (long long)(nc2 * nc2), X0, int(D), (long long)nc2, &zero, w, int(D), (long long)nc2, int(nk)),
+              "dr w = Cb^T X0");
+    cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(D), int(nout), int(D), &one, e->Ks, int(D), w, int(D), &zero, u, int(D)),
+              "dr u = Ks^T w");
+    if (cusolverDnZgetrs(e->cs, CUBLAS_OP_N, int(D), int(nout), e->M, int(D), e->ipiv, u, int(D), e->dinfo) != CUSOLVER_STATUS_SUCCESS)
+      APP_ABORT(std::string(" ue_dressed_prepare: cusolverDnZgetrs failed."));
+    {   // getrs' devInfo (an illegal argument is reported there, not in the status)
+      int info = 0;
+      cu_check(cudaMemcpy(&info, e->dinfo, sizeof(int), cudaMemcpyDeviceToHost), "dr getrs info");
+      if (info != 0) APP_ABORT(" ue_dressed_prepare: cusolverDnZgetrs devInfo = " + std::to_string(info) + " -- ABORTING.");
+    }
+    cub_check(cublasZgeam(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(D), int(nout), &one, X0, int(D), &one, u, int(D), X0, int(D)), "dr X0 += u");
+    cub_check(cublasZgeam(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(nout), int(D), &one, X0, int(D), &zero, d.Etj, int(nout), d.Etj, int(nout)),
+              "dr Etj");
+    cu_check(cudaDeviceSynchronize(), "dr prepare");
+    for (cd *p : {X0, w, u}) (void)cudaFree(p);
+    return true;
+  }
+
+  double ue_gamma1_dressed(unit_engine *e, long nR, cplx const *Dblkh, cplx inu, bool ts_zero, bool want_r1, cplx *Pdh, cplx *Pr1h,
+                           double *tim, bool want_gsum1) {
+    if (not e->dr.on) APP_ABORT(std::string(" ue_gamma1_dressed: ue_dressed_prepare was not called."));
+    if (nR > e->c.nR_max) APP_ABORT(std::string(" ue_gamma1_dressed: block wider than the engine's nR_max."));
+    const long W = e->D * nR;
+    double t0 = wnow();
+    h2d_c(e->Dblk, Dblkh, size_t(W), "dr Dblk");
+    e->cbd_ok = false;
+    tim[5] += wnow() - t0;
+    // d~ = D + T_s Cb D  (into Xcst)
+    if (ts_zero) {
+      cu_check(cudaMemcpy(e->Xcst, e->Dblk, size_t(W) * sizeof(cd), cudaMemcpyDeviceToDevice), "dr d~ = D");
+    } else {
+      ue_cb_times(e, nR, e->Dblk, e->Xcst, false);
+      ue_ts(e, nR, e->Xcst, &tim[1]);
+      add2_kernel<<<grid_for(W), 256>>>(W, e->Dblk, e->csb, e->Xcst);
+      launch_check("dr d~");
+    }
+    // r = L0 d~ (Fsum = Cb d~: the static column's Gsum), y1 = K_d(r); with the one bare dynamic rung (T_s = 0: d~ = e~ = D) as
+    // a second input of the same rung pass when the engine packs two (its L0 into F2fam / F2sum, its y into yfam1 / ycst1)
+    ue_l0(e, nR, nullptr, e->Xcst, e->Ffam, e->Fsum, &tim[0]);
+    cu_check(cudaMemcpy(e->Gs0, e->Fsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToDevice), "dr Gs0");
+    const bool r1_here = want_r1 and not ts_zero and not want_gsum1;
+    const bool r1_fused = r1_here and e->fuse;
+    double fe = 0.0;
+    if (r1_fused) {
+      ue_l0(e, nR, nullptr, e->Dblk, e->F2fam, e->F2sum, &tim[0]);
+      cd const *gin[2] = {e->Ffam, e->F2fam};
+      cd const *sin[2] = {e->Fsum, e->F2sum};
+      cd *yo[2] = {e->yfam, e->yfam1};
+      cd *co[2] = {e->ycst, e->ycst1};
+      double fes[2] = {0.0, 0.0};
+      ue_kd_multi(e, nR, 2, gin, sin, yo, co, fes, tim);
+      fe = fes[0];                                        // the one-bare-rung input's refit error is not reported (as unfused)
+    } else {
+      fe = ue_kd(e, nR, e->Ffam, e->Fsum, e->yfam, e->ycst, tim);
+    }
+    t0 = wnow();
+    dr_zt(e, nR, inu, e->yfam, e->ycst);
+    dr_collapse(e, nR, e->dr.Zt, e->dr.Etj, Pdh);
+    tim[4] += wnow() - t0;
+    if (want_gsum1) {
+      // the Sigma deposits (ue_sd_block) read Gsum1 = Cb d~ + L + Cb T_s L, L = (L0 y1)^sum = Zt, and y1 = (yfam, ycst) in place
+      if (ts_zero) {
+        add2_kernel<<<grid_for(W), 256>>>(W, e->Gs0, e->dr.Zt, e->Gsum);
+      } else {
+        ue_ts(e, nR, e->dr.Zt, &tim[1]);
+        add2_kernel<<<grid_for(W), 256>>>(W, e->Gs0, e->dr.Zt, e->Gsum);
+        add2_kernel<<<grid_for(W), 256>>>(W, e->Gsum, e->cbb, e->Gsum);
+      }
+      launch_check("dr Gsum1");
+      cu_check(cudaDeviceSynchronize(), "dr gsum1");
+    }
+    e->r1_ok = false;
+    if (r1_here) {
+      // the one bare dynamic rung (T_s = 0): d~ = e~ = D
+      if (not r1_fused) {
+        ue_l0(e, nR, nullptr, e->Dblk, e->Ffam, e->Fsum, &tim[0]);
+        (void)ue_kd(e, nR, e->Ffam, e->Fsum, e->yfam, e->ycst, tim);
+      }
+      t0 = wnow();
+      if (r1_fused) dr_zt(e, nR, inu, e->yfam1, e->ycst1);
+      else dr_zt(e, nR, inu, e->yfam, e->ycst);
+      dr_collapse(e, nR, e->dr.Zt, e->Dcj, Pr1h);
+      tim[4] += wnow() - t0;
+    }
+    return fe;
+  }
+
+
+  void ue_set_rung_mode(unit_engine *e, bool rung_pair, long rr, cplx const *ctr_h) {
+    // the frequency-factorized rung keeps its R matrices resident (its pass mixes every K_r into every tau column)
+    if (rr > 0 and e->nres < e->c.ndist)
+      APP_ABORT(std::string(" ue_set_rung_mode: the frequency-factorized rung needs all ") + std::to_string(e->c.ndist) +
+                " K_r resident on the device (" + std::to_string(e->nres) + " fit) -- ABORTING.");
+    e->rung_pair = rung_pair;
+    e->rr = rr;
+    if (rr > 0) {
+      if (e->ctr) (void)cudaFree(e->ctr);
+      e->ctr = dalloc<cd>(size_t(e->c.nt * rr), "rung ctr");
+      h2d_c(e->ctr, ctr_h, size_t(e->c.nt * rr), "rung ctr");
+    }
+  }
 
 } // namespace methods::solvers::dynbse_cuda

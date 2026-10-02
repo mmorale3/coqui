@@ -397,21 +397,20 @@ namespace methods {
     std::array<double, 2> mixing{io::get_value_with_default<double>(pt,"dc_pi_mixing",1.0),
                                  io::get_value_with_default<double>(pt,"u_weiss_mixing",1.0)};
 
-    // Project 2 increment Q4 (notes/q4_edmft_skeleton_spec.md, R-Q4-2 AMENDMENT): whether
-    // the lattice ladder's local part joins the bosonic double counting. OPT-IN and OFF by
-    // default -- the only object this tree can produce today is the THC-adjoint one, whose
-    // convention the amendment rejects as a DC contribution (increment Q4-C3b delivers the
-    // orbital/chi-convention 4-leg projection). "thc_adjoint_diag" is named for what it is.
-    // "orbital" (Q4-C3b, notes/q4_c3b_orbital_ladder_dc_spec.md) is the DC-ready value:
-    // the orbital/chi-convention 4-leg projection of the same lattice ladder.
+    // pi_lad_dc: whether the local part of the lattice ladder polarizability joins the
+    // bosonic double counting. Opt-in, off by default ("none").
+    //   "orbital"          -- the orbital/chi-convention 4-leg projection of the lattice
+    //                         ladder; this is the object valid as a DC contribution.
+    //   "thc_adjoint_diag" -- the THC-adjoint projection of the same ladder. Its convention
+    //                         is not valid as a DC contribution; diagnostics only.
     auto pi_lad_dc = io::tolower_copy(
         io::get_value_with_default<std::string>(pt,"pi_lad_dc","none"));
     utils::check(pi_lad_dc == "none" or pi_lad_dc == "thc_adjoint_diag" or
                  pi_lad_dc == "orbital",
                  "downfolding_edmft: unknown pi_lad_dc = \"{}\". Valid options: \"none\" "
-                 "(default), \"orbital\" (the eq-7 ladder DC of Q4-C3b), "
-                 "\"thc_adjoint_diag\" (the DIAGNOSTIC-convention ladder DC of "
-                 "Q4 C3 -- see the R-Q4-2 AMENDMENT before using it).", pi_lad_dc);
+                 "(default), \"orbital\" (orbital/chi-convention local ladder DC), "
+                 "\"thc_adjoint_diag\" (THC-adjoint ladder DC; DIAGNOSTIC convention, "
+                 "not a valid DC contribution).", pi_lad_dc);
 
     _Timer.stop("DF_READ");
 
@@ -844,34 +843,32 @@ namespace methods {
         proj_boson.proj_fermi().downfold_loc<false>(sG_tskij_dc, "Gloc for DC polarizability");
     auto sPi_dc_wabcd_new = eval_Pi_rpa_dc<true>(*mpi, G_tsIab, ft, density_only);
 
-    // Project 2 increment Q4 (notes/q4_edmft_skeleton_spec.md C3): eq 7's bosonic double
-    // counting is P_dc = bubble[G_loc] + P^lad_loc. The bubble is the line above (the
-    // implemented convention, kept -- it is what makes the clean limit exact); the LADDER
-    // half is what the lattice BSE tier already contains locally.
+    // Bosonic double counting with the lattice ladder: P_dc = bubble[G_loc] + P^lad_loc.
+    // The bubble is the line above (it is what makes the clean limit exact); the ladder
+    // half is the local part of what the lattice BSE already contains.
     //
-    // ⚠ OPT-IN, DEFAULT OFF (R-Q4-2 AMENDMENT): the only P^lad_loc this tree produces is
-    // the THC-ADJOINT object of C3, whose convention the amendment rejects as a DC
-    // contribution (it carries the upfold's ||B||^2 gain instead of its reciprocal, so it
-    // is ~10 orders above bubble[G_loc]). The DC-ready orbital/chi-convention 4-leg
-    // projection is increment Q4-C3b. With pi_lad_dc = "none" this block does not execute
-    // at all -- no h5 read, no accumulation -- so P_dc is bit-identical to pre-C3.
+    // Opt-in, default off. "orbital" adds the orbital/chi-convention 4-leg projection,
+    // the object valid as a DC contribution. "thc_adjoint_diag" adds the THC-adjoint
+    // projection, which carries the upfold's ||B||^2 gain instead of its reciprocal (many
+    // orders of magnitude above bubble[G_loc]); it is a diagnostic only. With
+    // pi_lad_dc = "none" this block does not execute (no h5 read, no accumulation).
     // Source when enabled: MBState if the lattice stage ran in this process, else the
     // checkpoint group that produced the RPA polarizability (g_grp[0]/g_iter[0] --
     // P^lad_loc belongs to that lattice screening step, not to the Gloc used for the
     // bubble).
     if (pi_lad_dc != "none") {
       const bool orb_dc = (pi_lad_dc == "orbital");
-      // Q4-C3b: the "orbital" value selects the DC-ready object (same read pattern, dataset
-      // and MBState slot swapped); the diagnostic warning belongs to the OTHER value only.
+      // "orbital" selects the DC-ready object (same read pattern, dataset and MBState slot
+      // swapped); the diagnostic warning belongs to "thc_adjoint_diag" only.
       const std::string lad_dset = orb_dc ? "pi_lad_loc_orb_wabcd" : "pi_lad_loc_wabcd";
       if (orb_dc)
-        app_log(1, "\n  - pi_lad_dc = \"orbital\": eq 7's P_dc = bubble[Gloc] + P^lad_loc "
-                   "with the orbital/chi-convention\n    ladder DC of increment Q4-C3b "
+        app_log(1, "\n  - pi_lad_dc = \"orbital\": P_dc = bubble[Gloc] + P^lad_loc "
+                   "with the orbital/chi-convention\n    local ladder polarizability "
                    "(dataset {}).", lad_dset);
       else
         app_log(1, "\n  [WARNING] pi_lad_dc = \"{}\": the ladder double counting is ON with "
-                   "the\n            DIAGNOSTIC (THC-adjoint) convention, which the R-Q4-2 "
-                   "AMENDMENT rejects\n            as a DC contribution. U(i.nu) from this "
+                   "the\n            DIAGNOSTIC (THC-adjoint) convention, which is not "
+                   "valid\n            as a DC contribution. U(i.nu) from this "
                    "run is a diagnostic, not a result.", pi_lad_dc);
       nda::array<ComplexType, 5> Pi_lad_loc;
       bool have_lad = false;
@@ -897,22 +894,21 @@ namespace methods {
         }
       }
       mpi->node_comm.broadcast_n(&have_lad, 1, 0);
-      // Q4-C3b: the DC-ready value is a DEMAND -- if the object is missing, the run would
-      // silently fall back to a bubble-only P_dc. That is the failure the amendment's whole
-      // bookkeeping exists to prevent, so it is fatal here (the producer's own
-      // window-compatibility skip logs the usual cause).
+      // "orbital" is a demand: if the object is missing the run would silently fall back
+      // to a bubble-only P_dc, so it is fatal here (the producer's window-compatibility
+      // skip logs the usual cause).
       if (orb_dc)
         utils::check(have_lad,
                      "downfold_edmft_impl: pi_lad_dc = \"orbital\" but no P^lad_loc,orb is "
                      "available -- neither MBState nor {}/iter{} of {} carries "
                      "\"pi_lad_loc_orb_wabcd\". The lattice stage must have run with an "
                      "injecting ladder AND a bosonic projector whose band window lies "
-                     "inside the ladder window (see the Q4-C3b warning in its log).",
+                     "inside the ladder window (see the orbital ladder warning in its log).",
                      g_grp[0], g_iter[0], filename);
       if (have_lad) {
         sPi_dc_wabcd_new.win().fence();
         if (mpi->node_comm.root()) {
-          // element-wise dims: rusty's bundled fmt has no std::array formatter
+          // element-wise dims: some bundled fmt versions have no std::array formatter
           utils::check(Pi_lad_loc.shape() == sPi_dc_wabcd_new.shape(),
                        "downfold_edmft_impl: P^lad_loc shape ({},{},{},{},{}) does not "
                        "match P_dc ({},{},{},{},{}).",
@@ -924,12 +920,12 @@ namespace methods {
           double lmax = 0.0, dmax = 0.0;
           for (auto const &v : Pi_lad_loc) lmax = std::max(lmax, std::abs(v));
           for (auto const &v : sPi_dc_wabcd_new.local()) dmax = std::max(dmax, std::abs(v));
-          app_log(1, "  - eq-7 ladder DC: ||P^lad_loc||_max = {:.4e} added to "
+          app_log(1, "  - ladder DC: ||P^lad_loc||_max = {:.4e} added to "
                      "||bubble[Gloc]||_max = {:.4e} (ratio {:.3e}){}",
                   lmax, dmax, lmax / std::max(dmax, 1e-300),
                   (lmax > dmax) ? "\n    [WARNING] the ladder half of P_dc EXCEEDS the "
-                                  "bubble half: P_dc is then dominated by a term eq 7 "
-                                  "intends as a correction. Check the local projection's "
+                                  "bubble half: P_dc is then dominated by a term "
+                                  "intended as a correction. Check the local projection's "
                                   "normalization before trusting U(i.nu)." : "");
           sPi_dc_wabcd_new.local() += Pi_lad_loc;
         }

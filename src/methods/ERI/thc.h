@@ -78,20 +78,17 @@ class thc
    *  - thresh: "1e-5", Threshold in cholesky decomposition.
    *  - nIpts: number of interpolating points to select, instead of letting `thresh` decide.
    *
-   *  REPRODUCIBILITY, threshold vs. fixed count (measured 2026-08-03, job 6744072).
+   *  Reproducibility, threshold vs. fixed count.
    *  With `thresh` driving the truncation, the *number* of interpolating points depends on the
-   *  processor grid, hence on the rank count: the pivoted-Cholesky residual at the margin wobbles
-   *  at roundoff and crosses `thresh` at a different pivot for a different decomposition. Measured
-   *  at Si 2x2x2 / 100 bands, `thresh = 1e-5` gives Np = 1289 / 1279 / 1275 / 1290 at 1 / 2 / 4 / 8
-   *  ranks and a total-energy spread of 3.1e-05 -- the method's own ISDF truncation error at that
-   *  threshold, not a defect. Pinning `nIpts = 1275` instead collapses the spread to 1.3e-14: the
-   *  pivot *sequence* is reproducible across decompositions to roundoff, only the cutoff moves.
+   *  processor grid, hence on the rank count: the pivoted-Cholesky residual at the margin varies
+   *  at roundoff and crosses `thresh` at a different pivot for a different decomposition. The
+   *  resulting spread in the total energy is of the order of the ISDF truncation error at that
+   *  threshold, not a defect. With a fixed `nIpts` the pivot *sequence* is reproducible across
+   *  decompositions to roundoff, and so are the results.
    *  => Set `nIpts` explicitly for any number that will be compared across rank counts (scaling
-   *     studies, A/B benchmarks, published values). `thresh` is fine for exploratory work.
-   *  Note the two routes are not interchangeable at equal Np: `thresh = 1e-5` at 4 ranks also lands
-   *  on Np = 1275 but gives E = 0.5145880920947619 versus 0.5146250400187667 for pinned
-   *  `nIpts = 1275`, because exhausting a threshold part-way through a `chol_block_size` block
-   *  selects a different point set than taking exactly Np pivots.
+   *     studies, benchmarks, published values). `thresh` is fine for exploratory work.
+   *  The two routes are not interchangeable at equal Np: exhausting a threshold part-way through
+   *  a `chol_block_size` block selects a different point set than taking exactly Np pivots.
    *
    *  Performance related options:
    *  - matrix_block_size: 1024, Block size used in distributed arrays.
@@ -156,11 +153,11 @@ class thc
                     >;
 
   /**
-   * W-int-1b (coarse->fine vertex interpolation, notes/wannier_coarse_vertex_plan.md): the collocation
+   * Coarse->fine vertex interpolation support: the collocation
    * of the orbitals a_rg at a GIVEN point list IPts (density-FFT-grid indices), for all k in kp_rg, in the
    * interpolating_points output convention X(s, k, a, u) = u_{a k}(r_u) e^{i k.r_u}. Lets a fine-mesh
    * run FREEZE the ISDF points selected on a coarse mesh. Replicated host array (ns, nk, na, Np).
-   * (The convention is psi_{a k}(r_u) = u_{a k}(r_u) e^{i k.r_u}; pinned by the W-int-1b gate.)
+   * (The convention is psi_{a k}(r_u) = u_{a k}(r_u) e^{i k.r_u}, identical to interpolating_points.)
    */
   nda::array<ComplexType,4> collocation_at_points(nda::array<long,1> const& IPts, nda::range kp_rg, nda::range a_rg);
   nda::array<long,1> rho_mesh() const { return nda::array<long,1>{long(rho_g.mesh(0)), long(rho_g.mesh(1)), long(rho_g.mesh(2))}; }

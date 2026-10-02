@@ -41,9 +41,9 @@
 #include "methods/pproc/pproc_drivers.hpp"
 
 /**
- * P24 / G31 (notes/vertex_perf_plan.md): Wannier interpolation of the quasiparticle bands in qp_gaps.
+ * Wannier interpolation of the quasiparticle bands in qp_gaps.
  *
- * The identity gate: Wannier interpolation is EXACT on the coarse mesh -- at a mean-field k the
+ * The identity test: Wannier interpolation is EXACT on the coarse mesh -- at a mean-field k the
  * fine-mesh bands of pproc_t::interpolate_qp_bands_on_mesh must reproduce the eigenvalues of the
  * downfolded Heff(k) (the projector's window block in the Wannier basis) to 1e-8 Ha, for the fine
  * mesh equal to the mean-field mesh and for a refinement that contains it. Two probes on the lih222

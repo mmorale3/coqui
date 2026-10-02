@@ -1,13 +1,14 @@
 #ifndef COQUI_VERTEX_DYNBSE_ICC
 #define COQUI_VERTEX_DYNBSE_ICC
+#include "utilities/blas_threads.hpp"   // the dressed-leg BLAS3 on the rank's threads
 
 /**
- * scGW-tilde Tier 2, FULL FREQUENCY: the resummed DYNAMIC-rung BSE polarization in the ladder's
- * pair space (notes/dynbse_plan.md D0.1; the algebra in dynbse.hpp, increment D1; this file is
- * increment D2: the production driver, its THC rung operator and the gates).
+ * Full-frequency resummed DYNAMIC-rung BSE polarization in the ladder's pair space (the algebra
+ * lives in dynbse.hpp; this file holds the production driver, its THC rung operator and the
+ * validation checks).
  *
- * THE OBJECT (plan section 1), per external (q, inu), pair r = (a nc + b), a on the k line, b on
- * the k+q line, D = nc^2 nk, one right-hand side per secondary aux index N:
+ * THE OBJECT, per external (q, inu), pair r = (a nc + b), a on the k line, b on the k+q line,
+ * D = nc^2 nk, one right-hand side per secondary aux index N:
  *
  *   Gamma_N(k,iw) = d_N(k) + sum_{k'} (1/beta) sum_{iw'} K_s+d(k' <- k; iw - iw') L0(k',iw') Gamma_N(k',iw')
  *   P_MN(q,inu)   = (spin/nk) sum_k conj(d_M(k))^T [ (1/beta) sum_iw L0(k,iw) Gamma_N(k,iw) ]
@@ -15,28 +16,29 @@
  * with the rung split K = K_s + K_d: K_s = sign_ks * Kbig / nk the STATIC (W0bar) rung of
  * pair_space_ladder in exactly its twist-packed orientation (Kbig[(k'),(k)] maps the L0-output
  * pair (p1'p3) at k to the L0-input pair (p1 p3') at k'), K_d(inu') = the same THC contraction
- * with W_dyn(inu') - W_dyn(0) (the cache _Wb_qwmm) in place of W0bar, applied in tau
- * (plan section 4). sign_ks = -1 is the DERIVED sign (memory l2-resolvent-sign-finding: the
- * house bubble +spin/nk D^dag Cb D and the anchor -spin/nk^2 D^dag Cb K Cb D force the rung -W);
- * sign_ks = +1 reproduces the as-implemented L2 resolvent up to an overall sign of the rung part.
+ * with W_dyn(inu') - W_dyn(0) (the cache _Wb_qwmm) in place of W0bar, applied in tau.
+ * sign_ks = -1 is the DERIVED sign: the bubble +spin/nk D^dag Cb D and the one-rung term
+ * -spin/nk^2 D^dag Cb K Cb D force the rung -W; sign_ks = +1 gives the opposite-sign static
+ * resummation (1 - Xh Kt)^-1, Xh Kt = (1/nk) Cb Kbig, up to an overall sign of the rung part.
  *
- * The static part is resummed exactly (one dense LU per unit, T_s = K_s (1 - Cb K_s)^-1, the L2
- * solve) and the dynamic remainder is solved by GMRES(m) / Neumann on
+ * The static part is resummed exactly (one dense LU per unit, T_s = K_s (1 - Cb K_s)^-1, the static
+ * ladder solve) and the dynamic remainder is solved by GMRES(m) / Neumann on
  * (1 - K_d L_s) y = K_d L_s d (dynbse.hpp). Output columns (rungs >= 1, i.e. minus the bubble):
- * static (the sign-corrected L2), the one bare dynamic rung D^dag L0 K_d L0 D (the Pi^C anchor's
- * dynamic part), Gamma_1 (one dynamic rung dressed by static ladders) and the resummed vertex.
+ * static (the sign-corrected static ladder), the one bare dynamic rung D^dag L0 K_d L0 D (the
+ * dynamic part of the one-rung term), Gamma_1 (one dynamic rung dressed by static ladders) and the
+ * resummed vertex.
  *
- * NOSYM full mesh only at D2 (the external and transfer meshes coincide); the (s, q) units are
- * round-robined over (rank, nproc) and every (jn, iq) cell is written by exactly one rank, so the
- * caller's zeros-elsewhere all_reduce reproduces the replicated result (the pair_space_ladder
- * contract). The k-sum of the rung is the direct gemm form at D2 (the FFT is the D2b' optimization;
- * the gemm path stays as its machine-precision cross-check).
+ * The (s, q, nu) units are distributed over (rank, nproc) (round-robin or dynamic scheduling) and
+ * every (jn, iq) cell is written by exactly one rank, so the caller's zeros-elsewhere all_reduce reproduces the replicated result
+ * (the pair_space_ladder contract). The k-sum of the rung runs either as a direct gemm or through
+ * the k-mesh Fourier transform (kmesh_ft); the gemm path is the machine-precision cross-check.
  */
 
 #include <array>
 #include <tuple>
 #include <set>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -54,8 +56,8 @@
 #if defined(ENABLE_FFTW)
 #include "numerics/fft/fftw.h"
 #include "methods/vertex/vertex_debug.hpp"
-#include "methods/vertex/vertex_sigma_dyn.icc"   // LFF-Sigma L-7: the Sigma hook of the dynamic-rung solver
-#include "methods/vertex/nu_sampling.hpp"       // P14: the sampled-nu service (reconstruction from a node subset)
+#include "methods/vertex/vertex_sigma_dyn.icc"   // the Sigma hook of the dynamic-rung solver
+#include "methods/vertex/nu_sampling.hpp"       // the sampled-nu service (reconstruction from a node subset)
 #endif
 
 namespace methods {
@@ -73,10 +75,10 @@ namespace solvers {
       bool one_rung_only = false; // T_s = 0 and one application: the pure one dynamic rung
       bool gamma1_only = false;   // stop at the first iterate (Gamma_1); skip the resummation GMRES
       double sign_ks = -1.0;      // K = sign_ks * (THC rung) / nk  (-1 = the derived sign)
-      bool static_only = false;   // no dynamic solve: the static column only (gate G-A)
+      bool static_only = false;   // no dynamic solve: the static column only
       bool union_nodes = false;   // G's residues on the half-spacing-SHIFTED grid (no node coincides
-                                  // with a vertex node: no confluent product, no re-expansion table;
-                                  // D2e finding) -- false = the shared aux grid with Dsq/Dcb (inu = 0 only)
+                                  // with a vertex node: no confluent product, no re-expansion table)
+                                  // -- false = the shared aux grid with Dsq/Dcb (inu = 0 only)
       double readout_tol = 0.0;   // GMRES: stop when the physical readout D^dag Gsum moves by less than this
                                   // per cycle (0 = off); the criterion blind to readout-invisible modes
       long rhs_block = 0;         // solve the Nm right-hand-side columns in blocks of this width (0 = all at
@@ -88,43 +90,42 @@ namespace solvers {
       MPI_Comm sched_comm = MPI_COMM_NULL;           // when set: DYNAMIC scheduling of the (s, q, nu) units through
                                                      // a shared task counter (one-sided MPI on rank 0), longest
                                                      // units first; MPI_COMM_NULL = static round-robin
-      std::string schedule = "longest";   // P5 (vertex_perf_plan.md): the unit order handed out by the scheduler -- "longest": the
+      std::string schedule = "longest";   // the unit order handed out by the scheduler -- "longest": the
                                           // heuristic (nu != 0 units, highest node first, then nu = 0); "measured": by the wall
                                           // time of the same (s, q, nu) unit in a previous call (unit_cost), unseen units first
       std::map<std::tuple<long, long, long>, double> const *unit_cost = nullptr;   // (is, iq, m) -> seconds (dyn_meter::merge_unit_cost)
-      utils::mpi_context_t<mpi3::communicator> *shm_mpi = nullptr;   // P19: when set, the driver's W_d(q', tau) / W_d(q', 0)
+      utils::mpi_context_t<mpi3::communicator> *shm_mpi = nullptr;   // when set, the driver's W_d(q', tau) / W_d(q', 0)
                                                                      // tables live in ONE node-shared window per NUMA node
                                                                      // (16 nq nt Nm^2 bytes once per node, not once per rank)
       nda::array<double, 2> const *kcrys = nullptr;  // (nk, 3) crystal coordinates of the k mesh: when given
                                                      // (and ksum_ft), the rung's k-sum runs through kmesh_ft
       bool ksum_ft = true;
       double vmask_lo = 0.0, vmask_hi = 0.0;   // the in-gap vertex-node mask (pol_vertex_dyn_vmask), active when hi > lo
-      bool wannier_pairs = false; // W-int-0/1: the outputs are the Wannier-PAIR polarization Pi_loc(q) (nout = nc^2)
+      bool wannier_pairs = false; // the outputs are the Wannier-PAIR polarization Pi_loc(q) (nout = nc^2)
                                   // instead of the aux frame (Nm). The inputs G_CC / Xb are then ALREADY in the MLWF
                                   // frame (ladder_inputs: G_bar = U^dag G U; the rotated secondary collocation X_bar
                                   // = X U, nc = M), so the external legs are the IDENTITY on the (a, b) pair labels --
-                                  // the mesh-independent frame for coarse->fine interpolation
-                                  // (notes/wannier_coarse_vertex_plan.md). W-int-0 put U on the legs of band-frame
-                                  // inputs, which mixed frames for any non-degenerate U (W-int-1 finding).
+                                  // the mesh-independent frame for coarse->fine interpolation. (Putting U on the legs
+                                  // of band-frame inputs instead would mix frames for any non-degenerate U.)
       double tfold = 0.0;         // the small-nu fold ratio (pol_vertex_dyn_tfold): T_a with |eps_a| >= tfold |nu| folded into U
       int table_mode = 0;         // inu != 0 twisted-pair tables: 0 = fitted on the dense tau grid (default), 1 = the
                                   // exact partial fractions through Dsq (1/nu-amplified; the diagnostic route)
       long union_stride = 1;      // union grid: keep every union_stride-th shifted G node (plus the last); the
                                   // inu != 0 L0 cost scales as ng (1 + 2 (np_fit + ng)) -> stride 2 is ~5x cheaper
-                                  // IF G still fits (node_pole_fit error reported as the G fit; gate it)
-      std::string resolvent = "inverse";   // P7 (vertex_perf_plan.md): the static resolvent T_s = K_s (1 - Cb K_s)^-1 --
+                                  // IF G still fits (node_pole_fit error reported as the G fit; check it)
+      std::string resolvent = "inverse";   // the static resolvent T_s = K_s (1 - Cb K_s)^-1 --
                                   // "inverse": the explicit inverse, T_s stored dense (D x D); "lu": the LU factors of
                                   // 1 - Cb K_s (built blockwise, no D^3 inverse), T_s applied as getrs + one K_s gemm
-      bool dense_rung = true;     // the DENSE per-tau rung (2026-09-13): K_d(s) = build_kbig(W_d(s)) on the PH-sym
-                                  // half of the tau nodes (nt/2 x D x D per unit, 5.4 GB at Si 4^3/8) and every
-                                  // application = nt (D x D)(D x nR) gemms (compute-bound) instead of the THC
-                                  // pair-space streaming (memory-bound: ~180 GB of traffic per application on Si)
+      bool dense_rung = true;     // the DENSE per-tau rung: K_d(s) = build_kbig(W_d(s)) on the PH-sym half of the
+                                  // tau nodes (nt/2 x D x D per unit) and every application = nt (D x D)(D x nR)
+                                  // gemms (compute-bound) instead of the THC pair-space streaming (memory-bound:
+                                  // the W and leg tables are re-read for every tau node and application)
       std::vector<long> const *q_subset = nullptr;   // evaluate only these transfers (all q when null);
                                                      // the outputs keep the full q axis (zeros elsewhere)
-      // LFF-Sigma L-7 (vertex_sigma_dyn.icc): when non-null, every unit also contracts its amputated vertex
+      // vertex_sigma_dyn.icc: when non-null, every unit also contracts its amputated vertex
       // A = K_s Gsum + y into the self-energy accumulators of the hook (the solvers then keep their y iterates)
       sigma_dyn_hook *sigma = nullptr;
-      std::string sigma_ckpt;            // P20 (vertex_perf_plan.md): prefix of the Sigma-accumulator checkpoint files
+      std::string sigma_ckpt;            // prefix of the Sigma-accumulator checkpoint files
                                          // "<sigma_ckpt>.r<rank>.h5" (empty = off): every rank writes its partial S_cst / RT / RU
                                          // and the list of units it has deposited every sigma_ckpt_minutes and at the end; at
                                          // entry the files of a previous run are loaded (rank r takes files r, r + P, ...) and
@@ -132,24 +133,24 @@ namespace solvers {
       double sigma_ckpt_minutes = 30.0;
       double gap_mask = 0.0;      // union scheme: DROP the G nodes with |eps| < gap_mask (Ha, relative to
                                   // mu = 0 of the pole variable). A gapped G has no spectral weight there;
-                                  // the DLR fit's O(1) in-gap residues (T15 lesson) otherwise feed a loop
-                                  // through the near-confluent double-pole products at inu != 0 (gain
-                                  // ~1/gap: measured Ritz 2.6 on lih222 at the first node). 0 = no mask.
-      // LFF-aux L-0 (notes/lff_aux_plan.md): the WINDOW BUBBLE column. When Pi_bub is non-null every unit also writes
+                                  // the DLR fit's O(1) in-gap residues otherwise feed a loop through the
+                                  // near-confluent double-pole products at inu != 0 (gain ~1/gap, enough to
+                                  // push the Ritz value of K_d L_s above 1 at the first node). 0 = no mask.
+      // The WINDOW BUBBLE column. When Pi_bub is non-null every unit also writes
       // Pi_bub(jn, iq, M, N) = (spin/nk) [D^dag Cb D](M, N) -- the C-window pair bubble in the output frame, the object
       // the dumped "rungs >= 1" columns are corrections TO (the reference of the multiplicative local-field factor).
       // bubble_only = true evaluates ONLY that column: no rung (no Kbig / K_d(s) / resolvent), no solve, no unit dump;
-      // the other outputs stay zero. ~1 s per unit.
+      // the other outputs stay zero.
       nda::array<cplx, 4> *Pi_bub = nullptr;
       bool bubble_only = false;
     };
 
 
     /**
-     * D2f: a VERTEX-LOCAL imaginary-axis grid for the dynamic pair algebra. The loop's DLR precision
-     * ("low" = 1e-6 on the Si runs) is what the small-nu twisted algebra inherits: at beta = 1000 the
-     * union scheme at the first bosonic node converges to the dense oracle (2e-6, 25 applications) at
-     * prec "high" and stalls at a 3e-2 residual floor at prec "low" (dynbse_small_nu_1000). With prec
+     * A VERTEX-LOCAL imaginary-axis grid for the dynamic pair algebra. The small-nu twisted algebra
+     * inherits the loop's DLR precision: at large beta a "low" precision grid can leave the union
+     * scheme at the first bosonic node stalled at a residual floor far above the solver tolerance,
+     * while a "high" precision grid converges to the dense reference. With prec
      * non-empty the pair algebra runs on IAFT(beta, wmax, dlr, prec): G_CC is interpolated onto the
      * finer tau grid through the loop's DLR (exact to the loop's class), W(inu) keeps the LOOP's
      * bosonic labels (the cut's nodes) and reaches the vertex tau nodes through Ttw_v = T Ttw_loop,
@@ -205,22 +206,25 @@ namespace solvers {
       double wtau_sym = 0.0;                  // max |W_d(s) - W_d(beta - s)| / max |W_d|
       double ritz_max = 0.0;                  // watchdog: max over units of |Ritz(K_d L_s)| / contraction
       long it_max = 0, it_sum = 0, nunits = 0, nconv = 0;
+      // how the units ended -- converged to tol / stagnated (at the refit floor) / stopped by the readout criterion /
+      // converged by definition (one application: one-bare-rung, static, direct Gamma_1) / hit maxit / restored from a dump
+      long n_stag = 0, n_rconv = 0, n_def = 0, n_maxit = 0, n_restored = 0;
       long r1_fused = 0, r1_missing = 0;      // units whose one-bare-rung column came from the device unit / was requested but not produced
       double t_setup = 0.0, t_kbig = 0.0, t_cb = 0.0, t_lu = 0.0, t_solve = 0.0, t_read = 0.0;
       double t_rung = 0.0, t_refit = 0.0;   // inside the solve: the rung applications (all tau nodes), the tau refits
       double t_l0 = 0.0, t_ts = 0.0, t_orth = 0.0;   // the L0 pole algebra, the static-resolvent gemms, the Arnoldi dots
       long n_apps = 0;                      // K_d applications (all units, all blocks)
-      // the L0 split (gpu port, 2026-09-25; see dynbse::solve_timers): nu = 0 kernel, nu != 0 host kernel, nu != 0
-      // device path and its phases; the number of L0 applications and of constant-input ones (the P-3a fast path)
+      // the L0 split (see dynbse::solve_timers): nu = 0 kernel, nu != 0 host kernel, nu != 0 device path and its
+      // phases; the number of L0 applications and of constant-input ones (the constant-input fast path)
       double t_l0_nu0 = 0.0, t_l0_host = 0.0, t_l0_dev = 0.0;
       double t_l0_prep = 0.0, t_l0_alloc = 0.0, t_l0_h2d = 0.0, t_l0_kernel = 0.0, t_l0_d2h = 0.0;
-      long n_l0 = 0, n_l0_cst = 0, n_l0_nu0 = 0, n_l0_nu0_dev = 0;   // n_l0_nu0_dev: nu = 0 applications on the device (R3)
-      double t_vec = 0.0, t_ws = 0.0;       // O-1: the elementwise passes of the Gamma_1 path, the scratch allocation
+      long n_l0 = 0, n_l0_cst = 0, n_l0_nu0 = 0, n_l0_nu0_dev = 0;   // n_l0_nu0_dev: nu = 0 applications on the device
+      double t_vec = 0.0, t_ws = 0.0;       // the elementwise passes of the Gamma_1 path, the scratch allocation
       double rss_max_gb = 0.0;
       bool ksum_ft = false;         // the rung's k-sum ran through the mesh Fourier transform
       nda::array<double, 2> unit_diag;   // per unit (nunits_all x 13): is iq m apps conv stag rconv |Ritz| refit shift-fit
                                          // shift-cond last-readout-step wall-seconds; zeros for units restored from the dump
-      /** P5: fold the (reduced) per-unit wall times into the (is, iq, m) -> seconds table of dyn_opts::unit_cost */
+      /** fold the (reduced) per-unit wall times into the (is, iq, m) -> seconds table of dyn_opts::unit_cost */
       void merge_unit_cost(std::map<std::tuple<long, long, long>, double> &cost) const {
         if (unit_diag.size() == 0 or unit_diag.shape(1) < 13) return;
         for (long u = 0; u < unit_diag.shape(0); ++u) {
@@ -235,13 +239,20 @@ namespace solvers {
         mx(fit_err_G); mx(rr_G); mx(dsq_err); mx(refit_err_max); mx(wtau_sym); mx(ritz_max);
         it_max = comm.all_reduce_value(it_max, boost::mpi3::max<>{});
         sm(it_sum); sm(nunits); sm(nconv); sm(r1_fused); sm(r1_missing);
+        sm(n_stag); sm(n_rconv); sm(n_def); sm(n_maxit); sm(n_restored);
+        if (comm.root() and (n_maxit > 0 or n_stag > 0 or n_rconv > 0))
+          app_log(1, "  [dynbse] {}WARNING: of {} units, {} hit maxit WITHOUT converging, {} stopped on stagnation (residual above tol, "
+                     "at the refit floor), {} stopped on the readout criterion; worst refit {:.2e}, max iterations {}{}",
+                  n_maxit > 0 ? "" : "(convergence) ", nunits, n_maxit, n_stag, n_rconv, refit_err_max, it_max,
+                  n_restored > 0 ? " (" + std::to_string(n_restored) + " units restored from dumps: their convergence was logged by the run "
+                                       "that wrote them)" : std::string());
         mx(t_setup); mx(t_kbig); mx(t_cb); mx(t_lu); mx(t_solve); mx(t_read); mx(rss_max_gb);
         mx(t_rung); mx(t_refit); sm(n_apps); mx(t_l0); mx(t_ts); mx(t_orth);
         mx(t_l0_nu0); mx(t_l0_host); mx(t_l0_dev); mx(t_l0_prep); mx(t_l0_alloc); mx(t_l0_h2d); mx(t_l0_kernel); mx(t_l0_d2h);
         sm(n_l0); sm(n_l0_cst); sm(n_l0_nu0); sm(n_l0_nu0_dev);
         mx(t_vec); mx(t_ws);
       }
-      /** the L0 split as one log line (the slowest rank's times, the summed counts); O-1 adds the host-traffic
+      /** the L0 split as one log line (the slowest rank's times, the summed counts), plus the host-traffic
        *  items outside the kernels (vector ops, scratch allocation) and the solve's unaccounted rest */
       std::string l0_split_line() const {
         char buf[640];
@@ -257,7 +268,7 @@ namespace solvers {
       }
     };
 
-    /** P6 (vertex_perf_plan.md): the symmetry classes of the transfers for the streaming rung on a symmetric mesh. The
+    /** The symmetry classes of the transfers for the streaming rung on a symmetric mesh. The
      *  dense rung (build_kbig) reads, for every (k, k'), the IBZ-stored W at q_star(k - k') (PQ-transposed for a
      *  time-reversal transfer) and takes the four legs from Xhat(is, q_isym(k - k'), .). Grouping the full-mesh transfers
      *  by js = q_isym(q') makes every class term a function of k - k' alone with a fixed leg set,
@@ -301,7 +312,7 @@ namespace solvers {
       nda::array<cplx, 4> Y(Nm, Nm, nk, nb), Z(Nm, Nm, nk, nb);
       nda::array<cplx, 2> Wm(nk, nk), Zk(Nm, Nm * nb), B(nc, Nm * nb), B2(nc * nb, Nm), O2(nc * nb, nc);
       const bool sym = (symc != nullptr and symc->active);
-      for (long js : rung_sym_classes(symc)) {                      // P6: one pass per symmetry class (nosym: one pass)
+      for (long js : rung_sym_classes(symc)) {                      // one pass per symmetry class (nosym: one pass)
       auto X = [&](long k, long P, long a) -> cplx { return sym ? symc->Xhat(is, js, k, P, a) : Xb(is, k, P, a); };
       auto Wc = [&](long qp, long P, long Q) -> cplx {              // the class-masked rung at the full-mesh transfer q'
         if (not sym) return Wq(qp)(P, Q);
@@ -366,7 +377,7 @@ namespace solvers {
     }
 
     /**
-     * The k-mesh Fourier transform of the rung's k-sum (2026-09-12). On the full nosym mesh the k-sum
+     * The k-mesh Fourier transform of the rung's k-sum. On the full nosym mesh the k-sum
      *   Z(k') = sum_k W(k - k') Y(k)
      * is a circular convolution on the abelian group of the mesh, so with the characters
      *   U(R, k) = exp(-2 pi i m_k . m_R / n)   (m = integer mesh coordinates, R labeled by the same set)
@@ -385,7 +396,7 @@ namespace solvers {
       nda::array<cplx, 2> Uq;       // (R, q): exp(+2 pi i m_q . m_R / n) -- the transform of the rung
       bool ok = false;
       double check = -1.0;          // the convolution identity residual of build()
-      // the FFT route (2026-09-12): mesh dimensions and the lexicographic row index of every k / q
+      // the FFT route: mesh dimensions and the lexicographic row index of every k / q
       // (m1 n2 + m2) n3 + m3, so the three-dimensional FFT over the mesh replaces the dense U/Uinv
       // (nk log nk instead of nk^2 per column). fft = false falls back to the dense transform.
       int ndim[3] = {0, 0, 0};
@@ -496,7 +507,7 @@ namespace solvers {
     /** thc_rung_apply with the k-sum done by the mesh Fourier transform (see kmesh_ft): identical
      *  contraction, out(k', (p1 p3'), N) = scale sum_k sum_PQ X(k',P,p1) conj(X(k'+q,Q,p3')) W_PQ(k-k')
      *  sum_{p1' p3} conj(X(k,P,p1')) F(k,(p1'p3),N) X(k+q,Q,p3).
-     *  Layout (2026-09-12): the k-sum buffers hold (k | R, (P n Q)) so that every intermediate of the
+     *  Layout: the k-sum buffers hold (k | R, (P n Q)) so that every intermediate of the
      *  leg gemms is a plain reinterpretation -- A(P, (n p3)) = A2((P n), p3), Y2((P n), Q) = one
      *  contiguous row, Z row (P, (n Q)) feeds the leg-out gemm directly, B(p1, (n Q)) = B2((p1 n), Q) --
      *  no transposes of the (Nm x Nm x nb) blocks (they dominated the wall: memory traffic, not flops). */
@@ -538,7 +549,7 @@ namespace solvers {
       auto A2 = nda::reshape(A, std::array<long, 2>{Nm * nb, nc});     // ((P n), p3): the same memory as A
       auto B2 = nda::reshape(B, std::array<long, 2>{nc * nb, Nm});     // ((p1 n), Q): the same memory as B
       const bool sym = (symc != nullptr and symc->active);
-      for (long js : rung_sym_classes(symc)) {                        // P6: one pass per symmetry class (nosym: one pass)
+      for (long js : rung_sym_classes(symc)) {                        // one pass per symmetry class (nosym: one pass)
       auto X = [&](long k, long P, long a) -> cplx { return sym ? symc->Xhat(is, js, k, P, a) : Xb(is, k, P, a); };
       // the rung's transform A(R, (P Q)) once per class (the same for every N block): the class-masked rung table
       for (long q = 0; q < nq; ++q) {
@@ -645,7 +656,7 @@ namespace solvers {
       // run over the FULL BZ; with an active symc the transfer's rung is read from the IBZ-stored W0b
       // at q_star(iqx) -- PQ-TRANSPOSED for a time-reversal transfer -- and the four legs use the
       // effective (rotation + trev-conj) columns Xhat via build_U_legs with jsym = q_isym(iqx). With
-      // symc == nullptr this is bitwise the historic nosym expression (jsx = 0, qsx = iqx, no transpose).
+      // symc == nullptr this is exactly the nosym expression (jsx = 0, qsx = iqx, no transpose).
       decltype(nda::range::all) all;
       const long nk = kpq.shape(1), Nm = Xb.shape(2), nc = Xb.shape(3), nc2 = nc * nc;
       const bool sym = (symc != nullptr and symc->active);
@@ -674,7 +685,7 @@ namespace solvers {
       }
     }
 
-    /** the tau-route chi0 of the ladder (A.4 block) at bosonic node m: Cb(k, (p1'p3), (ab)) */
+    /** the tau-route chi0 of the ladder at bosonic node m: Cb(k, (p1'p3), (ab)) */
     inline void build_cb_tau(nda::MemoryArrayOfRank<5> auto const &G_CC, vertex_pi::iaft_tools const &tools,
                              long is, long iq, long m, nda::array<long, 2> const &kpq,
                              nda::array<cplx, 3> &Cb) {
@@ -690,8 +701,8 @@ namespace solvers {
                 for (long b = 0; b < nc; ++b)
                   Pf(s, (p1p * nc + p3) * nc2 + (a * nc + b)) = G_CC(sm, is, ik, a, p1p) * G_CC(s, is, ikpq, p3, b);
         }
-        // only the bosonic row m is kept: Cb(k) = -Twt_bb(m, :) . Pf (a gemv; the full (nw_b x nt)(nt x nc2^2) gemm computed
-        // nw_b rows to keep one -- gpu port 2026-09-27). vertex_debug dynbse_cb_gemm restores it (the A/B; rounding class)
+        // only the bosonic row m is needed: Cb(k) = -Twt_bb(m, :) . Pf as a gemv (the full (nw_b x nt)(nt x nc2^2) gemm
+        // would compute nw_b rows to keep one). vertex_debug dynbse_cb_gemm selects the full gemm (equal up to rounding)
         if (vertex_debug::flag("dynbse_cb_gemm")) {   // vertex_debug: dynbse_cb_gemm
           nda::blas::gemm(cplx(-1.0), tools.Twt_bb, Pf, cplx(0.0), Bf);
           for (long r = 0; r < nc2; ++r)
@@ -718,7 +729,7 @@ namespace solvers {
     inline void pair_space_ladder_dyn(nda::MemoryArrayOfRank<5> auto const &G_CC,    // (nt,ns,nk,nc,nc)
                                       nda::array<cplx, 4> const &Xb,                 // (ns,nk,Nm,nc)
                                       nda::array<cplx, 3> const &W0b,                // (nq,Nm,Nm)
-                                      nda::MemoryArrayOfRank<4> auto const &Wbh,     // (nq,nw_half,Nm,Nm): array or view (P19)
+                                      nda::MemoryArrayOfRank<4> auto const &Wbh,     // (nq,nw_half,Nm,Nm): array or view (node-shared)
                                       nda::array<long, 2> const &kmq, nda::array<long, 2> const &kpq,
                                       vertex_pi::iaft_tools &tools, std::vector<long> const &nu_list,
                                       nda::array<cplx, 4> *Pi_static, nda::array<cplx, 4> *Pi_dyn1,
@@ -728,13 +739,13 @@ namespace solvers {
       decltype(nda::range::all) all;
       vertex_ladder_detail::prof_watch watch;
       const bool sym = (symc != nullptr and symc->active);
-      const bool wan = opt.wannier_pairs;   // W-int-0/1: Wannier-pair output frame (inputs already MLWF-rotated)
+      const bool wan = opt.wannier_pairs;   // Wannier-pair output frame (inputs already MLWF-rotated)
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3);
       const long Nm = Xb.shape(2), nc2 = nc * nc, D = nc2 * nk;
       const long nout = wan ? nc2 : Nm;                     // external-leg / output dimension (aux Nm, or Wannier pair)
       const long nq = W0b.shape(0), nw_b = tools.nw_b;
       const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
-      if (sym and not opt.dense_rung and rank == 0)   // P6: the streaming rung runs per symmetry class of the transfers
+      if (sym and not opt.dense_rung and rank == 0)   // the streaming rung runs per symmetry class of the transfers
         app_log(2, "  [dynbse] streaming THC rung on the symmetric mesh: {} symmetry classes of the {} transfers per application",
                 rung_sym_classes(symc).size(), symc->nq_full);
       const long nnu = long(nu_list.size());
@@ -766,12 +777,22 @@ namespace solvers {
       // ---- the vertex basis and G's residues --------------------------------------------------
       tools.init_poles();
       auto b = db::build_freq_basis(*tools.ft);
-      // D2f: the in-gap vertex-node mask (pol_vertex_dyn_vmask = [lo, hi] relative to mu; env COQUI_DYNBSE_VMASK="lo,hi"
+      // the in-gap vertex-node mask (pol_vertex_dyn_vmask = [lo, hi] relative to mu; env COQUI_DYNBSE_VMASK="lo,hi"
       // overrides for experiments)
       double vlo = opt.vmask_lo, vhi = opt.vmask_hi;
       if (auto vm = vertex_debug::get("dynbse_vmask"); vm.has_value()) {   // vertex_debug: dynbse_vmask = lo,hi  (Ha about mu)
-        vlo = std::atof(vm->c_str());
-        if (const char *cm = std::strchr(vm->c_str(), ',')) vhi = std::atof(cm + 1);
+        // strict parse (a typo must not silently become 0) and a WARNING that the input mask is overridden
+        const std::string v(*vm);
+        const size_t cm = v.find(',');
+        size_t e1 = 0, e2 = 0;
+        try {
+          vlo = std::stod(v.substr(0, cm), &e1);
+          vhi = (cm == std::string::npos) ? vhi : std::stod(v.substr(cm + 1), &e2);
+        } catch (...) { e1 = std::string::npos; }
+        utils::check(e1 == (cm == std::string::npos ? v.size() : cm) and (cm == std::string::npos or e2 == v.size() - cm - 1),
+                     "pair_space_ladder_dyn: vertex_debug dynbse_vmask = \"{}\" is not \"lo,hi\" (Ha about mu).", v);
+        if (rank == 0)
+          app_log(1, "  [dynbse] WARNING: vertex_debug dynbse_vmask = {} overrides pol_vertex_dyn_vmask ({}, {})", v, opt.vmask_lo, opt.vmask_hi);
       }
       const bool vmasked = (vhi > vlo);
       if (vmasked) db::mask_freq_basis(b, vlo, vhi);
@@ -841,6 +862,32 @@ namespace solvers {
                 for (long bb2 = 0; bb2 < nc; ++bb2) gC(is, p, k, a, bb2) = c(p, a * nc + bb2);
           }
       }
+      // WANNIER MODE (the Sigma hook's closure): the closure G = U^T G_W U^* (hook.G_close, set by the Sigma entry
+      // points) fitted on the SAME basis and G node set as gC -- its residues are the closure's g_j; the pair propagator keeps gC
+      if (opt.sigma != nullptr and opt.sigma->wannier_closure()) {
+        auto const &Gc = opt.sigma->G_close;
+        utils::check(not sym and Gc.shape(0) == nt and Gc.shape(1) == ns and Gc.shape(2) == nk and Gc.shape(3) == nc and Gc.shape(4) == nc,
+                     "pair_space_ladder_dyn: the Wannier closure G ({} x {} x {} x {} x {}) does not match G_CC's layout "
+                     "({} x {} x {} x {} x {}; nosym meshes only).", Gc.shape(0), Gc.shape(1), Gc.shape(2), Gc.shape(3), Gc.shape(4),
+                     nt, ns, nk, nc, nc);
+        opt.sigma->gC_close = nda::array<cplx, 5>(ns, ng, nk, nc, nc);
+        double fe_c = 0.0;
+        nda::array<cplx, 2> Fg(nt, nc2);
+        for (long is = 0; is < ns; ++is)
+          for (long k = 0; k < nk; ++k) {
+            for (long i = 0; i < nt; ++i)
+              for (long a = 0; a < nc; ++a)
+                for (long bb2 = 0; bb2 < nc; ++bb2) Fg(i, a * nc + bb2) = Gc(i, is, k, a, bb2);
+            auto c = use_npf ? npf.coeffs(Fg) : db::basis_coeffs(b, Fg);
+            fe_c = std::max(fe_c, use_npf ? npf.fit_error(Fg, c) : db::basis_fit_error(b, Fg, c));
+            for (long p = 0; p < ng; ++p)
+              for (long a = 0; a < nc; ++a)
+                for (long bb2 = 0; bb2 < nc; ++bb2) opt.sigma->gC_close(is, p, k, a, bb2) = c(p, a * nc + bb2);
+          }
+        if (rank == 0)
+          app_log(1, "  [dynbse] Wannier-mode Sigma closure: U^T G_W U^* fitted on the ladder's G node set ({} nodes), fit error {:.2e}",
+                  ng, fe_c);
+      }
       if (rank == 0)
         app_log(2, "  [dynbse] node set: {} ({} vertex nodes, {} G nodes ({} in-gap nodes masked at |eps| < {:.4f} Ha), "
                    "{} total); G fit error {:.2e}, residue ratio {:.2f}",
@@ -851,7 +898,7 @@ namespace solvers {
       // bosonic inu -> tau transform Ttw_bb (nt, nw_b); W_d(s) = W_dyn(s) (its tau form), the
       // constant part of K_d is -W_dyn(inu'=0) acting on the frequency sums.
       const long lpos0 = std::max(tools.m0, tools.w_mirror_b(tools.m0)) - nw_b / 2;
-      // P19: the tables are per rank ("replicated") or node-shared (opt.shm_mpi set): the same unfold, each q' by one rank
+      // the tables are per rank ("replicated") or node-shared (opt.shm_mpi set): the same unfold, each q' by one rank
       // of the node, published by a fence -- bitwise the same values
       const bool shm_w = (opt.shm_mpi != nullptr);
       nda::array<cplx, 4> Wd_s_own;
@@ -895,6 +942,71 @@ namespace solvers {
         if (shm_w) { sWd_s->win().fence(); sWd0->win().fence(); }   // publish the node-shared tables
         if (met) met->wtau_sym = std::max(met->wtau_sym, (wmax > 0.0) ? dsym / wmax : 0.0);
       }
+      // ---- the FREQUENCY-FACTORIZED dense rung (vertex_debug dyn_rung_rank = R > 0) ---------------------------------------
+      // W_dyn(q', tau_i) ~ sum_{r<R} c_r(tau_i) A_r(q') with UNIVERSAL (q'-independent) time functions c_r: the top-R
+      // eigenvectors of the (nt x nt) Gram of the per-q'-normalized tau data (its spectrum decays fast, so a small R
+      // suffices), A_r(q') = sum_i c_r(tau_i)^* W_dyn(q', tau_i). The rung is then R
+      // dense matrices K_r = build_kbig(A_r) instead of one per PH-representative tau node, applied to ALL tau nodes of an
+      // application at once: Y(:, (i, N)) = sum_r K_r c_r(tau_i) F(:, (i, N)) -- R x the flops of the per-tau gemms, but
+      // compute-bound (the per-tau (D x D)(D x nR) gemms are bandwidth-bound) and R/ndist of the memory and the builds.
+      const long rrank = opt.dense_rung ? long(vertex_debug::number("dyn_rung_rank", 0.0)) : 0l;   // vertex_debug: dyn_rung_rank
+      // the HYBRID: the per-tau dense rung (fast application) BUILT from R factorized matrices, K_d(tau_rep) = sum_r c_r(tau_rep) K_r
+      // (R build_kbig calls + ndist R axpys instead of ndist build_kbig calls; vertex_debug dyn_rung_build_rank = R)
+      const long brank = (opt.dense_rung and rrank == 0) ? long(vertex_debug::number("dyn_rung_build_rank", 0.0)) : 0l;
+      {   // a requested rung rank that this path cannot honour aborts (never silently ignored)
+        const long rr_req = long(vertex_debug::number("dyn_rung_rank", 0.0)), br_req = long(vertex_debug::number("dyn_rung_build_rank", 0.0));
+        utils::check(opt.dense_rung or (rr_req == 0 and br_req == 0),
+                     "pair_space_ladder_dyn: vertex_debug dyn_rung_rank / dyn_rung_build_rank ({} / {}) need the dense rung "
+                     "(pol_vertex_dyn_dense = true); the streaming rung ignores them. ABORTING.", rr_req, br_req);
+        utils::check(not (rr_req > 0 and br_req > 0),
+                     "pair_space_ladder_dyn: dyn_rung_rank = {} and dyn_rung_build_rank = {} are exclusive (the factorized rung or "
+                     "the hybrid build). ABORTING.", rr_req, br_req);
+      }
+      const long frank = std::max(rrank, brank);          // the rank of the universal time functions computed below
+      nda::array<cplx, 2> c_tr;                   // (nt, R)
+      nda::array<cplx, 4> A_rq;                   // (R, nq, Nm, Nm)
+      if (frank > 0) {
+        utils::check(frank <= nt, "pair_space_ladder_dyn: dyn_rung_rank {} > nt {}.", frank, nt);
+        nda::matrix<cplx> Gm(nt, nt);
+        Gm() = cplx(0.0);
+        for (long iqp = 0; iqp < nq; ++iqp) {
+          auto Wq = nda::reshape(Wd_s(iqp, all, all, all), std::array<long, 2>{nt, Nm * Nm});
+          double nmax = 0.0;
+          for (long i = 0; i < nt; ++i) {
+            double n2 = 0.0;
+            for (long x = 0; x < Nm * Nm; ++x) n2 += std::norm(Wq(i, x));
+            nmax = std::max(nmax, n2);
+          }
+          if (nmax <= 0.0) continue;
+          nda::blas::gemm(cplx(1.0 / nmax), Wq, nda::dagger(Wq), cplx(1.0), Gm);   // M M^dag: its eigenvectors = the left singular vectors
+        }
+        for (long i = 0; i < nt; ++i)
+          for (long j = 0; j < i; ++j) { auto a = 0.5 * (Gm(i, j) + std::conj(Gm(j, i))); Gm(i, j) = a; Gm(j, i) = std::conj(a); }
+        auto [lam, V] = nda::linalg::eigenelements(Gm);   // ascending
+        double tr = 0.0, tail = 0.0;
+        for (long i = 0; i < nt; ++i) tr += std::max(double(lam(i)), 0.0);
+        for (long i = 0; i < nt - frank; ++i) tail += std::max(double(lam(i)), 0.0);
+        c_tr = nda::array<cplx, 2>(nt, frank);
+        for (long r = 0; r < frank; ++r)
+          for (long i = 0; i < nt; ++i) c_tr(i, r) = V(i, nt - 1 - r);
+        A_rq = nda::array<cplx, 4>(frank, nq, Nm, Nm);
+        nda::array<cplx, 2> cH(frank, nt);
+        for (long r = 0; r < frank; ++r)
+          for (long i = 0; i < nt; ++i) cH(r, i) = std::conj(c_tr(i, r));
+        for (long iqp = 0; iqp < nq; ++iqp) {
+          auto Wq = nda::reshape(Wd_s(iqp, all, all, all), std::array<long, 2>{nt, Nm * Nm});
+          nda::array<cplx, 2> Ar(frank, Nm * Nm);
+          nda::blas::gemm(cH, Wq, Ar);
+          for (long r = 0; r < frank; ++r)
+            A_rq(r, iqp, all, all) = nda::reshape(Ar(r, all), std::array<long, 2>{Nm, Nm});
+        }
+        if (rank == 0)
+          app_log(1, "  [dynamic vertex] frequency-factorized dense rung: R = {} universal time functions of {} tau nodes "
+                     "(Gram tail {:.2e} of the trace; rms relative truncation of the normalized tau data {:.2e}); "
+                     "K_d memory {:.2f} GB per unit instead of {} per-tau matrices",
+                  frank, nt, tail / std::max(tr, 1e-300), std::sqrt(tail / std::max(tr, 1e-300)),
+                  double(frank) * double(D) * double(D) * 16.0 / 1.0e9, nt / 2);
+      }
       // ---- transfer lookup ---------------------------------------------------------------------
       nda::array<long, 2> qx_of(nk, nk);
       qx_of() = -1;
@@ -914,17 +1026,59 @@ namespace solvers {
         utils::check(not opt.bubble_only, "pair_space_ladder_dyn: the Sigma hook needs the solve (bubble_only set).");
         utils::check(long(nu_list.size()) == nw_b or opt.sigma->sampled or not opt.sigma->nodes_active.empty() or opt.sigma->initialized,
                      "pair_space_ladder_dyn: the Sigma hook needs EVERY bosonic node ({} of {} given) unless sampled weights are set "
-                     "(or the hook is a P3 shared one: its node set over the P-side call and the Sigma-side call).", nu_list.size(), nw_b);
+                     "(or the hook is a shared one: its node set over the P-side call and the Sigma-side call).", nu_list.size(), nw_b);
         utils::check(opt.dump_prefix.empty(), "pair_space_ladder_dyn: the Sigma hook and the unit dump/restart are exclusive.");
         opt.sigma->init(nt, ns, nk, np, nc, b, nw_b);
         if (rank == 0)
-          app_log(1, "  [LFF-Sigma dyn] Sigma hook armed: col {}, outer W {}; accumulators (nt {}, nk {}, np {}, nc {}) {}, {:.2f} GB per rank",
-                  opt.sigma->col, opt.sigma->outer, nt, nk, np, nc, opt.sigma->single_acc ? "in ONE tau-resolved object (P4-C14)" : "x 3",
+          app_log(1, "  [Sigma vertex, dynamic] Sigma hook armed: col {}, outer W {}; accumulators (nt {}, nk {}, np {}, nc {}) {}, {:.2f} GB per rank",
+                  opt.sigma->col, opt.sigma->outer, nt, nk, np, nc, opt.sigma->single_acc ? "in ONE tau-resolved object" : "x 3",
                   double(nt * ns * nk * nc2) * (opt.sigma->single_acc ? 1.0 : 2.0 * double(np) + 1.0) * 16.0 / 1e9);
       }
-      // ---- P20: the Sigma-accumulator checkpoint -----------------------------------------------
+      // ---- the Sigma-accumulator checkpoint ----------------------------------------------------
       std::set<std::tuple<long, long, long>> sig_done;         // units whose deposits are already in the accumulators (all ranks)
       std::vector<std::array<long, 3>> sig_mine;                 // the units whose deposits sit in THIS rank's accumulators
+      // ---- the INPUT FINGERPRINT of this call (G, the legs, W0, a sample of W-bar_d, the solver options, the nu list, the
+      // dressed / rung settings, the Sigma hook's columns). It names the Sigma checkpoint and the unit dumps, so files written
+      // for another scGW iteration, another configuration or other inputs can never be loaded (e.g. the checkpoint of one
+      // iteration reloaded as "done" by the next). A restart of the SAME state finds them.
+      std::string fp_hex;
+      {
+        std::uint64_t hsh = 1469598103934665603ull;
+        auto mix = [&](void const *p, size_t nb) {
+          auto const *c = static_cast<unsigned char const *>(p);
+          for (size_t i = 0; i < nb; ++i) { hsh ^= c[i]; hsh *= 1099511628211ull; }
+        };
+        auto mixd = [&](double v) { mix(&v, sizeof(v)); };
+        auto mixl = [&](long v) { mix(&v, sizeof(v)); };
+        auto mixs = [&](std::string const &v) { mix(v.data(), v.size()); mixl(long(v.size())); };
+        auto mixc = [&](cplx v) { mixd(v.real()); mixd(v.imag()); };
+        for (long i0 = 0; i0 < G_CC.shape(0); ++i0)
+          for (long i1 = 0; i1 < G_CC.shape(1); ++i1)
+            for (long i2 = 0; i2 < G_CC.shape(2); ++i2)
+              for (long i3 = 0; i3 < G_CC.shape(3); ++i3)
+                for (long i4 = 0; i4 < G_CC.shape(4); ++i4) mixc(G_CC(i0, i1, i2, i3, i4));
+        mix(Xb.data(), size_t(Xb.size()) * sizeof(cplx));
+        mix(W0b.data(), size_t(W0b.size()) * sizeof(cplx));
+        for (long iq = 0; iq < Wbh.shape(0); ++iq)            // W-bar_d: a strided sample (every q, nu; diagonal + one off-diagonal)
+          for (long w = 0; w < Wbh.shape(1); ++w)
+            for (long i = 0; i < Wbh.shape(2); ++i) { mixc(Wbh(iq, w, i, i)); mixc(Wbh(iq, w, i, (7 * i + 3) % Wbh.shape(3))); }
+        for (long m : nu_list) mixl(m);
+        mixd(opt.tol); mixl(opt.maxit); mixl(opt.gmres_m); mixl(opt.one_rung_only); mixl(opt.gamma1_only); mixd(opt.sign_ks);
+        mixl(opt.static_only); mixl(opt.union_nodes); mixd(opt.readout_tol); mixd(opt.vmask_lo); mixd(opt.vmask_hi);
+        mixl(opt.wannier_pairs); mixd(opt.tfold); mixl(opt.table_mode); mixl(opt.union_stride); mixl(opt.dense_rung);
+        mixd(opt.gap_mask); mixs(opt.resolvent); mixl(rrank); mixl(brank);
+        mixs(vertex_debug::number("dyn_dressed", -1.0) >= 0.0 ? std::string(vertex_debug::number("dyn_dressed", -1.0) != 0.0 ? "on" : "off")
+                                                              : dyn_dressed_state());
+        mixs(vertex_debug::list());                           // every vertex_debug switch (over-strict on performance switches: safe)
+        if (opt.q_subset != nullptr) for (long q : *opt.q_subset) mixl(q);
+        if (opt.sigma != nullptr) {
+          mixs(opt.sigma->col); mixs(opt.sigma->outer); mixl(opt.sigma->sampled); mixl(opt.sigma->single_acc);
+          mixl(opt.sigma->use_U); mixl(opt.sigma->use_T); mixl(opt.sigma->poles);
+        }
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(hsh));
+        fp_hex = buf;
+      }
       std::vector<std::string> sig_consumed;                     // checkpoint files beyond this run's rank count, merged into this rank's
       double t_ckpt_last = db::wall_now();
       const bool sig_ckpt = (opt.sigma != nullptr and not opt.sigma_ckpt.empty());
@@ -932,7 +1086,7 @@ namespace solvers {
         namespace fs = std::filesystem;
         long nfiles = 0, nloaded = 0;
         for (long r = rank;; r += nproc) {
-          const std::string fn = opt.sigma_ckpt + ".r" + std::to_string(r) + ".h5";
+          const std::string fn = opt.sigma_ckpt + ".fp" + fp_hex + ".r" + std::to_string(r) + ".h5";
           if (not fs::exists(fn)) break;
           h5::file f(fn, 'r');
           h5::group g(f);
@@ -970,22 +1124,22 @@ namespace solvers {
           MPI_Allreduce(MPI_IN_PLACE, &tot_units, 1, MPI_LONG, MPI_SUM, opt.sched_comm);
         }
         if (rank == 0)
-          app_log(1, "  [LFF-Sigma dyn] Sigma checkpoint \"{}.r*.h5\": {} files, {} finished units loaded (skipped); interval {:.1f} min",
+          app_log(1, "  [Sigma vertex, dynamic] Sigma checkpoint \"{}.r*.h5\": {} files, {} finished units loaded (skipped); interval {:.1f} min",
                   opt.sigma_ckpt, tot_files, tot_units, opt.sigma_ckpt_minutes);
       }
-      std::function<void()> sd_flush_hook;                       // D-3: the device Sigma accumulators into the hook's
+      std::function<void()> sd_flush_hook;                       // flushes the device Sigma accumulators into the hook's
       auto write_sig_ckpt = [&]() {
         if (sd_flush_hook) sd_flush_hook();                      // (also at the final call below, checkpoints or not)
         if (not sig_ckpt) return;
         opt.sigma->flush_unit();
-        const std::string fn = opt.sigma_ckpt + ".r" + std::to_string(rank) + ".h5";
+        const std::string fn = opt.sigma_ckpt + ".fp" + fp_hex + ".r" + std::to_string(rank) + ".h5";
         nda::array<long, 2> done(long(sig_mine.size()), 3);
         for (long i = 0; i < done.shape(0); ++i) for (int c = 0; c < 3; ++c) done(i, c) = sig_mine[size_t(i)][size_t(c)];
         {
           h5::file f(fn + ".tmp", 'w');
           h5::group g(f);
           nda::h5_write(g, "S_cst", opt.sigma->S_cst);
-          if (not opt.sigma->single_acc) { nda::h5_write(g, "RT", opt.sigma->RT); nda::h5_write(g, "RU", opt.sigma->RU); }   // P4-C14
+          if (not opt.sigma->single_acc) { nda::h5_write(g, "RT", opt.sigma->RT); nda::h5_write(g, "RU", opt.sigma->RU); }   // split accumulators only
           nda::h5_write(g, "done", done);
         }
         std::filesystem::rename(fn + ".tmp", fn);                 // atomic replacement: a kill during the write keeps the previous file
@@ -998,19 +1152,82 @@ namespace solvers {
       const long nrb = (opt.rhs_block > 0) ? std::min(opt.rhs_block, nout) : nout;   // RHS column block width
       // the mesh Fourier transform of the rung's k-sum (self-checked; direct sum otherwise)
       kmesh_ft kft;
-      // the transform pays off when nk is large (the direct sum's Nm^2 tiny gemms are overhead-bound
-      // at nk = 64: Si 4^3; on lih222's 8-point mesh the direct sum is 2x faster)
+      // the transform pays off when nk is large (the direct sum's Nm^2 tiny gemms are overhead-bound);
+      // on very small meshes the direct sum is faster
       if (opt.ksum_ft and opt.kcrys != nullptr and nk >= 8) kft.build(*opt.kcrys, kmq, kpq);
       const bool use_ft = kft.ok;
       if (rank == 0)
         app_log(2, "  [dynbse] rung k-sum: {} (mesh transform check {:.2e})",
                 use_ft ? (kft.fft ? "mesh FFT (FFTW)" : "dense mesh Fourier transform") : "direct", kft.check);
       if (met) met->ksum_ft = use_ft;
+      // the transform was requested and applicable but could not be built -> the direct sum runs (same answer, slower)
+      if (rank == 0 and opt.ksum_ft and opt.kcrys != nullptr and nk >= 8 and not use_ft and not opt.dense_rung)
+        app_log(1, "  [dynbse] WARNING: the mesh Fourier transform of the rung k-sum could not be built (check {:.2e}); the direct "
+                   "k-sum runs (same result, slower)", kft.check);
       auto rung_apply = [&](auto &&Wfn, cplx sc, auto const &Fin, auto &&Oout, long is_, long iq_) {
-        if (use_ft) thc_rung_apply_ft(Xb, is_, iq_, kpq, kft, Wfn, sc, Fin, Oout, nb, symc);   // P6: symc (nullptr on nosym)
+        if (use_ft) thc_rung_apply_ft(Xb, is_, iq_, kpq, kft, Wfn, sc, Fin, Oout, nb, symc);   // symc: nullptr on nosym
         else thc_rung_apply(Xb, is_, iq_, kpq, qx_of, Wfn, sc, Fin, Oout, nb, symc);
       };
-      // host threads (the omp_threads knob; the global OMP_NUM_THREADS stays 1 per the T-3b contract): the
+#if defined(ENABLE_CUDA)
+      // the STREAMING THC rung on the device. vertex_debug
+      // dynbse_dev_stream = 1 runs the streaming path's rung applications (dense_rung = false) through rs_apply instead of
+      // thc_rung_apply_ft -- nosym full meshes with the FFT k-sum only (else the host route, with the reason logged);
+      // dynbse_dev_stream_nb = the FFT block width (default 16, halved to fit); dynbse_dev_stream_check = 1: the first kd
+      // call of every rank's first unit also runs the host rung on two tau nodes and the constant part, and logs the
+      // device-vs-host difference.
+      std::unique_ptr<dynbse_cuda::rung_stream, void (*)(dynbse_cuda::rung_stream *)> rs(nullptr, dynbse_cuda::rs_destroy);
+      long rs_sq = -1;
+      bool rs_res = false;                           // the transformed tables resident (slot i = tau node i, slot nt = W_d0)
+      double rs_t[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // [0] W transforms, [1] legs in, [2] FFT + product, [3] legs out, [4] H2D/D2H
+      if (not opt.dense_rung and not opt.bubble_only and vertex_debug::flag("dynbse_dev_stream")) {
+        std::string why_rs;
+        if (not use_ft or not kft.fft) why_rs = "no FFT mesh transform";
+        else if (sym) why_rs = "a symmetry-reduced mesh (no per-class device pass)";
+        else if (kft.Uq.shape(1) != nq) why_rs = "transfer count mismatch";
+        else {
+          dynbse_cuda::rs_config rc;
+          rc.ns = ns; rc.nk = nk; rc.nq = nq; rc.Nm = Nm; rc.nc = nc;
+          rc.nb = std::max(1l, long(vertex_debug::number("dynbse_dev_stream_nb", 16.0)));
+          rc.layout = int(vertex_debug::number("dynbse_dev_stream_layout", 2.0));   // 2 fused k-sum | 1 contiguous cuFFT | 0 strided
+          rc.ntab = nt + 1;           // every tau table + W_d0 transformed once per driver call (fixed here), else per call
+          for (int a = 0; a < 3; ++a) rc.ndim[a] = kft.ndim[a];
+          rc.fz_g = long(vertex_debug::number("dynbse_dev_stream_g", 0.0));        // vertex_debug: dynbse_dev_stream_g (layout 2 columns per block)
+          // the fused k-sum (layout 2) covers mesh dimensions <= 16 and nk <= 256; beyond, the contiguous-cuFFT layout 1 computes
+          // the same rung
+          if (rc.layout == 2 and (rc.ndim[0] > 16 or rc.ndim[1] > 16 or rc.ndim[2] > 16 or nk > 256)) {
+            if (rank == 0)
+              app_log(1, "  [dynbse] WARNING: mesh {} x {} x {} is beyond the fused k-sum's limits (dimensions <= 16, nk <= 256): the "
+                         "streaming rung uses layout 1", rc.ndim[0], rc.ndim[1], rc.ndim[2]);
+            rc.layout = 1;
+          }
+          char why[256] = {0};
+          rs.reset(dynbse_cuda::rs_create(rc, nrb, kft.lex_k.data(), kft.lex_q.data(), Xb.data(),
+                                          1.0e6 * double(utils::freemem_device_effective()), why, 256));
+          if (not rs) why_rs = why;
+          else {
+            rs_res = (dynbse_cuda::rs_ntab(rs.get()) == nt + 1);
+            if (rs_res) {
+              for (long i = 0; i < nt; ++i) dynbse_cuda::rs_load_w(rs.get(), i, Wd_s.data() + i * Nm * Nm, nt * Nm * Nm, rs_t);
+              dynbse_cuda::rs_load_w(rs.get(), nt, Wd0.data(), Nm * Nm, rs_t);
+            }
+            if (rank == 0) {
+              rc.ntab = dynbse_cuda::rs_ntab(rs.get());
+              app_log(1, "  [dynbse] streaming THC rung on the DEVICE: ON (layout {}, nb {}, {} rung tables {}, {:.2f} GB; mesh {} x {} x {}, "
+                         "Nm {}, nc {})", rc.layout, dynbse_cuda::rs_nb(rs.get()), rc.ntab, rs_res ? "resident" : "(reloaded per call)",
+                      dynbse_cuda::rs_bytes(rc, nrb) / 1.0e9, rc.ndim[0], rc.ndim[1], rc.ndim[2], Nm, nc);
+            }
+          }
+        }
+        if (not rs) {
+          utils::check(dyn_device_fallback_state(),
+                       "pair_space_ladder_dyn: the device streaming THC rung (vertex_debug dynbse_dev_stream) cannot run: {}. "
+                       "pol_vertex_dyn_device_fallback = false forbids the host rung: ABORTING.", why_rs);
+          if (rank == 0) app_log(1, "  [dynbse] WARNING: the device streaming THC rung cannot run ({}): MOVED TO THE CPU "
+                                    "(pol_vertex_dyn_device_fallback = true)", why_rs);
+        }
+      }
+#endif
+      // host threads (the omp_threads knob; the global OMP_NUM_THREADS stays 1): the
       // tau nodes of a rung application are independent; the body holds no MPI, no HDF5, no shared writes
       // (each tau writes its own Ys slice; the rung buffers are per call)
       const long nthr = std::max(1l, utils::omp_threads());
@@ -1020,6 +1237,7 @@ namespace solvers {
       nda::array<cplx, 4> Dc(nk, nc, nc, nout);   // external legs: aux (Nm) or Wannier-pair (nab) columns
       // per-block scratch, sized to the current RHS block width nR (the kd operator reads F.nR)
       nda::array<cplx, 4> Dblk, CbD, Vout, Fs, Ys;
+      nda::array<cplx, 4> Fs1, Ys1;   // family 1 of the fused two-family rung (dyn_fam_fuse)
       nda::array<cplx, 3> Fs3, Os3;
       nda::array<cplx, 2> Yc2;
       long nR_cur = -1;
@@ -1047,12 +1265,12 @@ namespace solvers {
         for (long q = 0; q < nq; ++q) qlist.push_back(q);
       }
       const long nql = long(qlist.size());
-      // the parallel unit is (s, q, nu) [2026-09-12]: with a long nu list and few transfers (the eps cuts)
-      // the former (s, q) units left most ranks idle; the per-(s, q) setup below is cheap next to a solve.
-      // Scheduling [2026-09-13]: with opt.sched_comm the units are handed out through a shared counter
+      // the parallel unit is (s, q, nu): with a long nu list and few transfers (the eps cuts) (s, q) units
+      // alone would leave most ranks idle; the per-(s, q) setup below is cheap next to a solve.
+      // Scheduling: with opt.sched_comm the units are handed out through a shared counter
       // (MPI_Fetch_and_op on rank 0's window) in LONGEST-FIRST order -- the nu != 0 (union-grid) units,
       // highest node first, then nu = 0 -- so the tail is one unit long instead of one round; without
-      // it the static round-robin of before (bitwise the same unit list).
+      // it a static round-robin over the same unit list.
       const long nunits_all = ns * nql * nnu;
       std::vector<long> order(static_cast<size_t>(nunits_all), 0l);
       for (long u = 0; u < nunits_all; ++u) order[size_t(u)] = u;
@@ -1062,7 +1280,7 @@ namespace solvers {
         if (za != zb) return zb;                          // nu != 0 before nu = 0
         return nu_list[size_t(ja)] > nu_list[size_t(jb)]; // then the higher node first
       };
-      // P5: with schedule = "measured" the units solved in a previous call (same (s, q, nu)) go longest-first by their
+      // with schedule = "measured" the units solved in a previous call (same (s, q, nu)) go longest-first by their
       // measured wall time; the unseen ones (unknown length) first of all; ties and the rest by the heuristic
       const bool measured = (opt.schedule == "measured" and opt.unit_cost != nullptr and not opt.unit_cost->empty());
       std::vector<double> ucost;
@@ -1086,15 +1304,12 @@ namespace solvers {
       });
       if (measured and rank == 0)
         app_log(2, "  [dynbse] unit order: measured wall times for {} of {} units (the heuristic for the rest)", n_measured, nunits_all);
-      // D-0 (gpu port plan 4d, 2026-09-26): units are handed out by TRANSFER GROUPS -- all nnu nodes of one (s, q) go to
-      // the same rank, contiguously -- so the (s, q) objects (the legs, K_big / K_s, the dense tau rungs, the pair poles)
-      // are built ONCE per group (the cache in the loop below) instead of once per unit; `order` becomes group-major
-      // (groups in the order of their earliest unit in the cost-sorted list, nu ascending inside). Every unit is still an
-      // independent solve, so the results are unchanged; vertex_debug dynbse_group_sched = 0 restores the per-unit hand-out.
-      // Gate (2026-09-26, Mac, 2 ranks, the gate binary's dynbse_readout): cache + groups ON vs OFF differ by at most 2.1e-9
-      // relative over the 37 logged readout numbers, while the OFF configuration run twice differs by 4.3e-9 -- the change is
-      // inside the run-to-run floor of the dynamically scheduled solve (the unit-to-rank assignment changes the reduction order;
-      // the resummed GMRES numbers carry the 1e-9 floor recorded in vertex_perf_plan.md). Not bitwise, by that mechanism.
+      // Units are handed out by TRANSFER GROUPS -- all nnu nodes of one (s, q) go to the same rank, contiguously -- so the
+      // (s, q) objects (the legs, K_big / K_s, the dense tau rungs, the pair poles) are built ONCE per group (the cache in
+      // the loop below) instead of once per unit; `order` becomes group-major (groups in the order of their earliest unit in
+      // the cost-sorted list, nu ascending inside). Every unit is still an independent solve, so the results agree with the
+      // per-unit hand-out up to the run-to-run floor of the dynamically scheduled solve (the unit-to-rank assignment changes
+      // the reduction order; not bitwise). vertex_debug dynbse_group_sched = 0 selects the per-unit hand-out.
       const bool group_sched = (vertex_debug::number("dynbse_group_sched", 1.0) != 0.0) and nnu > 1 and nunits_all % nnu == 0;   // vertex_debug: dynbse_group_sched
       if (group_sched) {
         const long ngrp = nunits_all / nnu;
@@ -1110,9 +1325,9 @@ namespace solvers {
         for (long g : gorder)
           for (long jn = 0; jn < nnu; ++jn) order.push_back(g * nnu + jn);
       }
-      // the hand-out CHUNKS over `order` (2026-09-27): a whole transfer group per hand-out leaves ranks idle when the number of
-      // groups is not a large multiple of the rank count (the conv_vertex coarse dumps: 64 groups of 40 nodes on 56 ranks ->
-      // 8 ranks take a second group while 48 wait); each group is therefore split into nsplit contiguous sub-chunks of about
+      // the hand-out CHUNKS over `order`: a whole transfer group per hand-out leaves ranks idle when the number of
+      // groups is not a large multiple of the rank count (e.g. 64 groups on 56 ranks: 8 ranks take a second group
+      // while 48 wait); each group is therefore split into nsplit contiguous sub-chunks of about
       // `target` units, with target sized for >= ~4 chunks per rank. The (s, q) objects are then built once per CHUNK (a
       // rank that draws two sub-chunks of the same transfer in a row still reuses them).
       std::vector<long> cbeg, clen;
@@ -1166,7 +1381,7 @@ namespace solvers {
       std::ofstream dump_out;
       if (not opt.dump_prefix.empty()) {
         namespace fs = std::filesystem;
-        const fs::path pfx(opt.dump_prefix);
+        const fs::path pfx(opt.dump_prefix + ".fp" + fp_hex);   // the input fingerprint names the dumps
         const std::string stem = pfx.filename().string() + ".r";
         const fs::path dir = pfx.parent_path().empty() ? fs::path(".") : pfx.parent_path();
         long nrec = 0;
@@ -1177,46 +1392,102 @@ namespace solvers {
             std::ifstream in(e.path(), std::ios::binary);
             while (in) {
               long hdr[5];
-              if (not in.read(reinterpret_cast<char *>(hdr), sizeof(hdr))) break;
-              if (hdr[3] != nout or hdr[4] != 4) break;
+              if (not in.read(reinterpret_cast<char *>(hdr), sizeof(hdr))) break;   // clean end of file
+              // a malformed record aborts (never skipped silently); a record cut short by a killed
+              // writer at the END of the file is the one tolerated case (its unit is re-solved), and it is logged
+              utils::check(hdr[3] == nout and hdr[4] == 4, "pair_space_ladder_dyn: malformed unit-dump record in {} (header {} {} {} {} {}, "
+                           "expected nout {} and 4 columns). ABORTING: delete the dump files to recompute.", e.path().string(), hdr[0],
+                           hdr[1], hdr[2], hdr[3], hdr[4], nout);
               std::vector<cplx> blk(static_cast<size_t>(4 * nout * nout));
-              if (not in.read(reinterpret_cast<char *>(blk.data()), std::streamsize(blk.size() * sizeof(cplx)))) break;
+              if (not in.read(reinterpret_cast<char *>(blk.data()), std::streamsize(blk.size() * sizeof(cplx)))) {
+                app_log(1, "  [dynbse] WARNING: unit-dump {} ends with a truncated record (unit s {} q {} nu node {}): it is re-solved",
+                        e.path().string(), hdr[0], hdr[1], hdr[2]);
+                break;
+              }
               dumped[std::make_tuple(hdr[0], hdr[1], hdr[2])] = std::move(blk);
               ++nrec;
             }
           }
         if (rank == 0)
-          app_log(1, "  [dynbse] unit dump \"{}.r*.bin\": {} finished units found (loaded, not re-solved)", opt.dump_prefix, nrec);
-        dump_out.open(opt.dump_prefix + ".r" + std::to_string(rank) + ".bin", std::ios::binary | std::ios::app);
+          app_log(1, "  [dynbse] unit dump \"{}.r*.bin\": {} finished units found for this input fingerprint (loaded, not re-solved)",
+                  pfx.string(), nrec);
+        dump_out.open(pfx.string() + ".r" + std::to_string(rank) + ".bin", std::ios::binary | std::ios::app);
       }
       long pos = rank;                                    // the static hand-out's chunk index
       long units_taken = 0;
       db::tfold_ratio_ref() = opt.tfold;
-      // the (s, q) cache (D-0): built when the unit's transfer differs from the last one built; with the group hand-out
+      // the (s, q) cache: built when the unit's transfer differs from the last one built; with the group hand-out
       // every rank sees each transfer's nu nodes contiguously, so the objects are built once per group
       long last_sq = -1;
       std::vector<long> trep(static_cast<size_t>(nt), -1);
+      std::vector<std::pair<long, long>> rep_nodes;     // the (one or two) tau nodes of each representative
+      // mirror-pair rung gemms (vertex_debug dyn_rung_pair = 0 selects the per-node gemms)
+      const bool rung_pair = (vertex_debug::number("dyn_rung_pair", 1.0) != 0.0);   // vertex_debug: dyn_rung_pair
       long ndist = 0;
       nda::array<cplx, 3> Kd_s;
       nda::array<cplx, 2> Kd0;
       std::optional<db::pair_poles> Pcache;
       std::map<long, db::shift_tables> stab_cache;         // the twisted-pair tables depend on the nu node alone
+      // NO SILENT WORKFLOW CHANGES. A device stage that does not fit moves to the CPU only when
+      // pol_vertex_dyn_device_fallback = true (with a WARNING); otherwise the run aborts with the reason.
+      auto dev_fallback = [&](std::string const &what, std::string const &why_s) {
+        utils::check(dyn_device_fallback_state(),
+                     "pair_space_ladder_dyn: {} cannot run on the device ({}). pol_vertex_dyn_device_fallback = false forbids moving it "
+                     "to the CPU: ABORTING. Set pol_vertex_dyn_device_fallback = true to allow the CPU path, or use devices with more "
+                     "memory (e.g. H100-SXM5 94 GB / H200), or reduce the footprint (vertex_debug dyn_rung_rank = R).", what, why_s);
+        app_log(1, "  [dynbse] WARNING (rank {}): {} cannot run on the device ({}): MOVED TO THE CPU (pol_vertex_dyn_device_fallback = true)",
+                rank, what, why_s);
+      };
+      (void)dev_fallback;                                  // (a CPU build has no device stage)
+      // the dressed-leg request and whether this pass can honour it ("on" + a pass that cannot use it aborts; "auto" runs the
+      // standard path there and logs it; the static-only pass has no dynamic rung: nothing to dress)
+      // pol_vertex_dyn_dressed (auto | on | off; vertex_debug dyn_dressed = 1 | 0 overrides with on | off)
+      const double dr_dbg = vertex_debug::number("dyn_dressed", -1.0);   // vertex_debug: dyn_dressed
+      const std::string dressed_mode = (dr_dbg >= 0.0) ? std::string(dr_dbg != 0.0 ? "on" : "off") : dyn_dressed_state();
+      const bool dressed_sig_ok = (opt.sigma == nullptr) or (opt.sigma->col == "dyn1" or opt.sigma->col == "dyn1_bare" or
+                                                             opt.sigma->col == "static_dyn");
+      const bool dressed_fits = (opt.gamma1_only or opt.one_rung_only) and not opt.static_only and dressed_sig_ok;
+      const bool dressed_req = (dressed_mode != "off") and dressed_fits;
+      // pol_vertex_dyn_gamma1_only on the Neumann path (gmres = 0) would run the full resummation while the caller
+      // logs it as skipped -- abort (the dressed / one-rung / static paths do not reach the Neumann solver)
+      utils::check(not (opt.gamma1_only and opt.gmres_m <= 0 and not opt.static_only and not opt.one_rung_only and not dressed_req),
+                   "pair_space_ladder_dyn: pol_vertex_dyn_gamma1_only = true with the Neumann solver (pol_vertex_dyn_gmres = 0) is not "
+                   "implemented (the Neumann path runs the full resummation). ABORTING: use pol_vertex_dyn_gmres > 0.");
+      const std::string dressed_why = (opt.sigma != nullptr and not dressed_sig_ok) ? "Sigma column " + opt.sigma->col
+                                                                                   : std::string("the full GMRES resummation");
+      utils::check(not (dressed_mode == "on" and not opt.static_only and not dressed_fits),
+                   "pair_space_ladder_dyn: pol_vertex_dyn_dressed = on (required) but this dynamic pass cannot use the dressed legs "
+                   "({}): ABORTING. The dressed legs apply to the Gamma_1-only / one-bare-rung passes (pol_vertex_dyn_gamma1_only = "
+                   "true) and the Sigma columns dyn1 / dyn1_bare / static_dyn; use \"auto\" to run the standard path on the others.",
+                   dressed_why);
+      if (rank == 0 and not opt.static_only)
+        app_log(1, "  [dynbse] dressed legs (pol_vertex_dyn_dressed = {}): {}", dressed_mode,
+                dressed_req ? std::string("ON for this pass")
+                            : (dressed_mode == "off" ? std::string("off -- the standard path runs")
+                                                     : "not applicable to " + dressed_why + " -- the standard path runs"));
 #if defined(ENABLE_CUDA)
-      // THE DEVICE-RESIDENT UNIT (gpu port plan 4d, 2026-09-27): the Gamma_1 block -- both ls_apply's (L0, T_s through a
+      // THE DEVICE-RESIDENT UNIT: the Gamma_1 block -- both ls_apply's (L0, T_s through a
       // cuSOLVER LU of 1 - Cb K_s) and K_d (the DLR expansion, the dense tau rungs, the refit) -- runs on the device with
       // the (s, q) rung objects resident; the host uploads the external leg block and reads Gsum0 / Gsum1 (+ y1 for the
       // Sigma deposits). Scope: the dense rung, the Gamma_1-only GMRES path, the unmasked basis, the batched L0; anything
-      // else keeps the host path. vertex_debug dynbse_dev_unit = 0 disables it (the A/B).
+      // else keeps the host path. vertex_debug dynbse_dev_unit = 0 disables it.
       std::unique_ptr<dynbse_cuda::unit_engine, void (*)(dynbse_cuda::unit_engine *)> ue(nullptr, dynbse_cuda::ue_destroy);
+      // the streaming rung inside the device-resident unit (dense_rung = false with the device streaming rung and its
+      // tables resident); vertex_debug dynbse_dev_stream_unit = 0 keeps the host-driven streaming path
+      const bool ue_stream = (not opt.dense_rung and rs and rs_res and vertex_debug::number("dynbse_dev_stream_unit", 1.0) != 0.0);
       const bool ue_want = db::l0_device_enabled() and vertex_debug::number("dynbse_dev_unit", 1.0) != 0.0 and   // vertex_debug: dynbse_dev_unit
-                           opt.dense_rung and opt.gmres_m > 0 and opt.gamma1_only and not opt.static_only and
+                           (opt.dense_rung or ue_stream) and opt.gmres_m > 0 and opt.gamma1_only and not opt.static_only and
                            not opt.one_rung_only and db::l0_cols_state() and not b.npf_mask and
                            not (opt.sigma != nullptr and opt.sigma->col == "dyn");
+      if (rank == 0 and db::l0_device_enabled() and not ue_want)
+        app_log(1, "  [dynbse] WARNING: the device-resident unit does not cover this pass (scope: dense rung, GMRES Gamma_1-only, "
+                   "unmasked basis, no resummed Sigma column; static_only {} one_rung_only {} gamma1_only {} dense {} gmres {}): its units "
+                   "run on the CPU with the device L0", opt.static_only, opt.one_rung_only, opt.gamma1_only, opt.dense_rung, opt.gmres_m);
       bool ue_tried = false;
       db::l0_table_store ue_store;
-      sigma_dyn_dev sd_dev;                                // D-3: the Sigma deposits on the engine (off = the host deposits)
+      sigma_dyn_dev sd_dev;                                // the Sigma deposits on the engine (off = the host deposits)
 #endif
-      bool kb_dev = false;                                 // D-1b: the rungs are built on the device (the host K_d arrays stay empty)
+      bool kb_dev = false;                                 // the rungs are built on the device (the host K_d arrays stay empty)
       if (met) { met->unit_diag = nda::array<double, 2>(nunits_all, 13); met->unit_diag() = 0.0; }
       for (long u = next_unit(pos); u >= 0; u = next_unit(pos)) {
         ++units_taken;
@@ -1224,7 +1495,7 @@ namespace solvers {
         const long sq = u / nnu, jn_unit = u % nnu;
         const long is = sq / nql, iq = qlist[size_t(sq % nql)];
         if (opt.Pi_bub != nullptr) {
-          // LFF-aux L-0: the window bubble of this unit in the output frame, (spin/nk) D^dag Cb(q, i nu) D. The legs
+          // the window bubble of this unit in the output frame, (spin/nk) D^dag Cb(q, i nu) D. The legs
           // and Cb are the unit's own (rebuilt below for the solve: cheap, and the solve path stays untouched).
           const long m_b = nu_list[size_t(jn_unit)];
           for (long k = 0; k < nk; ++k) {
@@ -1253,8 +1524,8 @@ namespace solvers {
           }
         }
         if (sig_ckpt and sig_done.count(std::make_tuple(is, iq, nu_list[size_t(jn_unit)]))) {
-          if (met) { ++met->nunits; ++met->nconv; }
-          continue;                                             // P20: the deposits of this unit are in a loaded checkpoint
+          if (met) { ++met->nunits; ++met->nconv; ++met->n_restored; }   // restored, reported separately
+          continue;                                             // the deposits of this unit are in a loaded checkpoint
         }
         if (not dumped.empty()) {
           auto it_d = dumped.find(std::make_tuple(is, iq, nu_list[size_t(jn_unit)]));
@@ -1272,25 +1543,25 @@ namespace solvers {
               for (long e = 0; e < nout * nout and not any; ++e) any = (blk[size_t(nout * nout + e)] != cplx(0.0));
               if (any) ++met->r1_fused; else ++met->r1_missing;
             }
-            if (met) { ++met->nunits; ++met->nconv; }
+            if (met) { ++met->nunits; ++met->nconv; ++met->n_restored; }   // restored, reported separately
             continue;
           }
         }
         if (rank == 0)
           app_log(2, "  [dynbse] rank 0 takes unit {} (s {}, q {}, nu node {}), its {}-th{}", u, is, iq,
                   nu_list[size_t(jn_unit)], units_taken, dyn_sched ? " (dynamic scheduling)" : "");
-        // D-0: the (s, q) objects of this transfer are not cached yet; vertex_debug dynbse_sq_cache = 0 rebuilds them for
-        // every unit (the A/B of the cache: bitwise identical results, the objects do not depend on nu)
+        // the (s, q) objects of this transfer are not cached yet; vertex_debug dynbse_sq_cache = 0 rebuilds them for
+        // every unit (bitwise identical results: the objects do not depend on nu)
         static const bool sq_cache = (vertex_debug::number("dynbse_sq_cache", 1.0) != 0.0);   // vertex_debug: dynbse_sq_cache
         const bool build_sq = (sq != last_sq) or not sq_cache;
         if (build_sq) {
-        // ---- the external legs of this unit: aux (window) or the MLWF pair E (Wannier, W-int-0) --------
+        // ---- the external legs of this unit: aux (window) or the MLWF pair E (Wannier) ----------------
         for (long k = 0; k < nk; ++k) {
           const long kq = kpq(iq, k);
           if (wan) {
-            // W-int-1: the inputs are in the MLWF frame, so the Wannier-PAIR readout is the identity on the
+            // the inputs are in the MLWF frame, so the Wannier-PAIR readout is the identity on the
             // pair labels: column N = a nc + b picks the (hole a at k, particle b at k+q) MLWF pair. For a
-            // unitary U this equals W-int-0's U-leg sandwich on band-frame inputs; for an isometry (M < nW,
+            // unitary U this equals the U-leg sandwich on band-frame inputs; for an isometry (M < nW,
             // a disentangled C) it is the only consistent form (the kernel runs on the M-dim C).
             for (long a = 0; a < nc; ++a)
               for (long bb2 = 0; bb2 < nc; ++bb2)
@@ -1315,19 +1586,63 @@ namespace solvers {
             trep[size_t(i)] = slot;
           }
           ndist = long(reps.size());
+          rep_nodes.assign(size_t(ndist), {-1l, -1l});
+          for (long i = 0; i < nt; ++i) {
+            auto &pr = rep_nodes[size_t(trep[size_t(i)])];
+            if (pr.first < 0) pr.first = i; else pr.second = i;
+          }
         }
 #if defined(ENABLE_CUDA)
         if (ue_want and not ue_tried) {                   // created at the first transfer (ndist is known), before its rungs
           ue_tried = true;
           dynbse_cuda::ue_config uc;
           uc.np = np; uc.np_fit = b.np_fit; uc.nk = nk; uc.nc = nc; uc.ng = ng; uc.nt = nt; uc.nR_max = nrb;
-          uc.ndist = ndist; uc.n_kept = b.pf.n_kept; uc.nout = nout;
+          uc.ndist = (rrank > 0) ? rrank : ndist; uc.n_kept = b.pf.n_kept; uc.nout = nout;   // R rung slots when frequency-factorized
           uc.l0_fused = int(vertex_debug::number("dynbse_l0_fused", 2.0));        // vertex_debug: dynbse_l0_fused (0 | 1 | 2 = merged)
           uc.l0_fz_cfg = int(vertex_debug::number("dynbse_l0_fz_cfg", 44.0));     // vertex_debug: dynbse_l0_fz_cfg
           uc.l0_fz_bench = int(vertex_debug::number("dynbse_l0_fz_bench", 0.0)); // vertex_debug: dynbse_l0_fz_bench
           uc.l0_asm_gemm = int(vertex_debug::number("dynbse_l0_asm_gemm", 1.0));  // vertex_debug: dynbse_l0_asm_gemm
+          // the memory policy of the dense rungs (pol_vertex_dyn_device_memory): the resident count and the sources of the others
+          // (device rebuild, needs the device rung builds = nosym meshes; pinned-host copy), and the device bytes the engine leaves
+          // free for the stages created after it -- rung builds, Sigma deposits, dressed legs -- computed with their own formulas.
+          // vertex_debug dynbse_dev_nres = n forces n resident rungs (exercises the non-resident paths); -1 = the most that fit.
+          {
+            auto const &mpol = dyn_device_memory_state();
+            const bool kb_will = not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0;
+            uc.nres = long(vertex_debug::number("dynbse_dev_nres", -1.0));   // vertex_debug: dynbse_dev_nres
+            // vertex_debug: dynbse_dev_rung_fuse = 1 packs the one-bare-rung and Gamma_1 inputs into one rung pass (more device
+            // memory; slower than two passes when the rungs are resident and the gemms are compute-bound)
+            uc.rung_fuse = int(vertex_debug::number("dynbse_dev_rung_fuse", 0.0));
+            uc.stream = ue_stream ? 1 : 0;
+            if (ue_stream) { uc.rung_fuse = 0; uc.nres = 0; }
+            uc.partial_ok = kb_will ? 1 : 0;
+            uc.nonres_src = (mpol == "auto") ? 0 : (mpol == "rebuild" ? 1 : (mpol == "host" ? 2 : 3));
+            if (rrank > 0) uc.nonres_src = 3;   // the frequency-factorized rung keeps all R slots resident
+            utils::check(not (mpol == "rebuild" and not kb_will and not ue_stream),
+                         "pair_space_ladder_dyn: pol_vertex_dyn_device_memory = rebuild needs the device rung builds ({}). ABORTING: use "
+                         "auto or host.", sym ? "a symmetry-reduced mesh has none" : "vertex_debug dynbse_dev_kbig = 0");
+            const long nrep_b = (rrank > 0) ? rrank : ndist;
+            const bool sd_will = opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma);
+            const bool dr_will = dressed_req and (opt.sigma == nullptr or sd_will);
+            double later = 0.0;
+            if (kb_will) later += dynbse_cuda::ue_kb_bytes(ns, nq, Nm, nk, nc, nrep_b) / 0.9;
+            if (sd_will) {
+              dynbse_cuda::sd_config sc;
+              sc.nt = nt; sc.nw_f = long(tools.ft->Ttw_ff().shape(1)); sc.ns = ns; sc.nk = nk; sc.nc = nc; sc.np = np;
+              sc.np_fit = b.np_fit; sc.ng = ng; sc.Nm = Nm;
+              later += dynbse_cuda::ue_sd_bytes(sc, nrb) / 0.9;
+            }
+            if (dr_will) later += dynbse_cuda::ue_dressed_bytes(ng, np, nk, nc, nout, nrb) / 0.9;
+            uc.reserve_bytes = later + 0.5e9 + 1.0e9 * vertex_debug::number("dyn_dev_extra_gb", 0.0);   // vertex_debug: dyn_dev_extra_gb
+            if (rank == 0)
+              app_log(1, "  [dynbse] device memory policy \"{}\": {:.2f} GB kept free for the later device stages (rung builds {}, "
+                         "Sigma deposits {}, dressed legs {})", mpol, uc.reserve_bytes / 1e9, kb_will, sd_will, dr_will);
+          }
           char why[256] = {0};
           ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
+          if (ue) {                                       // the rung form (mirror pairs / frequency-factorized)
+            dynbse_cuda::ue_set_rung_mode(ue.get(), rung_pair, rrank, rrank > 0 ? c_tr.data() : nullptr);
+          }
           if (ue) {                                       // the basis' DLR refit at its fixed rank (basis_coeffs, npf_mask off)
             auto const &pf = b.pf;
             utils::check(pf.np == b.np_fit and pf.nt == nt and pf.n_kept == b.pf.n_kept,
@@ -1336,31 +1651,72 @@ namespace solvers {
             Utk() = pf.Ut(nda::range(0, pf.n_kept), all);
             Vsk() = pf.Vs(all, nda::range(0, pf.n_kept));
             dynbse_cuda::ue_set_basis(ue.get(), b.KF.data(), b.KF2.data(), Utk.data(), Vsk.data(), Kck.data());
+            if (ue_stream) dynbse_cuda::ue_set_stream(ue.get(), rs.get());
           }
-          if (rank == 0)
-            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated){}{}", ue ? "ON" : "OFF, the host path runs",
-                    dynbse_cuda::ue_bytes(uc) / 1e9, ue ? "" : " -- ", ue ? "" : why);
-          // D-1b: the rungs built on the device (nosym meshes); vertex_debug dynbse_dev_kbig = 0 keeps the host builds (the A/B)
+          if (rank == 0) {
+            dynbse_cuda::ue_config ucr = uc;
+            if (ue) { ucr.nres = dynbse_cuda::ue_nres(ue.get()); ucr.rung_fuse = dynbse_cuda::ue_rung_fused(ue.get()) ? 1 : 0; }
+            const std::string resid = (ue and ucr.nres < ndist)
+                ? "; tau rungs resident " + std::to_string(ucr.nres) + " of " + std::to_string(ndist) +
+                  ", the others rebuilt on the device or copied from pinned host memory per application" : std::string();
+            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated{}, {:.1f} GB reserved{}{}){}{}", ue ? "ON" : "OFF",
+                    dynbse_cuda::ue_bytes(ucr) / 1e9, resid, uc.reserve_bytes / 1e9,
+                    (ue and ucr.rung_fuse) ? "; two inputs per rung pass" : "", ue_stream ? "; STREAMING rung" : "", ue ? "" : " -- ", ue ? "" : why);
+          }
+          if (not ue) dev_fallback("the device-resident unit", why);
+          // the rungs built on the device (nosym meshes); vertex_debug dynbse_dev_kbig = 0 keeps the host builds
           if (ue and not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0) {   // vertex_debug: dynbse_dev_kbig
-            nda::array<cplx, 4> Wreps(ndist, nq, Nm, Nm);
-            for (long r = 0; r < ndist; ++r) Wreps(r, all, all, all) = Wd_s(all, reps[size_t(r)], all, all);
+            const long nrep_dev = (rrank > 0) ? rrank : ndist;     // frequency-factorized: K_r = K[A_r] in the rung slots
+            nda::array<cplx, 4> Wreps(nrep_dev, nq, Nm, Nm);
+            for (long r = 0; r < nrep_dev; ++r)
+              if (rrank > 0) Wreps(r, all, all, all) = A_rq(r, all, all, all);
+              else if (brank > 0) {
+                // the hybrid build on the device -- K is linear in W, so building from W_hyb(rep) = sum_r c_r(rep) A_r is
+                // the host hybrid K_d(rep) = sum_r c_r(rep) K[A_r] to rounding
+                Wreps(r, all, all, all) = cplx(0.0);
+                for (long rf = 0; rf < brank; ++rf) Wreps(r, all, all, all) += c_tr(reps[size_t(r)], rf) * A_rq(rf, all, all, all);
+              } else Wreps(r, all, all, all) = Wd_s(all, reps[size_t(r)], all, all);
             nda::array<cplx, 3> W0c(W0b), Wd0c(Wd0);
             nda::array<long, 2> qxc(qx_of);
             nda::array<cplx, 4> Xc(Xb);
             char whyk[256] = {0};
-            kb_dev = dynbse_cuda::ue_kb_init(ue.get(), ns, nq, Nm, Xc.data(), qxc.data(), W0c.data(), Wd0c.data(), Wreps.data(), ndist,
+            kb_dev = dynbse_cuda::ue_kb_init(ue.get(), ns, nq, Nm, Xc.data(), qxc.data(), W0c.data(), Wd0c.data(), Wreps.data(), nrep_dev,
                                              1.0e6 * double(utils::freemem_device_effective()), whyk, 256);
             if (rank == 0)
-              app_log(1, "  [dynbse] device rung builds (K_s, K_d(s), K_d0): {}{}", kb_dev ? "ON" : "OFF, built on the host -- ",
-                      kb_dev ? "" : whyk);
+              app_log(1, "  [dynbse] device rung builds (K_s, K_d(s), K_d0): {}{}", kb_dev ? "ON" : "OFF -- ", kb_dev ? "" : whyk);
+            if (not kb_dev) dev_fallback("the device rung builds (K_s, K_d(s), K_d0)", whyk);
+          } else if (ue and rank == 0) {
+            app_log(1, "  [dynbse] WARNING: the device rung builds do not cover this run ({}): K_s, K_d(s), K_d0 are built on the CPU "
+                       "and uploaded", sym ? "a symmetry-reduced mesh" : "vertex_debug dynbse_dev_kbig = 0");
           }
           if (ue and opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma)) {
             std::string why_sd;
-            const bool ok = sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, G_CC, nk, nc, ng, epsG, Nm, tools, why_sd);
+            const bool ok = opt.sigma->wannier_closure()   // Wannier mode: the deposits' closure G
+                ? sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, opt.sigma->G_close, nk, nc, ng, epsG, Nm, tools, why_sd)
+                : sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, G_CC, nk, nc, ng, epsG, Nm, tools, why_sd);
             if (rank == 0)
               app_log(1, "  [dynbse] device Sigma deposits: {}{}", ok ? "ON (accumulators resident, flushed at checkpoints and the end)"
-                                                                        : "OFF, the host deposits run -- ", ok ? "" : why_sd);
+                                                                        : "OFF -- ", ok ? "" : why_sd);
             if (ok) sd_flush_hook = [&]() { sigma_dyn_device_flush(*opt.sigma, sd_dev, ue.get()); };
+            else dev_fallback("the device Sigma deposits", why_sd);
+          } else if (ue and opt.sigma != nullptr and rank == 0) {
+            app_log(1, "  [dynbse] WARNING: the device Sigma deposits do not support this configuration (Wannier pairs or the Sigma "
+                       "column); the Sigma deposits run on the CPU");
+          }
+          // the device dressed-leg path needs the device Sigma deposits. Without them the dressed legs run only
+          // on the host unit: move the whole unit to the CPU when allowed, else abort -- never fall back to the standard path.
+          if (ue and dressed_req and opt.sigma != nullptr and not sd_dev.on) {
+            // a SCOPE limit (the device deposits do not cover Wannier pairs / this Sigma configuration) moves the unit to
+            // the CPU with a WARNING (the answer does not change); a MEMORY failure goes through pol_vertex_dyn_device_fallback
+            const bool sd_scope = (not wan) and sigma_dyn_device_ok(*opt.sigma);
+            if (sd_scope)
+              dev_fallback("the device dressed-leg path with the Sigma hook (it needs the device Sigma deposits, which do not fit)",
+                           "the device Sigma deposits are off");
+            if (rank == 0)
+              app_log(1, "  [dynbse] WARNING: the device-resident unit is released{}; the dressed-leg units run on the CPU",
+                      sd_scope ? "" : " (the device Sigma deposits do not support this configuration: Wannier pairs or the Sigma column)");
+            ue.reset();
+            kb_dev = false;
           }
         }
         if (kb_dev) {
@@ -1389,21 +1745,38 @@ namespace solvers {
         }
         // the dense per-tau rungs K_d(s) and the constant part
         if (opt.dense_rung) {
-          Kd_s = nda::array<cplx, 3>(ndist, D, D);
+          Kd_s = nda::array<cplx, 3>(rrank > 0 ? rrank : ndist, D, D);
           Kd0 = nda::array<cplx, 2>(D, D);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
-          for (long r = 0; r < ndist; ++r) {
-            auto Wr = Wd_s(all, reps[size_t(r)], all, all);
+          for (long r = 0; r < (rrank > 0 ? rrank : ndist); ++r) {
             auto Kr = Kd_s(r, all, all);
-            build_kbig(Xb, Wr, is, iq, kpq, qx_of, Kr, symc);
+            if (rrank > 0) build_kbig(Xb, A_rq(r, all, all, all), is, iq, kpq, qx_of, Kr, symc);   // frequency-factorized: K_r
+            else if (brank > 0) continue;                                                        // (the hybrid: below)
+            else build_kbig(Xb, Wd_s(all, reps[size_t(r)], all, all), is, iq, kpq, qx_of, Kr, symc);
+          }
+          if (brank > 0) {
+            nda::array<cplx, 3> Kfac(brank, D, D);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
+            for (long r = 0; r < brank; ++r) {
+              auto Kr = Kfac(r, all, all);
+              build_kbig(Xb, A_rq(r, all, all, all), is, iq, kpq, qx_of, Kr, symc);
+            }
+            const long DD = D * D;
+#pragma omp parallel for schedule(static) num_threads(nthr)
+            for (long x = 0; x < DD; ++x)
+              for (long rep = 0; rep < ndist; ++rep) {
+                cplx acc(0.0);
+                for (long r = 0; r < brank; ++r) acc += c_tr(reps[size_t(rep)], r) * Kfac.data()[r * DD + x];
+                Kd_s.data()[rep * DD + x] = acc;
+              }
           }
           build_kbig(Xb, Wd0, is, iq, kpq, qx_of, Kd0, symc);
           if (rank == 0 and units_taken == 1)
             app_log(2, "  [dynbse] dense tau rungs: {} distinct PH-sym tau nodes of {}, {:.2f} GB per rank", ndist, nt,
                     double(ndist) * double(D) * double(D) * 16.0 / 1.0e9);
-          if (rank == 0 and units_taken == 1 and vertex_debug::flag("rung_rank")) {
-            // P10 measurement (vertex_perf_plan.md; vertex_debug rung_rank = 1): the tau rank of the dense rung -- the singular
-            // values of the (ndist x D^2) stack [K_d(s_r)]_r; a low-rank-over-tau rung (P10) pays only if the rank at 1e-8 is
+          if (rank == 0 and units_taken == 1 and rrank == 0 and vertex_debug::flag("rung_rank")) {
+            // diagnostic (vertex_debug rung_rank = 1): the tau rank of the dense rung -- the singular
+            // values of the (ndist x D^2) stack [K_d(s_r)]_r; a low-rank-over-tau rung pays only if the rank at 1e-8 is
             // well below ndist. Logged once, for the first unit of rank 0 (an (ndist x ndist) Gram eigenproblem).
             nda::matrix<cplx> Gm(ndist, ndist);
             for (long r = 0; r < ndist; ++r)
@@ -1425,7 +1798,7 @@ namespace solvers {
               if (s1 > 1e-4) ++n4;
               char buf[32]; std::snprintf(buf, sizeof(buf), "%.1e ", s1); sv += buf;
             }
-            app_log(1, "  [dynbse] P10 rung-rank meter (unit s {} q {}): {} tau nodes, singular values / |K_d|_F: {}-> rank {} at 1e-4, {} at 1e-8",
+            app_log(1, "  [dynbse] rung-rank meter (unit s {} q {}): {} tau nodes, singular values / |K_d|_F: {}-> rank {} at 1e-4, {} at 1e-8",
                     is, iq, ndist, sv, n4, n8);
           }
         }
@@ -1438,15 +1811,23 @@ namespace solvers {
             gkq(all, k, all, all) = gC(is, all, kpq(iq, k), all, all);
           }
           Pcache.emplace(db::make_pair_poles(tools.beta, epsG, gk, gkq, gnode0, (gmap.size() > 0) ? &gmap : nullptr));
+          // an ACCIDENTAL degeneracy eps(a) == epsG(j) with a != gnode(j) (duplicate / coinciding nodes) aborts: the fused
+          // device L0 would zero those terms silently, the other kernels would divide by zero
+          for (long a = 0; a < b.np; ++a)
+            for (long j = 0; j < Pcache->ng; ++j)
+              utils::check(not (b.eps(a) == Pcache->epsG(j) and a != Pcache->gnode(j)),
+                           "pair_space_ladder_dyn: vertex node {} (eps {:.17g}) coincides with G pole {} which is attached to node {} -- a "
+                           "degenerate node set (duplicate nodes). ABORTING.", a, b.eps(a), j, Pcache->gnode(j));
         }
         last_sq = sq;
 #if defined(ENABLE_CUDA)
         if (ue) {
+          if (ue_stream and rs_sq != is * nq + iq) { dynbse_cuda::rs_set_sq(rs.get(), is, &kpq(iq, 0)); rs_sq = is * nq + iq; }
           if (not kb_dev) dynbse_cuda::ue_set_rung(ue.get(), Ks.data(), Kd_s.data(), Kd0.data(), trep.data(), scale_k);
           dynbse_cuda::ue_set_legs(ue.get(), Dc.data());
         }
 #endif
-        }                                                 // end of the (s, q) build (D-0)
+        }                                                 // end of the (s, q) build
         if (met) met->t_kbig += watch.lap();
         if (opt.sigma != nullptr) ++opt.sigma->nunits;
         auto const &P = *Pcache;
@@ -1460,6 +1841,10 @@ namespace solvers {
           y.zero();
           double fe = 0.0;
           const long nR = F.nR;           // the RHS block width of this solve
+          // the gemms OUTSIDE the omp regions below (the tau expansion KF . fam, the DLR refit, the constant part K_d0 . Fsum)
+          // run on the rank's threads (vertex_debug kd_blas_threads = 0 keeps the configured BLAS threads)
+          static const bool kd_thr = (vertex_debug::number("kd_blas_threads", 1.0) != 0.0);   // vertex_debug: kd_blas_threads
+          auto bthr = [&](bool on) { if (kd_thr) utils::apply_blas_threads(on ? nthr : std::max(1l, utils::blas_threads())); };
           utils::check(nR == nR_cur and y.nR == nR and Fsum.shape(3) == nR, "pair_space_ladder_dyn: kd block width mismatch.");
           const bool nu0 = (inu_cur == cplx(0.0));
           const bool dbg = (rank == 0 and units_taken == 1);
@@ -1470,25 +1855,96 @@ namespace solvers {
           // inu = 0: family 1 (U_j^2 at the union's G nodes, kernel KF2) joins family 0 in ONE refit;
           // inu != 0: family 1 = the twisted pairs, its own refit (the phi_nu factor rides along)
           const long nfam = nu0 ? 1 : 2;
+          // inu != 0 with both families present -- ONE mirror-pair gemm per representative carries both
+          // families' tau columns (D x D)(D x 4 nR): K_d(rep) is streamed once per application instead of twice (the per-tau
+          // gemms are bandwidth-bound on the host). Same products, same refits (vertex_debug dyn_fam_fuse = 0: one gemm per family).
+          auto fam_nz = [&](long ff) {
+            for (auto const &v : F.fam(ff, nda::ellipsis{})) if (v != cplx(0.0)) return true;
+            return false;
+          };
+          static const bool fam_fuse = (vertex_debug::number("dyn_fam_fuse", 1.0) != 0.0);   // vertex_debug: dyn_fam_fuse
+          const bool fuse2 = fam_fuse and nfam == 2 and opt.dense_rung and rung_pair and rrank == 0 and fam_nz(0) and fam_nz(1);
+          if (fuse2 and (Fs1.shape(0) != nt or Fs1.shape(3) != nR)) {
+            Fs1 = nda::array<cplx, 4>(nt, nk, nc2, nR);
+            Ys1 = nda::array<cplx, 4>(nt, nk, nc2, nR);
+          }
           for (long fam = 0; fam < nfam; ++fam) {
             bool anyf = false;
             for (long ff = fam; ff < (nu0 ? 2 : fam + 1) and not anyf; ++ff)
               for (auto const &v : F.fam(ff, nda::ellipsis{})) { if (v != cplx(0.0)) { anyf = true; break; } }
             if (not anyf) continue;
+            const bool fused_done = fuse2 and fam == 1;    // family 1 already went through the fused rung of family 0
+            vertex_ladder_detail::prof_watch kwatch;
+            if (not fused_done) {
             // tau values (nt, nk, nc2, nR) = KF (nt, np) . fam (np, nk nc2 nR)   [+ KF2 . fam1 at inu = 0]
             auto Fs2 = nda::reshape(Fs, std::array<long, 2>{nt, nk * nc2 * nR});
             Fs2() = cplx(0.0);
-            // O-1: the family goes into the gemm as a reshaped view (before: a 0.3-4.5 GB copy into a fresh array
-            // per family per application)
+            // the family goes into the gemm as a reshaped view (no copy into a fresh array per family per application)
             nda::array<cplx, 2> KFc(nt, np);
+            bthr(true);
             for (long ff = fam; ff < (nu0 ? 2 : fam + 1); ++ff) {
               auto fam2 = nda::reshape(F.fam(ff, nda::ellipsis{}), std::array<long, 2>{np, nk * nc2 * nR});
               for (long i = 0; i < nt; ++i)
                 for (long p = 0; p < np; ++p) KFc(i, p) = cplx((ff == 1 and nu0) ? b.KF2(i, p) : b.KF(i, p));
               nda::blas::gemm(cplx(1.0), KFc, fam2, cplx(1.0), Fs2);
             }
-            vertex_ladder_detail::prof_watch kwatch;
-            if (opt.dense_rung) {
+            if (fuse2) {                                   // family 1's tau values (inu != 0: KF)
+              auto Fs12 = nda::reshape(Fs1, std::array<long, 2>{nt, nk * nc2 * nR});
+              auto fam12 = nda::reshape(F.fam(1, nda::ellipsis{}), std::array<long, 2>{np, nk * nc2 * nR});
+              for (long i = 0; i < nt; ++i)
+                for (long p = 0; p < np; ++p) KFc(i, p) = cplx(b.KF(i, p));
+              nda::blas::gemm(cplx(1.0), KFc, fam12, cplx(0.0), Fs12);
+            }
+            bthr(false);
+            kwatch.lap();
+            if (opt.dense_rung and rrank > 0) {
+              // frequency-factorized: Ys(i) = scale_k sum_r c_r(s_i) K_r Fs(i) for ALL tau nodes: the (i, N) columns are split
+              // into nthr contiguous chunks; each thread gathers its c_r-scaled chunk (D x w) and runs R gemms
+              // (D x D)(D x w) into a private accumulator (sequential BLAS inside; K = D keeps them compute-bound)
+              const long ncol = nt * nR;
+              const long nch = std::min(nthr, ncol);
+#pragma omp parallel for schedule(static, 1) num_threads(nthr)
+              for (long ch = 0; ch < nch; ++ch) {
+                const long c0 = (ncol * ch) / nch, c1 = (ncol * (ch + 1)) / nch, w = c1 - c0;
+                nda::array<cplx, 2> Fr(D, w), Yr(D, w);
+                Yr() = cplx(0.0);
+                for (long r = 0; r < rrank; ++r) {
+                  for (long y = 0; y < D; ++y)
+                    for (long cc = 0; cc < w; ++cc) {
+                      const long col = c0 + cc, i = col / nR, N = col % nR;
+                      Fr(y, cc) = c_tr(i, r) * Fs(i, y / nc2, y % nc2, N);
+                    }
+                  nda::blas::gemm(scale_k, Kd_s(r, all, all), Fr, cplx(1.0), Yr);
+                }
+                for (long y = 0; y < D; ++y)
+                  for (long cc = 0; cc < w; ++cc) {
+                    const long col = c0 + cc, i = col / nR, N = col % nR;
+                    Ys(i, y / nc2, y % nc2, N) = Yr(y, cc);
+                  }
+              }
+            } else if (opt.dense_rung and rung_pair) {
+              // the two PH-mirror nodes of a representative share K_d(rep): ONE gemm (D x D)(D x 2 nR) per
+              // representative (half the K_d traffic of the per-node gemms; the per-tau form is bandwidth-bound in production)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
+              for (long r = 0; r < ndist; ++r) {
+                const long i0 = rep_nodes[size_t(r)].first, i1 = rep_nodes[size_t(r)].second;
+                const long nb = (i1 < 0) ? 1 : 2, nf = fuse2 ? 2 : 1, w = nf * nb * nR;
+                nda::array<cplx, 2> F2(D, w), Y2(D, w);
+                for (long f = 0; f < nf; ++f) {
+                  auto const &Fsrc = f ? Fs1 : Fs;
+                  for (long y = 0; y < D; ++y)
+                    for (long bb = 0; bb < nb; ++bb)
+                      for (long N = 0; N < nR; ++N) F2(y, (f * nb + bb) * nR + N) = Fsrc(bb ? i1 : i0, y / nc2, y % nc2, N);
+                }
+                nda::blas::gemm(scale_k, Kd_s(r, all, all), F2, cplx(0.0), Y2);
+                for (long f = 0; f < nf; ++f) {
+                  auto &Ydst = f ? Ys1 : Ys;
+                  for (long y = 0; y < D; ++y)
+                    for (long bb = 0; bb < nb; ++bb)
+                      for (long N = 0; N < nR; ++N) Ydst(bb ? i1 : i0, y / nc2, y % nc2, N) = Y2(y, (f * nb + bb) * nR + N);
+                }
+              }
+            } else if (opt.dense_rung) {
               // Ys(i) = scale_k K_d(s_i) Fs(i): nt gemms (D x D)(D x nR) on the mirrored blocks
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
               for (long i = 0; i < nt; ++i) {
@@ -1497,24 +1953,60 @@ namespace solvers {
                 nda::blas::gemm(scale_k, Kd_s(trep[size_t(i)], all, all), Fi, cplx(0.0), Oi);
               }
             } else {
+#if defined(ENABLE_CUDA)
+              if (rs) {
+                if (rs_sq != is * nq + iq) { dynbse_cuda::rs_set_sq(rs.get(), is, &kpq(iq, 0)); rs_sq = is * nq + iq; }
+                const long NN = Nm * Nm;
+                for (long i = 0; i < nt; ++i) {
+                  if (not rs_res) dynbse_cuda::rs_load_w(rs.get(), 0, Wd_s.data() + i * NN, nt * NN, rs_t);
+                  dynbse_cuda::rs_apply(rs.get(), rs_res ? i : 0, scale_k, Fs(i, all, all, all).data(), Ys(i, all, all, all).data(),
+                                        nR, rs_t + 1);
+                }
+                if (dbg and kd_calls == 0 and vertex_debug::flag("dynbse_dev_stream_check")) {
+                  // the device rung against the host one on the same inputs (expected: a few ulp of the scale)
+                  double dmax = 0.0, hmax = 0.0;
+                  nda::array<cplx, 3> Oh(nk, nc2, nR);
+                  for (long i : {0l, nt / 2}) {
+                    auto Fi = Fs(i, all, all, all);
+                    rung_apply(Wq_s(i), scale_k, Fi, Oh, is, iq);
+                    auto Oi = Ys(i, all, all, all);
+                    for (long k = 0; k < nk; ++k)
+                      for (long r = 0; r < nc2; ++r)
+                        for (long N = 0; N < nR; ++N) {
+                          dmax = std::max(dmax, std::abs(Oi(k, r, N) - Oh(k, r, N)));
+                          hmax = std::max(hmax, std::abs(Oh(k, r, N)));
+                        }
+                  }
+                  app_log(1, "  [dynbse] device streaming rung check (fam {}, tau nodes 0 and {}): max|dev - host| {:.3e}, "
+                             "max|host| {:.3e}, relative {:.3e}", fam, nt / 2, dmax, hmax, (hmax > 0.0) ? dmax / hmax : dmax);
+                }
+              } else
+#endif
+              {
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
               for (long i = 0; i < nt; ++i) {
                 auto Fi = Fs(i, all, all, all);
                 auto Oi = Ys(i, all, all, all);
                 rung_apply(Wq_s(i), scale_k, Fi, Oi, is, iq);
               }
+              }
             }
             if (met) met->t_rung += kwatch.lap();
-            auto Ys2 = nda::reshape(Ys, std::array<long, 2>{nt, nk * nc2 * nR});
+            }                                              // (not fused_done)
+            auto &Ysf = fused_done ? Ys1 : Ys;
+            auto &Fsf = fused_done ? Fs1 : Fs;
+            auto Ys2 = nda::reshape(Ysf, std::array<long, 2>{nt, nk * nc2 * nR});
             Yc2() = Ys2;
+            bthr(true);
             auto c = db::basis_coeffs(b, Yc2);
             const double fef = db::basis_fit_error(b, Yc2, c);
+            bthr(false);
             if (met) met->t_refit += kwatch.lap();
             fe = std::max(fe, fef);
             if (dbg)
               app_log(2, "  [dynbse dbg]   fam {}: |F(s)| {:.3e} |W F(s)| {:.3e} refit {:.3e} |coeffs| {:.3e}", fam,
-                      nrm(Fs), nrm(Ys), fef, nrm(c));
-            // O-1: the coefficient scatter (np_fit x nk nc2 nR) in parallel over the nodes (elementwise: bitwise)
+                      nrm(Fsf), nrm(Ysf), fef, nrm(c));
+            // the coefficient scatter (np_fit x nk nc2 nR) in parallel over the nodes (elementwise: bitwise)
 #pragma omp parallel for schedule(static) num_threads(nthr)
             for (long p = 0; p < b.np_fit; ++p)
               for (long k = 0; k < nk; ++k)
@@ -1528,8 +2020,30 @@ namespace solvers {
           if (opt.dense_rung) {
             auto F2 = nda::reshape(Fs3, std::array<long, 2>{D, nR});
             auto O2 = nda::reshape(Os3, std::array<long, 2>{D, nR});
+            bthr(true);
             nda::blas::gemm(-scale_k, Kd0, F2, cplx(0.0), O2);
+            bthr(false);
           } else {
+#if defined(ENABLE_CUDA)
+            if (rs) {
+              if (rs_sq != is * nq + iq) { dynbse_cuda::rs_set_sq(rs.get(), is, &kpq(iq, 0)); rs_sq = is * nq + iq; }
+              if (not rs_res) dynbse_cuda::rs_load_w(rs.get(), 0, Wd0.data(), Nm * Nm, rs_t);
+              dynbse_cuda::rs_apply(rs.get(), rs_res ? nt : 0, -scale_k, Fs3.data(), Os3.data(), nR, rs_t + 1);
+              if (dbg and kd_calls == 0 and vertex_debug::flag("dynbse_dev_stream_check")) {
+                nda::array<cplx, 3> Oh(nk, nc2, nR);
+                rung_apply(Wq_0, -scale_k, Fs3, Oh, is, iq);
+                double dmax = 0.0, hmax = 0.0;
+                for (long k = 0; k < nk; ++k)
+                  for (long r = 0; r < nc2; ++r)
+                    for (long N = 0; N < nR; ++N) {
+                      dmax = std::max(dmax, std::abs(Os3(k, r, N) - Oh(k, r, N)));
+                      hmax = std::max(hmax, std::abs(Oh(k, r, N)));
+                    }
+                app_log(1, "  [dynbse] device streaming rung check (the constant part K_d0): max|dev - host| {:.3e}, max|host| "
+                           "{:.3e}, relative {:.3e}", dmax, hmax, (hmax > 0.0) ? dmax / hmax : dmax);
+              }
+            } else
+#endif
             rung_apply(Wq_0, -scale_k, Fs3, Os3, is, iq);
           }
           for (long k = 0; k < nk; ++k)
@@ -1548,10 +2062,10 @@ namespace solvers {
           const long m = nu_list[jn];
           const cplx inu = (m == tools.m0) ? cplx(0.0) : cplx(tools.ft->omega(tools.wn_b(m)));
           inu_cur = inu;
-          // inu != 0: the twisted-pair tables of this node (D2e); built once per (unit, nu)
+          // inu != 0: the twisted-pair tables of this node; built once per (unit, nu)
           db::shift_tables const *stp = nullptr;
           if (inu != cplx(0.0)) {
-            auto it_st = stab_cache.find(m);                // D-0: built once per nu node on this rank
+            auto it_st = stab_cache.find(m);                // built once per nu node on this rank
             if (it_st == stab_cache.end()) {
               it_st = stab_cache.emplace(m, db::build_shift_tables(b, inu, 1e-11, opt.table_mode)).first;
               if (met) met->dsq_err = std::max(met->dsq_err, it_st->second.fit_err);
@@ -1568,7 +2082,7 @@ namespace solvers {
           if (opt.one_rung_only) {
             S.D = D; S.nk = nk; S.nc = nc;
             if (opt.resolvent == "lu") {
-              S.mode = "lu"; S.zero = true;                  // P7: T_s = 0 without the dense zero matrices
+              S.mode = "lu"; S.zero = true;                  // T_s = 0 without the dense zero matrices
             } else {
               S.Cb = nda::array<cplx, 2>(D, D);
               S.Cb() = cplx(0.0);
@@ -1588,9 +2102,86 @@ namespace solvers {
               utils::check(info == 0, "pair_space_ladder_dyn: the device getrf of (1 - Cb K_s) failed (info {}).", info);
             } else
 #endif
-            S = db::build_static_resolvent_from(Cb_k, Ks, opt.resolvent);
+            {
+              // the dense getrf / inverse outside any omp region -- on the rank's threads (vertex_debug dyn_lu_threads = 0
+              // keeps the configured BLAS threads)
+              const bool lu_thr = (vertex_debug::number("dyn_lu_threads", 1.0) != 0.0);   // vertex_debug: dyn_lu_threads
+              if (lu_thr) utils::apply_blas_threads(nthr);
+              S = db::build_static_resolvent_from(Cb_k, Ks, opt.resolvent);
+              if (lu_thr) utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+            }
           }
           if (met) met->t_lu += watch.lap();
+          // ---- the DRESSED-LEG Gamma_1 readout (pol_vertex_dyn_dressed; dynbse.hpp block comment) ---------------------
+          // e~ = d + T_s^dag Cb^dag d for all nout left legs, once per unit
+          // (the one-bare-rung pass is the same readout with T_s = 0: d~ = e~ = d)
+          // the Sigma side: the columns built from (Gsum0, Gsum1, y1) are supported (Gsum1 = Cb d~ + (1 + Cb T_s)(L0 y1)^sum, the
+          // full pair vector (L0 y1)^sum = Zt + Cb y1.cst from the same Grams); the resummed "dyn" column is not
+          const bool dressed = dressed_req;                                                    // pol_vertex_dyn_dressed
+          const bool ts_zero = opt.one_rung_only;
+          nda::array<cplx, 4> Et;                               // (nk, nc, nc, nout)
+          std::optional<db::dressed_grams> dgram;
+          double t_dressed = 0.0;
+          double t_dr_e = 0.0, t_dr_d = 0.0, t_dr_z = 0.0, t_dr_c = 0.0;   // e~ build, d~, Zt, collapse
+          bool dressed_dev = false;
+#if defined(ENABLE_CUDA)
+          if (dressed and ue and (opt.sigma == nullptr or sd_dev.on)) {   // (Sigma: the device deposits read Gsum1 / y1 in place)
+            // the device unit: grams / legs from the host, e~ built and kept on the device
+            dgram.emplace(db::build_dressed_grams(b, P, inu));
+            char whyd[256] = {0};
+            dressed_dev = dynbse_cuda::ue_dressed_prepare(ue.get(), P.ng, dgram->H.data(), dgram->Gh.data(), dgram->Gt.data(),
+                                                          P.gk.data(), P.gkq.data(), ts_zero, whyd, 256);
+            // its bytes are reserved up front (ue_dressed_bytes in the unit's partition), so a failure here is an estimate
+            // error, not a configuration the user can route to the CPU mid-transfer: abort with the reason
+            utils::check(dressed_dev, "pair_space_ladder_dyn: the device dressed-leg readout could not be prepared: {} (its memory was "
+                         "reserved when the unit was created -- raise vertex_debug dyn_dev_extra_gb or report this). ABORTING.", whyd);
+            if (rank == 0 and units_taken == 1) app_log(1, "  [dynamic vertex] dressed-leg Gamma_1 readout ON THE DEVICE UNIT");
+          }
+#endif
+#if defined(ENABLE_CUDA)
+          const bool host_unit = not ue;
+#else
+          const bool host_unit = true;
+#endif
+          utils::check(not (dressed and not dressed_dev and not host_unit),
+                       "pair_space_ladder_dyn: dyn_dressed is set but neither the device dressed path nor the host dressed path can run "
+                       "this unit (internal: the device unit is on without the device Sigma deposits). Refusing to run the standard "
+                       "path instead.");
+          if (dressed and not dressed_dev and host_unit) {
+            const double tw0 = db::wall_now();
+            utils::apply_blas_threads(nthr);                  // the serial BLAS3 of the dressed legs: the rank's threads
+            Et = nda::array<cplx, 4>(nk, nc, nc, nout);
+            nda::array<cplx, 2> w(ts_zero ? 0 : D, ts_zero ? 0 : nout), v(D, nout);
+            v() = cplx(0.0);
+            if (not ts_zero) {
+            for (long k = 0; k < nk; ++k) {                                   // w = Cb^dag d (Cb block diagonal)
+              auto Dk = nda::reshape(Dc(k, all, all, all), std::array<long, 2>{nc2, nout});
+              auto wk = w(nda::range(k * nc2, (k + 1) * nc2), all);
+              nda::blas::gemm(nda::dagger(Cb_k(k, all, all)), Dk, wk);
+            }
+            if (S.mode == "lu") {                                             // T_s^dag w = M^-dag K_s^dag w,  M = 1 - Cb K_s
+              nda::array<cplx, 2> const &Ksr = S.own_ks ? S.Cb : *S.Ks;
+              nda::blas::gemm(nda::dagger(Ksr), w, v);
+              // the stored LU is LAPACK's factorization of M^T (C layout): M^-dag v = conj(M^-T conj(v)), op 'N' on that storage
+              nda::matrix<cplx, nda::F_layout> Yc(D, nout);
+              for (long i = 0; i < D; ++i)
+                for (long c = 0; c < nout; ++c) Yc(i, c) = std::conj(v(i, c));
+              const int info = nda::lapack::getrs(nda::transpose(S.Mlu), Yc, S.ipiv);
+              utils::check(info == 0, "pair_space_ladder_dyn: dressed getrs failed (info {}).", info);
+              for (long i = 0; i < D; ++i)
+                for (long c = 0; c < nout; ++c) v(i, c) = std::conj(Yc(i, c));
+            } else {
+              nda::blas::gemm(nda::dagger(S.Ts), w, v);
+            }
+            }                                                                 // (not ts_zero)
+            for (long k = 0; k < nk; ++k)
+              for (long r = 0; r < nc2; ++r)
+                for (long c = 0; c < nout; ++c) Et(k, r / nc, r % nc, c) = Dc(k, r / nc, r % nc, c) + v(k * nc2 + r, c);
+            dgram.emplace(db::build_dressed_grams(b, P, inu));
+            utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+            t_dressed += db::wall_now() - tw0;
+            t_dr_e += db::wall_now() - tw0;
+          }
           // ---- the RHS column blocks: each block is an independent solve of width nR ----------
           db::dyson_result res;          // the unit's aggregate over its blocks (histories: the last block)
           long it_unit = 0;
@@ -1620,15 +2211,30 @@ namespace solvers {
               for (long M = 0; M < nout; ++M)
                 for (long N = 0; N < nR; ++N) (*out)(jn, iq, M, N0 + N) = cplx(spinfac / double(nk)) * Pblk(M, N);
             };
-            // the one-bare-rung column rides the device unit (D-2 r1) when requested outside a one_rung_only pass
+            // the one-bare-rung column rides the device unit when requested outside a one_rung_only pass
             const bool want_r1 = (Pi_dyn1 != nullptr and not opt.one_rung_only);
             bool have_r1 = false;
 #if defined(ENABLE_CUDA)
-            if (ue) {
+            std::optional<nda::array<cplx, 2>> Pd_dev, Pr1_dev;            // the device dressed-leg columns
+            if (ue and dressed_dev) {
+              have_r1 = want_r1;
+              res = db::dyson_result{};
+              Pd_dev.emplace(nout, nR); Pr1_dev.emplace(nout, nR);
+              double tim[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+              if (opt.sigma != nullptr) have_r1 = false;
+              res.fit_err_max = dynbse_cuda::ue_gamma1_dressed(ue.get(), nR, Dblk.data(), inu, ts_zero, have_r1, Pd_dev->data(),
+                                                               Pr1_dev->data(), tim, opt.sigma != nullptr);
+              res.iterations = 1; res.converged = true;
+              if (met) {
+                met->t_l0 += tim[0]; met->t_l0_dev += tim[0]; met->t_ts += tim[1]; met->t_rung += tim[2] + tim[7];
+                met->t_refit += tim[3]; met->t_vec += tim[4]; met->t_l0_h2d += tim[5]; met->t_l0_d2h += tim[6];
+                ++met->n_apps; met->n_l0 += have_r1 ? 2 : 1;
+              }
+            } else if (ue) {
               have_r1 = want_r1;
               res = db::dyson_result{};
               // the readouts run on the device (ue_readout); Gsum0 / Gsum1 / y1 come down only for the HOST Sigma deposits
-              const bool y_host = keep_y and not sd_dev.on;     // D-3: the device deposits read y1 where it is
+              const bool y_host = keep_y and not sd_dev.on;     // the device deposits read y1 where it is
               if (y_host) {
                 res.Gsum0 = nda::array<cplx, 4>(nk, nc, nc, nR);
                 res.Gsum1 = nda::array<cplx, 4>(nk, nc, nc, nR);
@@ -1647,7 +2253,153 @@ namespace solvers {
               }
             } else
 #endif
-            if (opt.static_only) {
+            if (dressed) {
+              const double tw0 = db::wall_now();
+              utils::apply_blas_threads(nthr);
+              // d~ = d + T_s Cb d (the ls_apply resolvent arithmetic on a constant input)
+              nda::array<cplx, 2> fs(D, nR), cs(D, nR);
+              cs() = cplx(0.0);
+              if (not ts_zero) {
+              for (long k = 0; k < nk; ++k) {
+                auto Dk = nda::reshape(Dblk(k, all, all, all), std::array<long, 2>{nc2, nR});
+                auto fk = fs(nda::range(k * nc2, (k + 1) * nc2), all);
+                nda::blas::gemm(Cb_k(k, all, all), Dk, fk);
+              }
+              if (S.mode == "lu") {
+                nda::array<cplx, 2> const &Ksr = S.own_ks ? S.Cb : *S.Ks;
+                nda::matrix<cplx, nda::F_layout> Y(D, nR);
+                Y() = fs;
+                const int info = nda::lapack::getrs(S.Mlu, Y, S.ipiv);
+                utils::check(info == 0, "pair_space_ladder_dyn: dressed getrs failed (info {}).", info);
+                nda::array<cplx, 2> z(Y);
+                nda::blas::gemm(Ksr, z, cs);
+              } else {
+                nda::blas::gemm(S.Ts, fs, cs);
+              }
+              }                                                               // (not ts_zero)
+              db::tf_vector X(np, nk, nc, nR), rv(np, nk, nc, nR), y1(np, nk, nc, nR);
+              for (long k = 0; k < nk; ++k)
+                for (long r = 0; r < nc2; ++r)
+                  for (long N = 0; N < nR; ++N) X.cst(k, r / nc, r % nc, N) = Dblk(k, r / nc, r % nc, N) + cs(k * nc2 + r, N);
+              nda::array<cplx, 4> rsum(nk, nc, nc, nR);
+              utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+              t_dressed += db::wall_now() - tw0;
+              t_dr_d += db::wall_now() - tw0;
+              double tw = db::wall_now();
+              db::l0_apply(b, P, inu, shared, X, rv, rsum, &Cb_k, stp, false, true);   // r = L0 d~, rsum = Cb d~ (tau route)
+              if (met) { met->t_l0 += db::wall_now() - tw; ++met->n_l0; ++met->n_l0_cst; }
+              const double fe = kd(rv, rsum, y1);
+              tw = db::wall_now();
+              nda::array<cplx, 4> Zt(nk, nc, nc, nR);
+              utils::apply_blas_threads(nthr);                            // the Gram product Z = H y: one big threaded gemm
+              auto Zg = db::dressed_z(b, P, *dgram, y1);
+              utils::apply_blas_threads(1);                               // the per-k sandwiches: omp threads, sequential BLAS
+              db::dressed_zt(P, *dgram, inu, Zg, nR, Zt);
+              utils::apply_blas_threads(nthr);
+              t_dr_z += db::wall_now() - tw;
+              const double tc0 = db::wall_now();
+              for (long k = 0; k < nk; ++k) {                                  // + Cb y1.cst
+                auto yk = nda::reshape(y1.cst(k, all, all, all), std::array<long, 2>{nc2, nR});
+                auto zk = nda::reshape(Zt(k, all, all, all), std::array<long, 2>{nc2, nR});
+                nda::blas::gemm(cplx(1.0), Cb_k(k, all, all), yk, cplx(1.0), zk);
+              }
+              auto Pd = db::collapse(Et, Zt);                                  // (nout, nR): e~^dag (L0 y1)^sum
+              utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+              t_dr_c += db::wall_now() - tc0;
+              t_dressed += db::wall_now() - tw;
+              if (rank == 0 and units_taken == 1 and N1 == nout)
+                app_log(1, "  [dynamic vertex] dressed-leg Gamma_1, first unit on rank 0: e~ build {:.2f} s, d~ {:.2f} s, Zt (Gram gemm + "
+                           "sandwiches) {:.2f} s, Cb y.cst + collapse {:.2f} s ({} RHS blocks)", t_dr_e, t_dr_d, t_dr_z, t_dr_c,
+                        (nout + nrb - 1) / nrb);
+              // the one-bare-rung column in this unit (T_s = 0: d~ = e~ = d, the same Grams) -- a second rung
+              // application on the resident K_d instead of the caller's second driver pass with its K_d rebuilds
+              // (vertex_debug dyn_r1_fuse = 0 selects the second pass)
+              const bool r1_host = want_r1 and not ts_zero and opt.sigma == nullptr and
+                                   (vertex_debug::number("dyn_r1_fuse", 1.0) != 0.0);   // vertex_debug: dyn_r1_fuse
+              nda::array<cplx, 4> rsum_r1;
+              nda::array<cplx, 2> Pr1;
+              double fe_r1 = 0.0;
+              if (r1_host) {
+                db::tf_vector Xr1(np, nk, nc, nR), rv_r1(np, nk, nc, nR), y_r1(np, nk, nc, nR);
+                Xr1.cst() = Dblk;
+                rsum_r1 = nda::array<cplx, 4>(nk, nc, nc, nR);
+                double tw1 = db::wall_now();
+                db::l0_apply(b, P, inu, shared, Xr1, rv_r1, rsum_r1, &Cb_k, stp, false, true);   // L0 d, Cb d
+                if (met) { met->t_l0 += db::wall_now() - tw1; ++met->n_l0; ++met->n_l0_cst; }
+                fe_r1 = kd(rv_r1, rsum_r1, y_r1);
+                tw1 = db::wall_now();
+                nda::array<cplx, 4> Zr1(nk, nc, nc, nR);
+                utils::apply_blas_threads(nthr);
+                auto Zg1 = db::dressed_z(b, P, *dgram, y_r1);
+                utils::apply_blas_threads(1);
+                db::dressed_zt(P, *dgram, inu, Zg1, nR, Zr1);
+                utils::apply_blas_threads(nthr);
+                for (long k = 0; k < nk; ++k) {
+                  auto yk = nda::reshape(y_r1.cst(k, all, all, all), std::array<long, 2>{nc2, nR});
+                  auto zk = nda::reshape(Zr1(k, all, all, all), std::array<long, 2>{nc2, nR});
+                  nda::blas::gemm(cplx(1.0), Cb_k(k, all, all), yk, cplx(1.0), zk);
+                }
+                Pr1 = db::collapse(Dc, Zr1);                                   // d^dag (L0 K_d L0 d)^sum
+                utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+                t_dressed += db::wall_now() - tw1;
+              }
+              res = db::dyson_result{};
+              res.Gsum0 = rsum;                                                // the static column: (L_s d)^sum = Cb d~
+              res.Gsum1 = rsum;                                                // (P side: Pi_gam1 is written below from Pd)
+              res.Gsum = rsum;
+              if (opt.sigma != nullptr) {
+                // Sigma side: Gsum1 = Cb d~ + L + Cb T_s L, L = (L0 y1)^sum = Zt (+ Cb y1.cst, already in Zt); y1 kept
+                const double tws = db::wall_now();
+                utils::apply_blas_threads(nthr);
+                nda::array<cplx, 2> Lm(D, nR), cl(D, nR);
+                for (long k = 0; k < nk; ++k)
+                  for (long r = 0; r < nc2; ++r)
+                    for (long N = 0; N < nR; ++N) Lm(k * nc2 + r, N) = Zt(k, r / nc, r % nc, N);
+                cl() = cplx(0.0);
+                if (not ts_zero) {
+                  if (S.mode == "lu") {
+                    nda::array<cplx, 2> const &Ksr = S.own_ks ? S.Cb : *S.Ks;
+                    nda::matrix<cplx, nda::F_layout> Y(D, nR);
+                    Y() = Lm;
+                    const int info = nda::lapack::getrs(S.Mlu, Y, S.ipiv);
+                    utils::check(info == 0, "pair_space_ladder_dyn: dressed Sigma getrs failed (info {}).", info);
+                    nda::array<cplx, 2> z(Y);
+                    nda::blas::gemm(Ksr, z, cl);
+                  } else {
+                    nda::blas::gemm(S.Ts, Lm, cl);
+                  }
+                }
+                res.Gsum1 = nda::array<cplx, 4>(nk, nc, nc, nR);
+                for (long k = 0; k < nk; ++k) {
+                  auto ck = cl(nda::range(k * nc2, (k + 1) * nc2), all);
+                  nda::array<cplx, 2> cbc(nc2, nR);
+                  nda::blas::gemm(Cb_k(k, all, all), ck, cbc);
+                  for (long r = 0; r < nc2; ++r)
+                    for (long N = 0; N < nR; ++N)
+                      res.Gsum1(k, r / nc, r % nc, N) = rsum(k, r / nc, r % nc, N) + Lm(k * nc2 + r, N) + cbc(r, N);
+                }
+                res.Gsum = res.Gsum1;
+                res.y1 = std::move(y1); res.has_y = true;
+                utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+                t_dressed += db::wall_now() - tws;
+              }
+              res.iterations = 1; res.converged = true; res.fit_err_max = std::max(fe, fe_r1);
+              readout(res.Gsum0, Pi_static);
+              for (auto *out : {opt.one_rung_only ? Pi_dyn1 : Pi_gam1, opt.one_rung_only ? nullptr : Pi_dyn}) {
+                if (out == nullptr) continue;
+                readout(res.Gsum0, out);
+                for (long M = 0; M < nout; ++M)
+                  for (long N = 0; N < nR; ++N) (*out)(jn, iq, M, N0 + N) += cplx(spinfac / double(nk)) * Pd(M, N);
+              }
+              if (r1_host) {                                                   // as the T_s = 0 pass writes it
+                readout(rsum_r1, Pi_dyn1);
+                for (long M = 0; M < nout; ++M)
+                  for (long N = 0; N < nR; ++N) (*Pi_dyn1)(jn, iq, M, N0 + N) += cplx(spinfac / double(nk)) * Pr1(M, N);
+                have_r1 = true;
+              }
+              if (met) met->t_vec += t_dressed;
+              t_dressed = 0.0;
+            } else if (opt.static_only) {
               db::tf_vector y0(np, nk, nc, nR), Gamma(np, nk, nc, nR);
               nda::array<cplx, 4> Gsum(nk, nc, nc, nR);
               db::ls_apply(b, P, S, inu, shared, Dblk, y0, Gamma, Gsum, &Cb_k, stp);
@@ -1681,7 +2433,7 @@ namespace solvers {
             ritz_unit = std::max(ritz_unit, res.contraction);
             refit_unit = std::max(refit_unit, res.fit_err_max);
             if (opt.sigma != nullptr) {
-              // LFF-Sigma L-7: the outer W-bar of this node, then the block's deposit into the accumulators
+              // the outer W-bar of this node, then the block's deposit into the accumulators
               nda::array<cplx, 2> Wout(Nm, Nm);
               Wout() = W0b(iq, all, all);
               if (opt.sigma->outer == "dynamic") {
@@ -1694,7 +2446,12 @@ namespace solvers {
                 sigma_dyn_accumulate_device(*opt.sigma, sd_dev, ue.get(), b, P, inu, Dc, N0, N1, Wout, kpq, is, iq, m, tools);
               else
 #endif
-              sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools);
+              {
+              if (opt.sigma->wannier_closure())   // Wannier mode: the closure G (U^T G_W U^*), not the ladder's G_CC
+                sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, opt.sigma->G_close, kpq, is, iq, m, tools);
+              else
+                sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools);
+              }
             }
 #if defined(ENABLE_CUDA)
             if (ue) {
@@ -1706,15 +2463,25 @@ namespace solvers {
                 for (long M = 0; M < nout; ++M)
                   for (long N = 0; N < nR; ++N) (*out)(jn, iq, M, N0 + N) = cplx(spinfac / double(nk)) * Pb(M, N);
               };
+              if (dressed_dev) {
+                // static column on the device (Gs0 = Cb d~); Gamma_1 = static + e~^dag (L0 y1)^sum; the one bare rung = D^dag (L0 K_d L0 D)^sum
+                dynbse_cuda::ue_readout(ue.get(), nR, 0, Pb.data(), &trd);
+                if (Pi_static != nullptr) place(Pi_static);
+                for (long M = 0; M < nout; ++M)
+                  for (long N = 0; N < nR; ++N) Pb(M, N) += (*Pd_dev)(M, N);
+                place(Pi_gam1); place(Pi_dyn);
+                if (have_r1) { Pb() = *Pr1_dev; place(Pi_dyn1); }
+              } else {
               if (Pi_static != nullptr) { dynbse_cuda::ue_readout(ue.get(), nR, 0, Pb.data(), &trd); place(Pi_static); }
               if (Pi_gam1 != nullptr or Pi_dyn != nullptr) {   // gamma1_only: the resummed slot repeats Gamma_1
                 dynbse_cuda::ue_readout(ue.get(), nR, 1, Pb.data(), &trd);
                 place(Pi_gam1); place(Pi_dyn);
               }
               if (have_r1) { dynbse_cuda::ue_readout(ue.get(), nR, 2, Pb.data(), &trd); place(Pi_dyn1); }
+              }
             } else
 #endif
-            {
+            if (not dressed) {   // the dressed-leg branch wrote its columns already
             readout(res.Gsum0, Pi_static);
             if (opt.one_rung_only) {
               // Gsum1 = Cb D + sum L0 K_d L0 D  (T_s = 0): the pure one dynamic rung
@@ -1752,7 +2519,7 @@ namespace solvers {
             row(7) = res.contraction; row(8) = res.fit_err_max;
             row(9) = (stp != nullptr) ? stp->fit_err : 0.0; row(10) = (stp != nullptr) ? stp->cond_kept : 0.0;
             row(11) = res.readout_history.empty() ? -1.0 : res.readout_history.back();
-            row(12) = db::wall_now() - t_unit0;             // P5: the unit's wall time (schedule = "measured")
+            row(12) = db::wall_now() - t_unit0;             // the unit's wall time (schedule = "measured")
           }
           if (sig_ckpt) {
             sig_mine.push_back({is, iq, nu_list[size_t(jn_unit)]});
@@ -1783,7 +2550,14 @@ namespace solvers {
             met->it_max = std::max(met->it_max, res.iterations);
             met->it_sum += res.iterations;
             ++met->nunits;
-            if (res.converged or res.stagnated or res.readout_converged) ++met->nconv;   // stagnated at the refit floor / readout-converged count as done
+            // count each ending separately (stagnated / readout-stopped still count as done, but are reported; the
+            // one-application passes are converged by definition instead of reporting "false")
+            const bool by_def = opt.one_rung_only or opt.static_only;
+            if (res.converged) ++met->nconv;
+            else if (res.stagnated) { ++met->nconv; ++met->n_stag; }
+            else if (res.readout_converged) { ++met->nconv; ++met->n_rconv; }
+            else if (by_def) { ++met->nconv; ++met->n_def; }
+            else ++met->n_maxit;
           }
           if (met) {
             met->t_read += watch.lap();
@@ -1791,22 +2565,97 @@ namespace solvers {
           }
         }
       }
-      write_sig_ckpt();                                         // P20: the finished run's accumulators (a restart loads them)
+#if defined(ENABLE_CUDA)
+      if (ue and dynbse_cuda::ue_nres(ue.get()) < ndist) {   // larger spaces: what the partial rung residency cost this rank
+        long nrb_ = 0, nhr = 0, ncp = 0;
+        double trb = 0.0, tcp_e = 0.0, trb_e = 0.0;
+        dynbse_cuda::ue_rebuild_stats(ue.get(), &nrb_, &trb);
+        dynbse_cuda::ue_source_stats(ue.get(), &nhr, &ncp, &tcp_e, &trb_e);
+        double tg_e = 0.0;
+        long napp_e = 0;
+        dynbse_cuda::ue_plan_inputs(ue.get(), &tg_e, &napp_e);
+        char plan_txt[512] = {0};
+        dynbse_cuda::ue_plan_report(ue.get(), plan_txt, 512);
+        if (rank == 0)
+          app_log(1, "  [dynbse] partial rung residency ({} of {} tau rungs resident; last plan: {} copied from pinned host memory, {} "
+                     "rebuilt): rank 0 did {} rebuilds ({:.1f} s, {:.1f} ms each) and {} copies (estimated {:.1f} ms each); planner "
+                     "inputs: rung gemm {:.2f} ms per representative, {} rung passes per transfer; timed splits: {}",
+                  dynbse_cuda::ue_nres(ue.get()), ndist, nhr, ndist - dynbse_cuda::ue_nres(ue.get()) - nhr, nrb_, trb,
+                  nrb_ > 0 ? 1e3 * trb / double(nrb_) : 0.0, ncp, 1e3 * tcp_e, 1e3 * tg_e, napp_e, plan_txt);
+      }
+#endif
+#if defined(ENABLE_CUDA)
+      if (rs and rank == 0)
+        app_log(1, "  [dynbse] device streaming rung on rank 0: W transforms {:.1f} s, legs in {:.1f} s, FFT + product {:.1f} s, "
+                   "legs out {:.1f} s, H2D/D2H {:.1f} s", rs_t[0], rs_t[1], rs_t[2], rs_t[3], rs_t[4]);
+#endif
+      write_sig_ckpt();                                         // the finished run's accumulators (a restart loads them)
       if (dyn_sched) {
         MPI_Win_fence(0, win);
         MPI_Win_free(&win);
       }
     }
 
+    /** WANNIER MODE: the Sigma closure's G, U^T G_W U^* (eval_sigma_pair's G_close), from the loop's
+     *  band-window G (G_W, nW = |window| bands) and the projector U(s, k) = U_skia(s, k, :, :) (nW x M); full-BZ k axis. */
+    inline void wannier_closure_G(nda::MemoryArrayOfRank<5> auto const &G_tskij, nda::range band_window, bool sym_mesh,
+                                  auto const &kp_to_ibz, auto const &kp_trev, nda::array<ComplexType, 4> const &U_skia,
+                                  long nt, long ns, long nk_full, long M, nda::array<ComplexType, 5> &out) {
+      decltype(nda::range::all) all;
+      const long nW = long(band_window.size());
+      utils::check(U_skia.shape(0) == ns and U_skia.shape(1) >= nk_full and U_skia.shape(2) == nW and U_skia.shape(3) == M,
+                   "wannier_closure_G: projector ({}, {}, {}, {}) vs (ns {}, nk {}, nW {}, M {}).", U_skia.shape(0), U_skia.shape(1),
+                   U_skia.shape(2), U_skia.shape(3), ns, nk_full, nW, M);
+      nda::array<ComplexType, 5> Gw(nt, ns, nk_full, nW, nW);
+      vertex_ladder_detail::expand_G_CC_fullbz(G_tskij, band_window, sym_mesh, kp_to_ibz, kp_trev, Gw);
+      out = nda::array<ComplexType, 5>(nt, ns, nk_full, M, M);
+      nda::array<ComplexType, 2> Ut(M, nW), Uc(nW, M), S(nW, nW), T1(M, nW), R(M, M);
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk_full; ++k) {
+          for (long a = 0; a < nW; ++a)
+            for (long m = 0; m < M; ++m) { Ut(m, a) = U_skia(is, k, a, m); Uc(a, m) = std::conj(U_skia(is, k, a, m)); }
+          for (long it = 0; it < nt; ++it) {
+            S() = Gw(it, is, k, all, all);
+            nda::blas::gemm(Ut, S, T1);                                     // U^T G
+            nda::blas::gemm(T1, Uc, R);                                     // (U^T G) U^*
+            out(it, is, k, all, all) = R;
+          }
+        }
+    }
+
+    /** WANNIER MODE: the closure-convention block dSigma_bar = U^T dSigma U^* (M x M) back to the band window with U^* dSigma_bar U^T
+     *  (the inverse of that map, as eval_sigma_pair; NOT U dSigma_bar U^dag) -- dSig (nt, ns, nk, M, M) -> (nt, ns, nk, nW, nW) */
+    inline void wannier_sigma_to_window(nda::array<ComplexType, 5> &dSig, nda::array<ComplexType, 4> const &U_skia) {
+      decltype(nda::range::all) all;
+      const long nt = dSig.shape(0), ns = dSig.shape(1), nk = dSig.shape(2), M = dSig.shape(3), nW = U_skia.shape(2);
+      utils::check(U_skia.shape(0) == ns and U_skia.shape(1) >= nk and U_skia.shape(3) == M,
+                   "wannier_sigma_to_window: projector ({}, {}, {}, {}) vs dSigma (ns {}, nk {}, M {}).", U_skia.shape(0), U_skia.shape(1),
+                   U_skia.shape(2), U_skia.shape(3), ns, nk, M);
+      nda::array<ComplexType, 5> dSb(nt, ns, nk, nW, nW);
+      nda::array<ComplexType, 2> Uc(nW, M), Ut(M, nW), T1(nW, M), S(M, M), Sb(nW, nW);
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk; ++k) {
+          for (long a = 0; a < nW; ++a)
+            for (long m = 0; m < M; ++m) { Uc(a, m) = std::conj(U_skia(is, k, a, m)); Ut(m, a) = U_skia(is, k, a, m); }
+          for (long it = 0; it < nt; ++it) {
+            S() = dSig(it, is, k, all, all);
+            nda::blas::gemm(Uc, S, T1);                                    // U^* dSigma_bar
+            nda::blas::gemm(T1, Ut, Sb);                                   // (U^* dSigma_bar) U^T
+            dSb(it, is, k, all, all) = Sb;
+          }
+        }
+      dSig = std::move(dSb);
+    }
+
   } // namespace vertex_dynbse_detail
 
   /**
-   * THE D2 GATES on the readout instance (nosym window mode; requires W0bar and the W-bar cache):
+   * THE VALIDATION CHECKS on the readout instance (nosym window mode; requires W0bar and the W-bar cache):
    *   a0_resid  : the THC rung operator with a nu'-constant W (= W0bar) vs the explicit Kbig on a
    *               random pair block -- machine class (pins the leg conjugation and the k-sum orientation);
-   *   a_resid   : the static limit of the driver vs the SIGN-CORRECTED L2 resolvent
-   *               pair_space_ladder(W0bar) (resolvent 1 + Xh Kt since 2026-09-11) -- 1e-12 class (same tau-route Cb, same Kbig, same legs);
-   *   a_l2_diff : the same vs the as-implemented L2 (the even-order sign; O(lambda^2), reported);
+   *   a_resid   : the static limit of the driver vs the SIGN-CORRECTED static ladder resolvent
+   *               pair_space_ladder(W0bar) (resolvent (1 + Xh Kt)^-1) -- 1e-12 class (same tau-route Cb, same Kbig, same legs);
+   *   a_l2_diff : the same vs the opposite-sign resolvent -ladder(-W0bar) (the even-order sign; O(lambda^2), reported);
    *   b_resid   : the one bare dynamic rung vs pi_c_accumulate_w(Z = 0, W_dyn - W_dyn(0)) -- fit class;
    *   herm      : |P - P^dag| / |P| of the resummed vertex; ritz / iterations / fit meters.
    */
@@ -1822,7 +2671,7 @@ namespace solvers {
     auto MF = thc.MF();
     auto mpi = thc.mpi();
     utils::check(MF->nkpts() == MF->nkpts_ibz() and MF->nqpts() == MF->nqpts_ibz(),
-                 "vertex_t::dynbse_gate: nosym meshes only at D2.");
+                 "vertex_t::dynbse_gate: nosym meshes only.");
     nda::array<ComplexType, 5> G_CC;
     nda::array<long, 2> kmq, kpq;
     vertex_sym::sym_ctx const *symc = nullptr;
@@ -1857,7 +2706,7 @@ namespace solvers {
     {
       auto [ev, ec] = vd::window_mf_gap(MF, _band_window);
       gap_mask = (ec > ev) ? 0.45 * (ec - ev) : 0.0;
-      app_log(1, "  [D2 gate] window mean-field gap: occupied max {:.4f}, empty min {:.4f} Ha (gap {:.4f}); union G nodes "
+      app_log(1, "  [dynbse check] window mean-field gap: occupied max {:.4f}, empty min {:.4f} Ha (gap {:.4f}); union G nodes "
                  "masked at |eps| < {:.4f} Ha", ev, ec, ec - ev, gap_mask);
     }
     // ---- (A0) the rung operator vs Kbig (rank 0, unit (0, 0)) --------------------------------
@@ -1887,8 +2736,8 @@ namespace solvers {
             sm = std::max(sm, std::abs(acc));
           }
       d.a0_resid = (sm > 0.0) ? dm / sm : dm;
-      app_log(1, "  [D2 gate] (A0) THC rung operator vs explicit Kbig: rel diff {:.3e} (scale {:.3e})", d.a0_resid, sm);
-      // the mesh-Fourier k-sum (2026-09-12): the same operator through kmesh_ft, timed against the direct sum
+      app_log(1, "  [dynbse check] (A0) THC rung operator vs explicit Kbig: rel diff {:.3e} (scale {:.3e})", d.a0_resid, sm);
+      // the mesh-Fourier k-sum: the same operator through kmesh_ft, timed against the direct sum
       {
         vd::kmesh_ft kft;
         kft.build(kc, kmq, kpq);
@@ -1905,18 +2754,18 @@ namespace solvers {
             for (long r = 0; r < nc2; ++r)
               for (long n = 0; n < nR; ++n) df = std::max(df, std::abs(Of(kp, r, n) - O(kp, r, n)));
           d.a0_ft_resid = (sm > 0.0) ? df / sm : df;
-          app_log(1, "  [D2 gate] (A0-FT) mesh-Fourier k-sum [{}] vs the direct sum: rel diff {:.3e} (mesh check {:.2e}); wall "
+          app_log(1, "  [dynbse check] (A0-FT) mesh-Fourier k-sum [{}] vs the direct sum: rel diff {:.3e} (mesh check {:.2e}); wall "
                      "{:.3f} s vs {:.3f} s (Nm = {}, nk = {}, nR = {})", kft.fft ? "FFTW" : "dense", d.a0_ft_resid, kft.check,
                   t_ft, t_direct, Nm, nk, nR);
         } else {
-          app_log(1, "  [D2 gate] (A0-FT) mesh transform NOT usable (check {:.2e}): the driver uses the direct sum", kft.check);
+          app_log(1, "  [dynbse check] (A0-FT) mesh transform NOT usable (check {:.2e}): the driver uses the direct sum", kft.check);
         }
       }
       if (quick) return d;
-      // ---- the SIGNED dominant eigenvalue of Xh Kt = (1/nk) Cb Kbig at inu = 0 (the L2 resolvent's operator):
+      // ---- the SIGNED dominant eigenvalue of Xh Kt = (1/nk) Cb Kbig at inu = 0 (the static resolvent's operator):
       // the Bethe-Salpeter series with the kernel -W is a geometric series in K'Cb = -(1/nk) Kbig Cb,
       // i.e. its resolvent is (1 + Xh Kt)^-1 and the particle-hole instability sits at lambda(Xh Kt) -> -1;
-      // the as-implemented L2 resolvent (1 - Xh Kt)^-1 would only meet it at +1. A NEGATIVE dominant
+      // the opposite-sign resolvent (1 - Xh Kt)^-1 would only meet it at +1. A NEGATIVE dominant
       // eigenvalue is therefore the sign-sensitive pin the power-iteration watchdog (|lambda|) cannot give.
       {
         nda::array<ComplexType, 3> Cb0(nk, nc2, nc2);
@@ -1949,18 +2798,18 @@ namespace solvers {
         }
         d.lam_xhkt_re = lam.real();
         d.lam_xhkt_im = lam.imag();
-        app_log(1, "  [D2 gate] (A0') dominant eigenvalue of Xh Kt = (1/nk) Cb Kbig at inu = 0, unit (0,0): {:+.6f} {:+.3e} i "
+        app_log(1, "  [dynbse check] (A0') dominant eigenvalue of Xh Kt = (1/nk) Cb Kbig at inu = 0, unit (0,0): {:+.6f} {:+.3e} i "
                    "(|lambda| {:.6f}); the -W ladder's resolvent (1 + Xh Kt)^-1 is singular at lambda = -1, the "
-                   "as-implemented L2 resolvent (1 - Xh Kt)^-1 at +1", lam.real(), lam.imag(), lam_abs);
+                   "opposite-sign resolvent (1 - Xh Kt)^-1 at +1", lam.real(), lam.imag(), lam_abs);
       }
     }
 
-    // ---- (A) the static limit vs the L2 resolvent, both signs --------------------------------
+    // ---- (A) the static limit vs the static resolvent, both signs-----------------------------
     nda::array<ComplexType, 4> Ps(nnu, nq, Nm, Nm);
     {
       vd::dyn_opts o;
       o.kcrys = std::addressof(kc);
-      o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
+      o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // node-shared W_d tables with the shared cache
       o.gap_mask = gap_mask;
       o.static_only = true;
       vd::dyn_meter met;
@@ -1979,15 +2828,15 @@ namespace solvers {
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0m, kmq, kpq, tools, nus, nullptr, &Plm, rank, size, symc);
       mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
       mpi->comm.all_reduce_in_place_n(Plm.data(), Plm.size(), std::plus<>{});
-      // 2026-09-11: pair_space_ladder now resums the derived resolvent (1 + Xh Kt)^-1, so the
-      // static column must equal it DIRECTLY; -ladder(-W0) reproduces the former (1 - Xh Kt)^-1
-      // resummation and is kept as the "as-implemented-before" reference (a_l2_diff).
-      Plm() = -Plm;                                   // the former L2 resolvent
+      // pair_space_ladder resums the derived resolvent (1 + Xh Kt)^-1, so the static column must
+      // equal it DIRECTLY; -ladder(-W0) gives the opposite-sign (1 - Xh Kt)^-1 resummation, reported
+      // as the sign-sensitivity reference (a_l2_diff).
+      Plm() = -Plm;                                   // the opposite-sign resolvent
       d.a_resid = rel4(Ps, Pl);
       d.a_l2_diff = rel4(Ps, Plm);
       d.static_max = max_abs4(Ps);
-      app_log(1, "  [D2 gate] (A) static limit vs pair_space_ladder(W0) [resolvent 1 + Xh Kt]: rel diff {:.3e}; vs the "
-                 "former L2 resolvent (-ladder(-W0), 1 - Xh Kt): {:.3e} (|static| {:.3e}); G fit {:.3e} (rr {:.3g}), "
+      app_log(1, "  [dynbse check] (A) static limit vs pair_space_ladder(W0) [resolvent 1 + Xh Kt]: rel diff {:.3e}; vs the "
+                 "opposite-sign resolvent (-ladder(-W0), 1 - Xh Kt): {:.3e} (|static| {:.3e}); G fit {:.3e} (rr {:.3g}), "
                  "Dsq/Dcb {:.3e}, W_d(s) PH-sym resid {:.3e}",
               d.a_resid, d.a_l2_diff, d.static_max, d.fit_err_G, d.rr_G, d.dsq_err, d.wtau_sym);
     }
@@ -1997,7 +2846,7 @@ namespace solvers {
       nda::array<ComplexType, 4> P1(nnu, nq, Nm, Nm);
       vd::dyn_opts o;
       o.kcrys = std::addressof(kc);
-      o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
+      o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // node-shared W_d tables with the shared cache
       o.gap_mask = gap_mask;
       o.one_rung_only = true;
       vd::dyn_meter met;
@@ -2051,7 +2900,7 @@ namespace solvers {
               da = std::max(da, std::abs(PiC(nus[1], iq, M, N) - PiC(nus[0], iq, M, N)));
               sa = std::max(sa, std::abs(PiC(nus[0], iq, M, N)));
             }
-        app_log(1, "  [D2 gate] (B) nu-continuity of the one dynamic rung, node 1 vs 0: driver {:.3e}, anchor {:.3e}",
+        app_log(1, "  [dynbse check] (B) nu-continuity of the one dynamic rung, node 1 vs 0: driver {:.3e}, anchor {:.3e}",
                 d.b_continuity, (sa > 0.0) ? da / sa : da);
       }
       {
@@ -2062,10 +2911,10 @@ namespace solvers {
               dm0 = std::max(dm0, std::abs(P1(0, iq, M, N) - PiC(nus[0], iq, M, N)));
               sm0 = std::max(sm0, std::abs(PiC(nus[0], iq, M, N)));
             }
-        d.b_resid = (sm0 > 0.0) ? dm0 / sm0 : dm0;      // the gate: inu = 0
+        d.b_resid = (sm0 > 0.0) ? dm0 / sm0 : dm0;      // the asserted value: inu = 0
       }
       d.onerung_max = sm;
-      app_log(1, "  [D2 gate] (B) one bare dynamic rung vs pi_c_accumulate_w(Z = 0, W_dyn - W_dyn(0)): rel diff "
+      app_log(1, "  [dynbse check] (B) one bare dynamic rung vs pi_c_accumulate_w(Z = 0, W_dyn - W_dyn(0)): rel diff "
                  "{:.3e} (|anchor| {:.3e}, |static| {:.3e}); tau refit err {:.3e}",
               d.b_resid, sm, d.static_max, d.refit_err_1);
       // per-node detail
@@ -2081,7 +2930,7 @@ namespace solvers {
         for (long iq = 0; iq < nq; ++iq)
           for (long M = 0; M < Nm; ++M)
             for (long N = 0; N < Nm; ++N) pj = std::max(pj, std::abs(P1(jn, iq, M, N)));
-        app_log(1, "  [D2 gate] (B) node {} (n = {}): rel diff {:.3e}, |anchor| {:.3e}, |P1| {:.3e}", jn,
+        app_log(1, "  [dynbse check] (B) node {} (n = {}): rel diff {:.3e}, |anchor| {:.3e}, |P1| {:.3e}", jn,
                 tools.wn_b(nus[size_t(jn)]), (sj > 0.0) ? dj / sj : dj, sj, pj);
       }
     }
@@ -2094,7 +2943,7 @@ namespace solvers {
         nda::array<ComplexType, 4> Pn(nnu, nq, Nm, Nm);
         vd::dyn_opts o;
         o.kcrys = std::addressof(kc);
-        o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
+        o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // node-shared W_d tables with the shared cache
         o.gap_mask = gap_mask;
         o.gmres_m = 0;
         o.maxit = nord;
@@ -2111,7 +2960,7 @@ namespace solvers {
               s0 = std::max(s0, std::abs(Pn(0, iq, M, N)));
               dS = std::max(dS, std::abs(Pn(0, iq, M, N) - Ps(0, iq, M, N)));
             }
-        app_log(1, "  [D2 gate] (B2) Neumann order {}: nu-continuity node 1 vs 0 = {:.3e} (|P| {:.3e}; |P - static| at node 0 "
+        app_log(1, "  [dynbse check] (B2) Neumann order {}: nu-continuity node 1 vs 0 = {:.3e} (|P| {:.3e}; |P - static| at node 0 "
                    "{:.3e})", nord, (s0 > 0.0) ? d0 / s0 : d0, s0, dS);
       }
     }
@@ -2119,14 +2968,14 @@ namespace solvers {
     // ---- (C) the resummed vertex at inu = 0: Neumann and GMRES, Hermiticity, meters --------
     // (inu = 0 only here: in the {U, S} two-family representation the index-confluent pairs carry
     //  coefficients +-1/(i nu) that cancel only in values, and at the first positive node of a
-    //  beta = 1000 grid (1/nu = 159) the per-family tau refit noise re-enters the iteration at the
-    //  level of the physical content -- measured: Ritz 2e3, the solve stalls. The bounded
-    //  representation T_a = U_a S_a of the shifted family is increment D2e; the one-rung column
-    //  above is continuous into that node because its readout cancels exactly.)
+    //  large-beta grid the per-family tau refit noise, amplified by 1/nu, re-enters the iteration
+    //  at the level of the physical content and the solve stalls. The bounded representation
+    //  T_a = U_a S_a of the shifted family addresses this (C'); the one-rung column above is
+    //  continuous into that node because its readout cancels exactly.)
     // ---- (C') the inu != 0 EXPERIMENT (reported, not asserted): union grid + mask + tau metric ----
-    // D2e status: the physical readouts are nu-continuous order by order (B2), the tau-metric GMRES
-    // readout at the first positive node is continuous with inu = 0, but the iteration carries a
-    // spurious mode (watchdog ~2.6 union / ~40 shared+mask on lih222 at beta = 1000) -- open.
+    // The physical readouts are nu-continuous order by order (B2) and the tau-metric GMRES readout
+    // at the first positive node is continuous with inu = 0, but the iteration can carry a spurious
+    // mode (watchdog above 1), so these variants are reported only.
     {
       std::vector<long> nu1 = {tools.m0 + 1};
       nda::array<ComplexType, 4> Pe(1, nq, Nm, Nm), Pge(1, nq, Nm, Nm);
@@ -2151,7 +3000,7 @@ namespace solvers {
               ds = std::max(ds, std::abs(Pe(0, iq, M, N) - Ps(1, iq, M, N)));
               ss = std::max(ss, std::abs(Ps(1, iq, M, N)));
             }
-        app_log(1, "  [D2 gate] (C') inu != 0 experiment [{}], tau metric, GMRES(12), readout tol 1e-6: |resummed - static| / "
+        app_log(1, "  [dynbse check] (C') inu != 0 experiment [{}], tau metric, GMRES(12), readout tol 1e-6: |resummed - static| / "
                    "|static| at node 1 = {:.3e} (node 0's asserted value below), watchdog {:.3e}, applications max {}, "
                    "done {}, refit {:.2e}, G pole fit {:.2e}",
                 variant == 0 ? "union, no mask" : (variant == 1 ? "union + mask" : "shared + mask"),
@@ -2163,12 +3012,12 @@ namespace solvers {
       }
     }
     {
-      std::vector<long> nu0 = {tools.m0};          // the asserted solve: inu = 0, the D4 configuration
+      std::vector<long> nu0 = {tools.m0};          // the asserted solve: inu = 0, the production configuration
       const long nnu0 = 1;
       nda::array<ComplexType, 4> Pg(nnu0, nq, Nm, Nm), Pd(nnu0, nq, Nm, Nm), Pd2(nnu0, nq, Nm, Nm), Pg2(nnu0, nq, Nm, Nm);
       vd::dyn_opts o;
       o.kcrys = std::addressof(kc);
-      o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
+      o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // node-shared W_d tables with the shared cache
       o.gmres_m = 4;
       o.maxit = 12;
       vd::dyn_meter met;
@@ -2200,7 +3049,7 @@ namespace solvers {
         mpi->comm.all_reduce_in_place_n(Pdb.data(), Pdb.size(), std::plus<>{});
         metb.reduce(mpi->comm);
         d.block_resid = std::max(rel4(Pd, Pdb), rel4(Pg, Pgb));
-        app_log(1, "  [D2 gate] (C'') RHS blocks of 5 (of Nm = {}) vs the unblocked solve: resummed rel diff {:.3e}, Gamma1 "
+        app_log(1, "  [dynbse check] (C'') RHS blocks of 5 (of Nm = {}) vs the unblocked solve: resummed rel diff {:.3e}, Gamma1 "
                    "{:.3e}; applications max {} vs {}; RSS {:.2f} vs {:.2f} GB", Nm, rel4(Pd, Pdb), rel4(Pg, Pgb), metb.it_max,
                 met.it_max, metb.rss_max_gb, met.rss_max_gb);
       }
@@ -2224,10 +3073,10 @@ namespace solvers {
               ss = std::max(ss, std::abs(Ps(jn, iq, M, N)));
             }
         if (jn == 0) { d.dyn_vs_static = (ss > 0.0) ? ds / ss : ds; d.gam1_vs_static = (ss > 0.0) ? d1 / ss : d1; }
-        app_log(1, "  [D2 gate] (C) node {}: |resummed - static| / |static| = {:.3e}, |Gamma1 - static| / |static| "
+        app_log(1, "  [dynbse check] (C) node {}: |resummed - static| / |static| = {:.3e}, |Gamma1 - static| / |static| "
                    "= {:.3e}", jn, (ss > 0.0) ? ds / ss : ds, (ss > 0.0) ? d1 / ss : d1);
       }
-      app_log(1, "  [D2 gate] (C) resummed: GMRES(4) vs Neumann rel diff {:.3e} (Gamma1 {:.3e}); max |Ritz(K_d L_s)| "
+      app_log(1, "  [dynbse check] (C) resummed: GMRES(4) vs Neumann rel diff {:.3e} (Gamma1 {:.3e}); max |Ritz(K_d L_s)| "
                  "{:.3f}, Neumann contraction {:.3f}; applications max {} / {}; all converged {}; tau refit "
                  "{:.3e}; Hermiticity {:.3e}; walls: setup {:.2f} kbig {:.2f} cb {:.2f} lu {:.2f} solve {:.2f} "
                  "read {:.2f} s; RSS {:.2f} GB",
@@ -2244,7 +3093,7 @@ namespace solvers {
     vertex_ladder_detail::prof_watch twatch;
     dynbse_nu0_result r;
     utils::check(active() and secondary(), "vertex_t::eval_pol_dynbse_nu0: requires an ACTIVE secondary-basis vertex.");
-    // W-int-0: _wannier => the outputs are the MLWF-pair polarization (dumped for coarse->fine interpolation).
+    // _wannier => the outputs are the MLWF-pair polarization (dumped for coarse->fine interpolation).
     utils::check(_W0b_qmm.has_value(), "vertex_t::eval_pol_dynbse_nu0: W0bar is absent -- build_w0 must run first.");
     utils::check(has_cached_w(),
                  "vertex_t::eval_pol_dynbse_nu0: the W-bar cache is absent -- cache_w must run on this instance "
@@ -2259,13 +3108,13 @@ namespace solvers {
     auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
     auto &tools = *tools_h.tools;
     const long nq = long(_W0b_qmm.value().shape(0)), Nm = _Xb_skma.shape(2);   // nq_ibz on a symmetric mesh
-    const bool pair_frame = _wannier and (_wannier_frame == "pair");   // W-int-1b: "aux" (points) is the interpolable frame
+    const bool pair_frame = _wannier and (_wannier_frame == "pair");   // "aux" (points) is the interpolable frame
     const long nout = pair_frame ? _M * _M : Nm;
     std::vector<long> nu0 = {tools.m0};
     nda::array<ComplexType, 4> Ps(1, nq, nout, nout), P1(1, nq, nout, nout), Pg(1, nq, nout, nout), Pd(1, nq, nout, nout);
     vd::dyn_opts o;
     o.kcrys = std::addressof(kc);
-    o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
+    o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // node-shared W_d tables with the shared cache
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = _dyn_gmres; o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
@@ -2273,26 +3122,29 @@ namespace solvers {
     o.tfold = _dyn_tfold;
     o.vmask_lo = _dyn_vmask_lo; o.vmask_hi = _dyn_vmask_hi;
     o.gamma1_only = _dyn_gamma1_only;
-    if (_dyn_gamma1_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
+    if (_dyn_gamma1_only) app_log(1, "  [dynamic vertex] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
-    o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // P5
+    o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // the measured unit times
     o.readout_tol = 1e-6;                // the physical readout's own stop (the 1e-8 residual is below the refit floor)
+    if (not _dyn_gamma1_only)            // an extra (looser) stopping rule beside pol_vertex_dyn_tol -- say so
+      app_log(1, "  [dynbse] WARNING: the GMRES resummation also stops when the physical readout moves by < 1e-6 (fixed readout_tol), "
+                 "besides pol_vertex_dyn_tol = {:.1e}", _dyn_tol);
     if (_wannier) {
       o.wannier_pairs = pair_frame;
-      if (pair_frame) app_log(1, "  [scGW-tilde T2] Wannier-pair vertex output (W-int-0/1): Pi_loc(q) in the MLWF pair basis (M = {}, nab = {}; G_bar / X_bar inputs, identity pair legs) -- the SAME-CELL pair block.", _M, nout);
-      else app_log(1, "  [scGW-tilde T2] Wannier-C vertex output in the aux/point frame (W-int-1b): Pi(q)_{{MN}} on the N_m = {} secondary points (M = {} MLWFs, G_bar / X_bar inputs) -- the interpolable frame (freeze the points on the fine mesh).", nout, _M);
+      if (pair_frame) app_log(1, "  [dynamic vertex] Wannier-pair vertex output: Pi_loc(q) in the MLWF pair basis (M = {}, nab = {}; G_bar / X_bar inputs, identity pair legs) -- the SAME-CELL pair block.", _M, nout);
+      else app_log(1, "  [dynamic vertex] Wannier-C vertex output in the aux/point frame: Pi(q)_{{MN}} on the N_m = {} secondary points (M = {} MLWFs, G_bar / X_bar inputs) -- the interpolable frame (freeze the points on the fine mesh).", nout, _M);
     }
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0.g" + std::to_string(gen);
-    // D3/D4 configuration at inu = 0: the shared aux grid with the Dsq/Dcb tables, no mask (the
-    // union grid / in-gap mask / twisted-pair basis are the inu != 0 machinery of D2e, still open)
+    // the inu = 0 configuration: the shared aux grid with the Dsq/Dcb tables, no mask (the
+    // union grid / in-gap mask / twisted-pair basis are the inu != 0 machinery)
     vd::dyn_meter met;
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nu0,
                               &Ps, &P1, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
     // the pure one dynamic rung (T_s = 0, one application) as its own column: produced by the pass above when the device-resident
-    // unit ran every unit (gpu 4d), else by a second pass (which re-zeroes P1)
+    // unit ran every unit, else by a second pass (which re-zeroes P1)
     const long r1_miss_a = mpi->comm.all_reduce_value(met.r1_missing, std::plus<>{});
     if (r1_miss_a == 0)
-      app_log(1, "  [scGW-tilde T2] the one-bare-rung column came with the Gamma_1 pass (device-resident unit, or its unit dump): no second driver pass.");
+      app_log(1, "  [dynamic vertex] the one-bare-rung column came with the Gamma_1 pass (device-resident unit, or its unit dump): no second driver pass.");
     else {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
@@ -2303,7 +3155,7 @@ namespace solvers {
     }
     for (auto *A : {&Ps, &P1, &Pg, &Pd}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
     met.reduce(mpi->comm);
-    met.merge_unit_cost(_dyn_unit_cost);   // P5: the measured unit times for the next call's order
+    met.merge_unit_cost(_dyn_unit_cost);   // the measured unit times for the next call's order
     const double hs = vertex_ladder_detail::hermitize_mn(Ps), h1 = vertex_ladder_detail::hermitize_mn(P1);
     const double hg = vertex_ladder_detail::hermitize_mn(Pg), hd = vertex_ladder_detail::hermitize_mn(Pd);
     r.Pi_static = nda::array<ComplexType, 3>(nq, nout, nout); r.Pi_static = Ps(0, all, all, all);
@@ -2311,7 +3163,7 @@ namespace solvers {
     r.Pi_gam1 = nda::array<ComplexType, 3>(nq, nout, nout);   r.Pi_gam1 = Pg(0, all, all, all);
     r.Pi_dyn = nda::array<ComplexType, 3>(nq, nout, nout);    r.Pi_dyn = Pd(0, all, all, all);
     if (_dyn_dump and mpi->comm.root()) {
-      // W-int-1b: the assembled inu = 0 columns as ONE h5 (the offline Route-B tool's input, and the fine-mesh
+      // the assembled inu = 0 columns as ONE h5 (the offline interpolation tool's input, and the fine-mesh
       // consumer's format: pol_vertex_interp_file). q in crystal coordinates (this run's Qpts order).
       const std::string fn = mb_state.coqui_prefix + ".pol_nu0.g" + std::to_string(gen) + ".h5";
       auto lat = MF->lattv();                          // rows a_i (bohr); a_i . b_j = 2 pi delta_ij
@@ -2337,7 +3189,7 @@ namespace solvers {
       h5::h5_write(g, "window_first", long(_band_window.first()));
       h5::h5_write(g, "window_size", long(_band_window.size()));
       if (_sec_ipts.size() > 0) nda::h5_write(g, "ipts", _sec_ipts);
-      app_log(1, "  [W-int] inu = 0 vertex columns written to {} ({} q x {} x {}, frame {}).", fn, nq, nout, nout,
+      app_log(1, "  [vertex Wannier] inu = 0 vertex columns written to {} ({} q x {} x {}, frame {}).", fn, nq, nout, nout,
               pair_frame ? "pair" : "aux");
     }
     r.ritz_max = met.ritz_max; r.refit_err = met.refit_err_max; r.fit_err_G = met.fit_err_G; r.rr_G = met.rr_G;
@@ -2345,7 +3197,7 @@ namespace solvers {
     r.all_converged = (met.nconv == met.nunits); r.t_solve = met.t_solve; r.rss_gb = met.rss_max_gb;
     r.t_total = twatch.lap();
     auto mx = [](nda::array<ComplexType, 3> const &A) { double m = 0.0; for (auto const &v : A) m = std::max(m, std::abs(v)); return m; };
-    app_log(1, "  [scGW-tilde T2] dynamic-rung ladder at inu = 0: {} units, applications max {} (mean {:.1f}), "
+    app_log(1, "  [dynamic vertex] dynamic-rung ladder at inu = 0: {} units, applications max {} (mean {:.1f}), "
                "all converged {}, watchdog max |Ritz(K_d L_s)| {:.3f}; G pole fit {:.2e} (rr {:.2f}), tau refit "
                "{:.2e}; (M,N) asymmetry static {:.1e} / one-rung {:.1e} / Gamma1 {:.1e} / resummed {:.1e}; "
                "|static| {:.3e} |one-rung| {:.3e} |Gamma1| {:.3e} |resummed| {:.3e}; wall {:.1f} s (solve {:.1f} s "
@@ -2357,23 +3209,23 @@ namespace solvers {
             met.t_solve - met.t_rung - met.t_refit - met.t_l0 - met.t_ts - met.t_orth, met.n_apps,
             (met.n_apps > 0) ? met.t_solve * double(mpi->comm.size()) / double(met.n_apps) : 0.0, met.rss_max_gb,
             utils::omp_threads());
-    app_log(1, "  [scGW-tilde T2] {}", met.l0_split_line());
-    app_log(1, "  [scGW-tilde T2] unit split on the slowest rank: setup {:.1f} s, K_big build {:.1f} s, Cb {:.1f} s, LU {:.1f} s, solve {:.1f} s, "
+    app_log(1, "  [dynamic vertex] {}", met.l0_split_line());
+    app_log(1, "  [dynamic vertex] unit split on the slowest rank: setup {:.1f} s, K_big build {:.1f} s, Cb {:.1f} s, LU {:.1f} s, solve {:.1f} s, "
                "readout {:.1f} s; wall {:.1f} s -> unaccounted {:.1f} s (dumps, reductions, scheduling)",
             met.t_setup, met.t_kbig, met.t_cb, met.t_lu, met.t_solve, met.t_read, r.t_total,
             r.t_total - met.t_setup - met.t_kbig - met.t_cb - met.t_lu - met.t_solve - met.t_read);
     if (met.ritz_max >= 1.0)
-      app_log(1, "  [scGW-tilde T2] WARNING: the dynamic remainder's watchdog is >= 1 on some unit -- the resummed "
+      app_log(1, "  [dynamic vertex] WARNING: the dynamic remainder's watchdog is >= 1 on some unit -- the resummed "
                  "column is not to be trusted there; Gamma_1 is the reportable number.");
     return r;
   }
 
   /**
-   * eps(q_i, i nu) cuts (2026-09-11): the dynamic-rung columns on a list of PH-sym bosonic HALF
-   * nodes (j <-> full index nw_b/2 + j) at a subset of transfers. The inu != 0 framework of D2e:
+   * eps(q_i, i nu) cuts: the dynamic-rung columns on a list of PH-sym bosonic HALF
+   * nodes (j <-> full index nw_b/2 + j) at a subset of transfers. The inu != 0 framework:
    * the UNION {U, T} basis (G on the half-shifted grid, in-gap nodes masked at 0.45 x the window
-   * gap), the tau metric, GMRES with a Krylov space of at least 12 (the restart at m = 4 was the
-   * stall: lih node 1 converges to 6e-9 in 10 applications at m = 12), the readout criterion as
+   * gap), the tau metric, GMRES with a Krylov space of at least 12 (a restart at m = 4 can stall
+   * at the first positive node), the readout criterion as
    * the stop. Node 0 is evaluated on the same footing (the union scheme is exact there too), so
    * the cut's node 0 agrees with eval_pol_dynbse_nu0's shared-grid value to the refit class.
    */
@@ -2407,14 +3259,16 @@ namespace solvers {
     r.half_nodes = half_nodes;
     r.qsel = qsel;
     nda::array<ComplexType, 4> Ps(nn, nq, Nm, Nm), P1(nn, nq, Nm, Nm), Pg(nn, nq, Nm, Nm), Pd(nn, nq, Nm, Nm);
-    nda::array<ComplexType, 4> Pb(nn, nq, Nm, Nm);   // LFF-aux L-0: the window bubble column (always evaluated: cheap)
+    nda::array<ComplexType, 4> Pb(nn, nq, Nm, Nm);   // the window bubble column (always evaluated: cheap)
     vd::dyn_opts o;
     o.Pi_bub = std::addressof(Pb);
     o.bubble_only = bubble_only;
-    if (bubble_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_bubble_only: ONLY the window bubble column Pi_bub = (spin/nk) D^dag Cb D is evaluated (no rung, no solve).");
+    if (bubble_only) app_log(1, "  [dynamic vertex] pol_vertex_dyn_bubble_only: ONLY the window bubble column Pi_bub = (spin/nk) D^dag Cb D is evaluated (no rung, no solve).");
     o.kcrys = std::addressof(kc);
-    o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
+    o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // node-shared W_d tables with the shared cache
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = _dyn_sign;
+    if (_dyn_gmres < 12)                 // the input is raised here -- say so
+      app_log(1, "  [dynbse] WARNING: pol_vertex_dyn_gmres = {} is raised to GMRES(12) for this pass", _dyn_gmres);
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
     o.resolvent = _dyn_resolvent;
@@ -2423,21 +3277,21 @@ namespace solvers {
     o.tfold = _dyn_tfold;
     o.vmask_lo = _dyn_vmask_lo; o.vmask_hi = _dyn_vmask_hi;
     o.gamma1_only = _dyn_gamma1_only;
-    if (_dyn_gamma1_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
+    if (_dyn_gamma1_only) app_log(1, "  [dynamic vertex] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
-    o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // P5
+    o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // the measured unit times
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.cut.g" + std::to_string(gen);
     o.union_nodes = true;
-    // NO in-gap mask: the symmetric |eps| < 0.45 gap mask is centered at mu, not on the gap, and on
-    // lih222 it removed the nodes the occupied top (0.027 Ha) needs (G pole fit 2.5e-1). The union
+    // NO in-gap mask: the symmetric |eps| < 0.45 gap mask is centered at mu, not on the gap, and can
+    // remove the nodes a band edge close to mu needs (the G pole fit then fails). The union
     // grid without a mask represents G to the node_pole_fit class; GMRES(>= 12) handles the rest.
     o.gap_mask = 0.0;
-    // EXPERIMENT (small-nu spurious mode): COQUI_DYNBSE_UNION=0 runs the cut on the SHARED node set
+    // EXPERIMENT (small-nu spurious mode): vertex_debug dynbse_union = 0 runs the cut on the SHARED node set
     // (exact confluent algebra + the twisted R1/R3 tables) instead of the union grid.
-    if (auto u = vertex_debug::get("dynbse_union"); u.has_value()) o.union_nodes = (std::atoi(u->c_str()) != 0);   // vertex_debug: dynbse_union = 0 | 1
+    if (const double u = vertex_debug::number("dynbse_union", -1.0); u >= 0.0) o.union_nodes = (u != 0.0);   // vertex_debug: dynbse_union = 0 | 1 (strict parse)
     o.readout_tol = 1e-6;
     o.q_subset = std::addressof(qsel);
-    if (_shared_hook != nullptr and not bubble_only) {   // P3: the Sigma hook armed by arm_shared_sigma_hook rides the main solve
+    if (_shared_hook != nullptr and not bubble_only) {   // the Sigma hook armed by arm_shared_sigma_hook rides the main solve
       utils::check(o.dump_prefix.empty(), "vertex_t::eval_pol_dynbse_cut: the shared Sigma hook and the unit dump are exclusive.");
       utils::check(qsel.size() == size_t(nq), "vertex_t::eval_pol_dynbse_cut: the shared Sigma hook needs every transfer (no q subset).");
       o.sigma = std::static_pointer_cast<vd::sigma_dyn_hook>(_shared_hook).get();
@@ -2446,10 +3300,10 @@ namespace solvers {
     const bool want_r1_cut = (_dyn_cut_r1 and not bubble_only);
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
                               &Ps, want_r1_cut ? &P1 : nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
-    if (o.sigma != nullptr) { o.sigma->flush_unit(); o.sigma = nullptr; }   // P3: the last unit's star fold; the cut_r1 pass carries no hook
+    if (o.sigma != nullptr) { o.sigma->flush_unit(); o.sigma = nullptr; }   // the last unit's star fold; the cut_r1 pass carries no hook
     const long r1_miss_b = want_r1_cut ? mpi->comm.all_reduce_value(met.r1_missing, std::plus<>{}) : 0l;
     if (want_r1_cut and r1_miss_b == 0) {
-      app_log(1, "  [scGW-tilde T2] the one-bare-rung column came with the main pass (device-resident unit, or its unit dump): no cut_r1 driver pass.");
+      app_log(1, "  [dynamic vertex] the one-bare-rung column came with the main pass (device-resident unit, or its unit dump): no cut_r1 driver pass.");
     } else if (want_r1_cut) {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
@@ -2462,12 +3316,12 @@ namespace solvers {
       // pol_vertex_dyn_cut_r1 = false: the one-bare-rung column is not computed (Pi_dyn1 below = Pi_static)
       P1() = ComplexType(0.0);
       if (not bubble_only)
-        app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_cut_r1 = false: the one-bare-dynamic-rung pass is SKIPPED; the Pi_dyn1 column repeats Pi_static.");
+        app_log(1, "  [dynamic vertex] pol_vertex_dyn_cut_r1 = false: the one-bare-dynamic-rung pass is SKIPPED; the Pi_dyn1 column repeats Pi_static.");
     }
     for (auto *A : {&Ps, &P1, &Pg, &Pd, &Pb}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
     r.Pi_bub = std::move(Pb);
     met.reduce(mpi->comm);
-    met.merge_unit_cost(_dyn_unit_cost);   // P5: the measured unit times for the next call's order
+    met.merge_unit_cost(_dyn_unit_cost);   // the measured unit times for the next call's order
     r.Pi = nda::array<ComplexType, 5>(4, nn, nq, Nm, Nm);
     r.Pi(0, all, all, all, all) = Ps;
     r.Pi(1, all, all, all, all) = Ps;
@@ -2478,7 +3332,7 @@ namespace solvers {
     r.it_max = met.it_max; r.it_sum = met.it_sum; r.nunits = met.nunits;
     r.all_converged = (met.nconv == met.nunits); r.t_solve = met.t_solve; r.rss_gb = met.rss_max_gb;
     r.t_total = twatch.lap();
-    app_log(1, "  [scGW-tilde T2] {} on {} nu nodes x {} transfers (union basis, mask {:.4f} Ha, "
+    app_log(1, "  [dynamic vertex] {} on {} nu nodes x {} transfers (union basis, mask {:.4f} Ha, "
                "GMRES({}), RHS blocks {}, readout tol 1e-6): {} units, applications max {} (mean {:.1f}), all done {}, "
                "watchdog max |Ritz(K_d L_s)| {:.3f}; G pole fit {:.2e}, tau refit {:.2e}; wall {:.1f} s (solve {:.1f} s on "
                "the slowest rank: rung {:.1f} s, refit {:.1f} s, L0 {:.1f} s, T_s gemms {:.1f} s, Arnoldi {:.1f} s, rest {:.1f} s; "
@@ -2488,7 +3342,7 @@ namespace solvers {
             met.fit_err_G, met.refit_err_max, r.t_total, met.t_solve, met.t_rung, met.t_refit, met.t_l0, met.t_ts, met.t_orth,
             met.t_solve - met.t_rung - met.t_refit - met.t_l0 - met.t_ts - met.t_orth, met.n_apps, met.rss_max_gb,
             utils::omp_threads());
-    app_log(1, "  [scGW-tilde T2] {}", met.l0_split_line());
+    app_log(1, "  [dynamic vertex] {}", met.l0_split_line());
     if (met.unit_diag.size() > 0) {
       app_log(2, "  [dynbse cut units]   s   q  node  apps conv stag rconv    |Ritz|     refit   shift-fit  shift-cond  last-readout-step  (table mode {}, fold ratio {})", o.table_mode, o.tfold);
       for (long u = 0; u < met.unit_diag.shape(0); ++u) {
@@ -2500,7 +3354,7 @@ namespace solvers {
       }
     }
     if ((met.fit_err_G > 1e-4 or not r.all_converged) and not bubble_only)
-      app_log(1, "  [scGW-tilde T2] WARNING: the dynamic cut's G pole fit ({:.2e}) or convergence ({}) is not clean -- "
+      app_log(1, "  [dynamic vertex] WARNING: the dynamic cut's G pole fit ({:.2e}) or convergence ({}) is not clean -- "
                  "its columns are not to be trusted at that level.", met.fit_err_G, r.all_converged);
     return r;
   }
@@ -2514,11 +3368,14 @@ namespace solvers {
     const bool compatible = (opt.col == "dyn1" and _dyn_gamma1_only) or (opt.col == "dyn" and not _dyn_gamma1_only);
     if (not compatible) {
       if (opt.col == "dyn1" or opt.col == "dyn")
-        app_log(1, "  [LFF-Sigma dyn] P3: pol_vertex_sigma_share ignored -- the P-side solve is {} and the Sigma column is {} (separate solves)",
+        app_log(1, "  [Sigma vertex, dynamic] WARNING: pol_vertex_sigma_share ignored -- the P-side solve is {} and the Sigma column is {} (separate solves)",
                 _dyn_gamma1_only ? "Gamma_1 only" : "resummed", opt.col);
       return 0;
     }
     utils::check(not _dyn_dump, "vertex_t::arm_shared_sigma_hook: pol_vertex_sigma_share and the unit dump/restart are exclusive.");
+    // the shared hook keeps this run's P-side deposits while a Sigma checkpoint would add an earlier run's on top
+    utils::check(not (opt.dyn_ckpt_minutes > 0.0), "vertex_t::arm_shared_sigma_hook: pol_vertex_sigma_share and the Sigma checkpoint "
+                 "(pol_vertex_sigma_dyn_ckpt_minutes > 0) are exclusive (the P-side deposits would be counted twice on a restart). ABORTING.");
     auto MF = thc.MF();
     if (not has_cached_w()) cache_w(mb_state, thc);
     nda::array<ComplexType, 5> G_CC;
@@ -2531,6 +3388,11 @@ namespace solvers {
     std::vector<long> nus;
     auto hook = std::make_shared<vd::sigma_dyn_hook>();
     prepare_sigma_dyn_hook(*hook, opt, thc, tools, symc, sym_, nus);
+    if (_wannier) {                                                  // Wannier mode: the closure G (see eval_sigma_pair_dyn)
+      utils::check(not sym_, "vertex_t::arm_shared_sigma_hook: the Wannier-mode dynamic Sigma vertex runs on nosym meshes only.");
+      vd::wannier_closure_G(mb_state.sG_tskij.value().local(), _band_window, MF->nkpts() != MF->nkpts_ibz(), MF->kp_to_ibz(),
+                            MF->kp_trev(), _U_skia, G_CC.shape(0), G_CC.shape(1), G_CC.shape(2), G_CC.shape(3), hook->G_close);
+    }
     // the P-side nodes that belong to the Sigma node set are deposited by the P-side call
     std::vector<long> shared;
     for (long m : p_nodes) if (std::find(nus.begin(), nus.end(), m) != nus.end()) shared.push_back(m);
@@ -2540,12 +3402,12 @@ namespace solvers {
     _shared_hook = hook;
     _shared_hook_nodes = nus;
     _shared_hook_col = opt.col; _shared_hook_outer = opt.outer;
-    app_log(1, "  [LFF-Sigma dyn] P3: the Sigma hook armed on the P-side readout for {} of its {} nodes ({} Sigma nodes in total)",
+    app_log(1, "  [Sigma vertex, dynamic] the Sigma hook armed on the P-side readout for {} of its {} nodes ({} Sigma nodes in total)",
             shared.size(), p_nodes.size(), nus.size());
     return long(shared.size());
   }
 
-  /** P3: the Sigma hook's preparation (the column, the outer W, the sym context, the sampled-mode weights from the reference
+  /** the Sigma hook's preparation (the column, the outer W, the sym context, the sampled-mode weights from the reference
    *  dump, the node list `nus` it will run on) -- shared by eval_sigma_pair_dyn and arm_shared_sigma_hook. */
   void vertex_t::prepare_sigma_dyn_hook(vertex_dynbse_detail::sigma_dyn_hook &hook, sigma_pair_opts const &opt, THC_ERI auto &thc,
                                         vertex_pi::iaft_tools const &tools, vertex_sym::sym_ctx const *symc, bool sym_,
@@ -2557,15 +3419,15 @@ namespace solvers {
     hook.col = opt.col;
     hook.outer = opt.outer;
     hook.dump = opt.dyn_dump;
-    hook.single_acc = (opt.dyn_acc == "single");   // P4-C14
+    hook.single_acc = (opt.dyn_acc == "single");   // one tau-resolved accumulator instead of three
     hook.refit = opt.dyn_refit; hook.refit_rtol = opt.dyn_refit_rtol;
-    hook.symc = symc; hook.ibz = (sym_ and opt.ibz);   // P1: the IBZ solve + star fold (the driver's units are the IBZ transfers)
-    // ---- L-8: the nu-SAMPLED mode: the deposit weights Tt = Ttw . Phi_all . pinv(Phi_S) from a reference dump's nu-bases ----
-    const bool auto_nodes = (opt.dyn_nodes.empty() and opt.dyn_auto_nodes > 0);   // P14b
+    hook.symc = symc; hook.ibz = (sym_ and opt.ibz);   // the IBZ solve + star fold (the driver's units are the IBZ transfers)
+    // ---- the nu-SAMPLED mode: the deposit weights Tt = Ttw . Phi_all . pinv(Phi_S) from a reference dump's nu-bases ----
+    const bool auto_nodes = (opt.dyn_nodes.empty() and opt.dyn_auto_nodes > 0);   // nodes chosen from the dump's nu-modes
     const bool sampled = not opt.dyn_nodes.empty() or auto_nodes;
-    // gpu port 2026-09-27 (p1gpu_n3q: 7.5 s of the Sigma call's preparation per iteration, most of it re-reading ~1 GB of
-    // the reference dump for the same Gram matrices): the sampled-mode products are a function of the dump and the grid
-    // only -- reuse them while the dump (path, size, mtime), the node options and Ttw are unchanged.
+    // the sampled-mode products are a function of the dump and the grid only (rebuilding them means re-reading the
+    // reference dump for the same Gram matrices every call) -- reuse them while the dump (path, size, mtime), the node
+    // options and Ttw are unchanged.
     // vertex_debug sigdyn_bases_cache = 0 rebuilds them every call.
     std::string skey;
     if (sampled) {
@@ -2594,7 +3456,7 @@ namespace solvers {
         hook.W_cst = c->W_cst;
         hook.R_T = c->R_T;
         hook.sampled = true;
-        app_log(1, "  [LFF-Sigma dyn] SAMPLED mode: {} of {} nodes, nu-bases REUSED from the previous call ({} unchanged) --{}",
+        app_log(1, "  [Sigma vertex, dynamic] SAMPLED mode: {} of {} nodes, nu-bases REUSED from the previous call ({} unchanged) --{}",
                 nus.size(), nw_b, opt.dyn_fit_file, c->log);
         return;
       }
@@ -2618,7 +3480,7 @@ namespace solvers {
         nda::h5_read(g, "Hc", H);
         utils::check(H.shape(0) == nw_b, "vertex_t::eval_sigma_pair_dyn: the reference dump has {} nodes, this run {}.", H.shape(0), nw_b);
         {
-          // P13: the reference may come from ANOTHER k mesh (the nu-modes are set by the pair continuum, not by the mesh);
+          // the reference may come from ANOTHER k mesh (the nu-modes are set by the pair continuum, not by the mesh);
           // what must agree is the imaginary-axis grid: the bosonic node labels and the pole node set
           nda::array<long, 1> wn_ref;
           nda::h5_read(g, "wn_b", wn_ref);
@@ -2635,18 +3497,18 @@ namespace solvers {
           nda::blas::gemm(H2, nda::dagger(H2), Gc);                       // G(m, m') = sum_rows H(m, row) H(m', row)^*
         }
         {
-          // P15 (2026-09-22): WHICH object the T-family nu-modes are learned from. "trace" (the default, the historic
-          // behaviour) uses HT = sum_c Y(c i, c j), one specific contraction of the object the sampled mode actually
-          // reconstructs; "sketch" uses HS = nsk RANDOM contractions of the same Y, which cannot be blind to a nu-mode
-          // the way a fixed one can. The Si 4^3 sampled vertex fails with the trace proxy while its own Gram reports a
-          // kept weight of 0.999997 -- the proxy is not a faithful guide for the full T family there.
+          // WHICH object the T-family nu-modes are learned from. "trace" (the default) uses HT = sum_c Y(c i, c j), one
+          // specific contraction of the object the sampled mode actually reconstructs; "sketch" uses HS = nsk RANDOM
+          // contractions of the same Y, which cannot be blind to a nu-mode the way a fixed one can. The trace proxy can
+          // report a kept weight close to 1 in its own Gram while missing nu-modes of the full T family.
           const std::string gram_src = vertex_debug::text("sigdyn_gram", "trace");
-          bool use_sketch = (gram_src == "sketch");
-          if (use_sketch and not g.has_dataset("HS")) {
-            app_log(1, "  [LFF-Sigma dyn] P15: vertex_debug sigdyn_gram = sketch, but {} carries no HS dataset "
-                       "(it predates P15) -- falling back to the trace proxy.", opt.dyn_fit_file);
-            use_sketch = false;
-          }
+          utils::check(gram_src == "trace" or gram_src == "sketch", "vertex_t::prepare_sigma_dyn_hook: vertex_debug sigdyn_gram = \"{}\" is not trace | sketch.", gram_src);
+          const bool use_sketch = (gram_src == "sketch");
+          // the sketch request on a dump without HS aborts (no silent fallback to the trace proxy)
+          utils::check(not use_sketch or g.has_dataset("HS"),
+                       "vertex_t::prepare_sigma_dyn_hook: vertex_debug sigdyn_gram = sketch, but {} carries no HS dataset (written without the random sketch). ABORTING "
+                       "instead of falling back to the trace proxy: regenerate the dump or set sigdyn_gram = trace explicitly.",
+                       opt.dyn_fit_file);
           nda::array<ComplexType, 5> HSk;
           if (use_sketch) nda::h5_read(g, "HS", HSk);                      // (nw_b, ns, np, nk, nsk)
           else            nda::h5_read(g, "HT", H);                        // (nw_b, ns, np, nk, nc, nc)
@@ -2671,7 +3533,7 @@ namespace solvers {
             G3(pp, all, all) = Gm;
           }
           if (use_sketch)
-            app_log(1, "  [LFF-Sigma dyn] P15: the T-family nu-modes learned from the RANDOM SKETCH ({} contractions x {} k) "
+            app_log(1, "  [Sigma vertex, dynamic] the T-family nu-modes learned from the RANDOM SKETCH ({} contractions x {} k) "
                        "instead of the trace proxy.", HSk.shape(4), HSk.shape(3));
         }
       }
@@ -2681,7 +3543,7 @@ namespace solvers {
       mpi->comm.broadcast_n(Gc.data(), Gc.size(), 0);
       mpi->comm.broadcast_n(GT.data(), GT.size(), 0);
       if (auto_nodes) {
-        // P14b: the sampled nodes from the dump's own nu-modes -- the trace-normalized Gram matrices of the cst + U object and of
+        // the sampled nodes from the dump's own nu-modes -- the trace-normalized Gram matrices of the cst + U object and of
         // every T-family node summed (one Gram over nodes that carries both object types), nu = 0 and the two tails forced,
         // the rest the row pivots of the top-K modes (nusamp::pivot_nodes); deterministic on every rank (same Gram)
         nda::array<ComplexType, 2> Gsum(nw_b, nw_b);
@@ -2703,14 +3565,14 @@ namespace solvers {
         nus = nusamp::pivot_nodes(Gsum, Kn, forced);
         std::string lst;
         for (long m : nus) lst += std::to_string(tools.wn_b(m)) + " ";
-        app_log(1, "  [LFF-Sigma dyn] P14b: {} sampled nodes chosen from {} (nu = 0 and the tails forced, pivots of the top-{} nu-modes of the dump): w_n = {}",
+        app_log(1, "  [Sigma vertex, dynamic] {} sampled nodes chosen from {} (nu = 0 and the tails forced, pivots of the top-{} nu-modes of the dump): w_n = {}",
                 nus.size(), opt.dyn_fit_file, Kn, lst);
       }
       const long nS = long(nus.size());
       const long K = (opt.dyn_fit_rank > 0) ? std::min<long>(opt.dyn_fit_rank, nS) : std::max<long>(1, std::min<long>(6, nS - 3));
       nda::array<ComplexType, 2> const &Ttw = tools.Ttw_bb;               // (nt, nw_b)
       // the weights of one basis: Tt = Ttw . Phi_all . pinv(Phi_S) scattered onto the sampled node indices; returns the kept weight
-      // the nu-reconstruction of one object type (nu_sampling.hpp, P14): R = G(:, S) G(S, S)^-1_Kr (regression form) at the
+      // the nu-reconstruction of one object type (nu_sampling.hpp): R = G(:, S) G(S, S)^-1_Kr (regression form) at the
       // sampled columns m = nus[s], zero elsewhere; returns the spectral weight of G kept by its top-Kr modes (nK_out: modes to 1e-4)
       auto weights_of = [&](nda::array<ComplexType, 2> const &Gin, long Kr, nda::array<ComplexType, 2> &Rout, long &nK_out) -> double {
         Rout = nda::array<ComplexType, 2>(nw_b, nw_b);
@@ -2748,7 +3610,7 @@ namespace solvers {
                     nKc, wc_, Kc, nKt_max, wt_min, K);
       std::string spec_log(buf);
       hook.sampled = true;
-      app_log(1, "  [LFF-Sigma dyn] SAMPLED mode: {} of {} nodes, nu-bases from {} --{}", nS, nw_b, opt.dyn_fit_file, spec_log);
+      app_log(1, "  [Sigma vertex, dynamic] SAMPLED mode: {} of {} nodes, nu-bases from {} --{}", nS, nw_b, opt.dyn_fit_file, spec_log);
       auto c = std::make_shared<vd::sigdyn_sampled_cache>();
       c->key = skey;
       c->Ttw = nda::array<ComplexType, 2>(tools.Ttw_bb);
@@ -2765,7 +3627,7 @@ namespace solvers {
   }
 
   /**
-   * LFF-Sigma L-7: the DYNAMIC-rung vertex in Sigma (vertex_sigma_dyn.icc), on the READOUT instance: the dynamic-rung
+   * The DYNAMIC-rung vertex in Sigma (vertex_sigma_dyn.icc), on the READOUT instance: the dynamic-rung
    * ladder solver of eval_pol_dynbse_cut on EVERY bosonic node (both signs) x every transfer, with the Sigma hook armed;
    * opt.col selects static_dyn | dyn1_bare | dyn1 | dyn (the solver mode follows: static_only | one_rung_only |
    * gamma1_only | full GMRES). dSig OUT: (nt, ns, nk, nc, nc), replicated, Hermitized in (i, j) when opt.hermitize.
@@ -2776,7 +3638,9 @@ namespace solvers {
     namespace vd = vertex_dynbse_detail;
     vertex_ladder_detail::prof_watch twatch;
     utils::check(active() and secondary(), "vertex_t::eval_sigma_pair_dyn: requires an ACTIVE secondary-basis vertex (the readout instance).");
-    utils::check(not _wannier, "vertex_t::eval_sigma_pair_dyn: the dynamic pair-resolved Sigma vertex runs in the band (window) frame only.");
+    // Wannier mode: the contraction runs in the MLWF frame (the ladder's G_CC and legs X_bar = X U), the closure with
+    // U^T G_W U^* (hook.G_close, fitted next to gC by the driver), and dSigma is rotated back to the band window with
+    // U^* dSigma U^T -- eval_sigma_pair's conventions; nosym meshes only.
     utils::check(_W0b_qmm.has_value(), "vertex_t::eval_sigma_pair_dyn: W0bar is absent -- build_w0 must run first.");
     utils::check(opt.col == "static_dyn" or opt.col == "dyn1_bare" or opt.col == "dyn1" or opt.col == "dyn",
                  "vertex_t::eval_sigma_pair_dyn: unknown column \"{}\" (static_dyn | dyn1_bare | dyn1 | dyn).", opt.col);
@@ -2784,7 +3648,7 @@ namespace solvers {
     auto MF = thc.MF();
     auto mpi = thc.mpi();
     if (not has_cached_w()) {
-      app_log(1, "  [LFF-Sigma dyn] folding this iteration's W into the W-bar cache (cache_w on demand).");
+      app_log(1, "  [Sigma vertex, dynamic] folding this iteration's W into the W-bar cache (cache_w on demand).");
       cache_w(mb_state, thc);
     }
     nda::array<ComplexType, 5> G_CC;
@@ -2793,7 +3657,7 @@ namespace solvers {
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
     const bool sym_ = (symc != nullptr and symc->active);
     utils::check(sym_ or MF->nkpts() == MF->nkpts_ibz(), "vertex_t::eval_sigma_pair_dyn: a symmetry-reduced mesh without a symmetry context.");
-    utils::check(not sym_ or opt.ibz, "vertex_t::eval_sigma_pair_dyn: a symmetric mesh needs pol_vertex_sigma_pair_ibz = true (P1: the IBZ solve + star fold).");
+    utils::check(not sym_ or opt.ibz, "vertex_t::eval_sigma_pair_dyn: a symmetric mesh needs pol_vertex_sigma_pair_ibz = true (the IBZ solve + star fold).");
     const nda::array<double, 2> kc(MF->kpts_crystal());
     auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
     auto &tools = *tools_h.tools;
@@ -2802,7 +3666,7 @@ namespace solvers {
     const long nq = long(_W0b_qmm.value().shape(0)), nw_b = tools.nw_b, nt_l = tools.nt_f;
     std::vector<long> nus, qs(static_cast<size_t>(nq));
     for (long iq = 0; iq < nq; ++iq) qs[size_t(iq)] = iq;
-    // ---- the hook (P3: a hook armed by arm_shared_sigma_hook on the P-side call is reused; its nodes are skipped) --------
+    // ---- the hook (a hook armed by arm_shared_sigma_hook on the P-side call is reused; its nodes are skipped) ------------
     std::shared_ptr<vd::sigma_dyn_hook> hook_h;
     const bool shared_in = (_shared_hook != nullptr and _shared_hook_col == opt.col and _shared_hook_outer == opt.outer);
     if (shared_in) {
@@ -2812,18 +3676,33 @@ namespace solvers {
       utils::check(hook_h->symc == symc and hook_h->ibz == (sym_ and opt.ibz), "vertex_t::eval_sigma_pair_dyn: the shared hook was armed for another mesh context.");
       std::vector<long> rest;
       for (long m : nus) if (std::find(hook_h->nodes_done.begin(), hook_h->nodes_done.end(), m) == hook_h->nodes_done.end()) rest.push_back(m);
-      app_log(1, "  [LFF-Sigma dyn] P3 shared hook: {} of {} nodes deposited by the P-side readout, {} left for this call", nus.size() - rest.size(), nus.size(), rest.size());
+      app_log(1, "  [Sigma vertex, dynamic] shared hook: {} of {} nodes deposited by the P-side readout, {} left for this call", nus.size() - rest.size(), nus.size(), rest.size());
       hook_h->nodes_active.clear();
       nus = rest;
     } else {
       hook_h = std::make_shared<vd::sigma_dyn_hook>();
       prepare_sigma_dyn_hook(*hook_h, opt, thc, tools, symc, sym_, nus);
     }
+    // TESTS ONLY: truncate the Sigma-side units to the first N transfers / nu nodes -- the Sigma correction is
+    // then incomplete but defined identically for any two runs with the same keys (vertex_debug sigdyn_test_nq / sigdyn_test_nnu)
+    if (const long tq = long(vertex_debug::number("sigdyn_test_nq", 0.0)); tq > 0 and tq < nq) qs.resize(size_t(tq));
+    if (const long tn = long(vertex_debug::number("sigdyn_test_nnu", 0.0)); tn > 0 and size_t(tn) < nus.size()) nus.resize(size_t(tn));
+    if (vertex_debug::number("sigdyn_test_nq", 0.0) > 0 or vertex_debug::number("sigdyn_test_nnu", 0.0) > 0)
+      app_log(1, "  [dynamic vertex] Sigma-side TEST truncation: {} transfers x {} nu nodes (NOT a physical Sigma)", qs.size(), nus.size());
     vd::sigma_dyn_hook &hook = *hook_h;
+    if (_wannier and not hook.wannier_closure()) {
+      utils::check(not sym_, "vertex_t::eval_sigma_pair_dyn: the Wannier-mode dynamic Sigma vertex runs on nosym meshes only.");
+      vd::wannier_closure_G(mb_state.sG_tskij.value().local(), _band_window, MF->nkpts() != MF->nkpts_ibz(), MF->kp_to_ibz(),
+                            MF->kp_trev(), _U_skia, G_CC.shape(0), G_CC.shape(1), G_CC.shape(2), G_CC.shape(3), hook.G_close);
+      app_log(1, "  [Sigma vertex, dynamic] Wannier mode: the closure G = U^T G_W U^* (M = {} MLWFs, band window [{}, {}))", G_CC.shape(3),
+              _band_window.first(), _band_window.last());
+    }
     vd::dyn_opts o;
     o.kcrys = std::addressof(kc);
-    o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
+    o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // node-shared W_d tables with the shared cache
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = opt.sign_ks;
+    if (_dyn_gmres < 12)                 // the input is raised here -- say so
+      app_log(1, "  [Sigma vertex, dynamic] WARNING: pol_vertex_dyn_gmres = {} is raised to GMRES(12) for the Sigma solve", _dyn_gmres);
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
     o.resolvent = _dyn_resolvent;
@@ -2835,35 +3714,35 @@ namespace solvers {
     o.one_rung_only = (opt.col == "dyn1_bare");
     o.gamma1_only = (opt.col == "dyn1");
     o.sched_comm = mpi->comm.get();
-    o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // P5
+    o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // the measured unit times
     o.union_nodes = true;
     o.gap_mask = 0.0;
-    if (auto u = vertex_debug::get("dynbse_union"); u.has_value()) o.union_nodes = (std::atoi(u->c_str()) != 0);   // vertex_debug: dynbse_union = 0 | 1
+    if (const double u = vertex_debug::number("dynbse_union", -1.0); u >= 0.0) o.union_nodes = (u != 0.0);   // vertex_debug: dynbse_union = 0 | 1 (strict parse)
     o.readout_tol = 1e-6;
     o.q_subset = std::addressof(qs);
     o.sigma = std::addressof(hook);
-    if (opt.dyn_ckpt_minutes > 0.0) { o.sigma_ckpt = mb_state.coqui_prefix + ".sigdyn_ckpt"; o.sigma_ckpt_minutes = opt.dyn_ckpt_minutes; }   // P20
+    if (opt.dyn_ckpt_minutes > 0.0) { o.sigma_ckpt = mb_state.coqui_prefix + ".sigdyn_ckpt"; o.sigma_ckpt_minutes = opt.dyn_ckpt_minutes; }   // the Sigma-accumulator checkpoint
     vd::dyn_meter dmet;
-    const double sw_pre = twatch.peek();                              // gpu port 2026-09-27: the Sigma call's phase walls
+    const double sw_pre = twatch.peek();                              // the Sigma call's phase walls
     if (not nus.empty())
       vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
                                 nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o, &dmet, symc);
     const double sw_drv = twatch.peek();
-    hook.flush_unit();                                               // P1: the last unit's star fold
+    hook.flush_unit();                                               // the last unit's star fold
     mpi->comm.all_reduce_in_place_n(hook.S_cst.data(), hook.S_cst.size(), std::plus<>{});
-    if (hook.RT.size() > 0) mpi->comm.all_reduce_in_place_n(hook.RT.data(), hook.RT.size(), std::plus<>{});   // P4-C14: empty in the single mode
+    if (hook.RT.size() > 0) mpi->comm.all_reduce_in_place_n(hook.RT.data(), hook.RT.size(), std::plus<>{});   // empty in the single-accumulator mode
     if (hook.RU.size() > 0) mpi->comm.all_reduce_in_place_n(hook.RU.data(), hook.RU.size(), std::plus<>{});
     if (hook.dump) {
-      // L-8: the per-node objects of the all-node run -> <prefix>.sigdyn.h5 (the nu-bases of a later sampled run)
+      // the per-node objects of the all-node run -> <prefix>.sigdyn.h5 (the nu-bases of a later sampled run)
       for (auto *A : {&hook.Hc_n, &hook.HT_n}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
-      if (hook.HS_n.size() > 0) mpi->comm.all_reduce_in_place_n(hook.HS_n.data(), hook.HS_n.size(), std::plus<>{});   // P15
+      if (hook.HS_n.size() > 0) mpi->comm.all_reduce_in_place_n(hook.HS_n.data(), hook.HS_n.size(), std::plus<>{});   // the random sketch
       if (mpi->comm.root()) {
         const std::string fn = opt.dump_prefix + ".sigdyn.h5";
         h5::file f(fn, 'w');
         h5::group g(f);
         nda::h5_write(g, "Hc", hook.Hc_n);
         nda::h5_write(g, "HT", hook.HT_n);
-        if (hook.HS_n.size() > 0) { nda::h5_write(g, "HS", hook.HS_n); nda::h5_write(g, "Omega", hook.Om); }   // P15: the T family's random sketch
+        if (hook.HS_n.size() > 0) { nda::h5_write(g, "HS", hook.HS_n); nda::h5_write(g, "Omega", hook.Om); }   // the T family's random sketch
         nda::array<long, 1> nodes(nw_b);
         for (long l = 0; l < nw_b; ++l) nodes(l) = l;
         nda::h5_write(g, "nodes", nodes);
@@ -2878,13 +3757,13 @@ namespace solvers {
         h5::h5_write(g, "beta", tools.beta);
         h5::h5_write(g, "col", opt.col);
         h5::h5_write(g, "outer", opt.outer);
-        app_log(1, "  [LFF-Sigma dyn] per-node objects written to {} (Hc (nw_b, ns, nt, nk, nc, nc): cst + U; HT (nw_b, ns, np, nk, nc, nc): the T proxy): {:.2f} GB",
+        app_log(1, "  [Sigma vertex, dynamic] per-node objects written to {} (Hc (nw_b, ns, nt, nk, nc, nc): cst + U; HT (nw_b, ns, np, nk, nc, nc): the T proxy): {:.2f} GB",
                 fn, double(hook.Hc_n.size() + hook.HT_n.size()) * 16.0 / 1e9);
       }
       hook.Hc_n = nda::array<ComplexType, 6>(); hook.HT_n = nda::array<ComplexType, 6>(); hook.HS_n = nda::array<ComplexType, 5>();
     }
     dmet.reduce(mpi->comm);
-    dmet.merge_unit_cost(_dyn_unit_cost);   // P5
+    dmet.merge_unit_cost(_dyn_unit_cost);   // the measured unit times
     hook.ks_herm = mpi->comm.all_reduce_value(hook.ks_herm, boost::mpi3::max<>{});
     hook.amax = mpi->comm.all_reduce_value(hook.amax, boost::mpi3::max<>{});
     hook.ymax = mpi->comm.all_reduce_value(hook.ymax, boost::mpi3::max<>{});
@@ -2892,8 +3771,13 @@ namespace solvers {
     hook.nunits = mpi->comm.all_reduce_value(hook.nunits, std::plus<>{});
     double e_fit = 0.0;
     const double sw_red = twatch.peek();
-    vd::sigma_dyn_finish(hook, opt.scale, MF->nkpts(), dSig, e_fit, opt.dyn_refit, opt.dyn_refit_rtol);   // P12
-    app_log(1, "  [LFF-Sigma dyn] call walls: preparation (hook, sampled-mode bases) {:.1f} s, the driver {:.1f} s, "
+    vd::sigma_dyn_finish(hook, opt.scale, MF->nkpts(), dSig, e_fit, opt.dyn_refit, opt.dyn_refit_rtol);
+    if (_wannier) {                                                  // the MLWF-frame block back to the band window (before the meters)
+      vd::wannier_sigma_to_window(dSig, _U_skia);
+      app_log(1, "  [Sigma vertex, dynamic] Wannier mode: dSigma rotated from the MLWF frame to the band window [{}, {}) (nW = {}).",
+              _band_window.first(), _band_window.last(), dSig.shape(3));
+    }
+    app_log(1, "  [Sigma vertex, dynamic] call walls: preparation (hook, sampled-mode bases) {:.1f} s, the driver {:.1f} s, "
                "the accumulator reductions + dump {:.1f} s, the finish {:.1f} s", sw_pre, sw_drv - sw_pre, sw_red - sw_drv,
             twatch.peek() - sw_red);
     const long nt = dSig.shape(0), ns = dSig.shape(1), nk = dSig.shape(2), nc = dSig.shape(3);
@@ -2921,30 +3805,29 @@ namespace solvers {
     mloc.nunits = hook.nunits; mloc.t_total = twatch.lap(); mloc.t_amp = hook.t_sig; mloc.rss_gb = dmet.rss_max_gb;
     mloc.e_fit_err = e_fit; mloc.fit_err_G = dmet.fit_err_G; mloc.refit_err = dmet.refit_err_max; mloc.ritz_max = dmet.ritz_max;
     mloc.t_solve = dmet.t_solve; mloc.all_converged = (dmet.nconv == dmet.nunits);
-    app_log(1, "  [LFF-Sigma dyn] col {} outer {} scale {}: {} (s, q, nu) units on {} of {} bosonic nodes (union basis, GMRES({}), RHS blocks {}, "
+    app_log(1, "  [Sigma vertex, dynamic] col {} outer {} scale {}: {} (s, q, nu) units on {} of {} bosonic nodes (union basis, GMRES({}), RHS blocks {}, "
                "C = [{}, {}), N_m = {}, n_p = {}): max |dSigma(tau)| = {:.4e}, anti-Hermitian residual {:.3e} ({}), |K_s - K_s^dag|/|K_s| = {:.2e}; "
                "max |A_cst| {:.3e}, max |y| {:.3e}; E-refit (T family) {:.2e}, G pole fit {:.2e}, tau refit {:.2e}, watchdog {:.3f}, all converged {}; "
                "wall {:.1f} s (solve {:.1f} s, Sigma deposits {:.1f} s on the slowest rank), RSS {:.2f} GB",
             opt.col, opt.outer, opt.scale, dmet.nunits, long(nus.size()), nw_b, o.gmres_m, o.rhs_block, _band_window.first(), _band_window.last(), _Xb_skma.shape(2),
             hook.np, dmax, mloc.dsig_herm, opt.hermitize ? "Hermitized" : "NOT Hermitized", hook.ks_herm, hook.amax, hook.ymax, e_fit,
             dmet.fit_err_G, dmet.refit_err_max, dmet.ritz_max, mloc.all_converged, mloc.t_total, dmet.t_solve, hook.t_sig, dmet.rss_max_gb);
-    app_log(1, "  [LFF-Sigma dyn] {}", dmet.l0_split_line());
-    // the per-unit work OUTSIDE the solve (gpu port, 2026-09-26: n3j left 45 % of the Sigma-side wall unaccounted): the same
-    // meter fields the P-side summary prints -- setup (the unit's tables, scratch, shift tables), the K_big THC contraction,
+    app_log(1, "  [Sigma vertex, dynamic] {}", dmet.l0_split_line());
+    // the per-unit work OUTSIDE the solve: the same meter fields the P-side summary prints -- setup (the unit's tables, scratch, shift tables), the K_big THC contraction,
     // the Cb tau-route chi0, the static-resolvent LU, the readout; the remainder is the deposits + dumps + scheduling
-    app_log(1, "  [LFF-Sigma dyn] unit split on the slowest rank: setup {:.1f} s, K_big build {:.1f} s, Cb {:.1f} s, LU {:.1f} s, solve {:.1f} s, "
+    app_log(1, "  [Sigma vertex, dynamic] unit split on the slowest rank: setup {:.1f} s, K_big build {:.1f} s, Cb {:.1f} s, LU {:.1f} s, solve {:.1f} s, "
                "readout {:.1f} s (deposits {:.1f} s, inside the solve); wall {:.1f} s -> unaccounted {:.1f} s (dumps, nu-basis fit, reductions, scheduling)",
             dmet.t_setup, dmet.t_kbig, dmet.t_cb, dmet.t_lu, dmet.t_solve, dmet.t_read, hook.t_sig, mloc.t_total,
             mloc.t_total - dmet.t_setup - dmet.t_kbig - dmet.t_cb - dmet.t_lu - dmet.t_solve - dmet.t_read);
     if (hook.conv_kf >= 0.0)
-      app_log(1, "  [LFF-Sigma dyn] product-route checks: w_to_tau[U_a] vs +KF {:.2e} / vs -KF {:.2e}; tau_to_w[G] vs pole-fit G {:.2e}; "
+      app_log(1, "  [Sigma vertex, dynamic] product-route checks: w_to_tau[U_a] vs +KF {:.2e} / vs -KF {:.2e}; tau_to_w[G] vs pole-fit G {:.2e}; "
                  "max |fam1| on extension nodes {:.2e}{}", hook.conv_kf, hook.conv_kf_neg, hook.conv_g, hook.fam1_ext,
               hook.poles ? " (POLE ROUTE active: COQUI_SIGDYN_ROUTE=poles)" : "");
-    else if (hook.poles) app_log(1, "  [LFF-Sigma dyn] POLE ROUTE active (COQUI_SIGDYN_ROUTE=poles).");
+    else if (hook.poles) app_log(1, "  [Sigma vertex, dynamic] POLE ROUTE active (COQUI_SIGDYN_ROUTE=poles).");
     {
       double fro = 0.0;
       for (auto const &v : dSig) fro += std::norm(v);
-      app_log(1, "  [LFF-Sigma dyn] |dSigma|_F = {:.10e} (families: U {} T {}; route {})", std::sqrt(fro), hook.use_U ? "on" : "OFF",
+      app_log(1, "  [Sigma vertex, dynamic] |dSigma|_F = {:.10e} (families: U {} T {}; route {})", std::sqrt(fro), hook.use_U ? "on" : "OFF",
               hook.use_T ? "on" : "OFF", hook.poles ? "poles" : "product");
     }
     if (met) *met = mloc;

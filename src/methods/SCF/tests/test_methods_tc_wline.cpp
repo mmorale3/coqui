@@ -19,30 +19,36 @@
  */
 
 /**
- * GATE TC-3-a of notes/tc_coqui_impl_spec.md, and the two pins Fable's review
- * asked for ahead of any fixture run.
+ * Tests of W^c on the line (wc_line.hpp) and of the contour-deformation (CD)
+ * assembly (sigma_cd_line.hpp). Equation labels (CD), (EXACT), (SIGMA_M) refer
+ * to the sigma_cd_line.hpp header.
  *
- *   tc_sigma_cd_single_pole   THE SIGN PIN. The eq-1 CD assembly with the
+ *   tc_sigma_cd_single_pole   THE SIGN TEST. The (CD) assembly with the
  *                             DERIVED sigma_m, against the EXACT finite-T
  *                             Lehmann self-energy, for one G pole and one
  *                             plasmon pair. Both the integral term and the
  *                             reference are closed form, so this is a machine-
  *                             precision identity and NOT quadrature-limited.
- *   tc_sigma_cd_sign_bites    The same pin with the spec-as-written (opposite)
- *                             signs must FAIL, and the beta -> infinity limit
- *                             of sigma_m = theta(w-eps) - f(eps) must be the
- *                             +1/-1/0 table of results section 2.3.
+ *   tc_sigma_cd_sign_bites    The same test with the opposite signs must
+ *                             FAIL, and the beta -> infinity limit of
+ *                             sigma_m = theta(w-eps) - f(eps) must be the
+ *                             zero-temperature +1/-1/0 table.
+ *   tc_sigma_cd_fractional_occupation
+ *                             the fractional (finite-T) sigma_m against the
+ *                             T = 0 step near mu.
+ *   tc_sigma_cd_nonsym_poles  the residue argument eps_m - w on non-symmetric
+ *                             pole sets.
  *   tc_wc_line_dyson          W^c = ([I - Z.Pi]^{-1} - I).Z -- CoQuI's OWN
- *                             operation order -- against the campaign's
- *                             independently generated RPA W^c, by both of its
- *                             routes (dense solve and the closed-form plasmon
- *                             pole sum).
+ *                             operation order -- against an independently
+ *                             generated RPA W^c, by both of its routes (dense
+ *                             solve and the closed-form plasmon pole sum).
  *   tc_wc_line_krylov         dense == warm-started GMRES on the contracted
- *                             elements (the campaign measured 9e-13).
- *   tc_sigma_cd_multipole     the eq-1 assembly on the campaign's full
- *                             SigmaModel, against its exact Lehmann pole sum.
+ *                             elements.
+ *   tc_sigma_cd_multipole     the (CD) assembly on a multi-plasmon model
+ *                             self-energy, against its exact Lehmann pole sum.
  *
- * The reference file is written by tc_validation/tests/export_tc3_reference.py.
+ * The reference file tests/unit_test_files/tilted_contour/tc3_reference.json is
+ * exported from an independent Python implementation.
  */
 
 #undef NDEBUG
@@ -90,7 +96,7 @@ namespace bdft_tests {
   }
 
   // =====================================================================
-  //  GATE TC-3-a -- THE SIGN PIN (closed form, machine precision)
+  //  THE SIGN TEST (closed form, machine precision)
   // =====================================================================
   //
   // One G pole at eps_m (weight 1), one PH-symmetric W^c pair:
@@ -143,27 +149,27 @@ namespace bdft_tests {
                                         scd::thermal_leftover_bound(beta, ov));
               ++n;
             }
-    app_log(2, "[TC-3-a sign pin] eq-1 with sigma_m = theta(w-eps) - f(eps) vs the "
+    app_log(2, "[CD sign test] CD assembly with sigma_m = theta(w-eps) - f(eps) vs the "
                "EXACT finite-T Lehmann over {} (r, wp, eps, omega, beta) points: "
                "max rel = {:.3e}; bosonic leftover bound max |n_B(om)+theta(-om)| = "
-               "{:.3e} (the ONE approximation eq 1 makes)", n, worst, worst_leftover);
+               "{:.3e} (the ONE approximation the CD form makes)", n, worst, worst_leftover);
     REQUIRE(n > 400);
-    REQUIRE(worst < 1e-13);          // the spec's class; measured ~1e-14
+    REQUIRE(worst < 1e-13);          // machine-precision identity
   }
 
   TEST_CASE("tc_sigma_cd_sign_bites", "[methods][tc_wline]") {
-    // (1) the beta -> infinity limit of sigma_m IS the results-2.3 table
+    // (1) the beta -> infinity limit of sigma_m IS the zero-temperature table
     const double mu = 0.0, big = 1e8;
     REQUIRE(std::abs(scd::sigma_m_weight(+5.0, +2.0, mu, big) - 1.0) < 1e-12); // empty, below w
     REQUIRE(std::abs(scd::sigma_m_weight(-5.0, -2.0, mu, big) + 1.0) < 1e-12); // occ, above w
     REQUIRE(std::abs(scd::sigma_m_weight(-5.0, +2.0, mu, big)) < 1e-12);       // empty, above w
     REQUIRE(std::abs(scd::sigma_m_weight(+5.0, -2.0, mu, big)) < 1e-12);       // occ, below w
-    app_log(2, "[TC-3-a sign pin] beta -> inf limit of sigma_m = theta(w-eps) - f(eps): "
-               "+1 (mu<eps<w), -1 (w<eps<mu), 0 otherwise -- the DERIVED table of "
-               "results section 2.3");
+    app_log(2, "[CD sign test] beta -> inf limit of sigma_m = theta(w-eps) - f(eps): "
+               "+1 (mu<eps<w), -1 (w<eps<mu), 0 otherwise -- the zero-temperature "
+               "sign table");
 
-    // (2) THE OPPOSITE (spec-as-written) SIGNS MUST FAIL -- otherwise the pin
-    //     above is not testing the signs at all.
+    // (2) THE OPPOSITE SIGNS MUST FAIL -- otherwise the test above is not
+    //     testing the signs at all.
     double worst_flipped = 0.0;
     for (int c = 0; c < 5; ++c)
       for (int d = 0; d < 5; ++d) {
@@ -181,28 +187,28 @@ namespace bdft_tests {
         const dcomplex ex = exact_lehmann(dcomplex(om, 0.0), eps, 0.0, r, wp, beta);
         worst_flipped = std::max(worst_flipped, std::abs(got - ex) / std::abs(ex));
       }
-    app_log(2, "[TC-3-a sign pin] with the OPPOSITE (spec-as-written) signs the same "
-               "identity is off by {:.3e} -- the pin bites", worst_flipped);
+    app_log(2, "[CD sign test] with the OPPOSITE signs the same "
+               "identity is off by {:.3e} -- the test is sensitive to the sign", worst_flipped);
     REQUIRE(worst_flipped > 1e-2);
   }
 
   // =====================================================================
-  //  DOES THE FINITE-T sigma_m MATTER?  (Fable review point, section 6 item 5)
+  //  DOES THE FINITE-T sigma_m MATTER?
   //
-  //  sigma_m = theta(w - eps_m) - f(eps_m) reduces to the campaign's +1/-1/0
-  //  table as beta -> infinity. The question the SVO metal leg asks is whether
-  //  the FRACTIONAL value matters for states within k_B T of mu. That is a
-  //  property of the weight, not of the fixture, so it is answered here: score
-  //  the exact finite-T Lehmann against eq 1 with (a) the fractional sigma_m
-  //  and (b) the T = 0 step, as beta*|eps_m - mu| is swept through 1.
+  //  sigma_m = theta(w - eps_m) - f(eps_m) reduces to the +1/-1/0 table as
+  //  beta -> infinity. For a metal the question is whether the FRACTIONAL
+  //  value matters for states within k_B T of mu. That is a property of the
+  //  weight, not of the fixture, so it is answered here: score the exact
+  //  finite-T Lehmann against (CD) with (a) the fractional sigma_m and (b) the
+  //  T = 0 step, as beta*|eps_m - mu| is swept through 1.
   // =====================================================================
   TEST_CASE("tc_sigma_cd_fractional_occupation", "[methods][tc_wline]") {
     const double r = 1.3, wp = 2.2, mu = 0.0, beta = 100.0;
-    app_log(2, "[TC-3-a fractional] beta = {:.4g}; one G pole at eps_m, one plasmon pair "
-               "(r = {:.3g}, omega_p = {:.3g}); the exact finite-T Lehmann vs eq 1 with "
+    app_log(2, "[CD fractional] beta = {:.4g}; one G pole at eps_m, one plasmon pair "
+               "(r = {:.3g}, omega_p = {:.3g}); the exact finite-T Lehmann vs the CD form with "
                "(a) sigma_m = theta - f  and  (b) sigma_m = theta - step(mu - eps_m)",
             beta, r, wp);
-    app_log(2, "[TC-3-a fractional] {:>12} {:>10} {:>12} {:>12} {:>12}",
+    app_log(2, "[CD fractional] {:>12} {:>10} {:>12} {:>12} {:>12}",
             "beta*(eps-mu)", "f(eps)", "sigma_m", "(a) frac", "(b) T=0 step");
     double worst_frac = 0.0, worst_step = 0.0, worst_step_at_small = 0.0;
     for (double be : {-8.0, -3.0, -1.0, -0.3, 0.0, 0.3, 1.0, 3.0, 8.0}) {
@@ -220,17 +226,17 @@ namespace bdft_tests {
       const dcomplex ex = exact_lehmann(dcomplex(om, 0.0), eps, mu, r, wp, beta);
       const double ea = std::abs(I + sg_frac * Wl - ex) / std::abs(ex);
       const double eb = std::abs(I + sg_step * Wl - ex) / std::abs(ex);
-      app_log(2, "[TC-3-a fractional] {:>12.2f} {:>10.4f} {:>12.4f} {:>12.3e} {:>12.3e}",
+      app_log(2, "[CD fractional] {:>12.2f} {:>10.4f} {:>12.4f} {:>12.3e} {:>12.3e}",
               be, f, sg_frac, ea, eb);
       worst_frac = std::max(worst_frac, ea);
       worst_step = std::max(worst_step, eb);
       if (std::abs(be) <= 3.0) worst_step_at_small = std::max(worst_step_at_small, eb);
     }
-    app_log(2, "[TC-3-a fractional] VERDICT: the fractional sigma_m is exact to {:.3e} "
+    app_log(2, "[CD fractional] VERDICT: the fractional sigma_m is exact to {:.3e} "
                "everywhere; the T = 0 step is wrong by up to {:.3e} overall and {:.3e} "
                "for |beta(eps-mu)| <= 3 -- i.e. the difference is entirely carried by the "
                "states within a few k_B T of mu, which is precisely the population a "
-               "METAL has and an insulator does not (the qe_lih222 census reports ZERO "
+               "METAL has and an insulator does not (an insulator has essentially no "
                "strictly fractional sigma_J).",
             worst_frac, worst_step, worst_step_at_small);
     REQUIRE(worst_frac < 1e-13);
@@ -241,11 +247,11 @@ namespace bdft_tests {
   //  THE RESIDUE ARGUMENT -- eq (EXACT) on a NON-SYMMETRIC pole set
   // =====================================================================
   //
-  // The single-pole pin above uses a PH pair, which is exactly EVEN, so it
+  // The single-pole test above uses a PH pair, which is exactly EVEN, so it
   // cannot distinguish W^c(eps_m - w) from W^c(w - eps_m). A fitted W^c is even
   // only on the imaginary axis (masked_pole_fit runs on a deliberately NONSYM
   // auxiliary node set -- wc_band_elements.hpp), so at real argument the two
-  // differ by O(1). This pins the one eq (EXACT) requires.
+  // differ by O(1). This checks the one eq (EXACT) requires.
   //
   TEST_CASE("tc_sigma_cd_nonsym_poles", "[methods][tc_wline]") {
     double worst_minus = 0.0, worst_plus = 0.0, worst_left = 0.0;
@@ -294,7 +300,7 @@ namespace bdft_tests {
           worst_left = std::max(worst_left, scd::thermal_leftover_bound(beta, om));
           ++n;
         }
-    app_log(2, "[TC-3-a nonsym] eq (EXACT) on {} NON-SYMMETRIC pole sets, deviation from "
+    app_log(2, "[CD nonsym] eq (EXACT) on {} NON-SYMMETRIC pole sets, deviation from "
                "the exact finite-T closed form normalized by sum |w/(A+om)| (which cannot "
                "cancel): W^c(eps_m - w) gives {:.3e}; W^c(w - eps_m) gives {:.3e}; "
                "bosonic leftover {:.3e}",
@@ -305,7 +311,7 @@ namespace bdft_tests {
   }
 
   // =====================================================================
-  //  W ON THE LINE -- CoQuI's Dyson chain vs the campaign's RPA W^c
+  //  W ON THE LINE -- CoQuI's Dyson chain vs an independent RPA W^c
   // =====================================================================
   TEST_CASE("tc_wc_line_dyson", "[methods][tc_wline]") {
     auto doc = mjson::load(ref_path());
@@ -349,14 +355,14 @@ namespace bdft_tests {
       worst_p = std::max(worst_p, dp / den);
       wmax = std::max(wmax, den);
     }
-    app_log(2, "[TC-3-a W pin] CoQuI's Dyson chain ([I-Z.Pi]^-1 - I).Z on {} targets "
+    app_log(2, "[W on the line] CoQuI's Dyson chain ([I-Z.Pi]^-1 - I).Z on {} targets "
                "({} on the line Im z = {:.3g}, {} on the imaginary axis), n_aux = {}: "
-               "vs the campaign's DENSE solve {:.3e} (worst target {}), vs its "
+               "vs the reference DENSE solve {:.3e} (worst target {}), vs its "
                "independent PLASMON POLE SUM {:.3e}; max|W^c| = {:.4g}; "
                "max |[I-Z.Pi]^-1| = {:.3e}",
             nz, rpa["n_line"].i(), rpa["delta"].d(), nz - rpa["n_line"].i(), n,
             worst_d, worst_iz, worst_p, wmax, st.cond_hint);
-    app_log(2, "[TC-3-a W pin] the two REFERENCE routes agree to {:.3e} among "
+    app_log(2, "[W on the line] the two REFERENCE routes agree to {:.3e} among "
                "themselves (exported); the plasmon structure sigma_min[I-vP] at w_p "
                "is {:.2e} of its value one spacing away",
             rpa["two_routes_max_rel"].d(),
@@ -411,7 +417,7 @@ namespace bdft_tests {
         den = std::max(den, std::abs(od(v)));
       }
     }
-    app_log(2, "[TC-3-a Krylov] dense vs warm-started GMRES on <nm|W^c|mn>, {} targets "
+    app_log(2, "[W on the line, Krylov] dense vs warm-started GMRES on <nm|W^c|mn>, {} targets "
                "x {} vectors: max abs dev {:.3e} over max|element| {:.4g} = {:.3e} rel; "
                "{} solves, {} total iterations (max {} per solve), worst achieved "
                "relative residual {:.2e}, {} warm starts",
@@ -421,7 +427,7 @@ namespace bdft_tests {
   }
 
   // =====================================================================
-  //  the eq-1 assembly on the campaign's full SigmaModel
+  //  the (CD) assembly on a multi-plasmon model self-energy
   // =====================================================================
   TEST_CASE("tc_sigma_cd_multipole", "[methods][tc_wline]") {
     auto doc = mjson::load(ref_path());
@@ -459,8 +465,8 @@ namespace bdft_tests {
       return acc;
     };
 
-    // the beta of the reference is T = 0 (models.SigmaModel splits at mu with a
-    // step); reproduce that limit with a large beta so sigma_m -> the step.
+    // the reference is at T = 0 (the model splits at mu with a step);
+    // reproduce that limit with a large beta so sigma_m -> the step.
     const double beta = 1e7;
     auto q = scd::tan_quadrature(2000, 50.0);
     const long nnu = q.nu.size();
@@ -483,9 +489,9 @@ namespace bdft_tests {
         worst = std::max(worst, std::abs(got - ex) / std::abs(ex));
       }
     }
-    app_log(2, "[TC-3-a multipole] eq-1 assembly vs the EXACT Lehmann pole sum on the "
-               "campaign's SigmaModel ({} plasmons x {} states, bands {}): max rel = "
-               "{:.3e} at n_nu = {}; the campaign's own python value is {:.3e} at "
+    app_log(2, "[CD multipole] CD assembly vs the EXACT Lehmann pole sum on the "
+               "model self-energy ({} plasmons x {} states, bands {}): max rel = "
+               "{:.3e} at n_nu = {}; the reference Python value is {:.3e} at "
                "n_nu = 6000 (both quadrature-limited, not sign-limited)",
             np, nm, bands.size(), worst, nnu, sg["cd_vs_exact_max_rel"].d());
     REQUIRE(worst < 1e-6);

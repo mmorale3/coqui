@@ -1,5 +1,5 @@
 /**
- * Shared exact-toy helpers for the scGW-tilde vertex tests (Tier 1.5 and the dynamic BSE):
+ * Shared exact-toy helpers for the scGW-tilde vertex tests (the pole-sum oracles and the dynamic BSE):
  *   dense_fsum / richardson_fsum -- dense fermionic Matsubara sums with Richardson tail elimination;
  *   toy_k / make_toy              -- an EXACT rational G and Sigma_c from a Hermitian Schur embedding
  *                                    H_big = [[h, B_p], [B_p^dag, e_p 1]]: G(z) = P (z - H_big)^-1 P^dag
@@ -72,7 +72,7 @@ namespace bdft_tests {
       for (long j = 0; j < ng; ++j) Gz += g(j, all_, all_) / (z - lam(j));
       return Gz;
     }
-    // Lambda0(z; inu) - 1 = sum_p R_p / ((z + inu - e_p)(z - e_p))   (eq 28; double pole at inu = 0)
+    // Lambda0(z; inu) - 1 = sum_p R_p / ((z + inu - e_p)(z - e_p))   (double pole at inu = 0)
     nda::array<cplx, 2> Lam1(cplx z, cplx inu) const {
       nda::array<cplx, 2> L(nb, nb);
       L() = cplx(0.0);
@@ -126,7 +126,7 @@ namespace bdft_tests {
         }
     }
     auto [ev, U] = nda::linalg::eigenelements(Hb);
-    // defensive: the eigenvectors are the COLUMNS of U (nda doc); verify on the toy itself
+    // the eigenvectors are the COLUMNS of U; verify on the toy itself
     {
       double resid = 0.0;
       for (long j = 0; j < N; ++j)

@@ -31,7 +31,7 @@
  * and Wx/Wy bosonic, PH-symmetric (W(-iv) = W(iv)) DYNAMIC (decaying) parts;
  * cx/cy are the exact instantaneous (frequency-constant, batch-varying) parts.
  *
- * Algorithm ("DLR channel algebra", see notes/double_convolution_design.md):
+ * Algorithm ("DLR channel algebra"):
  * the DLR expansion of each input is an exact-to-eps pole representation
  *   fermionic F(z) = sum_l f_l / (z - eps_l),        f_l = DLR time coeffs
  *   bosonic   W(z) = sum_l [w_l tanh(hw_l/2)]/(z-eps_l)
@@ -159,13 +159,12 @@ namespace imag_axes_ft {
       // ---- auxiliary DLR pole basis, REGULARIZED fit ----------------------
       // The pole DATA lives on cppdlr's NONSYM grid: the backend's SYM grid contains
       // near-degenerate +/- node pairs whose interpolatory coefficients are huge and
-      // cancelling (cond(cf2it) 6.2e10 vs 6.7e6, measured), and this algebra divides by
-      // node gaps. What CHANGED (2026-07-28, see dlr_pole_fit.hpp for the measurements):
-      // the residues used to come from an interpolation onto the aux tau nodes followed by
-      // a square interpolatory solve there. That composite has 2-norm 9.4e6, so O(eps)
-      // content the pole basis cannot resolve came back as residues hundreds of times the
-      // data -- and this algebra is bilinear in them. They now come from a truncated-SVD
-      // least-squares fit against the backend tau grid directly.
+      // cancelling (cond(cf2it) 6.2e10 vs 6.7e6), and this algebra divides by node gaps.
+      // The residues come from a truncated-SVD least-squares fit against the backend tau
+      // grid directly, NOT from an interpolation onto the aux tau nodes followed by a square
+      // interpolatory solve: that composite is badly conditioned (2-norm ~1e7), so O(eps)
+      // content the pole basis cannot resolve would come back as residues hundreds of times
+      // the data -- and this algebra is bilinear in them. See dlr_pole_fit.hpp.
       imag_axes_ft::dlr_pole_fit pfit(ft);
       const long np = pfit.np;
       auto const& epsl = pfit.epsl;

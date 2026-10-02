@@ -18,11 +18,10 @@
  * ==========================================================================
  */
 
-// ISDF-Vertex Phase 2 regression: C = empty set reproduces plain scGW BIT-FOR-BIT.
+// ISDF-Vertex regression: C = empty set reproduces plain scGW BIT-FOR-BIT.
 //
-// The primary correctness gate of the vertex plan (theory notes CLAUDE.md section 2,
-// invariant 5): enabling vertex_type = "2nd_exchange" with an EMPTY subspace window
-// must be an exact no-op. The scaffold guarantees this structurally (vertex_t::active()
+// Invariant: enabling vertex_type = "2nd_exchange" with an EMPTY subspace window
+// must be an exact no-op. The vertex guarantees this structurally (vertex_t::active()
 // is false => every injection guard is false => no allocation, no arithmetic, and the
 // scf driver's W-lifetime exception does not trigger since has_active_vertex() is
 // false). This test asserts the guarantee END TO END on the LiH-222 nosym system by
@@ -32,13 +31,11 @@
 // disabled path (reordered arithmetic, stray allocation-induced nondeterminism, a
 // guard evaluated on the wrong object) fails this test.
 //
-// INCREMENT S1 (notes/static_vertex_implementation_plan.md sections 2.1, 4) extends the
-// gate to ALL THREE rung modes: with C = empty set the vertex is inert whichever theory
-// was requested, so "dynamic" (Formulation B), "static" (B-S) and "linear" (B-L) must
-// each reproduce the vertex-absent run BITWISE -- even though the B-S/B-L kernels do not
-// exist yet. This is what makes the mode plumbing provably free of behavior change and
-// pins the ordering of the two constructor guards (the C = empty inert path is reached
-// BEFORE the "kernels not implemented" abort).
+// The check covers ALL THREE rung modes: with C = empty set the vertex is inert whichever
+// theory was requested, so "dynamic" (Formulation B), "static" (B-S) and "linear" (B-L)
+// must each reproduce the vertex-absent run BITWISE. This shows the mode plumbing is free
+// of behavior change and that the C = empty inert path is reached before any rung-specific
+// constructor work.
 
 #include <cmath>
 #include <random>

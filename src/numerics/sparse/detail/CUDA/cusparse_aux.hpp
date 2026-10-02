@@ -90,7 +90,7 @@ uint32_t find_alignment(T *p) {
 // The cuSPARSE operation for an op char. For a REAL value type the conjugate transpose is the transpose:
 // cuSPARSE rejects CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE for CUDA_R_32F/64F operands ("conjugate
 // transpose (opA) is not valid for A data type (CUDA_R_64F)", CUSPARSE_STATUS_INVALID_VALUE at the
-// SpMM bufferSize query -- test_sparse/csr_blas<double> on rusty, CUDA 12.5).
+// SpMM bufferSize query, observed with CUDA 12.5).
 template<typename value_type = std::complex<double>>
 inline auto get_operation(char op) {
   constexpr bool is_real = std::is_floating_point_v<std::decay_t<value_type>>;
@@ -150,7 +150,7 @@ auto cuDn(X& x) {
   utils::check(x.indexmap().min_stride() == 1, "Stride mismatch");
   if constexpr (std::is_const_v<std::remove_pointer_t<decltype(x.data())>>) {
     cusparseDnMatDescr_t cuX;
-    // MAM: nasty!!! 
+    // const_cast: the cuSPARSE dense descriptor takes a non-const pointer (read-only use here)
     using non_const_T = std::remove_const_t<std::remove_pointer_t<decltype(x.data())>>;
     auto ptr = const_cast<non_const_T*>(x.data()); 
     if constexpr (std::decay_t<X>::is_stride_order_C()) {
@@ -187,8 +187,8 @@ auto cuCSR(csr& spA, ::nda::MemoryArrayOfRank<1> auto& ofs, int batchCount = 1) 
   utils::check(spA.compact(), "device::csrmv: Sparse matrix must be in compact form.");
   if constexpr (std::is_const_v<std::remove_pointer_t<decltype(spA.values().data())>>) { 
     cusparseSpMatDescr_t cuA;
-    // MAM: nasty!!! 
-    // need non const T* to be able to set batchCount
+    // const_cast: the cuSPARSE sparse descriptor needs non-const pointers, e.g. to set
+    // batchCount (the data is only read)
     auto val_ptr = const_cast<value_type*>(spA.values().data()); 
     auto col_ptr = const_cast<index_type*>(spA.columns().data());
     auto [m, n] = spA.shape();

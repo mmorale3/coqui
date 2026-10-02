@@ -75,7 +75,7 @@ void csrmv(char oper_A,typename A::value_type alpha, A const& a, X const &x, typ
                   CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize) 
   // cuSPARSE reports bufferSize = 0 for small problems; a zero-length device array is a null
   // pointer and nda's value-init then calls cudaMemset(nullptr, 0, 0) -> cudaErrorInvalidValue
-  // (test_csr_blas on rusty, CUDA 12.5). Always allocate at least one byte.
+  // (seen with CUDA 12.5). Always allocate at least one byte.
   memory::buffered_array<MEM,char,1> buffer(std::max<size_t>(bufferSize, size_t(1)),char(0));
 
   // execute preprocess (optional)
@@ -150,9 +150,8 @@ void csrmm(char oper_A, char oper_B, typename A::value_type alpha, A const& a, B
 
   // allocate an external buffer if needed. CSR_ALG2 (deterministic) is preferred; should cuSPARSE reject it
   // for an (op, layout) combination with CUSPARSE_STATUS_INVALID_VALUE / NOT_SUPPORTED at the bufferSize
-  // query, fall back to ALG_DEFAULT for that call. (The INVALID_VALUE test_sparse hit on rusty, CUDA 12.5,
-  // was the conjugate transpose of a REAL matrix -- fixed in get_operation<value_type>, not by the
-  // algorithm; the fallback stays as a safety net and its diagnostics name the call.)
+  // query, fall back to ALG_DEFAULT for that call (a safety net; its diagnostics name the call). A conjugate
+  // transpose of a REAL matrix is mapped to a plain transpose by get_operation<value_type>.
   size_t bufferSize = 0;
   cusparseSpMMAlg_t alg = CUSPARSE_SPMM_CSR_ALG2;
   {

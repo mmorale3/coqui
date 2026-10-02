@@ -10,9 +10,9 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
-# RW-2 (notes/rw_real_axis_w_spec.md): gate RW-2-a, the TOY gate of the spectral-quadrature
-# W^c pole representation. Pure math on a closed-form Drude W^c -- no fixture, no FINUFFT --
-# so it builds and runs in every configuration.
+# The spectral-quadrature pole representation of W^c, checked against a closed-form
+# Lorentzian-broadened W^c. Pure math -- no fixture, no FINUFFT -- so it builds and runs in
+# every configuration.
 set(TEST_ID methods_wc_spectral)
 
 add_executable(test_${TEST_ID} test_wc_spectral.cpp)
@@ -21,11 +21,10 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield scf_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
-# P25 / G32 (notes/vertex_perf_plan.md): the small-q fit of epsilon_inf (eps_inf_fit = true), the
-# pure function of methods/scr_coulomb/eps_inf_fit.hpp alone -- synthetic eps(q) = eps_inf + A q^2
-# (+ B q^4) recovered to round-off, q = 0 excluded, the degenerate inputs refused. Header-only math:
-# no fixture, no MPI, builds and runs in every configuration. Separate executable so the existing
-# suites keep their exact tallies.
+# The small-q fit of epsilon_inf (eps_inf_fit = true), the pure function of
+# methods/scr_coulomb/eps_inf_fit.hpp alone -- synthetic eps(q) = eps_inf + A q^2 (+ B q^4)
+# recovered to round-off, q = 0 excluded, the degenerate inputs refused. Header-only math:
+# no fixture, no MPI, builds and runs in every configuration.
 set(TEST_ID methods_eps_inf_fit)
 
 add_executable(test_${TEST_ID} test_eps_inf_fit.cpp)
@@ -34,11 +33,9 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics)
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
-# increment TC-2 (notes/tc_coqui_impl_spec.md, spec M3): P on the tilted contour --
-# the complex-time ISDF kernel against the production imaginary-axis Pi, at t = -i tau
-# (the contraction) and through the tilted transform at z = i nu (the M3 gate), plus
-# the band-truncation on/off check. Separate executable so the existing suites keep
-# their exact tallies.
+# P on the tilted contour: the complex-time ISDF kernel against the production
+# imaginary-axis Pi, at t = -i tau (the contraction) and through the tilted transform at
+# z = i nu, plus the band-truncation on/off check.
 set(TEST_ID methods_tc_contour)
 
 add_executable(test_${TEST_ID} test_methods_tc_contour.cpp)
@@ -49,10 +46,10 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT 14400)
 
-# increment TC-3 (notes/tc_coqui_impl_spec.md, spec M4): W on the line + the eq-1 CD
-# assembly. Gate TC-3-a -- the single-pole Lehmann SIGN pin (closed form, machine
-# precision), the Dyson-chain pin against the campaign's RPA W^c, dense == warm-started
-# GMRES, and the multipole eq-1 corroboration. Pure math + a JSON reference: no fixture,
+# W^c on the tilted line and the contour-deformation Sigma^c assembly: the single-pole
+# Lehmann sign check (closed form, machine precision), the Dyson chain against an
+# independently generated RPA W^c reference, dense == warm-started GMRES, and the multipole
+# assembly against its exact Lehmann pole sum. Pure math + a JSON reference: no fixture,
 # no MPI, builds and runs in every configuration.
 set(TEST_ID methods_tc_wline)
 
@@ -63,8 +60,8 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT 3600)
 
-# Project 2 increment Q2: the qp_map A/B surrogate-spread gate (full qp-scf
-# loops on real fixtures -- separate executable so ctest can target it).
+# The quasiparticle maps of the qpGW loop compared on the same fixtures (full qp-scf
+# loops; the band-edge spread between the static maps is reported).
 set(TEST_ID methods_qp_map_ab)
 
 add_executable(test_${TEST_ID} test_qp_map_ab.cpp)
@@ -73,10 +70,9 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
-# Project 2 increment Q3 (notes/q3_bse_tier_spec.md): the BSE (ladder) polarization tier
-# in the qpGW loop -- the noop legs, the loop-vs-readout eps_M identity, the lambda_max
-# watchdog and the s = 1 anchor pin on the qpGW state. Links vertex/scr_coulomb: the
-# gates run on the production ladder instance.
+# The BSE (ladder) polarization in the qpGW loop -- the no-op legs, the loop-vs-readout
+# eps_M identity, the lambda_max watchdog and the one-rung anchor check on the qpGW state.
+# Links vertex/scr_coulomb: the checks run on the production ladder instance.
 set(TEST_ID methods_qpgw_bse)
 
 add_executable(test_${TEST_ID} test_methods_qpgw_bse.cpp)
@@ -87,10 +83,11 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT 14400)
 
-# Project 2 increment Q4 (notes/q4_edmft_skeleton_spec.md): the EDMFT skeleton -- the
-# C = empty identity of the qpGW+BSE lattice stage under screen_type = "gw_edmft" with a
-# bosonic projector, and the eq-7 ladder DC (P^lad_loc). Links methods_lib: it needs the
-# embedding projector alongside the scf/vertex/scr_coulomb stack.
+# qpGW+BSE as the lattice stage of GW+EDMFT: the identity with the plain RPA-screened run
+# when no local polarizabilities are set (screen_type = "gw_edmft" with a bosonic
+# projector), and the local ladder polarization P^lad_loc for the bosonic double counting.
+# Links methods_lib: it needs the embedding projector alongside the scf/vertex/scr_coulomb
+# stack.
 set(TEST_ID methods_qpgw_edmft)
 
 add_executable(test_${TEST_ID} test_methods_qpgw_edmft.cpp)
@@ -100,9 +97,8 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT 14400)
 
-# Project 2 increment Q4-C3b (notes/q4_c3b_orbital_ladder_dc_spec.md): the eq-7 ladder DC
-# proper -- the orbital/chi-convention local part of the lattice ladder. Separate executable
-# so the Q3/Q4 suites keep their exact tallies (gate G1's no-disturbance discipline).
+# The ladder double counting in the orbital (chi-convention) basis: the local part of the
+# lattice ladder entering the bosonic double counting.
 set(TEST_ID methods_qpgw_c3b)
 
 add_executable(test_${TEST_ID} test_methods_qpgw_c3b.cpp)
@@ -112,10 +108,9 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT 14400)
 
-# Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md): the Option-2 outer loop --
-# the source-swap identity of the external-G injection (Q5-g1) and the restart composition
-# that IS the C = empty-set Option-1-vs-Option-2 statement (Q5-g2). Separate executable so
-# the Q3/Q4 suites keep their exact tallies.
+# The external-G injection of the qpGW loop (greens_func_source): the source-swap
+# identity, and the restart composition that shows the "option1" and "option2" outer loops
+# agree when no impurity corrections are present.
 set(TEST_ID methods_qpgw_q5)
 
 add_executable(test_${TEST_ID} test_methods_qpgw_q5.cpp)
@@ -126,10 +121,9 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT 14400)
 
-# Project 2 increment Q6 (notes/q6_diagnostics_closeout_spec.md): the diagnostics closeout --
-# the compressibility seam (§1.2, scope-reduced: const_mu does not reach the qp path), the
-# map-stage lineshape meter (§1.3) and the persisted injection meters + consolidated summary
-# line (§1.4). Separate executable so the Q3/Q4/Q5 suites keep their exact tallies.
+# qpGW diagnostics: the compressibility check (fixed-Sigma dN/dmu against the q -> 0
+# charge response), the map-stage lineshape meter, and the ladder injection meters
+# persisted in the checkpoint.
 set(TEST_ID methods_qpgw_q6)
 
 add_executable(test_${TEST_ID} test_methods_qpgw_q6.cpp)

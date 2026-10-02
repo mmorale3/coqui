@@ -22,9 +22,7 @@
 #define COQUI_SIGMA_REAL_AXIS_HPP
 
 /**
- * Project 2 (qpGW+BSE+EDMFT) increment QM1 -- ROUTE A: the real-axis self-energy
- * evaluator (spec notes/qm1_route_a_spec.md; parent notes/qsgw_matsubara_plan.pdf
- * section 2, gates section 6.1-6.3). Sibling of qp_maps_matsubara.hpp: that file
+ * ROUTE A: the real-axis self-energy evaluator. Sibling of qp_maps_matsubara.hpp: that file
  * carries the AC-free Matsubara-native maps, this one carries the van Schilfgaarde
  * mode-A real-axis evaluation WITHOUT analytic continuation -- Sigma(eps) is obtained
  * from a low-order Taylor expansion about a REAL centre z0, whose coefficients are
@@ -35,16 +33,16 @@
  * Sigma is analytic in a disk of radius R_conv about a real z0 in the gap region, so
  * the expansion is legitimate; R_conv is estimated per fit and reported.
  *
- * THE REFLECTION CONSTRAINT (the correctness core, spec section 1)
- * ---------------------------------------------------------------
+ * THE REFLECTION CONSTRAINT (the correctness core)
+ * ------------------------------------------------
  * Schwarz reflection for the self-energy matrix reads Sigma_ij(z*) = [Sigma_ji(z)]*,
- * the same identity Q1's even/odd extrapolation uses on the Matsubara axis in the form
+ * the same identity the Matsubara-native maps' even/odd extrapolation uses in the form
  * Sigma(-i w) = Sigma(i w)^dag (qp_maps_matsubara.hpp header). Taylor coefficients
  * about a REAL centre therefore obey
  *
  *     c_n^(ij) = (c_n^(ji))*      =>      diagonal c_n^(ii) is REAL.
  *
- * The pinned implementation rule: for each UNORDERED pair {i,j} the sample function on
+ * The implementation rule: for each UNORDERED pair {i,j} the sample function on
  * both signs of t is built from the +t half-window ONLY,
  *
  *     F_ij(+t) = Sigma_ij(z0 + i t),
@@ -61,10 +59,10 @@
  * deliberately no herm() call in assemble_vxc. On the diagonal the +/- sample symmetry
  * F(-t) = F(t)* already forces a real least-squares solution; Re(c_n) is taken and
  * imag_c_rel = max_n |Im c_n| / max_n |c_n| is retained as the logged fit-quality
- * diagnostic (spec section 2.1).
+ * diagnostic.
  *
- * FIT (spec section 2)
- * --------------------
+ * FIT
+ * ---
  * Complex LS of the polynomial in (i t), order p (default 2), over 2m samples (both
  * signs). The variable is SCALED before the Vandermonde is formed, u = t/t_max, the fit
  * is done in (i u)^n and unscaled by c_n <- c_n / t_max^n -- pure conditioning, and it
@@ -75,15 +73,15 @@
  * Sampling window: t = +/- w_n over m fermionic nodes starting at node n0 (default 0),
  * m default 3p, i.e. the window [w_0, w_{3p-1}] and 6p samples. |t| >= w_0 ALWAYS --
  * mandatory when the sampler is a DLR pole representation, whose fit poles lie ON the
- * real axis (plan section 2 caveat), and kept uniformly for every sampler so that one
+ * real axis, and kept uniformly for every sampler so that one
  * window convention covers all of them.
  *
  * Diagnostics returned with every fit: relative residual ||F - fit|| / ||F||, imag_c_rel
  * (meaningful for diagonal pairs), the convergence-radius estimate R_conv = |c_{p-1}/c_p|,
  * and |eps - z0| / R_conv at evaluation.
  *
- * SAMPLERS (spec section 3)
- * -------------------------
+ * SAMPLERS
+ * --------
  * The fit/eval core is sampler-agnostic: it takes arrays (t_k, F_k). Three sources:
  *   - Matsubara data (z0 = 0 first pass): the samples ARE the stored MO-basis
  *     Sigma(i w_n); the negative half comes from the dagger identity, i.e. exactly the
@@ -93,8 +91,8 @@
  *     OFF-GRID source needed for re-expansion about z0 != 0. See pole_sampler.
  *   - Analytic models (tests).
  *
- * QP ROOT WITH RE-EXPANSION (spec sections 2.2-2.3, the production algorithm)
- * --------------------------------------------------------------------------
+ * QP ROOT WITH RE-EXPANSION
+ * -------------------------
  * Given a sampler S and a static part e0, solve eps = e0 + Sigmahat(eps):
  *   1. z0 <- 0 (or a caller-provided guess);
  *   2. fit the expansion about z0 -- for a general sampler the two signs are sampled
@@ -106,10 +104,10 @@
  *      |delta eps| < 1e-9 (model units).
  * At the fixed point z0 = eps the quadratic model reproduces Sigma(eps) through its own
  * c_0, so the re-expanded order-p = 2 map is far more accurate than a high-order
- * expansion about zero (spec section 2.3) -- that is the reason re-expansion exists.
+ * expansion about zero -- that is the reason re-expansion exists.
  *
- * Defaults (plan section 5 item 5): p = 2, n_reexp = 4, m = 3p. They are struct options
- * here; toml exposure and the loop dispatch are increment QM2, NOT this file.
+ * Defaults: p = 2, n_reexp = 4, m = 3p. They are struct options here; the input-file
+ * exposure and the loop dispatch live with the caller, not in this file.
  */
 
 #include <cmath>
@@ -126,7 +124,7 @@
 namespace methods {
 namespace sigma_real_axis {
 
-  /** Fit + re-expansion options. Defaults are the production settings. */
+  /** Fit + re-expansion options. Defaults are the recommended settings. */
   struct fit_opts {
     long p = 2;               // Taylor order about z0
     long m = -1;              // fermionic nodes in the half-window; < 0 selects 3p
@@ -137,7 +135,7 @@ namespace sigma_real_axis {
     double newton_tol = 1e-14;
   };
 
-  /** Per-fit diagnostics (spec section 2, "returned with every fit"). */
+  /** Per-fit diagnostics, returned with every fit. */
   struct fit_diag {
     double rel_resid = 0.0;   // ||F - fit||_2 / ||F||_2 over the sample set
     double imag_c_rel = 0.0;  // max_n |Im c_n| / max_n |c_n|  (diagonal fit quality)
@@ -285,7 +283,7 @@ namespace sigma_real_axis {
   };
 
   /**
-   * Diagonal quasiparticle root with re-expansion (spec sections 2.2-2.3).
+   * Diagonal quasiparticle root with re-expansion.
    * S must be callable as S(ComplexType) -> ComplexType. e0 is the static part.
    */
   template <class Sampler>
@@ -419,7 +417,7 @@ namespace sigma_real_axis {
   /**
    * Matsubara-data path (the z0 = 0 first pass): the samples ARE the stored MO-basis
    * Sigma(i w_n) on the fermionic nodes, and the negative-t half follows from the dagger
-   * identity Sigma(-i w) = Sigma(i w)^dag (the Q1 identity, qp_maps_matsubara.hpp header)
+   * identity Sigma(-i w) = Sigma(i w)^dag (see the qp_maps_matsubara.hpp header)
    * -- i.e. exactly the reflection rule. Uses nodes opt.n0 .. opt.n0+m-1 of the supplied
    * mesh, m defaulting to 3p.
    */

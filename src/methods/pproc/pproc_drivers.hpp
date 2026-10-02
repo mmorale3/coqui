@@ -174,12 +174,12 @@ namespace methods {
       pp.wannier_interpolation(*mf, pt, wannier_file, "quasiparticle", grp_name, iteration, trans_home_cell);
 
     } else if (pp_type == "qp_gaps") {
-      // LFF (notes/lff_aux_plan.md): quasiparticle energies on the IBZ k-mesh from the Dyson self-energy of a scGW
+      // Quasiparticle energies on the IBZ k-mesh from the Dyson self-energy of a scGW
       // checkpoint (Pade AC of the MO-diagonal Sigma + the QP equation, compute_qp_on_ibz_kmesh -> qp_approx/E_ska)
       // followed by the band gaps on that mesh: fundamental (min CBM - max VBM over the mesh, occupation by mu),
-      // direct at Gamma, and the smallest direct gap -- the qsGW-hat benchmark's convention. Results are printed in
+      // direct at Gamma, and the smallest direct gap. Results are printed in
       // eV and written to <grp>/iter<n>/qp_approx/gaps; epsilon_inf of the same iteration is printed alongside.
-      // P24 / G31 (notes/vertex_perf_plan.md): with qp_gaps_interp = true the QP Hamiltonian is in addition
+      // With qp_gaps_interp = true the QP Hamiltonian is in addition
       // Wannier-interpolated (pproc_t::qp_bands_on_mesh, the band_interpolation machinery) onto the uniform
       // qp_gaps_interp_mesh = [n1, n2, n3] (default: the mean-field mesh, on which the interpolation is exact),
       // and the same gaps are reported on that mesh -- the off-mesh (indirect) CBM/VBM. Needs wannier_file (the
@@ -264,7 +264,7 @@ namespace methods {
       }
       mpi->comm.barrier();
       if (qp_gaps_interp) {
-        // P24 / G31: the same report on the Wannier-interpolated fine mesh (all ranks: the interpolation is collective)
+        // the same report on the Wannier-interpolated fine mesh (all ranks: the interpolation is collective)
         utils::check(qp_gaps_interp_mesh.size() == 3, "qp_gaps: qp_gaps_interp_mesh expects 3 integers (got {}).",
                      qp_gaps_interp_mesh.size());
         std::array<long, 3> mesh = {qp_gaps_interp_mesh[0], qp_gaps_interp_mesh[1], qp_gaps_interp_mesh[2]};
@@ -390,8 +390,7 @@ namespace methods {
 
     } else if (pp_type == "cvv_eps") {
 
-      // scGW-tilde increment C3: covariant-velocity dielectric readout on a stored
-      // checkpoint (notes/scgwt_implementation_plan.md; the T-c probe).
+      // covariant-velocity (CVV) dielectric readout on a stored checkpoint.
       pproc_t pp(*mpi, prefix, outdir);
       auto grp_name  = io::get_value_with_default<std::string>(pt, "grp_name", "scf");
       auto iteration = io::get_value_with_default<long>(pt, "iteration", -1);

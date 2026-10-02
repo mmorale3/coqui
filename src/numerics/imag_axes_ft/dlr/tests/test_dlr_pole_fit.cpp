@@ -20,18 +20,16 @@
 
 // Unit tests for imag_axes_ft::dlr_pole_fit.
 //
-// The last case is the REGRESSION: it is the failure that produced the 2026-07-27
-// scGW+vertex divergence, and it is the one no pre-existing check could see. The old
-// residue route (interpolate onto the auxiliary tau nodes, then run a square
-// interpolatory solve there) is a fixed linear map of 2-norm 9.4e6 at the production
-// grid. Feeding it Lehmann data perturbed by a RELATIVE 1e-4 along its worst-conditioned
-// direction returned residues 379x the data and a fit error of 2.4e-3 -- reproducing the
-// observed break (383x, 3.19e-3) to a few percent -- and the downstream algebras are
-// bilinear in those residues, so it entered squared.
+// The last case is the key REGRESSION test. A residue route that interpolates onto the
+// auxiliary tau nodes and then runs a square interpolatory solve there is a fixed linear map
+// of 2-norm ~1e7 at a realistic grid. Feeding it Lehmann data perturbed by a RELATIVE 1e-4
+// along its worst-conditioned direction returns residues hundreds of times the data and a
+// fit error of order 1e-3, and the downstream algebras are bilinear in those residues, so
+// the error enters squared and can drive a self-consistent vertex calculation to diverge.
 //
-// The old self-check validated the pole CONVENTION against a single synthetic pole, which
-// is trivially in the span; it passed through every divergence. Hence case 1 below uses a
-// MULTI-pole object, and case 4 perturbs deliberately.
+// A self-check of the pole CONVENTION against a single synthetic pole is not enough: a single
+// pole is trivially in the span. Hence case 1 below uses a MULTI-pole object, and case 4
+// perturbs deliberately.
 
 #undef NDEBUG
 
@@ -73,7 +71,7 @@ namespace bdft_tests {
   }
 
   TEST_CASE("dlr_pole_fit", "[iaft]") {
-    double beta = 1000.0, wmax = 4.0;   // lambda = 4000, close to the production grid
+    double beta = 1000.0, wmax = 4.0;   // lambda = 4000, a realistic grid
     imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::dlr_basis, "low");
     imag_axes_ft::dlr_pole_fit pf(ft);
 
@@ -99,7 +97,7 @@ namespace bdft_tests {
       double err = pf.fit_error(F, c);
       // exact-to-eps for data that IS in the represented class
       REQUIRE(err < 1e-4);
-      // and the residues stay the size of the data -- this is what the old route lost
+      // and the residues stay the size of the data -- this is what a square solve loses
       REQUIRE(maxabs(c) < 50.0 * maxabs(F));
     }
 
@@ -122,8 +120,8 @@ namespace bdft_tests {
     }
 
     // ---- 3. a looser accuracy target really does use fewer directions -------------------
-    // n_kept is per-call state (the rank is chosen from the data), so compare AFTER fitting
-    // the same object with two different targets.
+    // n_kept is fixed at build() by rel_tol; fit the same object with two instances that
+    // differ only in rel_tol.
     {
       imag_axes_ft::dlr_pole_fit coarse(ft, 1e-2);
       auto F = lehmann_tau(pf, e, w, 1);
@@ -136,9 +134,9 @@ namespace bdft_tests {
       REQUIRE(coarse.fit_error(F, c_coarse) < 1e-1);
     }
 
-    // ---- 3b. BATCH SEMANTICS: batched must equal per-element, bit for bit ---------------
-    // The rank is data-dependent, so it must be chosen per COLUMN; a rank derived from
-    // batch-summed norms would couple independent columns.
+    // ---- 3b. BATCH SEMANTICS: batched must equal per-element ----------------------------
+    // The fit must act on each column independently; any rank derived from batch-summed
+    // norms would couple independent columns.
     {
       auto Fb = lehmann_tau(pf, e, w, 4);
       auto cb = pf.coeffs(Fb);
@@ -154,8 +152,8 @@ namespace bdft_tests {
         // Column coupling would show up at the size of the coefficients; the batched and the
         // per-column paths are the same algorithm on the same data, but the BLAS may use different
         // kernels for 4 columns and for 1 (MKL does), so bit-for-bit is not a property of the
-        // algorithm: measured 0.0 with OpenBLAS/clang, 3.0e-12 relative with MKL/gcc on rusty
-        // (the multi-RHS and the single-RHS least-squares solves round differently).
+        // algorithm (the multi-RHS and the single-RHS solves may round differently, at the
+        // 1e-12 relative level); the tolerance allows for that.
         INFO("column " << j << ": batched vs per-column |dc|_max = " << d << ", |c|_max = " << cmax);
         REQUIRE(d <= 1e-10 * std::max(cmax, 1.0));
       }
@@ -163,7 +161,7 @@ namespace bdft_tests {
 
     // ---- 3c. GAUGE COVARIANCE: the fit must commute with a unitary mixing of columns ----
     // Physical results depend on range(P) only: under U(k) -> U(k) V(k) the vertex cuts are
-    // exactly invariant (CLAUDE.md section 8), and test_methods_vertex_wannier pins that. The
+    // exactly invariant, and test_methods_vertex_wannier pins that. The
     // pole fit is applied to a batch whose columns carry the C-orbital index, so a gauge
     // rotation MIXES those columns. If the fit is a fixed linear map it commutes with the
     // mixing exactly; if the rank is chosen from the data it need not, because the mixed data
@@ -216,9 +214,9 @@ namespace bdft_tests {
       REQUIRE(std::isfinite(scale));
       REQUIRE(std::isfinite(dev));
       // A fixed map is covariant EXACTLY, so all that is left is roundoff, floored by
-      // machine eps times the residue amplification (~6e5 here). Measured: 1.6e-12 relative.
-      // The broken per-column adaptive rule sat at 1.9e-01 relative, so 1e-9 separates them
-      // by eight orders while leaving three orders of roundoff headroom.
+      // machine eps times the residue amplification (~6e5 here), i.e. ~1e-12 relative. A
+      // per-column data-adaptive rank gives O(0.1), so 1e-9 separates the two by eight orders
+      // while leaving three orders of roundoff headroom.
       REQUIRE(dev <= 1e-9 * std::max(scale, 1.0));
     }
 
@@ -226,7 +224,7 @@ namespace bdft_tests {
     // Perturb Lehmann data along the direction the pole kernel resolves LEAST (its smallest
     // retained right-singular direction is inside the span, so use the tau-space direction
     // orthogonal to what the kernel can reach: the residual of a random vector after
-    // projection onto range(K)). Relative size 1e-4 -- the level that broke production.
+    // projection onto range(K)). Relative size 1e-4 -- enough to break a square solve.
     {
       auto F = lehmann_tau(pf, e, w, 1);
       double fmax = maxabs(F);
@@ -253,7 +251,7 @@ namespace bdft_tests {
       if (rn > 1e-12) {          // a rank-deficient kernel always leaves such a direction
         for (long i = 0; i < pf.nt; ++i) F(i, 0) += cplx(1e-4 * fmax * r(i) / rn);
         auto c = pf.coeffs(F);
-        // The residues must stay O(data). The unregularized route returned 379x here.
+        // The residues must stay O(data); an unregularized square solve returns hundreds of x.
         REQUIRE(maxabs(c) < 50.0 * fmax);
         // The fit error must REPORT the unrepresentable content rather than absorb it into
         // huge residues -- but stay far below the hard gate, since the content is tiny.

@@ -5,8 +5,8 @@ add_library(embed_lib projector_t.cpp projector_boson_t.cpp dc_utilities.hpp emb
 target_link_libraries(embed_lib PUBLIC utils numerics meanfield methods_tools_lib hf_lib gw_lib scf_lib mb_state_lib)
 # embed_lib sits in a static-library dependency CYCLE
 #   embed_lib -> gw_lib -> scr_coulomb_lib -> embed_lib
-# and, since the scGW-tilde C3 readout made pproc_lib depend on scr_coulomb_lib as well
-# (src/methods/pproc/CMakeLists.txt), the cycle is now entered from pproc_lib too. CMake
+# and, since the cvv_eps readout makes pproc_lib depend on scr_coulomb_lib as well
+# (src/methods/pproc/CMakeLists.txt), the cycle is also entered from pproc_lib. CMake
 # breaks such a cycle by repeating its members on the link line LINK_INTERFACE_MULTIPLICITY
 # times (default 2), and two rounds are one short here: round 2 is where
 # scr_coulomb_t.cpp.o first gets pulled in, and its reference to

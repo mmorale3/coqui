@@ -1,7 +1,7 @@
 {
  "meta": {
-  "source": "tc_validation (campaign of notes/tilted_contour_validation_results.md)",
-  "generator": "tc_validation/tests/export_tc1_reference.py",
+  "source": "independent Python implementation of the tilted-contour construction",
+  "generator": "reference exporter (Python / numpy)",
   "profile": "flat",
   "rho": 0.65,
   "eps": 1e-06,

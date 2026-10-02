@@ -58,13 +58,13 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
  * The template parameters allow for different types of self-energy solvers (e.g. HF, GW, GF2)
  * and different types of Coulomb Hamiltonian representations (e.g. THC, Cholesky).
  *
- * Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the last two arguments are
- * the Option-2 re-QP-ization knobs, following the scf_loop naming convention.
+ * The last two arguments re-quasiparticle-ize an external Green's function (e.g. a DMFT outer
+ * loop), following the scf_loop naming convention.
  * @param gf_grp  - checkpoint group of an EXTERNAL Green's function ("scf"/"embed"), which
  *                  ITERATION 1 consumes in place of the restart-H_eff's analytic QP G (its
  *                  density matrix feeds the HF stage and it feeds the Sigma^GW/W build;
- *                  iterations >= 2 revert to the loop's own QP G). EMPTY = INERT (default):
- *                  the loop is bit-identical to the pre-Q5 one.
+ *                  iterations >= 2 revert to the loop's own QP G). Empty (default): no
+ *                  external G is read and the loop is the standard qp-SCF loop.
  * @param gf_iter - iteration inside gf_grp; -1 = that group's "final_iter".
  */
 template<typename eri_t, typename corr_solver_t>

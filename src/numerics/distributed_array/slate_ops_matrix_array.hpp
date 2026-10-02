@@ -24,8 +24,7 @@
 /*
  * slate_ops overloads for math::nda::distributed_matrix_array.
  *
- * Kept in a separate header so that existing slate_ops users are untouched and call sites can
- * be migrated one at a time.
+ * Kept in a separate header so that slate_ops users of distributed_array are unaffected.
  *
  * Two things are simpler here than in the distributed_array path:
  *
@@ -71,7 +70,7 @@ concept DistributedMatrixArray = requires(std::decay_t<A>& a, std::decay_t<A> co
 /*                            operand tagging                              */
 /***************************************************************************/
 
-/// transpose/dagger wrapper for the new container. The existing math::detail::*_tag types
+/// transpose/dagger wrapper for distributed_matrix_array. The existing math::detail::*_tag types
 /// cannot be reused: they require MA::Array_t.
 template<typename MA>
 struct ma_op_tag {

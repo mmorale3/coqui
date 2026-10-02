@@ -1,6 +1,41 @@
 
 # Changelog
 
+## Unreleased — dynamic vertex (vertex-gpu)
+
+### Added
+
+- Dressed-leg Γ₁ readout of the dynamic-rung ladder: the dynamic rung is contracted with legs dressed by the static
+  resolvent through closed-form Matsubara Grams of the pole families, exact to round-off and without an L0 application on
+  the frequency-dependent intermediate. Used for the polarization (Γ₁ and the one-bare-rung column) and for the Σ-side
+  deposits; host and device paths. Input `pol_vertex_dyn_dressed = "auto" | "on" | "off"`.
+- Device engine for the dynamic vertex (CUDA): the unit (static resolvent LU, L0, dense τ rungs, DLR refit) is resident on
+  the GPU; mirror-paired τ rungs share one gemm; optional two-input rung pass; streaming THC rung and frequency-factorized
+  rung variants; device Σ deposits.
+- Partial rung residency: when the dense τ rungs do not fit on the device, the remaining ones are rebuilt on the device or
+  copied from pinned host memory per application; the split is chosen at run time by timing the candidate splits
+  (no per-device tuning). Input `pol_vertex_dyn_device_memory = "auto" | "rebuild" | "host" | "resident"`.
+- Hybrid / frequency-factorized dynamic rung builds, threaded serial sections of the rung application, the static
+  resolvent and the static-ladder readout.
+- Dynamic pair Σ vertex in Wannier mode; host parking of W during the vertex drivers to free device memory.
+- Small Si unit-test fixtures (2×2×2, 3×3×3, 4×4×4; symmetric, time-reversal-only and unreduced meshes) for the IBZ and
+  dynamic-vertex symmetry tests.
+
+### Improved
+
+- Si kp444, 12-band window, ν = 0 dressed Γ₁ (2 ranks): CPU 1776 s → 1308 s (hybrid rung build: 937 s); A100
+  552 s → 349 s; H100 108 s; dynamic Σ vertex on H100 975 s → 352 s. Results unchanged to ≤ 1e-13 relative.
+
+### Changed (robustness — no silent workflow changes)
+
+- A device stage that does not fit aborts with the reason; `pol_vertex_dyn_device_fallback = true` (default false) allows
+  moving it to the CPU with a WARNING.
+- New inputs, all default false, each re-allowing a behaviour that can change the answer and is otherwise an abort:
+  `vertex_allow_missing_head`, `pol_vertex_allow_bare_rung`, `pol_vertex_allow_unprojected`,
+  `vertex_allow_unchecked_reflection`.
+- `vertex_debug` keys are validated against a known-key list (an unknown key aborts) and parsed strictly.
+- A Σ^C rung that violates the pair symmetry W_PQ(q) = W_QP(−q) is reported with a prominent warning.
+
 ## CoQui v0.3.0 [2026-06-03]
 
 ### Added

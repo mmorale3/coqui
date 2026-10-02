@@ -2,15 +2,15 @@
  * ==========================================================================
  * CoQuí: Correlated Quantum ínterface
  *
- * RW-1 GATE HARNESS (notes/rw_real_axis_w_spec.md, gate RW-1-a).
+ * Real-axis vs imaginary-axis cross-check of the screened interaction.
  *
- * THE ONE ACCEPTANCE NUMBER of the real-axis W port: the correlated screened
+ * The acceptance test of the real-axis W chain: the correlated screened
  * interaction computed on the REAL axis, mapped forward to the imaginary axis
  * by the bosonic spectral (Lehmann) integral, must agree with the imaginary-
  * axis production W^c built from THE SAME Green's function.
  *
  *   real axis   :  A(w) = QP-pole Lorentzians of width eta
- *                    -> real_axis_scr_coulomb_t::update_w   (the ported chain)
+ *                    -> real_axis_scr_coulomb_t::update_w
  *                    -> Im W^c(q, P, Q, Omega),  Omega > 0
  *                    -> W^c(q, P, Q, i nu_n) = (2/pi) int_0^inf dOmega
  *                                              Omega Im W^c(Omega)
@@ -23,20 +23,18 @@
  * SIGN OF THE FORWARD MAP. For a retarded response X^R(z), analytic in the
  * upper half plane,
  *      X(z) = (1/pi) int dOmega' Im X^R(Omega') / (Omega' - z),
- * which is the same convention the branch's fermionic cross-validation uses
- * (test_real_axis_xvalidate.cpp:366-398, Sigma_c(z) = -(1/pi) int Im Sigma /
- * (z - omega')). Im W^c is ODD on the real axis (real_axis_sigma.hpp:25-32
- * documents the odd extension of the bosonic half-grid), so folding the
- * negative half onto the positive one gives
+ * the same convention as the fermionic spectral representation
+ * Sigma_c(z) = -(1/pi) int Im Sigma / (z - omega'). Im W^c is ODD on the real
+ * axis (the bosonic half-grid is odd-extended), so folding the negative half
+ * onto the positive one gives
  *      X(i nu) = (2/pi) int_0^inf dOmega Omega Im X(Omega) / (Omega^2 + nu^2).
- * NOTE (flagged in notes/rw1_port_report.md): the spec writes the denominator
- * as ((i nu)^2 - Omega^2) = -(nu^2 + Omega^2), i.e. the OPPOSITE overall sign.
- * The form used here is the one that follows from the branch's own retarded
- * convention and is the one that gives Re W^c(i nu = 0) < 0 (screening lowers
- * W below the bare v), so it is what this harness implements.
+ * Note the sign: writing the denominator as ((i nu)^2 - Omega^2) =
+ * -(nu^2 + Omega^2) would give the OPPOSITE overall sign. The form used here
+ * follows from the retarded convention and gives Re W^c(i nu = 0) < 0
+ * (screening lowers W below the bare v).
  *
- * CONVENTION PINS (pre-registered in the spec; each is asserted below, and a
- * violation aborts the test rather than being absorbed into a tolerance):
+ * CONVENTION PINS (each is asserted below, and a violation aborts the test
+ * rather than being absorbed into a tolerance):
  *   P1  same static Hamiltonian on both sides   (H0 + F == diag(eps_KS), S == 1)
  *   P2  same mu (the imaginary-axis Dyson's own mu feeds grid.mu_chem())
  *   P3  beta = 1000 on both sides
@@ -45,13 +43,14 @@
  *       quadrature/NUFFT error stays below the eta error (Nyquist is enforced
  *       as a hard error by real_freq_grid_t itself)
  *
- * KNOWN STRUCTURAL DIFFERENCES, reported but excluded from the gate:
+ * KNOWN STRUCTURAL DIFFERENCES, reported but excluded from the check:
  *   D1  q = Gamma. Under ignore_g0 the real-axis chain zeroes Pi AND W at
- *       Gamma explicitly (real_axis_scr_coulomb_t.h:846-853); the imaginary-
+ *       Gamma explicitly (real_axis_scr_coulomb_t::update_w); the imaginary-
  *       axis chain does NOT -- it solves the Dyson equation at Gamma with the
- *       regularized aux-basis V. The gate therefore runs over q != Gamma and
+ *       regularized aux-basis V. The check therefore runs over q != Gamma and
  *       reports Gamma separately.
- *   D2  spin degeneracy. See COQUI_RW1_SPIN_DEGENERACY below.
+ *   D2  spin degeneracy. For ns == 1 both chains count the single stored
+ *       spin channel twice (ns_factor in update_w, sp_factor in rpa_pi.icc).
  * ==========================================================================
  */
 
@@ -82,7 +81,7 @@
 #include "methods/GW_real_axis/real_axis_scr_coulomb_t.h"
 #include "methods/GW_real_axis/real_axis_qp_A.hpp"
 
-// Matsubara branch.
+// Matsubara side.
 #include "methods/mb_state/mb_state.hpp"
 #include "methods/SCF/simple_dyson.h"
 #include "methods/SCF/scf_common.hpp"
@@ -103,24 +102,23 @@ namespace bdft_tests {
   using methods::real_axis::real_axis_scr_coulomb_t;
   using cval_t = std::complex<double>;
 
-  // RW-2: the grid sizing rule and the QP-pole Lorentzian A builder were PROMOTED out of
-  // this harness into methods/GW_real_axis/real_axis_qp_A.hpp, so the production spectral
-  // path (qp_modea_wfit = "spectral") and this gate share one implementation. Neither is
-  // changed in content -- the derivations that used to live here are in that file's header.
+  // The grid sizing rule and the QP-pole Lorentzian A builder live in
+  // methods/GW_real_axis/real_axis_qp_A.hpp, shared with the production spectral path
+  // (qp_modea_wfit = "spectral"); their derivations are in that file's header.
   namespace rw1 {
     using methods::real_axis::grid_sizing_t;
     using methods::real_axis::size_grids;
   } // namespace rw1
 
   // =====================================================================
-  // The gate body, parameterized by fixture. `use_rspace` selects the Pi
+  // The test body, parameterized by fixture. `use_rspace` selects the Pi
   // code path: the k-space branch hard-requires IBZ == FBZ
-  // (real_axis_scr_coulomb_t.h:833-837), so symmetry-reduced fixtures must
+  // (checked in real_axis_scr_coulomb_t::update_w), so symmetry-reduced fixtures must
   // use the R-space branch (which is also the production default for Nk>1).
   static void run_lehmann_gate(char const* mf_src, bool use_rspace)
   {
     auto& mpi_context = utils::make_unit_test_mpi_context();
-    if (mpi_context->comm.size() != 1) return;   // single-rank gate
+    if (mpi_context->comm.size() != 1) return;   // single-rank test
 
     // ---------------- fixture + THC ----------------------------------
     // The THC rank is COMMON MODE: both axes consume the identical
@@ -141,7 +139,7 @@ namespace bdft_tests {
     const long Naux      = thc.Np();
     const double beta    = 1000.0;              // PIN P3
 
-    app_log(2, "[rw1] fixture {}: ns={} Nk={} Nq_ibz={} nbnd={} Naux={}  "
+    app_log(2, "[real-axis W] fixture {}: ns={} Nk={} Nq_ibz={} nbnd={} Naux={}  "
                "(Pi path: {})",
             mf_src, ns, Nk, Nq_ibz, nbnd, Naux,
             use_rspace ? "R-space" : "k-space");
@@ -159,14 +157,14 @@ namespace bdft_tests {
         }
     const double w_max     = std::max(std::abs(e_min), std::abs(e_max)) + 2.0;
     const double Omega_max = 2.0 * w_max;
-    app_log(2, "[rw1] eps range = [{:.4f}, {:.4f}] Ha -> w_max = {:.4f}, "
+    app_log(2, "[real-axis W] eps range = [{:.4f}, {:.4f}] Ha -> w_max = {:.4f}, "
                "Omega_max = {:.4f}", e_min, e_max, w_max, Omega_max);
 
     // =================================================================
-    // MATSUBARA BRANCH: G_0 from the MF static Hamiltonian, W^c(q,inu).
+    // MATSUBARA SIDE: G_0 from the MF static Hamiltonian, W^c(q,inu).
     // =================================================================
     imag_axes_ft::IAFT ft(beta, w_max + 1.0, imag_axes_ft::dlr_basis, "high");
-    const std::string prefix = std::string("coqui_rw1_lehmann_") + mf_src;
+    const std::string prefix = std::string("coqui_real_axis_lehmann_") + mf_src;
 
     MBState mb_state(mpi_context, ft, prefix);
     simple_dyson dyson(mf.get(), &ft);
@@ -192,7 +190,7 @@ namespace bdft_tests {
 
     double mu = 0.0;
     update_G(dyson, *mf, ft, sDm, sG, sF, sSigma, mu, /*const_mu*/ false);
-    app_log(2, "[rw1] Matsubara mu = {:.10f} Ha  (PIN P2: shared with the "
+    app_log(2, "[real-axis W] Matsubara mu = {:.10f} Ha  (PIN P2: shared with the "
                "real-axis grid)", mu);
 
     // ---- PIN P1: the static Hamiltonian must be diag(eps_KS) with S = 1,
@@ -217,7 +215,7 @@ namespace bdft_tests {
                 off_S = std::max(off_S, std::abs(S(s, k, i, j)));
               }
             }
-      app_log(2, "[rw1] PIN P1: |H0+F - diag(eps)|_max = {:.3e} (diag) / {:.3e} "
+      app_log(2, "[real-axis W] PIN P1: |H0+F - diag(eps)|_max = {:.3e} (diag) / {:.3e} "
                  "(offdiag);  |S - 1|_max = {:.3e} / {:.3e}",
               dia_H, off_H, dia_S, off_S);
       REQUIRE(dia_H < 1e-8);
@@ -242,7 +240,7 @@ namespace bdft_tests {
     {
       auto dPi = scr_im.eval_Pi_qdep(mb_state, thc);
       auto gsh = dPi.global_shape();
-      app_log(2, "[rw1] imag-axis Pi global shape = ({}, {}, {}, {})",
+      app_log(2, "[real-axis W] imag-axis Pi global shape = ({}, {}, {}, {})",
               gsh[0], gsh[1], gsh[2], gsh[3]);
       const long ntp = gsh[0];
       nda::array<ComplexType, 4> Pt(ntp, gsh[1], gsh[2], gsh[3]);
@@ -285,12 +283,12 @@ namespace bdft_tests {
     }
 
     // The bosonic Matsubara frequencies of the PH-symmetric half grid:
-    // index n <-> full-mesh index nw_b()/2 + n (IAFT.icc:64-65).
+    // index n <-> full-mesh index nw_b()/2 + n (see IAFT.icc).
     auto wn_b = ft.wn_mesh_b();
     nda::array<double, 1> nu_n(nw_half);
     for (long n = 0; n < nw_half; ++n)
       nu_n(n) = ft.omega(wn_b(ft.nw_b() / 2 + n)).imag();
-    app_log(2, "[rw1] bosonic PH-sym half grid: nw_half={}, nu_0={:.6e}, "
+    app_log(2, "[real-axis W] bosonic PH-sym half grid: nw_half={}, nu_0={:.6e}, "
                "nu_1={:.6e}, nu_2={:.6e}", nw_half, nu_n(0),
             (nw_half > 1 ? nu_n(1) : 0.0), (nw_half > 2 ? nu_n(2) : 0.0));
     REQUIRE(std::abs(nu_n(0)) < 1e-12);   // index 0 must be the static node
@@ -316,7 +314,8 @@ namespace bdft_tests {
     const double head_pref = (q2_small / (4.0 * M_PI)) * mf->volume();
 
     // eps^-1 head channel (minus one) of the Matsubara W at the smallest
-    // non-zero |q|: same formula as real_axis_scr_coulomb_t.h:983-1010 and
+    // non-zero |q|: same formula as the eps^-1 head step of
+    // real_axis_scr_coulomb_t::update_w and
     // methods/GW/g0_div_utils.hpp::eval_eps_inv_q.
     auto head_of = [&](nda::array<ComplexType,4> const& W_qwPQ, long iq) {
       nda::array<ComplexType, 1> h(W_qwPQ.shape()[1]);
@@ -344,7 +343,7 @@ namespace bdft_tests {
     //        from the production Matsubara Pi (below), i.e. from the
     //        REFERENCE, never from the real-axis answer.
     // Budget: |W_re(i nu) - W_im(i nu)| <= (2 eta / d_min) * kappa * max|W_im|.
-    // This is a BOUND with an O(1) coefficient of one, not a fit; the report
+    // This is a BOUND with an O(1) coefficient of one, not a fit; the log
     // quotes observed/budget at every eta so the bound can be judged.
     double kappa = 0.0;
     double d_min = std::numeric_limits<double>::infinity();
@@ -356,8 +355,8 @@ namespace bdft_tests {
     // ---- Z / DYSON CONSISTENCY PROBE ---------------------------------
     // The Dyson step is the SAME algebra on both axes:
     //     W^c = [ (I - Z.Pi)^{-1} - I ] . Z
-    // (real axis real_axis_scr_coulomb_t.h:859-884; imaginary axis
-    // scr_coulomb_t.cpp:1165-1196). So if Pi agrees at i nu = 0 and the two
+    // (real axis: Step 4 of real_axis_scr_coulomb_t::update_w; imaginary axis:
+    // scr_coulomb_t::dyson_W_in_place). So if Pi agrees at i nu = 0 and the two
     // paths read the SAME Z, W^c must agree at i nu = 0 too. This rebuilds
     // W^c(0) from the production Matsubara Pi(0) and the Z that the
     // REAL-AXIS path reads (thc.Z(iq), the plain per-q overload) and
@@ -397,13 +396,13 @@ namespace bdft_tests {
             znum += d * m; zden += m * m;
           }
       }
-      app_log(2, "[rw1] Z/Dyson probe: rebuilding W^c(0) from the production "
+      app_log(2, "[real-axis W] Z/Dyson probe: rebuilding W^c(0) from the production "
                  "Pi(0) with the real-axis Z read gives <ratio> = {:.6f}, "
                  "worst abs = {:.4e} (max|W_im| = {:.4e})",
               (zden > 0.0) ? znum / zden : 0.0, zworst, zamp);
     }
 
-    // ---- HONEST eta BUDGET -------------------------------------------
+    // ---- eta BUDGET --------------------------------------------------
     // A Lorentzian-broadened spectral function is the spectral function of
     // G^R(w) with its poles pushed to Im w = -eta. On the imaginary axis
     // that is G_0(i nu + i eta sgn(nu)), so the bubble built from it is
@@ -423,7 +422,7 @@ namespace bdft_tests {
             amp_ref_global = std::max(amp_ref_global,
                                       std::abs(Wc_im_qwPQ(iq, n, P, Q)));
     }
-    app_log(2, "[rw1] eta budget ingredients: d_min = min|eps - mu| = {:.6f} Ha, "
+    app_log(2, "[real-axis W] eta budget ingredients: d_min = min|eps - mu| = {:.6f} Ha, "
                "kappa = ||(I-Z.Pi)^-1||_max = {:.4f}, max|W_im| = {:.4e}",
             d_min, kappa, amp_ref_global);
     auto budget_for = [&](double eta) {
@@ -431,15 +430,15 @@ namespace bdft_tests {
     };
 
     // =================================================================
-    // REAL-AXIS BRANCH, one pass per eta.
+    // REAL-AXIS SIDE, one pass per eta.
     // =================================================================
     const std::vector<double> etas = {0.05, 0.025, 0.0125};
     std::vector<double> worst_dev, worst_rel, head_dev, gamma_amp, budget;
 
     for (double eta : etas) {
       auto gs = rw1::size_grids(eta, w_max, Omega_max);
-      app_log(2, "\n[rw1] ===== eta = {:.5f} Ha =====", eta);
-      app_log(2, "[rw1]   N_w={} (dw={:.5f} = eta/{:.2f})  N_t={} "
+      app_log(2, "\n[real-axis W] ===== eta = {:.5f} Ha =====", eta);
+      app_log(2, "[real-axis W]   N_w={} (dw={:.5f} = eta/{:.2f})  N_t={} "
                  "(T={:.1f} = {:.1f}/eta, dt={:.4f})  N_Omega={} "
                  "(dOmega={:.5f} = eta/{:.2f})",
               gs.N_w, gs.dw, eta / gs.dw, gs.N_t, gs.T_window,
@@ -452,15 +451,15 @@ namespace bdft_tests {
 
       real_axis_mb_state_t state(grid);
       state.mpi = mpi_context;
-      // A lives at IBZ k (update_w hard-checks the shape); both fixtures of this gate have
+      // A lives at IBZ k (update_w hard-checks the shape); both fixtures of this test have
       // IBZ == FBZ, which is asserted here rather than assumed.
       REQUIRE(mf->nkpts_ibz() == Nk);
       state.A_wskij.emplace(*state.mpi,
           std::array<long, 5>{gs.N_w, ns, Nk, nbnd, nbnd});
       if (state.A_wskij->node_comm()->root()) {
-        // The promoted builder (real_axis_qp_A.hpp) with MO = identity -- licensed by PIN P1
-        // -- and E = eps_KS, i.e. exactly the G_0 of the Matsubara branch, Lorentzian-
-        // broadened by eta. Identical arithmetic to the loop this call replaced.
+        // The shared builder (real_axis_qp_A.hpp) with MO = identity -- licensed by PIN P1
+        // -- and E = eps_KS, i.e. exactly the G_0 of the Matsubara side, Lorentzian-
+        // broadened by eta.
         methods::real_axis::build_A_from_QP_poles(
             state.A_wskij->local(), grid, eigval,
             (nda::array<ComplexType, 4> const*)nullptr, eta);
@@ -590,13 +589,13 @@ namespace bdft_tests {
               if (P == Q) wdiag = std::max(wdiag, r); else woff = std::max(woff, r);
             }
         }
-        app_log(2, "[rw1]   Pi residual split: worst rel dev  diag = {:.4e}   "
+        app_log(2, "[real-axis W]   Pi residual split: worst rel dev  diag = {:.4e}   "
                    "offdiag = {:.4e};  |ImPi_PQ - ImPi_QP|_max / |ImPi|_max = {:.3e}",
                 wdiag, woff, (symamp > 0 ? sym / symamp : 0.0));
       }
-      app_log(2, "[rw1]   Pi worst RELATIVE elementwise dev at inu=0 = {:.4e}",
+      app_log(2, "[real-axis W]   Pi worst RELATIVE elementwise dev at inu=0 = {:.4e}",
               pworst_rel);
-      app_log(2, "[rw1]   Pi-level ratio at inu=0: <Pi_re/Pi_im> = {:.6f}  "
+      app_log(2, "[real-axis W]   Pi-level ratio at inu=0: <Pi_re/Pi_im> = {:.6f}  "
                  "(max|Pi_im| = {:.4e})", ratio_pi, pamp);
 
       // ---- Re Pi PROBE: the code's own Hilbert transform vs the correct
@@ -634,7 +633,7 @@ namespace bdft_tests {
               rden += kk_full * kk_full;
             }
         }
-        app_log(2, "[rw1]   Re Pi probe: <RePi_code(Omega_1) / KK_full(0)> = "
+        app_log(2, "[real-axis W]   Re Pi probe: <RePi_code(Omega_1) / KK_full(0)> = "
                    "{:.6f}   (Omega_1 = {:.5f} Ha; 1.0 = full-axis KK, "
                    "0.5 = half-axis only)",
                 (rden > 0.0) ? rnum / rden : 0.0, Om(0));
@@ -662,7 +661,7 @@ namespace bdft_tests {
                 a = std::max(a, std::abs(Wc_im_qwPQ(iq, n, P, Q)));
               }
           }
-          app_log(2, "[rw1]     nu[{:2d}] = {:.5f} Ha : worst dev = {:.4e}  "
+          app_log(2, "[real-axis W]     nu[{:2d}] = {:.5f} Ha : worst dev = {:.4e}  "
                      "max|W_im| = {:.4e}  rel = {:.4e}",
                   n, nu_n(n), d, a, (a > 0 ? d / a : 0.0));
         }
@@ -691,7 +690,7 @@ namespace bdft_tests {
               if (std::abs(d) >= 0.05 * amp_ref) { bnum += k * d; bden += d * d; }
             }
         }
-        app_log(2, "[rw1]   W split: (a) <ReW_code(Omega_1)/W_im(0)> = {:.6f}   "
+        app_log(2, "[real-axis W]   W split: (a) <ReW_code(Omega_1)/W_im(0)> = {:.6f}   "
                    "(b) <KK[ImW](0)/ReW_code(Omega_1)> = {:.6f}",
                 (aden > 0.0) ? anum / aden : 0.0,
                 (bden > 0.0) ? bnum / bden : 0.0);
@@ -716,34 +715,34 @@ namespace bdft_tests {
       gamma_amp.push_back(gamp);
       budget.push_back(bud);
 
-      app_log(2, "[rw1]   worst |W_re(inu) - W_im(inu)| (q != Gamma) = {:.6e}  "
+      app_log(2, "[real-axis W]   worst |W_re(inu) - W_im(inu)| (q != Gamma) = {:.6e}  "
                  "at (q={}, n={}, P={}, Q={})", dev, dq, dn, dP, dQ);
-      app_log(2, "[rw1]   reference amplitude max|W_im| = {:.6e}  -> relative "
+      app_log(2, "[real-axis W]   reference amplitude max|W_im| = {:.6e}  -> relative "
                  "= {:.4e}", amp_ref, rel);
-      app_log(2, "[rw1]   least-squares ratio Re(W_re)/Re(W_im) = {:.6f}", ratio);
-      app_log(2, "[rw1]   eta budget (2 eta / d_min) * kappa * max|W_im| = {:.6e}", bud);
-      app_log(2, "[rw1]   eps^-1 head channel (q_min): worst |dev| = {:.6e}  "
+      app_log(2, "[real-axis W]   least-squares ratio Re(W_re)/Re(W_im) = {:.6f}", ratio);
+      app_log(2, "[real-axis W]   eta budget (2 eta / d_min) * kappa * max|W_im| = {:.6e}", bud);
+      app_log(2, "[real-axis W]   eps^-1 head channel (q_min): worst |dev| = {:.6e}  "
                  "[re(nu=0) = {:.6e}, im(nu=0) = {:.6e}]",
               hdev, head_re(0).real(), head_im(0).real());
-      app_log(2, "[rw1]   Gamma (excluded, D1): real-axis is 0 by construction; "
+      app_log(2, "[real-axis W]   Gamma (excluded, D1): real-axis is 0 by construction; "
                  "max|W_im(Gamma)| = {:.6e}", gamp);
     }
 
     // =================================================================
-    // GATE RW-1-a
+    // ACCEPTANCE: eta series
     // =================================================================
-    app_log(2, "\n[rw1] ===== GATE RW-1-a: eta series =====");
-    app_log(2, "[rw1]   eta        worst dev      relative     budget        "
+    app_log(2, "\n[real-axis W] ===== acceptance: eta series =====");
+    app_log(2, "[real-axis W]   eta        worst dev      relative     budget        "
                "obs/budget   head dev");
     for (size_t i = 0; i < etas.size(); ++i)
-      app_log(2, "[rw1]   {:8.5f}   {:.6e}   {:.4e}   {:.6e}   {:.4f}       {:.6e}",
+      app_log(2, "[real-axis W]   {:8.5f}   {:.6e}   {:.4e}   {:.6e}   {:.4f}       {:.6e}",
               etas[i], worst_dev[i], worst_rel[i], budget[i],
               worst_dev[i] / budget[i], head_dev[i]);
 
     // (a) monotone decreasing in eta
     for (size_t i = 1; i < worst_dev.size(); ++i)
       REQUIRE(worst_dev[i] < worst_dev[i - 1]);
-    // (b) inside the honestly pre-computed budget at the smallest eta
+    // (b) inside the a-priori budget at the smallest eta
     REQUIRE(worst_dev.back() < budget.back());
   }
 
@@ -752,9 +751,8 @@ namespace bdft_tests {
     run_lehmann_gate("qe_lih222", /*use_rspace*/ false);
   }
 
-  // SECOND FIXTURE. The spec asks for si222; no usable si222 exists in this
-  // tree (notes/rw1_port_report.md): qe_si222_so is spin-orbit and the ported
-  // update_w hard-requires npol() == 1 (real_axis_scr_coulomb_t.h:200-202);
+  // SECOND FIXTURE. No usable si222 fixture exists: qe_si222_so is spin-orbit
+  // and update_w hard-requires npol() == 1;
   // bdft_si222 is inside a /* */ block in default_MF.hpp and does not
   // dispatch; pyscf_si222 is a Gaussian-basis fixture with S != 1, which
   // violates convention pin P1 (the identity-MO construction of A on the FBZ

@@ -2,22 +2,21 @@
 #define COQUI_VERTEX_NU_SAMPLING_HPP
 
 /**
- * The sampled-nu service (vertex_perf_plan.md P14, 2026-09-21): ONE set of routines for the reconstruction of a
+ * The sampled-nu service: ONE set of routines for the reconstruction of a
  * bosonic-node-resolved object H(m, col) (m over the nw nodes, col over everything else) from its values at a SUBSET S
- * of the nodes, used by the P side (the L-3 on-demand fit of the all-nu dump, scr_coulomb_t.cpp) and by the Sigma side
+ * of the nodes, used by the P side (the on-demand fit of the all-nu dump, scr_coulomb_t.cpp) and by the Sigma side
  * (the nu-sampled dynamic Sigma vertex, vertex_dynbse.icc). Everything is expressed through the Gram matrix over the
  * nodes of a REFERENCE object, G = H_ref H_ref^dag (nw x nw), whose eigenvectors are the nu-modes of that object.
  *
  *   reconstruction(G, S, K, mode) -> R (nw x |S|) with H(m) ~ sum_s R(m, s) H(S_s):
- *     "modes":      R = Phi (Phi_S^dag Phi_S)^-1 Phi_S^dag, Phi = the top-K eigenvectors of G (the L-3 form: exact at
- *                   the sampled nodes when K = |S|; least squares on the K modes otherwise);
+ *     "modes":      R = Phi (Phi_S^dag Phi_S)^-1 Phi_S^dag, Phi = the top-K eigenvectors of G (exact at the sampled
+ *                   nodes when K = |S|; least squares on the K modes otherwise);
  *     "regression": R = G(:, S) [G(S, S)]^-1_K, the least-squares predictor of all nodes from the sampled ones (Nystrom
  *                   form; G(S, S)^-1 through its top-K eigenpairs). The two agree for K well below |S|; the regression
- *                   form keeps improving up to K ~ |S| - 2 where the modes form degrades (measured on the LiH Sigma
- *                   objects: K 6 5.0e-2, K 9 3.5e-3, K 10 3.3e-3 regression vs 9.2e-3 modes).
+ *                   form keeps improving up to K ~ |S| - 2 where the modes form degrades.
  *   modes_to(G, tol)         -> the number of leading modes that carry 1 - tol of the trace (a smoothness meter and
  *                               the automatic rank: K_auto = max(1, min(modes_to(G, tol), |S| - 2))).
- *   pivot_nodes(G, K, forced, nw) -> a sample: the row pivots of the top-K mode matrix (QR with column pivoting on
+ *   pivot_nodes(G, K, forced) -> a sample: the row pivots of the top-K mode matrix (QR with column pivoting on
  *                               Phi^T, i.e. the nodes that best condition the K x K system), with the forced nodes
  *                               (nu = 0, the tail) kept in front.
  */
@@ -28,6 +27,7 @@
 #include <cmath>
 #include "configuration.hpp"
 #include "nda/nda.hpp"
+#include "IO/app_loggers.h"
 #include "nda/linalg.hpp"
 #include "utilities/check.hpp"
 
@@ -107,11 +107,16 @@ namespace nusamp {
         for (long s2 = 0; s2 < nS; ++s2) Gss(s, s2) = G(S[size_t(s)], S[size_t(s2)]);
       auto [lam, V] = modes(Gss);                                        // descending
       Ginv() = cplx(0.0);
+      long used = 0;
       for (long a = 0; a < K; ++a) {
         if (lam(a) <= 1e-14 * lam(0)) break;
         for (long s = 0; s < nS; ++s)
           for (long s2 = 0; s2 < nS; ++s2) Ginv(s, s2) += V(s, a) * std::conj(V(s2, a)) / lam(a);
+        ++used;
       }
+      if (used < K)   // the regression ran at a lower rank than requested -- say so
+        app_log(1, "  [nu-sampling] WARNING: the regression reconstruction uses {} of the requested {} modes (the sampled Gram is "
+                   "rank-deficient below 1e-14)", used, K);
       for (long m = 0; m < nw; ++m)
         for (long s = 0; s < nS; ++s) GcS(m, s) = G(m, S[size_t(s)]);
       nda::blas::gemm(GcS, Ginv, R);                                      // G(:, S) G(S, S)^-1_K
@@ -165,6 +170,9 @@ namespace nusamp {
       taken[size_t(best)] = 1;
       orth(best);
     }
+    if (long(S.size()) < K)   // fewer sampled nodes than requested -- say so
+      app_log(1, "  [nu-sampling] WARNING: pivot_nodes found {} of the requested {} nodes (the mode matrix has lower rank)",
+              long(S.size()), K);
     std::sort(S.begin(), S.end());
     return S;
   }

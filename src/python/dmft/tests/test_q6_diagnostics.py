@@ -19,38 +19,34 @@ limitations under the License.
 """
 
 """
-Q6 §1.1 (notes/q6_diagnostics_closeout_spec.md, PDF §8.3) -- the R(inu) CANCELLATION LOAD,
-python half. Gate pattern is the Q5 numpy-only tier's: synthetic arrays with EXACT
-expectations, ``outer_loop.py`` loaded by file path so nothing here needs ``coqui`` or
-``triqs``.
+Python tests of the R(inu) CANCELLATION LOAD of the polarization double counting.
+Same pattern as the numpy-only tier of ``test_q5_outer_loop.py``: synthetic arrays with
+EXACT expectations, ``outer_loop.py`` loaded by file path so nothing here needs ``coqui``
+or ``triqs``.
 
-What is measured:
+What is tested:
 
     R(inu) = ||P_imp(inu) - P_dc(inu)||_max / ||P_dc(inu)||_max
 
-per bosonic node, aggregated into the three nu bands of spec §1.1 (the nu = 0 node, the
-middle third, the top third) and APPENDED to the Q5-b Mott-chain trail and log block,
-alongside the C3b ladder column ||P^lad_loc,orb||_max / ||P_dc||_max.
-
-A SEPARATE FILE on purpose: extending ``test_q5_outer_loop.py`` would move that suite's
-measured 16/16 tally, and the Q5 gates are commit-point gates for this increment.
+per bosonic node, aggregated into three nu bands (the nu = 0 node, the middle third, the
+top third) and APPENDED to the Mott-chain trail and log block, alongside the
+orbital-ladder column ||P^lad_loc,orb||_max / ||P_dc||_max.
 
 RUN COMMANDS
 ------------
-Standalone (this is how it was measured -- no pytest needed, no coqui, no triqs):
+Standalone (no pytest needed, no coqui, no triqs):
 
     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \\
       python3 src/python/dmft/tests/test_q6_diagnostics.py
 
-Under pytest on a TRIQS host, alongside the tiers that must stay green:
+Under pytest on a TRIQS host, together with the related suites:
 
     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \\
       python3 -m pytest -v src/python/dmft/tests/test_q6_diagnostics.py \\
                            src/python/dmft/tests/test_q5_outer_loop.py \\
                            src/python/dmft/tests/test_q4_edmft_skeleton.py
 
-MEASURED 2026-08-14 on the implementation host (numpy 2.x, no coqui/triqs): **10/10** legs
-pass. Every leg in this file is numpy-only; there is no coqui-gated leg to skip.
+Every test in this file is numpy-only; there is no coqui-dependent test to skip.
 """
 
 import importlib.util
@@ -60,12 +56,12 @@ import numpy as np
 
 
 # --------------------------------------------------------------------------
-# Load dmft/outer_loop.py standalone (no coqui / triqs import) -- the Q5 pattern.
+# Load dmft/outer_loop.py standalone (no coqui / triqs import).
 # --------------------------------------------------------------------------
 
 def _load_outer_loop():
     path = pathlib.Path(__file__).resolve().parents[1] / "outer_loop.py"
-    spec = importlib.util.spec_from_file_location("_q6_outer_loop_standalone", path)
+    spec = importlib.util.spec_from_file_location("_outer_loop_standalone_r", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -103,7 +99,7 @@ def _pi_fixture(u_per_node, d_per_node=None):
 
 
 # ==========================================================================
-# The nu-band partition (spec §1.1)
+# The nu-band partition
 # ==========================================================================
 
 def test_nu_band_slices_are_the_spec_bands():
@@ -128,7 +124,7 @@ def test_nu_band_slices_are_the_spec_bands():
     assert nu0.tolist() == [0] and mid.tolist() == [] and top.tolist() == [0]
     nu0, mid, top = ol.nu_band_slices(0)
     assert nu0.tolist() == [] and mid.tolist() == [] and top.tolist() == []
-    print("    [Q6 §1.1] nu bands (n=9): nu0=[0], mid=[3,4,5], top=[6,7,8]")
+    print("    [R(inu)] nu bands (n=9): nu0=[0], mid=[3,4,5], top=[6,7,8]")
 
 
 # ==========================================================================
@@ -143,7 +139,7 @@ def test_r_cancellation_load_is_exact_on_a_synthetic_pi():
     """
     u = [0.5, 9.0, 9.0, 0.125, 0.375, 0.25, 0.0625, 0.75, 0.03125]
     r_nu0, r_mid, r_top = ol.r_cancellation_load(_pi_fixture(u))
-    print(f"    [Q6 §1.1] R = (nu0 {r_nu0}, mid {r_mid}, top {r_top})")
+    print(f"    [R(inu)] R = (nu0 {r_nu0}, mid {r_mid}, top {r_top})")
     assert r_nu0 == 0.5
     assert r_mid == 0.375         # max over nodes 3,4,5 = max(0.125, 0.375, 0.25)
     assert r_top == 0.75          # max over nodes 6,7,8 = max(0.0625, 0.75, 0.03125)
@@ -160,7 +156,7 @@ def test_r_cancellation_load_scales_with_the_dc_norm():
 
 
 def test_r_cancellation_load_vanishes_in_the_clean_limit():
-    """P_imp == P_dc is Q4-b's clean limit: perfect cancellation, R exactly 0 everywhere."""
+    """P_imp == P_dc is the clean limit: perfect cancellation, R exactly 0 everywhere."""
     fix = _pi_fixture([0.0] * 9)
     assert ol.r_cancellation_load(fix) == (0.0, 0.0, 0.0)
 
@@ -177,7 +173,7 @@ def test_r_cancellation_load_skips_dead_nodes():
     assert r_mid == 0.25          # node 4 (the band max) is dead => max(0.125, 0.25)
     assert r_top == ol.MISSING    # the whole top third is dead
     assert np.isfinite(r_top)
-    print(f"    [Q6 §1.1] dead-node handling: mid {r_mid}, top {r_top} (MISSING, finite)")
+    print(f"    [R(inu)] dead-node handling: mid {r_mid}, top {r_top} (MISSING, finite)")
 
 
 def test_r_cancellation_load_is_missing_on_unusable_input():
@@ -191,13 +187,13 @@ def test_r_cancellation_load_is_missing_on_unusable_input():
 
 
 # ==========================================================================
-# The C3b ladder column
+# The orbital-ladder column
 # ==========================================================================
 
 def test_ladder_over_dc_is_the_cpp_ratio_definition():
     """
     ``||P^lad_loc,orb||_max / ||P_dc||_max`` -- the same max-norm ratio the C++ side reports
-    as pol_lad_loc_orb_ratio() (scr_coulomb_t.h:355-360).
+    as scr_coulomb_t::pol_lad_loc_orb_ratio().
     """
     lad = np.array([1.0, -3.0, 2.0])
     dc = np.array([0.5, 2.0])
@@ -211,17 +207,17 @@ def test_ladder_over_dc_is_the_cpp_ratio_definition():
 
 
 # ==========================================================================
-# The trail and the log block (the Q5-b block, extended)
+# The trail and the log block
 # ==========================================================================
 
 def test_trail_carries_the_q6_columns_in_the_appended_slots():
     """
-    The Q6 columns are APPENDED (spec §1.1) -- the Q5-b slots must not move, and the four new
-    ones must land in the documented order.
+    The cancellation-load columns are APPENDED -- the earlier slots must not move, and the
+    four new ones must land in the documented order.
     """
     labels = ol.MOTT_CHAIN_TRAIL_LABELS
     assert labels[-4:] == ("r_nu0", "r_mid", "r_top", "lad_over_dc")
-    assert labels[0] == "gap_eV" and labels[10] == "o_c"     # the Q5-b prefix, unmoved
+    assert labels[0] == "gap_eV" and labels[10] == "o_c"     # the original prefix, unmoved
     assert ol.R_BAND_LABELS == ("r_nu0", "r_mid", "r_top")
 
     r = ol.r_cancellation_load(
@@ -236,7 +232,7 @@ def test_trail_carries_the_q6_columns_in_the_appended_slots():
     assert v["gap_eV"] == 1.85
     # a cycle that measured no polarization still produces a FINITE trail
     assert ol.mott_chain_trail(gap_eV=1.0)[-4:].tolist() == [ol.MISSING] * 4
-    print(f"    [Q6 §1.1] appended trail slots = "
+    print(f"    [R(inu)] appended trail slots = "
           f"{ {k: v[k] for k in labels[-4:]} }")
 
 
@@ -251,7 +247,7 @@ def test_r_columns_reject_a_typo_like_every_other_field():
 
 
 def test_log_block_survives_a_cycle_that_measured_nothing():
-    """The consolidated block gained four lines; it must still run on an empty trail."""
+    """The consolidated block, with its four R(inu) lines, must still run on an empty trail."""
     ol.log_mott_chain(1, 8, ol.mott_chain_trail(), verbose=True)
     ol.log_mott_chain(2, 8, ol.mott_chain_trail(r_nu0=4.2e-2, r_mid=7.8e-2,
                                                 r_top=1.3e-1, lad_over_dc=0.64),
@@ -260,7 +256,7 @@ def test_log_block_survives_a_cycle_that_measured_nothing():
 
 
 # ==========================================================================
-# Standalone runner (no pytest required) -- the Q5 pattern
+# Standalone runner (no pytest required)
 # ==========================================================================
 
 if __name__ == "__main__":
@@ -281,5 +277,5 @@ if __name__ == "__main__":
             print(f"FAIL {name}")
             traceback.print_exc()
     print(f"\n{len(numpy_only) - failures}/{len(numpy_only)} numpy-only legs passed "
-          f"(every Q6 §1.1 leg is numpy-only; nothing here is skipped on a coqui-less host).")
+          f"(every leg is numpy-only; nothing here is skipped on a coqui-less host).")
     sys.exit(1 if failures else 0)

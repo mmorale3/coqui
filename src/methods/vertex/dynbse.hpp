@@ -22,9 +22,9 @@
 #define COQUI_VERTEX_DYNBSE_HPP
 
 /**
- * scGW-tilde Tier 2, full frequency: the resummed DYNAMIC-rung Bethe-Salpeter polarization
- * (notes/dynbse_plan.md, increment D1 -- the algebra; D2 puts the THC rung and the
- * parallel driver around it).
+ * The resummed DYNAMIC-rung Bethe-Salpeter polarization at full frequency: the pole-family
+ * algebra, the frequency bases, the L0 pair propagator, the static resolvent and the Krylov /
+ * Neumann solves of the dynamic remainder.
  *
  * THE OBJECT (pair space of vertex_ladder.icc: pair r = (a nc + b), a on the k line, b on the
  * k+q line; the loop frequency iw kept explicit; the external (q, inu) fixed per unit):
@@ -47,8 +47,8 @@
  *       S_l S_a = [S_l - S_a]/(e_l - e_a) (a != l),  S_a^2 -> Dsq (same function of z + inu)
  *       U_j S_a = [U_j - S_a]/(e_j - e_a + inu),     S_l U_a = [U_a - S_l]/(e_a - e_l + inu)
  *     where Dsq re-expands U_a^2 on the node set through the regularized tau fit of its exact
- *     tau function, d/de K_F(s,e) = -K_F(s,e) [s - beta f(e)] (the parent's degenerate twisted
- *     pair, vertex_pi.icc build_kappa). At inu = 0 the families coincide (S = U): one family.
+ *     tau function, d/de K_F(s,e) = -K_F(s,e) [s - beta f(e)] (the degenerate twisted pair of
+ *     vertex_pi.icc build_kappa). At inu = 0 the families coincide (S = U): one family.
  *   * convolution with the rung W (frequency convolution = tau product): the smooth parts of
  *     both families are evaluated on the DLR tau grid, multiplied by W(s), and refit; the
  *     e^{inu s} factor of the shifted family rides along untouched.
@@ -59,18 +59,18 @@
  * THE SOLVE. K = K_s + K_d with K_s the static (inu'-independent) rung W0bar and
  * K_d(inu') = W_dyn(inu') - W_dyn(0) the remainder (K_d(0) = 0). The static ladder is closed
  * form and separable in frequency, L_s = L0 + L0 T_s L0 with T_s = K_s (1 - Cb K_s)^-1 in the
- * D = nk nc^2 pair space (the existing dense static resolvent), so the vertex solves the Dyson
+ * D = nk nc^2 pair space (the dense static resolvent), so the vertex solves the Dyson
  * equation in the dynamic remainder,
  *
  *   Gamma = L_s (D + y),   y = K_d Gamma,    y = (two families) + (a frequency constant:
  *                                              -W_dyn(0) sum_iw Gamma).
- * Iterated as a Neumann series on y with Anderson(2) acceleration; the first iterate is the
- * "static-dressed one dynamic rung". Everything here is pure algebra on residue arrays and
- * explicit pair-space rung matrices (the toy / gate form); the THC rung with the k-FFT and the
- * node-shared W(s) are the production driver's business (D2).
+ * Solved as a Neumann series on y with Anderson(2) acceleration or by restarted GMRES; the first
+ * iterate is the "static-dressed one dynamic rung". The routines here are algebra on residue
+ * arrays with the rung supplied as an operator (an explicit pair-space matrix, or the THC rung
+ * with the k-FFT and the node-shared W(s) provided by the driver).
  *
- * Conventions pinned by the gates: dense Matsubara BSE oracle (G-C), the L2 static resolvent
- * (G-A) and pi_c_accumulate_w's one rung (G-B).
+ * Sign and normalization conventions agree with a dense Matsubara BSE reference, the dense
+ * static resolvent, and the one-rung result of pi_c_accumulate_w.
  */
 
 #include <chrono>
@@ -91,6 +91,7 @@
 #if defined(ENABLE_CUDA)
 #include "utilities/device_pool.h"        // freemem_device_effective: the k-batch budget of the device L0
 #include "methods/vertex/cuda/l0_cuda.cuh"
+#include "methods/vertex/cuda/rung_cuda.cuh"   // the streaming THC rung on the device
 #endif
 #include "nda/lapack.hpp"
 #include "numerics/nda_functions.hpp"
@@ -116,20 +117,19 @@ namespace dynbse {
 
   /** wall-time sinks of the solver internals (seconds, cumulative; the driver resets and reads them per
    *  unit): the L0 pair-pole applications, the static-resolvent gemms (T_s, Cb), the Arnoldi
-   *  orthogonalization, and (gpu port, 2026-09-25) the SPLIT of the L0 applications: the nu = 0 kernel
-   *  (l0_apply_cols, host), the nu != 0 host kernel, the nu != 0 device path and its phases -- prep (Ghat/Gtil,
-   *  tables, the Cb_cst term on the host), alloc (the per-k working set, incl. retries), H2D (the fixed uploads),
-   *  kernel (pack + batched gemms + scatter + assemble + fold, to the device sync), D2H (F, Fsum) -- with the
-   *  counts of applications and of constant-input applications (the P-3a fast path). Not thread-safe by design:
-   *  the solver runs outside any omp region. */
+   *  orthogonalization, and the split of the L0 applications: the nu = 0 kernel (l0_apply_cols, host),
+   *  the nu != 0 host kernel, the nu != 0 device path and its phases -- prep (Ghat/Gtil, tables, the Cb_cst
+   *  term on the host), alloc (the per-k working set, incl. retries), H2D (the fixed uploads), kernel (pack +
+   *  batched gemms + scatter + assemble + fold, to the device sync), D2H (F, Fsum) -- with the counts of
+   *  applications and of constant-input applications (the constant-input fast path). Not thread-safe by
+   *  design: the solver runs outside any omp region. */
   struct solve_timers {
     double t_l0 = 0.0, t_ts = 0.0, t_orth = 0.0;
     double t_l0_nu0 = 0.0, t_l0_host = 0.0, t_l0_dev = 0.0;
     double t_l0_prep = 0.0, t_l0_alloc = 0.0, t_l0_h2d = 0.0, t_l0_kernel = 0.0, t_l0_d2h = 0.0;
-    long n_l0 = 0, n_l0_cst = 0, n_l0_nu0 = 0, n_l0_nu0_dev = 0;   // n_l0_nu0_dev: nu = 0 applications on the device (R3)
-    // O-1 (gpu port, 2026-09-26): the host-traffic split of the Gamma_1 path outside the kernels -- the elementwise
-    // passes over tf_vectors (copies, zeroing, axpy; t_vec) and the (re)allocation + first touch of the solver's
-    // scratch (t_ws). Both were untimed and dominated the "rest" of the Sigma-side solve (46 % at Si kp444 / C = 8).
+    long n_l0 = 0, n_l0_cst = 0, n_l0_nu0 = 0, n_l0_nu0_dev = 0;   // n_l0_nu0_dev: nu = 0 applications on the device
+    // host traffic of the Gamma_1 path outside the kernels: the elementwise passes over tf_vectors (copies,
+    // zeroing, axpy; t_vec) and the (re)allocation + first touch of the solver's scratch (t_ws).
     double t_vec = 0.0, t_ws = 0.0;
     void reset() {
       t_l0 = t_ts = t_orth = 0.0;
@@ -270,16 +270,16 @@ namespace dynbse {
       for (long p = 0; p < np; ++p) for (long k = 0; k < n_kept; ++k) Vsc(p, k) = cplx(Vs(p, k));
       for (long i = 0; i < nt; ++i) for (long p = 0; p < np; ++p) Kmatc(i, p) = cplx(Kmat(i, p));
     }
-    // complex copies of Ut / Vs / Kmat for the gemm route of coeffs / fit_error (gpu port 2026-09-27: the scalar triple loops
-    // below were ~10 % of the Sigma-side solve at Si kp444 -- d = nk nc^2 nR = 131 072 columns per refit -- single-threaded)
+    // complex copies of Ut / Vs / Kmat for the gemm route of coeffs / fit_error (the refit of K_d has d = nk nc^2 nR
+    // columns; the scalar loops below are single-threaded and are kept for real data only)
     nda::array<cplx, 2> Utc, Vsc, Kmatc;
-    /** residues of tau-grid data (nt, d) -> (np, d): c = Vs (Ut F) -- two gemms for complex data (the refit of K_d), the
-     *  original loop otherwise (real data: the basis build's tables). The gemm sums in another order: rounding class. */
+    /** residues of tau-grid data (nt, d) -> (np, d): c = Vs (Ut F) -- two gemms for complex data (the refit of K_d), a
+     *  scalar loop otherwise (real data: the basis build's tables). The two routes agree to rounding. */
     nda::array<cplx, 2> coeffs(nda::MemoryArrayOfRank<2> auto const &F) const {
       const long d = F.shape(1);
       nda::array<cplx, 2> c(np, d);
       if constexpr (std::is_same_v<nda::get_value_t<decltype(F)>, cplx>) {
-        if (Utc.size() > 0 and not vertex_debug::flag("dynbse_refit_loop")) {   // vertex_debug: dynbse_refit_loop (the old loop, A/B)
+        if (Utc.size() > 0 and not vertex_debug::flag("dynbse_refit_loop")) {   // vertex_debug: dynbse_refit_loop (use the scalar loop for complex data too)
           nda::array<cplx, 2> g(n_kept, d);
           nda::blas::gemm(Utc, F, g);
           nda::blas::gemm(Vsc, g, c);
@@ -333,10 +333,10 @@ namespace dynbse {
   }
 
   /**
-   * D2f: drop the vertex nodes with lo < eps < hi (the in-gap nodes of a gapped system, measured from mu) from
+   * Drop the vertex nodes with lo < eps < hi (the in-gap nodes of a gapped system, measured from mu) from
    * the basis BEFORE the union extension. The pair function's poles sit at the band energies, so in-gap nodes
-   * are pure DLR redundancy -- and at small nu they carry the dominant spurious mode of the resummation
-   * (Si q_min nu_1: |Ritz| 427 on the six nodes inside (-0.023, +0.01) Ha; harmless 0.29 at nu = 0). The
+   * are pure DLR redundancy -- and at small nonzero nu they can carry a large spurious mode of the resummation
+   * (a Ritz value of the iteration operator far outside the unit disk; harmless at nu = 0). The
    * double/triple/quartic tables are refitted on the kept set with the regularized node_pole_fit (rtol).
    */
   inline void mask_freq_basis(freq_basis &b, double lo, double hi, double rtol = 1e-8) {
@@ -484,7 +484,7 @@ namespace dynbse {
 
   /**
    * gnode0: the vertex node index of G pole 0 (the G poles occupy gnode0 .. gnode0 + ng - 1 of
-   * the vertex node set): 0 for the shared (production) set, np_fit for the union set built by
+   * the vertex node set): 0 for the shared set (the driver's), np_fit for the union set built by
    * extend_freq_basis.
    */
   inline pair_poles make_pair_poles(double beta, nda::array<double, 1> const &epsG,
@@ -510,9 +510,8 @@ namespace dynbse {
    * A two-family vector with a frequency-constant part, for all k, pairs (matrix form) and
    * right-hand sides: fam(2, np, nk, nc, nc, nR) + cst(nk, nc, nc, nR).
    */
-  // O-1 (gpu port, 2026-09-26): the elementwise passes over the solver's big vectors (0.7 GB per tf_vector at Si
-  // kp444 / C = 8, 9 GB at kp666 / C = 16) ran as single-threaded nda expressions; they now run over the flat data
-  // with the kernels' thread count. Elementwise, so bitwise identical to the serial loops. Not for use inside an
+  // Elementwise passes over the solver's large vectors (a tf_vector can reach several GB), run over the flat data
+  // with the kernels' thread count. Elementwise, so bitwise identical to a serial loop. Not for use inside an
   // omp region (the solver runs outside any).
   inline void par_zero(cplx *d, long n) {
 #pragma omp parallel for schedule(static) num_threads(utils::omp_threads())
@@ -540,7 +539,7 @@ namespace dynbse {
     tf_vector() = default;
     tf_vector(long np_, long nk_, long nc_, long nR_)
         : np(np_), nk(nk_), nc(nc_), nR(nR_), fam(2, np_, nk_, nc_, nc_, nR_), cst(nk_, nc_, nc_, nR_) {
-      par_zero(fam.data(), fam.size());          // parallel first touch (O-1)
+      par_zero(fam.data(), fam.size());          // parallel first touch
       cst() = cplx(0.0);
     }
     void zero() { par_zero(fam.data(), fam.size()); cst() = cplx(0.0); }
@@ -568,7 +567,7 @@ namespace dynbse {
    * = (1/beta) sum_iw F(k, iw) EXACT from the product form (ward_legs T-sums), so the readout
    * and the instantaneous rung never see the re-expanded tails.
    *
-   * The G poles are vertex nodes through P.gnode (the shared production set: identity; the
+   * The G poles are vertex nodes through P.gnode (the shared set: identity; the
    * exact tests: the union extension). A product confluent on one node (X carrying a component
    * at a G node, or U_j^2 at inu = 0) is re-expanded with the Dsq/Dcb tables, which exist for
    * the DLR part of the node set only. `shared` is informational (checks the gnode map). At
@@ -717,16 +716,16 @@ namespace dynbse {
   }
 
   // ==================================================================================
-  // THE TWISTED-PAIR BASIS AT inu != 0  (increment D2e)
+  // THE TWISTED-PAIR BASIS AT inu != 0
   // ==================================================================================
   //
   // At inu != 0 the shifted family is carried as the TWISTED PAIRS T_a = U_a S_a instead of S_a:
   //   S_a = U_a - i nu T_a,   T_a = [U_a - S_a]/(i nu),   tau[T_a] = K_F(s, e_a) phi_nu(s),
   //   phi_nu(s) = (1 - e^{i nu s})/(i nu)  (bounded: -> -s),   (1/beta) sum_iw T_a = 0 EXACTLY.
-  // Every partial-fraction coefficient is then bounded by node gaps (never 1/nu), which is
-  // what the {U, S} representation lacked: its index-confluent pairs [U_j - S_j]/(i nu) put
-  // +-1/nu-sized canceling content into both families and the per-family refit noise
-  // re-entered the iteration at the physical level (1/nu = beta/2pi = 159 at beta = 1000).
+  // Every partial-fraction coefficient is then bounded by node gaps (never 1/nu). In the {U, S}
+  // representation the index-confluent pairs [U_j - S_j]/(i nu) put +-1/nu-sized canceling content
+  // into both families, and the per-family refit noise is amplified by 1/nu (= beta/2pi at the
+  // first bosonic frequency) into the iteration.
   // The confluent products that remain are re-expanded through two nu-dependent tables,
   // in the Dsq/Dcb pattern (exact large parts + a fitted bounded remainder):
   //   R1_j = U_j^2 S_j     = (beta f_j / i nu) U_j              + fit[K_F(s,e_j) psi_nu(s)],
@@ -829,9 +828,9 @@ namespace dynbse {
     // The FULL tau-functions are fitted (no analytic split): tau[U_j^2 S_j] = K_F [beta f_j/(i nu)
     // + psi_nu(s)] and tau[U_j^2 S_j^2] = K_F [2 beta f_j/(i nu)^2 - (beta f_j/(i nu)) phi_nu + 2 xi_nu
     // - s psi_nu] are benign (Dcb-class: for f_j = 1 the bracket vanishes at s = beta where K_F
-    // peaks), whereas their "exact part + remainder" pieces are two huge canceling functions --
-    // fitting the remainder alone lost the cancellation at large beta (R3 wrong by O(1) at
-    // beta = 1000). The exact frequency sums are kept.
+    // peaks), whereas their "exact part + remainder" pieces are two large canceling functions --
+    // fitting the remainder alone loses the cancellation at large beta. The exact frequency sums
+    // are kept.
     for (long j = 0; j < np; ++j) {
       const double f1 = b.fd[size_t(j)].f1;
       st.r1u(j) = cplx(0.0);
@@ -858,9 +857,9 @@ namespace dynbse {
     const long ncol = 2 * npf;
     nda::array<cplx, 2> A(ntau, ncol);
     nda::array<double, 1> cn(ncol);
-    // EXPERIMENT (small-nu spurious mode): keep the twisted column T_c only when |eps_c| <= ratio |nu|
+    // Optional pruning of the fit basis: keep the twisted column T_c only when |eps_c| <= ratio |nu|
     // (for |eps_c| >> |nu| the twist is invisible on K_F's support and T_c ~ -s K_F(eps_c) lies in the
-    // U span to the DLR class); env COQUI_DYNBSE_TKEEP = ratio, unset / 0 = keep all.
+    // U span to DLR accuracy); ratio from vertex_debug dynbse_tkeep, 0 = keep all.
     double tkeep = 0.0;
     tkeep = vertex_debug::number("dynbse_tkeep", tkeep);   // vertex_debug: dynbse_tkeep
     long n_tkept = 0;
@@ -961,8 +960,7 @@ namespace dynbse {
   inline double tfold_ratio() { return tfold_ratio_ref(); }
 
 #if defined(ENABLE_CUDA)
-  /** gpu port 5b (notes/gpu_port_plan.md section 5): the device L0 is the default on a CUDA build;
-   *  vertex_debug dynbse_l0_device = 0 keeps the host kernel (the A/B reference). */
+  /** the device L0 is the default on a CUDA build; vertex_debug dynbse_l0_device = 0 selects the host kernel. */
   inline bool l0_device_enabled() {
     static const bool v = (vertex_debug::number("dynbse_l0_device", 1.0) != 0.0);   // vertex_debug: dynbse_l0_device
     return v;
@@ -973,7 +971,7 @@ namespace dynbse {
   inline void l0_apply_shift_cols_device(freq_basis const &b, pair_poles const &P, shift_tables const &st,
                                          tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
                                          nda::array<cplx, 3> const *Cb_cst, double tfold,
-                                         std::vector<long> const &act) {   // the active components (P-3a)
+                                         std::vector<long> const &act) {   // the active input components
     auto &stt = solve_timers_state();
     const double tw_prep = wall_now();
     const cplx inu = st.inu;
@@ -1028,7 +1026,7 @@ namespace dynbse {
     stt.t_l0_prep += wall_now() - tw_cst;          // the host-side Cb_cst term counts as prep
   }
 
-  /** the L0 tables of one (s, q, nu) unit for the device unit engine (gpu port 4d): the pole matrices Ghat / Gtil at this inu
+  /** the L0 tables of one (s, q, nu) unit for the device unit engine: the pole matrices Ghat / Gtil at this inu
    *  (l == j excluded, as both host kernels form them), f' / f'', and the shift tables at inu != 0. The returned l0_tables
    *  point into `store` (and into b / P / st), so `store` must outlive its use. */
   struct l0_table_store {
@@ -1071,7 +1069,7 @@ namespace dynbse {
     return t;
   }
 
-  /** l0_apply_cols on the device (gpu port R3, 2026-09-26): the inu = 0 twin of l0_apply_shift_cols_device. Ghat /
+  /** l0_apply_cols on the device: the inu = 0 twin of l0_apply_shift_cols_device. Ghat /
    *  Gtil are formed at inu = 0 exactly as the host kernel forms them (l == j excluded: the confluent U_j^2 is the
    *  kernel's own pass), the family fold X.fam(0) + X.fam(1) happens in the device pack, f' / f'' feed the double and
    *  triple poles; the Cb_cst term (a small per-k contraction) stays on the host as in the host kernel. `act` lists
@@ -1132,7 +1130,7 @@ namespace dynbse {
 
   /** l0_apply_shift with the RHS columns batched into the gemms (the inu != 0 twin of l0_apply_cols): the
    *  same terms and tables, per (k, G node) ONE (nc x nc)(nc x ncomp nR nc) gemm and its two follow-ups
-   *  instead of nR sets. Gated against l0_apply_ref by the toy tests (L)/(G) at inu != 0. */
+   *  instead of nR sets. Checked against l0_apply_ref at inu != 0 by the unit tests. */
   inline void l0_apply_shift_cols(freq_basis const &b, pair_poles const &P, shift_tables const &st,
                                   tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
                                   nda::array<cplx, 3> const *Cb_cst, [[maybe_unused]] bool force_host = false,
@@ -1145,14 +1143,14 @@ namespace dynbse {
     Fsum() = cplx(0.0);
     const long ncomp = 1 + 2 * np;
     double tfold = tfold_ratio();
-    tfold = vertex_debug::number("dynbse_tfold", tfold);   // vertex_debug: dynbse_tfold (experiment override)
-    // THE ACTIVE COMPONENTS (gpu port P-3a, 2026-09-25): the input's components c (0 = the constant, 1 + f np + a =
-    // node a of family f) that carry content anywhere; the packing, the batched gemms and the scatter run over this
-    // list only. A frequency-CONSTANT input (L_s's second call, both calls of L_s d) is then ONE component instead
-    // of 1 + 2 np -- the gemms' free dimension and the scatter shrink by that factor; a K_d output (every component
-    // set) is unchanged. `pos` is the inverse map (global c -> packed position, -1 if absent). vertex_debug
-    // dynbse_l0_active = 0 packs every component (the old path, for A/B). x_fam_zero (O-1): the caller vouches
-    // that X.fam is zero, so the family scan (a full read of X) is skipped.
+    tfold = vertex_debug::number("dynbse_tfold", tfold);   // vertex_debug: dynbse_tfold (overrides the driver's fold ratio)
+    // THE ACTIVE COMPONENTS: the input's components c (0 = the constant, 1 + f np + a = node a of family f) that
+    // carry content anywhere; the packing, the batched gemms and the scatter run over this list only. A
+    // frequency-CONSTANT input (L_s's second call, both calls of L_s d) is then ONE component instead of 1 + 2 np --
+    // the gemms' free dimension and the scatter shrink by that factor; a K_d output (every component set) is
+    // unchanged. `pos` is the inverse map (global c -> packed position, -1 if absent). vertex_debug
+    // dynbse_l0_active = 0 packs every component. x_fam_zero: the caller guarantees that X.fam is zero, so the
+    // family scan (a full read of X) is skipped.
     std::vector<long> act;
     act.reserve(size_t(ncomp));
     {
@@ -1179,14 +1177,14 @@ namespace dynbse {
     stt_l0.n_l0 += 1;
     if (nca == 1 and act[0] == 0) stt_l0.n_l0_cst += 1;
 #if defined(ENABLE_CUDA)
-    if (l0_device_enabled() and not force_host) {   // force_host: the A/B gate of the toy tests
+    if (l0_device_enabled() and not force_host) {   // force_host: run the host kernel (host / device comparison in the tests)
       l0_apply_shift_cols_device(b, P, st, X, F, Fsum, Cb_cst, tfold, act);
       stt_l0.t_l0_dev += wall_now() - tw_l0;
       return;
     }
 #endif
-    // P26 (notes/vertex_perf_plan.md, the L0 miniapp): PB = poles per tile of the traffic restructuring below;
-    // 4 was the best of {4, 8, 16, 40} at 96 threads (1.37x), 1 keeps the tile machinery with one pole per tile.
+    // PB = poles per tile of the traffic restructuring below (default 4); 1 keeps the tile machinery with one pole
+    // per tile.
     const long PB = std::max(1l, long(vertex_debug::number("dynbse_l0_pb", 4.0)));   // vertex_debug: dynbse_l0_pb
 #pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
     for (long ik = 0; ik < nk; ++ik) {
@@ -1195,15 +1193,15 @@ namespace dynbse {
       // accumulators over all columns: (part, node, x, r, y)
       nda::array<cplx, 5> AU(2, np, nc, nR, nc), AT(2, np, nc, nR, nc), M2(2, np, nc, nR, nc), A1(2, np, nc, nR, nc),
           A3(2, np, nc, nR, nc);   // (part, node, x, r, y): the order of the V blocks
-      // TILED TRAFFIC (P26, ported from bench/l0_miniapp l0_tiled, measured 1.32-1.37x at 96 threads, 1.15x at 3):
-      // in mulU / mulT the component c selects the node a = c - 1 (or c - 1 - np), so every (pole, component) did a
-      // read-modify-write of TWO node blocks -- A[nj], fixed by the pole, and A[a], sweeping the node axis as c
-      // runs: a cold RMW 2 ng ncomp times per k, the kernel's DRAM traffic. The gemms of a TILE of PB poles are
-      // done first (Qt / Bt), then the component loop runs OUTSIDE and the tile's poles INSIDE: the a-indexed
-      // targets become a reduction over the tile in the accU / accT buffers, flushed once per component, and the
-      // nj-indexed targets touch only the tile's PB blocks. Every per-term product is the production arithmetic
-      // (the l pass's mV = -R and tV = i nu R are reproduced by (-w) R == w (-R) bitwise and by pre-scaling);
-      // only the ORDER in which the a-indexed targets accumulate over the poles changes (roundoff).
+      // TILED TRAFFIC: in mulU / mulT the component c selects the node a = c - 1 (or c - 1 - np), so a direct loop
+      // over (pole, component) does a read-modify-write of TWO node blocks -- A[nj], fixed by the pole, and A[a],
+      // sweeping the node axis as c runs: a cold RMW 2 ng ncomp times per k, which dominates the kernel's DRAM
+      // traffic. Here the gemms of a TILE of PB poles are done first (Qt / Bt), then the component loop runs
+      // OUTSIDE and the tile's poles INSIDE: the a-indexed targets become a reduction over the tile in the
+      // accU / accT buffers, flushed once per component, and the nj-indexed targets touch only the tile's PB
+      // blocks. Every per-term product is the direct form's arithmetic (the l pass's mV = -R and tV = i nu R are
+      // reproduced by (-w) R == w (-R) bitwise and by pre-scaling); only the ORDER in which the a-indexed targets
+      // accumulate over the poles differs (roundoff).
       const long W = nc * nca * nR * nc, blk = nc * nR * nc, ry = nR * nc;   // nca active components packed
       nda::array<cplx, 4> Vt(nc, nca, nR, nc);
       nda::array<cplx, 2> Pj(nc, nca * nR * nc);
@@ -1212,7 +1210,7 @@ namespace dynbse {
       AU() = cplx(0.0); AT() = cplx(0.0); M2() = cplx(0.0); A1() = cplx(0.0); A3() = cplx(0.0);
       auto base = [&](nda::array<cplx, 5> &A, long part, long node) { return A.data() + (part * np + node) * blk; };
       // dst(x, r, y) (+= | -=) [w *] [pre *] src(x, c, r, y) over the (nc, nR, nc) block c of a pole's output, in the
-      // production's arithmetic: `scaled` = the weight multiplies, `prescale` = the l pass's i nu multiplies FIRST.
+      // direct form's arithmetic: `scaled` = the weight multiplies, `prescale` = the l pass's i nu multiplies FIRST.
       auto axpy_blk = [&](cplx *dst, cplx const *src, long c, bool sub, bool scaled, cplx w, bool prescale, cplx pre) {
         const long cl = pos[size_t(c)];               // the packed position of the global component c
         for (long x = 0; x < nc; ++x) {
@@ -1236,8 +1234,8 @@ namespace dynbse {
       bool used_U = false, used_T = false;   // the a-indexed buffers received something for this component
       // ---- the elementary multiplications on the (x, r, y) block c of a pole's output ------------------------
       // The a-indexed targets go to accU / accT (flushed per component with the sign of the range: the U range
-      // decrements AU[a], the T range increments AU[a] and AT[a] -- the production's signs); the nj-indexed
-      // targets are updated in place. `neg`: the production's mulU on -V (the l pass), folded into the weights.
+      // decrements AU[a], the T range increments AU[a] and AT[a] -- the direct form's signs); the nj-indexed
+      // targets are updated in place. `neg`: the direct form's mulU on -V (the l pass), folded into the weights.
       auto mulU_t = [&](long j, long c, cplx const *V, int part, bool neg) {
         const long nj = P.gnode(j);
         const double ej = P.epsG(j);
@@ -1270,7 +1268,7 @@ namespace dynbse {
           }
         }
       };
-      // `pre_on`: the production's mulT on i nu V (the l pass), the pre-scale applied first as it was there.
+      // `pre_on`: the direct form's mulT on i nu V (the l pass), the pre-scale applied first as there.
       auto mulT_t = [&](long l, long c, cplx const *V, int part, bool pre_on) {
         const long nl = P.gnode(l);
         const double el = P.epsG(l);
@@ -1385,7 +1383,7 @@ namespace dynbse {
                   mulT_t(pole, c, Q, part, true);                        // + i nu T_l . R_l
                 }
               }
-              if (a >= 0) {                                 // flush the a-indexed reductions, production signs
+              if (a >= 0) {                                 // flush the a-indexed reductions, direct form's signs
                 if (used_U) {
                   cplx *dst = base(AU, part, a);
                   cplx const *s = accU.data();
@@ -1467,10 +1465,9 @@ namespace dynbse {
           }
         }
       }
-      // THE SMALL-nu FOLD (D2f): the twisted components T_a with |eps_a| >= ratio |nu| are nearly degenerate
+      // THE SMALL-nu FOLD: the twisted components T_a with |eps_a| >= ratio |nu| are nearly degenerate
       // with U_a^2 (the twist is invisible on K_F's support) -- tau-metric near-null directions that carry
-      // the spurious Ritz values of the resummation at small nu (Si q_min: Ritz 38-60 at nu_2..nu_5 and a
-      // -13 % dip of the resummed eps; the fold restores a smooth monotone curve for nu >= nu_2). They are
+      // spurious Ritz values of the resummation at small nu and distort the resummed polarization. They are
       // folded into the U family through T_a = U_a^2 - i nu U_a^3 + (i nu)^2 U_a^4 + O((nu/eps_a)^3) with
       // the Dsq / Dcb / Dqt re-expansions (vertex and extension nodes). The frequency sums are untouched
       // (T sums to 0 exactly; they were accumulated from the product form). ratio = pol_vertex_dyn_tfold.
@@ -1759,8 +1756,8 @@ namespace dynbse {
 
   /** the RHS columns batched: the same terms as l0_apply's inu = 0 path (below), with the column index r
    *  folded into the gemms' free dimension -- per (k, family, G node) ONE (nc x nc)(nc x np nc nR) and ONE
-   *  ((nc np nR) x nc)(nc x nc) gemm instead of nR pairs of tiny ones. Gated against l0_apply_ref by the
-   *  toy test (L). Host threads over k as in l0_apply. */
+   *  ((nc np nR) x nc)(nc x nc) gemm instead of nR pairs of tiny ones. Checked against l0_apply_ref by the
+   *  unit tests. Host threads over k as in l0_apply. */
   inline bool &l0_cols_state() { static bool v = true; return v; }
   inline void l0_apply_cols(freq_basis const &b, pair_poles const &P, tf_vector const &X, tf_vector &F,
                             nda::array<cplx, 4> &Fsum, nda::array<cplx, 3> const *Cb_cst, bool x_fam_zero = false) {
@@ -1802,7 +1799,7 @@ namespace dynbse {
             C(x, r, y) = v;
             anyc = anyc or (v != cplx(0.0));
           }
-      // the single input family at inu = 0 (both families folded); x_fam_zero (O-1): the caller vouches that
+      // the single input family at inu = 0 (both families folded); x_fam_zero: the caller guarantees that
       // X.fam is zero -- no packing, the family block below is skipped (the constant part alone runs)
       bool anyv = false;
       if (not x_fam_zero)
@@ -2044,7 +2041,7 @@ namespace dynbse {
   }
 
   /**
-   * F = L0 X, the GROUPED (production) form of l0_apply_ref: identical terms, reassociated so
+   * F = L0 X, the GROUPED form of l0_apply_ref: identical terms, reassociated so
    * that the G-pole double sum never meets the vertex nodes. Per (k, r) and input family the
    * partial fractions of every term factor through the two (nc x nc) "pole-summed legs"
    *   Ghat_j = sum_l g_l(k+q)^T / D_jl,   Gtil_l = sum_j g_j(k)^T / D_jl,   D_jl = e_j - e_l + inu
@@ -2055,20 +2052,24 @@ namespace dynbse {
    * are re-expanded with the Dsq/Dcb tables; their frequency sums use the exact f', f''/2.
    *
    * `Cb_cst` (nk, nc^2, nc^2) or nullptr: when given, the frequency sum of the CONSTANT part of
-   * X is taken as Cb_cst(k) . X.cst(k) instead of the pole route -- the production driver passes
-   * the ladder's own tau-route chi0 here so the static limit reproduces the L2 resolvent to
-   * working precision (the two-family output itself is unchanged).
+   * X is taken as Cb_cst(k) . X.cst(k) instead of the pole route -- the driver passes the
+   * ladder's own tau-route chi0 here so the static limit reproduces the dense static resolvent
+   * to working precision (the two-family output itself is unchanged).
+   *
+   * Dispatch: inu != 0 goes to the {U, T} twisted-pair kernels (l0_apply_shift_cols / l0_apply_shift);
+   * inu = 0 goes to the batched l0_apply_cols (host or device) unless l0_cols_state() is false, in
+   * which case the per-column grouped form below runs.
    */
   inline void l0_apply(freq_basis const &b, pair_poles const &P, cplx inu, bool shared,
                        tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
                        nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr,
                        bool force_host = false, bool x_fam_zero = false) {
-    // x_fam_zero (O-1, 2026-09-26): the caller vouches that X.fam is zero (a frequency-constant input); the batched
-    // kernels then skip the family scan / packing instead of reading the whole vector to find that out.
+    // x_fam_zero: the caller guarantees that X.fam is zero (a frequency-constant input); the batched kernels then
+    // skip the family scan / packing instead of reading the whole vector to find that out.
     decltype(nda::range::all) all;
-    // inu != 0: the {U, T} twisted-pair basis (D2e). The {U, S} branches below this dispatch are
-    // the inu = 0 (folded, single-family) path only. force_host: the host L0 kernel even when the device
-    // one is enabled (the device-vs-host A/B gate of the toy tests, gpu port 5b).
+    // inu != 0: the {U, T} twisted-pair basis. The {U, S} branches below this dispatch are the inu = 0
+    // (folded, single-family) path only. force_host: the host L0 kernel even when the device one is
+    // enabled (used by the tests to compare host and device).
     if (inu != cplx(0.0)) {
       utils::check(st != nullptr and st->inu == inu,
                    "dynbse::l0_apply: inu != 0 needs the shift tables built for this inu (build_shift_tables).");
@@ -2090,10 +2091,10 @@ namespace dynbse {
         stt0.n_l0_nu0 += 1;
         if (x_fam_zero) stt0.n_l0_cst += 1;        // the nu = 0 kernel skips the family block for a constant input
 #if defined(ENABLE_CUDA)
-        if (l0_device_enabled() and not force_host) {   // R3: the nu = 0 kernel on the device (force_host: the A/B gate)
-          // the ACTIVE folded components (the P-3a list of l0_apply_shift_cols, folded: 0 = the constant, 1 + a = node
-          // a of X.fam(0) + X.fam(1)); vertex_debug dynbse_l0_active = 0 packs every component; x_fam_zero skips
-          // the family scan
+        if (l0_device_enabled() and not force_host) {   // the nu = 0 kernel on the device
+          // the ACTIVE folded components (the active list of l0_apply_shift_cols, folded: 0 = the constant, 1 + a =
+          // node a of X.fam(0) + X.fam(1)); vertex_debug dynbse_l0_active = 0 packs every component; x_fam_zero
+          // skips the family scan
           std::vector<long> act;
           act.reserve(size_t(1 + np_));
           const bool all_active = (vertex_debug::number("dynbse_l0_active", 1.0) == 0.0);   // vertex_debug: dynbse_l0_active
@@ -2426,7 +2427,7 @@ namespace dynbse {
   }
 
   /**
-   * The explicit pair-space rung of the toy/gate form: K(q'; s) as (nc^2 x nc^2) matrices on the
+   * The explicit (dense, reference) pair-space rung: K(q'; s) as (nc^2 x nc^2) matrices on the
    * tau grid (rows (p1' nc + p3), columns (a nc + b)), q' = k - k' through the map kmk(k, k'),
    * plus the instantaneous value K0(q') (the static rung W0bar = the full rung at inu' = 0) and
    * the inu' = 0 value of the dynamic part, Wd0(q') = W_dyn(0), used for K_d = W_dyn(s) - Wd0.
@@ -2528,9 +2529,9 @@ namespace dynbse {
    * (family, k, pair, column) of the tau-grid dot product of the functions the coefficients
    * represent, G_ab = sum_i K_F(s_i, e_a) K_F(s_i, e_b) (a, b < np_fit; the union's G nodes carry no
    * iterate content). The coefficient inner product is blind to the near-confluent pairs whose
-   * coefficients grow with every L0 application while their values cancel; in the tau metric the
-   * Arnoldi process and the residual see the functions (measured on lih222 at the first bosonic
-   * node: coefficient-norm Ritz 2.6 and a stalled GMRES, physical readouts continuous in nu).
+   * coefficients grow with every L0 application while their values cancel (in the coefficient norm
+   * this can produce spurious Ritz values and a stalled GMRES at small nu); in the tau metric the
+   * Arnoldi process and the residual see the functions.
    */
   struct tf_metric {
     long np = 0, np_fit = 0;
@@ -2639,19 +2640,19 @@ namespace dynbse {
    */
   struct static_resolvent {
     long D = 0, nk = 0, nc = 0;
-    std::string mode = "inverse";   // "inverse": T_s stored dense; "lu": the LU factors of 1 - Cb K_s, T_s applied as a solve (P7)
+    std::string mode = "inverse";   // "inverse": T_s stored dense; "lu": the LU factors of 1 - Cb K_s, T_s applied as a solve
     nda::array<cplx, 2> Cb;      // (D, D) block diagonal                          [inverse]
     nda::array<cplx, 2> Ts;      // (D, D)                                          [inverse]
     nda::array<cplx, 3> Cb_k;    // (nk, nc^2, nc^2) the diagonal blocks of Cb        [lu]
     nda::matrix<cplx> Mlu;       // (D, D) the LU factors of M = 1 - Cb K_s (getrf)   [lu]
     nda::array<int, 1> ipiv;     // its pivots                                        [lu]
     nda::array<cplx, 2> const *Ks = nullptr;   // the caller's static rung (D, D); it must outlive the resolvent  [lu]
-    bool own_ks = false;         // the static rung is the owned copy in Cb (the toy builder)        [lu]
+    bool own_ks = false;         // the static rung is the owned copy in Cb (build_static_resolvent) [lu]
     bool zero = false;           // T_s = 0 (the pure one-rung column): no solve       [lu]
   };
 
   /**
-   * P7 (vertex_perf_plan.md, 2026-09-21): the static resolvent WITHOUT the explicit inverse. T_s = K_s M^-1 with
+   * The static resolvent WITHOUT the explicit inverse. T_s = K_s M^-1 with
    * M = 1 - Cb K_s is never formed: M is assembled blockwise (Cb is block diagonal in k: nk gemms of nc^2 x nc^2 by
    * nc^2 x D instead of one D^3 gemm), factorized once (getrf, 2/3 D^3) and every application T_s f = K_s (M^-1 f) is a
    * getrs plus one K_s gemm -- the same 4 D^2 nR per application as the dense form (T_s gemm + dense Cb gemm) and a
@@ -2735,7 +2736,7 @@ namespace dynbse {
           for (long pp = 0; pp < nc2; ++pp) Ks(ik * nc2 + p, ikp * nc2 + pp) = R.K0(iq, p, pp);
       }
     if (mode == "lu") {
-      // the toy builder has no long-lived K_s to reference: the LU form keeps its own copy in the (otherwise unused) Cb
+      // this builder has no long-lived K_s to reference: the LU form keeps its own copy in the (otherwise unused) Cb
       // slot and marks it (own_ks), so no pointer into the returned object is needed
       S.Cb_k = Cb_k;
       S.Cb = Ks;
@@ -2752,7 +2753,7 @@ namespace dynbse {
     return S;
   }
 
-  /** the production builder: Cb_k (nk, nc^2, nc^2) the per-k chi0 (any route), Ks (D, D) the
+  /** the builder from precomputed blocks: Cb_k (nk, nc^2, nc^2) the per-k chi0 (any route), Ks (D, D) the
    *  static rung mapping the pair vector at k' (column) to k (row), D = nk nc^2. */
   inline static_resolvent build_static_resolvent_from(nda::array<cplx, 3> const &Cb_k,
                                                       nda::array<cplx, 2> const &Ks,
@@ -2762,7 +2763,7 @@ namespace dynbse {
     utils::check(Ks.shape(0) == D and Ks.shape(1) == D, "dynbse::build_static_resolvent_from: Ks shape.");
     utils::check(mode == "inverse" or mode == "lu", "dynbse::build_static_resolvent_from: mode {} (inverse | lu).", mode);
     S.D = D; S.nk = nk; S.nc = long(std::lround(std::sqrt(double(nc2))));
-    if (mode == "lu") {                            // P7: the caller's Ks is referenced, not copied (it outlives the unit)
+    if (mode == "lu") {                            // the caller's Ks is referenced, not copied (it outlives the unit)
       S.Cb_k = Cb_k;
       finish_static_resolvent_lu(S, Ks);
       return S;
@@ -2777,13 +2778,7 @@ namespace dynbse {
   }
 
   /**
-   * Gamma = L_s (D + y): with F = L0 (D + y) and its exact sum Fsum,
-   *   Gamma = F + L0 [ T_s Fsum ]   (the second term is L0 applied to a constant),
-   *   sum_iw Gamma = Fsum + Cb T_s Fsum.
-   * Returns Gamma (two-family) and Gsum. `Dc` is the constant external leg D (nk, nc, nc, nR).
-   */
-  /**
-   * LFF-Sigma L-7 (the dynamic-rung vertex in Sigma, notes/lff_aux_plan.md): the LEFT multiplication of a two-family
+   * For the dynamic-rung vertex in the self-energy: the LEFT multiplication of a two-family
    * vector by ONE Green's function, G(k, z) = sum_j g_j(k) U_j(z), acting on the pair's ROW index -- the k' line of the
    * self-energy junction:   F(k, z)_{(c y), r} = sum_x G_{c x}(k, z) X(k, z)_{(x y), r}.
    * Exact partial fractions on the {U, T} components (the rules of l0_apply_shift_cols's mulU without the second leg):
@@ -2854,14 +2849,10 @@ namespace dynbse {
     }
   }
 
-  // solve_timers, solve_timers_state() and wall_now() are defined at the top of this namespace (the L0 kernels
-  // above accumulate into them).
-
-  /** O-1 (gpu port, 2026-09-26): the working set of ls_apply, allocated ONCE per solve (or per unit) instead of
-   *  per call. Before, every call built four fresh tf_vectors (X, F, Xc, F2: 0.7 GB each at Si kp444 / C = 8, 9 GB
-   *  at kp666 / C = 16) plus the T_s work arrays, paying the mmap first touch and the zeroing every time; with two
-   *  calls per RHS block of Gamma_1 that was ~6 GB of page-faulted writes per block before any arithmetic.
-   *  Xc.fam is never written: it stays zero from construction (Xc is the frequency-constant input by design). */
+  /** the working set of ls_apply, allocated ONCE per solve (or per unit) instead of per call: four tf_vectors
+   *  (X, F, Xc, F2; each can reach several GB) plus the T_s work arrays, so the first touch and the zeroing are
+   *  not paid on every application. Xc.fam is never written: it stays zero from construction (Xc is the
+   *  frequency-constant input by design). */
   struct ls_scratch {
     long np = -1, nk = -1, nc = -1, nR = -1, D = -1;
     tf_vector X, F, Xc, F2;
@@ -2882,16 +2873,19 @@ namespace dynbse {
     }
   };
 
-  /** Gamma = L_s y (with the external leg Dc): F = L0 (Dc + y), c = T_s F^sum, Gamma = F + L0 c.
-   *  ws (O-1): the caller's scratch (null = a local one, allocated per call as before). y_fam_zero (O-1): the
-   *  caller vouches that y.fam is zero (L_s d: the first call of every block) -- the family copy into X and the
-   *  kernels' family scan / packing are skipped; the arithmetic is unchanged. */
+  /** Gamma = L_s (Dc + y), with `Dc` the constant external leg D (nk, nc, nc, nR): with F = L0 (Dc + y) and its
+   *  exact sum Fsum,
+   *    Gamma = F + L0 [ T_s Fsum ]   (the second term is L0 applied to a constant),
+   *    sum_iw Gamma = Fsum + Cb T_s Fsum.
+   *  Returns Gamma (two-family) and Gsum. ws: the caller's scratch (null = a local one, allocated per call).
+   *  y_fam_zero: the caller guarantees that y.fam is zero (L_s d: the first call of every block) -- the family
+   *  copy into X and the kernels' family scan / packing are skipped; the arithmetic is unchanged. */
   inline void ls_apply(freq_basis const &b, pair_poles const &P, static_resolvent const &S, cplx inu,
                        bool shared, nda::array<cplx, 4> const &Dc, tf_vector const &y,
                        tf_vector &Gamma, nda::array<cplx, 4> &Gsum,
                        nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr,
                        ls_scratch *ws = nullptr, bool y_fam_zero = false, bool want_gamma = true) {
-    // want_gamma (gpu port 4d, 2026-09-27): false when the caller reads only Gsum -- then L0 of the T_s image (whose only use
+    // want_gamma: false when the caller reads only Gsum -- then L0 of the T_s image (whose only use
     // is Gamma's second term) and the Gamma sum are skipped; Gsum = Fsum + Cb T_s Fsum is unchanged
     decltype(nda::range::all) all;
     auto &stt = solve_timers_state();
@@ -2913,7 +2907,7 @@ namespace dynbse {
       for (long p = 0; p < nc2; ++p)
         for (long r = 0; r < nR; ++r) fs(ik * nc2 + p, r) = Fsum(ik, p / nc, p % nc, r);
     if (S.mode == "lu") {
-      // P7: c = T_s Fsum = K_s [(1 - Cb K_s)^-1 Fsum] through the stored LU; Cb c blockwise (Cb is block diagonal in k)
+      // c = T_s Fsum = K_s [(1 - Cb K_s)^-1 Fsum] through the stored LU; Cb c blockwise (Cb is block diagonal in k)
       if (S.zero) {
         cs() = cplx(0.0);
         cb() = cplx(0.0);
@@ -2957,11 +2951,11 @@ namespace dynbse {
 
   // the readout block D^dag Gsum (the physical observable of the iteration)
   inline nda::array<cplx, 2> collapse(nda::array<cplx, 4> const &Dleft, nda::array<cplx, 4> const &Gsum) {
-    // P (nL, nR) = D^dag G over the pair index (k, a, b): one gemm (gpu port 2026-09-27; the scalar five-deep loop was ~0.3 s
-    // per unit at the Si kp444 bubble shape nL = nR = 156, D = 4096). The summation order changes: rounding class.
+    // P (nL, nR) = D^dag G over the pair index (k, a, b): one gemm. The scalar loop (debug switch below) sums in
+    // another order and agrees to rounding.
     const long nk = Gsum.shape(0), nc = Gsum.shape(1), nR = Gsum.shape(3), nL = Dleft.shape(3), D = nk * nc * nc;
     nda::array<cplx, 2> P(nL, nR);
-    if (vertex_debug::flag("dynbse_collapse_loop")) {   // vertex_debug: dynbse_collapse_loop (the old loop, A/B)
+    if (vertex_debug::flag("dynbse_collapse_loop")) {   // vertex_debug: dynbse_collapse_loop (scalar loop instead of the gemm)
       P() = cplx(0.0);
       for (long rl = 0; rl < nL; ++rl)
         for (long r = 0; r < nR; ++r)
@@ -2993,7 +2987,7 @@ namespace dynbse {
     nda::array<cplx, 4> Gsum;      // (nk, nc, nc, nR) sum_iw Gamma of the converged vertex
     nda::array<cplx, 4> Gsum1;     // the first iterate (static-dressed one dynamic rung)
     nda::array<cplx, 4> Gsum0;     // the static ladder (y = 0)
-    // LFF-Sigma L-7 (keep_y): the dynamic remainders themselves -- the amputated vertex of the self-energy junction is
+    // keep_y: the dynamic remainders themselves -- the amputated vertex of the self-energy junction is
     // A = K_s Gsum + y (Gamma - d = K_s P^sum + K_d * P), so the Sigma contraction needs y, not only its frequency sum
     bool has_y = false;
     tf_vector y1;                  // the first iterate y_1 = K_d L_s d (K_d L_0 d for one_rung_only)
@@ -3009,7 +3003,7 @@ namespace dynbse {
   /**
    * KdOp: double(tf_vector const& F, nda::array<cplx,4> const& Fsum, tf_vector& y) -- applies the
    * dynamic remainder K_d to the two-family F (with its exact frequency sums) and returns the tau
-   * refit error. The toy form is kd_apply(b, R, ...); the production driver supplies the THC rung.
+   * refit error: kd_apply(b, R, ...) with an explicit pair_rung, or the THC rung supplied by the driver.
    */
   template<class KdOp>
   inline dyson_result solve_dyson_op(freq_basis const &b, pair_poles const &P, KdOp &&kd,
@@ -3026,7 +3020,7 @@ namespace dynbse {
     tf_vector y(np, nk, nc, nR), Gamma(np, nk, nc, nR), ynew(np, nk, nc, nR);
     tf_vector yprev(np, nk, nc, nR), ynew_prev(np, nk, nc, nR);
     nda::array<cplx, 4> Gsum(nk, nc, nc, nR);
-    ls_scratch ws;                 // O-1: one working set for every ls_apply of this solve
+    ls_scratch ws;                 // one working set for every ls_apply of this solve
     double dprev = -1.0;
     for (long it = 0; it <= maxit; ++it) {
       ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st, &ws, it == 0);
@@ -3147,7 +3141,7 @@ namespace dynbse {
                                         tf_metric const *metric = nullptr, double readout_tol = 0.0,
                                         bool gamma1_only = false, bool keep_y = false,
                                         tf_vector const *y0 = nullptr) {
-    // P9 (vertex_perf_plan.md): y0 = an initial guess of the dynamic remainder (a warm start; null = y = 0). Every cycle
+    // y0 = an initial guess of the dynamic remainder (a warm start; null = y = 0). Every cycle
     // starts from the true residual r = rhs - A y, so a guess only changes the path, not the converged solution; with
     // y = 0 the first application A y is an exact zero and is skipped (one K_d application per block saved, bitwise).
     const long nk = P.nk, nc = P.nc, nR = Dc.shape(3), np = b.np;
@@ -3160,9 +3154,9 @@ namespace dynbse {
     out.Gsum0 = nda::array<cplx, 4>(nk, nc, nc, nR);
     nda::array<cplx, 4> Dzero(nk, nc, nc, nR), Gsum(nk, nc, nc, nR);
     Dzero() = cplx(0.0);
-    // O-1 (2026-09-26): y, Gamma, rhs are all the Gamma_1 path needs; w, r and the Krylov vectors are built past the
-    // gamma1_only return (before, two dead 0.7-9 GB vectors were allocated and zeroed per RHS block). ls_scratch:
-    // one working set for every ls_apply of this solve.
+    // y, Gamma, rhs are all the Gamma_1 path needs; w, r and the Krylov vectors are built past the gamma1_only
+    // return so a Gamma_1-only solve does not allocate them. ls_scratch: one working set for every ls_apply of
+    // this solve.
     tf_vector y(np, nk, nc, nR), Gamma(np, nk, nc, nR), rhs(np, nk, nc, nR);
     ls_scratch ws;
     // the operator: A v = v - K_d L_s v   (L_s v with a zero external leg)
@@ -3183,8 +3177,8 @@ namespace dynbse {
     if (keep_y) { out.has_y = true; out.y1 = rhs; }
     // Gamma_1 = static + one dynamic rung on static-ladder legs = D^dag L_s K_d L_s D, which is exactly the
     // first iterate (Gsum1) built above -- BEFORE the GMRES while-loop. A Gamma_1-only request stops here,
-    // skipping the ~10-25 resummation applications (5-8x cheaper). out.Gsum is set to Gsum1 so the resummed
-    // slot carries a defined value (the caller logs that resummation was skipped).
+    // skipping the resummation's operator applications. out.Gsum is set to Gsum1 so the resummed slot carries
+    // a defined value (the caller logs that resummation was skipped).
     if (gamma1_only) { out.Gsum = Gsum; out.iterations = 1; out.converged = true; if (keep_y) out.y = rhs; return out; }
     tf_vector w(np, nk, nc, nR), r(np, nk, nc, nR);
     nda::array<cplx, 1> rhs_norm2(nR), dots(nR), sc(nR);
@@ -3407,7 +3401,123 @@ namespace dynbse {
     return out;
   }
 
-  /** the readout block: P(r', r) = sum_k sum_{ab} conj(Dleft(k, a, b, r')) Gsum(k, a, b, r) */
+  // =====================================================================================================================
+  // The DRESSED-LEG Gamma_1 readout (polarization side). Exact identity:
+  //   d^dag (L_s d + L_s [K_d * L_s d])^sum = d^dag Cb d~ + e~^dag (L0 y1)^sum,   y1 = K_d * (L0 d~),
+  //   d~ = (1 - K_s Cb)^-1 d = d + T_s Cb d,   e~ = (1 - Cb K_s)^-dag d = d + T_s^dag Cb^dag d.
+  // (L0 y1)^sum contracted with e~ never needs L0 on the frequency-dependent y1: with the left pole function
+  //   lambda(z) = G(k, z) conj(e~) G(k+q, z + inu) = sum_n U_n (Q_n - R_n) + sum_n T_n (inu R_n + B_n)   [inu != 0]
+  //                                                 = sum_n U_n (Q_n - R_n) + sum_n U_n^2 B_n            [inu == 0]
+  //   (Q_n = g_n e Gh_n, R_n = Gt_n e g'_n, B_n = g_n e g'_n, Gh_n = sum_{l != n} g'_l / D_nl, Gt_n = sum_{j != n} g_j / D_jn,
+  //    D_jl = eps_j - eps_l + inu; g = the G(k) residues, g' = the G(k+q) residues)
+  // the frequency sum is sum_fl sum_n <C^fl_n, Z^fl_n> with Z^fl_n = sum_fy sum_a H[fl][fy](n, a) y1^fy_a (closed-form
+  // Matsubara Grams of the pole families), and moving the matrices onto Z:
+  //   e~^dag (L0 y1)^sum = sum_k e~^dag(k) [ Zt(k) + Cb(k) y1.cst(k) ],
+  //   Zt = sum_n g_n^T Z^U_n Gh_n^T - Gt_n^T Z^U_n g'_n^T + inu Gt_n^T Z^T_n g'_n^T + g_n^T Z^T_n g'_n^T   (Z^T -> Z^{U2} at nu = 0)
+  // =====================================================================================================================
+  struct dressed_grams {
+    long ng = 0, np = 0;
+    nda::array<cplx, 4> H;        // (2 fl, ng, 2 fy, np): fl = {U_n, T_n | U_n^2}, fy = {U_a, T_a}
+    nda::array<cplx, 4> Gh, Gt;   // (ng, nk, nc, nc): the pole-summed legs Gh_n(k) = sum_{l != n} g'_l / D_nl, Gt_n(k) = sum_{j != n} g_j / D_jn
+  };
+  inline dressed_grams build_dressed_grams(freq_basis const &b, pair_poles const &P, cplx inu) {
+    dressed_grams g;
+    g.ng = P.ng; g.np = b.np;
+    g.H = nda::array<cplx, 4>(2, P.ng, 2, b.np);
+    g.H() = cplx(0.0);
+    const bool nu0 = (inu == cplx(0.0));
+    const double nu = inu.imag(), beta = b.beta;
+    for (long n = 0; n < P.ng; ++n) {
+      auto const &fn = P.fdG[size_t(n)];
+      const double en = P.epsG(n);
+      for (long a = 0; a < b.np; ++a) {
+        auto const &fa = b.fd[size_t(a)];
+        const double D = en - b.eps(a), df = fn.f - fa.f;
+        const bool conf = std::abs(D) <= 1e-12 * (1.0 + std::abs(en));
+        const double suu = conf ? fn.f1 : df / D;                       // [U_n U_a]
+        g.H(0, n, 0, a) = suu;
+        if (nu0) {
+          // [U_n^2 U_a] = d/de_n [U_n U_a] = f'_n / D - (f_n - f_a) / D^2  (series for small beta D; conf: f''/2)
+          if (conf) g.H(1, n, 0, a) = 0.5 * fn.f2;
+          else if (std::abs(beta * D) < 1e-3) g.H(1, n, 0, a) = 0.5 * fn.f2 - D * fn.f3 / 6.0;
+          else g.H(1, n, 0, a) = fn.f1 / D - df / (D * D);
+        } else {
+          const cplx iv(0.0, nu);
+          g.H(0, n, 1, a) = conf ? cplx(fn.f1) / iv : cplx(df) / (D * (D + iv));          // [U_n T_a]
+          g.H(1, n, 0, a) = conf ? cplx(fn.f1) / iv : -cplx(df) / (D * (D - iv));         // [T_n U_a]
+          g.H(1, n, 1, a) = conf ? cplx(-2.0 * fn.f1 / (nu * nu)) : cplx(-2.0 * df / (D * (D * D + nu * nu)));   // [T_n T_a]
+        }
+      }
+    }
+    // the pole-summed legs (per unit: they depend on (q, inu) and k only)
+    const long nk = P.nk, nc = P.nc;
+    g.Gh = nda::array<cplx, 4>(P.ng, nk, nc, nc); g.Gt = nda::array<cplx, 4>(P.ng, nk, nc, nc);
+    g.Gh() = cplx(0.0); g.Gt() = cplx(0.0);
+#pragma omp parallel for collapse(2) num_threads(utils::omp_threads())
+    for (long n = 0; n < P.ng; ++n)
+      for (long k = 0; k < nk; ++k)
+        for (long l = 0; l < P.ng; ++l) {
+          if (l == n) continue;
+          const cplx wh = 1.0 / (P.epsG(n) - P.epsG(l) + inu), wt = 1.0 / (P.epsG(l) - P.epsG(n) + inu);
+          for (long a = 0; a < nc; ++a)
+            for (long c = 0; c < nc; ++c) {
+              g.Gh(n, k, a, c) += wh * P.gkq(l, k, a, c);
+              g.Gt(n, k, a, c) += wt * P.gk(l, k, a, c);
+            }
+        }
+    return g;
+  }
+
+  /** out[a'][b'][N] += alpha sum_{a,b} A(a, a') Z[a][b][N] B(b', b)  (i.e. A^T Z B^T per column N); Z, out: (nc, nc, nR) */
+  inline void pair_sandwich_add(nda::MemoryArrayOfRank<2> auto const &A, cplx const *Z, nda::MemoryArrayOfRank<2> auto const &B,
+                                cplx alpha, cplx *out, long nc, long nR, nda::array<cplx, 2> &W1) {
+    // W1[a][b'][N] = sum_b B(b', b) Z[a][b][N]
+    for (long a = 0; a < nc; ++a) {
+      nda::array_view<cplx const, 2> Za({nc, nR}, Z + a * nc * nR);
+      auto Wa = W1(nda::range(a * nc, (a + 1) * nc), nda::range::all);
+      nda::blas::gemm(B, Za, Wa);
+    }
+    // out[a'][(b', N)] += alpha sum_a A(a, a') W1[a][(b', N)]
+    nda::array_view<cplx, 2> O({nc, nc * nR}, out);
+    auto W2 = nda::reshape(W1, std::array<long, 2>{nc, nc * nR});
+    nda::blas::gemm(alpha, nda::transpose(A), W2, cplx(1.0), O);
+  }
+
+  /** Z^fl_n = sum_fy sum_a H[fl][fy](n, a) y^fy_a : one gemm (2 ng x 2 np)(2 np x W) -- call with threaded BLAS */
+  inline nda::array<cplx, 2> dressed_z(freq_basis const &b, pair_poles const &P, dressed_grams const &g, tf_vector const &y) {
+    const long ng = P.ng, np = b.np, W = P.nk * P.nc * P.nc * y.nR;
+    nda::array<cplx, 2> Z(2 * ng, W);
+    auto H2 = nda::reshape(g.H, std::array<long, 2>{2 * ng, 2 * np});
+    auto Y2 = nda::reshape(y.fam, std::array<long, 2>{2 * np, W});
+    nda::blas::gemm(H2, Y2, Z);
+    return Z;
+  }
+  /** Zt(k) = the operator side of e~^dag (L0 y1)^sum without the constant part (see the block comment above):
+   *  the per-k sandwiches of Z with the pole residues and pole-summed legs (omp threads, sequential BLAS inside) */
+  inline void dressed_zt(pair_poles const &P, dressed_grams const &g, cplx inu, nda::array<cplx, 2> const &Z, long nR,
+                         nda::array<cplx, 4> &Zt) {
+    decltype(nda::range::all) all;
+    const long nk = P.nk, nc = P.nc, ng = P.ng;
+    const bool nu0 = (inu == cplx(0.0));
+    Zt() = cplx(0.0);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
+    for (long k = 0; k < nk; ++k) {
+      nda::array<cplx, 2> W1(nc * nc, nR);
+      cplx *out = &Zt(k, 0, 0, 0);
+      for (long n = 0; n < ng; ++n) {
+        auto Gh = g.Gh(n, k, all, all);
+        auto Gt = g.Gt(n, k, all, all);
+        auto gn = P.gk(n, k, all, all);
+        auto gpn = P.gkq(n, k, all, all);
+        cplx const *ZU = &Z(n, 0) + k * nc * nc * nR;
+        cplx const *ZT = &Z(ng + n, 0) + k * nc * nc * nR;
+        pair_sandwich_add(gn, ZU, Gh, cplx(1.0), out, nc, nR, W1);
+        pair_sandwich_add(Gt, ZU, gpn, cplx(-1.0), out, nc, nR, W1);
+        if (not nu0) pair_sandwich_add(Gt, ZT, gpn, inu, out, nc, nR, W1);
+        pair_sandwich_add(gn, ZT, gpn, cplx(1.0), out, nc, nR, W1);        // T_n B_n (inu != 0) or U_n^2 B_n (inu == 0)
+      }
+    }
+  }
 
 } // namespace dynbse
 } // namespace solvers

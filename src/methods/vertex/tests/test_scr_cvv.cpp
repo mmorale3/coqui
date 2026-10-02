@@ -18,21 +18,22 @@
  * ==========================================================================
  */
 
-// scGW-tilde increments C1+ (notes/scgwt_implementation_plan.md): the CVV R-space
-// engine and covariant velocity.
+// scGW-tilde: the CVV (covariant velocity-velocity) R-space engine and covariant
+// velocity, the bubble kernel, and the q -> 0 head built from them.
 //
-//   C1-a  toy tight-binding oracle: for H(k) = sum_R t(R) e^{ik.R} with t supported
-//         STRICTLY INSIDE the WS supercell, the k->R->velocity pipeline reproduces the
-//         analytic  d_k H = sum_R iR t(R) e^{ik.R}  to FP accuracy (the WS interpolant
-//         is exact when no boundary aliasing occurs), and the value row reproduces
-//         H(k) on the mesh (round-trip pin).
-//   C1-b  hermiticity: hermitian-paired t (t(-R) = t(R)^dag) gives v_a(k)^dag = v_a(k)
-//         exactly; time reversal: REAL hoppings give v_a(-k) = -v_a(k)^T.
-//   C1-c  finite-difference-in-k cross-check of the derivative rows against the value
-//         rows of the SAME WS interpolant, at mesh and generic k.
-//   C1-s  class-level smoke on LiH-222: build cvv_head_t from a real 2-iteration scGW
-//         state (H0 + F + Sigma(tau)), log the R-decay/truncation, evaluate velocities;
-//         the Sigma = 0 control (KS/HF) velocity is exactly hermitian.
+// Velocity checks (cvv_velocity_toy, cvv_build_lih222):
+//   (a)  toy tight-binding oracle: for H(k) = sum_R t(R) e^{ik.R} with t supported
+//        STRICTLY INSIDE the WS supercell, the k->R->velocity pipeline reproduces the
+//        analytic  d_k H = sum_R iR t(R) e^{ik.R}  to FP accuracy (the WS interpolant
+//        is exact when no boundary aliasing occurs), and the value row reproduces
+//        H(k) on the mesh (round trip).
+//   (b)  hermiticity: hermitian-paired t (t(-R) = t(R)^dag) gives v_a(k)^dag = v_a(k)
+//        exactly; time reversal: REAL hoppings give v_a(-k) = -v_a(k)^T.
+//   (c)  finite-difference-in-k cross-check of the derivative rows against the value
+//        rows of the SAME WS interpolant, at mesh and generic k.
+//   smoke  class-level smoke on LiH-222: build cvv_head_t from a real 2-iteration scGW
+//        state (H0 + F + Sigma(tau)), log the R-decay/truncation, evaluate velocities;
+//        the Sigma = 0 control (KS/HF) velocity is exactly hermitian.
 
 #include <cmath>
 #include <random>
@@ -228,18 +229,18 @@ namespace bdft_tests {
         auto h_num = nda::reshape(out(3, all), std::array<long, 2>{nb, nb});
         err_val = std::max(err_val, max_abs_diff(h_num, h_ref));
 
-        // C1-a: derivative rows == analytic velocity
+        // (a): derivative rows == analytic velocity
         auto v_ref = toy.V(kv);
         for (int a = 0; a < 3; ++a) {
           auto va = nda::reshape(out(a, all), std::array<long, 2>{nb, nb});
           err_vel = std::max(err_vel, max_abs_diff(va, v_ref(a, all, all)));
-          // C1-b hermiticity: v_a(k)^dag = v_a(k)
+          // (b) hermiticity: v_a(k)^dag = v_a(k)
           for (long i = 0; i < nb; ++i)
             for (long j = 0; j < nb; ++j)
               err_herm = std::max(err_herm, std::abs(va(i, j) - std::conj(va(j, i))));
         }
 
-        // C1-b time reversal (real hoppings): v_a(-k) = -v_a(k)^T
+        // (b) time reversal (real hoppings): v_a(-k) = -v_a(k)^T
         if (real_t) {
           nda::array<double, 1> km(3); for (int a = 0; a < 3; ++a) km(a) = -kv(a);
           auto Pm = solvers::cvv_detail::phase_rows(Rcart, rw, km, false);
@@ -254,7 +255,7 @@ namespace bdft_tests {
           }
         }
 
-        // C1-c: central finite difference of the value rows vs the derivative rows
+        // (c): central finite difference of the value rows vs the derivative rows
         for (int a = 0; a < 3; ++a) {
           nda::array<double, 1> kp_(3), km_(3);
           kp_() = kv; km_() = kv; kp_(a) += dk; km_(a) -= dk;
@@ -273,16 +274,16 @@ namespace bdft_tests {
       app_log(1, "cvv_velocity_toy[real_t={}]: err_val = {:.3e}, err_vel = {:.3e}, "
                  "err_herm = {:.3e}, err_trev = {:.3e}, err_fd = {:.3e}",
               real_t, err_val, err_vel, err_herm, err_trev, err_fd);
-      REQUIRE(err_val < 1e-11);    // round-trip pin: interpolant == H on and off mesh
-      REQUIRE(err_vel < 1e-10);    // C1-a: exact analytic derivative
-      REQUIRE(err_herm < 1e-11);   // C1-b: hermiticity
-      if (real_t) REQUIRE(err_trev < 1e-11);   // C1-b: time reversal
-      REQUIRE(err_fd < 1e-5);      // C1-c: O(dk^2) finite-difference agreement
+      REQUIRE(err_val < 1e-11);    // round trip: interpolant == H on and off mesh
+      REQUIRE(err_vel < 1e-10);    // (a): exact analytic derivative
+      REQUIRE(err_herm < 1e-11);   // (b): hermiticity
+      if (real_t) REQUIRE(err_trev < 1e-11);   // (b): time reversal
+      REQUIRE(err_fd < 1e-5);      // (c): O(dk^2) finite-difference agreement
     }
   }
 
   // ---------------------------------------------------------------------------------
-  // Increment C2 gates. All pure toys (no MF); they drive the SAME
+  // Bubble-kernel and head checks. All pure toys (no MF); they drive the SAME
   // cvv_detail::bubble_accumulate + dlr_pole_fit_w + bosonic-transform path the
   // production head uses, through cvv_head_t::ensure_bubble_tables().
   // ---------------------------------------------------------------------------------
@@ -323,7 +324,7 @@ namespace bdft_tests {
 #ifndef ENABLE_DLR
     SUCCEED("cvv_bubble_oracle skipped: build has ENABLE_DLR=OFF.");
 #else
-    // C2-b: dense-Matsubara / analytic-pairing oracle for the bubble kernel, on a toy
+    // Dense-Matsubara / analytic-pairing oracle for the bubble kernel, on a toy
     // whose A, B are explicit pole sums (in the DLR span). Pins the kernel's SIGN,
     // 1/beta and slot convention:  kernel[A,B](inu) = -(1/beta) sum_w tr[A(w+nu) B(w)].
     const double beta = 20.0, wmax = 8.0;
@@ -405,14 +406,14 @@ namespace bdft_tests {
 #ifndef ENABLE_DLR
     SUCCEED("cvv_telescoping skipped: build has ENABLE_DLR=OFF.");
 #else
-    // C2-a [the load-bearing identity, PDF eq:telescope]: with the scalar WI vertex
+    // The telescoping identity (Ward identity at q = 0): with the scalar WI vertex
     // L0 = 1 - dSigma/inu, the q = 0 vertexed bubble vanishes at every inu != 0:
     //   P^L(inu) = (1/b)S tr[G(w)G(w+nu)]
     //            - (1/inu) { (1/b)S tr[G(w)(SG)(w+nu)] - (1/b)S tr[(GS)(w)G(w+nu)] } = 0
     // for ANY (G, Sigma) with G = [iw + mu - h - Sigma(iw)]^-1. Exact analytically; the
     // discrete path holds to the backend representation/fit accuracy (the fits are
-    // eps-limited BY DESIGN -- notes/scgwt_implementation_plan.md deviation note), so
-    // the gate bar is 1e-6 relative at prec "high", with the measured value logged.
+    // eps-limited BY DESIGN), so the bar is a few 1e-6 relative at prec "high", with the
+    // achieved value logged.
     const double beta = 20.0, wmax = 8.0, mu = 0.1;
     imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::dlr_basis, "high");
     const long nb = 2;
@@ -469,8 +470,8 @@ namespace bdft_tests {
     auto kSGG = run_bubble(SG_wd, G_wd);   // kernel[SG, G]
     auto kGGS = run_bubble(G_wd, GS_wd);   // kernel[G, GS]
 
-    // P^L(inu) = -kernel[G,G] + (kernel[SG,G] - kernel[G,GS]) / inu   (slot algebra in
-    // the test header comment; kernel[A,B](inu) = -(1/b) S tr[A(w+nu)B(w)])
+    // P^L(inu) = -kernel[G,G] + (kernel[SG,G] - kernel[G,GS]) / inu   (slot algebra as in
+    // the comment at the top of this case; kernel[A,B](inu) = -(1/b) S tr[A(w+nu)B(w)])
     auto wn_b = ft.wn_mesh_b();
     double resid = 0.0, scale = 0.0;
     for (long m = 0; m < nwb; ++m) {
@@ -483,9 +484,9 @@ namespace bdft_tests {
     app_log(1, "cvv_telescoping: max|P^L(inu != 0)| = {:.3e} against bubble scale {:.3e} "
                "(rel {:.3e})", resid, scale, resid / scale);
     // Bar: the discrete identity is fit/representation-limited BY DESIGN (fits ~2e-8
-    // here) and the 1/inu division amplifies by 1/nu_min ~ 3 at beta = 20; measured
-    // 1.03e-6 on 2026-08-11. 5e-6 keeps 5x headroom while sitting 5+ orders below any
-    // O(1) wiring failure.
+    // here) and the 1/inu division amplifies by 1/nu_min ~ 3 at beta = 20; the residual
+    // is ~1e-6. 5e-6 keeps ~5x headroom while sitting 5+ orders below any O(1) wiring
+    // failure.
     REQUIRE(resid / scale < 5e-6);
 #endif
   }
@@ -495,11 +496,11 @@ namespace bdft_tests {
     SUCCEED("cvv_ks_head_control skipped: build has ENABLE_DLR=OFF.");
 #else
     decltype(nda::range::all) all;
-    // C2-c [adapted]: Sigma = 0 (KS) control on a GAPPED 6^3 tight-binding toy -- the
-    // plan's si222 fixture cannot discriminate the head (the 2^3 TRIM zero pinned in
-    // cvv_build_lih222), so the control compares against the exact Adler-Wiser
-    // P00(q, inu=0)/q^2 on the same mesh at small finite q. Also logs the C2-d f-sum
-    // meter (static reference tr[rho d2h] vs nu^2 * Pi at the largest node).
+    // Sigma = 0 (KS) head control on a GAPPED 6^3 tight-binding toy -- a 2^3 fixture
+    // cannot discriminate the head (the 2^3 TRIM zero tested in cvv_build_lih222), so
+    // the control compares against the exact Adler-Wiser P00(q, inu=0)/q^2 on the same
+    // mesh at small finite q. Also logs the f-sum meter (static reference tr[rho d2h] vs
+    // nu^2 * Pi at the largest node).
     const double beta = 20.0, wmax = 8.0;
     imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::dlr_basis, "high");
     const long nb = 2, nmesh = 6, nk = nmesh * nmesh * nmesh;
@@ -523,7 +524,7 @@ namespace bdft_tests {
               kpts(ik, a) = (double(i)/nmesh)*b(0,a) + (double(j)/nmesh)*b(1,a) +
                             (double(l)/nmesh)*b(2,a); }
 
-    // WS R store of h (the C1 pipeline)
+    // WS R store of h (the same pipeline as cvv_velocity_toy)
     nda::array<long, 1> mesh(3); mesh() = nmesh;
     auto [rw, rp] = utils::WS_rgrid(toy.lattv, mesh);
     const long nR = rp.shape(0);
@@ -600,8 +601,8 @@ namespace bdft_tests {
       auto Pw2 = nda::reshape(Pi_w3, std::array<long, 2>{nwb, 9});
       ft.tau_to_w(P2, Pw2, imag_axes_ft::boson); }
     // the density head is the SUBTRACTED coefficient [Pi(inu) - Pi(0)]/(inu)^2 (see
-    // cvv_detail::head_subtract -- the raw paramagnetic bubble overshoots by gap^2,
-    // measured 53x on this toy before the subtraction landed)
+    // cvv_detail::head_subtract -- the raw paramagnetic bubble overshoots by ~gap^2,
+    // i.e. by more than an order of magnitude on this toy)
     auto Phead = solvers::cvv_detail::head_subtract(Pi_w3, ft);
     auto wn_b = ft.wn_mesh_b();
     long i0 = -1; for (long m = 0; m < nwb; ++m) if (wn_b(m) == 0) i0 = m;
@@ -652,8 +653,8 @@ namespace bdft_tests {
     REQUIRE(worst < 0.02);   // O(q^2) residual at |q| = 0.02 |b|
     REQUIRE(fe < 1e-6);
 
-    // C2-d f-sum METER (log-only; static reference -- the Sigma part of the exact
-    // reference and the sharp gate land with the real-data increments C3/C4):
+    // f-sum METER (log-only; static reference only -- the Sigma part of the exact
+    // reference is not included, so nothing is asserted beyond finiteness):
     //   f_ref_ab = (2/(nk V)) sum_k tr[rho(k) d_a d_b h(k)]   vs   -nu_max^2 Pi_ab(nu_max)
     {
       nda::array<ComplexType, 2> d2h(3, 3);
@@ -694,17 +695,15 @@ namespace bdft_tests {
       for (int a = 0; a < 3; ++a) REQUIRE(std::isfinite(d2h(a, a).real()));
     }
 
-    // C3-a MECHANISM PIN (2026-08-12): the SAME toy stored in the PER-K EIGENBASIS --
-    // the gauge every real mean-field's band data is in. H_eig(k) = diag(eps(k)), G
-    // diagonal; the R-interpolant derivative of eigen-gauge data carries the
-    // INTRABAND velocity only (the interband dipole <n|dH/dk|m> lives in the k-
-    // dependence of the basis rotation and cannot survive a per-k eigen store), so
-    // the subtracted head must COLLAPSE relative to the fixed-basis head above.
-    // This pins the rusty C3-a finding (eps_inf ~ 1.00 at iter 1 on real mfs, sym
-    // and nosym alike, vs 6.8-8.3 stored) as BASIS-GAUGE sensitivity of the CVV
-    // store -- NOT a symmetry-unfold defect (the D-rotation fix was necessary but
-    // insufficient). The store needs a smooth fixed gauge (Wannier-class) or a
-    // commutator/position-element velocity: an R1 theory decision.
+    // EIGEN-GAUGE MECHANISM: the SAME toy stored in the PER-K EIGENBASIS -- the gauge
+    // every real mean-field's band data is in. H_eig(k) = diag(eps(k)), G diagonal;
+    // the R-interpolant derivative of eigen-gauge data carries the INTRABAND velocity
+    // only (the interband dipole <n|dH/dk|m> lives in the k-dependence of the basis
+    // rotation and cannot survive a per-k eigen store), so the subtracted head must
+    // COLLAPSE relative to the fixed-basis head above. This is a BASIS-GAUGE
+    // sensitivity of the CVV store (an eigen-gauge store gives eps_inf ~ 1 on real
+    // mean fields), not a symmetry-unfold defect: the store needs a smooth fixed gauge
+    // (Wannier-class) or a commutator/position-element velocity.
     {
       nda::array<double, 1> evk(2);
       nda::array<ComplexType, 2> Uk(2, 2);
@@ -750,11 +749,11 @@ namespace bdft_tests {
       const double collapse = meig / std::max(mfix, 1e-300);
       app_log(1, "cvv_ks_head_control: EIGEN-GAUGE mechanism pin: max|Phead| fixed "
                  "basis = {:.4e}, eigen gauge = {:.4e}, ratio = {:.3e} "
-                 "(H1: the eigen-gauge store loses the interband dipole)",
+                 "(the eigen-gauge store loses the interband dipole)",
               mfix, meig, collapse);
       REQUIRE(std::isfinite(collapse));
-      REQUIRE(collapse < 0.05);   // the collapse IS the mechanism (H1); bars
-                                  // provisional -- pinned from the first run
+      REQUIRE(collapse < 0.05);   // the collapse IS the mechanism; the bar leaves
+                                  // margin over the observed ratio
     }
 #endif
   }
@@ -785,7 +784,7 @@ namespace bdft_tests {
     REQUIRE(mb_state.sF_skij.has_value());
     REQUIRE(mb_state.sSigma_tskij.has_value());
 
-    // C1-s: build from the real scGW state; log R decay + truncation; velocities run
+    // smoke: build from the real scGW state; log R decay + truncation; velocities run
     solvers::cvv_head_t cvv(&ft, 1e-6);
     cvv.build(*mf, dyson.H0(), mb_state.sF_skij.value().local(),
               mb_state.sSigma_tskij.value().local());
@@ -796,20 +795,19 @@ namespace bdft_tests {
     auto v = cvv.velocity(0, 0);
     REQUIRE(v.shape(0) == 3);
     REQUIRE(v.shape(1) == cvv.nw());
-    // STRUCTURAL PIN (measured 2026-08-11, first C1 run): on a Gamma-centered 2x2x2
-    // mesh EVERY mesh k is a time-reversal-invariant momentum -- all k.R phases are
+    // STRUCTURAL ZERO: on a Gamma-centered 2x2x2 mesh EVERY mesh k is a time-reversal-invariant momentum -- all k.R phases are
     // 0/pi (real), so the WS interpolant is a cosine sum and its derivative VANISHES
     // IDENTICALLY at mesh points (the +-R images at the WS boundary cancel pairwise).
     // v(mesh k) == 0 is therefore exact at 2^3, for ANY stored h. Meshes >= 3 per
     // direction carry nonzero mesh-point velocities (the 6^3 toy above proves the
-    // machinery). Consequence: 2^3 fixtures cannot discriminate the CVV head (C2-c
-    // note); the head needs denser meshes.
+    // machinery). Consequence: 2^3 fixtures cannot discriminate the CVV head (see
+    // cvv_ks_head_control); the head needs denser meshes.
     double vmax = 0.0;
     nda::for_each(v.shape(), [&](auto... i) { vmax = std::max(vmax, std::abs(v(i...))); });
     app_log(1, "cvv_build_lih222: nR = {}, nR_kept = {}, max|v| (2^3 TRIM zero) = {:.3e}",
             cvv.nR(), cvv.nR_kept(), vmax);
     REQUIRE(std::isfinite(vmax));
-    REQUIRE(vmax < 1e-10);   // the structural 2^3 zero, pinned
+    REQUIRE(vmax < 1e-10);   // the structural 2^3 zero
 
     // Sigma = 0 control (KS/HF): the velocity is iw-independent and exactly hermitian
     solvers::cvv_head_t cvv0(&ft, 1e-6);
@@ -829,14 +827,14 @@ namespace bdft_tests {
     REQUIRE(err_herm < 1e-10);
     REQUIRE(err_wdep == 0.0);
 
-    // P1 compaction control: an aggressive tolerance genuinely drops shells; the
+    // Compaction control: an aggressive tolerance genuinely drops shells; the
     // COMPACTED store (kept |R| shells only -- inversion-symmetric sets) still gives
     // the structural 2^3 TRIM zero and a smaller footprint.
     {
       solvers::cvv_head_t cvvc(&ft, 0.9);
       cvvc.build(*mf, dyson.H0(), mb_state.sF_skij.value().local(),
                  mb_state.sSigma_tskij.value().local());
-      app_log(1, "cvv_build_lih222: P1 aggressive tol 0.9 -> nR_kept = {} / {}",
+      app_log(1, "cvv_build_lih222: aggressive compaction tol 0.9 -> nR_kept = {} / {}",
               cvvc.nR_kept(), cvvc.nR());
       REQUIRE(cvvc.nR_kept() >= 1);
       REQUIRE(cvvc.nR_kept() < cvvc.nR());
@@ -848,11 +846,11 @@ namespace bdft_tests {
       REQUIRE(vmaxc < 1e-10);   // the TRIM zero survives compaction
     }
 
-    // C3 smoke: the cvv_eps pproc target end-to-end on the checkpoint this scf just
+    // cvv_eps smoke: the cvv_eps pproc target end-to-end on the checkpoint this scf just
     // wrote (load F/Sigma/mu -> Dyson G -> CVV head -> eps_inf + h5 output). On the
     // 2^3 mesh the TRIM zero forces Pi^jj == 0, so eps_inf == 1 EXACTLY -- the
-    // structural pin again, now through the full readout path. Real eps_inf numbers
-    // need the stored dense-mesh checkpoints (rusty; gate C3-a).
+    // structural zero again, now through the full readout path. Physical eps_inf values
+    // need denser meshes than the unit-test fixtures provide.
     {
       pproc_t pp(*mpi_context, output, ".");
       ptree pt;
@@ -880,20 +878,18 @@ namespace bdft_tests {
 #ifndef ENABLE_DLR
     SUCCEED("cvv_sym_unfold skipped: build has ENABLE_DLR=OFF.");
 #else
-    // C3-a fix gate (LOCAL tier): the TRUE D(S,k)-rotated IBZ -> full-BZ unfold
-    // (cvv_detail::unfold_rotate_slice) on REAL symmetry-reduced meshes. The former
-    // copy/identity-D unfold made the stored k-slices STAR-CONSTANT, so the
-    // interpolant velocity lost the interband dipole at image k (the rusty C3-a
-    // finding: iter-1 states read eps_inf 1.07 where the stored convention gives
-    // 10-16). Local gates (the ABSOLUTE pin is production-tier: sym-vs-nosym iter-1
-    // head at Si kp444 -- no nosym lih223 twin exists locally):
+    // The D(S,k)-rotated IBZ -> full-BZ unfold (cvv_detail::unfold_rotate_slice) on
+    // REAL symmetry-reduced meshes. A copy/identity-D unfold would make the stored
+    // k-slices STAR-CONSTANT, so the interpolant velocity would lose the interband
+    // dipole at image k. Checks (an absolute sym-vs-nosym head comparison needs a
+    // nosym twin of the 223 mesh, which the unit-test fixtures do not provide):
     //  (a) lih222_sym: the structural 2^3 TRIM zero must SURVIVE the rotations
     //      (v(mesh k) == 0 is unfold-independent), and the Sigma = 0 velocity must
     //      stay HERMITIAN -- a wrong sandwich composition (e.g. D H D^T) breaks
-    //      hermiticity at O(1), so err_herm < 1e-10 pins the composition;
-    //  (b) lih223_sym (non-TRIM k = +-1/3): same hermiticity pin with NONZERO
-    //      velocities, head finite, fit meters green; the diag is logged (measured,
-    //      not asserted -- the 223 mesh axis is b3, not a cartesian direction).
+    //      hermiticity at O(1), so err_herm < 1e-10 tests the composition;
+    //  (b) lih223_sym (non-TRIM k = +-1/3): same hermiticity check with NONZERO
+    //      velocities, head finite, fit errors small; the diag is logged, not
+    //      asserted (the 223 mesh axis is b3, not a cartesian direction).
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
 
@@ -916,7 +912,7 @@ namespace bdft_tests {
       REQUIRE(mb_state.sF_skij.has_value());
       REQUIRE(mb_state.sG_tskij.has_value());
 
-      // Sigma = 0 (KS/HF) build: the hermiticity pin on the D-rotated velocity
+      // Sigma = 0 (KS/HF) build: the hermiticity check on the D-rotated velocity
       solvers::cvv_head_t cvv0(&ft, 1e-6);
       nda::array<ComplexType, 5> sig_empty(0, 0, 0, 0, 0);
       cvv0.build(*mf, dyson.H0(), mb_state.sF_skij.value().local(), sig_empty);
@@ -953,13 +949,13 @@ namespace bdft_tests {
     {  // (a) lih222_sym: TRIM zero + hermiticity through the rotations
       auto [vmax, err_herm, pzz, fit] = run_fixture("qe_lih222_sym", "coqui_cvv_sym222");
       REQUIRE(vmax < 1e-10);        // the structural 2^3 TRIM zero survives
-      REQUIRE(err_herm < 1e-10);    // the composition pin (trivially met when v = 0)
+      REQUIRE(err_herm < 1e-10);    // the composition check (trivially met when v = 0)
       REQUIRE(fit < 1e-2);
     }
-    {  // (b) lih223_sym: nonzero velocities, the real composition pin
+    {  // (b) lih223_sym: nonzero velocities, the discriminating composition check
       auto [vmax, err_herm, pzz, fit] = run_fixture("qe_lih223_sym", "coqui_cvv_sym223");
       REQUIRE(vmax > 1e-6);         // non-TRIM k: the velocity is genuinely nonzero
-      REQUIRE(err_herm < 1e-10);    // hermiticity of D . H . D^dag -- THE pin
+      REQUIRE(err_herm < 1e-10);    // hermiticity of D . H . D^dag
       REQUIRE(std::isfinite(pzz));
       REQUIRE(std::abs(pzz) > 1e-10);   // the head sees the z-dispersion
       REQUIRE(fit < 1e-2);
@@ -971,16 +967,15 @@ namespace bdft_tests {
 #ifndef ENABLE_DLR
     SUCCEED("cvv_inloop_lih222 skipped: build has ENABLE_DLR=OFF.");
 #else
-    // Increment C4 gates on the 2^3 fixture. The TRIM zero makes the CVV head
-    // STRUCTURALLY ZERO at 2^3 (pinned above), which sharpens the A/B into:
-    //   C4-a  "cvv" == "ignore_g0" EXACTLY at 2^3: the head fill is exactly zero and
-    //         the Sigma correction adds an exactly-zero array -- the in-loop wiring
-    //         perturbs nothing outside the head;
-    //         "cvv" != "gygi": the gygi extrapolated head is nonzero, so the knob
-    //         moves numbers ONLY through the head content.
-    //   C4-c  ignore_g0/gygi bit-identity to the pre-scgwt tree is the scgwt_noop
-    //         gate (unchanged code paths; rerun with this suite).
-    // C4-b (8^3 damped-mixing stability without DIIS) needs the rusty checkpoints.
+    // In-loop "cvv" head treatment on the 2^3 fixture. The TRIM zero makes the CVV head
+    // STRUCTURALLY ZERO at 2^3 (tested above), which sharpens the comparison into:
+    //   - "cvv" == "ignore_g0" EXACTLY at 2^3: the head fill is exactly zero and
+    //     the Sigma correction adds an exactly-zero array -- the in-loop wiring
+    //     perturbs nothing outside the head;
+    //   - "cvv" != "gygi": the gygi extrapolated head is nonzero, so the knob
+    //     moves numbers ONLY through the head content.
+    // That ignore_g0/gygi are unchanged by the scGW-tilde code paths is tested by
+    // test_vertex_scgwt_noop.
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_cvv_inloop";
@@ -1014,7 +1009,7 @@ namespace bdft_tests {
             ec_c, std::abs(ec_c - ec_i));
     app_log(1, "cvv_inloop_lih222: gygi      e_corr = {}  (D vs ignore = {:.3e})",
             ec_g, std::abs(ec_g - ec_i));
-    REQUIRE(eh_c == eh_i);            // C4-a: exactly-zero head at 2^3 => bit identity
+    REQUIRE(eh_c == eh_i);            // exactly-zero head at 2^3 => bit identity
     REQUIRE(ec_c == ec_i);
     REQUIRE(std::abs(ec_g - ec_i) > 1e-10);   // the head is what the knob moves
 #endif

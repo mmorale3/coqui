@@ -167,9 +167,9 @@ namespace methods {
           auto closest_indices = find_n_closest_per_direction(mf.Qpts_ibz(), mf.lattv(), fit_order+1);
 
           app_log(2, "\n q -> 0 head policy: {} (eps^-1(q) = eps^-1(-q), so the two sides of an axis are one sample; "
-                     "the per-direction form's fit order depends on how the mesh was reduced -- see notes/vertex_perf_plan.md 2026-09-22).",
-                  (div_treatment.find("perdir") == std::string::npos) ? "AXIS-FOLDED (the default since 2026-09-22): every axis extrapolates"
-                                                                     : "per-direction (historic; reproduces pre-2026-09-22 numbers)");
+                     "the per-direction form's fit order depends on how the mesh was reduced).",
+                  (div_treatment.find("perdir") == std::string::npos) ? "AXIS-FOLDED (the default): every axis extrapolates"
+                                                                     : "per-direction (\"perdir\" in div_treatment)");
           if (two_dimension)
             app_log(2, "\n Polynomial extrapolate head of the inverse of the dielectric function as O(q^2) along +/-b1, and +/-b2 directions."); 
           else
@@ -177,19 +177,17 @@ namespace methods {
           app_log(4, "   - Maximum polynomial fit order: {}", fit_order);
           app_log(4, "   - Maximum number of q-points used for fit per direction: {}", fit_order+1);
           
-          // 2026-09-22 (the Si 4^3 time-reversal finding, notes/vertex_perf_plan.md; user ruling: "we should always use
-          // the extrapolated head"): the six per-direction samples are taken from the IBZ q LIST, so WHICH points the
-          // fit sees depends on how the mesh was reduced -- and eps^-1(q) = eps^-1(-q), so +b_i and -b_i are the SAME
-          // physical sample. On a Gamma-centered 4^3 mesh the full list gives +b_i two points (a linear fit in |q|^2)
-          // and -b_i one (the zone-boundary point folds onto the positive side, so that direction does NOT extrapolate
-          // at all), and averaging the six mixes the two; a time-reversal reduction drops the -b_i half entirely, so
-          // every surviving direction extrapolates and the head jumps (Si 4^3: eps_inf 6.78 -> 8.27, which the ladder
-          // turns into 7 % of its correction, and the plain scGW total energy by 1.9e-4 Ha).
-          // THE DEFAULT IS NOW THE AXIS FOLD: the two sides of each axis are MERGED (deduplicated by |q|^2, closest
-          // first) and fitted once at the highest order the merged sample allows, so every axis extrapolates and the
-          // head no longer depends on the reduction (Si 4^3: 8.2719 / 8.2730 / 8.2720 / 8.2728 on the full, point-group,
-          // time-reversal and fully symmetric meshes). "perdir" in div_treatment restores the historic per-direction
-          // sampling, for reproducing numbers published before 2026-09-22.
+          // The six per-direction samples are taken from the IBZ q LIST, so WHICH points the fit sees depends on how
+          // the mesh was reduced -- and eps^-1(q) = eps^-1(-q), so +b_i and -b_i are the SAME physical sample. On a
+          // Gamma-centered 4^3 mesh the full list gives +b_i two points (a linear fit in |q|^2) and -b_i one (the
+          // zone-boundary point folds onto the positive side, so that direction does NOT extrapolate at all), and
+          // averaging the six mixes the two; a time-reversal reduction drops the -b_i half entirely, so every surviving
+          // direction extrapolates and the head changes noticeably.
+          // The default is therefore the AXIS FOLD: the two sides of each axis are MERGED (deduplicated by |q|^2,
+          // closest first) and fitted once at the highest order the merged sample allows, so every axis extrapolates
+          // and the head does not depend on the reduction (full, point-group, time-reversal and fully symmetric meshes
+          // agree). "perdir" in div_treatment selects the per-direction sampling, for reproducing results obtained
+          // with it.
           const bool axis_fold = (div_treatment.find("perdir") == std::string::npos);
           if (axis_fold) {
             int naxis = 0;

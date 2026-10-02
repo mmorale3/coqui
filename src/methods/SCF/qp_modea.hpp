@@ -22,21 +22,20 @@
 #define COQUI_QP_MODEA_HPP
 
 /**
- * Project 2 (qpGW+BSE+EDMFT) increment QM3 -- the MODE-A quasiparticle map, live in the
- * qp/ev scf loops (spec notes/qm3_mode_a_loop_spec.md).
+ * The MODE-A quasiparticle map, used in the qp/ev scf loops.
  *
  *     V^xc_ab(s,k) = 1/2 [ Sigma^c_ab(s,k; eps_a) + Sigma^c_ab(s,k; eps_b) ]
  *
  * assembled in the MO basis of the current outer iteration, with Sigma^c evaluated at REAL
- * quasiparticle energies by the QM2 contour-deformation kernel (sigma_route_b::sigma_cd) --
+ * quasiparticle energies by the contour-deformation kernel (sigma_route_b::sigma_cd) --
  * no analytic continuation anywhere. The existing Hermitize + MO -> primary tail of
  * qp_approx is reused unchanged.
  *
  * =====================================================================================
  * DERIVATION 1 -- MOMENTUM / SPIN / PREFACTOR ROUTING
- * [verified: re-derived mechanically FROM the production GW assembly, thc_gw.icc:341-410
- *  together with thc_solver_comm's primary_to_aux (:384-450) and aux_to_primary (:458-520);
- *  every factor is pinned by the QM3-b anchor gate]
+ * [verified: re-derived mechanically FROM the production GW assembly in thc_gw.icc together
+ *  with thc_solver_comm's primary_to_aux and aux_to_primary; every factor is pinned by the
+ *  tau-anchor check in qp_approx]
  * =====================================================================================
  * The production GW self-energy is, in the THC auxiliary basis,
  *
@@ -48,12 +47,12 @@
  *     Sigma_ef   = sum_PQ conj(X_Pe(ks)) Sigma_PQ(ks) X_Qf(ks)
  *
  * and, for a symmetry-mapped external point ks = ks_to_k(isym, k), the D-matrix rotation
- * back to the IBZ orbital basis (thc_gw.icc:310-317)
+ * back to the IBZ orbital basis (thc_gw.icc)
  *
  *     Sigma_ij(k) = sum_ef conj(D_ei) Sigma_ef(ks) D_fj.
  *
  * Composing the three, and inserting the MO factorizations G_ij(k') = sum_n C_in g_n conj(C_jn)
- * (update_G, qp_scf_common.cpp:130-166 -- unit residues, poles at the CURRENT sE_ska) and
+ * (update_G in qp_scf_common.cpp -- unit residues, poles at the CURRENT sE_ska) and
  * Sigma^MO_ab = sum_ij conj(C_ia) Sigma_ij C_jb, the ENTIRE chain collapses onto two
  * (Np x nbnd) MO collocation matrices,
  *
@@ -62,10 +61,10 @@
  *
  * [the SYMMETRY half of this composition -- the D index order, the absence of any
  *  fractional-translation phase, the proof that the two sides are identical term by term for
- *  ANY D (so D leakage cannot reach the anchor), and the lih223 ladder that measures it --
- *  is derived in the header of wc_band_elements.hpp, section "THE SYMMETRY PATH"]
+ *  ANY D (so D leakage cannot reach the anchor) -- is derived in the header of
+ *  wc_band_elements.hpp, section "THE SYMMETRY PATH"]
  *
- * and the pair vector of the spec,   A_P(k,k'; a,n) = conj(XCe(P,a)) * XCi(P,n),   giving
+ * and the pair vector   A_P(k,k'; a,n) = conj(XCe(P,a)) * XCi(P,n),   giving
  *
  *     Sigma^c_ab(s,k; tau) = -(1/nk) sum_q sum_n g_n(k-q,tau)
  *                              sum_PQ A_P(a,n) W_PQ(q,tau) conj(A_Q(b,n)).
@@ -73,31 +72,31 @@
  * SPIN: the GW loop carries a single spin label through G, W is spin-summed already (it is
  * built from the RPA polarization), and the (s,k) external index is never mixed -- the
  * internal G leg carries the SAME spin as the external one, with no extra factor. Verified
- * by inspection of the isk loop at thc_gw.icc:366-397 (`G_skPQ(is, ...)` at the external
- * `is`) and of the k-space allocation (:255, spin is a plain outer index).
+ * by inspection of the isk loop in thc_gw.icc (`G_skPQ(is, ...)` at the external `is`) and
+ * of the k-space allocation (spin is a plain outer index).
  *
  * PREFACTOR AND THE KERNEL'S OWN SIGN. In tau space Sigma^{(q)}(tau) = -(1/nk) G(tau) W(tau);
  * Fourier of the product gives Sigma^{(q)}(i w_n) = -(1/(nk beta)) sum_m G(i w_n - i nu_m)
  * W(i nu_m), and W^c(i nu) is EVEN in nu (it is the transform of PH-symmetric-half tau data),
- * so the -i nu_m may be written +i nu_m. Comparing with the QM2 definition
+ * so the -i nu_m may be written +i nu_m. Comparing with the kernel's definition
  * Sigma^c(z) = -(1/beta) sum_m G(z + i nu_m) W^c(i nu_m) -- which is what sigma_cd returns,
  * minus sign INCLUDED -- the per-q contribution is
  *
  *     Sigma^{c,(q)}_ab(z) = (1/nk) * sigma_cd[ residues of W^c_{an,nb}(q, i nu) ].
  *
  * i.e. the band-element residues carry +1/nk, NOT -1/nk: the minus lives inside the kernel.
- * [assumed -- gate: QM3-b anchor] that W^c(i nu) is even to fit accuracy; the fitted rep is
+ * [assumed -- checked by the tau anchor] that W^c(i nu) is even to fit accuracy; the fitted rep is
  * built from, and measured against, the bosonic mesh, so any violation shows up in the
  * logged reconstruction error.
  *
- * TIME REVERSAL (the spec's section 3 HAZARD, resolved). The two in-tree conventions for a
- * trev transfer disagree: embed_eri_t.cpp:2129-2132 uses conj(W_PQ), vertex_sym.hpp:43-46
- * uses a PQ-TRANSPOSE. thc_gw -- the assembly this map must reproduce -- uses conj(W_PQ)
- * (had_prod2_conj / nda::conj at :381-393), so THE CONJ RULE IS THE ONE IMPLEMENTED HERE.
+ * TIME REVERSAL. The two in-tree conventions for a trev transfer disagree: embed_eri_t.cpp
+ * uses conj(W_PQ), vertex_sym.hpp uses a PQ-TRANSPOSE. thc_gw -- the assembly this map must
+ * reproduce -- uses conj(W_PQ) (had_prod2_conj / nda::conj), so THE CONJ RULE IS THE ONE
+ * IMPLEMENTED HERE.
  * The two coincide iff W_PQ is Hermitian, which is asserted nowhere; the context build
  * MEASURES max|W - W^dag| / max|W| on the stored data every outer iteration and logs it, and
- * the anchor gate would catch a wrong choice at O(1). Unified branch table, read off
- * thc_gw.icc:377-395:
+ * the anchor check would catch a wrong choice at O(1). Unified branch table, read off
+ * thc_gw.icc:
  *
  *     wconj = qp_trev(q');   kk = wconj ? qk_to_k2(qminus(qs), ks) : qk_to_k2(qs, ks);
  *     gconj = kp_trev(kk);   kg = gconj ? kp_trev_pair(kk) : kk;
@@ -131,7 +130,7 @@
  * THE POLE CLOSURE AND WHAT IS CACHED
  * =====================================================================================
  * With W^c_{an,nb}(q, i nu) = sum_p w^(anb)_p / (i nu - om_p) and the unit-residue QP-pole G,
- * the bosonic sum closes (QM2) into
+ * the bosonic sum closes into
  *
  *     Sigma^c_ab(z) = sum_{J,p} M^(J,p)_ab [ n_B(om_p) + f(eps_J) ] / ( z - (eps_J - om_p) )
  *
@@ -170,16 +169,16 @@
 namespace methods {
 namespace qp_modea {
 
-  /** knobs (qp_params_t / toml; spec section 6). */
+  /** knobs (qp_params_t / toml). */
   struct modea_opts {
     std::string route = "cd";          // {cd, expansion}
     long nconsist = 5;                 // inner-consistency cap
     double consist_tol = 1e-8;         // a.u.
     double eta = 0.0;                  // evaluation offset i*eta (stress only)
-    double eta_far = 0.0;              // rev 4: OUT-OF-STRIP offset i*eta_far (0 = mu fallback)
-    // TC-4: the EXPLICIT STRIP WINDOW (qp_modea_strip_lo / qp_modea_strip_hi), HALF-WIDTHS
+    double eta_far = 0.0;              // OUT-OF-STRIP offset i*eta_far (0 = mu fallback)
+    // The EXPLICIT STRIP WINDOW (qp_modea_strip_lo / qp_modea_strip_hi), HALF-WIDTHS
     // below and above mu in a.u. Both 0 (the default) = unset = the E_PH-derived strip
-    // EXACTLY, bit for bit. Both > 0 replaces it with [mu - strip_lo, mu + strip_hi]. It
+    // exactly. Both > 0 replaces it with [mu - strip_lo, mu + strip_hi]. It
     // overrides the STRIP ONLY: gap_edge, the W^c support constraint and the retained pole
     // set are untouched, which is what makes this an evaluation-coverage knob rather than a
     // representation knob. See the note above strip_of.
@@ -187,34 +186,32 @@ namespace qp_modea {
     double strip_hi = 0.0;
     std::string wsupp = "auto";        // {"auto","off",<value in a.u.>}
     std::string wfit = "tau";          // {tau, nu, spectral, contour}
-    // RW-2 (notes/rw_real_axis_w_spec.md): the spectral-quadrature W^c representation.
-    // Active only when wfit == "spectral"; both are FLAGGED agent-chosen defaults.
+    // The spectral-quadrature W^c representation. Active only when wfit == "spectral".
     //   spectral_eta   -- Lorentzian width of the QP-pole spectral function A(w) fed to the
     //                     real-axis chain, a.u. Sets the whole grid stack (dw <= eta/2,
     //                     dOmega <= eta, Nyquist-hard N_t), so cost ~ 1/eta^2 in memory and
-    //                     ~1/eta^2 .. 1/eta^3 in time. 0.0125 is the smallest value of the
-    //                     RW-1 eta series; larger values are cheaper and less accurate, and
-    //                     the Lehmann meter below reports the price.
+    //                     ~1/eta^2 .. 1/eta^3 in time. Larger values are cheaper and less
+    //                     accurate, and the Lehmann meter below reports the price.
     //   spectral_npole -- target number of POSITIVE-Omega quadrature nodes after coarsening
     //                     (the pole count is 2x this, plus the head sector). <= 0 keeps every
     //                     Omega node, which is unaffordable at production Np: the residue
     //                     slabs and the per-(s,k) sandwich are both LINEAR in npk.
-    //   spectral_gamma -- which representation the q = Gamma COLUMN uses. "ls" (default,
-    //                     the Fable ruling of 2026-08-20) puts the WHOLE Gamma column --
-    //                     body plus the eps_inv_head augmentation -- on an appended
-    //                     support-constrained LS pole set, so the one transfer that carries
-    //                     the 1/q^2 head and the largest |W| keeps exactly the production
-    //                     representation. "spectral" instead takes the Gamma BODY from the
-    //                     quadrature like every other q (the real-axis chain is asked to
-    //                     Dyson Gamma, so it is computed, not zeroed) and leaves only the
-    //                     scalar head on appended LS poles. MEASURED on SVO, both maps:
-    //                     "ls" gives Sabs/|Sigma^c| = 6.4e5 (head share 100 %) at the first
-    //                     map, "spectral" gives 2.4-3.6 -- see notes/rw2_report.md section
-    //                     4.5. The default follows the ruling, not the measurement.
+    //   spectral_gamma -- which representation the q = Gamma COLUMN uses. "ls" puts the
+    //                     WHOLE Gamma column -- body plus the eps_inv_head augmentation --
+    //                     on an appended support-constrained LS pole set, so the one
+    //                     transfer that carries the 1/q^2 head and the largest |W| keeps
+    //                     the least-squares representation. "spectral" instead takes the
+    //                     Gamma BODY from the quadrature like every other q (the real-axis
+    //                     chain is asked to Dyson Gamma, so it is computed, not zeroed) and
+    //                     leaves only the scalar head on appended LS poles. On a metal "ls"
+    //                     can need orders of magnitude more cancellation (Sabs/|Sigma^c|)
+    //                     than "spectral". The qp_params_t default (qp_modea_spectral_gamma)
+    //                     is "spectral"; the "ls" value below applies only when modea_opts
+    //                     is built directly.
     std::string spectral_gamma = "ls";
     double spectral_eta = 0.0125;
     long   spectral_npole = 64;
-    double wrtol = -1.0;               // masked-fit SVD cut; < 0 = the shared doctrine value
+    double wrtol = -1.0;               // masked-fit SVD cut; < 0 = the shared default value
     // W^c residue-slab compression (stage 1b of wc_band_elements.hpp). wrank is a RELATIVE
     // eigenvalue cut on each Hermitian slab W^(p)_PQ: <= 0 disables the factorization and
     // takes the dense Np^2 sandwich (the reference path). wsketch selects the factorization
@@ -226,57 +223,57 @@ namespace qp_modea {
     // Cut on the residue-weighted part of a retained slab direction that the shared basis
     // does not already span, scaled by the largest slab of the q: < 0 disables the
     // restructure (the per-slab stage-1b path -- THE DEFAULT), 0 takes wrank, > 0 is that
-    // tolerance. Measured in that file's header: R/Np is 1.00 at 1e-10 and 0.81 at 1e-8, so
-    // the restructure has nothing to compress at the accuracy class the gates require.
+    // tolerance. At tight cuts the union basis spans nearly all of Np, so the restructure
+    // only pays at looser cuts (see that file's header).
     double wunion = -1.0;
-    // ---- increment TC-2: the tilted-contour route (wfit == "contour") ----------
+    // ---- the tilted-contour route (wfit == "contour") ----------
     // Documented on qp_params_t.h; inert for every other wfit.
     double      tc_eps = 1e-6;
-    double      tc_delta = 0.0;        // a.u.; 0 = the eq-8 recipe (1.2 W_band/N_k floor)
+    double      tc_delta = 0.0;        // a.u.; 0 = the default recipe (1.2 W_band/N_k floor)
     double      tc_rho = 0.65;
     std::string tc_profile = "flat";   // {flat, growing}
     bool        tc_trunc = false;      // band truncation along the contour
-    // TC-3/TC-4: the per-block band factors B_J(P,a) the eq-1 residue source sandwiches
+    // The per-block band factors B_J(P,a) the residue source sandwiches
     // an arbitrary W^c with -- see modea_ctx::cd_band_store. TWO representations:
     //   "recompute" (the PRODUCTION default) keeps only the two ingredients B is a product
     //     of, XCe (nsym x Np x nbnd) and XCi (ns*nkpts x Np x nbnd, ONE copy shared by
     //     every owned block), and forms B_J on demand at Np*nbnd flops -- 0.06 % of the
     //     Np^3 Dyson solve that consumes it.
-    //   "store" materializes B at nJ x Np x nbnd complex per owned block, which is 1 MB on
-    //     qe_lih222 and ~1.25 GB at (64 k-points, Np 364, nbnd 60).
+    //   "store" materializes B at nJ x Np x nbnd complex per owned block, which is ~1 MB on
+    //     a small fixture and ~1.25 GB at (64 k-points, Np 364, nbnd 60).
     //   "auto" (default) takes "store" when cd_bstore_cap_gb admits it and "recompute"
     //     otherwise -- i.e. recompute unless a cap was set deliberately.
     // cd_bstore_cap_gb is that cap, in GB per owned (s,k) block; <= 0 = no store.
     std::string cd_bfactor = "auto";   // {auto, store, recompute}
     double      cd_bstore_cap_gb = 0.0;
-    // TC-4: the residue-evaluation BATCH budget, in MB. It caps how many residue targets
+    // The residue-evaluation BATCH budget, in MB. It caps how many residue targets
     // one batched call carries, hence the (nt x Np^2) transform buffer inside the contour
     // source -- which that source ALLOCATES ONCE and reuses -- and the
     // (nt x nbnd x nbnd) sandwich buffer here. 64 MB is ~15 targets at (Np 364,
     // nbnd 60). Results do not depend on it beyond the gemm reassociation class.
     double      cd_batch_mb = 64.0;
-    // TC-3 line-solver knobs (qp_tc_krylov / qp_tc_krylov_tol). The economics: the
+    // Line-solver knobs (qp_tc_krylov / qp_tc_krylov_tol). The economics: the
     // DIAGONAL path needs nbnd right-hand sides per (q, z) and warm-started GMRES wins
-    // (measured ~5 iterations per solve); a full qpscf block needs nbnd^2 and the dense
+    // (a few iterations per solve); a full qpscf block needs nbnd^2 and the dense
     // inverse amortizes. Default dense = the reference path.
     bool        tc_krylov = false;
     double      tc_krylov_tol = 1e-12;
-    // ---- TC-5: the amortized W^c tile cache (methods/SCF/wc_grid.hpp) ----------
-    // THE KNOB IS THE TARGET, NOT THE SPACING: h is derived from the measured
-    // sizing law dSigma = K (h/delta)^p / delta. 0 disables the cache and restores
+    // ---- the amortized W^c tile cache (methods/SCF/wc_grid.hpp) ----------
+    // THE KNOB IS THE TARGET, NOT THE SPACING: h is derived from the empirical
+    // sizing law dSigma = K (h/delta)^p / delta. 0 disables the cache and uses
     // the per-target Dyson path exactly.
-    double      wgrid_mev = 1.0;        // absolute residue-tier target, meV
+    double      wgrid_mev = 1.0;        // absolute residue accuracy target, meV
     double      wgrid_h = 0.0;          // EXPERT: h in a.u.; > 0 bypasses the law
     long        wgrid_audit = 16;       // audit samples per (q, iteration); 0 = off
     bool        wgrid_audit_hard = true;// abort on a >10x breach
-    long iter = 1;                     // outer iteration (1 => Route-A root refinement)
+    long iter = 1;                     // outer iteration
     int level = 2;                     // logging level for the per-iteration banner
   };
 
   /**
-   * Last-run diagnostics, for gates and post-mortems. This is a REPORTING hook only -- no
-   * code path branches on it. Gate QM3-b reads it to tabulate the anchor / delta_i / gap
-   * triples of spec section 7(v) without having to parse the run log.
+   * Last-run diagnostics, for tests and post-mortems. This is a REPORTING hook only -- no
+   * code path branches on it. Tests read it to tabulate the anchor / delta_i / gap
+   * triples without having to parse the run log.
    */
   struct last_run_t {
     double anchor = -1.0;          // max rel dev of route-B Sigma^c vs the solver Sigma(i w)
@@ -287,28 +284,28 @@ namespace qp_modea {
     double gap_edge = 0.0, rec_rel = -1.0, wall_s = 0.0, mem_mb = 0.0;
     double res_ratio = -1.0;       // max|c| / max|F| of the production W^c fit (worst q)
     double wrtol = -1.0;           // SVD cut actually used by that fit
-    // the gap-window A/B harness read at the INCOMING energies (before the inner loop):
+    // the gap-window route-A/route-B harness read at the INCOMING energies (before the inner loop):
     double delta_in = -1.0;        // max delta_i    over HOMO-1..LUMO+1
     double class_in = -1.0;        // max class_i    over the same states
     double ratio_in = -1.0;        // max delta_i/class_i over the same states
-    double tau_dev = -1.0;         // THE GATE quantity (spec rev 2)
+    double tau_dev = -1.0;         // THE GATE quantity (tau anchor)
     long n_fallback = 0;           // mode_b diagonal states demoted to z = mu
-    // mode_a STRIP CLAMP census (rev 3 addendum item 2), last outer iteration, last sweep:
+    // mode_a STRIP CLAMP census, last outer iteration, last sweep:
     long n_clamp = 0;              // evaluation energies OUT OF STRIP (mu-fallback or eta_far)
     long n_clamp_win = 0;          // ... of which are gap-window states
-    // rev 4 (graded-eta far-state evaluation):
+    // graded-eta far-state evaluation:
     double eta_far = 0.0;          // the knob in force, a.u.
     long n_eta = 0;                // out-of-strip evaluations taken at eps + i*eta_far
     double im_off = 0.0;           // max|Im Sigma^c| over those (PHYSICS, never an error)
     double anti_in = -1.0;         // max|V - V^dag|/max|V| over IN-STRIP elements only
     double spacing = 0.0;          // worst local fitted-pole spacing at an eta evaluation
-    long n_homo_clamp = 0;         // (s,k) blocks whose per-k HOMO was clamped -- THE JUDGE
-    long n_lumo_clamp = 0;         // (s,k) blocks whose per-k LUMO was clamped -- THE JUDGE
+    long n_homo_clamp = 0;         // (s,k) blocks whose per-k HOMO was clamped
+    long n_lumo_clamp = 0;         // (s,k) blocks whose per-k LUMO was clamped
     long n_eval = 0, n_blocks = 0;
     bool converged_inner = false;  // every block's inner-consistency loop met consist_tol
     long iters = 0, n_support = 0, np_total = 0, nJ = 0, npk = 0;
     std::string wfit;
-    // RW-2 spectral census (zero unless wfit == "spectral")
+    // spectral-quadrature census (zero unless wfit == "spectral")
     double sp_eta = 0.0, sp_width = 0.0, sp_sym = 0.0, sp_psdneg = 0.0;
     double sp_headrec = 0.0, sp_wall = 0.0;
     long   sp_NO = 0, sp_nbin = 0, sp_nhead = 0;
@@ -325,7 +322,7 @@ namespace qp_modea {
     double union_tail = 0.0;       // worst per-slab 2-norm projection residual / max|s|
     double union_frob = 0.0;       // worst per-slab Frobenius projection residual
     double t_union = 0.0;          // stage-1c wall time
-    // ---- TC-5 grid audit, harvestable from the [Q6] line as `wgrid_aud` ----
+    // ---- grid audit, reported in the [qpGW summary] line as `wgrid_aud` ----
     // -1 = the cache was off (qp_tc_wgrid_mev = 0) or the audit was disabled.
     double wgrid_meas_mev = -1.0;  // MEASURED residue-tier error
     double wgrid_pred_mev = -1.0;  // what the sizing law predicted
@@ -333,39 +330,37 @@ namespace qp_modea {
     double wgrid_worst_z = 0.0;    // ... and its Re z (a.u.)
     long Np = 0;                   // THC auxiliary basis size (the compression denominator)
     // the slab rank ladder: max / mean retained rank over (q,p) at the FIXED tolerances
-    // detail::wrank_ladder = {1e-2, 1e-4, 1e-6, 1e-8, 1e-10}. THE low-rank measurement --
-    // whether r saturates with Np decides whether this compression reaches production.
+    // detail::wrank_ladder = {1e-2, 1e-4, 1e-6, 1e-8, 1e-10}. Whether r saturates with Np
+    // decides whether the low-rank compression pays.
     std::array<long, 5> lad_max{};
     std::array<double, 5> lad_mean{};
   };
   inline last_run_t &last_run() { static last_run_t x; return x; }
 
-  /** rev-1 i w anchor threshold. RETAINED for the logged diagnostic only -- NOT a gate;
-   *  see the tau anchor below and notes/qm3_mode_a_loop_spec.md rev 2. */
+  /** i w anchor threshold. Used for the logged diagnostic only -- NOT a gate;
+   *  see the tau anchor below. */
   inline constexpr double modea_anchor_gate = 1e-2;
 
-  /** THE GATE (spec rev 2): the tau-domain anchor, in units of the W-fit reconstruction
-   *  class. Measured headroom on lih222 is three orders, so 10x is generous. NOT a tunable. */
+  /** THE GATE: the tau-domain anchor, in units of the W-fit reconstruction class. The
+   *  typical headroom is orders of magnitude, so 10x is generous. NOT a tunable. */
   inline constexpr double modea_tau_anchor_mult = 10.0;
 
   /**
    * ---------------------------------------------------------------------------------------
-   * per-external-(s,k) cached residue slab -- ENCAPSULATED (F6 part 2, TC-4)
+   * per-external-(s,k) cached residue slab -- ENCAPSULATED
    * ---------------------------------------------------------------------------------------
    * M(a, b, P) with the flat pole index P = (q'*nbnd + n)*npk + p, 1/nk folded in.
    *
    * ⚠ WHY THIS IS A CLASS AND NOT A STRUCT WITH A PUBLIC ARRAY.
    * This store is the mode-A memory wall (∝ nbnd^3, owner-only) and, through its
-   * contraction, the serialization wall (∝ nbnd^4) that stalled the nb100 legs and the m3d
-   * SVO map (notes/tc4_si_tier.md §13). The fix is to PARTITION P across the block's helper
-   * group, which turns every read into a partial sum needing a collective -- and a partial
-   * sum whose collective is MISSED, in a branch no gate reaches, is a silent hang. That is
-   * the m3d/thc.Z failure one level up.
+   * contraction, the serialization wall (∝ nbnd^4) at large band counts. The remedy is to
+   * PARTITION P across the block's helper group, which turns every read into a partial sum
+   * needing a collective -- and a partial sum whose collective is MISSED, in a branch no
+   * test reaches, is a silent hang.
    *
-   * When M was a public array the consumer list was "whatever grep finds", and grep found
-   * NINE sites across three files and TWO routes (mode A and mode B). It is private now so
-   * that the COMPILER enumerates them: every read must go through one of the accessors
-   * below, each of which carries an explicit collective contract.
+   * The array is private so that the COMPILER enumerates its consumers (they span several
+   * files and both routes, mode A and mode B): every read must go through one of the
+   * accessors below, each of which carries an explicit collective contract.
    *
    *   pole(a,b,P) / pole_diag(i,P)   LOCAL reads. Under slicing, valid only for P inside
    *                                  this rank's range -- checked when sliced.
@@ -377,9 +372,8 @@ namespace qp_modea {
    *                                  index and NOT by per-state work.
    *   alloc_poles / add_pole         stage 2 of build_modea_context ONLY.
    *
-   * THIS INCREMENT IS ENCAPSULATION ONLY: no slicing is performed, `sliced()` is false
-   * everywhere, and every accessor reduces to exactly the loop it replaced -- bit for bit
-   * (gate: the whole suite, @@MODEA_GAP and the F6 pins reproduce with zero change).
+   * No slicing is performed yet: `sliced()` is false everywhere, and every accessor
+   * reduces to the plain loop over the full P range.
    */
   class sk_block {
    public:
@@ -429,21 +423,21 @@ namespace qp_modea {
     bool has_poles() const { return M_.size() > 0; }
 
     /**
-     * ⚠ THE ONE CHECKPOINT (F6 part 2 entry point; not called yet).
+     * ⚠ THE ONE CHECKPOINT (entry point of P-slicing; not called yet).
      * Declaring a slice is the ONLY way to become sliced, so this is where the stored
      * band-factor incompatibility is caught -- a hard abort naming the reason, not an
      * unsupported-by-convention state.
      */
     void set_slice(long P0, long P1, bool band_factors_stored) {
       utils::check(not band_factors_stored,
-                   "qp_modea (F6): a P-SLICED residue store cannot be combined with STORED "
+                   "sk_block::set_slice: a P-SLICED residue store cannot be combined with STORED "
                    "band factors (qp_tc_bfactor = \"store\"). B is nJ x Np x nbnd and is NOT "
                    "sliced, so a sliced run would keep the FULL B on every rank and "
                    "re-create the very memory wall the slice exists to remove. Use "
                    "qp_tc_bfactor = \"auto\" or \"recompute\" (the production default), or "
                    "slice B over J in step with the residue store first.");
       utils::check(P0 >= 0 and P1 <= nP_total_ and P0 <= P1,
-                   "qp_modea (F6): slice [{}, {}) out of range for nP = {}.",
+                   "sk_block::set_slice: slice [{}, {}) out of range for nP = {}.",
                    P0, P1, nP_total_);
       P_lo_ = P0;
       P_hi_ = P1;
@@ -453,7 +447,7 @@ namespace qp_modea {
    private:
     long local(long P) const {
       utils::check(P >= P_lo_ and P < P_hi_,
-                   "qp_modea (F6): pole index {} is outside this rank's slice [{}, {}). A "
+                   "sk_block: pole index {} is outside this rank's slice [{}, {}). A "
                    "LOCAL accessor was used for a pole this rank does not hold.",
                    P, P_lo_, P_hi_);
       return P - P_lo_;
@@ -481,8 +475,8 @@ namespace qp_modea {
     // predicts (see the error budget note in wc_band_elements.hpp)
     double rec_budget = 0.0;
     double fit_err_worst = 0.0;        // worst-q fit residual ON ITS OWN grid (NOT a quality
-                                       // number -- see binding requirement 3)
-    // ---- RW-2 spectral path (all zero on the tau/nu routes) ----------------------------
+                                       // number: a fit always matches its own nodes well)
+    // ---- spectral-quadrature path (all zero on the tau/nu routes) ----------------------
     double sp_eta = 0.0;               // qp_modea_spectral_eta in force
     long   sp_NO = 0, sp_Nw = 0, sp_Nt = 0;   // the derived real-axis grid
     long   sp_nbin = 0;                // positive-Omega poles after coarsening
@@ -509,10 +503,10 @@ namespace qp_modea {
     double wtrunc_frob_worst = 0.0;    // worst Frobenius-relative discarded weight
     double wanti_worst = 0.0;          // worst max|W - W^dag| / max|W| of a residue slab
     double t_fit = 0.0, t_fac = 0.0, t_sand = 0.0;
-    // ---- the SYMMETRY path census (2026-08-13) -----------------------------------------
+    // ---- the SYMMETRY path census -----------------------------------------------------
     // The external-leg rotation XCe = X(ks) D(isym,k) C(k) is exercised only where the
     // stored D is NOT the identity: generate_dmatrix stores the identity for the symmetry
-    // that DEFINES the image k-point's orbitals (symmetry.hpp:906-921), so a reduced mesh
+    // that DEFINES the image k-point's orbitals (symmetry.hpp), so a reduced mesh
     // can run the whole isym loop with D = 1 everywhere and never test the rotation. These
     // two numbers say whether a given run did.
     long n_D_nonid = 0;                // (isym, k) pairs with a non-identity stored D
@@ -522,9 +516,9 @@ namespace qp_modea {
 
   /**
    * The mode-A evaluator context: everything Sigma^c needs at ARBITRARY z, frozen for the
-   * whole inner-consistency loop (spec section 4).
+   * whole inner-consistency loop.
    */
-  struct cd_line_ctx;                  // TC-3, defined below
+  struct cd_line_ctx;                  // the contour line evaluator, defined below
 
   struct modea_ctx {
     bool active = false;
@@ -546,8 +540,8 @@ namespace qp_modea {
     nda::array<ComplexType, 4> Mdiag;
     bool have_diag = false;
 
-    // ---- TC-3/TC-4: the CONTOUR residue source's per-block band factors ---------------
-    // The eq-1 residue term needs <aJ|W^c(q_J, z)|Jb> at targets z that move inside the
+    // ---- the CONTOUR residue source's per-block band factors ---------------------------
+    // The CD residue term needs <aJ|W^c(q_J, z)|Jb> at targets z that move inside the
     // self-consistency loop, so the sandwich cannot be precomputed the way blk.M is. What
     // it needs per internal state J = q'*nbnd + n is the band-pair factor
     //     B_J(P, a) = conj(XCe(isym(q'), P, a)) * u(P, n),
@@ -556,7 +550,7 @@ namespace qp_modea {
     //
     // TWO REPRESENTATIONS, and the production one is the RECOMPUTE path:
     //   * `stored` = true materializes B at nJ x Np x nbnd complex per owned block --
-    //     1 MB on qe_lih222, ~1.25 GB at (64 k-points, Np 364, nbnd 60). Guarded by
+    //     ~1 MB on a small fixture, ~1.25 GB at (64 k-points, Np 364, nbnd 60). Guarded by
     //     `modea_opts::cd_bstore_cap_gb`, which is 0 by default.
     //   * `stored` = false keeps only the FACTORS: XCe at nsym x Np x nbnd per block and
     //     XCi at ns*nkpts x Np x nbnd shared by every block on the rank (22 MB at the
@@ -564,8 +558,8 @@ namespace qp_modea {
     //     forms B_J on demand -- Np*nbnd complex mults, against the Np^3 Dyson solve that
     //     consumes it, so it does not appear in any profile.
     //   The recompute path produces the SAME EXPRESSION, term by term, so the two agree
-    //   bitwise (gate: the [TC-4 F5] leg of tc3b1_identity_lih222, which scores B
-    //   itself and Sigma^c through the same contour, both at 0.000e+00).
+    //   bitwise (checked by the unit test tc3b1_identity_lih222, which compares B itself
+    //   and Sigma^c through the same contour).
     //
     // The bookkeeping below is filled for EVERY (isym, q) pair of the block's star,
     // independently of which pairs this rank computed sandwiches for -- it costs nsym
@@ -608,7 +602,7 @@ namespace qp_modea {
     double cd_pref = 0.0;              // 1/nkpts, folded in by the residue source
     bool have_bstore = false;
 
-    // TC-3: the eq-1 CD line evaluator, when qp_modea_wfit = "contour". Holds the
+    // The CD line evaluator, when qp_modea_wfit = "contour". Holds the
     // residue source as a std::function whose closure OWNS the contour objects (the
     // sampled Pi, the transform factorization), so the context is self-contained once
     // build_modea_context returns. `have_cdl` is what modea_vxc_cd dispatches on.
@@ -621,7 +615,7 @@ namespace qp_modea {
       return -1;
     }
 
-    // ---- SYMMETRY BOOKKEEPING (the per-isym anchor breakdown, 2026-08-13) --------------
+    // ---- SYMMETRY BOOKKEEPING (the per-isym anchor breakdown) --------------------------
     // Every full-BZ transfer q' is handled by EXACTLY ONE (isym, q-in-star) pair of the
     // thc_gw star loop, so the flat internal label J = q'*nbnd + n inherits that pair's
     // symmetry class. q_isym(q') is that class (0 = identity, the qsymms POSITION), which
@@ -645,7 +639,7 @@ namespace qp_modea {
     /**
      * The pole weights (n_B(om_p) + f(eps_J)) / (z - (eps_J - om_p)) flattened as
      * P = J*npk + p, for one (s,k) and one ABSOLUTE evaluation point z. Also returns the
-     * smallest denominator met (the "min_den" tripwire of spec section 1).
+     * smallest denominator met (the "min_den" tripwire).
      */
     double pole_weights(long is, long ik, ComplexType z,
                         nda::array<ComplexType, 1> &w) const {
@@ -663,18 +657,18 @@ namespace qp_modea {
     }
 
     /**
-     * THE VALIDITY FLOOR MEASUREMENT (spec rev 4): the local spacing of the fitted Sigma^c
+     * THE VALIDITY FLOOR MEASUREMENT: the local spacing of the fitted Sigma^c
      * poles E_{Jp} = eps_J - om_p around a real energy x, as a MEAN SPACING in a.u.
      *
-     * Rev 4 requires eta_far to exceed the local pole spacing, or the evaluation rides a
+     * eta_far must exceed the local pole spacing, or the evaluation rides a
      * single fitted pole instead of sampling the eta-smoothed spectral density. The measure
      * used here is the MEAN spacing inside a fixed window, not the minimum adjacent gap: the
      * pole set has near-degenerate members by construction (every eps_J is offset by the SAME
      * om_p set, so accidental coincidences are generic), and a minimum gap is therefore ~0
      * everywhere and would warn unconditionally. The mean spacing is the number that decides
      * whether i*eta averages over many poles, which is what the criterion is about.
-     * [agent-chosen window; FLAGGED. The global mean spacing is the fallback when the window
-     *  holds fewer than two poles, and both are logged.]
+     * [The window width is a heuristic choice. The global mean spacing is the fallback when
+     *  the window holds fewer than two poles, and both are logged.]
      */
     double pole_spacing(long is, long ik, double x, double halfwidth) const {
       const long off = (is * nk + ik) * nJ;
@@ -697,7 +691,7 @@ namespace qp_modea {
 
   /** window half-width (a.u., ~1.4 eV) of the local pole-spacing measure above. */
   inline constexpr double modea_spacing_window = 0.05;
-  /** rev 4: eta_far must exceed this multiple of the measured local spacing (warn only). */
+  /** eta_far must exceed this multiple of the measured local spacing (warn only). */
   inline constexpr double modea_eta_far_mult = 3.0;
 
   // ---------------------------------------------------------------------------------------
@@ -707,7 +701,7 @@ namespace qp_modea {
   /**
    * E_PH = min_{f<1/2} eps - max_{f>=1/2} eps over the CURRENT QP spectrum: the indirect
    * particle-hole excitation minimum, below which W^c has no spectral weight. Prior physical
-   * information, not a tuned regularization (spec section 2).
+   * information, not a tuned regularization.
    */
   inline double ph_gap_edge(nda::MemoryArrayOfRank<3> auto const &E_ska, double mu) {
     double lo = -1e300, hi = 1e300;   // top of occupied, bottom of empty
@@ -739,7 +733,7 @@ namespace qp_modea {
         app_warning("qp_modea: the current QP spectrum has a particle-hole gap of {:.4g} a.u. "
                     "(<= {:.1g}); the W^c support constraint is DISABLED for this iteration "
                     "(metallic or degenerate). Route B at real z is then exposed to auxiliary "
-                    "nodes inside the gap -- see notes/qm2_route_b_finite_t_spec.md.", ge,
+                    "nodes inside the gap.", ge,
                     floor_au);
         return 0.0;
       }
@@ -752,7 +746,7 @@ namespace qp_modea {
 
   /**
    * Same, but clamped so that the constraint can never empty the auxiliary basis. A gap edge
-   * larger than the auxiliary grid's outermost node retains ZERO columns, which used to abort
+   * larger than the auxiliary grid's outermost node retains ZERO columns, which would abort
    * deep inside the least squares with a confusing message; it happens when a diverged QP
    * spectrum feeds "auto". Falls back to the unconstrained fit with a warning that names the
    * real cause.
@@ -784,50 +778,44 @@ namespace qp_modea {
     double min_den = 1e300;      // smallest |z - (eps_J - om_p)| met
     double anti_herm = 0.0;      // max|V - V^dag| / max|V| of the RAW map
     bool converged = false;
-    // WHERE the closest real-axis pole was met (the spec's min_den tripwire, resolved):
+    // WHERE the closest real-axis pole was met (the min_den tripwire, resolved):
     long min_den_a = -1;         // external state
     double min_den_ea = 0.0;     // its eps_a - mu  (a.u.)
     double vmax = 0.0;           // max|V^xc| of the last raw map
   };
 
   // ---------------------------------------------------------------------------------------
-  //  THE STRIP CLAMP  (spec rev 3 ADDENDUM item 2, 2026-08-12)
+  //  THE STRIP CLAMP
   // ---------------------------------------------------------------------------------------
   /**
    * Mode A needs Sigma^c at the quasiparticle energy of EVERY state, including states far
    * outside the analyticity strip (VBM - E_PH, CBM + E_PH), where the exact Sigma^c has
-   * genuine spectral weight and the finite fitted pole set is dense: that is the measured
-   * cause of the rev-1 inner-loop divergence (max|d eps| ~ 1e4-1e5 a.u.; no fit or eta knob
-   * cell cured it). The rev-3.1 convention (MEASURED, see the reversal note below):
+   * genuine spectral weight and the finite fitted pole set is dense: evaluating there makes
+   * the inner loop diverge, and no fit or eta setting cures it. The convention used:
    *
    *     z_i = eps_i                                  if eps_i is inside the strip
    *     z_i = mu                                     otherwise
    *
    * applied to BOTH indices of 1/2 [Sigma(eps_a) + Sigma(eps_b)]. In-strip states are exact
    * mode A (eta -> 0); out-of-strip states are evaluated at the Fermi level -- the SAME
-   * fallback mode_b uses for its out-of-strip diagonals, which converges on both fixtures.
+   * fallback mode_b uses for its out-of-strip diagonals.
    * The strip itself is the same prior information (the particle-hole edge E_PH of the
    * current QP spectrum) that the W^c support constraint and the mode_b strip test use.
    *
-   * ⚠ REVERSAL OF THE FIRST READING (rev 3 addendum item 2 -> rev 3.1, both measured here
-   * on 2026-08-12). The first implementation clamped to the strip BOUNDARY. On qe_lih222
-   * that is fatal: with margin 0.05 E_PH = 0.14 eV the boundary sits INSIDE the fitted-pole
-   * pile-up (min_den 3.9e-05 a.u. against a nominal clearance of 5.2e-03, fit residue ratio
-   * 6.0e+03), the 125 of 128 states evaluated there returned |V^xc| of 10-19 eV against a
-   * Sigma scale of 0.85 eV at mu, the gap collapsed 2.83 -> 0.18 eV at the second outer
-   * iteration, E_PH -> 0 then disabled BOTH the support constraint and the strip, and the
-   * rev-1 divergence followed (final gap -9.6e+03 eV). si222, whose judge states are never
-   * clamped, was unaffected (9.248928 eV, 0.0006 eV from ac_pade). mu is the only evaluation
-   * point whose analytic quality the fit guarantees.
+   * WHY mu AND NOT THE STRIP BOUNDARY. Clamping to the strip BOUNDARY is unstable: with a
+   * small margin the boundary sits INSIDE the fitted-pole pile-up (min_den orders of
+   * magnitude below the nominal clearance), the states evaluated there return |V^xc| far
+   * above the Sigma scale at mu, the gap collapses within a few outer iterations, E_PH -> 0
+   * then disables BOTH the support constraint and the strip, and the inner loop diverges.
+   * mu is the only evaluation point whose analytic quality the fit guarantees.
    *
    * [verified: bounded by construction -- mu keeps a clearance of at least gap_edge from the
-   *  nearest pole of the support-constrained rep, so the inner-consistency loop of section 4
-   *  is retained.]
+   *  nearest pole of the support-constrained rep, so the inner-consistency loop is retained.]
    * [assumed: Sigma^c(mu) is an acceptable stand-in for the true Sigma^c of a far state --
-   *  gate: the clamp census (judge states must show 0 clamps) + the gap table + the dmax /
-   *  gap / converged REQUIREs of the fixture gate. NOTE the tau anchor is VACUOUS once a
-   *  spectrum has collapsed: the reconstruction class it is normalized against blows up in
-   *  step with it. Those three REQUIREs are what catch this failure mode.]
+   *  checked by the clamp census (band-edge states must show 0 clamps), the gap table and
+   *  the dmax / gap / converged checks of the unit tests. NOTE the tau anchor is VACUOUS once
+   *  a spectrum has collapsed: the reconstruction class it is normalized against blows up in
+   *  step with it. Those checks are what catch this failure mode.]
    *
    * The clamp is INACTIVE when the support constraint itself is off (gap_edge = 0, i.e.
    * metallic / degenerate / qp_modea_wsupp = "off"): there is then no strip to speak of, and
@@ -835,27 +823,24 @@ namespace qp_modea {
    */
   /**
    * ---------------------------------------------------------------------------------------
-   * REV 4 (2026-08-13): GRADED-eta FAR-STATE EVALUATION -- the knob qp_modea_eta_far
+   * GRADED-eta FAR-STATE EVALUATION -- the knob qp_modea_eta_far
    * ---------------------------------------------------------------------------------------
-   * The judge verdict on kp222 (matched heads) put mode_a == mode_b at 3.714/1.219 eV against
-   * a real-axis reference series of 3.10-3.37/0.70-0.94 eV, with a tau oracle of 2.6e-08
-   * (per-element normalization, retired 2026-08-13 -- see "THE GATE'S NORMALIZATION" in
-   * wc_band_elements.hpp; the block-normalized value is smaller) at
-   * production: the contraction is right and the 0.35/0.45 eV offset is ENTIRELY the mu
-   * fallback of the 471 out-of-strip evaluations (per-k HOMO 7 of 8, LUMO 5 of 8 at
-   * E_PH = 1.22 eV). The reference's own far-state object is Re Sigma(eps + i eta), so ours
-   * must be too:
+   * With the mu fallback alone, band edges that fall out of the strip are biased: the tau
+   * oracle can confirm that the contraction is right while the gaps still deviate from a
+   * real-axis reference, the offset coming entirely from the out-of-strip evaluations at mu.
+   * A real-axis reference evaluates far states as Re Sigma(eps + i eta), so this map can
+   * too:
    *
    *     z_i = eps_i                       in strip   (eta -> 0, EXACT -- better than the
    *                                                   reference, which broadens everywhere)
    *     z_i = eps_i + i eta_far           out of strip, when qp_modea_eta_far > 0
-   *     z_i = mu                          out of strip, when qp_modea_eta_far = 0  (rev 3.1)
+   *     z_i = mu                          out of strip, when qp_modea_eta_far = 0
    *
-   * eta_far = 0 is the DEFAULT and reproduces rev 3.1 BIT-FOR-BIT (gate). The uniform stress
+   * eta_far = 0 is the DEFAULT (the mu fallback above). The uniform stress
    * knob qp_modea_eta rides on top of both branches, so the far-state offset composes as
    * eta + eta_far; with the production eta = 0 they coincide.
    *
-   * The rev-3.1 clamp-to-mu diagnosis is unchanged and is WHY eta_far exists rather than a
+   * The clamp-to-mu reasoning above is WHY eta_far exists rather than a
    * clamp to the strip boundary: the boundary sits inside the fitted-pole pile-up, whereas
    * eps + i eta_far keeps a clearance of eta_far from EVERY pole by construction (|z - E| >=
    * |Im z| = eta_far), which is the same bounded-evaluation property mu has, at the physically
@@ -866,10 +851,10 @@ namespace qp_modea {
   struct strip_t {
     double lo = 0.0, hi = 0.0, mu = 0.0;
     double eta = 0.0;                 // uniform evaluation offset (qp_modea_eta)
-    double eta_far = 0.0;             // rev 4 far-state offset (qp_modea_eta_far)
+    double eta_far = 0.0;             // far-state offset (qp_modea_eta_far)
     bool active = false;
     bool in_strip(double e) const { return (not active) or (e >= lo and e <= hi); }
-    /** the rev-3.1 REAL evaluation energy (out-of-strip -> mu). Retained because the A-side
+    /** the REAL evaluation energy (out-of-strip -> mu). Kept because the A-side
      *  (route-A) diagnostics can only be evaluated at real energies; with eta_far > 0 it is
      *  Re zeval(e). */
     double clamp(double e, bool *hit = nullptr) const {
@@ -878,7 +863,7 @@ namespace qp_modea {
       if (e < lo or e > hi) { if (hit != nullptr) *hit = true; return mu; }
       return e;
     }
-    /** THE evaluation point (rev 4). `hit` reports "this state is out of the strip". */
+    /** THE evaluation point. `hit` reports "this state is out of the strip". */
     ComplexType zeval(double e, bool *hit = nullptr) const {
       if (hit != nullptr) *hit = false;
       if (in_strip(e)) return ComplexType(e, eta);
@@ -890,28 +875,27 @@ namespace qp_modea {
 
   /**
    * ---------------------------------------------------------------------------------------
-   * TC-4 (2026-08-25): THE EXPLICIT STRIP WINDOW -- qp_modea_strip_lo / qp_modea_strip_hi
+   * THE EXPLICIT STRIP WINDOW -- qp_modea_strip_lo / qp_modea_strip_hi
    * ---------------------------------------------------------------------------------------
    * ⚠ THE DEFAULT STRIP IS METAL-TUNED, AND IT IS WRONG FOR AN INSULATOR QP STUDY.
    *
    * The E_PH-derived strip [VBM - 0.95 E_PH, CBM + 0.95 E_PH] is a window of order the gap,
    * straddling the gap. That is right for a metal, where everything that matters sits within
-   * k_BT of mu. On a gapped system with a wide band window it admits almost nothing:
-   * MEASURED on the TC-4 si444/nb60 legs, 12-15 of 780 states were in strip and the BAND
-   * EDGES THEMSELVES were clamped to mu, so the harvested VBM/CBM/gap metrics were reading
-   * Sigma^c(mu) rather than the contour. Two legs differing by 1.75x in delta agreed to
-   * 0.01 meV because they shared a clamp set. [notes/tc4_si_tier.md section 11]
+   * k_BT of mu. On a gapped system with a wide band window it admits only a few percent of
+   * the states, and the BAND EDGES THEMSELVES can be clamped to mu, so the reported
+   * VBM/CBM/gap then read Sigma^c(mu) rather than the contour -- and runs that differ only in
+   * contour parameters can agree spuriously because they share a clamp set.
    *
-   * This is the same pathology the rev-4 note above diagnosed on kp222; eta_far fixes it by
+   * This is the same pathology the eta_far note above describes; eta_far fixes it by
    * evaluating EVERY out-of-strip state at eps + i eta_far, but that is all-or-nothing and
    * the cost is prohibitive: the residue-target count grows with |eps - mu| (it is the
    * number of internal states between eps and mu, EXACTLY ZERO at mu), so the deep
    * conduction tail dominates and full coverage of a 60-band window is ~10^3 x the residue
-   * work of the clamped run. What is wanted instead is a CHOSEN window: the states the
-   * metric needs evaluated exactly, everything else still clamped and therefore still free.
+   * work of the clamped run. What is wanted instead is a CHOSEN window: the states of
+   * interest evaluated exactly, everything else still clamped and therefore still free.
    *
-   * That is this knob. Both half-widths 0 = unset = the E_PH strip, BIT FOR BIT (gate
-   * `tc_strip_window_default_identity`). Both > 0 replaces the bounds with
+   * That is this knob. Both half-widths 0 = unset = the E_PH strip, exactly (checked by the
+   * unit test `tc_strip_window_default_identity`). Both > 0 replaces the bounds with
    *
    *      strip = [ mu - qp_modea_strip_lo , mu + qp_modea_strip_hi ]
    *
@@ -927,12 +911,11 @@ namespace qp_modea {
    *
    * ⚠ THE KNOWN CAVEAT, stated because it is a real limitation and not a rounding error:
    * states outside the window are still clamped to mu (or to eps + i eta_far), and they
-   * still feed H_eff through self-consistency. The rev-4 kp222 lesson was about METRIC
-   * states being clamped, which a correctly sized window fixes outright; the residual
-   * effect of deep-state clamping is second order for delta-tier DIFFERENCES taken at a
-   * FIXED clamp policy, which is what the TC-4 study measures. A band-structure deliverable,
-   * where every band at every k is the metric, must WIDEN THE WINDOW rather than trust
-   * eta_far to stand in for it.
+   * still feed H_eff through self-consistency. Clamping of the states of interest is fixed
+   * outright by a correctly sized window; the residual effect of deep-state clamping is
+   * second order for energy DIFFERENCES taken at a FIXED clamp policy. A band-structure
+   * calculation, where every band at every k matters, must WIDEN THE WINDOW rather than
+   * trust eta_far to stand in for it.
    */
   inline strip_t strip_of(modea_ctx const &ctx) {
     strip_t s;
@@ -962,11 +945,11 @@ namespace qp_modea {
     long n_eval = 0;             // evaluation energies examined (= nbnd)
     long n_clamp = 0;            // ... of which were OUTSIDE the strip (mu-fallback or eta)
     long n_clamp_win = 0;        // ... of which are gap-window states
-    bool homo_clamp = false;     // this block's per-k HOMO was out of strip (the judge reads it)
+    bool homo_clamp = false;     // this block's per-k HOMO was out of strip
     bool lumo_clamp = false;
     double exc_lo = 0.0;         // worst excursion below the lower bound (a.u., >= 0)
     double exc_hi = 0.0;         // worst excursion above the upper bound (a.u., >= 0)
-    // ---- rev 4 (graded-eta far-state evaluation) ----
+    // ---- graded-eta far-state evaluation ----
     long n_eta = 0;              // out-of-strip evaluations taken at eps + i eta_far
     double im_off = 0.0;         // max|Im Sigma^c| over those evaluations (a.u.) -- PHYSICS
     double anti_in = -1.0;       // max|V - V^dag|/max|V| restricted to IN-STRIP (a,b) pairs
@@ -975,13 +958,13 @@ namespace qp_modea {
 
   /**
    * V^xc_ab = 1/2 [ Sigma_ab(z_a) + Sigma_ab(z_b) ] at the strip evaluation points
-   * z = zeval(eps) (rev 3.1 / rev 4: eps in-strip, mu or eps + i eta_far out-of-strip).
+   * z = zeval(eps) (eps in-strip, mu or eps + i eta_far out-of-strip).
    * D  (a,b) = Sigma_ab(z_a)   -- one gemv per a over the flat pole axis
    * D' (a,b) = Sigma_ab(z_b)   -- one dot per (a,b)
    * Both are formed EXPLICITLY (no Hermiticity identity) so that max|V - V^dag| is a genuine
    * routing tripwire rather than zero by construction.
    *
-   * HERMITICITY RESCOPE (rev 4). With eta_far > 0 the out-of-strip evaluations are genuinely
+   * HERMITICITY RESCOPE. With eta_far > 0 the out-of-strip evaluations are genuinely
    * complex -- Im Sigma(eps + i eta) is eta times the smoothed spectral density, which is
    * LARGE off strip, and any (a,b) with either index out of strip therefore carries a real
    * anti-Hermitian part. That is physics, and the existing Hermitize tail takes the Re map of
@@ -991,15 +974,15 @@ namespace qp_modea {
    * evaluation point is real and anti_in is a sub-block of the full residual.
    */
   // =====================================================================================
-  //  TC-3: THE eq-1 CD LINE EVALUATOR -- the sibling of the route-B closed form
+  //  THE CD LINE EVALUATOR -- the sibling of the route-B closed form
   // =====================================================================================
   //
   // Route B evaluates Sigma^c from a POLE representation of W^c:
   //     Sigma^c_ab(z) = sum_{J,p} M(a,b,J*npk+p) (n_B(om_p) + f_J) / (z - (eps_J - om_p))
   // which is exact at finite T but needs poles -- and at REAL z it evaluates the FITTED
-  // measure at real arguments, the standing QM3-b caveat (sigma_route_b.hpp).
+  // measure at real arguments (see the caveat in sigma_route_b.hpp).
   //
-  // The eq-1 contour-deformation form needs only W^c at POINTS, which is what the tilted
+  // The contour-deformation form needs only W^c at POINTS, which is what the tilted
   // contour supplies. With A_J = z - eps_J (complex; z carries the strip machinery's
   // i*eta_far when it is on):
   //
@@ -1008,7 +991,7 @@ namespace qp_modea {
   //
   // exact up to the bosonic leftover of sigma_cd_line.hpp eq (R). Note the residue
   // argument eps_J - z, NOT z - eps_J: they agree only for an EVEN W^c, which the
-  // physical one is but a fitted pole set is not (gate tc_sigma_cd_nonsym_poles).
+  // physical one is but a fitted pole set is not (unit test tc_sigma_cd_nonsym_poles).
   //
   // THE TWO TERMS HAVE DIFFERENT SOURCES, and that is the whole point:
   //
@@ -1027,17 +1010,15 @@ namespace qp_modea {
   //    |Re A| = |omega - eps_J| from the contour, and on a real fixture that distance is
   //    the QP LEVEL SPACING -- every evaluation energy is itself an eps_J (the q = 0
   //    member), and near-degenerate internal states across the q mesh drive it to zero.
-  //    MEASURED on qe_lih222: a symmetric tan-substituted Gauss-Legendre rule with 512
-  //    nodes leaves min |Re A| = 2.4e-02 a.u. BELOW its smallest node on 288 of 17408
-  //    (J, z) pairs and the assembly is then wrong by 3.6e-01. The closed form has no
-  //    such requirement, and its denominators (A + om_p) are EXACTLY route B's own, so
+  //    Even a fine symmetric tan-substituted Gauss-Legendre rule (hundreds of nodes) leaves
+  //    |Re A| BELOW its smallest node on some (J, z) pairs, and the assembly is then wrong
+  //    at O(1). The closed form has no such requirement, and its denominators (A + om_p) are EXACTLY route B's own, so
   //    the Iterm is no worse conditioned than the path it replaces.
   //    `sigma_cd_line::tan_quadrature` / `imag_axis_term` remain for the unit pins, where
   //    the continuous form is the independent reference.
   //  * The RESIDUE term is where the contour enters, through `cd_line_ctx::residue`.
   //    It is evaluated at (eps_J - Re z) + i*delta: the contour can only deliver W^c on
-  //    the line Im z = delta, and delta IS the scheme's sampling depth (the campaign's
-  //    models.py carries the same `delta_eval` caveat for its like-for-like comparison).
+  //    the line Im z = delta, and delta IS the scheme's sampling depth.
   //
   // sigma_J vanishes for the states on the "wrong side" of the evaluation energy -- about
   // half of them -- and those residue evaluations are SKIPPED, which is the single largest
@@ -1046,14 +1027,14 @@ namespace qp_modea {
   struct cd_line_opts {
     bool   on = false;
     double delta = 0.0;      // Im z of the residue targets (a.u.)
-    long   n_nu = 0;         // UNUSED by the evaluator (the Iterm is closed form, eq K);
+    long   n_nu = 0;         // UNUSED by the evaluator (the Iterm is closed form, (K));
     double nu_scale = 0.0;   // kept so a caller can request the quadrature reference
   };
 
   /**
    * The residue source: fills Msand(a,b) = <aJ|W^c(q_J, z)|Jb> for one internal state J
    * at one target z. `fit_residue_source` below is the pole-rep implementation (which
-   * makes the whole assembly an IDENTITY against route B -- gate TC-3-b(1)); the contour
+   * makes the whole assembly an IDENTITY against route B); the contour
    * implementation is installed by the caller that owns the contour context.
    */
   using cd_residue_fn =
@@ -1061,10 +1042,10 @@ namespace qp_modea {
                          nda::array<ComplexType, 2> & /*Msand*/)>;
 
   /**
-   * The BATCHED residue source (TC-4): Msand(t, a, b) = <aJ_t|W^c(q_{J_t}, z_t)|J_t b>
+   * The BATCHED residue source: Msand(t, a, b) = <aJ_t|W^c(q_{J_t}, z_t)|J_t b>
    * for a whole list of (J, z) targets, in the SAME order. This is the interface the
    * evaluator uses; a source that only implements the scalar form above is driven one
-   * target at a time and costs the same as before. The contour source implements it
+   * target at a time at the scalar cost. The contour source implements it
    * natively, which is where the transform contraction becomes a gemm.
    */
   using cd_residue_batch_fn =
@@ -1084,7 +1065,7 @@ namespace qp_modea {
      * buffer and, inside the contour source, of the (nt x Np^2) transform buffer.
      * <= 0 = no cap (every target of one evaluation point in one call), which is what the
      * unit fixtures want; production sets it from `modea_opts::cd_batch_mb`. 1 forces the
-     * per-target path, which is the batching gate's reference.
+     * per-target path, which is the batching tests' reference.
      */
     long batch_max = 0;
     std::string route = "fit";       // what the log line names
@@ -1123,7 +1104,7 @@ namespace qp_modea {
    * The pole-rep residue source: <aJ|W^c(z)|Jb> = sum_p M(a,b,J*npk+p)/(z - om_p).
    * Using it for BOTH terms turns the assembly into an identity against route B, which
    * is what validates the decomposition, the quadrature and the sigma weights before any
-   * contour is attached (gate TC-3-b(1)).
+   * contour is attached.
    */
   inline cd_residue_fn fit_residue_source(modea_ctx const &ctx,
                                           std::vector<sk_block> const &blocks) {
@@ -1146,24 +1127,24 @@ namespace qp_modea {
   }
 
   /**
-   * Sigma^c_ab(z) by the eq-1 CD assembly. The drop-in sibling of `modea_sigma_at`.
+   * Sigma^c_ab(z) by the CD assembly. The drop-in sibling of `modea_sigma_at`.
    *
-   * TC-4: the residue targets are collected FIRST and evaluated in batches, so a source
+   * The residue targets are collected FIRST and evaluated in batches, so a source
    * that can share work across targets (the contour's transform contraction) sees them
    * all at once. The assembly loop below is untouched -- same predicate, same order, same
    * accumulation -- it only reads its Ms out of the batch buffer instead of calling the
    * source itself, so the batching cannot reassociate the sum over J.
    */
   /**
-   * F6: the same assembly restricted to internal states J in [J0, J1), accumulating into S.
-   * BOTH terms of eq 1 are sums over J -- the closed-form Iterm over blk.M AND the residue
-   * term -- so a J-partition distributes the whole evaluator, including the residue targets
-   * that cost ~2.66 s each at production Np (notes §14). Since J = qp*nbnd + n, a J-range on
+   * The same assembly restricted to internal states J in [J0, J1), accumulating into S.
+   * BOTH terms of the CD form are sums over J -- the closed-form Iterm over blk.M AND the
+   * residue term -- so a J-partition distributes the whole evaluator, including the costly
+   * residue targets at production Np. Since J = qp*nbnd + n, a J-range on
    * a qp boundary is exactly the qp-aligned P-slice of `modea_sigma_at_range`: ONE partition
    * distributes storage, the Iterm and the residues together.
    *
    * Summing partials over any partition of [0, nJ) reproduces the whole call to the
-   * reassociation class. Pinned at `tc_f6_slice_identity`.
+   * reassociation class (unit test `tc_f6_slice_identity`).
    * ⚠ The census counters accumulate PER PARTITION, so a partitioned run's n_res_eval /
    * n_res_skip are the sum over partitions (correct), but min_absReA / sigma_abs_max are
    * per-partition maxima that the caller must reduce.
@@ -1288,7 +1269,7 @@ namespace qp_modea {
     nda::array<ComplexType, 2> D(nbnd, nbnd), Dp(nbnd, nbnd);
     double min_den = 1e300;
 
-    // ---- the strip evaluation points + their census (rev 3 addendum item 2, rev 4) ----
+    // ---- the strip evaluation points + their census ----
     const strip_t strip = strip_of(ctx);
     nda::array<ComplexType, 1> z_a(nbnd);
     nda::array<int, 1> far(nbnd);          // 1 = this index is OUT of the strip
@@ -1320,7 +1301,7 @@ namespace qp_modea {
       else cc->exc_hi = std::max(cc->exc_hi, eps(a) - strip.hi);
     }
 
-    // TC-3: when the context carries a cd-line evaluator (qp_modea_wfit = "contour")
+    // When the context carries a cd-line evaluator (qp_modea_wfit = "contour")
     // the Sigma^c SOURCE changes and nothing else does -- the strip evaluation points
     // z_a above, the census, the V = (D + D')/2 symmetrization and the anti-Hermitian
     // tripwire below are all untouched. `min_den` stays the route-B tripwire; the
@@ -1362,14 +1343,14 @@ namespace qp_modea {
       }
     }
     V = 0.5 * (D + Dp);
-    // rev 4: the anti-Hermitian tripwire, restricted to the elements both of whose evaluation
+    // The anti-Hermitian tripwire, restricted to the elements both of whose evaluation
     // points are real (in strip). At eta_far = 0 that restriction is inert -- every point is
     // real and this is a sub-block of the full residual, which the caller still reports.
     // NOTE the UNDEFINED case: if every index is out of strip there is no in-strip pair, and
     // reporting 0 there would read as "perfectly Hermitian" for a block in which the tripwire
-    // measured nothing at all (it happens on qe_lih222's first outer iteration, where the
-    // narrow initial E_PH puts all 128 states outside). anti_in stays -1 = "not measured" and
-    // the driver then falls back to the full-matrix residual.
+    // measured nothing at all (this can happen on the first outer iteration, where a narrow
+    // initial E_PH puts every state outside). anti_in stays -1 = "not measured" and the
+    // driver then falls back to the full-matrix residual.
     if (cc != nullptr) {
       double num = 0.0, den = 0.0;
       bool any = false;
@@ -1385,21 +1366,20 @@ namespace qp_modea {
     return min_den;
   }
 
-  /** Sigma^c_ab(z) for a single ABSOLUTE z (used by the anchor gate and the delta_i table). */
+  /** Sigma^c_ab(z) for a single ABSOLUTE z (used by the anchor check and the delta_i table). */
   /**
    * ---------------------------------------------------------------------------------------
-   * F6 (TC-4): THE SLICEABLE CONSUME -- Sigma^c over a RANGE of the flat pole index P.
+   * THE SLICEABLE CONSUME -- Sigma^c over a RANGE of the flat pole index P.
    * ---------------------------------------------------------------------------------------
    * `blk.M` is (nbnd, nbnd, nJ*npk) and is OWNER-ONLY: it is the memory wall (∝ nbnd^3) and,
-   * through this contraction, the serialization wall (∝ nbnd^4) that stalled the nb100 legs
-   * and the m3d SVO map (notes/tc4_si_tier.md §13). The fix is to partition P across the
+   * through this contraction, the serialization wall (∝ nbnd^4) at large band counts. The
+   * remedy is to partition P across the
    * block's helper group so each rank stores and contracts 1/gsize of it, and to sum the
    * partials with ONE small (nbnd^2) reduction.
    *
    * This is that contraction with an explicit [P0, P1) range. Summing the partials over any
-   * partition of [0, nJ*npk) reproduces the whole to the reduction-reassociation class --
-   * pinned at `tc_f6_slice_identity`. `modea_sigma_at` is the whole-range call and is
-   * therefore UNCHANGED, bit for bit.
+   * partition of [0, nJ*npk) reproduces the whole to the reduction-reassociation class
+   * (unit test `tc_f6_slice_identity`). `modea_sigma_at` is the whole-range call.
    *
    * ⚠ THE SLICE MUST BE qp-ALIGNED IN PRODUCTION. P = (qp*nbnd + n)*npk + p is qp-MAJOR, so
    * a transfer qp owns the contiguous block [qp*nbnd*npk, (qp+1)*nbnd*npk). Stage 2 already
@@ -1456,14 +1436,13 @@ namespace qp_modea {
   }
 
   /**
-   * MODE B (Faleev - van Schilfgaarde - Kotani, PRL 93, 126406), the map the user ruling of
-   * 2026-08-12 pivoted to. Spec rev 2:
+   * MODE B (Faleev - van Schilfgaarde - Kotani, PRL 93, 126406):
    *
    *     V^xc_ab = Re Sigma^c_ab(mu)     a != b    (the strip centre -- always inside the
    *                                                analyticity strip, hence always safe)
    *     V^xc_aa = Re Sigma^c_aa(eps_a)  diagonal
    *
-   * i.e. the existing off_diag_mode = "fermi" idiom (qp_scf_common.cpp:679-681) with the CD
+   * i.e. the existing off_diag_mode = "fermi" idiom of qp_approx with the CD
    * closed form in place of AC.evaluate. There is NO inner-consistency loop: the off-diagonals
    * do not depend on eps at all, and the outer loop supplies the self-consistency, exactly as
    * on the AC path.
@@ -1475,16 +1454,16 @@ namespace qp_modea {
    *
    * READING OF "Re". Taken literally on the DIAGONAL, where it is unambiguous and is what the
    * subsequent Hermitization would produce anyway. The off-diagonals are left as evaluated and
-   * the EXISTING :713 Hermitize tail takes their Hermitian part -- elementwise Re on an
+   * EXISTING Hermitize tail of qp_approx takes their Hermitian part -- elementwise Re on an
    * off-diagonal block is not basis-covariant, whereas (V + V^dag)/2 is, and for a Hermitian
-   * W the two agree. FLAGGED: this is an interpretation of the spec's one-line formula.
+   * W the two agree.
    *
    * SAFEGUARD (bounded, logged, never silent). Per diagonal state: if the evaluation sits
    * near a pole (min_den below the floor) or the result exceeds a data-derived sanity bound,
    * that state falls back to z = mu -- mode B where the representation resolves the state,
    * Fermi-static where it cannot. Counted and warned, never silent.
    *
-   * REV 4: with qp_modea_eta_far > 0 the out-of-strip diagonal is evaluated at
+   * FAR STATES: with qp_modea_eta_far > 0 the out-of-strip diagonal is evaluated at
    * z = eps_a + i eta_far and V_aa = Re Sigma_aa(z) instead of falling back to mu -- the same
    * convention mode_a uses, on the only index mode_b evaluates off-centre. eta_far = 0 keeps
    * the mu fallback exactly.
@@ -1493,21 +1472,21 @@ namespace qp_modea {
     long n_fallback = 0;         // OUT-OF-STRIP diagonal states (demoted to mu, or eta-evaluated)
     long n_fallback_win = 0;     // ... of which are in the gap window
     long n_sanity_trip = 0;      // STRIP-INTERIOR states tripping the |ReSigma| bound
-    bool homo_fallback = false;  // this block's per-k HOMO was out of strip (the judge reads it)
+    bool homo_fallback = false;  // this block's per-k HOMO was out of strip
     bool lumo_fallback = false;  // this block's per-k LUMO was out of strip
     double min_den = 1e300;      // smallest |z - (eps_J - om_p)| met on the diagonal at eta = 0
     double anti_herm = 0.0;      // max|V - V^dag| / max|V| of the RAW map
     double vmax = 0.0;
-    // ---- rev 4 (graded-eta far-state evaluation) ----
+    // ---- graded-eta far-state evaluation ----
     long n_eta = 0;              // of n_fallback, the ones taken at eps + i eta_far instead
     double im_off = 0.0;         // max|Im Sigma^c_aa| over those (a.u.) -- PHYSICS, not an error
     double spacing = 0.0;        // worst local fitted-pole spacing at an eta evaluation (a.u.)
   };
 
   /**
-   * THE STRIP TEST -- the diagonal fallback criterion (SPEC-AUTHOR DIRECTED, 2026-08-12,
-   * replacing the agent-chosen min_den floor + |ReSigma| bound that the first mode-B
-   * measurement showed were uncalibrated: at floor 1e-3 they demoted 86 of 96 states).
+   * THE STRIP TEST -- the diagonal fallback criterion. It replaces a min_den floor +
+   * |ReSigma| bound, which need calibration and, set too tight, demote most diagonal states
+   * to the Fermi-static value.
    *
    * Sigma^c has no genuine spectral weight between VBM - E_PH and CBM + E_PH: the nearest
    * pole of the exact object sits at an occupied energy minus a W^c excitation, or an empty
@@ -1527,13 +1506,11 @@ namespace qp_modea {
   /**
    * Floor on |z - (eps_J - om_p)|, below which a single fitted pole dominates the sum.
    *
-   * AGENT-CHOSEN AND NOT YET CALIBRATED -- FLAGGED. The spec rev 2 asks for "min_den < floor"
-   * without fixing the value. A first attempt at 1e-3 a.u. (27 meV) was measured to be far
-   * too aggressive: the pole set has nJ x npk ~ 3.6e3 members spread over ~4 a.u., so the mean
-   * spacing is ~1e-3 and that floor demoted 86 of 96 diagonal states on qe_lih223_sym,
-   * degenerating mode B into the Fermi-static map. It is lowered here so that the DATA-DERIVED
-   * |Re Sigma| sanity bound does the real work and this trigger only catches a genuine
-   * on-pole evaluation. The fallback counts are reported; the value wants a ruling.
+   * NOT CALIBRATED. A floor of the order of the mean pole spacing (~1e-3 a.u. for a pole
+   * set of a few thousand members over a few a.u.) is far too aggressive: it demotes most
+   * diagonal states and degenerates mode B into the Fermi-static map. The value is therefore
+   * small, so that the DATA-DERIVED |Re Sigma| sanity bound does the real work and this
+   * trigger only catches a genuine on-pole evaluation. The fallback counts are reported.
    */
   inline constexpr double modeb_min_den_floor = 1e-6;   // a.u.
   /** |Re Sigma_aa(eps_a)| beyond this multiple of the block's own scale at mu is insane. */
@@ -1549,7 +1526,7 @@ namespace qp_modea {
     double scale = 0.0;
     for (long a = 0; a < nbnd; ++a) scale = std::max(scale, std::abs(V(a, a).real()));
     const double bound = modeb_sanity_mult * std::max(scale, 1e-6);
-    // this block's own band edges -- the states the judge reads per k
+    // this block's own band edges -- the per-k band-edge states
     long homo = -1, lumo = -1;
     for (long a = 0; a < nbnd; ++a) {
       if (eps(a) < ctx.mu and (homo < 0 or eps(a) > eps(homo))) homo = a;
@@ -1572,7 +1549,7 @@ namespace qp_modea {
         if (a == homo) out.homo_fallback = true;
         if (a == lumo) out.lumo_fallback = true;
         if (ctx.eta_far > 0.0) {
-          // rev 4: the far-state object is Re Sigma(eps + i eta_far), not Sigma(mu). Note the
+          // The far-state object is Re Sigma(eps + i eta_far), not Sigma(mu). Note the
           // min_den above is deliberately the eta = 0 one -- it measures real-axis proximity;
           // this evaluation's own denominators are bounded below by eta_far by construction.
           ++out.n_eta;
@@ -1594,14 +1571,14 @@ namespace qp_modea {
   }
 
   /**
-   * The inner quasiparticle consistency loop of spec section 4, at FIXED Sigma data:
+   * The inner quasiparticle consistency loop, at FIXED Sigma data:
    *
    *   repeat: V^xc = 1/2[Sigma(eps_a) + Sigma(eps_b)]; Hermitize;
    *           eps <- eigvals(Hstat + V^xc);  until max|d eps| < tol or the cap is hit.
    *
    * `Hstat_ab` is the static (H0 + HF) part already in the MO basis; the MO basis itself is
    * FROZEN inside this loop -- basis updates belong to the outer loop. Returns the LAST V^xc
-   * (raw, un-Hermitized: the caller's :713 tail does that, and the raw residual is logged).
+   * (raw, un-Hermitized: the caller's Hermitize tail does that, and the raw residual is logged).
    */
   template<class SigmaBlock>
   inline consist_result inner_consistency(SigmaBlock &&sigma_of_eps,
@@ -1648,7 +1625,7 @@ namespace qp_modea {
    *     Sigma_B(tau_i) = sum_{J,p} R_{Jp} g(E_{Jp}, tau_i),
    *     R_{Jp} = M_ab^{(J,p)} [n_B(om_p) + f(eps_J)],   E_{Jp} = eps_J - om_p,
    *
-   * with g the SAME kernel update_G uses (qp_scf_common.cpp:134-141), i.e. the tau transform
+   * with g the SAME kernel update_G uses (qp_scf_common.cpp), i.e. the tau transform
    * of 1/(i w_n - (E - mu)) in the absolute-energy convention of sigma_route_b.
    *
    * WHY THIS EXISTS (the decisive oracle for the anchor discrepancy). The anchor compares
@@ -1688,7 +1665,7 @@ namespace qp_modea {
    * (ctx.q_isym; the classes partition the full transfer mesh, so the rows sum to
    * modea_sigma_tau). ONE pass over (J,p) -- the class is a property of J.
    *
-   * WHAT IT IS FOR (kp444 post-mortem, 2026-08-13). The reference Sigma^c(tau) cannot be
+   * WHAT IT IS FOR. The reference Sigma^c(tau) cannot be
    * split per class (the solver sums the isym loop internally), so a per-class DEVIATION does
    * not exist. What does exist, and is the discriminating statistic, is each class's own
    * MAGNITUDE: a class whose contribution is 1e-2 of the total cannot explain a 1e-4 total
@@ -1725,23 +1702,15 @@ namespace qp_modea {
   }
 
   /**
-   * REVERSAL OF A SPEC DEFAULT (measured, 2026-08-12; coordinator ruling the same day).
-   *
-   * notes/qm3_mode_a_loop_spec.md section 4 adopted, as a flagged default, a refinement of the
-   * inner loop's STARTING energies at the first outer iteration: "refine the diagonal by
-   * Route-A z0=0 roots from the gathered Sigma(iw) -- cheap, adopted default, log it". That
-   * path is DELETED, not switch-guarded.
-   *
-   * Why: the z0 = 0 expansion is a Taylor series about the Fermi level of radius
-   * R_conv = |c_{p-1}/c_p|, fitted from |t| <= 0.053 a.u. (9 fermionic nodes at beta = 1000).
-   * Newton on it is a runaway for every state outside that radius. Unguarded it moved lih222
-   * states to |eps - mu| ~ 1e4 eV on the first outer iteration. GUARDED -- accepting a root
-   * only inside R_conv -- it still accepted 9 of 16 roots at k = 0 with a max shift of
-   * 0.21 a.u. and turned the fixture's 2.83 eV particle-hole gap into 30.65 eV, i.e. it
-   * destroyed the band structure it was supposed to improve.
+   * NOTE ON THE INNER LOOP'S STARTING ENERGIES. The inner loop is NOT started from route-A
+   * z0 = 0 roots of the gathered Sigma(iw). The z0 = 0 expansion is a Taylor series about
+   * the Fermi level of radius R_conv = |c_{p-1}/c_p|, fitted from the few lowest fermionic
+   * nodes, so Newton on it is a runaway for every state outside that radius: unguarded it can
+   * move states by thousands of eV, and even guarded (accepting a root only inside R_conv)
+   * it can distort the particle-hole gap by an order of magnitude.
    *
    * The incoming sE_ska is the natural continuation of the outer loop and is already a
-   * converged-QP-loop spectrum, so the inner loop now starts there unconditionally.
+   * converged-QP-loop spectrum, so the inner loop starts there unconditionally.
    */
 
 } // qp_modea

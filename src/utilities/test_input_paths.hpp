@@ -84,29 +84,28 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
                                "/tests/unit_test_files/qe/si_kp111_nbnd8/",
                            std::string("pwscf"));
   } else if (src == "qe_si222_sym") {
-    // 2026-09-22: Si diamond, 2x2x2 Gamma-centered, 60 bands, QE with force_symmorphic (6 operations without inversion, 3-fold
+    // Si diamond, 2x2x2 Gamma-centered, 12 bands (ecutwfc 15 Ry), QE with force_symmorphic (6 operations without inversion, 3-fold
     // rotations among them; 4 IBZ k of 8) -- the symmetric fixture with NON-INVOLUTIVE operations the LiH fixtures lack
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
-                               "/tests/unit_test_files/qe/si_kp222_nbnd60_sym/out/",
+                               "/tests/unit_test_files/qe/si_kp222_nbnd12_sym/out/",
                            std::string("si"));
   } else if (src == "qe_si222_nosym") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
-                               "/tests/unit_test_files/qe/si_kp222_nbnd60/out/",
+                               "/tests/unit_test_files/qe/si_kp222_nbnd12/out/",
                            std::string("si"));
   } else if (src == "qe_si333_sym" or src == "qe_si333_nosym" or
              src == "qe_si444_sym" or src == "qe_si444_trevonly" or src == "qe_si444_noinv") {
-    // 2026-09-22 (the time-reversal hunt): Si diamond, 60 bands, force_symmorphic.
+    // Si diamond, 12 bands (ecutwfc 15 Ry), force_symmorphic (h5 only: si.coqui.h5 from pw2coqui).
     //   si333_sym      3x3x3, 6 operations AND time-reversal pairs (6 IBZ k of 27) -- the C3v x trev combination
     //                  the LiH fixtures (involutions only) and qe_si222_sym (no trev pairs) both miss;
     //   si333_nosym    the same mesh unreduced (27 k) -- its full-mesh reference;
-    //   si444_sym      the PRODUCTION mesh (13 IBZ k of 64, 28 trev pairs) where the symmetric P-side path
-    //                  loses 1.5 % of the ladder correction;
+    //   si444_sym      4x4x4 (13 IBZ k of 64, 28 trev pairs) -- the largest symmetric fixture;
     //   si444_trevonly the same mesh reduced by TIME REVERSAL ALONE (36 k, no point group).
-    const std::string dir = (src == "qe_si333_sym")   ? "si_kp333_nbnd60_sym"
-                          : (src == "qe_si333_nosym") ? "si_kp333_nbnd60_nosym"
-                          : (src == "qe_si444_sym")   ? "si_kp444_nbnd60_sym"
-                          : (src == "qe_si444_noinv") ? "si_kp444_nbnd60_noinv"
-                                                      : "si_kp444_nbnd60_trevonly";
+    const std::string dir = (src == "qe_si333_sym")   ? "si_kp333_nbnd12_sym"
+                          : (src == "qe_si333_nosym") ? "si_kp333_nbnd12_nosym"
+                          : (src == "qe_si444_sym")   ? "si_kp444_nbnd12_sym"
+                          : (src == "qe_si444_noinv") ? "si_kp444_nbnd12_noinv"
+                                                      : "si_kp444_nbnd12_trevonly";
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/" + dir + "/out/",
                            std::string("si"));

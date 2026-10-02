@@ -18,22 +18,21 @@
  * ==========================================================================
  */
 
-// ISDF-Vertex: IBZ k-point symmetry support (notes/vertex_ibz_symmetry.md).
+// ISDF-Vertex: IBZ k-point symmetry support.
 //
-// Validation ladder (memo section 7):
+// Tests:
 //   1. vertex_ibz_leakage_diag: the C-window D-matrix leakage diagnostic computed
 //      independently from MF->symmetry_rotation for a family of windows, tied to
-//      the measured eigenvalue degeneracy structure (a window boundary slicing a
+//      the eigenvalue degeneracy structure (a window boundary slicing a
 //      degenerate set <=> nonzero leakage). MF-only, fast.
-//   2. vertex_ibz_gold: THE GOLD CHECK -- the same physical LiH-222 state driven
-//      through the nosym (qe_lih222) and sym (qe_lih222_sym) variants with the
-//      vertex on: e_hf/e_corr must agree to (cross-variant class) + O(leakage);
-//      both error sources measured and reported separately (theory-owner item 3a).
-//      Includes the near-closed-window control (item 3c) and the secondary-basis
-//      path on the sym mesh.
+//   2. vertex_ibz_gold: the same physical LiH-222 state driven through the
+//      nosym (qe_lih222) and sym (qe_lih222_sym) variants with the vertex on:
+//      e_hf/e_corr must agree to (cross-variant class) + O(leakage); both error
+//      sources are reported separately. Includes a near-closed-window control
+//      and the secondary-basis path on the sym mesh.
 //   3. vertex_ibz_conservation_sym: the conservation identity S_SigmaG + S_PW = 0
-//      evaluated with star-weighted IBZ pairings (memo section 3.6) on the sym
-//      mesh; sign-flip control at O(1).
+//      evaluated with star-weighted IBZ pairings on the sym mesh; sign-flip
+//      control at O(1).
 //   4. vertex_ibz_noop_sym: C = empty set reproduces plain sym-scGW bitwise.
 
 #include <cstdio>
@@ -72,7 +71,7 @@ namespace bdft_tests {
 
   namespace ibz_test_detail {
 
-    // Independent reimplementation of the C-window leakage (memo (C-leak)):
+    // Independent reimplementation of the C-window leakage:
     // for every qsymms position >= 1 and full-BZ k, the D-mass of the window
     // columns outside the window. Returns (max, mean).
     inline std::pair<double, double> window_leakage(mf::MF &mf, long c0, long c1) {
@@ -110,8 +109,8 @@ namespace bdft_tests {
     }
 
     // does the window boundary [c0, c1) slice through a degenerate eigenvalue set
-    // at any (spin, k)? (the same 1e-4 degeneracy resolution generate_dmatrix uses,
-    // symmetry.hpp:1039)
+    // at any (spin, k)? (the same 1e-4 degeneracy resolution generate_dmatrix uses in
+    // symmetry.hpp)
     inline bool window_splits_degeneracy(mf::MF &mf, long c0, long c1) {
       auto eig = mf.eigval();
       const long ns = eig.shape(0), nk = eig.shape(1), nb = eig.shape(2);
@@ -127,8 +126,8 @@ namespace bdft_tests {
 
     // A fixture SPEC: either a registered default_MF name, or "qe:<outdir>:<prefix>" for an arbitrary
     // QE mean field on disk (h5). The second form lets the transport / census diagnostics run against a
-    // PRODUCTION mean field (the Si 4^3 symmetric mesh: 6 operations + time reversal, 3-fold rotations AND
-    // 28 time-reversal pairs -- the combination no unit-test fixture has; 2026-09-22 time-reversal hunt).
+    // PRODUCTION mean field (e.g. the Si 4^3 symmetric mesh: 6 operations + time reversal, 3-fold rotations AND
+    // 28 time-reversal pairs -- a combination no unit-test fixture has).
     inline mf::MF make_mf(auto &mpi_context, std::string const &spec) {
       if (spec.rfind("qe:", 0) == 0) {
         const auto c = spec.find(':', 3);
@@ -156,7 +155,7 @@ namespace bdft_tests {
       app_log(1, "ibz leakage: window [{}, {}): max = {:.3e}, mean = {:.3e}, "
                  "splits degenerate set = {}", c0, c1, mx, mean, sp);
     }
-    // the diagnostic must track the degeneracy structure (theory-owner item 3b):
+    // the diagnostic must track the degeneracy structure:
     // a window that does NOT split any degenerate set must be (near-)closed; a
     // window that does must show correspondingly larger leakage.
     double leak_closed_max = 0.0, leak_split_min = 1e300;
@@ -189,13 +188,13 @@ namespace bdft_tests {
 
   // ====================================================================================
   /**
-   * 2026-09-22: the TRANSPORT identity behind the symmetry path, tested numerically on the exact orbitals.
+   * The TRANSPORT identity behind the symmetry path, tested numerically on the exact orbitals.
    * The kernels' effective columns are Xhat(js, k) = X(krot(js, k)) . Dc(js, k) (vertex_t::build_sym_ctx), meant to be the
    * orbital at k evaluated at the rotated points: psi_{k,b}(S^{-1} r_P) (or S r_P). Both sides are computable exactly: the
    * collocation of every full-mesh k at an arbitrary point list (thc::collocation_at_points, which rotates the IBZ orbitals
    * in real space) and at the point list rotated by S (utils::transform_r). The eight candidates {D, D^T, D^*, D^dag} x
    * {S, S^-1} are compared on the closed window [0, 6) of qe_lih222_sym (a degenerate triplet inside: the conventions
-   * differ ONLY inside degenerate blocks, so the historic [1, 3) gates could not see it). COQUI_IBZ_TEST_WINDOW overrides.
+   * differ ONLY inside degenerate blocks, so a window like [1, 3) cannot distinguish them). COQUI_IBZ_TEST_WINDOW overrides.
    */
   // transform_r's arithmetic without the periodic wrap: returns the wrapped grid index (as transform_r) and the lattice
   // translation R_lat (integers) it removed, so that psi_k(S r_P) = e^{2 pi i k . R_lat} psi_k(r_wrapped) (Bloch phase)
@@ -226,13 +225,11 @@ namespace bdft_tests {
   }
 
   // ====================================================================================
-  // TREV CENSUS (2026-09-22): which fixtures exercise the time-reversal branches at all?
-  // The Si 4^3 symmetric P-side path loses 1.5 % of the vertex correction and the noinv
-  // experiment pinned it on time reversal (notes/vertex_perf_plan.md, 2026-09-22 ~04:50).
+  // TREV CENSUS: which fixtures exercise the time-reversal branches at all?
   // Two distinct branches carry trev: the trev k IMAGES (conjugated collocation columns,
   // thc::collocation_at_points / chol_metric_impl_ibz) and the trev TRANSFERS (qp_trev:
-  // the PQ-transposed read of the IBZ-stored rung, memo (P2)). This case counts both per
-  // fixture, so a branch no gate ever runs is visible.  MF-only, seconds.
+  // the PQ-transposed read of the IBZ-stored rung). This case counts both per fixture,
+  // so a branch no test runs is visible.  MF-only, seconds.
   // ====================================================================================
   TEST_CASE("vertex_ibz_trev_census", "[methods][vertex][ibz]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
@@ -260,9 +257,9 @@ namespace bdft_tests {
         for (long i = 0; i < qsymms.extent(0); ++i) if (qsymms(i) == qp_symm(q)) js = i;
         if (js == 0) ++nq_trev_id; else ++nq_trev_rot;
       }
-      // 2026-09-22: is -k of a time-reversal image a PLAIN negation in the stored crystal coordinates, or does it
+      // Is -k of a time-reversal image a PLAIN negation in the stored crystal coordinates, or does it
       // fold back with a reciprocal-lattice vector? (an even mesh carries zone-boundary components +-1/2, an odd one
-      // does not -- the difference between the broken Si 4^3 and the clean Si 3^3 / LiH fixtures)
+      // does not)
       auto kc = mf->kpts_crystal();
       auto trev_pair = mf->kp_trev_pair();
       long n_umk_k = 0, n_half = 0;
@@ -306,7 +303,7 @@ namespace bdft_tests {
   }
 
   // ====================================================================================
-  // CROSS-MESH TREV-IMAGE CHECK (2026-09-22). The transport test cannot see an error in the
+  // CROSS-MESH TREV-IMAGE CHECK. The transport test cannot see an error in the
   // time-reversal IMAGE columns themselves: on one mesh both of its sides come from
   // thc::collocation_at_points, which builds a trev image as conj(u_{k_ibz}(S^-1 r)) e^{i k r}
   // -- self-consistent by construction. This case compares the SAME physical k between TWO
@@ -548,8 +545,8 @@ namespace bdft_tests {
               kc(k, 0), kc(k, 1), kc(k, 2), kr, kc(kr, 0), kc(kr, 1), kc(kr, 2), lines);
     }
     // the DIRECTION of the transfer map vs the k map: the kernels rotate the legs with js = q_isym(q') and read W at q_star(q');
-    // they need q_star(q') = "js applied to q'" in the SAME sense as krot(js, k) = "js applied to k" (see the kernel identity in
-    // notes/vertex_perf_plan.md 2026-09-22). Check on the exact vectors: is q_ibz = k-map(js)(q') or q' = k-map(js)(q_ibz)?
+    // they need q_star(q') = "js applied to q'" in the SAME sense as krot(js, k) = "js applied to k". Check on the exact
+    // vectors: is q_ibz = k-map(js)(q') or q' = k-map(js)(q_ibz)?
     {
       auto Qcart = mf->Qpts();   // Cartesian: to crystal through the lattice vectors (as scr_coulomb's dump does)
       auto lat = mf->lattv();
@@ -619,7 +616,7 @@ namespace bdft_tests {
     // one (variant, run) driver: n_iter scGW, optional vertex window, returns
     // (e_hf, e_corr, sym_leakage_max). Side channels (most-recent run): last_grot = max
     // G_CC G-rotation residual (REPRO block); last_Nm / last_cond = secondary basis size
-    // and achieved max_q cond(s) (COND-CAP block). cond_max<=0 keeps the legacy behavior.
+    // and achieved max_q cond(s) (COND-CAP block). cond_max<=0 disables the conditioning cap.
     double last_grot = 0.0;
     long last_Nm = 0;
     double last_cond = 0.0;
@@ -664,10 +661,10 @@ namespace bdft_tests {
                "(|D| = {:.3e}); e_corr {:.12f} vs {:.12f} (|D| = {:.3e})",
             ehf_p_ns, ehf_p_s, d_plain_hf, ec_p_ns, ec_p_s, d_plain_ec);
 
-    // ---- GOLD: vertex on, production window C = [1, 3), both cuts, 2 iterations ------
-    // COQUI_IBZ_TEST_WINDOW = "a,b" overrides the window (2026-09-21: the degenerate-block convention test, e.g. "0,6" or "3,6"
-    // -- [1, 3) holds no degenerate band pair, so the D matrices are diagonal phases there and a transposition inside a
-    // degenerate block would pass unseen; Si 4^3 C = [0, 8) showed a 1.5 % sym-vs-nosym vertex gap, LiH [0, 6) a 1.7e-2 fold gap)
+    // ---- GOLD: vertex on, window C = [1, 3), both cuts, 2 iterations ------------------
+    // COQUI_IBZ_TEST_WINDOW = "a,b" overrides the window (e.g. "0,6" or "3,6" to test the degenerate-block convention:
+    // [1, 3) holds no degenerate band pair, so the D matrices are diagonal phases there and a transposition inside a
+    // degenerate block would pass unseen)
     nda::range gold_w(1, 3);
     if (const char *w = std::getenv("COQUI_IBZ_TEST_WINDOW")) { long a = 1, b = 3; std::sscanf(w, "%ld,%ld", &a, &b); gold_w = nda::range(a, b); }
     app_log(1, "ibz gold: vertex window C = [{}, {})", gold_w.first(), gold_w.last());
@@ -693,29 +690,20 @@ namespace bdft_tests {
     // the two variants must agree on the vertex physics: the sym-vs-nosym deviation
     // is bounded by (cross-variant baseline) + (leakage scale on the vertex shift)
     // + kernel headroom. A conjugation/rotation bug shows up at O(shift) instead.
-    //
-    // TIGHTENED 2026-07-25. The old margin was 0.25 * shift -- it accepted a sym-vs-nosym
-    // disagreement of a QUARTER of the whole vertex effect, i.e. ~350x the value actually
-    // observed, so it could not have caught a moderate symmetry defect. Measured on this
-    // case: d_vert_ec = 3.93e-6 against d_plain_ec = 3.41e-6 and shift = 7.05e-4, i.e. the
-    // symmetry path costs ~0.07% of the vertex signal. 0.05 * shift keeps ~10x headroom
-    // over that while being 5x tighter. (For the record of why this matters: the symmetry
-    // path was the leading suspect for the Si divergence for most of a session, and the
-    // reason it could not be dismissed quickly is that no gate here was sharp enough to
-    // say how accurate it actually is -- notes/vertex_divergence_diagnosis.md section 4.2.)
+    // The symmetry path costs well below 1% of the vertex signal on this case, so
+    // 0.05 * shift leaves ample headroom while still catching a moderate symmetry defect.
     const double gold_margin = std::max(0.05 * shift_ns, 5.0 * lv_s * shift_s) + 1e-8;
     REQUIRE(d_vert_ec <= d_plain_ec + gold_margin);
     REQUIRE(d_vert_hf <= d_plain_hf + gold_margin);
     // the shifts themselves must agree to the same class
     REQUIRE(std::abs(shift_ns - shift_s) <= d_plain_ec + gold_margin);
 
-    // NOTE (measured, vertex_ibz_leakage_diag): C = [1,3) is EXACTLY symmetry-closed
-    // on qe_lih222_sym (leak = 0) -- the gold comparison above is therefore the
-    // clean-separation case of theory-owner item 3c: pure kernel/cross-variant
-    // class, no leakage contribution.
+    // C = [1,3) is EXACTLY symmetry-closed on qe_lih222_sym (leak = 0, see
+    // vertex_ibz_leakage_diag) -- the gold comparison above is therefore the
+    // clean-separation case: pure kernel/cross-variant class, no leakage contribution.
 
-    // ---- LEAKY-WINDOW control (theory-owner item 3b): C = [1, 4) splits a
-    // degenerate conduction set (measured leak ~0.33). The deviation may grow to
+    // ---- LEAKY-WINDOW control: C = [1, 4) splits a degenerate conduction set
+    // (leak ~0.33). The deviation may grow to
     // O(leak * shift) but must remain finite and controlled.
     {
       auto [ehf_l_ns, ec_l_ns, ll_ns] = run("qe_lih222", nda::range(1, 4), 1, "global");
@@ -735,7 +723,7 @@ namespace bdft_tests {
 
     // ---- TIME-REVERSAL gold (qe_lih223: 4 trev k-pairs, 4 trev-mapped q; the
     // trev-leg conj and the PQ-transpose transfer branches are exercised here;
-    // C = [1,3) is measured closed on this mesh too) -------------------------------
+    // C = [1,3) is closed on this mesh too) ----------------------------------------
     {
       auto [ehf3_p_ns, ec3_p_ns, l3a] = run("qe_lih223", nda::range(0, 0), 1, "global");
       auto [ehf3_p_s, ec3_p_s, l3b] = run("qe_lih223_sym", nda::range(0, 0), 1, "global");
@@ -751,15 +739,15 @@ namespace bdft_tests {
               d3_plain, ec3_v_ns, ec3_v_s, d3_vert, shift3, l3d);
       for (double e : {ehf3_v_ns, ec3_v_ns, ehf3_v_s, ec3_v_s}) REQUIRE(std::isfinite(e));
       REQUIRE(shift3 > 1e-7);
-      // TIGHTENED with the same reasoning as the gold block above: measured
-      // d3_vert = 2.21e-5 against d3_plain = 2.62e-5 and shift3 = 1.34e-3.
+      // same margin as the gold block above: the symmetry path costs well below
+      // 1% of the vertex signal here too.
       const double t3_margin = std::max(0.05 * shift3, 5.0 * l3d * shift3) + 1e-8;
       REQUIRE(d3_vert <= d3_plain + t3_margin);
       REQUIRE(std::abs(ehf3_v_ns - ehf3_v_s) <=
               std::abs(ehf3_p_ns - ehf3_p_s) + t3_margin);
     }
 
-    // ---- secondary basis on the sym mesh (Refinement 2 under symmetry) ---------------
+    // ---- secondary basis on the sym mesh ---------------------------------------------
     {
       auto [ehf_sec, ec_sec, lsec] = run("qe_lih222_sym", nda::range(1, 3), 1, "secondary");
       auto [ehf_glo, ec_glo, lglo] = run("qe_lih222_sym", nda::range(1, 3), 1, "global");
@@ -769,8 +757,8 @@ namespace bdft_tests {
               ec_sec, ec_glo, std::abs(ec_sec - ec_glo), std::abs(ehf_sec - ehf_glo));
       REQUIRE(std::isfinite(ec_sec));
       // at the numerical full pair rank the secondary path tracks global to the
-      // downfold class (refinement2 memo 10.2: machine-level on the nosym mesh;
-      // allow the svd_tol/kernel class here)
+      // downfold class (machine-level on the nosym mesh; allow the svd_tol/kernel
+      // class here)
       REQUIRE(std::abs(ec_sec - ec_glo) <= 1e-5 + 0.05 * std::abs(ec_glo - ec_p_s));
     }
 
@@ -779,25 +767,17 @@ namespace bdft_tests {
     // LiH-222 secondary tracks global to ~1e-5 at 1 iteration, so both the window-leakage
     // and basis-crudeness confounds are removed: this isolates the secondary path itself.
     //
-    // HISTORICAL NOTE (2026-07-25) -- this block was written to chase the Si production
-    // signature "iter-2 G-rotation residual 5e-9 -> 0.49", on the hypothesis that it was a
-    // secondary-path symmetry-unfolding defect. That hypothesis is REFUTED, and the
-    // residual it keys on is NOT a defect indicator at all:
-    //   * the residual has a plain-scGW baseline of the same order (LiH-222 1.6e-3 with the
-    //     vertex OFF; Si M8 3.3e-4 on the converged no-vertex G) -- it is a D-matrix
-    //     accuracy floor, and 0.49 is a CONSEQUENCE of the blow-up, not its cause;
-    //   * the divergence reproduces identically on a symmetry-FREE mesh, and on a
-    //     symmetry-reduced twin of the same mesh the two agree to 3.5e-6.
-    // See notes/vertex_divergence_diagnosis.md section 4.2. The block is kept because
-    // secondary-vs-global agreement past one iteration is worth pinning on its own -- but
-    // do not read a large residual here as evidence of a symmetry bug.
+    // The G-rotation residual is NOT a defect indicator on its own: it has a plain-scGW
+    // baseline (a D-matrix accuracy floor, ~1e-3 on LiH-222 with the vertex off) and grows
+    // as a consequence of any divergence. Only its RATIO to the global path's value is
+    // tested here.
     {
       auto [ehf_sec2, ec_sec2, lsec2] = run("qe_lih222_sym", nda::range(1, 3), 2, "secondary");
       const double grot_sec2 = last_grot;
       auto [ehf_glo2, ec_glo2, lglo2] = run("qe_lih222_sym", nda::range(1, 3), 2, "global");
       const double grot_glo2 = last_grot;
       (void)ehf_sec2; (void)ehf_glo2; (void)lsec2; (void)lglo2;
-      app_log(1, "ibz REPRO (2-iter, C=[1,3) closed): e_corr secondary {:.12f} vs global "
+      app_log(1, "ibz secondary vs global (2 iterations, C=[1,3) closed): e_corr secondary {:.12f} vs global "
                  "{:.12f} (|D| = {:.3e}); G-rotation residual secondary = {:.3e}, global = "
                  "{:.3e}; window D-leak secondary = {:.3e}, global = {:.3e}",
               ec_sec2, ec_glo2, std::abs(ec_sec2 - ec_glo2), grot_sec2, grot_glo2, lsec2, lglo2);
@@ -815,8 +795,8 @@ namespace bdft_tests {
     // REGULARIZED conditioning (max_q, smallest RETAINED singular value). The blowup is
     // q-specific with a SHARED point set, so the cap bites in the SOLVE and leaves N_m
     // unchanged (pruning shared points cannot touch the worst q). We cap BELOW the uncapped
-    // regularized conditioning to force the truncation to engage; the real payoff is Si
-    // production (raw cond(s) ~ 5e7). The disabled path (cond_max <= 0) uses svd_tol only
+    // regularized conditioning to force the truncation to engage (production systems can
+    // reach raw cond(s) ~ 5e7). The disabled path (cond_max <= 0) uses svd_tol only
     // and is covered bit-identically by every other secondary run in the suite. ---------
     {
       auto [ehf0, ec0, l0] = run("qe_lih222_sym", nda::range(1, 3), 1, "secondary");
@@ -825,7 +805,7 @@ namespace bdft_tests {
       auto [ehf1, ec1, l1] = run("qe_lih222_sym", nda::range(1, 3), 1, "secondary", cap);
       const long Nm1 = last_Nm; const double cond1 = last_cond;
       (void)ehf0; (void)ehf1; (void)l0; (void)l1;
-      app_log(1, "ibz COND-CAP: uncapped cond(s)_eff = {:.3e} (N_m = {}); cap = {:.3e} -> "
+      app_log(1, "ibz conditioning cap: uncapped cond(s)_eff = {:.3e} (N_m = {}); cap = {:.3e} -> "
                  "cond(s)_eff = {:.3e} (N_m = {}); e_corr {:.10f} -> {:.10f}",
               cond0, Nm0, cap, cond1, Nm1, ec0, ec1);
       REQUIRE(std::isfinite(ec1));
@@ -882,7 +862,7 @@ namespace bdft_tests {
     const long nt_half = (nt % 2 == 0) ? nt / 2 : nt / 2 + 1;
     REQUIRE(G_loc.shape(2) == nkpts_ibz);
 
-    // star multiplicities (memo section 3.6)
+    // star multiplicities m_k, m_q (full-BZ points per IBZ representative)
     nda::array<double, 1> m_k(nkpts_ibz), m_q(nqpts_ibz);
     m_k() = 0.0; m_q() = 0.0;
     for (long k = 0; k < nkpts; ++k) m_k(MFp->kp_to_ibz(k)) += 1.0;
@@ -921,7 +901,7 @@ namespace bdft_tests {
     nda::array<cplx, 3> Zq(nqpts_ibz, Np, Np);
     for (long iq = 0; iq < nqpts_ibz; ++iq) Zq(iq, all_r, all_r) = thc.Z(int(iq));
 
-    // ---- pairing machinery (conservation_validation.md section 1.6) -------------------
+    // ---- pairing machinery ------------------------------------------------------------
     auto Twt_bb = ft.Twt_bb();
     long m0 = -1;
     {
@@ -963,7 +943,7 @@ namespace bdft_tests {
     //                                     + Twt_bb(m0,:) . g_q ],
     //   g_q(tau) = sum_MN Pi_notes(q,tau) Wdyn_NM(q, beta-tau); both PH-symmetric,
     //   Pi_notes on the full grid from the code storage via the PH mirror
-    //   (pi design section 2 rule 3: code(it) = notes(beta - tau_it), notes PH-sym).
+    //   (code(it) = notes(beta - tau_it), notes PH-sym).
     cplx S_PW(0.0);
     {
       nda::array<cplx, 2> Pi_full_t(nt, Np * Np);   // notes-tau, one q at a time
@@ -1008,9 +988,9 @@ namespace bdft_tests {
     app_log(1, "ibz cons: |S_SG + S_PW| / scale = {:.3e} (sign-flip control = {:.3f}; "
                "leakage = {:.3e})", rel, ctrl, vtx.sym_leakage_max());
     REQUIRE(scale > 1e-8);
-    // kernel-accuracy + D-matrix-accuracy + O(leakage) class (memo section 7 item 2;
-    // measured 5.05e-5 on qe_lih222_sym with leak = 0 -- ~13x the nosym identity's
-    // 3.78e-6, the D-overlap accuracy class); the sign-flip control breaks at O(1)
+    // kernel-accuracy + D-matrix-accuracy + O(leakage) class (with leak = 0 the residual
+    // is ~10x the nosym identity's, set by the D-overlap accuracy); the sign-flip
+    // control breaks at O(1)
     REQUIRE(rel < 5e-3);
     REQUIRE(ctrl > 1.5);
 

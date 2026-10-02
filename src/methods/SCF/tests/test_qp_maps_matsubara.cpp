@@ -67,7 +67,7 @@ namespace bdft_tests {
   }
 
   TEST_CASE("qp_mats_lin_static", "[methods][qpgw][qp_maps]") {
-    // Q1-a: a STATIC Hermitian Sigma_c => Z = 1 exactly (the odd part vanishes) and
+    // a STATIC Hermitian Sigma_c => Z = 1 exactly (the odd part vanishes) and
     // V = Sigma_c to machine precision -- both maps' trivial limit.
     const long nb = 3;
     const double beta = 100.0;
@@ -86,7 +86,7 @@ namespace bdft_tests {
   }
 
   TEST_CASE("qp_mats_lin_single_pole", "[methods][qpgw][qp_maps]") {
-    // Q1-b (map i): Sigma(iw) = c^2 / (iw - p), scalar. Analytic:
+    // map (i): Sigma(iw) = c^2 / (iw - p), scalar. Analytic:
     //   dSigma/d(iw)|_0 = -c^2/p^2  =>  Z = 1/(1 + c^2/p^2);  Sigma(0) = -c^2/p.
     // The first-node difference quotient carries an O(w0^2) error (the pi*T
     // resolution floor documented in the header) -- gate at that class.
@@ -104,7 +104,7 @@ namespace bdft_tests {
   }
 
   TEST_CASE("qp_mats_gmatch_exact_recovery", "[methods][qpgw][qp_maps]") {
-    // Q1-e: the target G IS a static resolvent => map (ii) must recover H_true from
+    // the target G IS a static resolvent => map (ii) must recover H_true from
     // a perturbed start, residual driven to the numerical floor.
     const long nb = 3, nw = 12;
     const double beta = 200.0, mu = 0.1;
@@ -130,7 +130,7 @@ namespace bdft_tests {
   }
 
   TEST_CASE("qp_mats_gmatch_covariance", "[methods][qpgw][qp_maps]") {
-    // Q1-c: basis covariance -- rotating (G, H_init) by a fixed unitary rotates the
+    // basis covariance -- rotating (G, H_init) by a fixed unitary rotates the
     // matched H covariantly (map (ii) is basis-invariant by construction).
     const long nb = 2, nw = 10;
     const double beta = 150.0, mu = 0.0;
@@ -181,15 +181,14 @@ namespace bdft_tests {
   }
 
   TEST_CASE("qp_mats_gmatch_vs_lin_surrogate_class", "[methods][qpgw][qp_maps]") {
-    // Q1-b, MEASURED AND REFRAMED (2026-08-12): near iw -> 0 the true G has residue
-    // Z != 1 (G ~ Z/(iw - E*), E* = Z(e0 + Sigma(0)) at mu = 0), which a residue-1
-    // resolvent CANNOT reproduce; the G-match therefore lands a compromise H that
-    // differs from eq 13's sandwich form (e0 + Z Sigma(0)) at O((1-Z)|E - mu|) --
-    // a BETA-INDEPENDENT surrogate difference (measured: 1.13e-3 at beta 200 AND
+    // near iw -> 0 the true G has residue Z != 1 (G ~ Z/(iw - E*), E* = Z(e0 + Sigma(0))
+    // at mu = 0), which a residue-1 resolvent CANNOT reproduce; the G-match therefore lands
+    // a compromise H that differs from the linearized form (e0 + Z Sigma(0)) at
+    // O((1-Z)|E - mu|) -- a BETA-INDEPENDENT surrogate difference (1.13e-3 at beta 200 AND
     // 1.16e-3 at beta 800 on this toy), NOT a discretization artifact. The two maps
-    // coincide only at leading order near mu; off mu their spread IS the spec
-    // section-4 "genuine ~0.1-0.2 eV scale" to be QUANTIFIED, not converged away.
-    // Gate: the spread obeys the analytic class bound |1-Z| * |E* - mu|.
+    // coincide only at leading order near mu; off mu their spread is a genuine
+    // ~0.1-0.2 eV-scale ambiguity to be QUANTIFIED, not converged away.
+    // Check: the spread obeys the analytic class bound |1-Z| * |E* - mu|.
     const double beta = 400.0, mu = 0.0, c2 = 0.04, p = 1.1, e0 = -0.3;
     auto wn = qpmats_detail::wmesh(2, beta);
     nda::array<ComplexType, 3> G(2, 1, 1), S(2, 1, 1);
@@ -211,13 +210,12 @@ namespace bdft_tests {
     const double class_bound = std::abs(1.0 - Z) * std::abs(Estar - mu);
     app_log(1, "qp_mats_gmatch_vs_lin: |H_gmatch - H_lin| = {:.3e}; class bound "
                "|1-Z||E*-mu| = {:.3e} (the reported surrogate spread)", d, class_bound);
-    REQUIRE(d < class_bound);      // measured 1.13e-3 vs 1.1e-2 on this toy
+    REQUIRE(d < class_bound);      // reference 1.13e-3 vs 1.1e-2 on this toy
     REQUIRE(d > 1e-5);             // and it is GENUINE -- not a numerical zero
   }
 
   // ==========================================================================================
-  // Increment QM1 -- ROUTE A real-axis Sigma evaluator (methods/SCF/sigma_real_axis.hpp).
-  // Spec: notes/qm1_route_a_spec.md; parent notes/qsgw_matsubara_plan.pdf section 2 / 6.1-6.3.
+  // ROUTE A real-axis Sigma evaluator (methods/SCF/sigma_real_axis.hpp).
   // Model units == eV throughout; beta = 1000 (w_0 = pi/1000 ~ 3.1e-3). 1 meV = 1e-3.
   // ==========================================================================================
 
@@ -225,8 +223,8 @@ namespace bdft_tests {
 
   namespace route_a_detail {
 
-    // The spec section 2.3 four-pole fixture: poles |p_k| >= 6 straddling zero, residues ~2
-    // tuned so Z = (1 - Sigma'(eps*))^{-1} lands in 0.75-0.9 (descriptive, not gated).
+    // The four-pole fixture: poles |p_k| >= 6 straddling zero, residues ~2
+    // tuned so Z = (1 - Sigma'(eps*))^{-1} lands in 0.75-0.9 (descriptive, not checked).
     inline const std::vector<double> pk{-9.0, -6.0, 6.0, 8.0};
     inline const std::vector<double> rk{2.0, 1.5, 2.5, 1.8};
 
@@ -276,7 +274,7 @@ namespace bdft_tests {
       return e;
     }
 
-    // --- the QM1-a/b/c fixture -------------------------------------------------------------
+    // --- the four-pole fixture -------------------------------------------------------------
     inline ComplexType sigma4(ComplexType z) { return sigma_p(pk, rk, z); }
     inline double sigma4_re(double e) { return sigma_p_re(pk, rk, e); }
     inline double sigma4_dre(double e) { return sigma_p_dre(pk, rk, e); }
@@ -328,9 +326,9 @@ namespace bdft_tests {
   } // route_a_detail
 
   TEST_CASE("route_a_qp_root_four_pole", "[methods][qpgw][qp_maps][route_a]") {
-    // QM1-a: Route A with re-expansion (p = 2, n_reexp = 4, analytic sampler) against the
-    // EXACT real-axis roots of the four-pole model, for five static parts. Gate: < 1e-3
-    // (1 meV in model units) -- the increment's acceptance criterion, NOT tunable.
+    // Route A with re-expansion (p = 2, n_reexp = 4, analytic sampler) against the EXACT
+    // real-axis roots of the four-pole model, for five static parts. Tolerance: < 1e-3
+    // (1 meV in model units) -- the acceptance criterion, NOT tunable.
     using namespace route_a_detail;
     const double beta = 1000.0;
     sra::fit_opts opt;                                  // p = 2, m = 3p = 6, n_reexp = 4
@@ -342,7 +340,7 @@ namespace bdft_tests {
       auto res = sra::qp_root(S, e0, beta, 0.0, opt);
       const double err = std::abs(res.eps - ex);
       const double Z = 1.0 / (1.0 - sigma4_dre(ex));
-      app_log(1, "QM1-a e0 = {:+6.3f}: eps_exact = {:+.10f}  eps_routeA = {:+.10f}  "
+      app_log(1, "route A e0 = {:+6.3f}: eps_exact = {:+.10f}  eps_routeA = {:+.10f}  "
                  "err = {:.3e} ({:.4f} meV)  Z = {:.4f}  n_reexp = {}  conv = {}  "
                  "rel_resid = {:.2e}  imag_c_rel = {:.2e}  R_conv = {:.4f}  |eps-z0|/R = {:.2e}",
               e0, ex, res.eps, err, err * 1e3, Z, res.n_reexp_used, res.converged,
@@ -351,12 +349,12 @@ namespace bdft_tests {
       REQUIRE(err < 1e-3);
       worst = std::max(worst, err);
     }
-    app_log(1, "QM1-a worst error over the five states = {:.3e} ({:.4f} meV)", worst, worst * 1e3);
+    app_log(1, "route A worst error over the five states = {:.3e} ({:.4f} meV)", worst, worst * 1e3);
     REQUIRE(worst < 1e-3);
   }
 
   TEST_CASE("route_a_fit_internal_consistency", "[methods][qpgw][qp_maps][route_a]") {
-    // QM1-b: the fitted expansion reproduces its input samples.
+    // the fitted expansion reproduces its input samples.
     using namespace route_a_detail;
     sra::fit_opts opt;
     const long p = opt.p, m = sra::m_default(p);
@@ -383,7 +381,7 @@ namespace bdft_tests {
         cmax = std::max(cmax, std::abs(cex(n)));
         dev = std::max(dev, std::abs(c(n) - cex(n)));
       }
-      app_log(1, "QM1-b (representable data): rel resid = {:.3e}, max|c - c_exact|/max|c| = {:.3e}",
+      app_log(1, "route A fit (representable data): rel resid = {:.3e}, max|c - c_exact|/max|c| = {:.3e}",
               d.rel_resid, dev / cmax);
       REQUIRE(d.rel_resid < 1e-13);
       REQUIRE(dev < 1e-10 * cmax);
@@ -408,7 +406,7 @@ namespace bdft_tests {
         num = std::max(num, std::abs(poly_it(c, -tp(k)) - Fm(k)));
         den = std::max(den, std::max(std::abs(Fp(k)), std::abs(Fm(k))));
       }
-      app_log(1, "QM1-b (four-pole, beta = {:.1e}): rel resid = {:.3e}, in-window max-norm "
+      app_log(1, "route A fit (four-pole, beta = {:.1e}): rel resid = {:.3e}, in-window max-norm "
                  "sample reproduction = {:.3e}", beta_b, d.rel_resid, num / den);
       REQUIRE(d.rel_resid < 1e-10);
       REQUIRE(num < 1e-10 * den);
@@ -432,7 +430,7 @@ namespace bdft_tests {
       const double cls = (std::abs(sigma4_cn(0.0, p + 1)) * std::pow(tmax, double(p + 1)) +
                           std::abs(sigma4_cn(0.0, p + 2)) * std::pow(tmax, double(p + 2))) /
                          std::abs(sigma4_cn(0.0, 0));
-      app_log(1, "QM1-b (four-pole, production beta = 1000): rel resid = {:.3e}, analytic "
+      app_log(1, "route A fit (four-pole, production beta = 1000): rel resid = {:.3e}, analytic "
                  "truncation class = {:.3e} (ratio = {:.4f})", d.rel_resid, cls, d.rel_resid / cls);
       REQUIRE(d.rel_resid < cls);
       REQUIRE(d.rel_resid > 1e-3 * cls);
@@ -440,7 +438,7 @@ namespace bdft_tests {
   }
 
   TEST_CASE("route_a_static_anchor", "[methods][qpgw][qp_maps][route_a]") {
-    // QM1-c (spec section 6.3): the z0 = 0 expansion evaluated at eps = 0 against the model's
+    // the z0 = 0 expansion evaluated at eps = 0 against the model's
     // exact Sigma(0) -- an assumption-free anchor; on exact data the error is fit truncation only.
     using namespace route_a_detail;
     const double beta = 1000.0;
@@ -459,12 +457,12 @@ namespace bdft_tests {
       auto c = sra::fit_taylor(tp, Fp, Fm, p, d);
       const ComplexType s0 = sra::eval_taylor(c, 0.0);
       const double exact = sigma4_re(0.0);
-      app_log(1, "QM1-c scalar: Sigmahat(0) = {:+.12e}, exact Sigma(0) = {:+.12e}, |diff| = {:.3e}, "
+      app_log(1, "route A static anchor, scalar: Sigmahat(0) = {:+.12e}, exact Sigma(0) = {:+.12e}, |diff| = {:.3e}, "
                  "|Im| = {:.3e}", s0.real(), exact, std::abs(s0.real() - exact), std::abs(s0.imag()));
       REQUIRE(std::abs(s0.real() - exact) < 1e-6);
     }
 
-    // ---- matrix: Hermitian at machine, and the Q1 even-quadratic cross-check ----------------
+    // ---- matrix: Hermitian at machine, and the qp_lin_matrix even-quadratic cross-check ----
     const long nb = 3;
     auto A = residue_mats();
     auto wn = qpmats_detail::wmesh(m, beta);
@@ -486,10 +484,11 @@ namespace bdft_tests {
         herr = std::max(herr, std::abs(Sh0(i, j) - std::conj(Sh0(j, i))));
     const double aerr = qpmats_detail::maxdiff(Sh0, S0exact);
 
-    // The Q1 even-quadratic extrapolation S0 = (w1^2 H(w0) - w0^2 H(w1)) / (w1^2 - w0^2) with
-    // H the Hermitian part -- the qp_lin_matrix internals' convention (qp_maps_matsubara.hpp
-    // header lines 39-41), reproduced here because S0 is not exposed. CONSISTENCY, not precision:
-    // it carries its own O(w^2)-removed truncation and is a different estimator of the same Sigma(0).
+    // The even-quadratic extrapolation S0 = (w1^2 H(w0) - w0^2 H(w1)) / (w1^2 - w0^2) with
+    // H the Hermitian part -- the qp_lin_matrix internals' convention (see the
+    // qp_maps_matsubara.hpp header), reproduced here because S0 is not exposed.
+    // CONSISTENCY, not precision: it carries its own O(w^2)-removed truncation and is a
+    // different estimator of the same Sigma(0).
     nda::array<ComplexType, 2> S0q(nb, nb);
     const double w0 = wn(0), w1 = wn(1), dd = w1 * w1 - w0 * w0;
     for (long i = 0; i < nb; ++i)
@@ -499,15 +498,15 @@ namespace bdft_tests {
         S0q(i, j) = (w1 * w1 * H0 - w0 * w0 * H1) / dd;
       }
     const double qerr = qpmats_detail::maxdiff(S0q, Sh0);
-    app_log(1, "QM1-c matrix: max|Sigmahat(0) - Sigma(0)| = {:.3e}, hermiticity = {:.3e}, "
-               "max|S0_Q1 - Sigmahat(0)| = {:.3e}", aerr, herr, qerr);
+    app_log(1, "route A static anchor, matrix: max|Sigmahat(0) - Sigma(0)| = {:.3e}, hermiticity = {:.3e}, "
+               "max|S0_lin - Sigmahat(0)| = {:.3e}", aerr, herr, qerr);
     REQUIRE(aerr < 1e-6);
     REQUIRE(herr < 1e-15);            // by construction: c(n,j,i) = conj(c(n,i,j))
     REQUIRE(qerr < 1e-6);
   }
 
   TEST_CASE("route_a_vxc_hermiticity_covariance", "[methods][qpgw][qp_maps][route_a]") {
-    // QM1-d: the mode-A V^xc assembly. (1) hermiticity by construction at distinct eps_i;
+    // the mode-A V^xc assembly. (1) hermiticity by construction at distinct eps_i;
     // (2) unitary covariance in the SHARED-functional setting only.
     using namespace route_a_detail;
     const long nb = 3;
@@ -539,7 +538,7 @@ namespace bdft_tests {
       for (long j = 0; j < nb; ++j)
         herr = std::max(herr, std::abs(V(i, j) - std::conj(V(j, i))));
     }
-    app_log(1, "QM1-d hermiticity (distinct eps): max|V - V^dag| = {:.3e}, max|Im V_ii| = {:.3e}",
+    app_log(1, "route A V^xc hermiticity (distinct eps): max|V - V^dag| = {:.3e}, max|Im V_ii| = {:.3e}",
             herr, dimag);
     REQUIRE(herr < 1e-14);
     REQUIRE(dimag < 1e-16);
@@ -549,7 +548,7 @@ namespace bdft_tests {
     // to the pair (Sigma(z0 + i t_k), Sigma^dag(z0 + i t_k)); both transform covariantly under
     // Sigma -> U Sigma U^dag, so V^xc must rotate exactly.
     //
-    // PINNED: with DISTINCT eps_i exact covariance does NOT hold and is deliberately NOT gated.
+    // PINNED: with DISTINCT eps_i exact covariance does NOT hold and is deliberately NOT checked.
     // Mode A is DEFINED in the eigenbasis -- eps_i labels state i of THAT frame, so rotating the
     // model while holding the same list of eps_i compares two different prescriptions, not two
     // representations of one. The deviation is measured and logged below to keep that honest.
@@ -599,41 +598,41 @@ namespace bdft_tests {
     const double dev = qpmats_detail::maxdiff(VU, rot(Vs));
     // descriptive only: the same comparison with DISTINCT eps, which is NOT a covariance defect
     const double dev_distinct = qpmats_detail::maxdiff(sra::assemble_vxc(XU, eps), rot(V));
-    app_log(1, "QM1-d covariance: shared-functional max|V[U S U^dag] - U V[S] U^dag| = {:.3e} "
-               "(gated); distinct-eps deviation = {:.3e} (NOT gated -- mode A is eigenbasis-defined)",
+    app_log(1, "route A V^xc covariance: shared-functional max|V[U S U^dag] - U V[S] U^dag| = {:.3e} "
+               "(checked); distinct-eps deviation = {:.3e} (NOT checked -- mode A is eigenbasis-defined)",
             dev, dev_distinct);
     REQUIRE(dev < 1e-10);
   }
 
 #ifdef ENABLE_DLR
   TEST_CASE("route_a_dlr_pole_chain", "[methods][qpgw][qp_maps][route_a]") {
-    // QM1-e: the PRODUCTION chain rehearsal. Four-pole scalar model -> Sigma(tau) on the real
+    // The PRODUCTION chain rehearsal. Four-pole scalar model -> Sigma(tau) on the real
     // IAFT fermionic tau mesh, built with the SAME kernel convention as imag_axes_ft::dlr_kF
     // -> dlr_pole_fit::build + coeffs() -> pole-rep sampler -> full re-expanded QP roots for
-    // the five states against the exact real-axis roots. Gate: < 1e-3 (1 meV), NOT tunable.
+    // the five states against the exact real-axis roots. Tolerance: < 1e-3 (1 meV), NOT tunable.
     // The sampler's poles lie ON the real axis, hence the mandatory |t| >= w_0 window floor.
     //
-    // DEVIATION FROM THE SPEC'S SUGGESTED FIXTURE, and the reason for it (measured, see the
-    // logged caveat block at the end of this case). The spec asks for Sigma(tau) built from
-    // poles {-9,-6,6,8} "so the pole fit is exact-to-eps". It is NOT: a least-squares DLR pole
+    // WHY THE MODEL POLES ARE AUXILIARY-GRID NODES (see also the logged caveat block at the
+    // end of this case). With Sigma(tau) built from the off-grid poles {-9,-6,6,8} the pole
+    // fit is NOT exact-to-eps everywhere: a least-squares DLR pole
     // fit of tau data whose poles are NOT auxiliary-grid nodes is exact-to-eps ON THE IMAGINARY
     // AXIS only. Off it -- which is exactly where re-expansion about z0 != 0 evaluates the
     // sampler -- the fitted measure differs from the true one by residues of order 1e-2 spread
     // over the aux grid, and at z = z0 + i w_0 those get divided by the LOCAL GRID SPACING near
-    // z0 (~3e-2), giving an O(1) error. Measured with {-9,-6,6,8}: tau-space fit_error 6.8e-9,
+    // z0 (~3e-2), giving an O(1) error. With {-9,-6,6,8}: tau-space fit_error 6.8e-9,
     // |S - Sigma| = 1.8e-7 at z0 = 0 but 1.77 at z0 = 0.3, and QP root errors of 60-450 meV.
     // The |t| >= w_0 floor does not help, because the ill-conditioning is controlled by the
     // ANGLE t/|z0|, not by t alone (two-constants/Hadamard three-lines: the error interpolates
     // between the imaginary-axis accuracy and the global bound as the ray tilts toward the real
-    // axis). To make the spec's own premise TRUE the model poles are therefore taken to BE
-    // auxiliary-grid nodes -- the two nodes nearest zero with |eps| >= 6 on each side -- so the
-    // tau data is genuinely in the span and the fit recovers the exact sparse residues. What
-    // QM1-e then measures is the EVALUATOR chain, which is what it is for.
+    // axis). The model poles are therefore taken to BE auxiliary-grid nodes -- the two nodes
+    // nearest zero with |eps| >= 6 on each side -- so the tau data is genuinely in the span
+    // and the fit recovers the exact sparse residues. What this case then measures is the
+    // EVALUATOR chain, which is what it is for.
     using namespace route_a_detail;
     const double beta = 1000.0, wmax = 12.0;      // wmax must bracket the model poles
     imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::dlr_basis, "low");
     imag_axes_ft::dlr_pole_fit pf(ft);
-    app_log(1, "QM1-e grid: np = {}, nt = {}, n_kept = {}, min|hw_l| = {:.4g}, min gap = {:.4g}",
+    app_log(1, "route A pole chain grid: np = {}, nt = {}, n_kept = {}, min|hw_l| = {:.4g}, min gap = {:.4g}",
             pf.np, pf.nt, pf.n_kept, pf.min_abs_node, pf.min_node_gap);
     // Exact recovery of a sparse residue vector needs the pole basis at FULL rank; a truncation
     // that drops directions re-spreads the residues and the near-real-axis fidelity goes with it.
@@ -654,7 +653,7 @@ namespace bdft_tests {
         pe.push_back(bv);
       }
     const std::vector<double> re{2.4, 3.0, 3.6, 2.6};
-    app_log(1, "QM1-e model poles (aux nodes): {:+.8f} {:+.8f} {:+.8f} {:+.8f}, "
+    app_log(1, "route A pole chain model poles (aux nodes): {:+.8f} {:+.8f} {:+.8f} {:+.8f}, "
                "Z(0) = {:.4f}", pe[0], pe[1], pe[2], pe[3],
             1.0 / (1.0 - sigma_p_dre(pe, re, 0.0)));
 
@@ -667,8 +666,8 @@ namespace bdft_tests {
     }
     auto cp = pf.coeffs(F);
     const double ferr = pf.fit_error(F, cp), fratio = pf.residue_ratio(F, cp);
-    app_log(1, "QM1-e pole fit: fit_error = {:.3e}, residue_ratio = {:.4f}", ferr, fratio);
-    imag_axes_ft::dlr_pole_fit_gate(ferr, "QM1-e");
+    app_log(1, "route A pole chain pole fit: fit_error = {:.3e}, residue_ratio = {:.4f}", ferr, fratio);
+    imag_axes_ft::dlr_pole_fit_gate(ferr, "route A pole chain");
 
     sra::pole_sampler S{nda::array<ComplexType, 1>(pf.np), pf.epsl};
     for (long p = 0; p < pf.np; ++p) S.c(p) = cp(p, 0);
@@ -679,7 +678,7 @@ namespace bdft_tests {
       const ComplexType z(z0, M_PI / beta);
       smax = std::max(smax, std::abs(S(z) - sigma_p(pe, re, z)));
     }
-    app_log(1, "QM1-e sampler vs model at |t| = w_0: max|S(z) - Sigma(z)| = {:.3e}", smax);
+    app_log(1, "route A pole chain sampler vs model at |t| = w_0: max|S(z) - Sigma(z)| = {:.3e}", smax);
     REQUIRE(smax < 1e-6);
 
     sra::fit_opts opt;                                        // p = 2, m = 3p = 6, n_reexp = 4
@@ -689,7 +688,7 @@ namespace bdft_tests {
       const double ex = root_p(pe, re, e0);
       auto res = sra::qp_root(S, e0, beta, 0.0, opt);
       const double err = std::abs(res.eps - ex);
-      app_log(1, "QM1-e e0 = {:+6.3f}: eps_exact = {:+.10f}  eps_poleRep = {:+.10f}  "
+      app_log(1, "route A pole chain e0 = {:+6.3f}: eps_exact = {:+.10f}  eps_poleRep = {:+.10f}  "
                  "err = {:.3e} ({:.4f} meV)  n_reexp = {}  conv = {}  rel_resid = {:.2e}  "
                  "imag_c_rel = {:.2e}  R_conv = {:.4f}  |eps-z0|/R = {:.2e}",
               e0, ex, res.eps, err, err * 1e3, res.n_reexp_used, res.converged,
@@ -698,22 +697,22 @@ namespace bdft_tests {
       REQUIRE(err < 1e-3);
       worst = std::max(worst, err);
     }
-    app_log(1, "QM1-e worst error over the five states = {:.3e} ({:.4f} meV)", worst, worst * 1e3);
+    app_log(1, "route A pole chain worst error over the five states = {:.3e} ({:.4f} meV)", worst, worst * 1e3);
     REQUIRE(worst < 1e-3);
 
-    // ---- the plan's flagged caveat, MEASURED (logged, not gated) ---------------------------
-    // Two separate things were flagged, and only one of them is real.
+    // ---- the near-real-axis caveat (logged, not checked) -----------------------------------
+    // Two candidate failure modes, and only one of them is real.
     //  (1) "the imaginary residual grows near |t| = w_0". It does NOT: imag_c_rel stays at
     //      machine level for every window below, because a real-residue/real-pole rep satisfies
     //      S(z*) = S(z)* identically, so the +/- samples are exact conjugates by construction.
     //  (2) The REAL failure mode is off-imaginary-axis continuation of a pole fit whose data is
-    //      not in the span. The block below reruns the whole chain with the spec's suggested
+    //      not in the span. The block below reruns the whole chain with the off-grid
     //      poles {-9,-6,6,8} (NOT aux nodes) and reports what happens.
     for (long n0 : {0L, 2L, 5L, 10L, 40L}) {
       sra::fit_opts o;
       o.n0 = n0;
       auto res = sra::qp_root(S, 0.5, beta, 0.0, o);
-      app_log(1, "QM1-e window probe n0 = {:2d} (|t| >= {:.4e}): eps = {:+.10f}, err = {:.3e}, "
+      app_log(1, "route A pole chain window probe n0 = {:2d} (|t| >= {:.4e}): eps = {:+.10f}, err = {:.3e}, "
                  "imag_c_rel = {:.3e}, rel_resid = {:.3e}",
               n0, (2.0 * double(n0) + 1.0) * M_PI / beta, res.eps,
               std::abs(res.eps - root_p(pe, re, 0.5)), res.diag.imag_c_rel, res.diag.rel_resid);
@@ -729,7 +728,7 @@ namespace bdft_tests {
       auto co = pf.coeffs(Fo);
       sra::pole_sampler So{nda::array<ComplexType, 1>(pf.np), pf.epsl};
       for (long p = 0; p < pf.np; ++p) So.c(p) = co(p, 0);
-      app_log(1, "QM1-e OFF-GRID caveat (poles {{-9,-6,6,8}}, NOT aux nodes): tau fit_error = "
+      app_log(1, "route A pole chain OFF-GRID caveat (poles {{-9,-6,6,8}}, NOT aux nodes): tau fit_error = "
                  "{:.3e} yet |S - Sigma| at |t| = w_0 is {:.3e} at z0 = 0 but {:.3e} at z0 = 0.3 "
                  "and {:.3e} at z0 = 2.4 -- the fit is exact-to-eps on the IMAGINARY AXIS only.",
               pf.fit_error(Fo, co),
@@ -738,7 +737,7 @@ namespace bdft_tests {
               std::abs(So(ComplexType(2.4, M_PI / beta)) - sigma4(ComplexType(2.4, M_PI / beta))));
       for (double e0 : e0s) {
         auto res = sra::qp_root(So, e0, beta, 0.0, opt);
-        app_log(1, "QM1-e OFF-GRID e0 = {:+6.3f}: err = {:.3e} ({:.2f} meV), imag_c_rel = {:.3e}",
+        app_log(1, "route A pole chain OFF-GRID e0 = {:+6.3f}: err = {:.3e} ({:.2f} meV), imag_c_rel = {:.3e}",
                 e0, std::abs(res.eps - exact_root(e0)), std::abs(res.eps - exact_root(e0)) * 1e3,
                 res.diag.imag_c_rel);
       }
@@ -747,10 +746,9 @@ namespace bdft_tests {
 #endif
 
   // ==========================================================================================
-  // Increment QM2 -- ROUTE B: the FINITE-T contour-deformation kernel
-  // (methods/SCF/sigma_route_b.hpp). Spec: notes/qm2_route_b_finite_t_spec.md; parent
-  // notes/qsgw_matsubara_plan.pdf section 3 -- whose eq 5 is the T = 0 formula and enters
-  // here ONLY as the beta -> infinity limit check, QM2-a(iii). Model units == eV; 1 meV = 1e-3.
+  // ROUTE B: the FINITE-T contour-deformation kernel (methods/SCF/sigma_route_b.hpp). The
+  // textbook T = 0 contour-deformation formula enters here ONLY as the beta -> infinity limit
+  // check. Model units == eV; 1 meV = 1e-3.
   // ==========================================================================================
 
   namespace srb = methods::sigma_route_b;
@@ -758,10 +756,9 @@ namespace bdft_tests {
   namespace route_b_detail {
 
     /**
-     * The spec section 3.1 fixture. Four G poles straddling mu = 0 (two occupied, two empty)
+     * The fixture. Four G poles straddling mu = 0 (two occupied, two empty)
      * and a PH-symmetric W^c of two plasmon +/- pairs, entered as the explicit SIGNED pole
-     * list (+Omega, +d) and (-Omega, -d) per pair -- 4 signed poles, not 8; the spec's phrase
-     * "the 8-pole list with +/- signs" counts the (Omega, d) entries, the object is the same:
+     * list (+Omega, +d) and (-Omega, -d) per pair -- 4 signed poles (8 (Omega, d) entries):
      *     W^c(z) = sum_pairs 2 d Omega / (z^2 - Omega^2),
      * even, decaying as 1/z^2 (so sum_j w_j = 0 -- which is what makes the brute-force
      * summand fall off as 1/nu^3, see brute_matsubara).
@@ -791,7 +788,7 @@ namespace bdft_tests {
     }
 
     /**
-     * The sign/prefactor SCAN family (QM2-a(iii)). The pinned kernel is
+     * The sign/prefactor SCAN family. The pinned kernel is
      * (sg, sB, sF, pref, sD) = (+1, +1, +1, 1, +1) and is checked against
      * srb::sigma_cd itself, so the scan tests the header's formula, not a copy of it.
      */
@@ -809,7 +806,7 @@ namespace bdft_tests {
       return s;
     }
 
-    // ---- QM2-a(i): the BRUTE-FORCE bosonic Matsubara sum ------------------------------------
+    // ---- the BRUTE-FORCE bosonic Matsubara sum ----------------------------------------------
     /**
      * sum_{m>=N} m^-K by Euler-Maclaurin (integral + f(N)/2 - f'(N)/12 + f'''(N)/720). Worst
      * case here is K = 26 at N = 1.6e3, where the first OMITTED term (2k = 6) is ~1e-15
@@ -831,9 +828,9 @@ namespace bdft_tests {
      * the analytic Laurent tail of the same summand -- no contour theorem anywhere, so this is
      * an independent oracle for the closed form.
      *
-     * Why the tail is mandatory (spec "traps"): the summand decays as 1/nu^3 (G ~ 1/nu,
+     * Why the tail is mandatory: the summand decays as 1/nu^3 (G ~ 1/nu,
      * W^c ~ 1/nu^2 because sum_j w_j = 0), and its odd part cancels between +/-m, so a bare
-     * cutoff leaves O(1/M^3) -- measured 3e-5 (beta = 1e4) to 1e-4 (beta = 100) at M = 16 beta,
+     * cutoff leaves O(1/M^3) -- 3e-5 (beta = 1e4) to 1e-4 (beta = 100) at M = 16 beta,
      * i.e. five to six orders ABOVE the 1e-10 gate.
      * The tail comes from the exact expansion
      *     1/((u + a)(u - o)) = sum_k c_k / u^{k+2},   c_k = sum_{p+q=k} (-a)^p o^q,
@@ -882,7 +879,7 @@ namespace bdft_tests {
       return out;
     }
 
-    // ---- QM2-a(iii): the T = 0 (eq-5) oracle ------------------------------------------------
+    // ---- the T = 0 oracle ---------------------------------------------------------------------
     struct t0_result { ComplexType total{0.0}, I{0.0}, R{0.0}; };
 
     /**
@@ -939,9 +936,9 @@ namespace bdft_tests {
   } // route_b_detail
 
   TEST_CASE("route_b_cd_matsubara_sum", "[methods][qpgw][qp_maps][route_b]") {
-    // QM2-a(i) + (ii): the closed form of sigma_route_b.hpp against the BRUTE-FORCE bosonic
-    // Matsubara sum at the first 20 fermionic nodes, at beta = 100 / 1000 / 10000.
-    // Gate: rel < 1e-10 -- the increment's acceptance criterion, NOT tunable. A rational
+    // the closed form of sigma_route_b.hpp against the BRUTE-FORCE bosonic Matsubara sum at
+    // the first 20 fermionic nodes, at beta = 100 / 1000 / 10000.
+    // Tolerance: rel < 1e-10 -- the acceptance criterion, NOT tunable. A rational
     // function of z that matches every node with the right decay IS the unique continuation,
     // so this leg is the finite-T correctness proof of the kernel.
     using namespace route_b_detail;
@@ -966,12 +963,12 @@ namespace bdft_tests {
         tail_rel = std::max(tail_rel, std::abs(b.tail) / std::abs(c));
         last_k = std::max(last_k, b.last_k_term);
         if (n < 3)
-          app_log(1, "QM2-a(i) beta = {:7g} n = {}: Sigma_closed = {:+.14g} {:+.14g}i, "
+          app_log(1, "route B Matsubara sum beta = {:7g} n = {}: Sigma_closed = {:+.14g} {:+.14g}i, "
                      "brute = {:+.14g} {:+.14g}i, rel = {:.3e}",
                   beta, n, c.real(), c.imag(), b.total.real(), b.total.imag(), rel);
         REQUIRE(rel < 1e-10);
       }
-      app_log(1, "QM2-a(i) beta = {:7g}: M = {}, nu_M = {:.1f} (vs max|omega_j| = 9), "
+      app_log(1, "route B Matsubara sum beta = {:7g}: M = {}, nu_M = {:.1f} (vs max|omega_j| = 9), "
                  "worst rel = {:.3e}  ||  TAIL EVIDENCE: |tail|/|Sigma| = {:.3e}, worst rel "
                  "WITHOUT the tail = {:.3e}, last Laurent order (k = 24) contributes {:.3e}",
               beta, M, 2.0 * M_PI * double(M) / beta, worst, tail_rel, worst_nt, last_k);
@@ -995,7 +992,7 @@ namespace bdft_tests {
         const auto b = brute_matsubara(z, F, beta, M);
         const double rel = std::abs(b.total - c) / std::abs(c);
         const double rel_nt = std::abs(b.trunc - c) / std::abs(c);
-        app_log(1, "QM2-a(i) M-scan beta = 1000, n = 0: M = {:6d}  rel WITH tail = {:.3e}  "
+        app_log(1, "route B Matsubara sum M-scan beta = 1000, n = 0: M = {:6d}  rel WITH tail = {:.3e}  "
                    "rel truncation-only = {:.3e}  (ratio to previous M = {:.2f})",
                 M, rel, rel_nt, (prev > 0.0) ? prev / rel_nt : 0.0);
         prev = rel_nt;
@@ -1003,17 +1000,17 @@ namespace bdft_tests {
       }
     }
 
-    // QM2-a(ii) -- the same measurement restated as the internal anchor, per-beta worst case.
-    app_log(1, "QM2-a(ii) internal anchor (closed form at i w_n vs the directly summed "
+    // the same measurement restated as the internal anchor, per-beta worst case.
+    app_log(1, "route B internal anchor (closed form at i w_n vs the directly summed "
                "Sigma^c): worst rel over the first 20 nodes = {:.3e} (beta = 100), {:.3e} "
-               "(beta = 1000), {:.3e} (beta = 10000); gate 1e-10.",
+               "(beta = 1000), {:.3e} (beta = 10000); tolerance 1e-10.",
             worst_b[0], worst_b[1], worst_b[2]);
     for (double x : worst_b) REQUIRE(x < 1e-10);
   }
 
   TEST_CASE("route_b_cd_zeroT_limit_and_sign_scan", "[methods][qpgw][qp_maps][route_b]") {
-    // QM2-a(iii): at beta = 1e6 the finite-T kernel must reproduce the T = 0 eq-5 evaluation
-    // (imaginary-axis quadrature + sharp window residues) at real omega -- gate max diff < 1e-5
+    // at beta = 1e6 the finite-T kernel must reproduce the T = 0 evaluation
+    // (imaginary-axis quadrature + sharp window residues) at real omega -- max diff < 1e-5
     // -- and then the SIGN SCAN: every wrong sign / prefactor variant must fail by O(1). The
     // scan is the reason this leg exists: a wrong sign is invisible in a "looks reasonable"
     // check and the T = 0 limit is the only place the absolute normalization is pinned.
@@ -1031,7 +1028,7 @@ namespace bdft_tests {
         d = std::max(d, std::abs(a - b));
         m = std::max(m, std::abs(a));
       }
-      app_log(1, "QM2-a(iii) scan family vs header kernel at the pinned parameters: "
+      app_log(1, "route B T=0 limit, scan family vs header kernel at the pinned parameters: "
                  "max|diff| = {:.3e}, max|Sigma| = {:.4f}", d, m);
       REQUIRE(d < 1e-14 * std::max(m, 1.0));
     }
@@ -1041,7 +1038,7 @@ namespace bdft_tests {
       const double wr = grid[3];
       for (long npts : {12501L, 25001L, 50001L, 100001L}) {
         const auto o = t0_oracle(wr, F, F.mu, npts);
-        app_log(1, "QM2-a(iii) quadrature probe at w = {:+.4f}: npts = {:6d} -> "
+        app_log(1, "route B T=0 limit, quadrature probe at w = {:+.4f}: npts = {:6d} -> "
                    "Sigma_T0 = {:+.12f} (I = {:+.9f}, R = {:+.9f})",
                 wr, npts, o.total.real(), o.I.real(), o.R.real());
       }
@@ -1056,13 +1053,13 @@ namespace bdft_tests {
       const double d = std::abs(c - o.total);
       worst = std::max(worst, d);
       sig_max = std::max(sig_max, std::abs(c));
-      app_log(1, "QM2-a(iii) w = {:+7.4f}: closed form (beta = 1e6) = {:+.10f}, T=0 eq-5 = "
+      app_log(1, "route B T=0 limit, w = {:+7.4f}: closed form (beta = 1e6) = {:+.10f}, T=0 CD = "
                  "{:+.10f} (quadrature {:+.6f} + window residues {:+.6f}), |diff| = {:.3e}",
               wr, c.real(), o.total.real(), o.I.real(), o.R.real(), d);
       REQUIRE(d < 1e-5);
     }
-    app_log(1, "QM2-a(iii) T=0 limit: max |Sigma_closed(beta=1e6) - Sigma_T0| = {:.3e} over "
-               "{} energies (gate 1e-5); max|Sigma| = {:.4f}", worst, grid.size(), sig_max);
+    app_log(1, "route B T=0 limit: max |Sigma_closed(beta=1e6) - Sigma_T0| = {:.3e} over "
+               "{} energies (tolerance 1e-5); max|Sigma| = {:.4f}", worst, grid.size(), sig_max);
     REQUIRE(worst < 1e-5);
 
     // ---- THE SIGN SCAN ----------------------------------------------------------------------
@@ -1089,7 +1086,7 @@ namespace bdft_tests {
       for (size_t k = 0; k < grid.size(); ++k)
         d = std::max(d, std::abs(sigma_variant(ComplexType(grid[k]), F, beta, F.mu,
                                                v.sg, v.sB, v.sF, v.pref, v.sD) - oracle[k]));
-      app_log(1, "QM2-a(iii) SIGN SCAN  {:34s}  max|diff vs T=0| = {:.4e}  -> {}",
+      app_log(1, "route B T=0 limit, SIGN SCAN  {:34s}  max|diff vs T=0| = {:.4e}  -> {}",
               v.name, d, first ? "PASS (pinned)" : (d > 5e-2 ? "fails by O(1) [required]"
                                                              : "*** NOT DISTINGUISHED ***"));
       if (first) {
@@ -1100,7 +1097,7 @@ namespace bdft_tests {
         worst_wrong_pass = (worst_wrong_pass == 0.0) ? d : std::min(worst_wrong_pass, d);
       }
     }
-    app_log(1, "QM2-a(iii) SIGN SCAN summary: {} wrong variants, the LEAST wrong misses by "
+    app_log(1, "route B T=0 limit, SIGN SCAN summary: {} wrong variants, the LEAST wrong misses by "
                "{:.4e} (= {:.1f}% of max|Sigma|); the pinned kernel is at {:.3e}.",
             vs.size() - 1, worst_wrong_pass, 100.0 * worst_wrong_pass / sig_max, worst);
   }
@@ -1126,14 +1123,14 @@ namespace bdft_tests {
      * and with the support constraint, ending in Sigma^c at the requested REAL energies.
      *
      *   W^c(i nu_m) on the bosonic mesh
-     *     -> Ttw_bb gemm onto the (shared) tau mesh                    | iaft_dconv.hpp:198-213
-     *     -> imag_axes_ft::dlr_pole_fit::coeffs + fit_error + gate     | iaft_dconv.hpp:191-209
+     *     -> Ttw_bb gemm onto the (shared) tau mesh                    | iaft_dconv.hpp
+     *     -> imag_axes_ft::dlr_pole_fit::coeffs + fit_error + gate     | iaft_dconv.hpp
      *     -> bosonic residues w_l = tanh(hw_l/2) * coeff_l             | the `th(l)` array there
      *     -> methods::sigma_route_b::sigma_cd at real z.
      *
      * The SUPPORT-CONSTRAINED variant is the same least squares on the same tau data with the
      * auxiliary kernel columns of |eps_p| < the model's PH-gap edge removed (truncated-SVD LS,
-     * same fixed-rank doctrine and rel_tol as dlr_pole_fit). W^c demonstrably has no spectral
+     * same fixed-rank rule and rel_tol as dlr_pole_fit). W^c demonstrably has no spectral
      * weight inside its gap, so this is prior physical information about the object being
      * fitted, not a tuned regularization.
      */
@@ -1161,7 +1158,7 @@ namespace bdft_tests {
       auto coef = pf.coeffs(W_t);
       R.fit_err_plain = pf.fit_error(W_t, coef);
       R.ratio_plain = pf.residue_ratio(W_t, coef);
-      imag_axes_ft::dlr_pole_fit_gate(R.fit_err_plain, "QM2-b plain fit", 1e-3, 1e-2, R.ratio_plain);
+      imag_axes_ft::dlr_pole_fit_gate(R.fit_err_plain, "route B plain fit", 1e-3, 1e-2, R.ratio_plain);
 
       nda::array<double, 1> om_fit(np);
       nda::array<ComplexType, 1> w_fit(np);
@@ -1186,12 +1183,9 @@ namespace bdft_tests {
       }
 
       // ---- the SUPPORT-CONSTRAINED least squares on the reduced kernel columns --------------
-      // QM3: this block WAS a local least squares here. It has been PROMOTED into shared code
-      // (imag_axes_ft::masked_pole_fit) so that the production mode-A fit and this gate run
-      // ONE code path -- no duplicated fit code test-vs-prod (QM3 spec, "PROMOTE"). The gate
-      // below is therefore also the promoted utility's unit test: the numbers it prints must
-      // be bit-identical to the pre-promotion measurement, which is why masked_pole_fit keeps
-      // the real-kernel gesvd and the exact accumulation order used here before.
+      // The fit is the shared imag_axes_ft::masked_pole_fit, so the production mode-A fit and
+      // this check run ONE code path; this case is therefore also that utility's unit test
+      // (it uses the real-kernel gesvd).
       auto mpf = imag_axes_ft::masked_pole_fit::from_tau(pf, F.gap_edge);
       const long npr = mpf.nkeep;
       R.n_support = npr;
@@ -1214,7 +1208,7 @@ namespace bdft_tests {
           den = std::max(den, std::abs(W_w(m, 0)));
         }
         R.rec_rel_sup = num / den;
-        // the promoted utility must agree with the auxiliary grid it was built from
+        // masked_pole_fit must agree with the auxiliary grid it was built from
         for (long q = 0; q < npr; ++q) REQUIRE(std::abs(om_sup(q)) >= F.gap_edge);
       }
 
@@ -1258,31 +1252,30 @@ namespace bdft_tests {
   } // route_b_detail
 
   TEST_CASE("route_b_fitted_W_chain", "[methods][qpgw][qp_maps][route_b]") {
-    // QM2-b: the OFF-NODE W stress at REAL z -- the QM1-e lesson applied to route B. Same
+    // the OFF-NODE W stress at REAL z -- the off-grid lesson of route_a_dlr_pole_chain applied
+    // to route B. Same
     // fixture, but W^c reaches the kernel through the PRODUCTION chain (bosonic mesh ->
     // Ttw_bb -> dlr_pole_fit -> residues x tanh(hw/2)), with Omega = 6.0 / 9.0 deliberately
-    // OFF the auxiliary node set. Gate: < 1e-3 (1 meV) on Sigma^c at the four eps_l and the
-    // five QM1 evaluation energies.
+    // OFF the auxiliary node set. Tolerance: < 1e-3 (1 meV) on Sigma^c at the four eps_l and
+    // the five route-A evaluation energies.
     //
-    // WHAT IS MEASURED, AND THE ONE DEVIATION FROM THE SPEC'S FIXTURE (flagged, not silent).
-    // The spec prescribes the QM1-e grid (beta = 1000, wmax = 12, prec "low") and, if the
-    // plain fit misses the gate, prescribes the SUPPORT-CONSTRAINED fit as the variant to gate
-    // at 1 meV. On that grid, measured here and logged in full:
+    // WHAT IS MEASURED, AND WHY THE CHECK RUNS AT prec "high". On the route-A chain grid
+    // (beta = 1000, wmax = 12, prec "low"), logged in full:
     //     plain fitted chain          worst error 1.5e+04 eV   (catastrophic, see below)
-    //     support-constrained fit     worst error 2.1e-02 eV   (20.8 meV -- ABOVE the gate)
+    //     support-constrained fit     worst error 2.1e-02 eV   (20.8 meV -- ABOVE tolerance)
     // The support constraint therefore fixes the catastrophe (6 orders) but does NOT reach
-    // 1 meV on the "low" grid, and the reason is measured rather than assumed: at prec "low"
+    // 1 meV on the "low" grid, and the reason is representation rank: at prec "low"
     // only 6 of 43 auxiliary nodes lie on the support |eps_p| >= 6 eV, and they are placed
     // asymmetrically ({-11.99, -9.96, -7.67, +6.74, +9.59, +11.99}) -- no node within 1.6 eV
     // of the model's -6 eV pole. The residual is pure representation rank:
     //     prec "low"    np = 43   6 support nodes ->  20.8 meV
     //     prec "medium" np = 72  11 support nodes ->   2.6 meV
     //     prec "high"   np = 90  14 support nodes ->   0.14 meV
-    // The 1 meV gate is an acceptance criterion and is NOT loosened. What is adapted instead
-    // is the FIXTURE's DLR precision, which the spec introduced as "the QM1-e grid" (i.e. for
-    // continuity with QM1, not as a physics requirement): the gate is applied to the
-    // support-constrained chain on the grid where the auxiliary basis can actually carry
-    // W^c's support. The prec "low" numbers are reported in full and NOT gated.
+    // The 1 meV tolerance is an acceptance criterion and is NOT loosened. What is adapted
+    // instead is the fixture's DLR precision (prec "low" is not a physics requirement): the
+    // check is applied to the support-constrained chain on the grid where the auxiliary basis
+    // can actually carry W^c's support. The prec "low" numbers are reported in full and NOT
+    // checked.
     using namespace route_b_detail;
     fixture F;
     const double beta = 1000.0, wmax = 12.0;
@@ -1292,20 +1285,20 @@ namespace bdft_tests {
     for (double e : {0.5, 1.5, 3.0, -0.8, -2.5}) zs.push_back(e);
 
     auto report = [&](chain_result const &R, bool full) {
-      app_log(1, "QM2-b [prec = {:6s}] grid: np = {}, nt = {}, nw_b = {}, min|hw_l| = {:.4g} "
+      app_log(1, "route B fitted W [prec = {:6s}] grid: np = {}, nt = {}, nw_b = {}, min|hw_l| = {:.4g} "
                  "(=> min|eps_p| = {:.3e} eV), min node gap = {:.4g}; Omega = 6.0 / 9.0 are "
                  "{:.4e} / {:.4e} eV from the nearest aux node (global min gap {:.3e} eV) -- "
                  "OFF the node set as required",
               R.prec, R.np, R.nt, R.nwb, R.min_abs_node, R.min_abs_node / beta, R.min_node_gap,
               R.dist6, R.dist9, R.min_node_gap / beta);
-      app_log(1, "QM2-b [prec = {:6s}] plain fit: tau fit_error = {:.3e}, residue_ratio = "
+      app_log(1, "route B fitted W [prec = {:6s}] plain fit: tau fit_error = {:.3e}, residue_ratio = "
                  "{:.4f}, bosonic-mesh reconstruction rel err = {:.3e}  ||  support-constrained "
                  "(|eps_p| >= {:.1f} eV: {} of {} nodes, {} singular directions): tau "
                  "fit_error = {:.3e}, bosonic-mesh rel err = {:.3e}",
               R.prec, R.fit_err_plain, R.ratio_plain, R.rec_rel_plain, F.gap_edge,
               R.n_support, R.np, R.s_kept, R.fit_err_sup, R.rec_rel_sup);
       if (full) {
-        app_log(1, "QM2-b [prec = {:6s}] fitted-residue profile near omega = 0 (the spurious-"
+        app_log(1, "route B fitted W [prec = {:6s}] fitted-residue profile near omega = 0 (the spurious-"
                    "weight diagnostic; |w_j n_B| is the combination the kernel actually uses, "
                    "bounded by |coeff| because tanh cancels the 1/omega of n_B):", R.prec);
         for (auto const &r : R.profile)
@@ -1315,34 +1308,35 @@ namespace bdft_tests {
                   r.kept ? "on the support -- kept" : "inside the PH gap -- DROPPED by the "
                                                       "support constraint");
         for (size_t k = 0; k < zs.size(); ++k)
-          app_log(1, "QM2-b [prec = {:6s}] z = {:+6.3f}: Sigma_exact = {:+.10f}, plain fit err "
+          app_log(1, "route B fitted W [prec = {:6s}] z = {:+6.3f}: Sigma_exact = {:+.10f}, plain fit err "
                      "= {:.4e} ({:.4g} meV), support-constrained err = {:.4e} ({:.4g} meV)",
                   R.prec, zs[k], R.sig_exact[k], R.err_plain[k], R.err_plain[k] * 1e3,
                   R.err_sup[k], R.err_sup[k] * 1e3);
-        app_log(1, "QM2-b [prec = {:6s}] smallest denominator |z - eps_l + omega_p| met by the "
+        app_log(1, "route B fitted W [prec = {:6s}] smallest denominator |z - eps_l + omega_p| met by the "
                    "PLAIN fit = {:.4e} eV -- an auxiliary node sits essentially AT eps_l - z, "
                    "and its n_B-weighted residue is divided by that gap. This is the whole "
                    "failure mode: the fit is exact-to-eps on the imaginary axis (fit_error "
                    "{:.2e}) and useless at real z.", R.prec, R.min_den_plain, R.fit_err_plain);
       }
-      app_log(1, "QM2-b [prec = {:6s}] RESULT over {} real evaluation energies: PLAIN fitted "
+      app_log(1, "route B fitted W [prec = {:6s}] RESULT over {} real evaluation energies: PLAIN fitted "
                  "chain worst = {:.4e} eV ({:.4g} meV); SUPPORT-CONSTRAINED worst = {:.4e} eV "
                  "({:.4g} meV).",
               R.prec, zs.size(), R.worst_plain, R.worst_plain * 1e3,
               R.worst_sup, R.worst_sup * 1e3);
     };
 
-    // (1) the spec's grid, reported in full -- NOT gated (see the block comment above)
+    // (1) the prec "low" grid, reported in full -- NOT checked (see the block comment above)
     auto lo = run_fitted_chain(F, beta, wmax, "low", zs);
     report(lo, true);
     // (2) the rank sweep that identifies the "low" residual as auxiliary-support coverage
     auto me = run_fitted_chain(F, beta, wmax, "medium", zs);
     report(me, false);
-    // (3) the gated chain
+    // (3) the checked chain
     auto hi = run_fitted_chain(F, beta, wmax, "high", zs);
     report(hi, true);
 
-    app_log(1, "QM2-b SUPPORT-COVERAGE SWEEP (the reason the spec's grid misses the gate): "
+    app_log(1, "route B fitted W SUPPORT-COVERAGE SWEEP (the reason prec low misses the "
+               "tolerance): "
                "prec low = {} support nodes -> {:.4g} meV; medium = {} -> {:.4g} meV; "
                "high = {} -> {:.4g} meV. The PLAIN fit is {:.3e} / {:.3e} / {:.3e} eV on the "
                "same three grids -- more precision does NOT fix it, only the support "
@@ -1351,7 +1345,7 @@ namespace bdft_tests {
             hi.n_support, hi.worst_sup * 1e3, lo.worst_plain, me.worst_plain, hi.worst_plain);
 
     for (auto const *R : {&lo, &me, &hi}) {
-      // Omega must be OFF the aux node set (spec "traps").
+      // Omega must be OFF the aux node set.
       REQUIRE(R->dist6 > R->min_node_gap / beta);
       REQUIRE(R->dist9 > R->min_node_gap / beta);
       // the tanh(hw/2) residue convention: a wrong factor is an O(1) error here.
@@ -1361,11 +1355,11 @@ namespace bdft_tests {
       REQUIRE(R->worst_plain > 1.0);
       REQUIRE(R->n_support > 4);
     }
-    // THE GATE (1 meV), on the support-constrained chain. NOT tunable.
-    app_log(1, "QM2-b GATED VARIANT: the SUPPORT-CONSTRAINED fit at prec \"high\" -- worst "
-               "error {:.4e} eV ({:.4g} meV) against the 1 meV acceptance criterion. The "
-               "plain fit FAILED the gate on every grid; the spec's prec \"low\" grid misses "
-               "it at {:.4g} meV (auxiliary support coverage, see above).",
+    // THE CHECK (1 meV), on the support-constrained chain. NOT tunable.
+    app_log(1, "route B fitted W CHECKED VARIANT: the SUPPORT-CONSTRAINED fit at prec "
+               "\"high\" -- worst error {:.4e} eV ({:.4g} meV) against the 1 meV acceptance "
+               "criterion. The plain fit FAILS the tolerance on every grid; the prec \"low\" "
+               "grid misses it at {:.4g} meV (auxiliary support coverage, see above).",
             hi.worst_sup, hi.worst_sup * 1e3, lo.worst_sup * 1e3);
     REQUIRE(hi.worst_sup < 1e-3);
   }

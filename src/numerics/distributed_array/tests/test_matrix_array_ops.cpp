@@ -341,7 +341,7 @@ TEST_CASE("matrix_array_solves_dev",     "[math][matrix_array_ops]") { test_solv
 /*
  * distributed_array -> distributed_matrix_array -> distributed_array must reproduce the
  * original exactly. This is the conversion that makes the copy into SLATE's layout free at
- * the points where the code already redistributes (thc_aux.icc:1716-1717).
+ * the points where the code already redistributes (e.g. in thc_aux.icc).
  */
 template<MEMORY_SPACE MEM, int BR>
 void test_roundtrip(std::array<long,BR+2> gshape, std::array<long,2> tile,
@@ -409,7 +409,7 @@ void test_roundtrip_all()
     test_roundtrip<MEM,1>({4,24,20}, {8,8}, {2,1,n/2}, {2,n/2,1});
   }
   // The shape intvec_impl actually uses: all ranks on the batch dimension, trivial matrix
-  // grid, and source == destination grid. This was missing and is where production broke.
+  // grid, and source == destination grid.
   test_roundtrip<MEM,1>({8,24,20},  {8,8}, {n,1,1}, {n,1,1});
   test_roundtrip<MEM,1>({8,37,29},  {8,8}, {n,1,1}, {n,1,1});   // non-divisible
   test_roundtrip<MEM,1>({8,24,100}, {8,16},{n,1,1}, {n,1,1});   // wide RHS, mb != nb
@@ -425,10 +425,9 @@ TEST_CASE("matrix_array_roundtrip_dev",  "[math][matrix_array_ops]") { test_roun
 /*      legacy single-block path vs block-cyclic path, same input          */
 /***************************************************************************/
 /*
- * The production A/B (job 6719571) showed the two paths disagreeing on the thc ISDF solve.
- * This pins the comparison down with no production noise: identical hermitian A and RHS B,
- * solved once through the legacy C-order view path (slate_ops::lu_solve<true> on a
- * distributed_array) and once through the block-cyclic path, with the RESIDUAL ||A X - B||
+ * Compares the two paths used for the thc ISDF solve on controlled input: identical hermitian
+ * A and RHS B, solved once through the legacy C-order view path (slate_ops::lu_solve<true> on
+ * a distributed_array) and once through the block-cyclic path, with the RESIDUAL ||A X - B||
  * as ground truth for both. A round-trip test cannot catch a transpose that both directions
  * apply consistently; this can.
  */
@@ -440,9 +439,9 @@ void test_legacy_vs_block_cyclic()
 {
   auto world = boost::mpi3::environment::get_world_instance();
   auto [p, q] = pq_of(world.size());
-  // Geometries to cover. Production (thc ISDF at 4 ranks) has mb == M -- a SINGLE tile row --
-  // and a wide RHS with nb != mb, e.g. block sizes (931, 1024) at Np=931. Every earlier
-  // comparison here used M=32/mb=8 (four square tiles), so that regime was untested.
+  // Geometries to cover. The thc ISDF solve at small rank counts has mb == M -- a SINGLE tile
+  // row -- and a wide RHS with nb != mb, e.g. block sizes (931, 1024) at Np=931, so that regime
+  // is covered alongside the square-tile one.
   struct Geom { long M, NRHS, mb, nb; };
   for (auto g : std::vector<Geom>{ {32, 20,  8,  8},   // square tiles, divisible
                                    {32, 20, 32, 20},   // single tile row+col
@@ -564,8 +563,8 @@ TEST_CASE("matrix_array_vs_legacy_dev",  "[math][matrix_array_ops]") { test_lega
  * actually is: it comes from a pivoted Cholesky truncated at thresh (1e-5 by default), so it is
  * hermitian and formally nonsingular but badly conditioned. Two factorizations that order
  * operations differently can then land on solutions that differ substantially while both having
- * tiny residuals. This is the test that says whether the production ERI difference is a bug or
- * conditioning: the assertion is on the RESIDUALS, not on X agreeing.
+ * tiny residuals. This test separates a genuine bug from conditioning: the assertion is on the
+ * RESIDUALS, not on X agreeing.
  */
 template<MEMORY_SPACE MEM>
 void test_legacy_vs_bc_illcond()
@@ -670,9 +669,9 @@ TEST_CASE("matrix_array_illcond_dev",  "[math][matrix_array_ops]") { test_legacy
  * Pinning it on a non-hermitian A makes the convention explicit and gives the tests teeth: if
  * either path's orientation is ever changed, the residual it is checked against here stops being
  * satisfied. The hermitian agreement tests alone cannot see such a change, because A^H == A hides
- * it -- which is how the wrong 2026-07-31 conclusion (that the paths disagreed on orientation, when
- * in fact the input C was singular) survived as long as it did. Production call sites all pass a
- * hermitian A; this test exists to keep the ground under that statement.
+ * it (and a discrepancy caused by a singular input could then be mistaken for an orientation
+ * error). Production call sites all pass a hermitian A; this test keeps the ground under that
+ * statement.
  */
 template<MEMORY_SPACE MEM>
 void test_solve_orientation()

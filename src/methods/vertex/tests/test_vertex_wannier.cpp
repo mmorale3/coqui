@@ -19,27 +19,29 @@
  */
 
 /**
- * ISDF-Vertex: Wannier-projector generalization of the subspace C
- * (notes/wannier_projector_theory.md). The committed formulation is ALREADY a
- * general-projector theory (Phi_2^C = Phi_2^x[PGP, W], P = U U^dag); this test
- * exercises the WANNIER-MODE input-slice substitutions X(:,C) -> X.U,
- * G_CC -> U^dag G U, injection -> U Sigma_bar U^dag, rotated point selection.
+ * ISDF-Vertex: Wannier-projector generalization of the subspace C. The vertex
+ * functional is a general-projector theory (Phi_2^C = Phi_2^x[PGP, W],
+ * P = U U^dag); this test exercises the Wannier-mode input substitutions
+ * X(:,C) -> X.U, G_CC -> U^dag G U, the Sigma^C injection and the rotated
+ * point selection.
  *
- * The subspace is installed through the PRODUCTION seam vertex_t::set_wannier_
- * projector, fed a synthetic projector_t (in-memory ctor). The validation ladder
- * (memo section 4):
- *   1. DEGENERATE-U bit-identity: U = the 0/1 window isometry (identity block)
- *      in Wannier mode == window mode, to machine rounding (the gemm path vs the
+ * The subspace is installed through vertex_t::set_wannier_projector, fed a
+ * synthetic projector_t (in-memory constructor). Checks:
+ *   1. Degenerate U: U = the 0/1 window isometry (identity block) in Wannier
+ *      mode reproduces window mode to machine rounding (the gemm path vs the
  *      slice path; the theory reduces exactly).
- *   2. GAUGE-INVARIANCE (the sharpest NEW check): U -> U V, V a fixed M x M
- *      unitary (k-independent AND k-dependent), leaves ALL observables invariant
- *      (Phi depends on range(P) only) -- kills every conj/transpose misplacement
- *      in the C2/C3/C4 substitutions at O(1).
- *   3. Non-trivial Wannier C (a genuine unitary mix of the window bands) runs
- *      end-to-end and shifts e_corr from plain scGW: the subspace actually acts,
- *      and the secondary (rotated selection) path agrees with the global path.
+ *   2. Gauge invariance: U -> U V, V a fixed M x M unitary (k-independent and
+ *      k-dependent), leaves all observables invariant (Phi depends on range(P)
+ *      only); any conj/transpose misplacement in the substitutions shows up at
+ *      O(1).
+ *   3. A non-trivial Wannier C (a genuine unitary mix of the window bands) runs
+ *      end-to-end and shifts e_corr from the full-window result: the subspace
+ *      actually acts, and the secondary (rotated selection) path agrees with the
+ *      global path.
  *   4. Loewdin isometry: a non-orthonormal raw U is repaired (defect logged),
  *      and the Loewdin result is gauge-equivalent to an orthonormal input.
+ *   5. The static rungs (B-S / B-L) satisfy checks 1 and 2.
+ *   6. A symmetry-closed Wannier C (SrVO3 t2g) has no symmetry leakage.
  */
 
 #undef NDEBUG
@@ -163,10 +165,9 @@ namespace bdft_tests {
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
-    // UNIQUE checkpoint per call: a fixed name lets a crashed/failed run_scgw leave a
-    // stale coqui_vertex_wannier.mbpt.h5 that the NEXT run's damping restart chokes on
-    // ("scf/iter1 does not exist"). Unique names + start-of-run cleanup make each run
-    // independent regardless of prior failures.
+    // Unique checkpoint per call: with a fixed name, a failed run would leave a stale
+    // .mbpt.h5 that the next run's damping restart reads ("scf/iter1 does not exist").
+    // Unique names plus start-of-run cleanup make each run independent.
     static long s_run_counter = 0;
     std::string output = "coqui_vertex_wannier_" + std::to_string(s_run_counter++);
     if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
@@ -211,8 +212,8 @@ namespace bdft_tests {
 
     // ================= 1. DEGENERATE-U: Wannier(identity) == window ==================
     // U = the 0/1 window isometry (identity block). Wannier mode must reproduce the
-    // committed window-mode result to machine rounding (the gemm path vs the slice
-    // path; the theory reduces exactly when P = the window indicator).
+    // window-mode result to machine rounding (the gemm path vs the slice path; the
+    // theory reduces exactly when P = the window indicator).
     auto [ehf_win, ec_win] =
         run_scgw(mpi_context, ft, "qe_lih222", window, n_iter, "global", no_proj);
     auto install_identity = [&](solvers::vertex_t& v, mf::MF& mf) {
@@ -231,7 +232,7 @@ namespace bdft_tests {
     REQUIRE(std::abs(ehf_wan_id - ehf_win) < 1e-10);
     REQUIRE(std::abs(ec_wan_id - ec_win) < 1e-10);
 
-    // ================= 2. GAUGE-INVARIANCE (the sharpest new check) ==================
+    // ================= 2. GAUGE-INVARIANCE ============================================
     // A genuine unitary mix of the window bands defines the physical subspace P; the
     // observables depend on range(P) ONLY. Rotate the SAME P by V (k-indep) and by a
     // k-dependent V(k): all observables must be invariant to kernel accuracy.
@@ -263,21 +264,16 @@ namespace bdft_tests {
             ehf_Vk, ec_Vk, std::abs(ehf_Vk - ehf_win), std::abs(ec_Vk - ec_win));
     // full-window M == nW: every rotation has range(P) = the window => the OBSERVABLES
     // (e_hf, e_corr) are invariant to the window result. This is the sharpest end-to-end
-    // check on the complex-U conj/transpose placement in the C3 Sigma^C injection.
+    // check on the complex-U conj/transpose placement in the Sigma^C injection.
     //
-    // RESOLVED (2026-07-17, notes/wannier_projector_theory.md section 6.2): the Sigma^C
-    // injection is the CHAIN-RULE sandwich conj(U) Sigma_bar U^T (not the operator sandwich
-    // U Sigma_bar U^dag, which leaked at O(1) for complex U while being invisible for real
-    // U). The kernel-level gauge oracles (vertex_sigma_toy / vertex_pi_toy "wannier_gauge")
-    // pin BOTH cuts' covariance to MACHINE precision (~1e-15) for real / diagonal / complex
-    // off-diagonal V. MEASURED end-to-end (isolated run, UNIQUE checkpoint per run_scgw so
-    // no stale-restart corruption): the complex-U gauge invariance is MACHINE-EXACT --
-    // V(k-indep) |D e_hf| = 0, |D e_corr| = 2.8e-17; V(k) 0 / 1.4e-17 -- the same MF/THC
-    // feeds both runs so the gauge rotation cancels to the last bit. (An apparent ~5e-5
-    // residual seen earlier was checkpoint-collision corruption from concurrent runs
-    // sharing a fixed output name, NOT a gauge leak.)
-    app_log(1, "vertex_wannier gauge: complex-U invariance MACHINE-EXACT (chain-rule "
-               "injection); see notes section 6.2.");
+    // The Sigma^C injection is the chain-rule sandwich conj(U) Sigma_bar U^T; the operator
+    // sandwich U Sigma_bar U^dag would break gauge invariance at O(1) for complex U while
+    // being invisible for real U. The kernel-level gauge tests (vertex_sigma_toy /
+    // vertex_pi_toy "wannier_gauge") check the covariance of both cuts to machine precision.
+    // End to end the same MF/THC feeds every run, so the gauge rotation cancels to rounding
+    // and a 1e-10 tolerance is ample.
+    app_log(1, "vertex_wannier gauge: complex-U invariance is machine-exact (chain-rule "
+               "injection).");
     REQUIRE(std::abs(ehf_V - ehf_win) < 1e-10);
     REQUIRE(std::abs(ec_V - ec_win) < 1e-10);
     REQUIRE(std::abs(ehf_Vk - ehf_win) < 1e-10);
@@ -322,18 +318,18 @@ namespace bdft_tests {
       REQUIRE(std::isfinite(ec_r1));
       REQUIRE(std::isfinite(ec_r1g));
       // the rank-1 subspace genuinely differs from the full 2-band window vertex
-      // (the projector actually RESTRICTS -- the interpretability payoff)
+      // (the projector actually restricts the subspace)
       REQUIRE(std::abs(ec_r1 - ec_win) > 1e-7);
-      // 1x1 gauge (a complex phase e^{i phi}) invariance of the rank-1 P: machine-exact
-      // with the chain-rule injection (notes section 6.2).
+      // 1x1 gauge (a complex phase e^{i phi}) invariance of the rank-1 P: exact to
+      // rounding with the chain-rule injection.
       app_log(1, "vertex_wannier rank-1 gauge (1x1 phase): |D e_corr| = {:.3e}",
               std::abs(ec_r1g - ec_r1));
       REQUIRE(std::abs(ehf_r1g - ehf_r1) < 1e-10);
       REQUIRE(std::abs(ec_r1g - ec_r1) < 1e-10);
 
       // secondary (rotated point selection) path on the SAME rank-1 Wannier C:
-      // full-rank secondary reproduces the global path (the refinement2 10.2
-      // argument is U-independent).
+      // a full-rank secondary basis reproduces the global path (the equivalence of
+      // the two point selections does not depend on U).
       auto [ehf_sec, ec_sec] = run_scgw(mpi_context, ft, "qe_lih222", window, 1,
                                         "secondary",
                                         [&](solvers::vertex_t& v, mf::MF& mf) {
@@ -361,8 +357,8 @@ namespace bdft_tests {
         v.set_wannier_projector(proj, /*loewdin*/ true);
         REQUIRE(v.isometry_defect() > 1e-3);           // the raw defect is measurable
       };
-      // the REPAIR itself (defect measured > 1e-3 before, U^dag U = 1 enforced after) is
-      // the deliverable of this case and is asserted inside install_raw_loewdin above.
+      // the repair itself (defect > 1e-3 before, U^dag U = 1 enforced after) is asserted
+      // inside install_raw_loewdin above.
       auto [ehf_lw, ec_lw] = run_scgw(mpi_context, ft, "qe_lih222", window, n_iter,
                                       "global", install_raw_loewdin);
       app_log(1, "vertex_wannier Loewdin-repaired e_corr = {:.12f} (|D| vs window = {:.2e})",
@@ -370,19 +366,19 @@ namespace bdft_tests {
       REQUIRE(std::isfinite(ec_lw));
       // Loewdin of a column-scaled full-window set still spans the window => range(P) =
       // the window, so with the chain-rule injection the observable matches window to
-      // machine precision (complex-U gauge invariance; notes section 6.2).
+      // rounding (complex-U gauge invariance).
       REQUIRE(std::abs(ec_lw - ec_win) < 1e-10);
     }
 
     // ================= 5. STATIC RUNGS (B-S / B-L) x Wannier U =======================
-    // T-1/T-3 of notes/wannier_static_vertex_plan.md: the static-rung theories route
-    // through the SAME U-branched input substitutions (G_CC/X_C) and the SAME chain-rule
-    // injection as the dynamic path, so degenerate-U bit-identity and complex-U gauge
-    // invariance must hold in vertex_rung = "static" (B-S: Sigma^{C,x} + Sigma^{C,r},
-    // P = RPA) and "linear" (B-L: + mixed terms, P^{C,L} injection, pi^dyn response)
-    // with ZERO production-code changes. Covers, per run: the static Sigma injection,
-    // Pi^{C,0} -> Delta w -> Sigma^{C,r} (U-free by theory -- full-space externals),
-    // and for B-L the factorized pi^dyn route and the P^{C,L} Dyson feed.
+    // The static-rung theories route through the same U-dependent input substitutions
+    // (G_CC/X_C) and the same chain-rule injection as the dynamic path, so the
+    // degenerate-U identity and complex-U gauge invariance must hold in
+    // vertex_rung = "static" (B-S: Sigma^{C,x} + Sigma^{C,r}, P = RPA) and "linear"
+    // (B-L: + mixed terms, P^{C,L} injection, pi^dyn response). Covers, per run: the
+    // static Sigma injection, Pi^{C,0} -> Delta w -> Sigma^{C,r} (U-free by theory --
+    // full-space externals), and for B-L the factorized pi^dyn route and the P^{C,L}
+    // Dyson feed.
     for (std::string rung : {std::string("static"), std::string("linear")}) {
       auto [ehf_w, ec_w] = run_scgw(mpi_context, ft, "qe_lih222", window, n_iter,
                                     "global", no_proj, rung);
@@ -400,27 +396,25 @@ namespace bdft_tests {
       // the static-mode vertex must actually act (a dead vertex would pass every
       // invariance check trivially)
       REQUIRE(std::abs(ec_w - ec_win) > 1e-9);   // differs from the DYNAMIC-rung result
-      // T-1: degenerate-U reduction (window fast-path vs the gemm path)
+      // degenerate-U reduction (window fast path vs the gemm path)
       REQUIRE(std::abs(ehf_id - ehf_w) < 1e-10);
       REQUIRE(std::abs(ec_id - ec_w) < 1e-10);
-      // T-3: complex k-dependent gauge invariance (range(P) = the window for M == nW)
+      // complex k-dependent gauge invariance (range(P) = the window for M == nW)
       REQUIRE(std::abs(ehf_g - ehf_w) < 1e-10);
       REQUIRE(std::abs(ec_g - ec_w) < 1e-10);
     }
 
-    // ================= 6. SYMMETRY-CLOSED WANNIER C (T-5): SrVO3 t2g =================
-    // The physics payoff of the Wannier subspace (notes/wannier_static_vertex_plan.md
-    // section 3.3): a C that is symmetry-CLOSED by construction kills the band-cut
-    // D-matrix leakage. Three one-iteration B-S runs on the SYMMETRIC SVO mesh
-    // (leakage is rung-independent; B-S is the cheapest rung):
-    //   (a) window C = [20,22) CUTS the t2g triplet (no 2-dim invariant subspace of a
-    //       3-dim multiplet exists) -> leakage O(0.1-1): the measured control;
+    // ================= 6. SYMMETRY-CLOSED WANNIER C: SrVO3 t2g =======================
+    // A C that is symmetry-closed by construction has no band-cut D-matrix leakage.
+    // Three one-iteration B-S runs on the symmetric SVO mesh (leakage is
+    // rung-independent; B-S is the cheapest rung):
+    //   (a) window C = [20,22) cuts the t2g triplet (no 2-dim invariant subspace of a
+    //       3-dim multiplet exists) -> leakage O(0.1-1): the control;
     //   (b) window C = [20,23) = the full t2g group -> leakage ~ 0 (closed window);
-    //   (c) the REAL Wannier90 MLWF t2g projector (M = 3 on the same window, read
-    //       through the production wan.h5 seam) -> projector-level leakage ~ 0 AND
-    //       e_corr == (b) to gauge class: range(P) = the window, so this is the
-    //       production-file gauge test -- and the first LOCAL sym x Wannier e2e run
-    //       (sections 1-5 are all nosym).
+    //   (c) the Wannier90 MLWF t2g projector (M = 3 on the same window, read from a
+    //       wan.h5 file) -> projector-level leakage ~ 0 and e_corr == (b) up to gauge:
+    //       range(P) = the window, so this is the gauge test with a real projector
+    //       file, with symmetry enabled (sections 1-5 run without symmetry).
     {
       imag_axes_ft::IAFT ft_svo(1000, 12.0, imag_axes_ft::dlr_basis, "low");
       auto [svo_outdir, svo_prefix] = utils::utest_filename("qe_svo222_sym");

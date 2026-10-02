@@ -1,29 +1,28 @@
 /**
- * scGW-tilde Tier 1.5, increment T15-a (notes/tier15_ward_legs_plan.md sections 5-6): the
- * discrete-Ward leg vertex ALGEBRA (methods/vertex/ward_legs.hpp) on exact rational data.
+ * The discrete-Ward leg vertex ALGEBRA (methods/vertex/ward_legs.hpp) on exact rational data.
  *
- * Pure toy, no MF, no scGW, seconds to run. Two cases:
+ * Pure toy, no MF, no scGW, seconds to run. Main cases:
  *
- *  ward_legs_conventions -- gate P0. The two-pole family T/T1/T2/T12 and the four-pole
+ *  ward_legs_conventions -- the two-pole family T/T1/T2/T12 and the four-pole
  *    tables S_{plm}(nu), every confluence branch, nu = 0 and nu != 0, at beta = 10 and at
  *    the production beta = 1000, against DENSE fermionic Matsubara sums with Richardson
  *    elimination of the 1/M tail. Distinct G/Sigma node sets and the shared (by-index
  *    confluent) case.
  *
- *  ward_legs_toy_gates -- gates P1-P4. G and Sigma_c are built as EXACT pole sums from a
+ *  ward_legs_toy_gates -- G and Sigma_c are built as EXACT pole sums from a
  *    Hermitian embedding H_big = [[h, B_p], [B_p^dag, e_p 1]]: G(z) = P (z - H_big)^-1 P^dag is
  *    a pole sum on the eigenvalues with PSD residues, Sigma_c(z) = sum_p B_p B_p^dag/(z - e_p),
- *    and G^-1 = z - h - Sigma_c EXACTLY (Schur complement), so the telescoping identity of
- *    proposal eq 22 holds to roundoff and any p-channel bug shows per nu.
+ *    and G^-1 = z - h - Sigma_c EXACTLY (Schur complement), so the matrix telescoping (Ward)
+ *    identity holds to roundoff and any p-channel bug shows per nu.
  *      (b) the pole bare bubble and the Lambda correction at k != k+q against dense
  *          matrix-valued Matsubara oracles (pins S, the assembly, and the two insertion
  *          terms with distinguishable k / k+q data);
- *      P1 (G-g) q = 0, full window: the vertex-traced chi0_Lambda vanishes for every nu != 0;
+ *      (P1) q = 0, full window: the vertex-traced chi0_Lambda vanishes for every nu != 0;
  *          at nu = 0 it equals sum_j g_j f'(lambda_j) (the static thermal intraband term);
- *      P2 (G-h) Tr[g_j Lambda0(lambda_j; 0)] = 1 for every pole (the exact matrix Z-link);
+ *      (P2) Tr[g_j Lambda0(lambda_j; 0)] = 1 for every pole (the exact matrix Z-link);
  *          Herm[Lambda0(i pi/beta; 0) - 1] PSD at beta = 1000;
- *      P3 (G-i) R = 0 leaves the pair block bitwise untouched;
- *      P4 window: with C a proper subset the traced residual equals MINUS the a-outside-C
+ *      (P3) R = 0 leaves the pair block bitwise untouched;
+ *      (P4) window: with C a proper subset the traced residual equals MINUS the a-outside-C
  *          complement of the full-window object (the exact bookkeeping identity);
  *      conditioning: a near-mu Sigma node (beta |e| ~ 2) at beta = 1000 -- the regime where
  *          S ~ beta^3 -- reports the telescoping residual (asserted at 1e-8, logged).
@@ -60,7 +59,7 @@ namespace bdft_tests {
   namespace wl = methods::solvers::ward_legs;
 
   // ======================================================================================
-  TEST_CASE("ward_legs_conventions", "[methods][vertex][scgwt][tier15]") {
+  TEST_CASE("ward_legs_conventions", "[methods][vertex][scgwt][ward_legs]") {
     auto &mpi = utils::make_unit_test_mpi_context();
     (void)mpi;
 
@@ -123,7 +122,7 @@ namespace bdft_tests {
   }
 
   // ======================================================================================
-  TEST_CASE("ward_legs_toy_gates", "[methods][vertex][scgwt][tier15]") {
+  TEST_CASE("ward_legs_toy_gates", "[methods][vertex][scgwt][ward_legs]") {
     auto &mpi = utils::make_unit_test_mpi_context();
     (void)mpi;
 
@@ -219,7 +218,7 @@ namespace bdft_tests {
       REQUIRE(sc_lam > 1e-3 * sc_bare);   // the correction is not trivially small on this toy
     }
 
-    // ---- P1 (G-g): q = 0 matrix telescoping at k = 0, full window ------------------------
+    // ---- (P1) q = 0 matrix telescoping at k = 0, full window ----------------------------
     auto traced = [&](wl::ward_ctx const &c, long jn, long ik, nda::array<cplx, 2> &tr_bare,
                       nda::array<cplx, 2> &tr_full) {
       const long nc = c.nc, n2 = nc * nc;
@@ -244,10 +243,10 @@ namespace bdft_tests {
         nda::array<cplx, 2> trb, trf;
         traced(ctx, jn, 0, trb, trf);
         const double sb = max_abs(trb), sf = max_abs(trf);
-        app_log(1, "ward_legs_toy_gates P1 (G-g): nu node {}: |traced bare| = {:.3e}, "
+        app_log(1, "ward_legs_toy_gates q = 0 telescoping: nu node {}: |traced bare| = {:.3e}, "
                    "|traced chi0_Lambda| = {:.3e} (ratio {:.3e})", jn, sb, sf, sf / sb);
         worst = std::max(worst, sf / sb);
-        REQUIRE(sb > 1e-3);              // the bare bubble violates C1 at O(1)
+        REQUIRE(sb > 1e-3);              // the bare bubble violates the q = 0 Ward identity at O(1)
       }
       REQUIRE(worst < 1e-12);
       // nu = 0: the traced object equals sum_j g_j f'(lambda_j)
@@ -259,12 +258,12 @@ namespace bdft_tests {
       double e = 0.0;
       for (long i = 0; i < nb; ++i)
         for (long k = 0; k < nb; ++k) e = std::max(e, std::abs(trf(i, k) - ref(i, k)));
-      app_log(1, "ward_legs_toy_gates P1 (G-g) nu = 0: traced chi0_Lambda vs sum_j g_j f'(lambda_j): "
+      app_log(1, "ward_legs_toy_gates q = 0 telescoping at nu = 0: traced chi0_Lambda vs sum_j g_j f'(lambda_j): "
                  "max err {:.3e} (scale {:.3e}, bare {:.3e})", e, max_abs(ref), max_abs(trb));
       REQUIRE(e < 1e-12 * std::max(1.0, max_abs(ref)));
     }
 
-    // ---- P2 (G-h): the Z-link and positivity ----------------------------------------------
+    // ---- (P2) the Z-link and positivity ----------------------------------------------------
     {
       double worst = 0.0;
       for (auto const &t : set.toys)
@@ -275,7 +274,7 @@ namespace bdft_tests {
             for (long k = 0; k < nb; ++k) tr += t.g(j, i, k) * (L(k, i) + ((i == k) ? 1.0 : 0.0));
           worst = std::max(worst, std::abs(tr - 1.0));
         }
-      app_log(1, "ward_legs_toy_gates P2 (G-h): max |Tr[g_j Lambda0(lambda_j; 0)] - 1| = {:.3e}", worst);
+      app_log(1, "ward_legs_toy_gates Z-link: max |Tr[g_j Lambda0(lambda_j; 0)] - 1| = {:.3e}", worst);
       REQUIRE(worst < 1e-10);
       // positivity of Herm[Lambda0(i pi/beta; 0) - 1] at beta = 1000 (T -> 0 corner)
       const double b1 = 1000.0;
@@ -286,13 +285,13 @@ namespace bdft_tests {
       auto ev = nda::linalg::eigenvalues(Hm);
       double emin = 1e300, emax = -1e300;
       for (long i = 0; i < nb; ++i) { emin = std::min(emin, ev(i)); emax = std::max(emax, ev(i)); }
-      app_log(1, "ward_legs_toy_gates P2 (G-h) positivity at beta = 1000: eig[Herm(Lambda0 - 1)] in "
+      app_log(1, "ward_legs_toy_gates positivity at beta = 1000: eig[Herm(Lambda0 - 1)] in "
                  "[{:.4e}, {:.4e}]", emin, emax);
       REQUIRE(emin > -1e-12 * emax);
       REQUIRE(emax > 0.0);
     }
 
-    // ---- P3 (G-i): R = 0 leaves the block bitwise untouched ---------------------------------
+    // ---- (P3) R = 0 leaves the block bitwise untouched -------------------------------------
     {
       nda::array<cplx, 5> R0(set.R.shape());
       R0() = cplx(0.0);
@@ -307,11 +306,11 @@ namespace bdft_tests {
       bool same = true;
       for (long r = 0; r < nc2; ++r)
         for (long c = 0; c < nc2; ++c) same = same and (Cb(r, c) == Cref(r, c));
-      app_log(1, "ward_legs_toy_gates P3 (G-i): R = 0 leaves the pair block bitwise: {}", same);
+      app_log(1, "ward_legs_toy_gates R = 0 leaves the pair block bitwise: {}", same);
       REQUIRE(same);
     }
 
-    // ---- P4 window: C = [0, 2) residual = minus the a = 2 complement of the full object -----
+    // ---- (P4) window: C = [0, 2) residual = minus the a = 2 complement of the full object --
     {
       const long ncw = 2;
       auto bw = wl::slice_blocks(set.g, set.R, nda::range(0, ncw));
@@ -331,7 +330,7 @@ namespace bdft_tests {
             scale = std::max(scale, std::abs(comp));
           }
       }
-      app_log(1, "ward_legs_toy_gates P4 (window C = [0,2) of 3): traced residual + complement: "
+      app_log(1, "ward_legs_toy_gates window complement (C = [0,2) of 3): traced residual + complement: "
                  "max {:.3e} (complement scale {:.3e})", worst, scale);
       REQUIRE(scale > 1e-6);
       REQUIRE(worst < 1e-12 * std::max(1.0, scale));
@@ -365,14 +364,13 @@ namespace bdft_tests {
   }
 
   // ======================================================================================
-  // PHYSICS PROBE (T15-b): the SIGN and size of the eq-21 correction in the interband
+  // PHYSICS PROBE: the SIGN and size of the Lambda pair correction in the interband
   // channel on the imaginary axis. Scalar toys: a valence-like pole at k (h < 0) and a
   // conduction-like pole at k+q (h > 0), each dressed by satellite-like Sigma poles on its
   // own side. The bare pair element (1/beta) sum G_v G_c is a screening-like (negative)
-  // number; the proposal's coherent-pole bookkeeping (eq 26) predicts Delta of the SAME
-  // sign at ~ (1/Z - 1) relative size. Reported, not asserted -- this is what the LiH
-  // fixture readout (T15-b) contradicted (anti-screening ~3x the RPA head at |q|^2 ~ 0.5).
-  TEST_CASE("ward_legs_interband_sign", "[methods][vertex][scgwt][tier15]") {
+  // number; a coherent-pole estimate predicts Delta of the SAME sign at ~ (1/Z - 1)
+  // relative size. Reported, not asserted.
+  TEST_CASE("ward_legs_interband_sign", "[methods][vertex][scgwt][ward_legs]") {
     auto &mpi = utils::make_unit_test_mpi_context();
     (void)mpi;
     for (double beta : {10.0, 1000.0}) {
@@ -432,14 +430,14 @@ namespace bdft_tests {
     }
   }
 
-  // PHYSICS PROBE 2 (T15-b): the SAME-BAND (intraband) channel of a FILLED band at finite q.
+  // PHYSICS PROBE 2: the SAME-BAND (intraband) channel of a FILLED band at finite q.
   // Both poles occupied (valence at k and at k+q, dispersion E_k != E_{k+q}); the bare pair
   // element carries the Pauli factor f(E_k) - f(E_{k+q}) = 0 (plus the tiny QP -> satellite
   // piece). With a q-INDEPENDENT Lambda0(k) the residue bracket becomes
   // Lambda0(E_k) - Lambda0(E_{k+q}) -- O(dispersion x dLambda/dE) over the same denominator,
   // i.e. O(1) at any finite q: a Pauli-blocking violation of the ansatz in the channel whose
   // density vertex is O(1). Reported, not asserted.
-  TEST_CASE("ward_legs_intraband_probe", "[methods][vertex][scgwt][tier15]") {
+  TEST_CASE("ward_legs_intraband_probe", "[methods][vertex][scgwt][ward_legs]") {
     auto &mpi = utils::make_unit_test_mpi_context();
     (void)mpi;
     const double beta = 1000.0;
@@ -490,14 +488,14 @@ namespace bdft_tests {
   }
 
   // ======================================================================================
-  // FITTED-RESIDUE PROBE (T15-b): the production pathway on exact data. The exact toy's
+  // FITTED-RESIDUE PROBE: the production pathway on exact data. The exact toy's
   // G(tau) and Sigma_c(tau) are sampled on the fixture's DLR grid (beta 1000, wmax 6, prec
   // low), pole-fitted with dlr_pole_fit (the aux NONSYM grid, shared node set), and the
   // ward algebra is run on the FITTED residues (shared = true) -- exactly what
   // build_ward_legs does. Compared against the exact-residue result at q = 0: the traced
   // pair propagator (bare and Lambda) at nu = 0 and at the first two nu != 0 nodes.
   // This isolates the "bilinear in the residues" hazard at the nu = 0 derivative branches.
-  TEST_CASE("ward_legs_fitted_residues", "[methods][vertex][scgwt][tier15]") {
+  TEST_CASE("ward_legs_fitted_residues", "[methods][vertex][scgwt][ward_legs]") {
 #ifndef ENABLE_DLR
     SUCCEED("ward_legs_fitted_residues skipped: build has ENABLE_DLR=OFF.");
 #else

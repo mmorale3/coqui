@@ -22,8 +22,7 @@
 #define COQUI_VERTEX_WARD_LEGS_HPP
 
 /**
- * scGW-tilde Tier 1.5 (notes/scgw_screening_fix_proposal.pdf section 4.6; plan
- * notes/tier15_ward_legs_plan.md): the telescoping (discrete-Ward) leg vertex
+ * The telescoping (discrete-Ward) leg vertex
  *
  *     Lambda0(k, iw; inu) = 1 - [Sigma(k, iw + inu) - Sigma(k, iw)] / inu
  *
@@ -32,12 +31,12 @@
  *     chi0_{(p1' nc + p3),(a nc + b)}(k; q, nu) = (1/beta) sum_iw G_{a p1'}(k, iw) G_{p3 b}(k+q, iw+inu),
  *
  * inserted ADJACENT TO THE VERTEX pair (a, b) -- a on the k line, b on the k+q line --
- * and symmetrized over the two legs (eq 21 of the proposal):
+ * and symmetrized over the two legs:
  *
  *     Dchi0 = (1/beta) sum_iw 1/2 { [(Lambda0 - 1) G]_{a p1'}(k, iw; inu) G_{p3 b}(k+q, iw+inu)
  *                                 + G_{a p1'}(k, iw) [G (Lambda0 - 1)]_{p3 b}(k+q, iw+inu; inu) }.
  *
- * That placement is the one that telescopes at q = 0 (proposal eq 22): with the vertex
+ * That placement is the one that telescopes at q = 0: with the vertex
  * traced, sum_a G_{p3 a}(iw+inu) [Lambda0 G]_{a p1'}(iw) = [G(iw+inu) Lambda0 G(iw)]_{p3 p1'}
  * and inu Lambda0 = G^-1(iw+inu) - G^-1(iw). The internal band sum of [Lambda0 G] runs
  * over ALL bands; only the external pair labels are restricted to the C window.
@@ -54,16 +53,16 @@
  * S closes in the two-pole family T(a, b; nu) = (1/beta) sum_iw 1/[(iw - a)(iw + inu - b)]
  * = [f(a) - f(b)] / (a - b + inu) (fermionic sum theorem; f(e - inu) = f(e) exactly for
  * bosonic nu) and its a-, b-, ab-derivatives (the confluent, same-node cases). Confluence
- * is decided BY INDEX (the dlr_pole_fit doctrine: the auxiliary grid is well separated,
- * min gap 2.17 dimensionless); every denominator is a real node gap or a complex gap with
+ * is decided BY INDEX (as in dlr_pole_fit: the auxiliary DLR grid is well separated, so
+ * distinct nodes are never near-confluent); every denominator is a real node gap or a complex gap with
  * |Im| = |nu| >= 2 pi / beta, so there is no small-nu cancellation and nu = 0 is an
  * ordinary node (the derivative branches). The same tables give the bare pair propagator
- * as sum_{lm} g_l(k)_{a p1'} g_m(k+q)_{p3 b} T(e_l, e_m; nu), which is the pin of the
- * normalization against the tau-product build (gate P0 of the plan).
+ * as sum_{lm} g_l(k)_{a p1'} g_m(k+q)_{p3 b} T(e_l, e_m; nu), which pins the
+ * normalization against the tau-product build.
  *
  * Pure algebra: no IAFT, no MPI, no loop state. Residues in, pair-space blocks out.
  * The residue arrays may come from iaft_tools::pole_coeffs (production, shared node set)
- * or from an exact rational toy (the unit gates, distinct node sets for G and Sigma).
+ * or from an exact rational toy (the unit tests, distinct node sets for G and Sigma).
  */
 
 #include <cmath>
@@ -167,14 +166,14 @@ namespace ward_legs {
   /**
    * THE nu = 0 ROW ON A FITTED REPRESENTATION (nu0_extrap > 0). At nu = 0 the S tables use
    * the derivative branches (f', f''/2, f'''/6 at same-index nodes; 1/(a-b)^2, 1/(a-b)^3
-   * at distinct ones): exact for an EXACT pole set (gate P1), but on a DLR-FITTED
+   * at distinct ones): exact for an EXACT pole set, but on a DLR-FITTED
    * representation the expansion coefficients at in-gap nodes are O(1) (they are not
-   * spectral weights) and the derivative along the axis is not what the fit controls --
-   * measured on the exact toy pushed through dlr_pole_fit (test "ward_legs_fitted_
-   * residues"): the nu != 0 correction is fit class (7e-5), the nu = 0 one is off by 4e2
-   * (the beta^3 same-node branches at the node nearest mu). Dropping the same-node
-   * pieces is NOT the cure (they are part of the axis functional: the bare bubble loses
-   * two digits without them). What IS controlled by the fit are the values at bosonic
+   * spectral weights) and the derivative along the axis is not what the fit controls:
+   * the nu != 0 correction is accurate to the fit tolerance while the nu = 0 one can be
+   * off by orders of magnitude (the beta^3 same-node branches at the node nearest mu; see
+   * the test "ward_legs_fitted_residues"). Dropping the same-node pieces is NOT the cure
+   * (they are part of the axis functional: the bare bubble loses accuracy without them).
+   * What IS controlled by the fit are the values at bosonic
    * MATSUBARA nu, so the nu = 0 row is taken as the nu -> 0 LIMIT: S(0) := sum_k w_k
    * S(i 2 pi k / beta), k = 1..K, Lagrange weights to 0 (K = 3: 3, -3, 1). For a gapped
    * system that limit differs from the true static value by the thermal intraband term

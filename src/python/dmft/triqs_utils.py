@@ -599,7 +599,7 @@ def arr_to_blk_arr(array, gf_struct):
 
 # deprecated - it is implemented in modest now
 def extract_ij(sigma_infty_embed, embedding):
-    # modest unstable renamed Embedding.imp_block_shape -> imp_block_structure.
+    # modest's Embedding exposes the per-impurity block structure as imp_block_structure.
     gf_struct_list = [embedding.imp_block_structure[imp] for imp in range(embedding.n_impurities)]
     sigma_infty_list = []
     for imp_idx in range(len(gf_struct_list)):
@@ -614,7 +614,7 @@ def extract_ij(sigma_infty_embed, embedding):
 
 # deprecated - it is implemented in modest now
 def extract_wij(sigma_iw_embed, embedding):
-    # modest unstable renamed Embedding.imp_block_shape -> imp_block_structure.
+    # modest's Embedding exposes the per-impurity block structure as imp_block_structure.
     gf_struct_list = [embedding.imp_block_structure[imp] for imp in range(embedding.n_impurities)]
     sigma_iw_list = []
     for imp_idx in range(len(gf_struct_list)):
@@ -860,11 +860,11 @@ def symmetrize_blk2_gf(u_iw_blk_gf2, deg_blk, gf_struct):
         # Guard the averages: a degenerate-block group need not contain every pair
         # type. A single-orbital group has no off-diagonal pairs (offdiag_count == 0),
         # and a spin-restricted gf_struct has no opposite-spin pairs
-        # (*_count_prime == 0). Dividing by zero there produced NaN buffers that were
-        # then written back into u_iw_sym, and the NaNs reached the impurity solver as
-        # a singular determinant. The counts are exactly the write-back guards: the
-        # loop below only assigns a buffer for a (spin, orbital) pair type that was
-        # actually accumulated, so a buffer left at 0.0 is never used.
+        # (*_count_prime == 0). Dividing by zero there would write NaN buffers into
+        # u_iw_sym, which reach the impurity solver as a singular determinant. The
+        # counts are exactly the write-back guards: the loop below only assigns a
+        # buffer for a (spin, orbital) pair type that was actually accumulated, so a
+        # buffer left at 0.0 is never used.
         if diag_count:
             u_diag_buffer /= diag_count
         if diag_count_prime:

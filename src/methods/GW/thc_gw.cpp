@@ -132,23 +132,23 @@ namespace methods {
                             mb_state.eps_inv_head.value());
       }
 
-      // ISDF-Vertex / LFF-Sigma consumers: host code on the host shared-memory G / Sigma and the host
-      // mirror of W. On the DEVICE path (increment G-1, notes/gpu_port_plan.md section 4) they run
-      // unchanged: G / Sigma stay host-resident by the gpu design and scr_coulomb_t::update_w keeps
-      // the W mirror (keep_host_W) whenever an attached vertex reads it (vertex_t::reads_host_W).
+      // Vertex and Sigma-vertex consumers: host code on the host shared-memory G / Sigma and the host
+      // mirror of W. On the DEVICE path they run unchanged: G / Sigma stay host-resident and
+      // scr_coulomb_t::update_w keeps the W mirror (keep_host_W) whenever an attached vertex reads it
+      // (vertex_t::reads_host_W).
       if constexpr (MEM != HOST_MEMORY) {
         utils::check(_vertex == nullptr or not _vertex->reads_host_W() or mb_state.dW_qtPQ.has_value(),
                      "gw_t::evaluate<DEVICE_MEMORY>: the vertex needs the host mirror of W (keep_host_W).");
       }
       {
-      // ISDF-Vertex: second-order-exchange self-energy cut Sigma^C, accumulated
+      // Vertex: second-order-exchange self-energy cut Sigma^C, accumulated
       // into sSigma_tskij on top of the GW self-energy. When no active vertex is
       // attached this is a strict no-op -- no allocation, no arithmetic -- so the
       // disabled path is bit-identical to plain scGW.
       if (_vertex != nullptr and _vertex->active())
         _vertex->eval_Sigma_C(mb_state, thc);
 
-      // LFF-Sigma (Route 1, notes/lff_aux_plan.md 2026-09-19): the local-field-factor vertex in Sigma. The SAME GW
+      // Sigma vertex (vertex-corrected W in Sigma): the local-field-factor vertex in Sigma. The SAME GW
       // contraction, driven with the vertex correction of W that scr_coulomb_t::build_sigma_lff published
       // (dW~ = scale x Herm[W (Gamma_eff - 1)], body + its extrapolated head), accumulated on top of Sigma^GW (+ Sigma^C).
       // Computed into its own buffer so Sigma^GW's contraction is untouched; the correction is released here.
@@ -180,18 +180,18 @@ namespace methods {
         dmax = mb_state.mpi->comm.all_reduce_value(dmax, boost::mpi3::max<>{});
         smax = mb_state.mpi->comm.all_reduce_value(smax, boost::mpi3::max<>{});
         _sigma_lff_dmax = dmax; _sigma_lff_smax = smax;
-        app_log(1, "  [LFF-Sigma] vertex self-energy ADDED: max |dSigma(tau)| = {:.4e} vs max |Sigma^GW(tau)| = {:.4e} (ratio {:.3e}); "
+        app_log(1, "  [Sigma vertex] vertex self-energy ADDED: max |dSigma(tau)| = {:.4e} vs max |Sigma^GW(tau)| = {:.4e} (ratio {:.3e}); "
                    "eps_inv_head_sig(tau_0) = {:.4e}", dmax, smax, dmax / std::max(smax, 1e-300), mb_state.eps_inv_head_sig.value()(0).real());
         mb_state.dWsig_qtPQ.reset();
         mb_state.eps_inv_head_sig.reset();
       }
-      // LFF-Sigma: the INSTANTANEOUS part of the vertex correction (the vertex's nu -> inf limit times the bare Coulomb)
+      // Sigma vertex: the INSTANTANEOUS part of the vertex correction (the vertex's nu -> inf limit times the bare Coulomb)
       // is a static exchange-like self-energy: the THC exchange contraction with that kernel, added to F (the Dyson reads
       // F + Sigma(tau) after this call; e_hf then carries it). Body only: the q -> 0 head of the static piece is NOT
-      // included (the exchange head correction is madelung x the vertex's tail, a rigid shift of the window; flagged).
+      // included (the exchange head correction is madelung x the vertex's tail, a rigid shift of the window).
       _sigma_lff_dfmax = 0.0;
       if (mb_state.dWsig_inf_qPQ.has_value()) {
-        utils::check(mb_state.sDm_skij.has_value() and mb_state.sF_skij.has_value(), "gw_t::evaluate: the static LFF-Sigma piece needs Dm and F.");
+        utils::check(mb_state.sDm_skij.has_value() and mb_state.sF_skij.has_value(), "gw_t::evaluate: the static Sigma-vertex piece needs Dm and F.");
         auto &sF = mb_state.sF_skij.value();
         auto sDF = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(*mb_state.mpi, sF.shape());
         lff_sigma_detail::exchange_with_kernel(mb_state.sDm_skij.value().local(), mb_state.dWsig_inf_qPQ.value(), sDF, thc);
@@ -216,11 +216,11 @@ namespace methods {
         dfmax = mb_state.mpi->comm.all_reduce_value(dfmax, boost::mpi3::max<>{});
         fmax = mb_state.mpi->comm.all_reduce_value(fmax, boost::mpi3::max<>{});
         _sigma_lff_dfmax = dfmax;
-        app_log(1, "  [LFF-Sigma] instantaneous part ADDED to the static self-energy: max |dF| = {:.4e} vs max |F| = {:.4e} (ratio {:.3e})",
+        app_log(1, "  [Sigma vertex] instantaneous part ADDED to the static self-energy: max |dF| = {:.4e} vs max |F| = {:.4e} (ratio {:.3e})",
                 dfmax, fmax, dfmax / std::max(fmax, 1e-300));
         mb_state.dWsig_inf_qPQ.reset();
       }
-      // LFF-Sigma Route 2 (L-6): the pair-resolved static-ladder vertex self-energy (scr_coulomb_t::build_sigma_pair,
+      // Sigma vertex, pair-resolved: the static-ladder vertex self-energy (scr_coulomb_t::build_sigma_pair,
       // the C-window block in band labels, replicated) accumulated on top of Sigma^GW; released here.
       _sigma_pair_dmax = 0.0; _sigma_pair_smax = 0.0;
       if (mb_state.dSigma_pair_tskab.has_value()) {
@@ -253,7 +253,7 @@ namespace methods {
         dmax = mb_state.mpi->comm.all_reduce_value(dmax, boost::mpi3::max<>{});
         smax = mb_state.mpi->comm.all_reduce_value(smax, boost::mpi3::max<>{});
         _sigma_pair_dmax = dmax; _sigma_pair_smax = smax;
-        app_log(1, "  [LFF-Sigma pair] vertex self-energy ADDED on the C block [{}, {}): max |dSigma(tau)| = {:.4e} vs max |Sigma^GW(tau)| = {:.4e} (ratio {:.3e})",
+        app_log(1, "  [Sigma vertex, pair] vertex self-energy ADDED on the C block [{}, {}): max |dSigma(tau)| = {:.4e} vs max |Sigma^GW(tau)| = {:.4e} (ratio {:.3e})",
                 b0, b0 + nb, dmax, smax, dmax / std::max(smax, 1e-300));
         mb_state.dSigma_pair_tskab.reset();
       }
@@ -262,7 +262,7 @@ namespace methods {
 
       print_thc_gw_timers();
       thc.print_timers();
-      // ISDF-Vertex breakdown. Printed here so it sits next to the GW/THC tables it must
+      // Vertex timer breakdown. Printed here so it sits next to the GW/THC tables it must
       // be compared against. Timers ACCUMULATE across scf iterations (never reset), so
       // "elapsed" is the running total and "avg" is the per-iteration cost -- which is the
       // number to watch, since the vertex cost per iteration is what sets the wall time.

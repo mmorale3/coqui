@@ -59,8 +59,7 @@ class device_pool_guard {
 public:
   /**
    * @param bytes  Pool capacity to reserve. 0 leaves the pool inert, which
-   *               makes the guard a no-op and is the default behaviour until
-   *               a size is chosen explicitly.
+   *               makes the guard a no-op (the default).
    * @param name   Label used in the log messages.
    */
   explicit device_pool_guard(std::size_t bytes, std::string name = "scf");
@@ -92,9 +91,7 @@ std::size_t device_pool_misses();
 
 /**
  * Pool capacity read from the COQUI_DEVICE_POOL_GB environment variable, in
- * bytes; 0 (inert) when unset or unparsable. A deliberately low-ceremony
- * knob so the pool can be sized and measured before committing to an input
- * -file option and a sizing policy.
+ * bytes; 0 (inert) when unset or unparsable.
  */
 std::size_t device_pool_size_from_env();
 

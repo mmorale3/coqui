@@ -36,33 +36,30 @@
 #include "methods/mb_state/mb_state.hpp"
 
 /**
- * INCREMENT B (notes/ladder_b_integration_design.md; spec notes/ladder_opt_spec.md
- * "Increment B", Gate B): the DISTRIBUTED (SLATE) solve path of the pair-space ladder.
+ * The DISTRIBUTED (SLATE) solve path of the pair-space ladder.
  *
  * The knob is ladder_solve_grid = g, the number of ranks that cooperate on ONE (s,q,nu)
- * resolvent. g = 1 is the historic per-rank LAPACK path; g > 1 tiles the (D,D) operator
+ * resolvent. g = 1 is the per-rank LAPACK path; g > 1 tiles the (D,D) operator
  * over a g-rank process grid, builds the owned tiles locally (each owner RECOMPUTING its
  * (N_m x nc2) legs rather than communicating them), runs ONE slate_ops::lu_solve per
  * (q,nu) with both RHS families as a single multi-RHS block, and estimates lambda_max by
  * the same 20-step power iteration made distributed.
  *
- * Gates here (measure first, then gate):
- *   B-1  eval_pol_ladder_whalf at g = 2 vs g = 1: max|dP| / max|P| <= 1e-12. This is
- *        Gate B's "fixture ladder observables" comparison; g = 1 vs the pre-B tree is the
- *        bitwise-class statement pinned by the commit-point suites (nothing on the g = 1
- *        path is touched -- the dispatch resolves g and falls through).
- *   B-2  the WHALF GATE cloned at g = 2: ladder_whalf_gate's node_map_resid compares the
- *        half-grid evaluator (SLATE at g = 2) against a FULL-mesh pair_space_ladder
- *        reference (always the per-rank kernel), so it is an independent A/B of the two
- *        solve paths through the production entry point. Bitwise 0 at g = 1.
- *   B-3  lambda_max: the SAME 20-step protocol, distributed. Reported, and gated only at
+ * Checks (the labels tag the corresponding log lines):
+ *   B-1  eval_pol_ladder_whalf at g >= 2 vs g = 1: max|dP| / max|P| <= 1e-12. At g = 1
+ *        the dispatch resolves g and falls through to the unchanged per-rank path.
+ *   B-2  ladder_whalf_gate at g >= 2: its node_map_resid compares the half-grid evaluator
+ *        (SLATE at g) against a FULL-mesh pair_space_ladder reference (always the
+ *        per-rank kernel), so it is an independent comparison of the two solve paths
+ *        through the production entry point. Exactly 0 at g = 1.
+ *   B-3  lambda_max: the SAME 20-step protocol, distributed. Reported, and checked only at
  *        the protocol's own resolution -- the iteration breaks on a 1e-3 RELATIVE change,
  *        so the estimate is a 1e-3-converged number by construction, not a 1e-12 one.
- *   B-4  the Q4-C3b E-family (the second RHS family) at g = 2 vs g = 1, on synthetic MLWF
- *        legs: the multi-RHS block carries [D | E] through ONE factorization.
+ *   B-4  the E-family (the second RHS family, orbital legs) at g >= 2 vs g = 1, on
+ *        synthetic MLWF legs: the multi-RHS block carries [D | E] through ONE factorization.
  *
  * ==========================================================================================
- * HOW TO RUN (Catch2 v2 traps) -- MEASURED, do not "improve" the command
+ * HOW TO RUN (Catch2 v2 caveats)
  * ==========================================================================================
  *
  *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
@@ -94,9 +91,8 @@ namespace bdft_tests {
     const std::string div = "ignore_g0";
     const nda::range window(1, 3);
 
-    // ---- one short qpGW run with the ladder READOUT on (the qpgw_bse recipe, trimmed to
-    // 3 iterations: every gate below is an A/B of two solve paths on ONE state, so a
-    // converged loop buys nothing) --------------------------------------------------
+    // ---- one short qpGW run with the ladder READOUT on (3 iterations: every check below
+    // compares two solve paths on ONE state, so a converged loop is not needed) ---------
     solvers::hf_t hf;
     solvers::gw_t gw(&ft, div, output);
     solvers::scr_coulomb_t scr_eri(&ft, "rpa", div);
@@ -115,7 +111,7 @@ namespace bdft_tests {
     mpi_context->comm.barrier();
 
     // the extra screening step: puts G and W0bar on the SAME state, which is what the
-    // ladder entry points read (the qpgw_bse/c3b recipe)
+    // ladder entry points read
     {
       using math::shm::make_shared_array;
       double mu = update_mu(0.0, *mf, mb_state.sE_ska.value(), ft.beta());
@@ -162,22 +158,22 @@ namespace bdft_tests {
       REQUIRE(P2.shape(1) == P1.shape(1));
       REQUIRE(P2.shape(2) == P1.shape(2));
       auto [rel_P, scale_P] = relmax(P1, P2);
-      app_log(1, "@@LADSLATE B-1: eval_pol_ladder_whalf g = {} vs g = 1 -- max|dP|/max|P| "
+      app_log(1, "[ladder solve] eval_pol_ladder_whalf g = {} vs g = 1 -- max|dP|/max|P| "
                  "= {:.3e} (max|P| = {:.6e}; {} nu nodes x {} q x {} x {})",
               g, rel_P, scale_P, P1.shape(0), P1.shape(1), P1.shape(2), P1.shape(3));
       REQUIRE(scale_P > 0.0);         // non-vacuous: the ladder is not identically zero
       REQUIRE(rel_P <= 1e-12);
 
-      // B-3: the watchdog. The 20-step power iteration breaks on a 1e-3 relative change,
-      // so the estimate is only defined to that resolution -- gate at 1e-2 relative and
-      // REPORT the measured deviation.
+      // B-3: the lambda_max watchdog. The 20-step power iteration breaks on a 1e-3
+      // relative change, so the estimate is only defined to that resolution -- check at
+      // 1e-2 relative and REPORT the deviation.
       double dlam = 0.0, lscale = 0.0;
       for (long j = 0; j < lam1.shape(0); ++j) {
         dlam = std::max(dlam, std::abs(lam1(j) - lam2(j)));
         lscale = std::max(lscale, std::abs(lam1(j)));
       }
-      app_log(1, "@@LADSLATE B-3: lambda_max g = {} vs g = 1 -- max|dlambda| = {:.3e} at "
-                 "max lambda = {:.6f} (relative {:.3e}); the 20-step protocol's own break "
+      app_log(1, "[ladder solve] lambda_max g = {} vs g = 1 -- max|dlambda| = {:.3e} at "
+                 "max lambda = {:.6f} (relative {:.3e}); the 20-step power iteration's own break "
                  "test is 1e-3 relative", g, dlam, lscale,
               dlam / std::max(lscale, 1e-300));
       REQUIRE(lscale > 0.0);
@@ -194,7 +190,7 @@ namespace bdft_tests {
       pv->set_ladder_solve(0, 1e-9);
       auto Pb = pv->eval_pol_ladder_whalf(mb_state, thc, nullptr);
       auto [rel_b, scale_b] = relmax(P1, Pb);
-      app_log(1, "@@LADSLATE B-1b: AUTO grid -- huge budget (=> g = 1) rel = {:.3e}, tiny "
+      app_log(1, "[ladder solve] AUTO grid -- huge budget (=> g = 1) rel = {:.3e}, tiny "
                  "budget (=> widest g that fits) rel = {:.3e} (scale {:.6e})",
               rel_a, rel_b, scale_a);
       REQUIRE(rel_a == 0.0);
@@ -203,7 +199,7 @@ namespace bdft_tests {
     }
 
     // ====================================================================================
-    // B-2: the WHALF GATE cloned at g = 2 (node_map_resid is the SLATE-vs-per-rank A/B)
+    // B-2: ladder_whalf_gate at each g (node_map_resid compares SLATE vs per-rank)
     // ====================================================================================
     pv->set_ladder_solve(1, 8.0);
     auto d1 = pv->ladder_whalf_gate(mb_state, thc, 2.0);
@@ -211,7 +207,7 @@ namespace bdft_tests {
     for (long g : gs) {
       pv->set_ladder_solve(g, 8.0);
       auto d2 = pv->ladder_whalf_gate(mb_state, thc, 2.0);
-      app_log(1, "@@LADSLATE B-2: whalf gate node_map_resid -- g = 1: {:.3e} (bitwise), "
+      app_log(1, "[ladder solve] ladder_whalf_gate node_map_resid -- g = 1: {:.3e} (bitwise), "
                  "g = {}: {:.3e} ; ph_sym_resid {:.3e} vs {:.3e} ; ladder_max {:.6e} vs "
                  "{:.6e}", d1.node_map_resid, g, d2.node_map_resid, d1.ph_sym_resid,
               d2.ph_sym_resid, d1.ladder_max, d2.ladder_max);
@@ -220,7 +216,7 @@ namespace bdft_tests {
     }
 
     // ====================================================================================
-    // B-4: the second RHS family (Q4-C3b E legs) through the SAME factorization
+    // B-4: the second RHS family (orbital E legs) through the SAME factorization
     // ====================================================================================
     {
       const long ns = mf->nspin(), nk = mf->nkpts(), nc = window.size();
@@ -241,7 +237,7 @@ namespace bdft_tests {
         pv->set_ladder_solve(g, 8.0);
         auto L2 = pv->eval_pol_ladder_loc_whalf(mb_state, thc, U_syn);
         auto [rel_L, scale_L] = relmax(L1, L2);
-        app_log(1, "@@LADSLATE B-4: eval_pol_ladder_loc_whalf (E legs, {} orbitals) g = {} "
+        app_log(1, "[ladder solve] eval_pol_ladder_loc_whalf (E legs, {} orbitals) g = {} "
                    "vs g = 1 -- max|dP|/max|P| = {:.3e} (max|P| = {:.6e})", norb, g, rel_L,
                 scale_L);
         REQUIRE(scale_L > 0.0);

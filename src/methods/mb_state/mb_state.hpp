@@ -91,8 +91,9 @@ public:
    * The screened interaction as a host darray, materialized from the device
    * copy if that is where it lives. For one-off host consumers after the SCF
    * loop (the optional W h5 dump); keeping the mirror up to date every
-   * iteration instead costs 13.4 s/iter, so use this rather than keep_host_W
-   * unless a consumer really needs it each iteration.
+   * iteration instead costs a full device->host copy and redistribution of W
+   * per iteration, so use this rather than keep_host_W unless a consumer
+   * really needs it each iteration.
    */
   dArray_t<nda::array<ComplexType, 4> >& W_host();
 
@@ -123,8 +124,8 @@ public:
   /**
    * Whether the host mirror dW_qtPQ has to be maintained on the device path.
    * A pure scGW run reads W only through dW_qtPQ_dev, so keeping the mirror
-   * costs 13.4 s and 18.5 GB of host memory per iteration for data nothing
-   * touches. Set this when a host-side consumer needs W every iteration; for a
+   * costs a full copy of W in host memory and its transfer every iteration for
+   * data nothing touches. Set this when a host-side consumer needs W every iteration; for a
    * one-off consumer after the SCF loop, prefer W_host() below.
    */
   bool keep_host_W = false;
@@ -140,16 +141,16 @@ public:
   std::string screen_type = "";
   // Head (G=G'=0) of the inverse dielectric function in the long wavelength limit (q->0 and w->0)
   std::optional<nda::array<ComplexType, 1> > eps_inv_head;
-  // LFF-Sigma (Route 1): the vertex correction of the screened interaction seen by Sigma ONLY --
+  // Sigma vertex: the vertex correction of the screened interaction seen by Sigma ONLY --
   // dW~ = scale x Herm[W (Gamma_eff - 1)] in the dW_qtPQ layout, and the q -> 0 head of that correction
   // (the eps_inv_head convention). Built at the update_w tail, consumed and released by gw_t::evaluate.
   std::optional<dArray_t<nda::array<ComplexType, 4> > > dWsig_qtPQ;
   std::optional<nda::array<ComplexType, 1> > eps_inv_head_sig;
-  // LFF-Sigma: the INSTANTANEOUS part of the vertex correction, dW~(i nu -> inf) = Herm[Z t^dag G1(inf) t] per q
+  // Sigma vertex: the INSTANTANEOUS part of the vertex correction, dW~(i nu -> inf) = Herm[Z t^dag G1(inf) t] per q
   // (a delta(tau): routed through the static self-energy F by gw_t::evaluate, not through tau); (nq, Np, Np) on the
   // HF exchange grid {1, np_P, np_Q}
   std::optional<dArray_t<nda::array<ComplexType, 3> > > dWsig_inf_qPQ;
-  // LFF-Sigma Route 2 (L-6): the pair-resolved static-ladder vertex self-energy on the ladder's C window,
+  // Sigma vertex, pair-resolved: the static-ladder vertex self-energy on the ladder's C window,
   // (nt, ns, nk, nc, nc) replicated, sigma_pair_window = {first band, size}. Built at the update_w tail on the readout
   // instance, added to Sigma (the C block) and released by gw_t::evaluate.
   std::optional<nda::array<ComplexType, 5> > dSigma_pair_tskab;
@@ -180,16 +181,15 @@ public:
   // Double-counting polarizability
   std::optional<sArray_t<nda::array_view<ComplexType, 5> > > sPi_dc_wabcd;
   // THC-adjoint local image of the LATTICE ladder polarization,
-  // (1/N_q) sum_q B(q)^dag P^lad(q, inu) B(q) (Project 2 increment Q4 C3), produced by
+  // (1/N_q) sum_q B(q)^dag P^lad(q, inu) B(q), produced by
   // the injection in scr_coulomb_t::eval_Pi_qdep whenever a bosonic projector is present.
-  // ⚠ DIAGNOSTIC convention, NOT DC-ready: the adjoint carries the upfold's ||B||^2 gain
-  // (R-Q4-2 AMENDMENT, notes/q4_edmft_skeleton_spec.md); the eq-7 ladder DC proper is the
-  // orbital/chi-convention 4-leg projection, delivered by increment Q4-C3b. Consumed only
+  // ⚠ DIAGNOSTIC convention, NOT DC-ready: the adjoint carries the upfold's ||B||^2 gain;
+  // the ladder double counting proper is the orbital/chi-convention 4-leg projection
+  // (sPi_lad_loc_orb_wabcd below). Consumed only
   // under the explicit opt-in knob pi_lad_dc = "thc_adjoint_diag" (downfold_edmft_impl).
   // Same shape class as sPi_dc_wabcd, (nw_half, nImpOrbs^4). Single impurity.
   std::optional<sArray_t<nda::array_view<ComplexType, 5> > > sPi_lad_loc_wabcd;
-  // THE eq-7 LADDER DC PROPER (Project 2 increment Q4-C3b,
-  // notes/q4_c3b_orbital_ladder_dc_spec.md): the ORBITAL / chi-convention local part of
+  // THE LADDER DOUBLE COUNTING PROPER: the ORBITAL / chi-convention local part of
   // the lattice ladder, (1/N_q) sum_q E(q)^dag [(1-XK)^-1 XKX](q, i.nu) E(q) with the MLWF
   // pair-leg maps E -- an O(1) object in the SAME convention as sPi_dc_wabcd (the pair pack
   // abcd of eval_Pi_rpa_dc), no metric inverse anywhere. Produced by the same injection as

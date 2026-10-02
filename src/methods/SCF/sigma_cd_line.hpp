@@ -23,7 +23,7 @@
 
 /**
  * ===========================================================================
- * THE eq-1 CD ASSEMBLY  (increment TC-3 / spec M4)
+ * THE CONTOUR-DEFORMATION (CD) ASSEMBLY ON THE LINE
  * ===========================================================================
  *
  * Sigma^c from W^c evaluated at POINTS -- an imaginary-axis integral plus a
@@ -34,19 +34,18 @@
  * it requires poles.)
  *
  *      Sigma^c_nn(w) = -(1/2pi) Int dnu  sum_m <nm|W^c(i nu)|mn> / (w + i nu - eps_m)
- *                    +           sum_m sigma_m <nm|W^c(w - eps_m + i delta)|mn>
+ *                    +           sum_m sigma_m <nm|W^c(w - eps_m + i delta)|mn>   (CD)
  *
  * ---------------------------------------------------------------------------
  * 1. THE sigma_m SIGNS -- DERIVED, AND IN THEIR FINITE-T FORM
  * ---------------------------------------------------------------------------
- * results section 2.3 records that the spec's stated sigma_m are the OPPOSITE
- * of the ones that reproduce Sigma^c, and fixes them to
+ * At zero temperature the signs that reproduce Sigma^c are
  *
  *      sigma_m = +1   for  mu < eps_m < w     (empty, below w)
  *      sigma_m = -1   for  w < eps_m < mu     (occupied, above w)
  *      sigma_m =  0   otherwise.
  *
- * Re-deriving that here mechanically produces something slightly stronger.
+ * Deriving them mechanically produces something slightly stronger.
  * For ONE G pole at eps_m (weight 1) and a W^c pole set {(w_j, om_j)}, closing
  * the nu integral in the upper half plane gives, with A = w - eps_m,
  *
@@ -74,11 +73,11 @@
  * FITTED pole set (the tau/nu routes' masked_pole_fit, on a deliberately NONSYM
  * auxiliary node set) is even only on the imaginary axis, and at real argument
  * the two forms differ by O(1).
- * MEASURED on random non-symmetric pole sets, deviation from the exact finite-T
- * closed form of sigma_route_b, normalized by a non-cancelling scale:
- *      W^c(eps_m - w) : 2.4e-16      W^c(w - eps_m) : 1.1e+01
- * [verified -- gate: tc_sigma_cd_nonsym_poles. The single-pole pin cannot see
- *  this: its PH pair is exactly even.]
+ * On random non-symmetric pole sets, the deviation from the exact finite-T
+ * closed form of sigma_route_b, normalized by a non-cancelling scale, is at
+ * round-off for W^c(eps_m - w) and O(10) for W^c(w - eps_m)
+ * [test: tc_sigma_cd_nonsym_poles. The single-pole test cannot see this: its
+ *  PH pair is exactly even.]
  *
  * Its beta -> infinity limit is exactly the three cases above (f -> a step at
  * mu), so this is the DERIVED convention, not a different one -- but it also
@@ -88,11 +87,11 @@
  * The leftover in (R) is purely BOSONIC and state-independent:
  * n_B(om) + theta(-om) equals n_B(om) for om > 0 and -n_B(-om) for om < 0, so
  * it is bounded by exp(-beta*om_min) where om_min is the bottom of W^c's
- * spectral support. It is the ONE approximation the eq-1 form makes relative to
+ * spectral support. It is the ONE approximation the (CD) form makes relative to
  * the exact finite-T closed form, it is reported by `thermal_leftover_bound`,
- * and on any gapped W^c at production beta it is astronomically small
- * (measured 1e-221 at beta = 1e3, om_p ~ 0.5 in the unit pin).
- * [verified: the pin `tc_sigma_cd_single_pole` scores (SIGMA_M) against the
+ * and on any gapped W^c at realistic beta it is astronomically small
+ * (~1e-221 at beta = 1e3, om_p ~ 0.5).
+ * [test: `tc_sigma_cd_single_pole` scores (SIGMA_M) against the
  *  exact finite-T Lehmann at 1e-14, with NO quadrature -- the integral term
  *  (I) is evaluated in closed form there.]
  *
@@ -102,15 +101,14 @@
  *  * The RESIDUE term needs W^c on the LINE Im z = delta, at z = w - eps_m +
  *    i delta -- one target per (evaluation energy, internal state m). This is
  *    the contour route's product (p_contour + wc_line).
- *  * The IMAGINARY-AXIS term needs W^c(i nu) only. That is what the production
- *    Matsubara solver already computes and stores, so it "reuses the existing
- *    machinery" (spec M4) and never asks the contour for small nu -- which is
- *    exactly where results section 5.5 says the contour is invalid
- *    (nu >= gamma only). The caller supplies the nu nodes, their weights and
+ *  * The IMAGINARY-AXIS term needs W^c(i nu) only. That is what the
+ *    Matsubara solver already computes and stores, so it reuses the existing
+ *    machinery and never asks the contour for small nu -- which is exactly
+ *    where the contour is invalid (it is valid for nu >= gamma only). The caller supplies the nu nodes, their weights and
  *    the contracted <nm|W^c(i nu)|mn>; `imag_axis_term` does the rest.
  *
- * `tan_quadrature` provides the campaign's own nu grid (Gauss-Legendre in
- * nu = L tan(u)) for the unit pins and for any caller that wants a continuous
+ * `tan_quadrature` provides a continuous nu grid (Gauss-Legendre in
+ * nu = L tan(u)) for the unit tests and for any caller that wants a continuous
  * rule rather than the stored bosonic mesh.
  */
 
@@ -148,7 +146,7 @@ namespace sigma_cd_line {
    * (SIGMA_M): sigma_m = theta(w - eps_m) - f(eps_m).
    *
    * At beta -> infinity this is +1 for mu < eps_m < w, -1 for w < eps_m < mu,
-   * and 0 otherwise -- the DERIVED signs of results section 2.3.
+   * and 0 otherwise -- the zero-temperature signs listed in the header.
    */
   inline double sigma_m_weight(double omega, double eps_m, double mu, double beta) {
     const double theta = (omega > eps_m) ? 1.0 : 0.0;
@@ -182,9 +180,8 @@ namespace sigma_cd_line {
 
   /**
    * Gauss-Legendre in the substituted variable nu = L tan(u), u in (-pi/2, pi/2).
-   * `L` must exceed the plasmon range or the eq-1 identity becomes
+   * `L` must exceed the plasmon range or the (CD) identity becomes
    * quadrature-limited rather than sign-limited.
-   * [port of tc_validation/models.py::SigmaModel.cd_assembly's _ivcache block]
    */
   inline quad_t tan_quadrature(long n, double L = 50.0) {
     utils::check(n >= 2, "sigma_cd_line::tan_quadrature: n = {} must be >= 2.", n);
@@ -216,7 +213,7 @@ namespace sigma_cd_line {
   }
 
   /**
-   * The imaginary-axis term of eq 1 for ONE internal state m:
+   * The imaginary-axis term of (CD) for ONE internal state m:
    *
    *     -(1/2pi) Int dnu  Wnm(i nu) / (w + i nu - eps_m)
    *
@@ -239,7 +236,7 @@ namespace sigma_cd_line {
 
   /**
    * The closed-form integral term (I) for a W^c given as an explicit pole set --
-   * the unit-pin path, exact and quadrature-free:
+   * the unit-test path, exact and quadrature-free:
    *
    *     I(A) = [A>0] sum_j w_j/(A+om_j)  -  sum_{om_j<0} w_j/(A+om_j).
    */
@@ -294,7 +291,7 @@ namespace sigma_cd_line {
   }
 
   /**
-   * The residue-target list eq 1 needs at one evaluation energy:
+   * The residue-target list (CD) needs at one evaluation energy:
    *      z_m = (eps_m - omega) + i delta,   eq (EXACT) -- NOT omega - eps_m.
    * The window is unchanged (|Re z| <= zeta_max either way, just mirrored), and
    * the transform's conjugate-mirror rows cover both halves.

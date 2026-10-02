@@ -1,11 +1,11 @@
 /**
- * scGW-tilde Tier 2 full frequency, increment D2 (notes/dynbse_plan.md section 9): the production
- * driver's gates on the qe_lih222 fixture with the production pol-only attachment (vertex_type =
+ * The dynamic-rung vertex (dynbse) at full frequency: checks of the production driver on the qe_lih222
+ * fixture with the production pol-only attachment (vertex_type =
  * "none", pol_vertex = "ladder"). After two damped iterations the W-bar cache is filled by hand
  * (update_w publishes dW; cache_w folds it -- the static rung mode never fills the cache), then
  * vertex_t::dynbse_gate runs:
  *   (A0) the THC rung operator vs the explicit Kbig                      -- machine class
- *   (A)  the static limit vs the sign-corrected L2 resolvent -ladder(-W0) -- 1e-12 class
+ *   (A)  the static limit vs the sign-corrected static-ladder resolvent -ladder(-W0) -- 1e-12 class
  *   (B)  the one bare dynamic rung vs pi_c_accumulate_w(Z = 0, W_dyn - W_dyn(0)) -- fit class
  *   (C)  GMRES vs Neumann on the resummed vertex; Hermiticity; the watchdog and meters.
  */
@@ -119,9 +119,9 @@ namespace bdft_tests {
       iter_scf::iter_scf_t iter_sol("damping");
       solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
       vtx.set_pol_vertex("ladder", "w0_prev", window, -1, 1e-8, -1.0, -1.0, -1.0);
-      if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-      if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-      if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+      if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+      if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+      if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
       scr_eri.set_vertex(&vtx);
       auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                      solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
@@ -153,7 +153,7 @@ namespace bdft_tests {
       return;
     }
     auto g = gate_at(nda::range(0, 4), 2, false);
-    app_log(1, "dynbse_gate [C = [0,4) of {}]: A0 {:.3e}; A {:.3e} (vs as-implemented L2 {:.3e}); B {:.3e} "
+    app_log(1, "dynbse_gate [C = [0,4) of {}]: A0 {:.3e}; A {:.3e} (vs the static-ladder resolvent as implemented {:.3e}); B {:.3e} "
                "(|anchor| {:.3e}, |static| {:.3e}); GMRES vs Neumann {:.3e}, Gamma1 {:.3e}; Ritz {:.3f} / "
                "contraction {:.3f}; applications {} / {}; converged {}; refit {:.3e}; herm {:.3e}; dyn vs static "
                "{:.3e}, Gamma1 vs static {:.3e}; G fit {:.3e} rr {:.3g}; Dsq {:.3e}; W(s) sym {:.3e}",
@@ -165,7 +165,7 @@ namespace bdft_tests {
     REQUIRE(g.a0_resid < 1e-12);                  // the THC rung operator IS Kbig
     REQUIRE(g.a0_ft_resid >= 0.0);
     REQUIRE(g.a0_ft_resid < 1e-11);               // (A0-FT) the mesh-Fourier k-sum IS the direct rung operator
-    REQUIRE(g.a_resid < 1e-10);                   // the static limit IS the (sign-corrected) L2 resolvent
+    REQUIRE(g.a_resid < 1e-10);                   // the static limit IS the (sign-corrected) static-ladder resolvent
     REQUIRE(g.b_resid < 1e-3);                    // one dynamic rung = the anchor at inu = 0 (fit class)
     REQUIRE(g.b_continuity < 1e-2);               // and continuous into the first positive node
     // the resummed solve at inu = 0: both solvers agree, converged, contractive
@@ -193,25 +193,25 @@ namespace bdft_tests {
                           std::getenv("COQUI_DYNBSE_TEST_PREC") ? std::string(std::getenv("COQUI_DYNBSE_TEST_PREC")) : std::string("low"));
     std::string output = "coqui_d3_readout";
 
-    // COQUI_DYNBSE_TEST_FX overrides the fixture (default qe_lih222). Added 2026-09-22 for the SAMPLED-Sigma
-    // hunt: the nu-sampled dynamic Sigma vertex is fine on LiH and fails at Si 4^3, and the nu-modes are set by
-    // the pair continuum rather than by the mesh (P13), so qe_si222_nosym is the cheap local reproducer to try.
+    // COQUI_DYNBSE_TEST_FX overrides the fixture (default qe_lih222), e.g. qe_si222_nosym: the nu-modes of the sampled
+    // dynamic Sigma vertex are set by the pair continuum rather than by the mesh, so a small Si mesh exercises the same
+    // nu structure as a large one.
     const std::string fx_readout = std::getenv("COQUI_DYNBSE_TEST_FX") ? std::getenv("COQUI_DYNBSE_TEST_FX") : "qe_lih222";
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fx_readout));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
 
-    // W-int-0 empirical gate: the full Wannier-vertex DUMP chain (pol-vertex "ladder" + wannier ->
+    // The full Wannier-vertex DUMP chain (pol-vertex "ladder" + wannier ->
     // set_wannier_projector -> scr_coulomb adopt_wannier + dump path -> dynbse E-leg -> Pi_loc dumped).
     if (std::getenv("COQUI_DYNBSE_TEST_WAN")) {
-      // W-int-0/1 empirical gate: the full Wannier-vertex DUMP chain (pol-vertex "ladder" + wannier ->
+      // The full Wannier-vertex DUMP chain (pol-vertex "ladder" + wannier ->
       // set_wannier_projector -> scr_coulomb adopt_wannier + dump path -> ladder_inputs G_bar + the rotated
       // X_bar -> identity pair legs -> Pi_loc dumped), run for the SAME C (window [0,4)) in two gauges: the
       // degenerate identity projector and a fixed complex unitary mix V of the window bands. Pi_loc(q) then
       // differs by the pair-frame rotation only, so its gauge INVARIANTS (tr H, tr H^2, tr H^3 of the
-      // Hermitized block, per q) must agree -- the W-int-1 frame-consistency oracle (W-int-0 mixed a
-      // band-frame G with the MLWF-frame X_bar and applied U twice; invisible for V = 1).
+      // Hermitized block, per q) must agree -- the frame-consistency oracle (a band-frame G mixed with the
+      // MLWF-frame X_bar, or U applied twice, breaks it; both are invisible for V = 1).
       using cplx = std::complex<double>;
       auto run_wan = [&](std::string const &tag, nda::array<cplx, 2> const *V) {
         const std::string out = "coqui_d3_wan_" + tag;
@@ -225,9 +225,9 @@ namespace bdft_tests {
         vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(true);
         auto proj = make_degenerate_projector(*mf, 0, 4, V); vtx.set_wannier_projector(proj, true);
         REQUIRE(vtx.wannier()); REQUIRE(vtx.subspace_rank() == 4); REQUIRE(vtx.isometry_defect() < 1e-10);
-        if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-        if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+        if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+        if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                        solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true);
@@ -304,10 +304,10 @@ namespace bdft_tests {
       return;
     }
 
-    // W-int-1b/4 gate as a lambda over the mesh: nosym (qe_lih222) and, with COQUI_DYNBSE_TEST_WINT_SYM, the SYMMETRIC
-    // qe_lih222_sym fixture (W-int-4s: the frozen-point gather builds the image k-points from the IBZ orbitals).
+    // The Wannier frozen-point check as a lambda over the mesh: nosym (qe_lih222) and, with COQUI_DYNBSE_TEST_WINT_SYM, the
+    // SYMMETRIC qe_lih222_sym fixture (the frozen-point gather builds the image k-points from the IBZ orbitals).
     auto wint_gate = [&](std::shared_ptr<mf::MF> mfw, auto &eriw, std::string const &mesh_tag) {
-      // W-int-1b/4 gate (notes/wannier_coarse_vertex_plan.md): the frozen-point aux frame + the consumer.
+      // The frozen-point aux frame + the consumer:
       //  A  window, dynamic Gamma_1, dumps <A>.secpts.h5 + <A>.pol_nu0.g2.h5
       //  B  window, the points FROZEN from A          -> the dumped Pi(q)_{MN} == A's, eps readout == A's
       //  V  a unitary MLWF mix V of the same window, frame "aux", points frozen from A -> Pi == A's: the point
@@ -317,7 +317,7 @@ namespace bdft_tests {
       using cplx = std::complex<double>;
       struct res_t { double e_corr, er, el; nda::array<cplx, 3> Ps, Pg; };
       bool trs_images = false;   // set with the V flavour below (captured by reference)
-      bool stream_cur = false;   // P6: the streaming THC rung (per symmetry class on the symmetric mesh) instead of the dense one
+      bool stream_cur = false;   // the streaming THC rung (per symmetry class on the symmetric mesh) instead of the dense one
       auto run_w = [&](std::string const &tag, std::string const &rung, std::string const &points, std::string const &interp,
                        nda::array<cplx, 2> const *V) {
         const std::string out = "coqui_d3_wint_" + mesh_tag + "_" + tag;
@@ -333,9 +333,9 @@ namespace bdft_tests {
         vtx.set_pol_interp(interp, "static");
         vtx.set_ladder_dyn_dense(not stream_cur);
         if (V) { auto proj = make_degenerate_projector(*mfw, 0, 4, V, trs_images); vtx.set_wannier_projector(proj, true); }
-        if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-        if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+        if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+        if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eriw, ft,
                                        solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true);
@@ -346,7 +346,7 @@ namespace bdft_tests {
           h5::file f(out + ".pol_nu0.g2.h5", 'r'); h5::group g(f);
           nda::h5_read(g, "Pi_static", r.Ps); nda::h5_read(g, "Pi_gam1", r.Pg);
         }
-        app_log(1, "dynbse_readout W-int gate {} [{}]: e_corr {:.10f}, eps_M RPA {:.8f} ladder {:.8f}{}", mesh_tag, tag, e_corr, er, el,
+        app_log(1, "dynbse_readout vertex Wannier check {} [{}]: e_corr {:.10f}, eps_M RPA {:.8f} ladder {:.8f}{}", mesh_tag, tag, e_corr, er, el,
                 rung == "dynamic" ? " (Pi dumped)" : "");
         mpi_context->comm.barrier();
         if (mpi_context->comm.root() and tag != "A") {
@@ -372,19 +372,19 @@ namespace bdft_tests {
       if (vflavour == "real") { givens(0, 1, 0.7, 0.0); givens(1, 2, 1.1, 0.0); givens(2, 3, 0.4, 0.0); givens(0, 3, 0.9, 0.0); }
       else { givens(0, 1, 0.7, 0.3); givens(1, 2, 1.1, -0.8); givens(2, 3, 0.4, 1.9); givens(0, 3, 0.9, 0.5); }
       trs_images = (vflavour == "trs");   // "trs2" = the fully TRS-consistent k-dependent gauge (handled in make_degenerate_projector)
-      app_log(1, "dynbse_readout W-int gate ({}): Wannier V flavour = {} (real | trs = conj(V) on the trev images | complex)", mesh_tag, vflavour);
+      app_log(1, "dynbse_readout vertex Wannier check ({}): Wannier V flavour = {} (real | trs = conj(V) on the trev images | complex)", mesh_tag, vflavour);
       const std::string pts = "coqui_d3_wint_" + mesh_tag + "_A.secpts.h5", nu0 = "coqui_d3_wint_" + mesh_tag + "_A.pol_nu0.g2.h5";
       auto A = run_w("A", "dynamic", "", "", nullptr);
       REQUIRE(std::filesystem::exists(pts)); REQUIRE(std::filesystem::exists(nu0));
       auto B = run_w("B", "dynamic", pts, "", nullptr);
-      {   // P6: the streaming THC rung (on the symmetric mesh: one pass per symmetry class of the transfers, legs from Xhat,
+      {   // the streaming THC rung (on the symmetric mesh: one pass per symmetry class of the transfers, legs from Xhat,
           // the IBZ-stored W at q_star, transposed on time-reversal transfers) is the same operator as the dense per-tau rung:
           // the static column and the one-rung Gamma_1 column agree to rounding (frozen points, the same aux frame as A)
         stream_cur = true;
         auto AS = run_w("AS", "dynamic", pts, "", nullptr);
         stream_cur = false;
         const double dS = relmax(AS.Pg, A.Pg), dSs = relmax(AS.Ps, A.Ps);
-        app_log(1, "dynbse_readout W-int gate ({}): P6 streaming THC rung vs the dense per-tau rung: |dPi_gam1| {:.2e} |dPi_static| {:.2e}; "
+        app_log(1, "dynbse_readout vertex Wannier check ({}): streaming THC rung vs the dense per-tau rung: |dPi_gam1| {:.2e} |dPi_static| {:.2e}; "
                    "e_corr {:.10f} vs {:.10f}", mesh_tag, dS, dSs, AS.e_corr, A.e_corr);
         REQUIRE(dS < 1e-9); REQUIRE(dSs < 1e-9);
       }
@@ -395,7 +395,7 @@ namespace bdft_tests {
       //     so eps_M(ladder) == A's again
       auto CW = run_w("CW", "static", pts, nu0, &V);
       const double dB = relmax(B.Pg, A.Pg), dW = relmax(W.Pg, A.Pg), dBs = relmax(B.Ps, A.Ps), dWs = relmax(W.Ps, A.Ps);
-      app_log(1, "dynbse_readout W-int gate ({}): FROZEN points reproduce the selection: |dPi_gam1| {:.2e} |dPi_static| {:.2e}; "
+      app_log(1, "dynbse_readout vertex Wannier check ({}): FROZEN points reproduce the selection: |dPi_gam1| {:.2e} |dPi_static| {:.2e}; "
                  "the point frame is gauge-invariant (unitary V, aux frame): {:.2e} / {:.2e}; eps_M(ladder) A {:.10f} B {:.10f} "
                  "CONSUMER window {:.10f} (|d| = {:.2e}) Wannier {:.10f} (|d| = {:.2e}); e_corr A-B {:.1e} A-V {:.1e} A-C {:.1e} A-CW {:.1e} "
                  "(a Wannier-mode DYNAMIC run dumps and returns before the eps readout: V.el = {:.1f} by design)",
@@ -403,7 +403,7 @@ namespace bdft_tests {
               std::abs(A.e_corr - B.e_corr), std::abs(A.e_corr - W.e_corr), std::abs(A.e_corr - C.e_corr),
               std::abs(A.e_corr - CW.e_corr), W.el);
       REQUIRE(dB < 1e-10); REQUIRE(dBs < 1e-10);
-      REQUIRE(dW < 1e-8); REQUIRE(dWs < 1e-8);   // W-int-4w fixed (conj(U) on the conjugated rotations of build_sym_ctx): holds with trev images too
+      REQUIRE(dW < 1e-8); REQUIRE(dWs < 1e-8);   // holds with trev images too (build_sym_ctx applies conj(U) on the conjugated rotations)
       REQUIRE(std::abs(B.el - A.el) < 1e-9);
       REQUIRE(std::abs(C.el - A.el) < 1e-8); REQUIRE(std::abs(C.er - A.er) < 1e-10);
       REQUIRE(std::abs(CW.el - A.el) < 1e-8); REQUIRE(std::abs(CW.er - A.er) < 1e-10);
@@ -416,7 +416,7 @@ namespace bdft_tests {
       mpi_context->comm.barrier();
     };
     if (std::getenv("COQUI_DYNBSE_TEST_WINT_CROSS")) {
-      // STAR-CLOSURE probe (kp888 finding 2026-09-16): points selected on the NOSYM mesh, frozen on the SYMMETRIC mesh.
+      // STAR-CLOSURE probe: points selected on the NOSYM mesh, frozen on the SYMMETRIC mesh.
       // The vertex's IBZ machinery assumes the secondary point set is closed under the group (the sym selection
       // builds it from irreducible r-grid sectors). Runs: A_nosym (window, dynamic, dumps points + Pi), A_sym (own
       // star-closed selection: the direct sym reference), C_sym (A_nosym's points frozen on the sym mesh, consuming
@@ -431,7 +431,7 @@ namespace bdft_tests {
       auto mfs = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fxn + "_sym"));
       thc_reader_t thcs(mfs, make_thc_reader_ptree(mfs->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mfs->ecutrho(), 1, 1024));
       auto eris = mb_eri_t(thcs, thcs);
-      app_log(1, "dynbse_readout W-int CROSS on {} (nk {}) vs {}_sym (nk {}, IBZ {}, trev pairs {})", fxn, mfn->nkpts(), fxn,
+      app_log(1, "dynbse_readout vertex Wannier CROSS on {} (nk {}) vs {}_sym (nk {}, IBZ {}, trev pairs {})", fxn, mfn->nkpts(), fxn,
               mfs->nkpts(), mfs->nkpts_ibz(), mfs->nkpts_trev_pairs());
       auto run_x = [&](std::string const &tag, std::shared_ptr<mf::MF> mfw, auto &eriw, std::string const &rung, bool dump,
                        std::string const &points, std::string const &interp) {
@@ -445,13 +445,13 @@ namespace bdft_tests {
         vtx.set_ladder_rung(rung, 1e-8, 30, 12, -1.0);
         vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(dump);
         vtx.set_isdf_points(points, dump); vtx.set_pol_interp(interp, "static");
-        if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-        if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+        if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+        if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true);
         auto [er, el] = scr_eri.pol_eps_readout();
-        app_log(1, "dynbse_readout W-int CROSS [{}]: e_corr {:.10f}, eps_M RPA {:.8f} ladder {:.8f}", tag, e_corr, er, el);
+        app_log(1, "dynbse_readout vertex Wannier CROSS [{}]: e_corr {:.10f}, eps_M RPA {:.8f} ladder {:.8f}", tag, e_corr, er, el);
         mpi_context->comm.barrier();
         if (mpi_context->comm.root() and tag != "A_nosym") {
           remove((out + ".mbpt.h5").c_str());
@@ -464,7 +464,7 @@ namespace bdft_tests {
       auto [ra, la] = run_x("A_nosym", mfn, erin, "dynamic", true, "", "");
       auto [rs, ls] = run_x("A_sym", mfs, eris, "static", false, "", "");
       auto [rc, lc] = run_x("C_sym", mfs, eris, "static", false, "coqui_d3_wcross_A_nosym.secpts.h5", "coqui_d3_wcross_A_nosym.pol_nu0.g2.h5");
-      app_log(1, "dynbse_readout W-int CROSS: eps_M(ladder, q_min): nosym direct {:.8f} | sym direct (star-closed points) {:.8f} | "
+      app_log(1, "dynbse_readout vertex Wannier CROSS: eps_M(ladder, q_min): nosym direct {:.8f} | sym direct (star-closed points) {:.8f} | "
                  "sym consumer on NOSYM-selected frozen points {:.8f}  => C_sym - A_sym = {:+.2e} (rel {:.1e}); RPA sym {:.8f} nosym {:.8f}",
               la, ls, lc, lc - ls, std::abs(lc - ls) / std::abs(ls - rs), rs, ra);
       mpi_context->comm.barrier();
@@ -477,8 +477,8 @@ namespace bdft_tests {
       return;
     }
     if (std::getenv("COQUI_DYNBSE_TEST_WINT_INJ")) {
-      // W-int-4f V0 gate (notes/wannier_coarse_vertex_plan.md): the FULL-FREQUENCY W-Dyson feed. A injects the direct
-      // resummed ladder at every PH-sym half node (pol_vertex_inject = ladder_n2, the L3 object) and dumps it
+      // The FULL-FREQUENCY W-Dyson feed. A injects the direct
+      // resummed ladder at every PH-sym half node (pol_vertex_inject = ladder_n2) and dumps it
       // (<A>.pol_wh.g1.h5 + <A>.secpts.h5); B runs the same loop with the injection READ from that file on A's frozen
       // points (never solving the ladder). Same G -> same P_RPA + P^{C,L} -> same W, Sigma: e_hf / e_corr / the loop-side
       // eps_M / the readout must be IDENTICAL (bit level). C = the same with a fixture of the SYMMETRIC mesh's own dump.
@@ -487,11 +487,11 @@ namespace bdft_tests {
       thc_reader_t thcn(mfn, make_thc_reader_ptree(mfn->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mfn->ecutrho(), 1, 1024));
       auto erin = mb_eri_t(thcn, thcn);
       auto section_m = [&]() {
-      {   // LFF-aux L-6 (Route 2) gate, section M: the PAIR-RESOLVED static-ladder vertex in Sigma (vertex_sigma_pair.icc).
+      {   // section M: the PAIR-RESOLVED static-ladder vertex in Sigma (vertex_sigma_pair.icc).
             // R0: plain GW; XS: B-S Sigma^{C,x} (vertex_type 2nd_exchange, rung static, secondary frame at run G's frozen
             // points, bl_drop 1 drops Sigma^{C,r}); P1: pair col static1 + outer static = the SAME diagram through the pair
-            // machinery (the exact identity, G2); P0: pair at scale 0 (bit-identical to R0); PS: col static + outer dynamic
-            // (the production object; G1: its Pi-check == the all-nu dump's Pi_static column at the half nodes); PH: PS at
+            // machinery (the exact identity); P0: pair at scale 0 (bit-identical to R0); PS: col static + outer dynamic
+            // (the production object; its Pi-check == the all-nu dump's Pi_static column at the half nodes); PH: PS at
             // scale 1/2 (linearity).
           using S5 = nda::array<std::complex<double>, 5>;
           auto read_sig = [&](std::string const &fn, S5 &S) {
@@ -503,10 +503,10 @@ namespace bdft_tests {
           { auto wb = ft.wn_mesh_b(); for (long l = 0; l < wb.shape(0); ++l) if (wb(l) == 0) m0b = l; }
           REQUIRE(m0b >= 0);
           std::string side_cur = "right";   // the junction of the next kind-2 run (section N sets it)
-          bool sd_dump = false; std::vector<long> sd_nodes; std::string sd_fit; long sd_rank = 0;   // L-8: the next kind-2 run's sampled-mode knobs
-          bool sd_ckpt = false;   // P20: the next kind-2 run checkpoints its Sigma accumulators after every unit (and keeps the files)
-          long sd_auto = 0;       // P14b: the next kind-2 run chooses this many sampled nodes from the dump (in place of sd_nodes)
-          std::string sd_acc = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC") ? std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC") : "split";   // P4-C14: split | single
+          bool sd_dump = false; std::vector<long> sd_nodes; std::string sd_fit; long sd_rank = 0;   // the next kind-2 run's sampled-mode knobs
+          bool sd_ckpt = false;   // the next kind-2 run checkpoints its Sigma accumulators after every unit (and keeps the files)
+          long sd_auto = 0;       // the next kind-2 run chooses this many sampled nodes from the dump (in place of sd_nodes)
+          std::string sd_acc = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC") ? std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC") : "split";   // split | single
           auto run_p = [&](std::string const &tag, int kind, std::string const &col, std::string const &outer, double scale, S5 &Sig) {
             // kind: 0 = plain GW, 1 = B-S Sigma^{C,x} (static rung), 2 = the pair vertex, 3 = the DYNAMIC-rung B-S Sigma^C (G^3 W^2)
             const std::string out = "coqui_d3_winj_" + tag;
@@ -519,37 +519,37 @@ namespace bdft_tests {
             if (kind == 1 or kind == 3) {
               solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(0, 4), mfn->nbnd(), "ignore_g0", "secondary", -1, 1e-8, -1.0, -1.0,
                                     kind == 1 ? "static" : "dynamic");
-              // 2026-09-22: section M normally runs on the G stage's frozen secondary points; with that dump absent
+              // section M normally runs on the G stage's frozen secondary points; with that dump absent
               // (running a sub-gate stand-alone, e.g. the SAMPLED one on a fixture whose INJ chain is not set up)
               // it selects its own -- the sub-gates below all compare runs with each other, not with the chain.
               if (std::filesystem::exists("coqui_d3_winj_G.secpts.h5")) vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
               vtx.set_bl_drop(1);
               if (kind == 3) vtx.set_skip_pi_c(true);   // the G^3 W^2 cut alone on the RPA W: the reference for the one-bare-rung pair column (N2)
-              if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-              if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-              if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+              if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+              if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+              if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
               scr_eri.set_vertex(&vtx); gw.set_vertex(&vtx);
               e_corr = std::get<1>(scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
             } else if (kind == 2) {
               solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfn->nbnd());
               vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
               vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
-              // 2026-09-22: section M normally runs on the G stage's frozen secondary points; with that dump absent
+              // section M normally runs on the G stage's frozen secondary points; with that dump absent
               // (running a sub-gate stand-alone, e.g. the SAMPLED one on a fixture whose INJ chain is not set up)
               // it selects its own -- the sub-gates below all compare runs with each other, not with the chain.
               if (std::filesystem::exists("coqui_d3_winj_G.secpts.h5")) vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
               vtx.set_sigma_pair(true, col, outer, scale, true, true, side_cur);
               vtx.set_sigma_dyn(sd_dump, sd_nodes, sd_fit, sd_rank);
-              if (sd_auto > 0) vtx.set_sigma_dyn_auto_nodes(sd_auto);   // P14b
-              if (sd_ckpt) vtx.set_sigma_dyn_ckpt_minutes(1e-9);   // P20: a checkpoint after every unit
-              if (auto *rf = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_REFIT")) vtx.set_sigma_dyn_refit(rf);   // P12: fit | union
-              vtx.set_sigma_dyn_acc(sd_acc);   // P4-C14: split | single
-              if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-              if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+              if (sd_auto > 0) vtx.set_sigma_dyn_auto_nodes(sd_auto);   // nodes chosen from the dump's nu-modes
+              if (sd_ckpt) vtx.set_sigma_dyn_ckpt_minutes(1e-9);   // a checkpoint after every unit
+              if (auto *rf = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_REFIT")) vtx.set_sigma_dyn_refit(rf);   // fit | union
+              vtx.set_sigma_dyn_acc(sd_acc);   // split | single
+              if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+              if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
               scr_eri.set_vertex(&vtx);
               e_corr = std::get<1>(scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
               m = scr_eri.sigma_pair_meter(); d = gw.sigma_pair_dsigma();
-              if (col == "static" or col == "static1") {   // G1: the P side's own object from the same amplitudes vs the dump's static column
+              if (col == "static" or col == "static1") {   // the P side's own object from the same amplitudes vs the dump's static column
                 nda::array<std::complex<double>, 4> Pc, Ps;
                 { h5::file f(out + ".sigpair.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_check", Pc); }
                 if (std::filesystem::exists("coqui_d3_winj_G.pol_wh_dyn.g1.h5")) {   // absent when a sub-gate runs stand-alone
@@ -568,7 +568,7 @@ namespace bdft_tests {
             }
             mpi_context->comm.barrier();
             read_sig(out + ".mbpt.h5", Sig);
-            app_log(1, "dynbse_readout LFF-Sigma pair [{}]: kind {} col {} outer {} scale {}: e_corr {:.12f}, max|dSigma| {:.6e} (anti-Hermitian {:.2e}, "
+            app_log(1, "dynbse_readout Sigma vertex, pair [{}]: kind {} col {} outer {} scale {}: e_corr {:.12f}, max|dSigma| {:.6e} (anti-Hermitian {:.2e}, "
                        "|K_s - K_s^dag|/|K_s| {:.2e}, wall {:.1f} s), added {:.6e} vs max|Sigma^GW| {:.4e}; Pi-check vs the dump's static column {:.3e}",
                     tag, kind, col, outer, scale, e_corr, m[0], m[1], m[2], m[3], d[0], d[1], pichk);
             mpi_context->comm.barrier();
@@ -584,7 +584,7 @@ namespace bdft_tests {
             return std::make_tuple(e_corr, m, d, pichk);
           };
           if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_SHARE")) {
-            // ---- P3 gate: one solve feeding the P readout and the Sigma deposits ---------------------------------------------
+            // ---- shared solve: one solve feeding the P readout and the Sigma deposits ---------------------------------------------
             // SH0 / SH1: the P-side all-nu dynamic readout (every half node) AND the dynamic pair vertex in Sigma (col dyn1, outer
             // dynamic, every node) in one run, without / with pol_vertex_sigma_share: the 21 nu >= 0 nodes are then deposited by
             // the P-side solve and the Sigma-side call solves the 20 others. Sigma and the P dump must agree (the same units on
@@ -599,7 +599,7 @@ namespace bdft_tests {
               vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
               vtx.set_ladder_rung("dynamic", 1e-8, 30, 12, -1.0);
               vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_all_nu(true);
-              // 2026-09-22: section M normally runs on the G stage's frozen secondary points; with that dump absent
+              // section M normally runs on the G stage's frozen secondary points; with that dump absent
               // (running a sub-gate stand-alone, e.g. the SAMPLED one on a fixture whose INJ chain is not set up)
               // it selects its own -- the sub-gates below all compare runs with each other, not with the chain.
               if (std::filesystem::exists("coqui_d3_winj_G.secpts.h5")) vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
@@ -610,7 +610,7 @@ namespace bdft_tests {
               mpi_context->comm.barrier();
               read_sig(out + ".mbpt.h5", Sig);
               { h5::file f(out + ".pol_wh_dyn.g1.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_gam1", Pg); }
-              app_log(1, "dynbse_readout LFF-Sigma SHARE [{}]: share {}: e_corr {:.12f}, max|dSigma| {:.6e}, wall {:.1f} s", tag, share, e_corr,
+              app_log(1, "dynbse_readout Sigma vertex SHARE [{}]: share {}: e_corr {:.12f}, max|dSigma| {:.6e}, wall {:.1f} s", tag, share, e_corr,
                       scr_eri.sigma_pair_meter()[0], scr_eri.sigma_pair_meter()[3]);
               mpi_context->comm.barrier();
               if (mpi_context->comm.root()) {
@@ -629,7 +629,7 @@ namespace bdft_tests {
             double ds = 0.0, ns_ = 0.0, dp = 0.0, np_ = 0.0;
             for (long i = 0; i < S0.size(); ++i) { ds = std::max(ds, std::abs(S0.data()[i] - S1.data()[i])); ns_ = std::max(ns_, std::abs(S0.data()[i])); }
             for (long i = 0; i < P0.size(); ++i) { dp = std::max(dp, std::abs(P0.data()[i] - P1.data()[i])); np_ = std::max(np_, std::abs(P0.data()[i])); }
-            app_log(1, "dynbse_readout LFF-Sigma SHARE gate (P3): {}: |dSigma| {:.2e} (max |Sigma| {:.3e}), "
+            app_log(1, "dynbse_readout Sigma vertex SHARE check: {}: |dSigma| {:.2e} (max |Sigma| {:.3e}), "
                        "|dPi_gam1| {:.2e} (max |Pi_gam1| {:.3e}); e_corr {:+.12f} vs {:+.12f}",
                     repro ? "the separate-solve run repeated (run-to-run floor)" : "one solve for P and Sigma vs separate solves", ds, ns_, dp, np_, c1, c0);
             REQUIRE(dp < 1e-9 * np_);
@@ -638,7 +638,7 @@ namespace bdft_tests {
             return;
           }
           if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_CKPT")) {
-            // ---- P20 gate: the Sigma-accumulator checkpoint / restart of the dynamic Sigma solve ---------------------------------
+            // ---- the Sigma-accumulator checkpoint / restart of the dynamic Sigma solve ---------------------------------
             // CK1 (a) solves every unit and checkpoints after each; (b) the same prefix again: every unit is loaded, none solved;
             // (c) rank 1's checkpoint removed: rank 1's units are re-solved, rank 0's loaded. All three dSigma must agree.
             S5 S_a, S_b, S_c;
@@ -656,7 +656,7 @@ namespace bdft_tests {
               dab = std::max(dab, std::abs(S_a.data()[i] - S_b.data()[i])); dac = std::max(dac, std::abs(S_a.data()[i] - S_c.data()[i]));
               na = std::max(na, std::abs(S_a.data()[i]));
             }
-            app_log(1, "dynbse_readout LFF-Sigma CKPT gate (P20): solve + checkpoint vs full restart |dSigma| {:.2e}, vs the partial restart (rank 1 re-solved) {:.2e} "
+            app_log(1, "dynbse_readout Sigma vertex CKPT check: solve + checkpoint vs full restart |dSigma| {:.2e}, vs the partial restart (rank 1 re-solved) {:.2e} "
                        "(max |Sigma| {:.3e}); e_corr {:+.12f} {:+.12f} {:+.12f}", dab, dac, na, ca_, cb_, cc_);
             REQUIRE(dab == 0.0);
             REQUIRE(dac < 1e-12 * na);
@@ -672,14 +672,14 @@ namespace bdft_tests {
             // cross-checks of vertex_sigma_dyn.icc (COQUI_SIGDYN_ROUTE, COQUI_SIGDYN_FAMILIES); the driver logs |dSigma|_F
             S5 S_one;
             auto [c1, m1, d1, k1] = run_p("D1B", 2, only, "dynamic", 1.0, S_one);
-            app_log(1, "dynbse_readout LFF-Sigma N_ONLY {}: e_corr {:+.12f}, max|dSigma| {:.6e}, anti-Hermitian {:.3e}", only, c1, m1[0], m1[1]);
+            app_log(1, "dynbse_readout Sigma vertex N_ONLY {}: e_corr {:+.12f}, max|dSigma| {:.6e}, anti-Hermitian {:.3e}", only, c1, m1[0], m1[1]);
             mpi_context->comm.barrier();
             return;
           }
           if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC1")) {
-            // ---- P4-C14 gate: the single tau-resolved accumulator vs the split (node-resolved) ones -------------------------------
+            // ---- the single tau-resolved accumulator vs the split (node-resolved) ones -------------------------------
             // A1 / A2: col dyn1, outer dynamic on all nodes, split (writing the per-node dump) / single; then the SAMPLED mode (the
-            // 11-node recipe of the SAMPLED gate on A1's dump) split / single. The two paths apply the same fixed linear maps in
+            // 11-node recipe of the SAMPLED check on A1's dump) split / single. The two paths apply the same fixed linear maps in
             // another order: rounding x cond(refit) -- reported; REQUIRE < 1e-6 relative on the C block.
             S5 S_a1, S_a2, S_a3, S_a4;
             sd_acc = "split"; sd_dump = true;
@@ -698,7 +698,7 @@ namespace bdft_tests {
               return std::make_pair(std::sqrt(num) / std::max(std::sqrt(den), 1e-300), mx);
             };
             auto [r12, m12] = rel4(S_a1, S_a2);
-            app_log(1, "dynbse_readout LFF-Sigma ACC gate (P4-C14), all nodes: single vs split accumulators: rel Frobenius {:.3e} (max |d| {:.3e}); "
+            app_log(1, "dynbse_readout Sigma vertex ACC check, all nodes: single vs split accumulators: rel Frobenius {:.3e} (max |d| {:.3e}); "
                        "e_corr {:+.12f} vs {:+.12f}; max|dSigma| {:.6e} vs {:.6e}", r12, m12, ca2, ca1, ma2[0], ma1[0]);
             REQUIRE(r12 < 1e-6);
             const long nwb = ft.wn_mesh_b().shape(0), hm = nwb / 2;
@@ -710,7 +710,7 @@ namespace bdft_tests {
             auto [ca4, ma4, da4, ka4] = run_p("A4", 2, "dyn1", "dynamic", 1.0, S_a4);
             sd_nodes.clear(); sd_fit.clear(); sd_rank = 0; sd_acc = "split";
             auto [r34, m34] = rel4(S_a3, S_a4);
-            app_log(1, "dynbse_readout LFF-Sigma ACC gate (P4-C14), sampled (11 of {} nodes, K = 6): single vs split accumulators: rel Frobenius {:.3e} (max |d| {:.3e}); "
+            app_log(1, "dynbse_readout Sigma vertex ACC check, sampled (11 of {} nodes, K = 6): single vs split accumulators: rel Frobenius {:.3e} (max |d| {:.3e}); "
                        "e_corr {:+.12f} vs {:+.12f}", nwb, r34, m34, ca4, ca3);
             REQUIRE(r34 < 1e-6);
             if (mpi_context->comm.root()) remove("coqui_d3_winj_A1.sigdyn.h5");
@@ -718,10 +718,9 @@ namespace bdft_tests {
             return;
           }
           if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_SAMPLED")) {
-            // ---- L-8 gate: the nu-SAMPLED dynamic Sigma vertex vs the all-node one -------------------------------------------
-            // D1D: col dyn1 on ALL nodes, writing the per-node objects; D1S: col dyn1 on 9 nodes (the S1 recipe's structure:
-            // nu = 0, three interior pivots and the tail node, both signs) with the nu-bases learned from D1D (K = 9:
-            // interpolation, exact at the samples). Reported: the relative Frobenius distance of the two dSigma on the C block.
+            // ---- the nu-SAMPLED dynamic Sigma vertex vs the all-node one ------------------------------------------------------
+            // D1D: col dyn1 on ALL nodes, writing the per-node objects; D1S: col dyn1 on a subset of the nodes (below) with the
+            // nu-bases learned from D1D. Reported: the relative Frobenius distance of the two dSigma on the C block.
             S5 S_r0s, S_d1d, S_d1s;
             auto [cr0s, mr0s, dr0s, kr0s] = run_p("R0", 0, "static", "static", 1.0, S_r0s);
             sd_dump = true;
@@ -731,9 +730,9 @@ namespace bdft_tests {
             if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_DUMP_ONLY")) return;   // keep the dump for offline analysis
             const long nwb = ft.wn_mesh_b().shape(0), hm = nwb / 2;   // LiH: 41 nodes, nu = 0 at 20
             // an evenly spread set (in node index ~ log nu): nu = 0 and +-4, 8, 12, 16, 20 -> 11 of 41 nodes; K = 6 per basis (least squares)
-            // COQUI_DYNBSE_TEST_SIGDYN_SAMPLED=auto: the 11 nodes chosen by the dump's own nu-modes instead (P14b)
+            // COQUI_DYNBSE_TEST_SIGDYN_SAMPLED=auto: the 11 nodes chosen by the dump's own nu-modes instead
             const bool auto_mode = (std::string(std::getenv("COQUI_DYNBSE_TEST_SIGDYN_SAMPLED")) == "auto");
-            // the reconstruction rank and the node count are scannable (P15 work, 2026-09-22): the sketch Gram resolves
+            // the reconstruction rank and the node count are scannable: the sketch Gram resolves
             // MORE nu-modes than the trace proxy, so the rank can become the binding constraint
             sd_fit = "coqui_d3_winj_D1D.sigdyn.h5";
             sd_rank = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_RANK") ? std::atol(std::getenv("COQUI_DYNBSE_TEST_SIGDYN_RANK")) : 6;
@@ -752,9 +751,9 @@ namespace bdft_tests {
                       const auto da = S_d1s(it, is, ik, i, j) - S_r0s(it, is, ik, i, j), db = S_d1d(it, is, ik, i, j) - S_r0s(it, is, ik, i, j);
                       num += std::norm(da - db); den += std::norm(db); mx = std::max(mx, std::abs(da - db));
                     }
-            app_log(1, "dynbse_readout LFF-Sigma SAMPLED gate: dyn1 on {} of {} nodes ({}; K = {}, per-p U/T bases) vs all nodes: rel Frobenius {:.3e} (max |d| {:.3e}); "
+            app_log(1, "dynbse_readout Sigma vertex SAMPLED check: dyn1 on {} of {} nodes ({}; K = {}, per-p U/T bases) vs all nodes: rel Frobenius {:.3e} (max |d| {:.3e}); "
                        "e_corr all {:+.10f} sampled {:+.10f} (R0 {:+.10f}); max|dSigma| all {:.6e} sampled {:.6e}; anti-Hermitian all {:.2e} sampled {:.2e}",
-                    used_nodes, nwb, auto_mode ? "chosen by the dump's nu-modes, P14b" : "the fixed evenly spread set", used_rank,
+                    used_nodes, nwb, auto_mode ? "chosen by the dump's nu-modes" : "the fixed evenly spread set", used_rank,
                     std::sqrt(num) / std::max(std::sqrt(den), 1e-300), mx, cd1d, cd1s, cr0s, md1d[0], md1s[0], md1d[1], md1s[1]);
             REQUIRE(den > 0.0);
             REQUIRE(std::sqrt(num) / std::sqrt(den) < 5e-2);
@@ -787,10 +786,10 @@ namespace bdft_tests {
             num = std::sqrt(num); den = std::sqrt(den);
           };
           double n1, d1, x1, n0, d0, x0, nh, dh_, xh, nfull, dfull, xfull;
-          win_diff(S_p1, S_xs, 1.0, S_r0, n1, d1, x1);          // G2: the exact identity
-          win_diff(S_p0, S_r0, 1.0, S_r0, n0, d0, x0);          // G3: scale 0 -> bitwise R0
+          win_diff(S_p1, S_xs, 1.0, S_r0, n1, d1, x1);          // the exact identity
+          win_diff(S_p0, S_r0, 1.0, S_r0, n0, d0, x0);          // scale 0 -> bitwise R0
           win_diff(S_ph, S_ps, 0.5, S_r0, nh, dh_, xh);         // linearity
-          win_diff(S_ps, S_xs, 1.0, S_r0, nfull, dfull, xfull); // the production object vs the one-rung static diagram (a size, not a gate)
+          win_diff(S_ps, S_xs, 1.0, S_r0, nfull, dfull, xfull); // the production object vs the one-rung static diagram (a size, not a check)
           // the off-window rows of Sigma must be untouched by the pair vertex (it is C-C by construction)
           double off = 0.0;
           for (long it = 0; it < S_ps.shape(0); ++it)
@@ -799,7 +798,7 @@ namespace bdft_tests {
                 for (long i = 0; i < S_ps.shape(3); ++i)
                   for (long j = 0; j < S_ps.shape(4); ++j)
                     if (i >= nb or j >= nb) off = std::max(off, std::abs(S_ps(it, is, ik, i, j) - S_r0(it, is, ik, i, j)));
-          app_log(1, "dynbse_readout LFF-Sigma pair gate: EXACT IDENTITY one static rung + static outer W vs B-S Sigma^(C,x): rel Frobenius {:.3e} "
+          app_log(1, "dynbse_readout Sigma vertex, pair check: EXACT IDENTITY one static rung + static outer W vs B-S Sigma^(C,x): rel Frobenius {:.3e} "
                      "(max |d| {:.3e}, |Sigma^(C,x)|_F {:.4e}, max |dSigma_pair| {:.4e}); e_corr XS {:+.10f} P1 {:+.10f} (R0 {:+.10f}); "
                      "scale 0: max |Sigma(P0) - Sigma(R0)| {:.2e}; linearity |dSigma(1/2) - dSigma(1)/2| {:.2e} rel {:.2e}; resummed + dynamic outer W vs "
                      "the static diagram: rel {:.3e}; off-window leakage {:.2e}; Pi-check(PS) {:.3e}; anti-Hermitian residual before Hermitization "
@@ -808,16 +807,16 @@ namespace bdft_tests {
                   n1 / d1, x1, d1, mp1[0], cxs, cp1, cr0, x0, xh, (dh_ > 0.0 ? nh / dh_ : 0.0), nfull / std::max(dfull, 1e-300), off, kps, mp1[1], mpt[1], mps[1], mps[2],
                   cr0, cp1, cpt, cps);
           REQUIRE(d1 > 0.0);
-          REQUIRE(n1 / d1 < 1e-8);                 // the exact identity (3e-12 measured; the leg/W variants miss it by 39-59 %)
+          REQUIRE(n1 / d1 < 1e-8);                 // the exact identity (other leg / outer-W choices miss it at O(1))
           REQUIRE(x0 == 0.0);                      // scale 0: bit-identical to plain GW
           REQUIRE(nh <= 1e-12 * dh_);              // linear in the scale
           REQUIRE(off == 0.0);                     // C-C only
           REQUIRE(kps >= 0.0); REQUIRE(kps < 1e-8); // the P side's own object from the same amplitudes == the dump's static column
           REQUIRE(mp1[1] < 1e-8);                  // the one-rung static diagram is Hermitian by itself (the one-sided insertion with a
-                                                   // dynamic outer W is not -- 6.7e-2 measured, Hermitized, logged above)
+                                                   // dynamic outer W is not: it is Hermitized, its residual logged above)
           REQUIRE(std::abs(cps - cr0) > 1e-10);    // the production object changes the correlation energy
           if (std::getenv("COQUI_DYNBSE_TEST_SKIP_N") == nullptr) {
-            // ---- section N (2026-09-20): L-6b the junction side + L-7 the DYNAMIC-rung vertex in Sigma (vertex_sigma_dyn.icc) ----
+            // ---- section N: the junction side + the DYNAMIC-rung vertex in Sigma (vertex_sigma_dyn.icc) ----
             // N1: the dynamic path with y = 0 (col static_dyn) == the static path (col static): the same amplitude K_s Gsum0 = T_s Cb D
             //     (Cb_cst route) through the tau-closure of vertex_sigma_dyn -- an identity to the Cb round trip;
             // N2: the ONE BARE dynamic rung (col dyn1_bare, T_s = 0) with the dynamic outer W == the G^3 W^2 second-order exchange
@@ -834,8 +833,8 @@ namespace bdft_tests {
             auto [cd1b, md1b, dd1b, kd1b] = run_p("D1B", 2, "dyn1_bare", "dynamic", 1.0, S_d1b);
             auto [cd1, md1, dd1, kd1] = run_p("D1", 2, "dyn1", "dynamic", 1.0, S_d1);
             auto [cd1h, md1h, dd1h, kd1h] = run_p("D1H", 2, "dyn1", "dynamic", 0.5, S_d1h);
-            // COQUI_DYNBSE_TEST_SKIP_DR: reuse the Gamma_1 column in place of the resummed one (39 min on 2 ranks; measured 2026-09-19:
-            // e_corr -0.10505671, max|dSigma| 1.3601e-02, anti-Hermitian 4.75e-02 vs Gamma_1 -0.10531543 / 1.3606e-02 / 3.99e-02)
+            // COQUI_DYNBSE_TEST_SKIP_DR: reuse the Gamma_1 column in place of the resummed one (the resummed run DR is the
+            // most expensive one of this section)
             const bool skip_dr = (std::getenv("COQUI_DYNBSE_TEST_SKIP_DR") != nullptr);
             auto [cdr, mdr, ddr, kdr] = skip_dr ? std::make_tuple(cd1, md1, dd1, kd1) : run_p("DR", 2, "dyn", "dynamic", 1.0, S_dr);
             if (skip_dr) S_dr = S_d1;
@@ -871,7 +870,7 @@ namespace bdft_tests {
                   for (long i = 0; i < S_dr.shape(3); ++i)
                     for (long j = 0; j < S_dr.shape(4); ++j)
                       if (i >= nb or j >= nb) off_d = std::max(off_d, std::abs(S_dr(it, is, ik, i, j) - S_r0(it, is, ik, i, j)));
-            app_log(1, "dynbse_readout LFF-Sigma DYN gate: N1 static limit of the dynamic path vs the static path: rel {:.3e} (max |d| {:.3e}); "
+            app_log(1, "dynbse_readout Sigma vertex, dynamic check: N1 static limit of the dynamic path vs the static path: rel {:.3e} (max |d| {:.3e}); "
                        "N2 EXACT IDENTITY one bare dynamic rung + dynamic outer W vs the DYNAMIC B-S Sigma^C (G^3 W^2): rel Frobenius {:.3e} "
                        "(max |d| {:.3e}, |Sigma^C_dyn|_F {:.4e}); e_corr XD {:+.10f} D1B {:+.10f} (R0 {:+.10f}, XS {:+.10f}); "
                        "N3 sizes: max|dSigma| dyn1 {:.4e} dyn {:.4e} (static {:.4e}), anti-Hermitian residual dyn1 {:.2e} dyn {:.2e} (static {:.2e}), "
@@ -905,14 +904,14 @@ namespace bdft_tests {
         vtx.set_ladder_dyn_dump(interp.empty());          // A dumps the injection object
         vtx.set_isdf_points(points, points.empty());       // A dumps its points, B freezes them
         vtx.set_pol_interp(interp, "ladder");
-        if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-        if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+        if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+        if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, niter, false, 1e-9, true);
         auto [er, el] = scr_eri.pol_eps_readout();
         const double eloop = scr_eri.pol_eps_loop();
-        app_log(1, "dynbse_readout W-int-4f INJ [{}]: e_hf {:.12f} e_corr {:.12f} eps_M readout RPA {:.10f} +ladder {:.10f} loop-side {:.10f}",
+        app_log(1, "dynbse_readout vertex Wannier INJ [{}]: e_hf {:.12f} e_corr {:.12f} eps_M readout RPA {:.10f} +ladder {:.10f} loop-side {:.10f}",
                 tag, e_hf, e_corr, er, el, eloop);
         mpi_context->comm.barrier();
         if (mpi_context->comm.root() and tag != "A") {
@@ -926,7 +925,7 @@ namespace bdft_tests {
       auto [ha, ca, ra, la, ea] = run_i("A", "", "", 1);
       REQUIRE(std::filesystem::exists("coqui_d3_winj_A.pol_wh.g1.h5")); REQUIRE(std::filesystem::exists("coqui_d3_winj_A.secpts.h5"));
       auto [hb, cb, rb, lb, eb] = run_i("B", "coqui_d3_winj_A.secpts.h5", "coqui_d3_winj_A.pol_wh.g1.h5", 1);
-      app_log(1, "dynbse_readout W-int-4f INJ gate: |d e_hf| {:.2e} |d e_corr| {:.2e} |d eps_M(readout +ladder)| {:.2e} |d eps_M(loop)| {:.2e}",
+      app_log(1, "dynbse_readout vertex Wannier INJ check: |d e_hf| {:.2e} |d e_corr| {:.2e} |d eps_M(readout +ladder)| {:.2e} |d eps_M(loop)| {:.2e}",
               std::abs(ha - hb), std::abs(ca - cb), std::abs(la - lb), std::abs(ea - eb));
       REQUIRE(std::abs(ha - hb) < 1e-12); REQUIRE(std::abs(ca - cb) < 1e-12);
       REQUIRE(std::abs(la - lb) < 1e-10); REQUIRE(std::abs(ea - eb) < 1e-10);
@@ -951,14 +950,14 @@ namespace bdft_tests {
         vtx.set_ladder_dyn_bubble_only(bubble_only); vtx.set_ladder_dyn_all_nu_nodes(nodes); vtx.set_ladder_dyn_fit(fit_file, 0);
         vtx.set_ladder_dyn_resum_mu_file(mu_file);
         vtx.set_isdf_points(points, points.empty()); vtx.set_pol_interp(interp, col);
-        if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-        if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+        if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+        if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true);
         auto ed = scr_eri.pol_eps_dyn();
         const double eloop = scr_eri.pol_eps_loop();
-        app_log(1, "dynbse_readout W-int-4f INJ [{}]: e_corr {:.12f}, dynamic readout (static {:.10f}, one rung {:.10f}, Gamma_1 {:.10f}), loop-side {:.10f}",
+        app_log(1, "dynbse_readout vertex Wannier INJ [{}]: e_corr {:.12f}, dynamic readout (static {:.10f}, one rung {:.10f}, Gamma_1 {:.10f}), loop-side {:.10f}",
                 tag, e_corr, ed[0], ed[1], ed[2], eloop);
         mpi_context->comm.barrier();
         if (mpi_context->comm.root() and tag != "G" and tag != "G2" and tag != "GB" and tag != "GS" and tag != "GF") {
@@ -978,7 +977,7 @@ namespace bdft_tests {
         REQUIRE(Ps.shape() == Pl.shape());
         double d = 0.0, n = 0.0;
         for (long i = 0; i < Ps.size(); ++i) { d += std::norm(Ps.data()[i] - Pl.data()[i]); n += std::norm(Pl.data()[i]); }
-        app_log(1, "dynbse_readout W-int-4f INJ: all-nu dump's static column vs the injected static-rung ladder: rel Frobenius {:.2e}", std::sqrt(d / n));
+        app_log(1, "dynbse_readout vertex Wannier INJ: all-nu dump's static column vs the injected static-rung ladder: rel Frobenius {:.2e}", std::sqrt(d / n));
         REQUIRE(std::sqrt(d / n) < 1e-8);
       }
       {   // G2: the production setting pol_vertex_dyn_cut_r1 = false (the one-bare-rung pass skipped): the Gamma_1 and
@@ -995,10 +994,10 @@ namespace bdft_tests {
           dg = std::max(dg, std::abs(Pg2.data()[i] - Pg.data()[i])); d1 = std::max(d1, std::abs(P12.data()[i] - Ps2.data()[i]));
           n = std::max(n, std::abs(Pg.data()[i]));
         }
-        app_log(1, "dynbse_readout W-int-4f INJ: cut_r1 = false vs true: max |d Pi_gam1| {:.2e} (max |Pi_gam1| {:.2e}); max |Pi_dyn1 - Pi_static| {:.2e}", dg, n, d1);
+        app_log(1, "dynbse_readout vertex Wannier INJ: cut_r1 = false vs true: max |d Pi_gam1| {:.2e} (max |Pi_gam1| {:.2e}); max |Pi_dyn1 - Pi_static| {:.2e}", dg, n, d1);
         // the two dumps come from separate solves under DYNAMIC unit scheduling (a shared task counter): the (s, q, nu)
-        // -> rank assignment is timing-dependent, so the all_reduce order of the unit results can differ between runs
-        // (measured 2.5e-8 on 8e2 = 3e-11 relative, 2026-09-19); the identity holds to reduction-order noise.
+        // -> rank assignment is timing-dependent, so the all_reduce order of the unit results can differ between runs;
+        // the identity holds to reduction-order noise.
         REQUIRE(dg <= 1e-9 * n); REQUIRE(d1 == 0.0);
         mpi_context->comm.barrier();
         if (mpi_context->comm.root()) {
@@ -1008,7 +1007,7 @@ namespace bdft_tests {
         }
         mpi_context->comm.barrier();
       }
-      {   // H (LFF-aux L-0, notes/lff_aux_plan.md): the window-bubble column and the sampled-node subset.
+      {   // H: the window-bubble column and the sampled-node subset.
           // GB: bubble_only -> the file carries Pi_bub only, bitwise the Pi_bub column of the full dump G, Hermitian and
           // sign-definite at every (node, q). GS: nodes {0, 2} -> nu_sampled == {0, 2}, the dynamic columns equal G's
           // at those nodes and are zero elsewhere, Pi_bub still at every node.
@@ -1044,12 +1043,12 @@ namespace bdft_tests {
           }
         // the tau-route bubble carries the DLR class (prec low here: ~4e-9 relative Hermiticity noise); the window
         // bubble is negative semi-definite to that class (its largest positive eigenvalue relative to |B| is noise)
-        app_log(1, "dynbse_readout LFF-aux H: bubble_only Pi_bub vs the full dump's column: max |d| {:.2e} (max |Pi_bub| {:.2e}); "
+        app_log(1, "dynbse_readout window bubble: bubble_only Pi_bub vs the full dump's column: max |d| {:.2e} (max |Pi_bub| {:.2e}); "
                    "Hermiticity max |P - P^dag| {:.2e} ({:.1e} relative); eigenvalues > 0: {}, < 0: {} (over all nodes x q), "
                    "largest positive / most negative relative to |ev|_max: {:.2e} / {:.2e}", db, nb, dh, dh / nb, npos, nneg, evpos, evneg);
         REQUIRE(db == 0.0); REQUIRE(nb > 0.0); REQUIRE(dh < 1e-7 * nb);
         REQUIRE(evneg < -0.5);            // the bubble's sign: negative semi-definite
-        REQUIRE(evpos < 2e-5);            // no positive eigenvalue above the DLR class (prec low: 5.7e-6 measured)
+        REQUIRE(evpos < 2e-5);            // no positive eigenvalue above the DLR class (prec low)
         run_g("GS", true, "", "", "gam1", false, false, std::vector<long>{0, 2});
         rd4("coqui_d3_winj_G.pol_wh_dyn.g1.h5", "Pi_gam1", PgG);
         rd4("coqui_d3_winj_GS.pol_wh_dyn.g1.h5", "Pi_gam1", PgS);
@@ -1072,11 +1071,11 @@ namespace bdft_tests {
                 dbs = std::max(dbs, std::abs(PbS(j, iq, M, N) - PbG(j, iq, M, N)));
               }
         }
-        app_log(1, "dynbse_readout LFF-aux H: sampled nodes {{0, 2}}: max |d Pi_gam1| at the sampled nodes {:.2e}, max |Pi_gam1| at the "
+        app_log(1, "dynbse_readout window bubble: sampled nodes {{0, 2}}: max |d Pi_gam1| at the sampled nodes {:.2e}, max |Pi_gam1| at the "
                    "unsampled nodes {:.2e} (max |Pi_gam1| {:.2e}); Pi_bub vs the full dump {:.2e}", ds_in, ds_out, ng, dbs);
-        // ds_in: two separate GMRES solves under dynamic unit scheduling -> reduction-order noise (1.2e-11 relative measured)
+        // ds_in: two separate GMRES solves under dynamic unit scheduling -> reduction-order noise
         REQUIRE(ds_in < 1e-9 * ng); REQUIRE(ds_out == 0.0); REQUIRE(dbs == 0.0);
-        {   // L-3: the on-demand fit. GF: nodes {0, 2, last} + fit_file = G's full dump (self-trained basis, 3 modes) -> the
+        {   // the on-demand fit. GF: nodes {0, 2, last} + fit_file = G's full dump (self-trained basis, 3 modes) -> the
             // written Pi_gam1 equals G's at the sampled nodes (least squares exact there) and approximates it elsewhere.
           const long nwh = PgG.shape(0);
           const std::vector<long> fnodes{0, nwh / 4, nwh / 2, nwh - 1};   // nu = 0, two interior nodes, the tail node
@@ -1092,7 +1091,7 @@ namespace bdft_tests {
             rd4("coqui_d3_winj_GF.pol_wh_dyn.g1.h5", "Pi_gam1", Pg_); rd4("coqui_d3_winj_GF.pol_wh_dyn.g1.h5", "Pi_dyn", Pd_);
             double dm = 0.0, nm = 0.0;
             for (long i = 0; i < Pg_.size(); ++i) { dm = std::max(dm, std::abs(Pd_.data()[i] - 2.0 * Pg_.data()[i])); nm = std::max(nm, std::abs(Pg_.data()[i])); }
-            app_log(1, "dynbse_readout LFF mu: Pi_dyn vs 2 x Pi_gam1 (constant mu table): max |d| {:.2e} (max |Pi_gam1| {:.2e})", dm, nm);
+            app_log(1, "dynbse_readout Sigma vertex, mu: Pi_dyn vs 2 x Pi_gam1 (constant mu table): max |d| {:.2e} (max |Pi_gam1| {:.2e})", dm, nm);
             REQUIRE(dm <= 1e-12 * nm);
           }
           nda::array<std::complex<double>, 4> PgF;
@@ -1107,7 +1106,7 @@ namespace bdft_tests {
                 for (long N = 0; N < PgG.shape(3); ++N) { dj += std::norm(PgF(j, iq, M, N) - PgG(j, iq, M, N)); nj += std::norm(PgG(j, iq, M, N)); }
             if (in) { d_in += dj; n_in += nj; } else { d_out += dj; n_out += nj; }
           }
-          app_log(1, "dynbse_readout LFF-aux L-3: on-demand fit ({} sampled nodes, self-trained basis): rel Frobenius error at the sampled "
+          app_log(1, "dynbse_readout on-demand fit ({} sampled nodes, self-trained basis): rel Frobenius error at the sampled "
                      "nodes {:.2e} (= the source dump's own non-Hermiticity, the written object is Hermitized), at the {} unsampled "
                      "nodes {:.2e}", fnodes.size(), std::sqrt(d_in / n_in), nwh - long(fnodes.size()), std::sqrt(d_out / n_out));
           REQUIRE(std::sqrt(d_in / n_in) < 1e-4);      // exact at the sampled nodes up to the Hermitization (K modes = K nodes)
@@ -1125,10 +1124,10 @@ namespace bdft_tests {
         mpi_context->comm.barrier();
       }
       auto [edd, eld] = run_g("D", false, "coqui_d3_winj_G.secpts.h5", "coqui_d3_winj_G.pol_wh_dyn.g1.h5", "gam1");
-      app_log(1, "dynbse_readout W-int-4f INJ: Gamma_1 consumed in the W-Dyson: loop-side eps_M {:.10f} vs the dynamic readout's Gamma_1 column {:.10f} (|d| = {:.2e})",
+      app_log(1, "dynbse_readout vertex Wannier INJ: Gamma_1 consumed in the W-Dyson: loop-side eps_M {:.10f} vs the dynamic readout's Gamma_1 column {:.10f} (|d| = {:.2e})",
               eld, edg[2], std::abs(eld - edg[2]));
-      REQUIRE(std::abs(eld - edg[2]) < 1e-5);   // the nu -> tau -> nu round trip of the injection (1.6e-7 here; 3e-4 on Si kp888)
-      {   // LFF-Sigma (Route 1) gate, section L: the local-field-factor vertex in SIGMA from the same dump (col gam1 +
+      REQUIRE(std::abs(eld - edg[2]) < 1e-5);   // the nu -> tau -> nu round trip of the injection
+      {   // section L: the local-field-factor vertex in SIGMA from the same dump (col gam1 +
           // Pi_bub), switched separately from the P-side injection. SP: the injection alone; S0: + the Sigma vertex at
           // scale 0 (bit-identical to SP); S1: scale 1 (window bubble); Sh: scale 1/2 (the vertex self-energy is LINEAR in
           // the scale); SF: the "full" bubble (a different, diluted vertex); SN: the Sigma side WITHOUT the P side.
@@ -1143,14 +1142,14 @@ namespace bdft_tests {
           vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, inject);
           vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
           vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_cut_r1(false);
-          // 2026-09-22: section M normally runs on the G stage's frozen secondary points; with that dump absent
+          // section M normally runs on the G stage's frozen secondary points; with that dump absent
               // (running a sub-gate stand-alone, e.g. the SAMPLED one on a fixture whose INJ chain is not set up)
               // it selects its own -- the sub-gates below all compare runs with each other, not with the chain.
               if (std::filesystem::exists("coqui_d3_winj_G.secpts.h5")) vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false); vtx.set_pol_interp("coqui_d3_winj_G.pol_wh_dyn.g1.h5", "gam1");
           vtx.set_sigma_lff(mode, bub, scale, 1e-3, 1.0, "", with_static);   // the strong-mode cutoff (1e-8 admits the bubble's null directions: |Gamma - 1| ~ 1e4)
-          if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-          if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+          if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+          if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
           scr_eri.set_vertex(&vtx);
           auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true);
           auto [dmax, smax, dfmax] = gw.sigma_lff_dsigma(); auto m = scr_eri.sigma_lff_meter();
@@ -1172,9 +1171,9 @@ namespace bdft_tests {
             }
             d = mpi_context->comm.all_reduce_value(d, boost::mpi3::max<>{}); n = mpi_context->comm.all_reduce_value(n, boost::mpi3::max<>{});
             xk_diff = d;
-            app_log(1, "dynbse_readout LFF-Sigma exchange-kernel identity: max |F_x(hf_t) - F_x(exchange_with_kernel(Z) + head)| = {:.3e} (max |F_x| = {:.3e})", d, n);
+            app_log(1, "dynbse_readout Sigma vertex exchange-kernel identity: max |F_x(hf_t) - F_x(exchange_with_kernel(Z) + head)| = {:.3e} (max |F_x| = {:.3e})", d, n);
           }
-          app_log(1, "dynbse_readout LFF-Sigma [{}]: inject {} sigma {} ({}, scale {}, static {}): e_hf {:.12f} e_corr {:.12f}, max|dSigma_dyn| {:.6e} (max|Sigma| {:.4e}), "
+          app_log(1, "dynbse_readout Sigma vertex [{}]: inject {} sigma {} ({}, scale {}, static {}): e_hf {:.12f} e_corr {:.12f}, max|dSigma_dyn| {:.6e} (max|Sigma| {:.4e}), "
                      "max|dF| {:.6e}, local vertex(q_1, nu_0) {:+.4f}, |dW~_dyn|_F/|dW|_F {:.3e}, heads at nu_0: correction {:+.5f} vs loop {:+.5f}",
                   tag, inject, mode, bub, scale, with_static, e_hf, e_corr, dmax, smax, dfmax, m[0], m[1], m[2], m[3]);
           mpi_context->comm.barrier();
@@ -1193,7 +1192,7 @@ namespace bdft_tests {
         auto [cf, df, mf_, ff] = run_s("SF", "ladder_n2", "lff", "full", 1.0);
         auto [cn, dn, mn, fn] = run_s("SN", "none", "lff", "window", 1.0);
         auto [cd, dd, md, fd] = run_s("SD", "ladder_n2", "lff", "window", 1.0, false);   // the instantaneous part dropped
-        app_log(1, "dynbse_readout LFF-Sigma gate: |e_corr(S0) - e_corr(SP)| {:.2e} (dSigma(S0) {:.2e}, dF(S0) {:.2e}); scale 1: d e_corr {:+.6e}, max|dSigma_dyn| {:.4e}, max|dF| {:.4e}; "
+        app_log(1, "dynbse_readout Sigma vertex check: |e_corr(S0) - e_corr(SP)| {:.2e} (dSigma(S0) {:.2e}, dF(S0) {:.2e}); scale 1: d e_corr {:+.6e}, max|dSigma_dyn| {:.4e}, max|dF| {:.4e}; "
                    "linearity |dSigma(1/2) - dSigma(1)/2| {:.2e}, |dF(1/2) - dF(1)/2| {:.2e}; full bubble: d e_corr {:+.6e}, max|dSigma_dyn| {:.4e}; Sigma side alone: d e_corr {:+.6e}; "
                    "static dropped: max|dSigma_dyn| {:.4e} (== S1's), max|dF| {:.2e}; vertex(q_1, nu_0) {:+.4f}, head correction at nu_0 {:+.5f} (loop {:+.5f})",
                 std::abs(c0 - cp), d0, f0, c1 - cp, d1, f1, std::abs(dh - 0.5 * d1), std::abs(fh - 0.5 * f1), cf - cp, df, cn - cp, dd, fd, m1[0], m1[2], m1[3]);
@@ -1223,7 +1222,7 @@ namespace bdft_tests {
       return;
     }
     if (std::getenv("COQUI_DYNBSE_TEST_SIGPAIR_SYMW")) {
-      // ---- L-6c (2026-09-20): the pair-resolved Sigma vertex in WANNIER mode and on the SYMMETRIC mesh ----------------------
+      // ---- the pair-resolved Sigma vertex in WANNIER mode and on the SYMMETRIC mesh ----------------------
       // (W) nosym fixture: the one-rung static object (col static1, outer static) in the band frame vs in a Wannier frame that is a
       //     unitary mix V of the SAME window (M = |C|): the C-space object is gauge-invariant, so the band-frame dSigma must agree
       //     (the MLWF-frame contraction rotated back with U dSigma_bar U^dag); V = 1 must reproduce it to rounding.
@@ -1236,13 +1235,17 @@ namespace bdft_tests {
         nda::h5_read(it, "Sigma_tskij", S);
       };
       // kind: 0 plain GW, 1 B-S Sigma^{C,x} (static rung, bl_drop 1), 2 the pair vertex (col static1, outer static; the eps readout
-      // CONSUMES `interp` -- the static nu = 0 ladder readout is window/nosym-only, exactly as the W-int gate's consumer runs),
+      // CONSUMES `interp` -- the static nu = 0 ladder readout is window/nosym-only, exactly as the Wannier frozen-point check's consumer runs),
       // 4 the dynamic band run that dumps the points and the nu0 column (2 iterations, as run_w's A)
-      bool ibz_cur = false;   // P1: the IBZ solve + star fold of the Sigma-side vertex (sym meshes)
+      bool ibz_cur = false;   // the IBZ solve + star fold of the Sigma-side vertex (sym meshes)
       std::string col_cur = "static1", outer_cur = "static";   // the Sigma-side column / outer W of the kind-2 runs
-      // P1 (2026-09-21): the window of the (S) part. The historic window [0, 4) CUTS the Gamma triplet (bands 3-5 of LiH), so the
-      // C-sector rotations of the symmetric path LEAK (D-matrix leakage 0.25, unitarity defect 0.99, G-rotation residual 4.5e-2
-      // on qe_lih222_sym): the full-mesh sym path is then NOT the exact object (its identity with the B-S Sigma^{C,x} holds
+      // COQUI_DYNBSE_TEST_SIGPAIR_WAN_DYN = 1 runs the (W) gauge check on the DYNAMIC pair
+      // Sigma vertex (col dyn1, outer dynamic = eval_sigma_pair_dyn with the Wannier closure U^T G U^* and the rotation back) and
+      // stops after it (the Wannier dynamic path is nosym-only; the (S) part is the static column's)
+      const bool wan_dyn = (std::getenv("COQUI_DYNBSE_TEST_SIGPAIR_WAN_DYN") != nullptr);
+      if (wan_dyn) { col_cur = "dyn1"; outer_cur = "dynamic"; }
+      // The window of the (S) part. The default window [0, 4) CUTS the Gamma triplet (bands 3-5 of LiH), so the C-sector
+      // rotations of the symmetric path LEAK on qe_lih222_sym: the full-mesh sym path is then NOT the exact object (its identity with the B-S Sigma^{C,x} holds
       // because both use the same lossy rotated legs), while the IBZ path (identity-frame legs at every full-mesh point) is.
       // COQUI_DYNBSE_TEST_SYMW_NC = 3 | 6 selects a symmetry-closed window ([0, 3): three non-degenerate bands; [0, 6): the
       // triplet complete), for which the two paths must agree; with NC != 4 the (W) Wannier part (a 4 x 4 mix) is skipped.
@@ -1260,9 +1263,9 @@ namespace bdft_tests {
           solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(0, ncw), mfw->nbnd(), "ignore_g0", "secondary", -1, 1e-8, -1.0, -1.0, "static");
           vtx.set_isdf_points(points, points.empty());
           vtx.set_bl_drop(1);
-          if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-          if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+          if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+          if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
           scr_eri.set_vertex(&vtx); gw.set_vertex(&vtx);
           e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
         } else if (kind == 2) {
@@ -1275,9 +1278,9 @@ namespace bdft_tests {
           if (V) { auto proj = make_degenerate_projector(*mfw, 0, ncw, V, false); vtx.set_wannier_projector(proj, true); }
           vtx.set_sigma_pair(true, col_cur, outer_cur, 1.0, true, false, "right");
           vtx.set_sigma_pair_ibz(ibz_cur);
-          if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-          if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+          if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+          if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
           scr_eri.set_vertex(&vtx);
           e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
           m = scr_eri.sigma_pair_meter();
@@ -1287,9 +1290,9 @@ namespace bdft_tests {
           vtx.set_ladder_rung("dynamic", 1e-8, 30, 12, -1.0);
           vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(true);
           vtx.set_isdf_points("", true); vtx.set_wannier_frame("aux");
-          if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-          if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+          if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+          if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
           scr_eri.set_vertex(&vtx);
           e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true));
         } else {
@@ -1297,7 +1300,7 @@ namespace bdft_tests {
         }
         mpi_context->comm.barrier();
         read_sig(out + ".mbpt.h5", Sig);
-        app_log(1, "dynbse_readout LFF-Sigma pair sym/Wannier [{}]: kind {} points \"{}\" Wannier {}: e_corr {:.12f}, max|dSigma| {:.6e} (anti-Hermitian {:.2e}, wall {:.1f} s)",
+        app_log(1, "dynbse_readout Sigma vertex, pair sym/Wannier [{}]: kind {} points \"{}\" Wannier {}: e_corr {:.12f}, max|dSigma| {:.6e} (anti-Hermitian {:.2e}, wall {:.1f} s)",
                 tag, kind, points, V != nullptr, e_corr, m[0], m[1], m[3]);
         mpi_context->comm.barrier();
         if (mpi_context->comm.root() and not keep) {
@@ -1345,17 +1348,25 @@ namespace bdft_tests {
         (void)ca;
         cdiff(S_pi, S_p1, S_r0, nb, S_r0.shape(2), relI, mxI);
         cdiff(S_pv, S_p1, S_r0, nb, S_r0.shape(2), relV, mxV);
-        app_log(1, "dynbse_readout LFF-Sigma pair WANNIER gate: band frame vs Wannier V = 1: rel {:.3e} (max |d| {:.2e}); vs a unitary mix V of the window: "
+        app_log(1, "dynbse_readout Sigma vertex, pair WANNIER check: band frame vs Wannier V = 1: rel {:.3e} (max |d| {:.2e}); vs a unitary mix V of the window: "
                    "rel {:.3e} (max |d| {:.2e}); e_corr band {:+.10f} V=1 {:+.10f} V {:+.10f} (R0 {:+.10f})", relI, mxI, relV, mxV, cp1, cpi, cpv, cr0);
       } else {
-        app_log(1, "dynbse_readout LFF-Sigma pair SYMW: window [0, {}) (COQUI_DYNBSE_TEST_SYMW_NC): the (W) Wannier part is skipped", ncw);
+        app_log(1, "dynbse_readout Sigma vertex, pair SYMW: window [0, {}) (COQUI_DYNBSE_TEST_SYMW_NC): the (W) Wannier part is skipped", ncw);
+      }
+      if (wan_dyn) {
+        REQUIRE(do_w);
+        app_log(1, "dynbse_readout Sigma vertex, pair WANNIER DYNAMIC check (col {}, outer {}): V = 1 rel {:.3e}, unitary mix V rel {:.3e}",
+                col_cur, outer_cur, relI, relV);
+        REQUIRE(relI < 1e-9);
+        REQUIRE(relV < 1e-7);
+        return;
       }
       // (S) the symmetric mesh
       std::string fx = std::getenv("COQUI_DYNBSE_TEST_SIGPAIR_SYMW"); if (fx == "1" or fx.empty()) fx = "qe_lih222_sym";
       auto mfs = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fx));
       thc_reader_t thcs(mfs, make_thc_reader_ptree(mfs->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mfs->ecutrho(), 1, 1024));
       auto eris = mb_eri_t(thcs, thcs);
-      app_log(1, "dynbse_readout LFF-Sigma pair SYM gate on {}: nkpts {} (IBZ {}), nqpts {} (IBZ {})", fx, mfs->nkpts(), mfs->nkpts_ibz(), mfs->nqpts(), mfs->nqpts_ibz());
+      app_log(1, "dynbse_readout Sigma vertex, pair SYM check on {}: nkpts {} (IBZ {}), nqpts {} (IBZ {})", fx, mfs->nkpts(), mfs->nkpts_ibz(), mfs->nqpts(), mfs->nqpts_ibz());
       S5 S_sr0, S_sp1, S_sxs, S_sa;
       const std::string ptss = "coqui_d3_sigsw_SA.secpts.h5", nu0s = "coqui_d3_sigsw_SA.pol_nu0.g2.h5";
       double csa = run_sw("SA", mfs, eris, 4, "", "", nullptr, true, S_sa);       // the sym mesh's own star-closed points + nu0 column
@@ -1365,23 +1376,23 @@ namespace bdft_tests {
       double csxs = run_sw("SXS", mfs, eris, 1, ptss, "", nullptr, false, S_sxs);     // B-S Sigma^{C,x} on the sym mesh at the same points
       S5 S_sp1i;
       ibz_cur = true;
-      double csp1i = run_sw("SP1I", mfs, eris, 2, ptss, nu0s, nullptr, false, S_sp1i);  // P1: the same object from the IBZ solve + star fold
+      double csp1i = run_sw("SP1I", mfs, eris, 2, ptss, nu0s, nullptr, false, S_sp1i);  // the same object from the IBZ solve + star fold
       ibz_cur = false;
       (void)csa;
       REQUIRE(S_sp1.shape(2) == mfs->nkpts_ibz());
       double relS, mxS;
       cdiff(S_sp1, S_sxs, S_sr0, nb, mfs->nkpts_ibz(), relS, mxS);
-      app_log(1, "dynbse_readout LFF-Sigma pair SYM gate: one rung + static W on the SYMMETRIC mesh vs B-S Sigma^(C,x) (sym): rel Frobenius {:.3e} "
+      app_log(1, "dynbse_readout Sigma vertex, pair SYM check: one rung + static W on the SYMMETRIC mesh vs B-S Sigma^(C,x) (sym): rel Frobenius {:.3e} "
                  "(max |d| {:.2e}); e_corr SP1 {:+.10f} SXS {:+.10f} (SR0 {:+.10f}); nosym P1 {:+.10f} XS-equivalent identity on nosym: see section M",
               relS, mxS, csp1, csxs, csr0, cp1);
-      if (do_w) { REQUIRE(relI < 1e-9); REQUIRE(relV < 1e-7); }   // the C-space object is gauge-invariant (the W-int point-frame gate holds at 1e-8)
+      if (do_w) { REQUIRE(relI < 1e-9); REQUIRE(relV < 1e-7); }   // the C-space object is gauge-invariant (the Wannier point-frame check holds at 1e-8)
       REQUIRE(relS < 1e-6);   // the symmetric path's own accuracy floor is the C-sector rotation unitarity (~1e-8 class)
       double relIB, mxIB;
       cdiff(S_sp1i, S_sp1, S_sr0, nb, mfs->nkpts_ibz(), relIB, mxIB);
-      app_log(1, "dynbse_readout LFF-Sigma pair IBZ gate (P1): the IBZ solve + star fold vs the full-mesh units on {}: rel {:.3e} (max |d| {:.2e}); "
+      app_log(1, "dynbse_readout Sigma vertex, pair IBZ check: the IBZ solve + star fold vs the full-mesh units on {}: rel {:.3e} (max |d| {:.2e}); "
                  "e_corr {:+.10f} vs {:+.10f}", fx, relIB, mxIB, csp1i, csp1);
       if (std::getenv("COQUI_DYNBSE_TEST_SYMW_XREF")) {
-        // P1 ARBITER: the NOSYM fixture (its own orbitals at every k, no rotation anywhere) on the SYM run's star-closed points is
+        // ARBITER: the NOSYM fixture (its own orbitals at every k, no rotation anywhere) on the SYM run's star-closed points is
         // the exact full-mesh object in another gauge; the gauge-invariant eigenvalues of the Hermitized C block of dSigma(tau, k)
         // at the IBZ points (matched by crystal coordinates) decide which sym path -- the full-mesh units or the IBZ fold -- is
         // closer to it. The two mean fields differ at the 1e-6 level (their GW baselines: R0 vs SR0), the arbiter's floor.
@@ -1414,18 +1425,18 @@ namespace bdft_tests {
             d_full = std::max(d_full, std::abs(ef[i] - en[i])); d_ibz = std::max(d_ibz, std::abs(ei[i] - en[i])); scale = std::max(scale, std::abs(en[i]));
           }
         }
-        app_log(1, "dynbse_readout LFF-Sigma pair IBZ ARBITER (P1): eigenvalues of the Hermitized dSigma C block at the IBZ k, nosym exact vs the sym "
+        app_log(1, "dynbse_readout Sigma vertex, pair IBZ ARBITER: eigenvalues of the Hermitized dSigma C block at the IBZ k, nosym exact vs the sym "
                    "full-mesh units: max |d| {:.3e}, vs the IBZ fold: max |d| {:.3e} (scale {:.3e}); e_corr nosym {:+.10f} (R0 {:+.10f}) sym full "
                    "{:+.10f} ibz {:+.10f} (SR0 {:+.10f})", d_full, d_ibz, scale, cxp1, cxr0, csp1, csp1i, csr0);
       }
-      // P1 tolerance: the two sym paths carry the D-matrix accuracy of symmetry_rotation differently (the full-mesh path in the
+      // Tolerance: the two sym paths carry the D-matrix accuracy of symmetry_rotation differently (the full-mesh path in the
       // transported legs of every pair, the IBZ path in the fold of the externals); on qe_lih222_sym with a closed window the
       // established class of the symmetry machinery is 5e-5 (test_vertex_ibz.cpp: "kernel-accuracy + D-matrix-accuracy +
-      // O(leakage) class", REQUIRE < 5e-3); measured here 1.5e-4 at [0, 3). With the leaking default window [0, 4) the full-mesh
-      // path is off by O(leakage) = 1.8e-2 and the check is informational.
+      // O(leakage) class", REQUIRE < 5e-3). With the leaking default window [0, 4) the full-mesh
+      // path is off by O(leakage) and the check is informational.
       const bool closed_window = (ncw == 3 or ncw == 6);
       if (std::getenv("COQUI_DYNBSE_TEST_SYMW_STATIC_ONLY")) { if (closed_window) REQUIRE(relIB < 5e-3); mpi_context->comm.barrier(); return; }
-      // P1, the dynamic path on the sym mesh: col static_dyn (y = 0 through vertex_sigma_dyn.icc, IBZ solve + fold) must equal
+      // The dynamic path on the sym mesh: col static_dyn (y = 0 through vertex_sigma_dyn.icc, IBZ solve + fold) must equal
       // the static path's resummed column (col static) with the same outer W and IBZ fold (the N1 identity on a sym mesh)
       S5 S_sps, S_spsd;
       ibz_cur = true; col_cur = "static"; outer_cur = "static";
@@ -1435,10 +1446,10 @@ namespace bdft_tests {
       ibz_cur = false; col_cur = "static1"; outer_cur = "static";
       double relSD, mxSD;
       cdiff(S_spsd, S_sps, S_sr0, nb, mfs->nkpts_ibz(), relSD, mxSD);
-      app_log(1, "dynbse_readout LFF-Sigma dyn IBZ gate (P1): the dynamic path (static_dyn, IBZ solve + fold) vs the static path (static, IBZ) on {}: "
+      app_log(1, "dynbse_readout Sigma vertex, dynamic IBZ check: the dynamic path (static_dyn, IBZ solve + fold) vs the static path (static, IBZ) on {}: "
                  "rel {:.3e} (max |d| {:.2e}); e_corr {:+.10f} vs {:+.10f}", fx, relSD, mxSD, cspsd, csps);
       if (closed_window) { REQUIRE(relIB < 5e-3); REQUIRE(relSD < 1e-8); }
-      else app_log(1, "dynbse_readout LFF-Sigma IBZ gates (P1): informational at the leaking window [0, 4) (run with COQUI_DYNBSE_TEST_SYMW_NC=3 for the REQUIREs)");
+      else app_log(1, "dynbse_readout Sigma vertex IBZ checks: informational at the leaking window [0, 4) (run with COQUI_DYNBSE_TEST_SYMW_NC=3 for the REQUIREs)");
       mpi_context->comm.barrier();
       if (mpi_context->comm.root())
         for (auto const &e : std::filesystem::directory_iterator("."))
@@ -1448,7 +1459,7 @@ namespace bdft_tests {
     }
     if (std::getenv("COQUI_DYNBSE_TEST_WINT")) { wint_gate(mf, eri, "nosym"); return; }
     if (std::getenv("COQUI_DYNBSE_TEST_SIGINTERP")) {
-      // ---- P16 (vertex_perf_plan.md): the Wannier-frame interpolation of the pair Sigma vertex, same-mesh identity -------------
+      // ---- the Wannier-frame interpolation of the pair Sigma vertex, same-mesh identity -------------
       //  I0  the pair vertex (window [0, 2) = the LiH projector's window, col static1, outer static) that DUMPS the Wannier-frame
       //      object with its R grid (pol_vertex_sigma_interp_dump = lih_wan.h5)
       //  I1  the same run CONSUMING I0's dump on the same mesh with the same projector: k -> R -> k is the identity on the coarse
@@ -1473,7 +1484,7 @@ namespace bdft_tests {
         const double e_corr = std::get<1>(scf_loop(mb_state, dyson, eri, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
         mpi_context->comm.barrier();
         { h5::file f(out + ".mbpt.h5", 'r'); h5::group g(f); auto it = g.open_group("scf").open_group("iter1"); nda::h5_read(it, "Sigma_tskij", Sig); }
-        app_log(1, "dynbse_readout LFF-Sigma INTERP [{}]: e_corr {:.12f}, max|dSigma| {:.6e}", tag, e_corr, scr_eri.sigma_pair_meter()[0]);
+        app_log(1, "dynbse_readout Sigma vertex INTERP [{}]: e_corr {:.12f}, max|dSigma| {:.6e}", tag, e_corr, scr_eri.sigma_pair_meter()[0]);
         mpi_context->comm.barrier();
         return e_corr;
       };
@@ -1487,7 +1498,7 @@ namespace bdft_tests {
           for (long ik = 0; ik < S0.shape(2); ++ik)
             for (long i = 0; i < 2; ++i)
               for (long j = 0; j < 2; ++j) { d = std::max(d, std::abs(S0(it, is, ik, i, j) - S1(it, is, ik, i, j))); n = std::max(n, std::abs(S0(it, is, ik, i, j))); }
-      app_log(1, "dynbse_readout LFF-Sigma INTERP gate (P16): the Wannier-frame dump consumed on the same mesh vs the solve: max |dSigma| {:.2e} "
+      app_log(1, "dynbse_readout Sigma vertex INTERP check: the Wannier-frame dump consumed on the same mesh vs the solve: max |dSigma| {:.2e} "
                  "(max |Sigma| {:.3e}); e_corr {:+.12f} vs {:+.12f} (|d| {:.1e})", d, n, c1, c0, std::abs(c1 - c0));
       REQUIRE(d < 1e-10 * n);
       REQUIRE(std::abs(c1 - c0) < 1e-10);
@@ -1499,7 +1510,7 @@ namespace bdft_tests {
       return;
     }
     if (std::getenv("COQUI_DYNBSE_TEST_CHAIN")) {
-      // ---- P18 (vertex_perf_plan.md, 2026-09-21): the in-process vertex chain == the scripted chain of one-iteration restarts.
+      // ---- the in-process vertex chain == the scripted chain of one-iteration restarts.
       //  CA  the seed: a dynamic Gamma_1 run (1 iteration) that dumps its points and its all-nu object CA.g1
       //  CC  pol_vertex_chain = true, 2 iterations restarted from CA's checkpoint: iteration 1 injects CA.g1 (the seed) and dumps
       //      CC.g1; iteration 2 injects CC.g1 (this run's previous dump) and dumps CC.g2
@@ -1552,7 +1563,7 @@ namespace bdft_tests {
       rd4("coqui_d3_chain_CC.pol_wh_dyn.g1.h5", C1); rd4("coqui_d3_chain_CC.pol_wh_dyn.g2.h5", C2);
       rd4("coqui_d3_chain_CS1.pol_wh_dyn.g1.h5", S1); rd4("coqui_d3_chain_CS2.pol_wh_dyn.g1.h5", S2);
       const double d1 = relmax4(C1, S1), d2 = relmax4(C2, S2), d12 = relmax4(C2, C1);
-      app_log(1, "dynbse_readout CHAIN gate (P18): in-process chain vs one-iteration restarts on qe_lih222: |dPi_gam1| iteration 1 {:.2e}, "
+      app_log(1, "dynbse_readout CHAIN check: in-process chain vs one-iteration restarts on qe_lih222: |dPi_gam1| iteration 1 {:.2e}, "
                  "iteration 2 {:.2e} (the chain moved the object by {:.2e} between the iterations); e_corr chain {:.12f} restarts {:.12f} "
                  "(|d| {:.1e})", d1, d2, d12, ecc, ecs2, std::abs(ecc - ecs2));
       REQUIRE(d1 < 1e-12);
@@ -1567,8 +1578,8 @@ namespace bdft_tests {
       return;
     }
     if (const char *sw = std::getenv("COQUI_DYNBSE_TEST_SYMEPS")) {
-      // ---- 2026-09-22: the P-side static-ladder eps_M readout, SYM vs NOSYM on LiH at window [0, nc) (nc = the env value) -------
-      // A fast reproducer of the Si 4^3 finding (the symmetric ladder correction 7 % below the full-mesh one): one scGW iteration
+      // ---- the P-side static-ladder eps_M readout, SYM vs NOSYM on LiH at window [0, nc) (nc = the env value) -------
+      // The symmetric-mesh ladder correction against the full-mesh one: one scGW iteration
       // from the DFT start on qe_lih222 and on qe_lih222_sym with the static ladder readout (its own point selection on each
       // mesh), the RPA and +ladder eps_M at q_min compared; the RPA agreement is the mean-field/THC floor, the ladder correction
       // is what the symmetry path must reproduce. COQUI_DYNBSE_TEST_SYMEPS_RUNG=dynamic adds the dynamic-rung columns.
@@ -1607,9 +1618,8 @@ namespace bdft_tests {
       // COQUI_DYNBSE_TEST_SYMEPS_FX = lih222 (default) | lih223 (a 2x2x3 mesh: non-TRIM k = +-1/3, time-reversal pairs when the
       // group lacks inversion -- qe_lih223_sym) | lih223inv (inversion only)
       const std::string fxs = std::getenv("COQUI_DYNBSE_TEST_SYMEPS_FX") ? std::getenv("COQUI_DYNBSE_TEST_SYMEPS_FX") : "lih222";
-      // si333: the C3v x TIME-REVERSAL combination (6 IBZ k of 27) against its own full mesh -- the cheap reproducer of the
-      // Si 4^3 production finding; si444trev: the production mesh reduced by time reversal ALONE (36 k of 64) against the
-      // symmetric one (13 k) -- both added 2026-09-22 for the time-reversal hunt.
+      // si333: the C3v x TIME-REVERSAL combination (6 IBZ k of 27) against its own full mesh; si444trev: a 4^3 mesh reduced
+      // by time reversal ALONE (36 k of 64) against the symmetric one (13 k).
       const std::string fx_ns = (fxs == "lih222") ? "qe_lih222" : (fxs == "si222") ? "qe_si222_nosym"
                               : (fxs == "si333") ? "qe_si333_nosym" : (fxs == "si444trev") ? "qe_si444_trevonly" : "qe_lih223";
       const std::string fx_s = (fxs == "lih222") ? "qe_lih222_sym" : (fxs == "si222") ? "qe_si222_sym"
@@ -1617,7 +1627,7 @@ namespace bdft_tests {
                              : (fxs == "lih223inv") ? "qe_lih223_inv" : "qe_lih223_sym";
       auto [cn, rn, ln, dn] = run_se(fx_ns, "nosym");
       auto [cs, rs, ls, ds] = run_se(fx_s, "sym");
-      app_log(1, "dynbse_readout SYMEPS gate (window [0, {}), rung {}): RPA eps_M sym vs nosym rel {:.3e}; the ladder correction Delta: nosym {:+.8f} sym {:+.8f} -> rel {:.3e} of the correction; "
+      app_log(1, "dynbse_readout SYMEPS check (window [0, {}), rung {}): RPA eps_M sym vs nosym rel {:.3e}; the ladder correction Delta: nosym {:+.8f} sym {:+.8f} -> rel {:.3e} of the correction; "
                  "e_corr {:.10f} vs {:.10f}; Gamma_1 column sym/nosym {:.6f}/{:.6f}",
               ncw, rung, std::abs(rs - rn) / rn, ln - rn, ls - rs, std::abs((ls - rs) - (ln - rn)) / std::abs(ln - rn), cs, cn, ds[2], dn[2]);
       mpi_context->comm.barrier();
@@ -1629,7 +1639,7 @@ namespace bdft_tests {
       auto mfs = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fx));
       thc_reader_t thcs(mfs, make_thc_reader_ptree(mfs->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mfs->ecutrho(), 1, 1024));
       auto eris = mb_eri_t(thcs, thcs);
-      app_log(1, "dynbse_readout W-int gate on the SYMMETRIC mesh: nkpts {} (IBZ {})", mfs->nkpts(), mfs->nkpts_ibz());
+      app_log(1, "dynbse_readout vertex Wannier check on the SYMMETRIC mesh: nkpts {} (IBZ {})", mfs->nkpts(), mfs->nkpts_ibz());
       wint_gate(mfs, eris, "sym"); return;
     }
 
@@ -1651,9 +1661,9 @@ namespace bdft_tests {
       if (char const *vp = std::getenv("COQUI_DYNBSE_TEST_VPREC")) vtx.set_ladder_dyn_iaft_prec(vp);   // vertex-local DLR precision
       if (char const *tf = std::getenv("COQUI_DYNBSE_TEST_TFOLD")) vtx.set_ladder_dyn_tfold(std::atof(tf));   // the small-nu fold ratio
       if (std::getenv("COQUI_DYNBSE_TEST_G1")) vtx.set_ladder_dyn_gamma1_only(true);   // Gamma_1 only (skip the resummation GMRES)
-      if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
-      if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
-      if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
+      if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // inverse | lu
+      if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // split | single
+      if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // replicated | shared
       scr_eri.set_vertex(&vtx);
       auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                      solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
@@ -1705,12 +1715,12 @@ namespace bdft_tests {
     }
     // the eps(q_i, i nu) cut (rank 0): node 0 of the q_min cut IS the readout (same rows, same
     // Dyson; the ladder node 0 of the whalf pass vs eval_pol_ladder_nu0 = the node-map class),
-    // the loop-side column at node 0 IS the Q3 loop-side value, every node is finite and the
+    // the loop-side column at node 0 IS the loop-side readout value, every node is finite and the
     // static screening decays along i nu (eps_M(i nu_max) < eps_M(0)).
     if (mpi_context->comm.root()) {
       REQUIRE(cut0.shape(0) > 1);
       REQUIRE(cut0.shape(1) == 8);
-      app_log(1, "dynbse_readout: eps-cut q_min node 0: RPA {} (readout {}), +ladder {} (readout {}), loop {} (Q3 {}); "
+      app_log(1, "dynbse_readout: eps-cut q_min node 0: RPA {} (readout {}), +ladder {} (readout {}), loop {} (loop-side readout {}); "
                  "last node: RPA {} +ladder {} loop {}", cut0(0, 0), r0, cut0(0, 1), l0, cut0(0, 3), eloop0,
               cut0(cut0.shape(0) - 1, 0), cut0(cut0.shape(0) - 1, 1), cut0(cut0.shape(0) - 1, 3));
       REQUIRE(std::abs(cut0(0, 0) - r0) < 1e-10);
@@ -1746,9 +1756,9 @@ namespace bdft_tests {
         for (int c = 4; c < 8; ++c) REQUIRE(cut0(j, c) == -1.0);
     }
     app_log(1, "dynbse_readout: static rung: e_corr {} eps RPA {} +ladder {} ; dynamic rung: e_corr {} eps RPA {} "
-               "+ladder(L2) {} ; +static(sign-corr.) {} +static+Pi^C_dyn {} +Gamma1 {} +resummed {} ; Ritz {}",
+               "+ladder(static) {} ; +static(sign-corr.) {} +static+Pi^C_dyn {} +Gamma1 {} +resummed {} ; Ritz {}",
             c0, r0, l0, c1, r1, l1, d1[0], d1[1], d1[2], d1[3], z1);
-    // the loop and the historic columns are bitwise (the dynamic rung is a readout-only column)
+    // the loop and the static-rung readout columns are bitwise (the dynamic rung is a readout-only column)
     REQUIRE(h1 == h0);
     REQUIRE(c1 == c0);
     REQUIRE(r1 == r0);
@@ -1757,8 +1767,8 @@ namespace bdft_tests {
     for (double v : d1) { REQUIRE(std::isfinite(v)); REQUIRE(v > 0.0); }
     REQUIRE(z1 >= 0.0);
     REQUIRE(z1 < 1.0);
-    // 2026-09-11: pair_space_ladder resums the derived resolvent (1 + Xh Kt)^-1, so the dynbse
-    // driver's static column IS the L2 readout (gate A class, through the same upfold + Dyson)
+    // pair_space_ladder resums the derived resolvent (1 + Xh Kt)^-1, so the dynbse driver's
+    // static column IS the static-ladder readout (check (A) class, through the same upfold + Dyson)
     REQUIRE(std::abs(d1[0] - l1) < 1e-8);
     // the dynamic rungs move eps_M away from the static ladder
     REQUIRE(d1[3] != d1[0]);

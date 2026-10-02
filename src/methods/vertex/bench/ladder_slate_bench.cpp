@@ -20,25 +20,24 @@
 
 /**
  * ladder_slate_bench -- the SLATE distributed dense pipeline of the pair-space ladder,
- * on SYNTHETIC data (notes/ladder_opt_spec.md increment B0).
+ * on SYNTHETIC data.
  *
- * WHY A MINI-APP. The ladder's cost is one LAPACK call: at kp666 a single (q, nu)
- * resolvent is D = 26 136 and takes 2 684 s on one rank -- 88.6% of the ladder, which is
- * itself 93% of the qpGW run (notes/ladder_profiling_results.md sections 1.1a, 1.3). The
- * fix is to distribute that solve, and the design space (ranks per solve grid, tile size,
+ * WHY A MINI-APP. The ladder's cost is dominated by one dense LU solve per (q, nu)
+ * resolvent, of dimension D = nk * nc2 (D = 26 136 for the kp666 preset). The remedy is
+ * to distribute that solve, and the design space (ranks per solve grid, tile size,
  * concurrent grids, ranks per node) is far cheaper to scan without coqui state in the way.
  * This target carries NO physics: it reproduces the SHAPES, the BLOCK STRUCTURE, the
  * arithmetic pattern and the conditioning of the real problem, nothing else.
  *
  * WHAT IS FAITHFUL TO THE REAL KERNEL
- *  - D = nk * nc2 with the (nc2 x nc2) block tiling over (ikp, ik) pairs; presets are the
- *    measured meshes (kp444: nk 64, nc2 121, N_m 243; kp666: nk 216, nc2 121, N_m 245).
+ *  - D = nk * nc2 with the (nc2 x nc2) block tiling over (ikp, ik) pairs; presets mirror
+ *    representative meshes (kp444: nk 64, nc2 121, N_m 243; kp666: nk 216, nc2 121, N_m 245).
  *  - the rung block is the real two-gemm leg contraction wb = U1(ik)^T . W . U2(ikp) with
  *    (N_m x nc2) legs and an (N_m x N_m) rung, then the Xh row factor Cb(ikp) . wb -- so
  *    the build's flop count and its per-block memory pattern are the production ones, and
- *    each tile owner RECOMPUTES its legs instead of communicating them (spec B.3).
- *  - the resolvent is I - XK, conditioned to sigma_max(XK) = 0.5 (the measured lambda_max
- *    at kp444 iteration 1 is 0.50), so the solve is as well-posed as the real one.
+ *    each tile owner RECOMPUTES its legs instead of communicating them.
+ *  - the resolvent is I - XK, conditioned to sigma_max(XK) = 0.5 (a representative value
+ *    of the real lambda_max), so the solve is as well-posed as the real one.
  *  - the RHS is the (D x N_m) block the production path solves, and the projections are
  *    the same two gemms.
  *  - the lambda_max watchdog is the same 20-step power iteration with the same break test.
@@ -145,8 +144,8 @@ namespace {
   };
 
   /** The synthetic legs of ONE k point, (N_m x nc2), and the shared (N_m x N_m) rung.
-   *  Recomputed by whichever rank owns the tile (spec B.3: legs are small, communication
-   *  is not worth it). */
+   *  Recomputed by whichever rank owns the tile (legs are small, communication is not
+   *  worth it). */
   void fill_leg(nda::array<ComplexType, 2> &U, long ik, long tag) {
     const long Nm = U.shape(0), nc2 = U.shape(1);
     const double s = 1.0 / std::sqrt(double(Nm));
@@ -244,9 +243,8 @@ int main(int argc, char **argv) {
   if (o.preset == "tiny")       { o.nk = 4;   o.nc2 = 121; o.Nm = 60;  }
   else if (o.preset == "kp444") { o.nk = 64;  o.nc2 = 121; o.Nm = 243; }
   else if (o.preset == "kp666") { o.nk = 216; o.nc2 = 121; o.Nm = 245; }
-  // B0-ext: the scale-out rungs. x2 exists so the D ladder 26 136 -> 52 272 -> 104 544 can
-  // be FIT on the 8/3 n^3 profile -- the documented estimation method for any point too
-  // expensive to run outright (spec B0-ext item 1).
+  // Scale-out presets. x2 exists so the D sequence 26 136 -> 52 272 -> 104 544 can be FIT
+  // on the 8/3 n^3 profile, to estimate any point too expensive to run outright.
   else if (o.preset == "kp666x2") { o.nk = 432; o.nc2 = 121; o.Nm = 245; }
   // the 4x problem: one (D,D) is 174.9 GB, so per-rank replication is impossible by
   // construction and g = 1 is not even representable -- that is the point of the preset.
@@ -266,7 +264,7 @@ int main(int argc, char **argv) {
   auto gcomm = world.split(gid, grank);
   const long px = utils::find_proc_grid_min_diff(o.g, D, D), py = o.g / px;
 
-  app_log(1, "\n=== ladder_slate_bench (notes/ladder_opt_spec.md B0) ===");
+  app_log(1, "\n=== ladder_slate_bench (distributed LU solve of the pair-space ladder) ===");
   app_log(1, "  preset {} : nk = {}, nc2 = {}, D = nk*nc2 = {}, N_m = {}", o.preset, o.nk,
           nc2, D, Nm);
   app_log(1, "  world = {} ranks; g = {} ranks/solve-grid => {} concurrent grids; proc "
@@ -363,7 +361,7 @@ int main(int argc, char **argv) {
       lam_last = lam;
       gcomm.barrier();
       t_lam += w.lap();
-      // condition the synthetic operator onto the measured lambda_max = 0.5
+      // condition the synthetic operator onto lambda_max = 0.5 (representative of the real one)
       const double sc = (lam > 0.0) ? 0.5 / lam : 1.0;
       auto la = A.local();
       for (auto &z : la) z = -z * sc;                 // Rm <- -XK, the production sign
@@ -464,12 +462,12 @@ int main(int argc, char **argv) {
                      + 8.0 * double(D) * double(D) * double(Nm);
   app_log(1, "  [bench] MaxRSS GB: entry(min) {:.3f} -> exit(max) {:.3f}", rmin, rmax);
   app_log(1, "  [bench] time per solve = {:.4f} s ; grid Gflop/s = {:.2f} ; per-rank "
-             "Gflop/s = {:.3f} ; sigma_max(XK) as built = {:.6f} (then scaled to 0.5, the "
-             "measured conditioning)",
+             "Gflop/s = {:.3f} ; sigma_max(XK) as built = {:.6f} (then scaled to 0.5, a "
+             "representative conditioning)",
           tsolve, flops / std::max(tsolve, 1e-30) / 1e9,
           flops / std::max(tsolve, 1e-30) / 1e9 / double(o.g), lam_last);
   // ONE machine-parseable row per design point -- this is what the scan table is built
-  // from (scalars only: rusty's bundled fmt cannot format containers)
+  // from (scalars only: some bundled fmt versions cannot format containers)
   app_log(1, "  [bench] SCAN {} np {} g {} t {} grids {} nb {} D {} Nm {} nsolve {} build "
              "{:.4f} lam {:.4f} rhs {:.4f} solve {:.4f} proj {:.4f} tsolve {:.4f} "
              "gbrank {:.3f} gfrank {:.3f} gfcore {:.3f} solveshr {:.2f}",

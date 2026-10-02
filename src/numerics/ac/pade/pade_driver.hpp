@@ -91,7 +91,7 @@ namespace analyt_cont {
       _pade_kernel.init(iw_fit, A_fit);
     }
 
-    // T-3b: the evaluate family is `const` (t3a section 4.2 item 4). The kernel is shared
+    // The evaluate family is `const`. The kernel is shared
     // across threads in the qp_approx / solve_qp_eqn regions, so read-onlyness is pinned by
     // the type system rather than by inspection.
     template<nda::MemoryArrayOfRank<1> mesh_w_t, nda::MemoryArray Array_w_t>
