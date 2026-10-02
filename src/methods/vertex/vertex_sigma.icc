@@ -294,24 +294,35 @@ namespace vertex_detail {
     // (Only measurable on the full transfer mesh; under IBZ symmetry the stored rows are
     // the irreducible ones and the -q partner is reconstructed inside the loop.)
     //
-    // A violation ABORTS: a non-conserving Sigma^C changes the answer. vertex_debug sigma_allow_nonconserving = 1
-    // is the explicit override (the run then continues with a WARNING, e.g. the illegal-rung positive control of
-    // test_vertex_fdoracle "vertex_slotprobe"). Read per call (not cached) so a test can scope it. On IBZ meshes the
-    // check cannot run and that is reported at level 1.
-    const bool allow_nonconserving = vertex_debug::flag("sigma_allow_nonconserving");   // vertex_debug: sigma_allow_nonconserving
+    // A violation is reported as a boxed level-1 WARNING with its size, once per rung. It is a diagnostic, not a guard:
+    // the measured asymmetry also contains the representation error of the rung (ISDF / DLR fits) and the basis
+    // convention at the self-inverse transfers, so it cannot by itself separate an illegal rung from a legal one.
+    // vertex_debug sigma_allow_nonconserving = 1 shortens the box to one line (for deliberate illegal-rung tests).
+    // On IBZ meshes the check cannot run and that is reported at level 1.
+    auto rung_pair_warn = [&](const char *what, double rel) {
+      if (vertex_debug::flag("sigma_allow_nonconserving")) {   // vertex_debug: sigma_allow_nonconserving
+        app_log(1, "  [WARNING] eval_sigma_C: the {} rung violates W_PQ(q) = W_QP(-q) by {:.3e} (relative); Sigma^C is "
+                   "not conserving (expected: vertex_debug sigma_allow_nonconserving is set)", what, rel);
+        return;
+      }
+      app_log(1, "\n"
+                 "  ##############################################################################################\n"
+                 "  ##  [WARNING]  NON-CONSERVING Sigma^C RUNG\n"
+                 "  ##\n"
+                 "  ##  eval_sigma_C: the {} rung violates W_PQ(q) = W_QP(-q) by {:.3e} (relative; a legal rung\n"
+                 "  ##  gives < 1e-8 up to its representation error).\n"
+                 "  ##  If the violation is real, the four G-cuts of Phi_2 differ: Sigma^C is NOT dPhi/dG and the\n"
+                 "  ##  self-energy is NOT conserving. Check the q = -q transfers (Gamma / zone boundary), where\n"
+                 "  ##  the relation forces a SYMMETRIC block, not merely a Hermitian one.\n"
+                 "  ##  The calculation CONTINUES (the check cannot separate an illegal rung from fit error).\n"
+                 "  ##############################################################################################\n",
+              what, rel);
+    };
     if (sym)
       app_log(1, "  eval_sigma_C: rung pair-symmetry check W_PQ(q) = W_QP(-q) CANNOT be performed on this IBZ mesh "
                  "(the -q partner is not a stored row).\n"
-                 "               Absence of an abort is NOT evidence the rung is legal (Sigma^C = dPhi/dG) -- "
+                 "               Absence of a warning is NOT evidence the rung is legal (Sigma^C = dPhi/dG) -- "
                  "cross-check on a nosym mesh.");
-    auto rung_pair_fail = [&](const char *what, double rel) {
-      utils::check(allow_nonconserving,
-                   "eval_sigma_C: the {} rung violates W_PQ(q) = W_QP(-q) by {:.3e} (relative, tolerance 1e-8). The "
-                   "four G-cuts of Phi_2 are then NOT equal, so Sigma^C is NOT dPhi/dG and the result is not "
-                   "conserving. Check the q = -q transfers (Gamma / zone boundary), where the relation forces a "
-                   "SYMMETRIC block, not merely a Hermitian one. To run anyway (diagnostics only), set "
-                   "vertex_debug = \"sigma_allow_nonconserving=1\".", what, rel);
-    };
     auto rung_pair_asym = [&](auto const &Aq, const char *what) {
       if (sym) return;                       // IBZ storage: -q is not a stored row
       double d = 0.0, sc = 0.0;
@@ -326,18 +337,7 @@ namespace vertex_detail {
       const double rel = (sc > 0.0) ? d / sc : 0.0;
       app_log(3, "  eval_sigma_C: rung pair symmetry |{}_PQ(q) - {}_QP(-q)|/|{}| = {:.3e}",
               what, what, what, rel);
-      if (rel > 1e-8) {
-        rung_pair_fail(what, rel);   // aborts unless sigma_allow_nonconserving
-        app_log(1, "  [WARNING] eval_sigma_C: the {} rung violates W_PQ(q) = W_QP(-q) by "
-                   "{:.3e} (relative).\n"
-                   "            The four G-cuts of Phi_2 are then NOT equal, so Sigma^C is "
-                   "NOT dPhi/dG and the\n"
-                   "            result is not conserving. Check the q = -q transfers "
-                   "(Gamma / zone boundary), where\n"
-                   "            the relation forces a SYMMETRIC block, not merely a "
-                   "Hermitian one. (Continuing: vertex_debug sigma_allow_nonconserving is set.)",
-                what, rel);
-      }
+      if (rel > 1e-8) rung_pair_warn(what, rel);
     };
     rung_pair_asym(Z_qPQ, "Z");
 
@@ -442,13 +442,7 @@ namespace vertex_detail {
       const double rel = (sc > 0.0) ? d / sc : 0.0;
       app_log(3, "  eval_sigma_C: rung pair symmetry |W_PQ(q,inu) - W_QP(-q,inu)|/|W| = "
                  "{:.3e}", rel);
-      if (rel > 1e-8) {
-        rung_pair_fail("DYNAMIC (W(q, inu))", rel);   // aborts unless sigma_allow_nonconserving
-        app_log(1, "  [WARNING] eval_sigma_C: the DYNAMIC rung violates "
-                   "W_PQ(q,inu) = W_QP(-q,inu) by {:.3e} (relative).\n"
-                   "            Sigma^C is then NOT dPhi/dG and the result is not conserving. "
-                   "(Continuing: vertex_debug sigma_allow_nonconserving is set.)", rel);
-      }
+      if (rel > 1e-8) rung_pair_warn("DYNAMIC (W(q, inu))", rel);
     }
 
     // ---- layout helpers ---------------------------------------------------

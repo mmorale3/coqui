@@ -1345,8 +1345,8 @@ namespace bdft_tests {
           }
       }
       REQUIRE(rung_sym_err(Bad) > 1e-3);              // it really is illegal
-      // eval_sigma_C aborts on an illegal rung unless the vertex_debug key sigma_allow_nonconserving is set; the control
-      // enables it (warn and continue) for this block only
+      // eval_sigma_C prints a boxed non-conserving warning for an illegal rung; this deliberate control sets the vertex_debug
+      // key sigma_allow_nonconserving (one-line warning) for this block only
       vertex_debug::set("sigma_allow_nonconserving=1");
       const double broke = profile("S3, ILLEGAL Z (CONTROL, must NOT be flat)", 3, Bad,
                                    nullptr);
