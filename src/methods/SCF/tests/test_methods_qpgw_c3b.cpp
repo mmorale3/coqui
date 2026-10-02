@@ -37,26 +37,26 @@
 #include "methods/embedding/dc_utilities.hpp"
 
 /**
- * Project 2 increment Q4-C3b (notes/q4_c3b_orbital_ladder_dc_spec.md): the ORBITAL /
- * chi-convention local part of the lattice ladder -- the eq-7 bosonic double counting's
- * ladder half PROPER, as mandated by the R-Q4-2 AMENDMENT (the C3 THC-adjoint object is a
- * diagnostic that carries the upfold's ||B||^2 gain, not a DC contribution).
+ * The ORBITAL (chi-convention) local part of the lattice ladder: the ladder half of the
+ * bosonic double counting. The THC-adjoint downfold P^lad_loc (test_methods_qpgw_edmft)
+ * carries the upfold's ||B||^2 gain; it is kept as a diagnostic and is not a
+ * double-counting contribution.
  *
- * Gates (spec section 3), measure-first-then-gate:
- *   G2  THE LEG PIN. The E-leg ONE-RUNG output of the kernel against a brute-force 4-leg
- *       contraction built from the chi0/K/E DEFINITIONS with explicit loops (no shared code
- *       with the kernel beyond its inputs). SYNTHETIC random U, fixed seed, 2 orbitals.
- *   G3  THE chi-CONVENTION PIN. The E-leg bubble against the same bubble taken in the
- *       G-space (U G U^dag) association -- eval_Pi_rpa_dc's index order, spin factor and
+ * Checks:
+ *   one-rung leg check   The E-leg ONE-RUNG output of the kernel against a brute-force
+ *       4-leg contraction built from the chi0/K/E DEFINITIONS with explicit loops (no shared
+ *       code with the kernel beyond its inputs). SYNTHETIC random U, fixed seed, 2 orbitals.
+ *   chi-convention check The E-leg bubble against the same bubble taken in the G-space
+ *       (U G U^dag) association -- eval_Pi_rpa_dc's index order, spin factor and
  *       conjugation from first principles -- and against its PH-sym tau route (the nu grid
  *       P_dc actually lives on).
- *   G4  SCALE SANITY. ||P^lad_loc,orb||_max vs ||bubble[G_loc]||_max on the PRODUCTION path
- *       (real projector, q-average, MBState + checkpoint). The amendment predicts O(1);
- *       the THC-adjoint object measured 3.5e5 on this fixture.
- * G1 (no-disturbance) is the commit-point suites; G5 (the consumer) is test_methods_embed.
+ *   scale check          ||P^lad_loc,orb||_max vs ||bubble[G_loc]||_max on the PRODUCTION
+ *       path (real projector, q-average, MBState + checkpoint). The orbital object must be
+ *       O(1) relative to the bubble; the THC-adjoint object is many orders larger.
+ * The consumer (pi_lad_dc = "orbital") is tested in src/methods/embedding/tests/test_embed.cpp.
  *
  * ==========================================================================================
- * HOW TO RUN (Catch2 v2 traps) -- MEASURED, do not "improve" the command
+ * HOW TO RUN (Catch2 v2 traps) -- do not "improve" the command
  * ==========================================================================================
  *
  *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 <build>/tests/bin/test_methods_qpgw_c3b
@@ -81,7 +81,7 @@ namespace bdft_tests {
     const std::string wannier_file = outdir + "/lih_wan.h5";
     const std::string output = "qpgw_c3b";
     const std::string div = "ignore_g0";
-    // THE LADDER WINDOW IS [0, 3), NOT the Q3/Q4 suites' [1, 3): the shipped lih_wan.h5
+    // THE LADDER WINDOW IS [0, 3), NOT the [1, 3) of the BSE/EDMFT suites: the lih_wan.h5
     // projector's band window is [0, 2), and the orbital ladder DC is only defined when the
     // projector's window lies INSIDE the ladder's (the producer skips with a warning
     // otherwise -- see accumulate_pi_lad_loc_orb). [1, 3) does NOT contain [0, 2).
@@ -124,7 +124,7 @@ namespace bdft_tests {
     REQUIRE(pv != nullptr);
 
     // ====================================================================================
-    // G2 / G3 -- the leg pin and the chi-convention pin, on SYNTHETIC legs
+    // the one-rung leg check and the chi-convention check, on SYNTHETIC legs
     // ====================================================================================
     // A synthetic U (fixed-seed LCG, 2 impurity orbitals) is the sharper probe: it has no
     // structure the kernel and the reference could share, and it is nowhere near unitary,
@@ -144,10 +144,10 @@ namespace bdft_tests {
             for (long a = 0; a < nc; ++a) U_syn(is, ik, m, a) = ComplexType(rnd(), rnd());
     }
     auto dl = pv->ladder_loc_gate(mb_state, thc, U_syn);
-    app_log(1, "@@C3B G2 one-rung (E legs) vs the brute-force 4-leg contraction: rel = "
+    app_log(1, "@@ORB_LADDER_DC one-rung (E legs) vs the brute-force 4-leg contraction: rel = "
                "{:.3e} at scale {:.3e} ({} nu nodes, {} orbitals)",
             dl.onerung_resid, dl.onerung_scale, dl.nnu_checked, dl.norb);
-    app_log(1, "@@C3B G3 E-leg bubble vs the G-space bubble: rel = {:.3e} at scale {:.3e}; "
+    app_log(1, "@@ORB_LADDER_DC E-leg bubble vs the G-space bubble: rel = {:.3e} at scale {:.3e}; "
                "vs the PH-sym tau route (eval_Pi_rpa_dc's own grid): raw = {:.3e}, after "
                "symmetrizing = {:.3e} (the bubble's tau asymmetry = {:.3e}); "
                "P^lad_loc nu-mirror resid = {:.3e}",
@@ -158,29 +158,27 @@ namespace bdft_tests {
     REQUIRE(dl.onerung_scale > 0.0);
     REQUIRE(dl.bub_scale > 0.0);
     REQUIRE(dl.lad_loc_max > 0.0);
-    // G2: an algebraic rearrangement of the same sums => machine class, no fitted scale.
-    // MEASURED (2026-08-14, qe_lih222, C = [0,3), 3 qpGW iterations, synthetic U):
-    // 5.3e-15 relative at scale 7.87e-03 (production legs: 1.2e-14). The gate is the
-    // spec's own machine-class bound.
+    // one-rung: an algebraic rearrangement of the same sums => machine class, no fitted
+    // scale. Reference (qe_lih222, C = [0,3), 3 qpGW iterations, synthetic U): 5.3e-15
+    // relative at scale 7.87e-03 (production legs: 1.2e-14).
     REQUIRE(dl.onerung_resid < 1e-12);
-    // G3: likewise for the bubble in the eval_Pi_rpa_dc pair pack abcd = (m, n, m', n').
-    // MEASURED 2.8e-15 at scale 3.71e-01 (production legs: 1.2e-15 at 1.10e-03, which is
-    // also the scale of bubble[G_loc] measured below -- they differ only by the off-site
-    // terms the spec flags).
+    // bubble: likewise in the eval_Pi_rpa_dc pair pack abcd = (m, n, m', n'). Reference
+    // 2.8e-15 at scale 3.71e-01 (production legs: 1.2e-15 at 1.10e-03, which is also the
+    // scale of bubble[G_loc] computed below -- the two differ only by off-site terms).
     REQUIRE(dl.bub_resid_w < 1e-12);
-    // ... and the same object on the PH-sym half grid P_dc lives on. MEASURED: the raw
-    // comparison does NOT close (see the @@C3B G3 line) and the reason is exact and
-    // characterized, not a bug: tau -> beta - tau maps Pi_{(mn),(m'n')} onto a transposed
-    // element, so the BARE local bubble is not PH-symmetric element by element, and a
-    // half-grid transform can only ever see its symmetric part. The pin is therefore on
-    // mirror-EXTENDED object (IAFT::tau_to_w_PHsym folds Twt(iw,it) + Twt(iw,nt-1-it) onto
-    // the first tau half) plus the asymmetry meter that makes the statement non-vacuous.
-    // MEASURED: raw 2.24e-01, mirror-extended reference 3.8e-16, tau asymmetry 3.36e-01
-    // (production legs: 2.0e-16 and 9.58e-01).
+    // ... and the same object on the PH-sym half grid P_dc lives on. The raw comparison
+    // does NOT close (see the E-leg bubble log line) and the reason is exact, not a bug:
+    // tau -> beta - tau maps Pi_{(mn),(m'n')} onto a transposed element, so the BARE local
+    // bubble is not PH-symmetric element by element, and a half-grid transform can only
+    // ever see its symmetric part. The check is therefore on the mirror-EXTENDED object
+    // (IAFT::tau_to_w_PHsym folds Twt(iw,it) + Twt(iw,nt-1-it) onto the first tau half),
+    // plus the asymmetry meter that makes the statement non-vacuous. Reference values: raw
+    // 2.24e-01, mirror-extended 3.8e-16, tau asymmetry 3.36e-01 (production legs: 2.0e-16
+    // and 9.58e-01).
     REQUIRE(dl.bub_tau_asym > 1e-6);            // non-vacuous: there IS an asymmetric part
     REQUIRE(dl.bub_resid_phsym_sym < 1e-12);    // ... and it is exactly what differs
 
-    // ---- the same two pins on the PRODUCTION legs --------------------------------------
+    // ---- the same two checks on the PRODUCTION legs ------------------------------------
     // (the real projector, extracted exactly as accumulate_pi_lad_loc_orb does: C_skIai on
     // the ladder window's columns, zero on the bands the projector does not span). This
     // also measures the nu-mirror residual of the object that actually reaches P_dc.
@@ -197,7 +195,8 @@ namespace bdft_tests {
             for (long j = 0; j < W_rng.size(); ++j) U_prod(is, ik, m, off + j) = C(is, ik, 0, m, j);
     }
     auto dp = pv->ladder_loc_gate(mb_state, thc, U_prod);
-    app_log(1, "@@C3B PROD legs: G2 = {:.3e} (scale {:.3e}), G3 = {:.3e} (scale {:.3e}), "
+    app_log(1, "@@ORB_LADDER_DC production legs: one-rung = {:.3e} (scale {:.3e}), bubble = "
+               "{:.3e} (scale {:.3e}), "
                "PH-sym tau route after symmetrizing = {:.3e} (raw {:.3e}, bubble tau "
                "asymmetry {:.3e}); P^lad_loc nu-mirror resid = {:.3e}",
             dp.onerung_resid, dp.onerung_scale, dp.bub_resid_w, dp.bub_scale,
@@ -207,17 +206,17 @@ namespace bdft_tests {
     REQUIRE(dp.onerung_resid < 1e-12);
     REQUIRE(dp.bub_resid_w < 1e-12);
     REQUIRE(dp.bub_resid_phsym_sym < 1e-12);
-    // REPORTED, NOT GATED: loc_ph_sym is the transform licence of the object P_dc receives.
-    // Unlike the D-leg ladder (ph_sym_resid 4.28e-09, ladder_whalf_gate) the E-leg one need
+    // REPORTED, NOT CHECKED: loc_ph_sym is the transform licence of the object P_dc receives.
+    // Unlike the D-leg ladder (ph_sym_resid ~4e-09, ladder_whalf_gate) the E-leg one need
     // not be nu-mirror symmetric element by element -- same reason the bare local bubble is
     // not -- and P_dc's own bubble half is built on the tau HALF grid, i.e. it carries only
     // the mirror-extended part. Both halves of P_dc therefore sit on the same nu nodes but
-    // treat the asymmetric content differently. Flagged for the spec author; nothing here
-    // depends on it, and no symmetrization is applied to the shipped object.
+    // treat the asymmetric content differently. Nothing here depends on it, and no
+    // symmetrization is applied to the stored object.
     REQUIRE(dp.loc_ph_sym >= 0.0);
 
     // ====================================================================================
-    // G4 -- the scale statement of the R-Q4-2 AMENDMENT, on the PRODUCTION path
+    // the scale check, on the PRODUCTION path
     // ====================================================================================
     REQUIRE(mb_state.sPi_lad_loc_orb_wabcd.has_value());     // the producer ran
     REQUIRE(mb_state.sPi_lad_loc_wabcd.has_value());         // ... next to the diagnostic
@@ -225,30 +224,31 @@ namespace bdft_tests {
     const double thc_max = scr_eri.pol_lad_loc_max();
     REQUIRE(orb_max > 0.0);
 
-    // bubble[G_loc] through the Q4 machinery: the DC bubble the ladder half is added to
+    // bubble[G_loc] through the EDMFT double-counting path: the DC bubble the ladder half
+    // is added to
     double bub_max = 0.0;
     {
       auto &pb = mb_state.proj_boson.value();
       auto G_tsIab = pb.proj_fermi().downfold_loc<false>(mb_state.sG_tskij.value(),
-                                                         "Gloc for the C3b scale gate");
+                                                         "Gloc for the orbital ladder DC scale check");
       auto sPi = eval_Pi_rpa_dc<true>(*mpi_context, G_tsIab, ft, false);
       for (auto const &v : sPi.local()) bub_max = std::max(bub_max, std::abs(v));
       mpi_context->comm.barrier();
-      if (mpi_context->comm.root()) remove("pi_rpa_loc_debug.h5");   // the eval_Pi_rpa_dc wart
+      if (mpi_context->comm.root()) remove("pi_rpa_loc_debug.h5");   // written by eval_Pi_rpa_dc
     }
     const double ratio = orb_max / std::max(bub_max, 1e-300);
-    app_log(1, "@@C3B G4 scale: ||P^lad_loc,orb||_max = {:.6e} vs ||bubble[Gloc]||_max = "
-               "{:.6e} (ratio {:.4e}); the C3 THC-adjoint object on the same state = "
+    app_log(1, "@@ORB_LADDER_DC scale: ||P^lad_loc,orb||_max = {:.6e} vs ||bubble[Gloc]||_max = "
+               "{:.6e} (ratio {:.4e}); the THC-adjoint object on the same state = "
                "{:.6e} (ratio {:.4e})",
             orb_max, bub_max, ratio, thc_max, thc_max / std::max(bub_max, 1e-300));
     REQUIRE(bub_max > 0.0);
-    // MEASURED (2026-08-14): ||P^lad_loc,orb||_max = 1.192e-06 vs ||bubble[Gloc]||_max =
+    // Reference values: ||P^lad_loc,orb||_max = 1.192e-06 vs ||bubble[Gloc]||_max =
     // 1.094e-03, ratio 1.09e-03 -- an O(1)-class object (a small correction), where the
-    // C3 THC-adjoint object on the SAME state is 7.28e+06, i.e. a ratio of 6.65e+09.
-    // The amendment's failure mode was 9-10 ORDERS; this is the coarse but decisive guard.
+    // THC-adjoint object on the SAME state is 7.28e+06, i.e. a ratio of 6.65e+09. The
+    // failure mode is off by 9-10 ORDERS; this is a coarse but decisive guard.
     REQUIRE(ratio < 10.0);
-    // ... and the diagnostic object is still the OLD, rejected scale (non-vacuity of the
-    // whole increment: the two objects are genuinely different, by many orders)
+    // ... and the THC-adjoint diagnostic is still many orders larger (non-vacuity: the two
+    // objects are genuinely different)
     REQUIRE(thc_max / std::max(bub_max, 1e-300) > 1e3);
 
     // the DC-ready object must also reach the checkpoint (how a separate-process
@@ -266,7 +266,7 @@ namespace bdft_tests {
       }
     }
     mpi_context->comm.barrier();
-    app_log(1, "@@C3B checkpoint: scf/iterN groups carrying pi_lad_loc_orb_wabcd = {} "
+    app_log(1, "@@ORB_LADDER_DC checkpoint: scf/iterN groups carrying pi_lad_loc_orb_wabcd = {} "
                "(final_iter = {})", orb_h5_iters, final_iter);
     REQUIRE(orb_h5_iters > 0);
 

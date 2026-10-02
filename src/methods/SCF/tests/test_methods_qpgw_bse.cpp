@@ -35,26 +35,25 @@
 #include "methods/vertex/vertex_t.h"
 
 /**
- * Project 2 increment Q3 (notes/q3_bse_tier_spec.md): the BSE (ladder) polarization tier
- * in the qpGW loop. The loop screens with
+ * The BSE (ladder) polarization in the qpGW loop. The loop screens with
  *
  *     P_latt(q, i.nu) = P^RPA(q, i.nu) + P^lad(q, i.nu),   W = v + v P_latt W,
  *
  * behind pol_vertex_inject = "ladder_n2". P^lad is the resummed static-rung
- * electron-hole ladder (rungs >= 1 = chi0-factor counts >= 2), which IS eq 6's
- * [.]_{n >= 2} as implemented -- no subtraction anywhere.
+ * electron-hole ladder (rungs >= 1 = chi0-factor counts >= 2), i.e. the n >= 2 terms of
+ * the ladder series as implemented -- no subtraction anywhere.
  *
- * Gates (spec section 5), measure-first-then-gate throughout:
- *   Q3-a  the three noop legs (bitwise);
- *   Q3-b  (i) the loop-vs-readout eps_M identity + the ladder's DIRECTION;
- *         (iii) the mode_a gap with and without injection (the physics readout);
- *   Q3-c  the lambda_max = rho(chi0 Xi) watchdog: parsed NUMBER finite and < 1, plus the
- *         kernel-scaling linearity pin on the estimator;
- *   Q3-d  the s = 1 pin -- ladder_sym_gate (one-rung rebuild == the pi_c_accumulate_w
- *         anchor) re-run on the qpGW-loop state.
+ * Checks:
+ *   no-op legs       the three no-op legs (bitwise);
+ *   eps_M identity   the loop-vs-readout eps_M identity + the ladder's DIRECTION;
+ *   mode_a gap       the mode_a gap with and without injection (the physics readout);
+ *   watchdog         the lambda_max = rho(chi0 Xi) watchdog: the NUMBER is finite and < 1,
+ *                    plus the kernel-scaling linearity check on the estimator;
+ *   one-rung anchor  ladder_sym_gate (one-rung rebuild == the pi_c_accumulate_w anchor,
+ *                    s = 1) re-run on the qpGW-loop state.
  *
  * ==========================================================================================
- * HOW TO RUN (Catch2 v2 traps, spec section 8) -- MEASURED, do not "improve" the command
+ * HOW TO RUN (Catch2 v2 traps) -- do not "improve" the command
  * ==========================================================================================
  *
  *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 <build>/tests/bin/test_methods_qpgw_bse
@@ -92,11 +91,11 @@ namespace bdft_tests {
 
     /**
      * One qpGW run with the ladder knobs of (pol_mode, inject, window), then -- when
-     * gates is set -- ONE more screening step outside the loop so the Q3-c/Q3-d gates
-     * can run on the state the loop actually used.
+     * gates is set -- ONE more screening step outside the loop so the watchdog and
+     * one-rung checks can run on the state the loop actually used.
      *
      * Why the state has to be rebuilt: qp_scf_loop frees mb_state.sG_tskij at the end of
-     * every iteration (qp_scf_common.cpp:1684) while sMO_skia / sE_ska -- the qp solution
+     * every iteration while sMO_skia / sE_ska -- the qp solution
      * itself -- persist. update_mu + update_G are the loop's OWN functions applied to the
      * loop's OWN final spectrum, so the G below is the G the last update_w saw, and the
      * extra update_w reproduces that screening step exactly (h5_iter = -1: no dump).
@@ -214,21 +213,21 @@ namespace bdft_tests {
 
   /**
    * ==========================================================================================
-   * GATE Q3-a -- THE NOOP LEGS (bitwise)
+   * THE NO-OP LEGS (bitwise)
    * ==========================================================================================
-   * Leg (i)   knob ABSENT: the qpGW loop must still reproduce the stored QM3 reference. The
-   *           BITWISE pin of that number is the commit-point suite test_methods_qp_map_ab
-   *           (which runs the same fixture/settings); here it is re-checked against the
+   * Leg (i)   knob ABSENT: the qpGW loop must still reproduce the stored reference. The
+   *           tight check of that number is test_methods_qp_map_ab (which runs the same
+   *           fixture/settings); here it is re-checked against the
    *           stored ac_pade gap 11.8024 eV of qp_map_modea_lih222 at its own quoted
-   *           precision, so a shared-seam edit that moves the loop cannot pass unnoticed.
+   *           precision, so an edit to shared code that moves the loop cannot pass unnoticed.
    * Leg (ii)  pol_vertex_inject = "ladder_n2" with an EMPTY C window: the injection is a
    *           STRUCTURAL no-op (pol_vertex_active() false), so the run must be BITWISE
    *           identical to leg (i) -- the scgwt_noop pattern.
    * Leg (ii-b) the ladder READOUT on a NON-empty window with inject = "none": report-only,
-   *           so still bitwise identical. This is what makes leg (iii)/Q3-b meaningful --
-   *           it proves the injection, not the ladder machinery, is what moves the loop.
-   * Leg (iii) the [gw] path: Project 1's test_vertex_scgwt_noop suite (shared seam), run as
-   *           a commit-point suite -- not duplicated here.
+   *           so still bitwise identical. This is what makes the injection checks meaningful
+   *           -- it proves the injection, not the ladder machinery, is what moves the loop.
+   * Leg (iii) the [gw] path is covered by test_vertex_scgwt_noop (shared code) -- not
+   *           duplicated here.
    */
   TEST_CASE("qpgw_bse_noop_lih222", "[methods][qpgw][bse]") {
 #ifndef ENABLE_DLR
@@ -241,8 +240,8 @@ namespace bdft_tests {
 
     auto r0 = run_qpgw(mpi_context, mf, ft, "noop_a", "ac_pade", "none", "none",
                        nda::range(0, 0), 12, 1e-10, 20, 1e-6);
-    // (i) the stored QM3 reference (qp_map_modea_lih222: ac_pade 11.8024 eV)
-    app_log(1, "@@Q3A leg (i): gap = {:.6f} eV vs the stored ac_pade reference 11.8024 eV "
+    // (i) the stored reference (qp_map_modea_lih222: ac_pade 11.8024 eV)
+    app_log(1, "@@BSE_NOOP leg (i): gap = {:.6f} eV vs the stored ac_pade reference 11.8024 eV "
                "(d = {:+.2e})", r0.gap_eV(), r0.gap_eV() - 11.8024);
     REQUIRE(std::abs(r0.gap_eV() - 11.8024) < 1e-4);
     REQUIRE(r0.eps_rpa == -1.0);        // no readout ran
@@ -251,7 +250,7 @@ namespace bdft_tests {
     // (ii) injection requested, EMPTY window => structurally inert
     auto r1 = run_qpgw(mpi_context, mf, ft, "noop_b", "ac_pade", "none", "ladder_n2",
                        nda::range(0, 0), 12, 1e-10, 20, 1e-6);
-    app_log(1, "@@Q3A leg (ii): empty-window injection e_hf = {}, gap = {:.9f} eV "
+    app_log(1, "@@BSE_NOOP leg (ii): empty-window injection e_hf = {}, gap = {:.9f} eV "
                "(d_e_hf = {:.3e}, d_gap = {:.3e})", r1.e_hf, r1.gap_eV(),
             std::abs(r1.e_hf - r0.e_hf), std::abs(r1.gap_eV() - r0.gap_eV()));
     REQUIRE(r1.e_hf == r0.e_hf);
@@ -263,7 +262,7 @@ namespace bdft_tests {
     // (ii-b) the READOUT on a live window, injection off => still bitwise
     auto r2 = run_qpgw(mpi_context, mf, ft, "noop_c", "ac_pade", "ladder", "none",
                        nda::range(1, 3), 12, 1e-10, 20, 1e-6);
-    app_log(1, "@@Q3A leg (ii-b): readout-only e_hf = {}, gap = {:.9f} eV; eps_M(q_min) "
+    app_log(1, "@@BSE_NOOP leg (ii-b): readout-only e_hf = {}, gap = {:.9f} eV; eps_M(q_min) "
                "RPA = {:.6f}, +ladder = {:.6f}", r2.e_hf, r2.gap_eV(), r2.eps_rpa,
             r2.eps_ladder);
     REQUIRE(r2.e_hf == r0.e_hf);
@@ -276,24 +275,24 @@ namespace bdft_tests {
 
   /**
    * ==========================================================================================
-   * GATES Q3-b(i), Q3-c, Q3-d -- the injection on qe_lih222, C = [1, 3)
+   * eps_M identity, watchdog, one-rung anchor -- the injection on qe_lih222, C = [1, 3)
    * ==========================================================================================
-   * Q3-b(i) THE IDENTITY. Two routes to the same number: the loop's own q-resolved
+   * eps_M IDENTITY. Two routes to the same number: the loop's own q-resolved
    *   eps^-1 head at q_min (tau Dyson of the INJECTED Pi, then tau -> i.nu = 0) against the
    *   readout's single-frequency i.nu = 0 Dyson of P^RPA(nu=0) + P^lad(nu=0). Same G, same
    *   kernel, same q. The expected deviation class is the nu -> tau -> nu round trip r_rt of
    *   P^lad through the IAFT PH-sym pair, which the injection logs every update_w.
-   *   MEASURED (2026-08-14, qe_lih222, C = [1,3), ac_pade, 20 iterations): see the numbers
-   *   in the REQUIREs below; the gate is 10x the measured class, as the spec prescribes.
-   *   Direction: the ladder must INCREASE eps_M (up at every Project-1 fixture/iteration).
-   * Q3-c  the watchdog NUMBER (not the log line): finite and < 1, and the estimator reads
+   *   The tolerances below are 10x the reference values (qe_lih222, C = [1,3), ac_pade,
+   *   20 iterations).
+   *   Direction: the ladder must INCREASE eps_M (it does on every scGW fixture as well).
+   * WATCHDOG  the NUMBER (not the log line): finite and < 1, and the estimator reads
    *   the right matrix -- Xh Kt is linear in the rung, so scaling W-bar_0 by 2 must scale
    *   rho by exactly 2.
-   * Q3-d  the s = 1 pin: the one-rung rebuild against the pi_c_accumulate_w anchor with the
-   *   Q3 configuration live, on the qpGW G. Machine class (3.2e-16 / 4.7e-16 measured on
-   *   scGW states); the qpGW G is a different G, the identity is the same.
-   * The node-map / PH-symmetry residuals of the multi-nu evaluator (increment I1) are
-   * checked here too: they are what licenses the PH-sym transform of P^lad at all.
+   * ONE-RUNG ANCHOR (s = 1): the one-rung rebuild against the pi_c_accumulate_w anchor
+   *   with the ladder injection live, on the qpGW-loop G. Machine class (3.2e-16 / 4.7e-16 on
+   *   scGW states); the qpGW-loop G is a different G, the identity is the same.
+   * The node-map / PH-symmetry residuals of the multi-nu evaluator are checked here too:
+   * they are what licenses the PH-sym transform of P^lad at all.
    */
   TEST_CASE("qpgw_bse_inject_lih222", "[methods][qpgw][bse]") {
 #ifndef ENABLE_DLR
@@ -307,81 +306,80 @@ namespace bdft_tests {
     auto r = run_qpgw(mpi_context, mf, ft, "inj_lih", "ac_pade", "ladder", "ladder_n2",
                       nda::range(1, 3), 12, 1e-10, 20, 1e-6, true);
 
-    // ---- the multi-nu evaluator (I1) --------------------------------------------------
-    app_log(1, "@@Q3I1 node-map resid = {:.3e}, PH-symmetry resid = {:.3e}",
+    // ---- the multi-nu evaluator --------------------------------------------------------
+    app_log(1, "@@BSE_NU_GRID node-map resid = {:.3e}, PH-symmetry resid = {:.3e}",
             r.node_map_resid, r.ph_sym_resid);
     // the PH-sym half grid must address the SAME nodes as a full-mesh evaluation: same
-    // kernel, same scheduling => bitwise 0 (a wrong half<->full map is O(1)). MEASURED
-    // exactly 0.0 (qe_lih222, nw_b = 53 -> 27 half nodes; the map is full = nw_b/2 + j).
+    // kernel, same scheduling => bitwise 0 (a wrong half<->full map is O(1)); on qe_lih222,
+    // nw_b = 53 -> 27 half nodes, and the map is full = nw_b/2 + j.
     REQUIRE(r.node_map_resid == 0.0);
     // ... and P^lad must be PH-symmetric in nu, or the PH-sym transform it is pushed
-    // through is not the right one. This is NOT machine precision: MEASURED 4.28e-09
-    // relative (2026-08-14) -- the DLR/solve class, not the FP class -- and the gate is
-    // 10x that. It is the licence for the transform, and the Q3-b(i) identity below is
-    // the falsifier that keeps it honest.
+    // through is not the right one. This is NOT machine precision: reference 4.28e-09
+    // relative -- the DLR/solve class, not the FP class -- and the tolerance is 10x that.
+    // It is the licence for the transform, and the eps_M identity below is the falsifier
+    // that keeps it honest.
     REQUIRE(r.ph_sym_resid < 5e-8);
 
-    // ---- Q3-b(i): the loop-vs-readout eps_M identity -----------------------------------
+    // ---- the loop-vs-readout eps_M identity --------------------------------------------
     const double dev = std::abs(r.eps_loop - r.eps_ladder);
-    app_log(1, "@@Q3B(i) eps_M(q_min, inu = 0): loop route = {:.9f}, readout route "
+    app_log(1, "@@BSE_EPS_IDENTITY eps_M(q_min, inu = 0): loop route = {:.9f}, readout route "
                "(+ladder) = {:.9f}, deviation = {:.3e}; RPA baseline = {:.9f} "
                "(Delta_ladder = {:+.3e}); transform class r_rt = {:.3e}",
             r.eps_loop, r.eps_ladder, dev, r.eps_rpa, r.eps_ladder - r.eps_rpa, r.r_rt);
     REQUIRE(r.eps_loop > 0.0);
     REQUIRE(r.eps_ladder > 0.0);
     REQUIRE(std::isfinite(r.eps_loop));
-    // MEASURED (2026-08-14, qe_lih222, C = [1,3), ac_pade, 20 iterations): loop route
-    // 1.439266540 vs readout route 1.439266535, deviation 4.78e-09 -- exactly the
-    // transform class the spec predicts (r_rt = 8.47e-08 measured on the same step).
-    // The gate is 10x the measured deviation (spec section 5: measure, then gate).
+    // Reference (qe_lih222, C = [1,3), ac_pade, 20 iterations): loop route 1.439266540 vs
+    // readout route 1.439266535, deviation 4.78e-09 -- the expected transform class
+    // (r_rt = 8.47e-08 on the same step). The tolerance is 10x the reference deviation.
     REQUIRE(dev < 4.8e-8);
-    // DIRECTION: the ladder increases eps_M (Project-1 reference behaviour everywhere).
-    // MEASURED here: 1.426163 -> 1.439267 at q_min, +0.0131 (+0.92 %).
+    // DIRECTION: the ladder increases eps_M (as on every scGW fixture).
+    // Reference: 1.426163 -> 1.439267 at q_min, +0.0131 (+0.92 %).
     REQUIRE(r.eps_ladder > r.eps_rpa);
     // the round trip is a meter, not decoration: it must have been measured and stay in
-    // its class (MEASURED 8.47e-08; gate 10x).
+    // its class (reference 8.47e-08; tolerance 10x).
     REQUIRE(r.r_rt >= 0.0);
     REQUIRE(r.r_rt < 8.5e-7);
 
-    // ---- Q3-c: the lambda_max watchdog (the NUMBER, not the log line) ------------------
-    app_log(1, "@@Q3C lambda_max(inu = 0) = {:.9f}, max over nu = {:.9f}; rung x {:.3g} => "
+    // ---- the lambda_max watchdog (the NUMBER, not the log line) ------------------------
+    app_log(1, "@@BSE_WATCHDOG lambda_max(inu = 0) = {:.9f}, max over nu = {:.9f}; rung x {:.3g} => "
                "{:.9f} (ratio {:.9f}); ||P^lad||/||P^RPA|| = {:.3e}",
             r.lam_nu0, r.lam_max, r.lam_scale, r.lam_scaled,
             r.lam_scaled / std::max(r.lam_nu0, 1e-300), r.lad_ratio);
-    // MEASURED: lambda_max = 0.114764 at every nu node (the nu = 0 node carries the
-    // maximum, as chi0 does), i.e. a wide margin to the eq-6 instability at 1.
+    // Reference: lambda_max = 0.114764 at every nu node (the nu = 0 node carries the
+    // maximum, as chi0 does), i.e. a wide margin to the ladder instability at 1.
     REQUIRE(std::isfinite(r.lam_nu0));
     REQUIRE(r.lam_nu0 > 0.0);
     REQUIRE(std::isfinite(r.lam_max));
     REQUIRE(r.lam_max < 1.0);
     REQUIRE(r.lam_max >= r.lam_nu0);
-    // the estimator reads Xh Kt, which is LINEAR in the rung: MEASURED ratio 2.000000 at
+    // the estimator reads Xh Kt, which is LINEAR in the rung: reference ratio 2.000000 at
     // scale 2 (a power iteration on any other matrix would not scale exactly)
     REQUIRE(std::abs(r.lam_scaled / r.lam_nu0 - r.lam_scale) < 1e-6 * r.lam_scale);
-    // and the correction is a correction (MEASURED ||P^lad||/||P^RPA|| = 3.14e-04)
+    // and the correction is a correction (reference ||P^lad||/||P^RPA|| = 3.14e-04)
     REQUIRE(r.lad_ratio > 0.0);
     REQUIRE(r.lad_ratio < 1.0);
 
-    // ---- Q3-d: the s = 1 pin on the qpGW-loop state ------------------------------------
-    app_log(1, "@@Q3D ladder_sym_gate on the qpGW state (sym {}): one-rung rebuild vs the "
+    // ---- the one-rung anchor (s = 1) on the qpGW-loop state ----------------------------
+    app_log(1, "@@BSE_ONE_RUNG ladder_sym_gate on the qpGW state (sym {}): one-rung rebuild vs the "
                "Pi^C anchor resid = {:.3e}; >= 2-rung content = {:.3e}",
             r.sym_active ? "ACTIVE" : "inactive", r.sym_resid, r.sym_ladder_frac);
-    // MEASURED 4.07e-16 on the qpGW G (3.2e-16 / 4.7e-16 on the Project-1 scGW states):
+    // Reference 4.07e-16 on the qpGW-loop G (3.2e-16 / 4.7e-16 on scGW states):
     // the same machine-precision identity, so s = 1 in this configuration too.
     REQUIRE(r.sym_resid >= 0.0);
     REQUIRE(r.sym_resid < 1e-12);
-    // the resummation is not trivially the anchor (MEASURED >= 2-rung content 8.64e-02)
+    // the resummation is not trivially the anchor (reference >= 2-rung content 8.64e-02)
     REQUIRE(r.sym_ladder_frac > 0.0);
 #endif
   }
 
   /**
    * ==========================================================================================
-   * GATE Q3-b(iii) -- THE PHYSICS READOUT: the mode-A gap with and without the BSE tier
+   * THE PHYSICS READOUT: the mode-A gap with and without the BSE ladder
    * ==========================================================================================
-   * The first qpGW+BSE number of the project. Both legs must converge, stay Hermitian (the
-   * mode-A driver's own anchor check aborts otherwise) and give finite, sane gaps; the SHIFT
-   * is RECORDED, never gated -- there is no reference to gate it against yet.
+   * Both legs must converge, stay Hermitian (the mode-A driver's own anchor check aborts
+   * otherwise) and give finite, sane gaps; the SHIFT is logged, never checked -- there is
+   * no reference value for it.
    * pyscf_si222 with C = [2, 6) straddling the gap.
    */
   TEST_CASE("qpgw_bse_modea_si222", "[methods][qpgw][bse]") {
@@ -401,7 +399,7 @@ namespace bdft_tests {
     auto r1 = run_qpgw(mpi_context, mf, ft, "si_modea_on", "mode_a", "ladder", "ladder_n2",
                        window, 10, 1e-8, 12, 1e-5, true);
 
-    app_log(1, "@@Q3B(iii) pyscf_si222 / mode_a, C = [{}, {}): gap OFF = {:.6f} eV, "
+    app_log(1, "@@BSE_MODEA_GAP pyscf_si222 / mode_a, C = [{}, {}): gap OFF = {:.6f} eV, "
                "ON = {:.6f} eV (shift {:+.6f} eV); eps_M(q_min) RPA = {:.6f} -> +ladder "
                "= {:.6f}; ||P^lad||/||P^RPA|| = {:.3e}, lambda_max = {:.6f}, "
                "r_rt = {:.3e}", window.first(), window.last(), r0.gap_eV(), r1.gap_eV(),
@@ -413,12 +411,12 @@ namespace bdft_tests {
       REQUIRE(r.gap_eV() < 30.0);
       REQUIRE(r.final_iter < r.niter);        // converged inside the cap
     }
-    // Q3-c on the second fixture: the watchdog NUMBER
+    // the watchdog NUMBER on the second fixture
     REQUIRE(std::isfinite(r1.lam_max));
     REQUIRE(r1.lam_max > 0.0);
     REQUIRE(r1.lam_max < 1.0);
     REQUIRE(r1.r_rt < 8.5e-7);
-    // Q3-b direction and Q3-d on the si222 state
+    // the ladder direction and the one-rung anchor on the si222 state
     REQUIRE(r1.eps_ladder > r1.eps_rpa);
     REQUIRE(r1.sym_resid >= 0.0);
     REQUIRE(r1.sym_resid < 1e-12);
@@ -437,7 +435,7 @@ namespace bdft_tests {
    * Leg (a) baseline: inject on, gygi div (so a head EXISTS to scale), at the reduced
    *         kernel head the fixture needs (see the FIXTURE CHOICE note below).
    * Leg (b) ladder_qnu_meter = true: the meters are PURE OBSERVERS, so every physics
-   *         number must be BITWISE leg (a). This is the strongest of the three gates --
+   *         number must be BITWISE leg (a). This is the strongest of the three checks --
    *         the (q,nu) accumulators sit inside the injection's innermost write loop.
    * Leg (c) ladder_tda = true: the kernel's resonant<->anti-resonant coupling block is
    *         zeroed. Must MOVE the answer (non-vacuous) and stay sane.
@@ -453,12 +451,12 @@ namespace bdft_tests {
     using namespace qpgw_bse_detail;
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
-    // FIXTURE CHOICE, MEASURED not assumed. The head knob needs a head, so div = "gygi"
+    // FIXTURE CHOICE. The head knob needs a head, so div = "gygi"
     // (under "ignore_g0" no head is inserted at all and ladder_head_scale is CORRECTLY inert). But the
     // gygi head at a 2^3 mesh is enormous relative to the body -- N_k*madelung is an O(1/N_k)
     // object -- and it drives the ladder past the particle-hole instability on BOTH toy
-    // fixtures: MEASURED rho(Xh Kt) = 1.688 (qe_lih222, C = [1,3)), 1.474 (pyscf_si222,
-    // C = [2,6)) and 1.007 (pyscf_si222, C = [3,5)), i.e. the eq-6 resolvent abort fires
+    // fixtures: rho(Xh Kt) = 1.688 (qe_lih222, C = [1,3)), 1.474 (pyscf_si222, C = [2,6))
+    // and 1.007 (pyscf_si222, C = [3,5)), i.e. the ladder resolvent abort fires
     // before any leg finishes. The legs therefore run at a REDUCED kernel head
     // (ladder_head_scale = HS0 = 0.25) and the head-scale non-vacuity leg drops it to 0. That
     // exercises the knob at TWO non-default values, which is strictly stronger evidence
@@ -469,7 +467,7 @@ namespace bdft_tests {
     // reduced head): it is the minimal window that still straddles the gap (Si nocc = 4:
     // band 3 occupied, band 4 empty), so the four pairs per k are (3,3) and (4,4) with
     // character 0 and (3,4)/(4,3) with characters +1/-1 -- both of the characters the TDA
-    // mask distinguishes are present, which is what the gate needs.
+    // mask distinguishes are present, which is what the check needs.
     constexpr double HS0 = 0.25;
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "pyscf_si222"));
     const long b1 = std::min<long>(5, mf->nbnd());
@@ -527,15 +525,15 @@ namespace bdft_tests {
     REQUIRE(rc.gap_eV() != ra.gap_eV());          // the knob reached the kernel
     // The TDA mask is nu-INDEPENDENT and exchanges the two characters under nu -> -nu, so
     // the truncated P^lad should stay PH-symmetric -- otherwise the injection's PH-sym
-    // transform would be illegitimate on this leg. MEASURE FIRST, THEN GATE: the residual
-    // is 3.02e-06 relative under TDA against 1.08e-08 for the untruncated kernel, i.e. the
-    // truncation DEGRADES the symmetry by ~300x without breaking it. That is expected and
-    // recorded rather than explained away -- the res <-> ares mirror also flips q, so the
+    // transform would be illegitimate on this leg. The reference residual is 3.02e-06
+    // relative under TDA against 1.08e-08 for the untruncated kernel, i.e. the truncation
+    // DEGRADES the symmetry by ~300x without breaking it. That is expected: the
+    // res <-> ares mirror also flips q, so the
     // two blocks are exact mirrors only up to the q -> -q relabeling of the IBZ transfer
     // axis, and the character assignment itself is only as sharp as the C-window density
-    // matrix is occupation-diagonal (this fixture measures crispness 0.45 / off-diagonal
-    // 0.26 and the code WARNS about it). 3e-06 is four orders below the ladder effects
-    // being measured, so the transform stays licensed; the gate is 10x the measurement.
+    // matrix is occupation-diagonal (this fixture has crispness 0.45 / off-diagonal 0.26
+    // and the code WARNS about it). 3e-06 is four orders below the ladder effects being
+    // measured, so the transform stays licensed; the tolerance is 10x the reference.
     app_log(1, "@@ladder_tda PH-symmetry check under TDA: node-map resid = {:.3e}, "
                "PH-symmetry resid = {:.3e}; one-rung-vs-anchor (untruncated) = {:.3e}",
             rc.node_map_resid, rc.ph_sym_resid, rc.sym_resid);

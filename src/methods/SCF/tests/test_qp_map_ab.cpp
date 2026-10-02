@@ -36,17 +36,15 @@
 #include "methods/SCF/qp_modea.hpp"
 
 /**
- * Project 2 increment Q2 (notes/qpgw_edmft_implementation_plan.md): the A/B
- * surrogate-spread deliverable. The full qp_scf_loop runs with each of the
- * quasiparticle maps (ac_pade / mats_lin / mats_gmatch, and from increment QM3
- * also mode_a) on the same
- * mean field and the same THC factorization, so every difference in the band
- * edges is the surrogate spread of the static map itself (spec section 4
- * "residual ambiguity" -- REPORTED, not converged away). Assertions are loose
- * tripwires against gross breakage; the table in the log is the deliverable.
+ * The quasiparticle maps of the qpGW loop compared. The full qp_scf_loop runs with each of
+ * the quasiparticle maps (ac_pade / mats_lin / mats_gmatch, mode_b and mode_a) on the same
+ * mean field and the same THC factorization, so every difference in the band edges is the
+ * surrogate spread of the static map itself (a residual ambiguity of any static map --
+ * REPORTED, not converged away). Assertions are loose tripwires against gross breakage;
+ * the table in the log is the main output.
  *
  * ==========================================================================================
- * HOW TO RUN THIS SUITE (gate QM3-a) -- MEASURED, do not "improve" the command
+ * HOW TO RUN THIS SUITE -- do not "improve" the command
  * ==========================================================================================
  *
  *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 <build>/tests/test_methods_qp_map_ab
@@ -55,8 +53,8 @@
  * DEFAULT (no test-spec) run: as soon as ANY test spec is supplied on the command line,
  * hidden cases are matched by it like any other, so a NEGATIVE filter such as `~[modea]` or
  * `~[.modeb_matrix]` does NOT exclude them -- it selects everything that does not carry that
- * tag, hidden cases included, and the hidden measurement/hold cases then run (measured here,
- * 2026-08-12: a "~[...]" suite command silently ran the hidden matrix case for >1 h).
+ * tag, hidden cases included, and the hidden measurement/hold cases then run (a "~[...]"
+ * suite command silently runs the hidden matrix case, which takes over an hour).
  *
  * Consequences for this file:
  *   - the live gates carry ordinary tags and run under the bare binary;
@@ -108,12 +106,12 @@ namespace bdft_tests {
       qp_params.qp_map = map;
       qp_params.qp_modea_wfit = wfit;
       qp_params.qp_modea_eta = eta;
-      qp_params.qp_modea_eta_far = eta_far;      // spec rev 4; 0 = the rev-3.1 mu fallback
+      qp_params.qp_modea_eta_far = eta_far;      // 0 = out-of-strip states evaluated at mu
       qp_params.qp_modea_wrtol = wrtol;
       qp_params.qp_modea_wrank = wrank;
       qp_params.qp_modea_wsketch = wsketch;
       qp_params.qp_modea_wunion = wunion;
-      qp_params.qp_modea_spectral_eta = sp_eta;         // RW-2, only read when wfit=spectral
+      qp_params.qp_modea_spectral_eta = sp_eta;         // only read when wfit = spectral
       qp_params.qp_modea_spectral_npole = sp_npole;
       qp_params.qp_modea_spectral_gamma = sp_gamma;
       qp_modea::last_run() = qp_modea::last_run_t{};
@@ -158,8 +156,8 @@ namespace bdft_tests {
               (row.e_lumo - row.e_homo) * HA2EV, row.e_homo, row.e_lumo);
       if (map == "mode_b" or map == "mode_a") {
         // Per-k band-edge geometry against the strip of qp_modea.hpp -- outside it mode_b
-        // falls back to z = mu on the diagonal and mode_a evaluates BOTH indices at mu
-        // (rev 3.1) -- evaluated on the FINAL stored spectrum. VBM/CBM here are the same
+        // falls back to z = mu on the diagonal and mode_a evaluates BOTH indices at mu --
+        // evaluated on the FINAL stored spectrum. VBM/CBM here are the same
         // global edges the driver uses.
         const double E_PH = row.lr.gap_edge;
         const double lo = row.e_homo - 0.95 * E_PH, hi = row.e_lumo + 0.95 * E_PH;
@@ -185,10 +183,10 @@ namespace bdft_tests {
       }
       if (map == "mode_a" or map == "mode_b") {
         auto const &L = row.lr;
-        // gate QM3-b(ii): the ANCHOR, with its expectation class. The hard < 1e-2 check is
+        // the tau ANCHOR, with its expectation class. The hard < 1e-2 check is
         // enforced inside the driver at EVERY outer iteration (qp_scf_common.cpp); this line
         // reports the last iteration's numbers and re-asserts them here.
-        app_log(1, "qp_map_ab [{}{}] QM3-b' diagnostics: TAU ANCHOR = {:.4e} (gate {:.1g} x "
+        app_log(1, "qp_map_ab [{}{}] map diagnostics: TAU ANCHOR = {:.4e} (gate {:.1g} x "
                    "the W-fit reconstruction class {:.4e}, ratio {:.3g});  i w diagnostic "
                    "(NOT a gate, reference-aliasing dominated) = {:.4e};  anti-Hermitian "
                    "residual = {:.3e};  min_den = {:.4e} a.u.;  diagonal fallbacks = {}",
@@ -201,7 +199,7 @@ namespace bdft_tests {
                 map, tag, L.wfit, L.gap_edge, L.gap_edge * HA2EV, L.n_support, L.np_total,
                 L.nJ, L.npk, L.wall_s, L.mem_mb);
         REQUIRE(L.tau_dev >= 0.0);
-        // THE GATE (spec rev 2) -- tau domain, not tunable. `gate = false` is used ONLY by the
+        // THE ANCHOR CHECK -- tau domain, not tunable. `gate = false` is used ONLY by the
         // hidden measurement harnesses, whose point is to REPORT a cell that misbehaves (a
         // REQUIRE there aborts the case and loses the rest of the table); every live case
         // leaves it true. The driver's own tau-anchor check still aborts the process, so this
@@ -210,26 +208,26 @@ namespace bdft_tests {
       }
       if (map == "mode_a") {
         auto const &L = row.lr;
-        // THE STRIP-CLAMP CENSUS of the LAST outer iteration (rev 3 addendum item 2) and the
+        // THE STRIP-CLAMP CENSUS of the LAST outer iteration and the
         // inner-consistency convergence that the clamp is there to restore.
         app_log(1, "@@CLAMPCENSUS [{}{}] out of strip {} of {} evaluation energies ({} in the "
                    "gap window) over {} (s,k) blocks; per-k HOMO out of strip in {} blocks, "
                    "LUMO in {}; inner consistency: {} sweeps, max|d eps| = {:.4e} a.u. ({}); "
-                   "rev4: etafar = {:.4e} a.u., eta-evaluated {} (mu-clamped {}), "
+                   "graded eta: etafar = {:.4e} a.u., eta-evaluated {} (mu-clamped {}), "
                    "max|Im Sigma| off strip = {:.4e} a.u., in-strip anti-herm = {:.3e}, "
                    "pole spacing = {:.4e} a.u.",
                 map, tag, L.n_clamp, L.n_eval, L.n_clamp_win, L.n_blocks, L.n_homo_clamp,
                 L.n_lumo_clamp, L.iters, L.dmax,
                 L.converged_inner ? "converged" : "HIT THE CAP",
                 L.eta_far, L.n_eta, L.n_clamp - L.n_eta, L.im_off, L.anti_in, L.spacing);
-        // (i) of gate QM3-b: THE LOOP MUST CONVERGE. The rev-1 failure mode was
-        // max|d eps| ~ 1e4-1e5 a.u. and the strip-BOUNDARY reading gave 2.4e+04; with the
-        // clamp to mu every evaluation is bounded.
+        // THE LOOP MUST CONVERGE. Without the strip clamp max|d eps| reaches ~1e4-1e5 a.u.,
+        // and clamping to the strip BOUNDARY gives 2.4e+04; with the clamp to mu every
+        // evaluation is bounded.
         //
-        // The gate is the EXIT RESIDUAL of the last outer iteration, not the per-block
-        // "met consist_tol within nconsist sweeps" flag. MEASURED (lih222, rev 3.1): 5 of 8
-        // blocks reach 6.6e-09 in 2 sweeps and 3 blocks are still contracting at 9.3e-08
-        // when the nconsist = 5 cap ends them -- a budget statement about the knob pair
+        // The check is the EXIT RESIDUAL of the last outer iteration, not the per-block
+        // "met consist_tol within nconsist sweeps" flag. On lih222, 5 of 8 blocks reach
+        // 6.6e-09 in 2 sweeps and 3 blocks are still contracting at 9.3e-08 when the
+        // nconsist = 5 cap ends them -- a budget statement about the knob pair
         // (nconsist 5, consist_tol 1e-8), not a physics one, and 9.3e-08 a.u. is 2.5 neV.
         // Requiring the flag would gate on the knob; requiring 1e-6 a.u. (0.027 meV) gates
         // on the physics and still fails the boundary pathology by ten orders. The flag is
@@ -246,10 +244,10 @@ namespace bdft_tests {
       return row;
     }
 
-    // THE deliverable: the per-map band-edge table + the per-band spread at
-    // k = 0 (the Q1 finding predicts the spread GROWS with |E - mu|).
+    // The per-map band-edge table + the per-band spread at k = 0 (the spread is
+    // expected to GROW with |E - mu|).
     inline void report_and_check(std::vector<ab_row> const &rows) {
-      app_log(1, "\n== qp_map A/B surrogate-spread table ==");
+      app_log(1, "\n== qp_map comparison: surrogate-spread table ==");
       app_log(1, "{:<24} {:>12} {:>12} {:>12}", "map", "E_homo (Ha)", "E_lumo (Ha)", "gap (eV)");
       for (auto const &r : rows)
         app_log(1, "{:<24} {:>12.6f} {:>12.6f} {:>12.4f}",
@@ -305,8 +303,7 @@ namespace bdft_tests {
     using namespace qp_map_ab_detail;
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
-    // bdft_si222 is commented out of default_MF -- pyscf_si222 is the plan's
-    // named alternative (notes/qpgw_edmft_implementation_plan.md section 4).
+    // bdft_si222 is not available in default_MF; pyscf_si222 is used instead.
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "pyscf_si222"));
 
     std::vector<ab_row> rows;
@@ -318,46 +315,44 @@ namespace bdft_tests {
 
   /**
    * ==========================================================================================
-   * GATE QM3-b -- THE mode_a FIXTURE GATE (spec rev 3 + its addendum: mode_a IS the
-   * deliverable again, with the CD evaluator and the STRIP CLAMP).
+   * mode_a ON THE FIXTURES -- the CD evaluator with the STRIP CLAMP
    * ==========================================================================================
-   * History, all measured on 2026-08-12 (kept because it is the justification for the clamp,
-   * not decoration):
+   * Why the strip clamp is needed:
    *
-   *   (ii) THE ANCHOR PASSED FROM THE START: route-B Sigma^c_ab at the first four fermionic
-   *        nodes agreed with the gathered solver Sigma(i w_n) to 6.28e-03 over the gap window
-   *        against a W-fit reconstruction class of 4.44e-03 (ratio 1.4), and the later tau
-   *        oracle put the same elements at 5.6e-05 with NO transform on either side. The
-   *        contraction (prefactor, spin, q-star/trev rule, MO rotation, head) IS CORRECT.
-   *   (i)  THE LOOP DIVERGED (max|d eps| ~ 1e4-1e5 a.u.) because mode A needs V^xc for ALL
-   *        nbnd states, and states OUTSIDE the analyticity strip -- lih222 empty states at
+   *   (ii) THE ANCHOR HOLDS without it: route-B Sigma^c_ab at the first four fermionic
+   *        nodes agrees with the gathered solver Sigma(i w_n) to 6.28e-03 over the gap window
+   *        against a W-fit reconstruction class of 4.44e-03 (ratio 1.4), and the tau anchor
+   *        puts the same elements at 5.6e-05 with NO transform on either side. The
+   *        contraction (prefactor, spin, q-star/trev rule, MO rotation, head) is correct.
+   *   (i)  BUT THE LOOP DIVERGES (max|d eps| ~ 1e4-1e5 a.u.) because mode A needs V^xc for
+   *        ALL nbnd states, and states OUTSIDE the analyticity strip -- lih222 empty states at
    *        eps - mu = 0.73 / 1.18 / 1.41 a.u., i.e. at and above the IAFT wmax = 1.2 a.u. --
    *        land on the fitted Sigma^c poles at eps_J - om_p (min_den down to 3e-07 a.u.).
-   *        No knob cell cured it: eta 0 / 3.14e-3 / 3e-2 a.u. all stayed at 1e3-1e5;
-   *        wfit nu improved the reconstruction (1.2e-3 vs 4.4e-3) and failed anyway;
-   *        wrtol 1e-6 only moved 9.1e3 -> 8.1e2. The trade-off is STRUCTURAL: the SVD cut
+   *        No knob setting cures it: eta 0 / 3.14e-3 / 3e-2 a.u. all stay at 1e3-1e5;
+   *        wfit nu improves the reconstruction (1.2e-3 vs 4.4e-3) and fails anyway;
+   *        wrtol 1e-6 only moves 9.1e3 -> 8.1e2. The trade-off is STRUCTURAL: the SVD cut
    *        that maximizes imaginary-axis accuracy produces a rational function with thousands
    *        of poles and residues 1e2-1e4x the data, i.e. a wild function at real z.
    *
-   * REV 3.1 ADDENDUM item 2 resolves it by CONVENTION, not by tuning: a state inside
+   * The strip convention resolves it, not tuning: a state inside
    * (VBM - 0.95 E_PH, CBM + 0.95 E_PH) -- the same particle-hole-edge prior the W^c support
    * constraint and the mode_b strip test already use -- is exact mode A, and a state outside
    * it is evaluated at mu, mode_b's fallback. The inner-consistency loop is RETAINED (every
    * evaluation is now bounded), and the clamp census is the acceptance measurement: the judge
    * states (per-k HOMO/LUMO) must not be clamped.
    *
-   * The intermediate reading of the addendum -- clamp to the strip BOUNDARY -- was measured
-   * and REVERSED here on the same day; the boundary sits inside the fitted-pole pile-up and
-   * collapsed lih222 to a -9.6e+03 eV gap. The diagnosis is in qp_modea.hpp, strip_t.
+   * Clamping to the strip BOUNDARY instead does not work: the boundary sits inside the
+   * fitted-pole pile-up and collapses lih222 to a -9.6e+03 eV gap (see strip_t in
+   * qp_modea.hpp).
    *
-   * This case therefore gates: the tau anchor (in run_map), inner-consistency convergence and
-   * a non-vacuous clamp census (in run_map), and finite/sane gaps (report_and_check). The last
-   * three matter because THE TAU ANCHOR IS VACUOUS in a collapsed-spectrum regime: it is
-   * normalized against the W-fit reconstruction class, which blows up in step with it (that
-   * boundary run "passed" the anchor at ratio 0.007 with a negative gap). The gap next to the
-   * stored ac_pade value is REPORTED, never gated.
-   * QPSCF ONLY -- the evGW leg's diagonal sampler is pathologically slow (rev 3 addendum
-   * item 4); see the [.modeb_evscf] case below.
+   * This case therefore checks: the tau anchor (in run_map), inner-consistency convergence
+   * and a non-vacuous clamp census (in run_map), and finite/sane gaps (report_and_check). The
+   * last three matter because THE TAU ANCHOR IS VACUOUS in a collapsed-spectrum regime: it is
+   * normalized against the W-fit reconstruction class, which blows up in step with it (the
+   * boundary-clamp run "passes" the anchor at ratio 0.007 with a negative gap). The gap next
+   * to the stored ac_pade value is REPORTED, never checked.
+   * QPSCF ONLY -- the evGW leg's diagonal sampler is pathologically slow; see the
+   * [.modeb_evscf] case below.
    */
   TEST_CASE("qp_map_modea_lih222", "[methods][qpgw][qp_map_ab][modea2]") {
     using namespace qp_map_ab_detail;
@@ -375,16 +370,16 @@ namespace bdft_tests {
   }
 
   /**
-   * GATE RW-2-b (notes/rw_real_axis_w_spec.md): the INSULATOR leg of the spectral-quadrature
-   * W^c representation. REPORT-ONLY -- spectral is the METAL path; on a gapped fixture the
-   * support-constrained LS fit has real prior information to use and the spectral rep is
-   * eta-limited, so the gap shift is expected at the ~0.1 eV class of RW-1 section 7 and is
-   * printed, never gated. What IS asserted is that the run completes, that the tau anchor
+   * The INSULATOR leg of the spectral-quadrature W^c representation. REPORT-ONLY --
+   * spectral is the METAL path; on a gapped fixture the support-constrained LS fit has real
+   * prior information to use and the spectral rep is eta-limited, so the gap shift is
+   * expected at the ~0.1 eV class and is printed, never checked. What IS asserted is that
+   * the run completes, that the tau anchor
    * holds against its own (spectral) reconstruction class, and that the representation is
    * definite (the sppsd census).
    *
    * COST. The real-axis chain is a Naux^2-wide NUFFT batch over N_t times, so its cost scales
-   * as Np^2 / eta^2 and the production Np = 192 at eta = 0.0125 is not a laptop object. This
+   * as Np^2 / eta^2 and the default Np = 192 at eta = 0.0125 is expensive. This
    * case therefore runs a REDUCED THC rank and a coarse eta on BOTH legs, so the LS and
    * spectral rows share every other convention and the difference is the representation. The
    * absolute gap is consequently not the production one -- the DIFFERENCE is the readout.
@@ -401,7 +396,7 @@ namespace bdft_tests {
     const double sp_eta  = std::getenv("RW2B_ETA")     ? std::atof(std::getenv("RW2B_ETA"))     : 0.05;
     const long   sp_np   = std::getenv("RW2B_NPOLE")   ? std::atol(std::getenv("RW2B_NPOLE"))   : 64;
     const std::string sp_g = std::getenv("RW2B_GAMMA") ? std::getenv("RW2B_GAMMA") : "ls";
-    app_log(1, "@@RW2B config: thc prefactor = {}, niter = {}, spectral_eta = {:.4g} a.u., "
+    app_log(1, "@@SPECTRAL_WC config: thc prefactor = {}, niter = {}, spectral_eta = {:.4g} a.u., "
                "spectral_npole = {}, spectral_gamma = {}", prefac, niter, sp_eta, sp_np, sp_g);
 
     std::vector<ab_row> rows;
@@ -409,7 +404,7 @@ namespace bdft_tests {
     // gate = false on both mode_a rows: the run_map inner-consistency assertion is calibrated
     // to the PRODUCTION THC rank and iteration budget, and this case deliberately runs a
     // reduced one so the real-axis chain (a Naux^2-wide NUFFT batch) is affordable. The
-    // diagnostics are all still logged and the RW-2-b assertions are below.
+    // diagnostics are all still logged and the assertions of this case are below.
     rows.push_back(run_map(mpi_context, mf, ft, "mode_a", "qpscf", prefac, 1e-10, niter, 1e-6,
                            "tau", "_ls", 0.0, -1.0, 1e-10, 0, 0.0, /*gate*/ false));
     rows.push_back(run_map(mpi_context, mf, ft, "mode_a", "qpscf", prefac, 1e-10, niter, 1e-6,
@@ -417,11 +412,11 @@ namespace bdft_tests {
                            "ignore_g0", sp_eta, sp_np, sp_g));
     report_and_check(rows);
     auto const &L = rows[2].lr;
-    app_log(1, "@@RW2B lih222/qpscf: ac_pade = {:.4f} eV, mode_a(tau/LS) = {:.4f} eV, "
+    app_log(1, "@@SPECTRAL_WC lih222/qpscf: ac_pade = {:.4f} eV, mode_a(tau/LS) = {:.4f} eV, "
                "mode_a(spectral) = {:.4f} eV; spectral - LS = {:+.4f} eV, spectral - ac_pade "
                "= {:+.4f} eV", rows[0].gap_eV(), rows[1].gap_eV(), rows[2].gap_eV(),
             rows[2].gap_eV() - rows[1].gap_eV(), rows[2].gap_eV() - rows[0].gap_eV());
-    app_log(1, "@@RW2B spectral census: eta = {:.4g} a.u., N_Omega = {}, bins = {}, head "
+    app_log(1, "@@SPECTRAL_WC spectral census: eta = {:.4g} a.u., N_Omega = {}, bins = {}, head "
                "poles = {}, npk = {}, worst bin width = {:.3e}, ImW symmetry = {:.3e}, "
                "definiteness = {:.3e}, head reconstruction = {:.3e}, Lehmann meter (rec) = "
                "{:.4e}, tau anchor = {:.4e} (ratio {:.3g}), real-axis wall = {:.2f} s",
@@ -447,21 +442,21 @@ namespace bdft_tests {
     app_log(1, "@@MODEA_GAP si222/qpscf: ac_pade = {:.4f} eV, mode_a = {:.4f} eV "
                "(d = {:+.4f} eV); stored references: ac_pade 9.2484, mode_b 9.2615",
             rows[0].gap_eV(), rows[1].gap_eV(), rows[1].gap_eV() - rows[0].gap_eV());
-    // THE JUDGE STATES on the si222-class gap: the measured strip bounds are VBM + 0.155 /
+    // THE JUDGE STATES on the si222-class gap: the strip bounds are VBM + 0.155 /
     // CBM + 0.496 a.u. against band edges spread by ~0.34 a.u., so the per-k band edges are
-    // deep inside the strip and must never be clamped (spec rev 3 addendum item 2).
+    // deep inside the strip and must never be clamped.
     REQUIRE(rows[1].lr.n_homo_clamp == 0);
     REQUIRE(rows[1].lr.n_lumo_clamp == 0);
   }
 
 
   /**
-   * GATE QM3-b' -- the mode_b fixture gate (spec rev 2, the user ruling of 2026-08-12; mode_b
-   * is now the AUXILIARY map, rev 3, and stays gated because mode_a shares all of its
-   * machinery). V^xc_ab = Re Sigma^c_ab(mu) off-diagonal, V^xc_aa = Re Sigma^c_aa(eps_a)
-   * diagonal, with the CD evaluator. No inner-consistency loop. The loops must CONVERGE; the
-   * tau anchor is the acceptance criterion; the diagonal-fallback count is logged (expected 0
-   * near the gap). QPSCF ONLY -- see [.modeb_evscf] below.
+   * mode_b on the fixtures. mode_b is the AUXILIARY map and stays tested because mode_a
+   * shares all of its machinery. V^xc_ab = Re Sigma^c_ab(mu) off-diagonal,
+   * V^xc_aa = Re Sigma^c_aa(eps_a) diagonal, with the CD evaluator. No inner-consistency
+   * loop. The loops must CONVERGE; the tau anchor is the acceptance criterion; the
+   * diagonal-fallback count is logged (expected 0 near the gap). QPSCF ONLY -- see
+   * [.modeb_evscf] below.
    */
   TEST_CASE("qp_map_modeb_lih222", "[methods][qpgw][qp_map_ab][modeb]") {
     using namespace qp_map_ab_detail;
@@ -476,14 +471,13 @@ namespace bdft_tests {
   }
 
   /**
-   * THE evGW (evscf) LEG OF THE CD MAPS -- HIDDEN, INCOMPLETE BY DESIGN (spec rev 3 addendum
-   * item 4). It was a SECTION of the live gate above until it was measured, on 2026-08-12, to
-   * take >75 min for a single outer iteration on qe_lih222 against ~7 s for the qsGW (qpscf)
-   * leg of the same fixture, __divdc3-bound: solve_qp_eqn's modea_diag_sampler rebuilds the
-   * whole nJ x npk pole-weight vector (thousands of complex divisions) at EVERY secant /
-   * bisection step of EVERY (s,k,a), instead of caching the per-(s,k,a) residue slab and
-   * evaluating incrementally. Until that is fixed the leg is neither gated nor deliverable;
-   * the driver emits a flagged warning when it is entered. Run explicitly if you need it:
+   * THE evGW (evscf) LEG OF THE CD MAPS -- HIDDEN. It takes over an hour for a single outer
+   * iteration on qe_lih222, against seconds for the qsGW (qpscf) leg of the same fixture,
+   * __divdc3-bound: solve_qp_eqn's modea_diag_sampler rebuilds the whole nJ x npk
+   * pole-weight vector (thousands of complex divisions) at EVERY secant / bisection step of
+   * EVERY (s,k,a), instead of caching the per-(s,k,a) residue slab and evaluating
+   * incrementally. Until that is fixed the leg is not checked; the driver emits a warning
+   * when it is entered. Run explicitly if you need it:
    *
    *     test_methods_qp_map_ab "qp_map_modeb_lih222_evscf"
    */
@@ -514,10 +508,9 @@ namespace bdft_tests {
    * MODE-B MEASUREMENT MATRIX, CONFIG (iii) -- measurement only, hidden tag, no gate is
    * added and no default is flipped here.
    *
-   * The matrix has two configs, both with the STRIP TEST as the diagonal fallback criterion
-   * (the earlier min_den-floor / |ReSigma| heuristic triggers no longer exist in the tree):
-   *   (ii)  strip test + the DEFAULT W^c fit  (wfit = "tau", wrtol = doctrine)
-   *         -> this IS the [modeb] gate case above; no separate case is needed.
+   * The matrix has two configs, both with the STRIP TEST as the diagonal fallback criterion:
+   *   (ii)  strip test + the DEFAULT W^c fit  (wfit = "tau", default wrtol)
+   *         -> this IS the [modeb] case above; no separate case is needed.
    *   (iii) strip test + wfit = "nu", wrtol = 1e-4                 <- THIS CASE
    *
    * Full qp_scf_loop, same niter/conv_tol/THC settings as the ac_pade rows of the
@@ -573,15 +566,14 @@ namespace bdft_tests {
 
   /**
    * ==========================================================================================
-   * GATE (spec rev 4): THE eta_far = 0 BIT-IDENTITY
+   * THE eta_far = 0 IDENTITY
    * ==========================================================================================
-   * Rev 4 adds the graded-eta far-state evaluation (qp_modea_eta_far). Its DEFAULT is 0, which
-   * must reproduce the rev-3.1 mu fallback exactly -- the whole increment is then a no-op on
-   * every stored number. THAT is what this case gates, and only that: the four converged gaps
-   * of the tree at 690ade1, with eta_far passed EXPLICITLY as 0 so the plumbing (params ->
-   * opts -> ctx -> strip_t::zeval) is exercised rather than bypassed.
+   * qp_modea_eta_far enables the graded-eta far-state evaluation. Its DEFAULT is 0, which must
+   * reproduce the mu fallback for out-of-strip states exactly. THAT is what this case checks,
+   * and only that: the four converged reference gaps, with eta_far passed EXPLICITLY as 0 so
+   * the plumbing (params -> opts -> ctx -> strip_t::zeval) is exercised rather than bypassed.
    *
-   *   fixture        map      gap (eV) at 690ade1
+   *   fixture        map      reference gap (eV)
    *   qe_lih222      mode_a   11.856870
    *   qe_lih222      mode_b   11.853654
    *   pyscf_si222    mode_a    9.257495
@@ -589,7 +581,7 @@ namespace bdft_tests {
    *
    * Tolerance 1e-5 eV: the references are quoted to 1e-6 eV, and the failure this guards
    * against (an out-of-strip state silently evaluated at eps instead of mu) moves the gap by
-   * O(0.1-1 eV) or diverges the loop. The eta_far > 0 cells are a MEASUREMENT, not a gate --
+   * O(0.1-1 eV) or diverges the loop. The eta_far > 0 cells are a MEASUREMENT, not a check --
    * they live in [.etafar_scan] below.
    */
   TEST_CASE("qp_map_etafar_identity", "[methods][qpgw][qp_map_ab][etafar]") {
@@ -599,7 +591,7 @@ namespace bdft_tests {
     constexpr double tol = 1e-5;   // eV
 
     auto check = [&](std::string const &fix, std::string const &map, double gap, double ref) {
-      app_log(1, "@@ETAFAR0 [{}/{}] gap = {:.6f} eV, reference (690ade1) = {:.6f} eV, "
+      app_log(1, "@@ETAFAR0 [{}/{}] gap = {:.6f} eV, reference = {:.6f} eV, "
                  "d = {:+.2e} eV", fix, map, gap, ref, gap - ref);
       REQUIRE(std::abs(gap - ref) < tol);
     };
@@ -627,14 +619,15 @@ namespace bdft_tests {
 
   /**
    * ==========================================================================================
-   * MEASUREMENT (hidden, run explicitly): THE eta_far SCAN of spec rev 4
+   * MEASUREMENT (hidden, run explicitly): THE eta_far SCAN
    * ==========================================================================================
    * eta_far in {0, 1.8e-3, 3.7e-3, 7.3e-3} a.u. (= 0, 0.05, 0.1, 0.2 eV), full loops, both
    * maps. Reports convergence, the final gap and its drift vs eta_far, the tau anchor, the
    * IN-STRIP anti-Hermitian residual, max|Im Sigma| off strip, the measured pole spacing and
    * the out-of-strip census. On these fixtures the gaps are huge and few states sit near the
-   * strip boundary, so little movement is EXPECTED -- the real target is the kp222 judge
-   * rerun. One section per (fixture, map); run them one at a time:
+   * strip boundary, so little movement is EXPECTED -- the scan matters on denser k meshes
+   * with states near the strip boundary. One section per (fixture, map); run them one at a
+   * time:
    *
    *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
    *       <build>/tests/bin/test_methods_qp_map_ab "qp_map_etafar_scan" -c lih222_mode_a
@@ -656,7 +649,7 @@ namespace bdft_tests {
                                conv_tol, "tau", "_ef" + std::to_string(c), 0.0, -1.0, 1e-10,
                                0, etas[c], false));
       }
-      app_log(1, "\n== rev-4 eta_far scan: {} / {} ==", fixture, map);
+      app_log(1, "\n== eta_far scan: {} / {} ==", fixture, map);
       app_log(1, "{:>12} {:>10} {:>12} {:>12} {:>10} {:>10} {:>7} {:>11} {:>11} {:>11} {:>11}",
               "eta_far (eV)", "gap (eV)", "d vs eta=0", "outer conv", "inner dmax", "taudev",
               "n_eta", "antiherm", "im_off", "spacing", "eta/spacing");
@@ -685,8 +678,8 @@ namespace bdft_tests {
    *
    * ONE CELL PER PROCESS, selected by the environment variable COQUI_MODEA_CELL:
    * a cell whose W^c fit is too coarse trips the anchor check in qp_scf_common.cpp and
-   * MPI_Aborts, which is exactly the behaviour the failing default-cell gate must KEEP, so
-   * the sweep is driven from outside instead of weakening the check. Every number the sweep
+   * MPI_Aborts, which is the intended behaviour of that check, so the sweep is driven from
+   * outside instead of weakening the check. Every number the sweep
    * needs is on the "@@MODEA_CELL" line, which the driver emits before any abort can happen.
    *
    * cell = iw*9 + ir*3 + ie  over  wfit {tau, nu} x wrtol {1e-8, 1e-6, 1e-4}
@@ -727,18 +720,18 @@ namespace bdft_tests {
    * MEASUREMENT (on hold, run explicitly): THE W^c SLAB LOW-RANK SCAN
    * ==========================================================================================
    * The mode-A context build is dominated by the (Np,Np)x(Np,nbnd) sandwich, whose cost is
-   * nqpts*nbnd*npk*8*Np*nbnd*(Np+nbnd) flops per owned (s,k) -- 1.2e14 at the production
-   * (nbnd 60, Np 2918, nq 8, npk 60), i.e. the measured ~45 min/iteration. Factoring each
+   * nqpts*nbnd*npk*8*Np*nbnd*(Np+nbnd) flops per owned (s,k) -- 1.2e14 at nbnd 60,
+   * Np 2918, nq 8, npk 60. Factoring each
    * residue slab as W^(p) = V S V^dag and contracting through V makes that r/Np of the dense
    * cost (wc_band_elements.hpp, stage 1b + the header's flop model).
    *
-   * This case measures the two things that decision rests on, on a fixture small enough that
+   * This case measures the two things that choice rests on, on a fixture small enough that
    * the EXACT eigendecomposition is affordable:
    *   (i)   the eigenvalue decay of the slabs -- the "rank ladder" line of every context
    *         build reports max/mean rank at |lambda| >= {1e-2 ... 1e-10} * max|lambda|;
    *   (ii)  the gap moved by the truncation, against the dense reference path (wrank <= 0),
-   *         and the agreement of the RANDOMIZED backend (the production one, which the
-   *         gates cannot reach because they run below detail::wslab_dense_max) with the
+   *         and the agreement of the RANDOMIZED backend (the one used at large Np, which
+   *         the checked cases never reach because they run below detail::wslab_dense_max) with the
    *         exact one at the same tolerance.
    *
    *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
@@ -761,8 +754,8 @@ namespace bdft_tests {
         {"exact heev,  wrank = 1e-8", 1e-8, -1},
         {"sketch 32 -> heev fallback", 1e-10, 32},
     };
-    // NOT a cell: wrank = 1e-4 ABORTS (measured) -- the tau anchor of qp_approx fires at
-    // 3.6e-1 against its 10 x 4.4e-3 gate. That is the intended interlock: an over-aggressive
+    // NOT a cell: wrank = 1e-4 ABORTS -- the tau anchor of qp_approx fires at 3.6e-1
+    // against its 10 x 4.4e-3 bound. That is the intended interlock: an over-aggressive
     // slab truncation is a CONTRACTION error to the anchor, and it stops the run rather than
     // quietly shifting the spectrum. The knob cannot silently buy speed with accuracy.
     std::vector<ab_row> rows;
@@ -781,7 +774,7 @@ namespace bdft_tests {
               cells[c].name, rows[c].gap_eV(), rows[c].gap_eV() - rows[0].gap_eV(),
               rows[c].lr.wrank_max, rows[c].lr.wrank_mean, rows[c].lr.wtrunc,
               rows[c].lr.t_fac, rows[c].lr.t_sand);
-    // the DEFAULT cut (cell 2) must not move the gap at the resolution the QM3 gates compare at
+    // the DEFAULT cut (cell 2) must not move the gap at the 1e-6 eV resolution of the mode_a checks
     REQUIRE(std::abs(rows[2].gap_eV() - rows[0].gap_eV()) < 1e-6);
     // ... and neither may the Hermitization on its own (cell 1)
     REQUIRE(std::abs(rows[1].gap_eV() - rows[0].gap_eV()) < 1e-6);
@@ -792,13 +785,13 @@ namespace bdft_tests {
    * MEASUREMENT (on hold, run explicitly): THE RANDOMIZED BACKEND AGAINST THE EXACT ONE
    * ==========================================================================================
    * detail::wslab_factorize takes LAPACK heev up to Np = 600 and the randomized Nystrom
-   * sketch above it, so the PRODUCTION backend is the one no fixture reaches by default.
+   * sketch above it, so the backend used at large Np is the one no fixture reaches by default.
    * Forcing the sketch on a fixture is only meaningful where it can actually resolve the
    * tail: the sketch doubles and then gives up to heev once 2l > Np, and at wrank = 1e-10
    * the fixture rank (~135 of 192) is above that ceiling, so the cut is loosened here until
    * the retained rank (~72 mean / 86 max of 192) is inside it -- the backend then reports
    * "mixed", the slabs that fit being sketched and the rest falling back. 1e-6 is as loose as
-   * this can go: at 1e-4 the tau anchor of qp_approx aborts the run (measured). One outer
+   * this can go: at 1e-4 the tau anchor of qp_approx aborts the run. One outer
    * iteration -- this compares two factorizations of the SAME W, not converged solutions.
    *
    *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
@@ -830,11 +823,12 @@ namespace bdft_tests {
    * ==========================================================================================
    * MEASUREMENT (on hold, run explicitly): DOES THE SLAB RANK SATURATE WITH Np?
    * ==========================================================================================
-   * THE question for the production sizes. The low-rank sandwich costs r/Np of the dense one,
+   * THE question for large systems. The low-rank sandwich costs r/Np of the dense one,
    * so the compression that matters is not r/Np at the fixture's Np -- it is whether r is set
-   * by the PHYSICS (a fixed number of screening modes per pole, so r/Np falls as 1/Np and the
-   * Np = 2918 production case wins by ~Np/r) or by the BASIS (r proportional to Np, so the
-   * ratio is frozen at whatever the fixture shows and kp444 needs a different idea).
+   * by the PHYSICS (a fixed number of screening modes per pole, so r/Np falls as 1/Np and a
+   * large-Np case, e.g. Np = 2918, wins by ~Np/r) or by the BASIS (r proportional to Np, so
+   * the ratio is frozen at whatever the fixture shows and large systems need another
+   * approach).
    *
    * Same cell, same everything, ONE outer iteration, THC prefactor swept: Np = 8/12/18/24
    * times nbnd. Only the auxiliary basis changes, so any growth of r with Np is basis-driven.
@@ -866,34 +860,32 @@ namespace bdft_tests {
       app_log(1, "{}", line);
     }
     app_log(1, "  [if the mean rank is FLAT down the columns the compression scales as 1/Np "
-               "and the production Np = 2918 wins by ~Np/r; if r/Np is flat it does not.]");
+               "and a large-Np run wins by ~Np/r; if r/Np is flat it does not.]");
   }
 
   /**
-   * WORK-SHARING GATE (stage 2 distribution): qe_lih222_sym has THREE (s,k) blocks and eight
+   * WORK-SHARING CHECK (stage 2 distribution): qe_lih222_sym has THREE (s,k) blocks and eight
    * (isym, q-in-star) pairs, so ANY run with more than three ranks makes the other ranks
    * helpers on somebody's block. That is the only configuration in this suite which exercises
    * the pair split and the per-pair group reduction of stage 2 -- lih222/si222 have 8 blocks
    * and lih223_sym 6, i.e. they need 9 / 7 ranks, which the ISDF setup of these fixtures does
-   * not survive on a laptop. One outer iteration; the gap and the anchor are rank-count
+   * not support. One outer iteration; the gap and the anchor are rank-count
    * invariants, so the SAME numbers must come out at -np 1 and -np 4:
    *
    *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 mpirun -np 4 \
    *       <build>/tests/bin/test_methods_qp_map_ab "qp_map_modea_worksharing"
    *
-   * [measured, 2026-08-13: gap 12.008579 eV and tau anchor 5.0378e-04 at both -np 1 and -np 2
-   *  (the anchor read 7.1816e-04 under the per-element normalization retired the same day --
-   *  see "THE GATE'S NORMALIZATION" in wc_band_elements.hpp; the gap is unchanged by it);
-   *  >= 4 ranks is not reachable on this laptop -- the ISDF setup of every mode_a fixture
-   *  aborts there (thc_reader_t::build, "create_plan_many: howmany=0"), which predates this
-   *  increment. A run-time tripwire in wc_band_elements.hpp checks the pair census of every
-   *  group instead, so a mis-split aborts rather than silently dropping a q.]
+   * [reference: gap 12.008579 eV and tau anchor 5.0378e-04 at both -np 1 and -np 2.
+   *  With >= 4 ranks the ISDF setup of every mode_a fixture aborts (thc_reader_t::build,
+   *  "create_plan_many: howmany=0"), independently of this map. A run-time tripwire in
+   *  wc_band_elements.hpp checks the pair census of every group instead, so a mis-split
+   *  aborts rather than silently dropping a q.]
    *
-   * The same case is ALSO the union-subspace agreement gate: qe_lih222_sym is the only fixture
+   * The same case is ALSO the union-subspace agreement check: qe_lih222_sym is the only fixture
    * in the suite with both D-matrix rotations and time-reversed q, so it is the only one that
    * exercises the wconj branch of the stage-1c contraction (the two unreduced fixtures never
    * enter it). At wunion = wrank the basis carries every direction the slab cut kept, to the
-   * same tolerance, so the two paths must agree at the resolution the QM3 gates compare at.
+   * same tolerance, so the two paths must agree at the 1e-6 eV resolution of the mode_a checks.
    */
   TEST_CASE("qp_map_modea_worksharing", "[methods][qpgw][qp_map_ab][modea2]") {
     using namespace qp_map_ab_detail;
@@ -901,8 +893,8 @@ namespace bdft_tests {
     imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_sym"));
     REQUIRE(mf->nkpts_ibz() < mf->nkpts());
-    // union ON at wunion = wrank (the restructure is OFF by default -- see the scan below --
-    // so it has to be asked for explicitly, and this case is where it is gated)
+    // union ON at wunion = wrank (the union subspace is OFF by default -- see the scan
+    // below -- so it has to be asked for explicitly, and this case is where it is checked)
     auto row = run_map(mpi_context, mf, ft, "mode_a", "qpscf", 12, 1e-10, 1, 1e-6, "tau", "_ws",
                        0.0, -1.0, 1e-10, 0, 0.0, true, 0.0);
     app_log(1, "@@WORKSHARE ranks = {}, (s,k) blocks = {}, (isym,q) pairs = {}: gap = {:.6f} eV,"
@@ -931,12 +923,12 @@ namespace bdft_tests {
    * whole restructure is worth R/Np -- and R is a function OF THE CUT, not of the cell: the
    * np_scan probe measures the stack rank saturating at 89 (1e-6) and 143 (1e-8) of Np = 384
    * while at the default 1e-10 it is Np itself (the retained tails of different poles are
-   * mutually orthogonal there). So this case is the one that decides the default: each cell
+   * mutually orthogonal there). So this case is the basis for choosing the default: each cell
    * runs the SAME full loop with a different qp_modea_wunion at fixed wrank = 1e-10, and
    * reports the gap against the union-OFF reference together with R, the projection residual
    * and the tau anchor.
    *
-   * The reference cell is wunion < 0 = the per-slab stage-1b path of 18d35a3, so cell k minus
+   * The reference cell is wunion < 0 = the per-slab stage-1b path, so cell k minus
    * cell 0 IS the union restructure's accuracy cost, isolated from everything else.
    *
    *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
@@ -948,11 +940,11 @@ namespace bdft_tests {
     imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
 
-    // 1e-4 is NOT a cell: the tau anchor of qp_approx aborts the process there (measured for
-    // wrank; the union cut carries the same error class), and an abort loses the table.
+    // 1e-4 is NOT a cell: the tau anchor of qp_approx aborts the process there (as it does
+    // for wrank; the union cut carries the same error class), and an abort loses the table.
     struct cell { const char *name; double wunion; };
     const std::vector<cell> cells = {
-        {"union OFF (per-slab, 18d35a3)", -1.0},
+        {"union OFF (per-slab)", -1.0},
         {"wunion = wrank = 1e-10", 0.0},
         {"wunion = 1e-8", 1e-8},
         {"wunion = 1e-6", 1e-6},
@@ -977,8 +969,8 @@ namespace bdft_tests {
               rows[c].lr.union_R_max / double(std::max(rows[c].lr.Np, 1L)),
               rows[c].lr.union_tail, rows[c].lr.tau_dev, rows[c].lr.t_union,
               rows[c].lr.t_sand);
-    app_log(1, "  [the DEFAULT is the loosest cell whose gap still sits inside the 1e-5 eV "
-               "gate band of qp_map_etafar_identity AND whose tau anchor is inside its own "
+    app_log(1, "  [a sound DEFAULT is the loosest cell whose gap still sits inside the 1e-5 eV "
+               "tolerance of qp_map_etafar_identity AND whose tau anchor is inside its own "
                "10 x reconstruction-class interlock.]");
     // the exact cell (wunion = wrank) must reproduce the per-slab path: at that cut the union
     // basis spans every retained direction, so the restructure is algebra, not truncation
@@ -986,11 +978,11 @@ namespace bdft_tests {
   }
 
   /**
-   * SYMMETRY SMOKE GATE (sanctioned extension): the ANCHOR on qe_lih223_sym, one outer
+   * SYMMETRY SMOKE CHECK: the ANCHOR on qe_lih223_sym, one outer
    * iteration, mode_a default cell. Both qp_map_ab fixtures are unreduced meshes (8 k-points,
    * 8 in the IBZ), so they never enter the isym loop, the D-matrix external rotation
-   * XCe = X(ks) D C(k), or the time-reversal conj branches of the contraction. This case is
-   * the first thing that does; without it the kp222 judge would be.
+   * XCe = X(ks) D C(k), or the time-reversal conj branches of the contraction. This case
+   * exercises them.
    */
   TEST_CASE("qp_map_modeb_sym_anchor", "[methods][qpgw][qp_map_ab][modeb]") {
     using namespace qp_map_ab_detail;
@@ -1012,19 +1004,18 @@ namespace bdft_tests {
   }
 
   /**
-   * THE GAMMA-HEAD GATE (2026-08-13). Until today the head augmentation of stage 1
-   * (wc_band_elements.hpp, "Gamma head") was the ONE code path of the map that no gate
-   * touched: every QM3 fixture and the QM3-c judge run div_treatment = ignore_g0, where the
-   * head is absent on BOTH sides by construction. It is also the only place where this map
-   * and the reference build the same physics by DIFFERENT routes -- the map adds
+   * THE GAMMA-HEAD CHECK. The head augmentation of stage 1 (wc_band_elements.hpp,
+   * "Gamma head") is exercised only here: every other case runs div_treatment = ignore_g0,
+   * where the head is absent on BOTH sides by construction. It is also the only place where
+   * this map and the reference build the same physics by DIFFERENT routes -- the map adds
    * W^head_PQ(tau) = nk madelung eps_inv_head(tau) conj(chi_P) chi_Q into the q = Gamma slab
    * and lets it ride through the ordinary contraction, while gw_t::Sigma_div_correction
-   * (thc_gw.icc:444-531) forms -madelung eps_inv_head(tau) T G T^dag directly at each IBZ k.
-   * The tau anchor is exactly the comparison that closes that loop, so it is now run with the
-   * head ON. Same fixture as the qp_map_ab gates, no symmetry (12 k, 12 in the IBZ).
+   * (thc_gw.icc) forms -madelung eps_inv_head(tau) T G T^dag directly at each IBZ k.
+   * The tau anchor is exactly the comparison that closes that loop, so it is run here with
+   * the head ON. qe_lih223, no symmetry (12 k, 12 in the IBZ).
    *
-   * [measured 2026-08-13, block-normalized semantics: anchor 3.4578e-04, ratio 0.158 of the
-   *  gate, from an absolute deviation of 7.11e-05 a.u. on a block scale of 2.057e-01 -- against
+   * [reference: anchor 3.4578e-04, ratio 0.158 of the bound, from an absolute deviation of
+   *  7.11e-05 a.u. on a block scale of 2.057e-01 -- against
    *  4.1824e-04 from 6.77e-05 a.u. on 1.620e-01 with the head OFF. The head adds ~27% to
    *  |Sigma| and moves the absolute deviation by < 5%.]
    */
@@ -1035,7 +1026,7 @@ namespace bdft_tests {
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih223"));
     auto row = run_map(mpi_context, mf, ft, "mode_b", "qpscf", 12, 1e-10, 1, 1e-6, "tau",
                        "_head", 0.0, -1.0, 1e-10, 0, 0.0, true, -1.0, "gygi");
-    app_log(1, "mode_b GAMMA HEAD gate (div_treatment = gygi): TAU ANCHOR = {:.4e}, W-fit "
+    app_log(1, "mode_b GAMMA HEAD check (div_treatment = gygi): TAU ANCHOR = {:.4e}, W-fit "
                "reconstruction class = {:.4e}, ratio = {:.3g}", row.lr.tau_dev,
             row.lr.anchor_expect,
             (row.lr.anchor_expect > 0.0 ? row.lr.tau_dev / row.lr.anchor_expect : 0.0));
@@ -1043,19 +1034,17 @@ namespace bdft_tests {
   }
 
   /**
-   * THE SYMMETRY LADDER (post-mortem of the kp444 tau-anchor abort, 2026-08-13). Three
-   * fixtures of the SAME cell and the SAME 2x2x3 mesh, differing only in how the mesh is
-   * reduced, so the W-fit class is (nearly) common and the tau deviation is attributable:
+   * THE SYMMETRY LADDER. Three fixtures of the SAME cell and the SAME 2x2x3 mesh, differing
+   * only in how the mesh is reduced, so the W-fit class is (nearly) common and the tau
+   * deviation is attributable:
    *
    *    qe_lih223       12 k, 12 IBZ, no reduction        -> isym loop and trev branches DEAD
    *    qe_lih223_inv   12 k,  8 IBZ, time reversal only  -> trev branches LIVE, no D
    *    qe_lih223_sym   12 k,  6 IBZ, 2 q-symmetries      -> D-matrix external rotation LIVE
    *
-   * [measured 2026-08-13, block-normalized semantics: 4.1824e-04 / 4.1824e-04 / 4.1827e-04
-   *  at a common W-fit class of 3.8581e-03 (ratio 0.108). The sym row is not vacuous -- its
-   *  census reads "D-rotation exercised on 4 of 6 (isym > 0, k) pairs, worst max|D - 1| = 2.0".
-   *  The same rows read 6.3697 / 6.3697 / 6.3703e-04 under the per-element normalization
-   *  retired the same day.]
+   * [reference: 4.1824e-04 / 4.1824e-04 / 4.1827e-04 at a common W-fit class of 3.8581e-03
+   *  (ratio 0.108). The sym row is not vacuous -- its census reads "D-rotation exercised on
+   *  4 of 6 (isym > 0, k) pairs, worst max|D - 1| = 2.0".]
    *
    * REPORTS only (hidden case, run explicitly by name).
    */
@@ -1086,16 +1075,15 @@ namespace bdft_tests {
   }
 
   /**
-   * Gate QM3-b(v) -- the two MEASUREMENTS that binding requirement 2 of the QM3 spec asks for,
-   * on lih222/qpscf:
+   * Two accuracy MEASUREMENTS of mode_a, on lih222/qpscf:
    *   (a) the DLR-precision notch: the fixture grid ("medium") and one notch higher ("high").
    *       Accuracy of the route-B evaluation is auxiliary-node COVERAGE of the retained
    *       support, so this is the knob that moves it -- not the DLR eps by itself.
-   *   (b) the two qp_modea_wfit routes at the fixture grid: "tau" (the QM2-b tested chain,
-   *       the default) and "nu" (the nu-space support-constrained LS, 3x better in the QM2
-   *       toy probe at equal grid).
-   * Each row REPORTS the triple (anchor, worst delta_i/class_i, gap). The DEFAULT IS NOT
-   * FLIPPED here -- that is a reported decision, per the spec.
+   *   (b) the two qp_modea_wfit routes at the fixture grid: "tau" (the default, the chain
+   *       tested in route_b_fitted_W_chain) and "nu" (the nu-space support-constrained LS,
+   *       ~3x more accurate on the toy model at equal grid).
+   * Each row REPORTS the triple (anchor, worst delta_i/class_i, gap); the default is not
+   * changed here.
    */
   TEST_CASE("qp_map_modea_measurements", "[.modea_hold]") {
     using namespace qp_map_ab_detail;
@@ -1120,7 +1108,7 @@ namespace bdft_tests {
                             "tau", "_h_tau")});
     }
 
-    app_log(1, "\n== QM3-b(v) mode_a measurement table (lih222 / qpscf) ==");
+    app_log(1, "\n== mode_a accuracy measurement table (lih222 / qpscf) ==");
     app_log(1, "{:<34} {:>11} {:>11} {:>8} {:>10} {:>12} {:>10}", "variant", "anchor",
             "rec class", "ratio", "d_i/cls", "gap (eV)", "nodes");
     for (auto const &m : ms) {

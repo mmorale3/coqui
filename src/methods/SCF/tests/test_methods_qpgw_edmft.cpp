@@ -36,31 +36,29 @@
 #include "methods/mb_state/mb_state.hpp"
 
 /**
- * Project 2 increment Q4 (notes/q4_edmft_skeleton_spec.md): the EDMFT skeleton's C++ half.
- * The qpGW+BSE lattice stage wired into the GW+EDMFT embedding machinery, and the ladder
- * half of the eq-7 bosonic double counting.
+ * qpGW+BSE as the lattice stage of GW+EDMFT: the qpGW+BSE loop wired into the embedding
+ * machinery, and the ladder half of the bosonic double counting.
  *
- * Gates (spec section 3), measure-first-then-gate throughout:
- *   Q4-a    C = empty: a qpgw run with screen_type = "gw_edmft" + a bosonic projector and
- *           NO local polarizabilities is EXACTLY the plain screen_type = "rpa" qpGW+BSE
- *           run -- == on the observables and on every ladder meter, ladder ON and OFF.
- *           (A raw h5 bit-compare is not required: the MBState constructor differs.)
- *   Q4-c3   (i)   additivity/no-leak: the trace of the stored P^lad_loc against the SAME
- *                 contraction taken in the other order and through the primary basis
- *                 (t^dag Pl t, then B^dag . B) -- machine class;
- *           (ii)  empty ladder window => pi_lad_loc ABSENT and everything bitwise;
- *           (iii) ||P^lad_loc|| / ||P_dc,bubble|| logged (the ladder column of the PDF
- *                 section 8.3 cancellation-load meter).
+ * Checks:
+ *   C = empty   a qpgw run with screen_type = "gw_edmft" + a bosonic projector and NO local
+ *               polarizabilities is EXACTLY the plain screen_type = "rpa" qpGW+BSE run --
+ *               == on the observables and on every ladder meter, ladder ON and OFF.
+ *               (A raw h5 bit-compare is not required: the MBState constructor differs.)
+ *   P^lad_loc   (i)   additivity/no-leak: the trace of the stored P^lad_loc against the
+ *                     SAME contraction taken in the other order and through the primary
+ *                     basis (t^dag Pl t, then B^dag . B) -- machine class;
+ *               (ii)  empty ladder window => pi_lad_loc ABSENT and everything bitwise;
+ *               (iii) ||P^lad_loc|| / ||P_dc,bubble|| logged (the ladder share of the
+ *                     double-counting cancellation load).
  *
- * On P^lad_loc's convention: meter (iii) is what showed the stored object carries the
- * upfold's ||B||^2 gain, and the R-Q4-2 AMENDMENT consequently rules it NOT a DC
- * contribution (increment Q4-C3b delivers the orbital/chi-convention one). It is retained
- * as the interface diagnostic, its only consumer is opt-in and off by default
- * (downfold_edmft_impl's pi_lad_dc), and the gates below are unchanged: they pin the
+ * On P^lad_loc's convention: the stored object carries the upfold's ||B||^2 gain, so it is
+ * NOT a double-counting contribution (test_methods_qpgw_c3b covers the orbital /
+ * chi-convention one). It is retained as the interface diagnostic, its only consumer is
+ * opt-in and off by default (downfold_edmft_impl's pi_lad_dc), and the checks below pin the
  * CONTRACTION (additivity, absence, bitwise), which is convention-independent.
  *
  * ==========================================================================================
- * HOW TO RUN (Catch2 v2 traps) -- MEASURED, do not "improve" the command
+ * HOW TO RUN (Catch2 v2 traps) -- do not "improve" the command
  * ==========================================================================================
  *
  *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 <build>/tests/bin/test_methods_qpgw_edmft
@@ -85,32 +83,32 @@ namespace bdft_tests {
       // the update_w readouts / injection meters of the LAST screening step
       double eps_rpa = -1.0, eps_ladder = -1.0, eps_loop = -1.0;
       double lam_nu0 = -1.0, lam_max = -1.0, r_rt = -1.0, lad_ratio = -1.0;
-      // Q4 C3
+      // the local ladder P^lad_loc
       bool lad_loc_present = false;
       long lad_loc_h5_iters = -1;   // scf/iterN groups carrying pi_lad_loc_wabcd
       double lad_loc_max = -1.0, lad_loc_ratio = -1.0;
-      // gate Q4-c3(i): the two contraction orders and their scale
+      // check (i): the two contraction orders and their scale
       double tr_dev = -1.0, tr_scale = -1.0;
       // DIAGNOSTIC (reported, never gated): the upfold metric s(q) = B(q)^dag B(q) and the
-      // magnitude of the metric-corrected (least-squares inverse) downfold, for the eq-7
-      // scale question recorded with the Q4 report.
+      // magnitude of the metric-corrected (least-squares inverse) downfold, which answers
+      // whether the stored object sits on the scale of the double-counting bubble.
       double s_max = -1.0, lad_loc_ls_max = -1.0;
       double gap_eV() const { return (e_lumo - e_homo) * HA2EV; }
     };
 
     /**
      * One qpGW run. wannier_file empty => the plain (projector-less) MBState of the [qpgw]
-     * driver; non-empty => the projector-carrying MBState of the Q4 branch, with NO local
+     * driver; non-empty => the projector-carrying MBState of the embedding path, with NO local
      * polarizabilities set (the C = empty leg: update_w's checkpoint-miss path plus
      * eval_Pi_qdep's "corrections not found" skip).
      *
      * With extra_w, ONE more screening step runs outside the loop -- on the loop's own final
-     * spectrum, exactly as the Q3 suite does -- and the meters are re-read from it. Legs
+     * spectrum, exactly as test_methods_qpgw_bse does -- and the meters are re-read from it. Legs
      * whose METERS are compared must set it the SAME way: the extra step re-derives mu with
      * update_mu(0.0, ...) instead of inheriting the loop's, so the two sampling points do
      * not agree bit for bit, and lambda_max in particular is a power iteration with a 1e-3
      * stopping test -- one sweep more or less moves it in the 9th digit.
-     * The C3 gates additionally need the extra step (they read the state the loop used).
+     * The P^lad_loc checks additionally need the extra step (they read the state the loop used).
      */
     inline q4_row run_q4(auto &mpi_context, std::shared_ptr<mf::MF> &mf,
                          imag_axes_ft::IAFT &ft, std::string const &tag,
@@ -169,7 +167,7 @@ namespace bdft_tests {
         h5::h5_read(scf_grp, "final_iter", row.final_iter);
         auto iter_grp = scf_grp.open_group("iter" + std::to_string(row.final_iter));
         nda::h5_read(iter_grp, "E_ska", E_ska);
-        // C3: the eq-7 ladder DC has to REACH the checkpoint -- it is how python's DC
+        // the ladder DC object has to REACH the checkpoint -- it is how python's DC
         // assembly and a separate-process downfold_2e see it at all.
         row.lad_loc_h5_iters = 0;
         for (long it = 0; it <= row.final_iter; ++it) {
@@ -208,7 +206,7 @@ namespace bdft_tests {
         row.lad_loc_ratio = scr_eri.pol_lad_loc_ratio();
         row.lad_loc_present = mb_state.sPi_lad_loc_wabcd.has_value();
 
-        // ---- gate Q4-c3(i): the additivity / no-leak identity ---------------------------
+        // ---- check (i): the additivity / no-leak identity -------------------------------
         // The stored P^lad_loc is assembled with the Y = t(q) B(q) shortcut, one q at a
         // time, accumulating the abcd TENSOR. The reference below takes the SAME sum in
         // the other order and through the PRIMARY basis: form the upfolded ladder
@@ -229,10 +227,10 @@ namespace bdft_tests {
           const long nw_h = Pl.shape(0), Nm = Pl.shape(2), Np = tmap.shape(2);
           const long nq_full = mf->nqpts(), n = pb.nImpOrbs();
 
-          // DIAGNOSTIC, reported and never gated (see the Q4 report): the upfold's metric
+          // DIAGNOSTIC, reported and never checked: the upfold's metric
           // s(q) = B(q)^dag B(q) on the local pair index. upfold_pi_local maps a local Pi
           // to B Pi B^dag, so its LEAST-SQUARES INVERSE is s^-1 B^dag . B s^-1, not the
-          // plain adjoint B^dag . B that C3 stores. ||s|| is the gain between the two, and
+          // plain adjoint B^dag . B that is stored. ||s|| is the gain between the two, and
           // it decides whether the stored object sits on the scale of bubble[G_loc].
           const long nab = n * n;
           nda::matrix<ComplexType> sinv_q(nab, nab), Dls(nab, nab);
@@ -292,12 +290,12 @@ namespace bdft_tests {
           }
           row.tr_dev = std::abs(tr_loc - tr_q);
           row.tr_scale = scale;
-          app_log(1, "@@Q4C3(i) [{}] Tr P^lad_loc: tensor route = {:.12e} {:+.12e}i, "
+          app_log(1, "@@LADDER_DC_TRACE [{}] Tr P^lad_loc: tensor route = {:.12e} {:+.12e}i, "
                      "primary-basis route = {:.12e} {:+.12e}i; |d| = {:.3e}, "
                      "sum |Tr| = {:.3e} (relative {:.3e})", tag,
                   tr_loc.real(), tr_loc.imag(), tr_q.real(), tr_q.imag(),
                   row.tr_dev, scale, row.tr_dev / std::max(scale, 1e-300));
-          app_log(1, "@@Q4SCALE [{}] upfold metric ||B^dag B||_max = {:.4e}; stored "
+          app_log(1, "@@LADDER_DC_METRIC [{}] upfold metric ||B^dag B||_max = {:.4e}; stored "
                      "(adjoint) ||P^lad_loc||_max = {:.4e}; least-squares-inverse "
                      "||s^-1 B^dag . B s^-1||_max = {:.4e} (ratio adjoint/LS = {:.3e})",
                   tag, row.s_max, row.lad_loc_max, row.lad_loc_ls_max,
@@ -319,15 +317,15 @@ namespace bdft_tests {
 
   /**
    * ==========================================================================================
-   * GATE Q4-a -- C = empty reproduces qpGW+BSE EXACTLY (and Q4-c3)
+   * C = empty reproduces qpGW+BSE EXACTLY (and the P^lad_loc checks)
    * ==========================================================================================
    * screen_type = "gw_edmft" with a bosonic projector but no impurity/DC polarizability is
    * arithmetically the RPA lattice problem: eval_Pi_qdep logs the "corrections not found"
-   * note and adds nothing. The Q4 seam refactor moved the ladder kernel build AND the
-   * injection into eval_Pi_qdep, and the edmft branch sits BETWEEN them, so this leg is what
-   * proves the ladder still lands on the same Pi in the embedding screen mode.
+   * note and adds nothing. eval_Pi_qdep builds the ladder kernel AND performs the injection,
+   * and the edmft branch sits BETWEEN them, so this leg is what proves the ladder still
+   * lands on the same Pi in the embedding screen mode.
    *
-   * The C3 accumulation runs in the projector legs only (it needs B(q)); it writes no
+   * The P^lad_loc accumulation runs in the projector legs only (it needs B(q)); it writes no
    * lattice quantity, so the observables must be untouched by its presence.
    */
   TEST_CASE("qpgw_edmft_cempty_lih222", "[methods][qpgw][edmft]") {
@@ -341,12 +339,12 @@ namespace bdft_tests {
     auto [outdir, prefix] = utils::utest_filename("qe_lih222");
     const std::string wannier_file = outdir + "/lih_wan.h5";
 
-    // ---- ladder OFF: the structural no-op leg (Q4-c3(ii)) ------------------------------
+    // ---- ladder OFF: the structural no-op leg (check (ii)) -----------------------------
     auto off_rpa = run_q4(mpi_context, mf, ft, "off_rpa", "rpa", "", "none", "none",
                           nda::range(0, 0), 12, 1e-10, 20, 1e-6);
     auto off_edmft = run_q4(mpi_context, mf, ft, "off_edmft", "gw_edmft", wannier_file,
                             "none", "none", nda::range(0, 0), 12, 1e-10, 20, 1e-6, true);
-    app_log(1, "@@Q4A ladder OFF: e_hf rpa = {}, gw_edmft = {} (d = {:.3e}); gap "
+    app_log(1, "@@EDMFT_CEMPTY ladder OFF: e_hf rpa = {}, gw_edmft = {} (d = {:.3e}); gap "
                "{:.9f} vs {:.9f} eV (d = {:.3e})", off_rpa.e_hf, off_edmft.e_hf,
             std::abs(off_edmft.e_hf - off_rpa.e_hf), off_rpa.gap_eV(),
             off_edmft.gap_eV(), std::abs(off_edmft.gap_eV() - off_rpa.gap_eV()));
@@ -357,7 +355,7 @@ namespace bdft_tests {
     // no ladder was ever built, in either leg
     REQUIRE(off_rpa.lam_nu0 == -1.0);
     REQUIRE(off_edmft.lam_nu0 == -1.0);
-    // Q4-c3(ii): no window => no P^lad_loc object at all, in MBState or the checkpoint
+    // check (ii): no window => no P^lad_loc object at all, in MBState or the checkpoint
     REQUIRE(not off_edmft.lad_loc_present);
     REQUIRE(off_edmft.lad_loc_max == -1.0);
     REQUIRE(off_edmft.lad_loc_h5_iters == 0);
@@ -372,7 +370,7 @@ namespace bdft_tests {
     auto on_edmft = run_q4(mpi_context, mf, ft, "on_edmft", "gw_edmft", wannier_file,
                            "ladder", "ladder_n2", nda::range(1, 3), 12, 1e-10, 20, 1e-6,
                            true);
-    app_log(1, "@@Q4A ladder ON: e_hf rpa = {}, gw_edmft = {} (d = {:.3e}); gap {:.9f} vs "
+    app_log(1, "@@EDMFT_CEMPTY ladder ON: e_hf rpa = {}, gw_edmft = {} (d = {:.3e}); gap {:.9f} vs "
                "{:.9f} eV (d = {:.3e}); meters lam_nu0 {:.9f}/{:.9f}, r_rt {:.3e}/{:.3e}, "
                "||P^lad||/||P^RPA|| {:.6e}/{:.6e}", on_rpa.e_hf, on_edmft.e_hf,
             std::abs(on_edmft.e_hf - on_rpa.e_hf), on_rpa.gap_eV(), on_edmft.gap_eV(),
@@ -393,12 +391,12 @@ namespace bdft_tests {
     REQUIRE(on_edmft.r_rt == on_rpa.r_rt);
     REQUIRE(on_edmft.lad_ratio == on_rpa.lad_ratio);
 
-    // ---- Q4-c3(i)/(iii): the ladder DC object ------------------------------------------
-    app_log(1, "@@Q4C3(iii) ||P^lad_loc||_max = {:.6e} (no bubble P_dc in the C = empty "
+    // ---- checks (i)/(iii): the ladder DC object ----------------------------------------
+    app_log(1, "@@LADDER_DC_SCALE ||P^lad_loc||_max = {:.6e} (no bubble P_dc in the C = empty "
                "leg, ratio = {:.3e}); additivity |d| = {:.3e} at scale {:.3e}",
             on_edmft.lad_loc_max, on_edmft.lad_loc_ratio, on_edmft.tr_dev,
             on_edmft.tr_scale);
-    app_log(1, "@@Q4C3 checkpoint: scf/iterN groups carrying pi_lad_loc_wabcd = {} "
+    app_log(1, "@@LADDER_DC checkpoint: scf/iterN groups carrying pi_lad_loc_wabcd = {} "
                "(gw_edmft+ladder), {} (rpa+ladder, no projector), {} (gw_edmft, no ladder)",
             on_edmft.lad_loc_h5_iters, on_rpa.lad_loc_h5_iters,
             off_edmft.lad_loc_h5_iters);
@@ -409,9 +407,9 @@ namespace bdft_tests {
     // no projector => nothing to downfold onto, so nothing is written
     REQUIRE(on_rpa.lad_loc_h5_iters == 0);
     REQUIRE(on_edmft.tr_scale > 0.0);
-    // the two contraction orders must agree at machine class relative to the traced scale.
-    // MEASURED: see the @@Q4C3(i) line; the gate is 10x the measured relative deviation,
-    // floored at the double-precision accumulation class of an Np^2 sum.
+    // the two contraction orders must agree at machine class relative to the traced scale
+    // (see the @@LADDER_DC_TRACE line): 10x the reference relative deviation, floored at the
+    // double-precision accumulation class of an Np^2 sum.
     REQUIRE(on_edmft.tr_dev < 1e-12 * on_edmft.tr_scale);
 #endif
   }

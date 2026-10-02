@@ -37,25 +37,25 @@
 #include "methods/vertex/vertex_t.h"
 
 /**
- * Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md): the Option-2 outer loop,
- * C++ half -- the re-QP-ization step. The qpGW driver gained
+ * The re-QP-ization step of the "option2" GW+EDMFT outer loop. The qpGW driver accepts
  * `greens_func_source` / `greens_func_iteration`; when set, ITERATION 1 of qp_scf_loop
  * consumes the EXTERNAL G of that checkpoint group (its density matrix drives the HF stage,
- * eq 3's Sigma^H[rho_latt]; update_w and the Sigma^GW build screen with the same G) and
+ * Sigma^H[rho_latt]; update_w and the Sigma^GW build screen with the same G) and
  * iterations >= 2 revert to the loop's own analytic QP G.
  *
- * Gates (spec §3), measure-first-then-gate throughout:
- *   Q5-g1  SOURCE-SWAP IDENTITY -- the falsifier for the whole injection. Feed the loop the
- *          very G it would have built itself and require the iteration to come out
- *          unchanged. Any deviation means the injection path differs from the analytic path
- *          (mu handling, Dm, or a stale field).
- *   Q5-g2  RESTART COMPOSITION -- one niter = 6 run == 3 x (niter = 2, restart), ladder ON.
- *          This IS the C = empty-set Option-1-vs-Option-2 insensitivity statement (PDF
- *          §5.1 + §7: with zero impurity corrections the outer loop is continued qp
- *          iteration), and it is what licenses running the qpGW stage inside every cycle.
+ * Checks:
+ *   source swap          Feed the loop the very G it would have built itself and require
+ *                        the iteration to come out unchanged. Any deviation means the
+ *                        injection path differs from the analytic path (mu handling, Dm,
+ *                        or a stale field).
+ *   restart composition  one niter = 6 run == 3 x (niter = 2, restart), ladder ON. With
+ *                        zero impurity corrections the option2 outer loop is a continued
+ *                        qp iteration, so this is the statement that "option1" and
+ *                        "option2" agree at C = empty set, and it is what licenses running
+ *                        the qpGW stage inside every cycle.
  *
  * ==========================================================================================
- * HOW TO RUN (Catch2 v2 traps) -- MEASURED, do not "improve" the command
+ * HOW TO RUN (Catch2 v2 traps) -- do not "improve" the command
  * ==========================================================================================
  *
  *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 <build>/tests/bin/test_methods_qpgw_q5
@@ -64,20 +64,20 @@
  * them, and two positional test names are silently concatenated into one (unmatched) name.
  *
  * ==========================================================================================
- * ENVIRONMENT-BLOCKED LEG (spec §5, recorded -- NOT gated here)
+ * NOT RUN HERE: sensitivity near the metal-insulator transition
  * ==========================================================================================
- * Q5-a (sensitivity near the transition) needs a correlated metal + QMC, i.e. a TRIQS host.
- * Protocol for rusty, svo fixtures, CT-SEG mode (a):
+ * This needs a correlated metal and a QMC impurity solver (TRIQS). Protocol, svo fixtures,
+ * CT-SEG solver:
  *
  *   1. Build the GW checkpoint:   coqui.run_gw(..., prefix="svo", niter=...).
- *   2. Option-1 trail:  run_gw_edmft(params | {"lattice_solver": "qpgw",
+ *   2. option1 trail:   run_gw_edmft(params | {"lattice_solver": "qpgw",
  *                                              "outer_loop": "option1", "niter": 8}).
- *   3. Option-2 trail:  the same params with "outer_loop": "option2"
- *                       (+ "outer_qpgw_niter": 1, iter_alg.mixing 0.3 -- PDF §7).
- *   4. Compare the per-cycle H_eff trails (gap(H_eff) of the Q5-b log block):
- *        - metallic side  => the two trails agree = the insensitivity statement;
- *        - near the transition => they separate = the restored gap -> Drude-loss ->
- *          U-growth feedback of PDF §5.3.
+ *   3. option2 trail:   the same params with "outer_loop": "option2"
+ *                       (+ "outer_qpgw_niter": 1, iter_alg.mixing 0.3).
+ *   4. Compare the per-cycle H_eff trails (gap(H_eff) in the per-cycle log block):
+ *        - metallic side  => the two trails agree;
+ *        - near the transition => they separate (restored gap -> loss of Drude weight ->
+ *          growth of the screened U).
  *   The full C = empty-set option2 end-to-end run command is recorded in
  *   src/python/dmft/tests/test_q5_outer_loop.py.
  */
@@ -102,18 +102,18 @@ namespace bdft_tests {
     };
 
     /**
-     * One qp_scf_loop on qe_lih222, with the Q3 ladder knobs and the Q5 external-G knobs.
-     * The THC/solver wiring is the [qpgw] driver's, copied from the Q3 suite's run_qpgw
-     * (test_methods_qpgw_bse.cpp) so the two suites screen with the same objects.
+     * One qp_scf_loop on qe_lih222, with the ladder knobs and the external-G knobs.
+     * The THC/solver wiring is the [qpgw] driver's, copied from run_qpgw in
+     * test_methods_qpgw_bse.cpp so the two suites screen with the same objects.
      *
-     * NOTE ON mu: qp_params_t's default mu_update_alg is "bisection" (qp_params_t.h:49) and
-     * update_mu_bisection_impl returns old_mu UNCHANGED when |N(old_mu) - N| < mu_tol
-     * (scf_common.hpp:81-84). That is what makes Q5-g1 a sharp gate: the restart-init mu is
-     * bitwise the checkpointed mu, so read_greens_function's on-the-fly analytic G (built
-     * from the checkpointed MO_skia/E_ska/mu, scf_common.cpp:440-459) is bitwise the G the
-     * loop's own update_G would build in iteration 1.
+     * NOTE ON mu: qp_params_t's default mu_update_alg is "bisection", and
+     * update_mu_bisection_impl returns old_mu UNCHANGED when |N(old_mu) - N| < mu_tol.
+     * That is what makes the source-swap check sharp: the restart-init mu is bitwise the
+     * checkpointed mu, so read_greens_function's on-the-fly analytic G (built from the
+     * checkpointed MO_skia/E_ska/mu) is bitwise the G the loop's own update_G would build in
+     * iteration 1.
      *
-     * The checkpoint is NOT removed here -- Q5-g1/g2 chain restarts onto it. Every TEST_CASE
+     * The checkpoint is NOT removed here -- both test cases chain restarts onto it. Every TEST_CASE
      * cleans up its own prefixes at the end.
      */
     inline q5_row run_qp(auto &mpi_context, std::shared_ptr<mf::MF> &mf,
@@ -199,22 +199,22 @@ namespace bdft_tests {
     };
 
     /**
-     * Decompose the Q5-g1 deviation BEFORE gating it. Two independent probes on the
+     * Decompose the source-swap deviation BEFORE checking it. Two independent probes on the
      * checkpointed qp solution (MO_skia, E_ska, mu) of `output`:
      *
      *  (1) g_read_resid -- does the injected G equal the analytic G bit for bit? The
-     *      production read path (read_greens_function, scf_common.cpp:440-459) finds no
+     *      production read path (read_greens_function) finds no
      *      G_tskij dataset in a qp checkpoint and rebuilds G from (MO_skia, E_ska, mu) with
      *      the SAME update_G the loop calls. This must be exactly 0.0; if it is not, the
      *      injection is reading a different state than the loop would build.
      *
      *  (2) dm_floor -- the density-matrix CONVENTION difference. The qp loop uses
      *      update_Dm = C f(E) C^dag; an external G supports only the Dyson convention
-     *      Dm = -G(tau -> beta) (simple_dyson.cpp:143-145). Analytically the two are the
+     *      Dm = -G(tau -> beta) (as in simple_dyson). Analytically the two are the
      *      same matrix (G(beta) = -C f C^dag exactly, from update_G's compute_G0), so their
      *      difference is PURELY the IAFT tau -> beta extrapolation error, i.e. the DLR
      *      leakage of a spectrum whose poles reach e_span >> wmax. That is the floor the
-     *      Q5-g1 deviation must sit under.
+     *      source-swap deviation must sit under.
      */
     inline g1_probe probe_analytic_g(auto &mpi_context, std::shared_ptr<mf::MF> &mf,
                                      imag_axes_ft::IAFT &ft, std::string const &output,
@@ -305,23 +305,23 @@ namespace bdft_tests {
 
   /**
    * ==========================================================================================
-   * GATE Q5-g1 -- THE SOURCE-SWAP IDENTITY (the falsifier for the whole injection)
+   * THE SOURCE-SWAP IDENTITY (the falsifier for the whole injection)
    * ==========================================================================================
    * Run A: 2 qp iterations, ac_pade, qe_lih222, from scratch -> checkpoint "scf/iter2"
-   *        (Dm_skij / Heff_skij / MO_skia / E_ska / mu; chkpt_utils.cpp:108-130 -- a qp
-   *        checkpoint carries NO G_tskij, so read_greens_function takes its second branch
-   *        and REBUILDS the analytic G from (MO_skia, E_ska, mu), scf_common.cpp:440-459).
+   *        (Dm_skij / Heff_skij / MO_skia / E_ska / mu -- a qp checkpoint carries NO
+   *        G_tskij, so read_greens_function takes its second branch and REBUILDS the
+   *        analytic G from (MO_skia, E_ska, mu)).
    * Run B: restart onto a private copy of that checkpoint WITH greens_func_source = "scf".
    * Run C: restart onto a private copy WITHOUT the knob (the plain continuation).
    *
    * G_ext is by construction the G that iteration 1 would have built itself, so B and C must
    * agree. The one place they can legitimately differ is the DENSITY MATRIX convention:
    * C uses update_Dm = C f(E) C^dag, B uses the Dyson convention Dm = -G(tau -> beta)
-   * (simple_dyson.cpp:143-145), the only one a GENERAL external G supports. Analytically
+   * (as in simple_dyson), the only one a GENERAL external G supports. Analytically
    * the two are the same matrix; numerically they differ by the IAFT tau -> beta
    * extrapolation. probe_analytic_g() measures BOTH halves of that story before anything is
-   * gated -- the G path (which must be bitwise) and the Dm floor (which must account for
-   * everything that is left) -- so the gate below is a decomposition, not a tolerance.
+   * checked -- the G path (which must be bitwise) and the Dm floor (which must account for
+   * everything that is left) -- so the check below is a decomposition, not a tolerance.
    */
   TEST_CASE("qpgw_q5_source_swap_lih222", "[methods][qpgw][q5]") {
 #ifndef ENABLE_DLR
@@ -339,7 +339,7 @@ namespace bdft_tests {
                      2, false, 1e-10);
     REQUIRE(rA.final_iter == 2);
 
-    // ---- decompose the deviation BEFORE gating it (measure first) ----------------------
+    // ---- decompose the deviation BEFORE checking it -------------------------------------
     auto probe = probe_analytic_g(mpi_context, mf, ft, pa);
     const double dm_floor = probe.dm_floor;
     // ... and the SAME Dm probe on a DLR window wide enough to actually span the spectrum:
@@ -347,8 +347,8 @@ namespace bdft_tests {
     // code path), widening wmax must collapse it.
     imag_axes_ft::IAFT ft_wide(1000.0, 4.0 * std::ceil(probe.e_span), imag_axes_ft::dlr_basis);
     const double dm_floor_wide = probe_analytic_g(mpi_context, mf, ft_wide, pa, false).dm_floor;
-    app_log(1, "@@Q5G1 |read_greens_function - update_G|_max = {:.3e}", probe.g_read_resid);
-    app_log(1, "@@Q5G1 Dm convention floor |C f C^dag - (-G(beta))|_max = {:.3e} "
+    app_log(1, "@@SOURCE_SWAP |read_greens_function - update_G|_max = {:.3e}", probe.g_read_resid);
+    app_log(1, "@@SOURCE_SWAP Dm convention floor |C f C^dag - (-G(beta))|_max = {:.3e} "
                "(wmax = 1.2, max|E - mu| = {:.3f}); same probe at wmax = {:.1f}: {:.3e}",
             dm_floor, probe.e_span, 4.0 * std::ceil(probe.e_span), dm_floor_wide);
 
@@ -365,7 +365,7 @@ namespace bdft_tests {
     REQUIRE(rB.final_iter == 3);
     REQUIRE(rC.final_iter == 3);
     // the restart-init mu must be bitwise the checkpointed one (bisection early-exit) --
-    // otherwise the external G is built at a DIFFERENT mu than the loop's and the gate below
+    // otherwise the external G is built at a DIFFERENT mu than the loop's and the check below
     // would be measuring mu drift instead of the injection.
     REQUIRE(rB.mu == rC.mu);
 
@@ -373,11 +373,11 @@ namespace bdft_tests {
     const double d_E   = max_abs_diff(rB.E_ska, rC.E_ska);
     const double d_Dm  = max_abs_diff(rB.Dm_skij, rC.Dm_skij);
     const double d_gap = std::abs(rB.gap_eV() - rC.gap_eV());
-    app_log(1, "@@Q5G1 external-G vs plain restart (iteration 3): d_e_hf = {:.3e}, "
+    app_log(1, "@@SOURCE_SWAP external-G vs plain restart (iteration 3): d_e_hf = {:.3e}, "
                "|dE_ska|_max = {:.3e}, |dDm|_max = {:.3e}, d_gap = {:.3e} eV "
                "(Dm floor = {:.3e})", d_e, d_E, d_Dm, d_gap, dm_floor);
 
-    // MEASURED 2026-08-14 (qe_lih222, ac_pade, 2+1 iterations, DLR beta = 1000, wmax = 1.2):
+    // Reference values (qe_lih222, ac_pade, 2+1 iterations, DLR beta = 1000, wmax = 1.2):
     //   |read_greens_function - update_G|_max = 0.000e+00   <-- BITWISE, see below
     //   max |E_ska - mu|                      = 2.220 Ha  (against wmax = 1.2)
     //   Dm convention floor (wmax =  1.2)     = 3.056e-06
@@ -395,14 +395,14 @@ namespace bdft_tests {
     // is the density-matrix CONVENTION -- C f(E) C^dag versus -G(tau -> beta) -- and the
     // whole 3.06e-06 of that difference is the DLR tau -> beta extrapolation of a spectrum
     // that reaches max|E - mu| = 2.22 Ha against a wmax = 1.2 window (the same leakage the
-    // Dyson path carries, simple_dyson.cpp:143-145: for a GENERAL external G that IS the
-    // only available convention). The wide-window probe above is the falsifier for that
+    // Dyson path carries in simple_dyson: for a GENERAL external G that IS the only
+    // available convention). The wide-window probe above is the falsifier for that
     // attribution. Every downstream deviation lands UNDER that floor.
     //
-    // Gate, in order of sharpness:
+    // Checks, in order of sharpness:
     //   (i)   the G path, bitwise -- this is the actual injection;
     //   (ii)  structural: nothing may exceed the Dm-convention floor;
-    //   (iii) absolute, at 10x the measured numbers (spec §3: measure, then gate).
+    //   (iii) absolute, at 10x the reference values.
     REQUIRE(probe.g_read_resid == 0.0);                       // (i)
     REQUIRE(dm_floor_wide < 1e-2 * dm_floor);                 // the attribution, falsified
     REQUIRE(d_e  <= dm_floor);                                // (ii)
@@ -413,10 +413,10 @@ namespace bdft_tests {
     REQUIRE(d_E  < 5.5e-6);
     REQUIRE(d_Dm < 2.2e-6);
     REQUIRE(d_gap < 7.3e-5);
-    // ... and the gate must not be vacuous: the iteration actually MOVED off the restart
+    // ... and the check must not be vacuous: the iteration actually MOVED off the restart
     // state, so a silently-skipped iteration cannot pass it.
     REQUIRE(rB.e_hf != rA.e_hf);
-    REQUIRE(std::abs(rB.e_hf - rA.e_hf) > 1e2 * dm_floor);   // MEASURED ratio 668
+    REQUIRE(std::abs(rB.e_hf - rA.e_hf) > 1e2 * dm_floor);   // reference ratio 668
 
     drop_chkpt(mpi_context, pa);
     drop_chkpt(mpi_context, pb);
@@ -426,13 +426,14 @@ namespace bdft_tests {
 
   /**
    * ==========================================================================================
-   * GATE Q5-g2 -- RESTART COMPOSITION (Option 1 vs Option 2 at C = empty set)
+   * RESTART COMPOSITION ("option1" vs "option2" outer loop at C = empty set)
    * ==========================================================================================
    * One niter = 6 run against 3 x (niter = 2, restart) on qe_lih222, ac_pade, ladder ON
-   * (pol_vertex = "ladder", inject = "ladder_n2", C = [1, 3) -- the Q3-b configuration).
+   * (pol_vertex = "ladder", inject = "ladder_n2", C = [1, 3) -- the configuration of
+   * qpgw_bse_inject_lih222).
    *
-   * Why this IS the Option-1/Option-2 statement (PDF §5.1 + §7): with no impurity correction
-   * the Option-2 outer cycle does nothing to the lattice stage except CUT IT INTO PIECES and
+   * Why this IS the option1/option2 statement: with no impurity correction the option2
+   * outer cycle does nothing to the lattice stage except CUT IT INTO PIECES and
    * restart it. If the pieces compose, then at C = empty set "H_eff re-derived every cycle"
    * and "H_eff derived once" reach the same fixed point -- which is exactly the
    * insensitivity claim, and what licenses moving the stage inside the cycle at all.
@@ -440,7 +441,7 @@ namespace bdft_tests {
    * The composition is not free: each restart re-reads H_eff from h5, re-canonicalizes, and
    * re-enters iter_alg damping against the checkpointed H_eff. Damping (iter_scf::damp_t)
    * carries no state beyond the checkpoint, so the chain reproduces the trajectory; a
-   * history-carrying mixer (DIIS) would NOT, and that is a real Option-2 constraint.
+   * history-carrying mixer (DIIS) would NOT, and that is a real constraint on option2.
    */
   TEST_CASE("qpgw_q5_restart_composition_lih222", "[methods][qpgw][q5]") {
 #ifndef ENABLE_DLR
@@ -459,7 +460,7 @@ namespace bdft_tests {
     auto one = run_qp(mpi_context, mf, ft, "g2_one(niter=6)", p1, "ladder", "ladder_n2",
                       win, 6, false, conv_tol);
 
-    // trajectory 2: 3 x (niter = 2, restart) -- the Option-2 outer cycle at C = empty set
+    // trajectory 2: 3 x (niter = 2, restart) -- the option2 outer cycle at C = empty set
     auto c1 = run_qp(mpi_context, mf, ft, "g2_chain(1/3)", p3, "ladder", "ladder_n2",
                      win, 2, false, conv_tol);
     auto c2 = run_qp(mpi_context, mf, ft, "g2_chain(2/3)", p3, "ladder", "ladder_n2",
@@ -470,15 +471,15 @@ namespace bdft_tests {
     const double d_e   = std::abs(one.e_hf - c3.e_hf);
     const double d_gap = std::abs(one.gap_eV() - c3.gap_eV());
     const double d_E   = max_abs_diff(one.E_ska, c3.E_ska);
-    app_log(1, "@@Q5G2 one-shot   : final iter {}, e_hf = {:.12f}, gap = {:.9f} eV",
+    app_log(1, "@@RESTART_CHAIN one-shot   : final iter {}, e_hf = {:.12f}, gap = {:.9f} eV",
             one.final_iter, one.e_hf, one.gap_eV());
-    app_log(1, "@@Q5G2 3x restart : final iter {}, e_hf = {:.12f}, gap = {:.9f} eV "
+    app_log(1, "@@RESTART_CHAIN 3x restart : final iter {}, e_hf = {:.12f}, gap = {:.9f} eV "
                "(legs: {:.9f} -> {:.9f} -> {:.9f} eV)",
             c3.final_iter, c3.e_hf, c3.gap_eV(), c1.gap_eV(), c2.gap_eV(), c3.gap_eV());
-    app_log(1, "@@Q5G2 composition: d_e_hf = {:.3e}, d_gap = {:.3e} eV, |dE_ska|_max = {:.3e}",
+    app_log(1, "@@RESTART_CHAIN composition: d_e_hf = {:.3e}, d_gap = {:.3e} eV, |dE_ska|_max = {:.3e}",
             d_e, d_gap, d_E);
 
-    // MEASURED 2026-08-14 (qe_lih222, ac_pade, ladder ON, C = [1,3), conv_thr = 1e-6):
+    // Reference values (qe_lih222, ac_pade, ladder ON, C = [1,3), conv_thr = 1e-6):
     //   one-shot   : final iter 6, e_hf = -4.276441914522236, gap = 11.797325416 eV
     //   3x restart : final iter 6, e_hf = -4.276441914522236, gap = 11.797325416 eV
     //                legs 11.785135844 -> 11.793459924 -> 11.797325416 eV
@@ -486,15 +487,13 @@ namespace bdft_tests {
     // The chain composes BITWISE: damping is stateless beyond the checkpoint, and the
     // restart-init re-derivation is exact (update_MOs on the checkpointed H_eff reproduces
     // MO/E, and update_mu's bisection early-exit returns the checkpointed mu untouched --
-    // MEASURED mu = 0.100000000000 at every leg). The spec's conv_thr class (1e-6) is the
-    // ceiling it must beat; the gate is set at the measured class, i.e. equality.
+    // mu = 0.100000000000 at every leg). The conv_thr class (1e-6) is the ceiling it must
+    // beat; the check is set at equality.
     // The absolute energies above carry ~1e-14 run-to-run noise (FP reduction order); the
-    // gate is INTRA-run (both trajectories in one process), so that noise cancels.
-    // d_gap alone is held to one ulp of the ~12 eV gap rather than equality: on the
-    // python-enabled rusty build (coqui_edmft, 2026-08-17) it measures 6.450e-16 eV with
-    // d_e and d_E still exactly 0.0 -- i.e. gap_eV() alone is build-sensitive at sub-ulp
-    // level even on bitwise-identical E_ska (attributed pre-existing by rebuilding the
-    // unmodified source; same class as the FFTW_MEASURE bitwise-gate finding).
+    // check is INTRA-run (both trajectories in one process), so that noise cancels.
+    // d_gap alone is held to one ulp of the ~12 eV gap rather than equality: on some builds
+    // it is ~6e-16 eV with d_e and d_E still exactly 0.0 -- gap_eV() alone is
+    // build-sensitive at sub-ulp level even on bitwise-identical E_ska.
     REQUIRE(one.final_iter == c3.final_iter);
     REQUIRE(d_e == 0.0);
     REQUIRE(d_gap <= 2e-15);
