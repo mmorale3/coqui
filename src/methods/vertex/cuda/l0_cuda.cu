@@ -69,7 +69,7 @@ namespace methods::solvers::dynbse_cuda {
       atomicAdd(reinterpret_cast<double *>(p) + 1, v.y);
     }
 
-    // nca = the number of ACTIVE input components packed into Vt (P-3a); act[il] = their global component index
+    // nca = the number of ACTIVE input components packed into Vt; act[il] = their global component index
     // c (0 = the constant, 1 + f np + a = node a of family f). A frequency-constant input packs one component.
     struct kdims { long nc, nR, np, ng, nca, blk, nk, np_fit; long const *act; };
 
@@ -166,7 +166,7 @@ namespace methods::solvers::dynbse_cuda {
           const long nj = gnode[pole];
           const double ej = epsG[pole];
           const cd q = Qk[pole * W + src];
-          // the vectors the production multiplications act on
+          // the vectors dynbse.hpp's mulU / mulT act on
           const cd vU = (which_pass == 0) ? q : neg(q);                   // U_j . Q_j   |  - U_l . R_l
           const cd vT = (which_pass == 0) ? Bk[pole * W + src] : inu * q;  // T_j . B_j   |  i nu T_l . R_l
           cd *AUnj = &AU[abase + nj * blk + e], *ATnj = &AT[abase + nj * blk + e];
@@ -431,7 +431,7 @@ namespace methods::solvers::dynbse_cuda {
       }
     }
 
-    // ---- the small-nu fold (D2f): T_a with |eps_a| >= ratio |nu| folded into the U family ------------
+    // ---- the small-nu fold: T_a with |eps_a| >= ratio |nu| folded into the U family ------------
     // grid (np, K): after the assembly of this batch (a separate launch, so every contribution to
     // F.fam(1, a) is in). Reads family 1, writes family 0 (atomics) and zeroes its own family-1 slot.
     __global__ void tfold_kernel(kdims d, long ik0, long K, cd inu, double tfold,
@@ -460,13 +460,12 @@ namespace methods::solvers::dynbse_cuda {
     }
 
     // =================================================================================================================
-    // THE FUSED OUTPUT-STATIONARY L0 PASSES (gpu port 2026-09-27; notes/gpu_port_plan.md section 4e). The nsys / ncu
-    // profile of the batched-gemm + scatter passes: the per-pole 8 x 8 gemms are memory-bound on the materialized
-    // Pj / Qj / Bj (ng K W elements each, ~260 GB of traffic per expensive application) and the scatter kernels are
-    // L2-atomic-bound (every component adds into the same pole-indexed targets). Here one block per (r, k) owns every
+    // THE FUSED OUTPUT-STATIONARY L0 PASSES. In the batched-gemm + scatter passes the per-pole nc x nc gemms are
+    // memory-bound on the materialized Pj / Qj / Bj (ng K W elements each) and the scatter kernels are L2-atomic-bound
+    // (every component adds into the same pole-indexed targets). Here one block per (r, k) owns every
     // accumulator element e = (x', r, y') of its slice -- no atomics -- and forms the per-pole products in registers:
     //   pass 0: P(y, x') = sum_x V(x, y) gk_j(x, x'),  Q(x', y') = sum_y Ghat_j(y, y') P(y, x'),
-    //           B(x', y') = sum_y gkq_j(y', y) P(y, x')                      (the gemms Pj, Qj, Bj of the old pass)
+    //           B(x', y') = sum_y gkq_j(y', y) P(y, x')                      (the gemms Pj, Qj, Bj of the batched pass)
     //   pass 1: P(y, x') = sum_x V(x, y) Gtil_j(x', x),  R(x', y') = sum_y gkq_j(y', y) P(y, x')   (Pl, Rl)
     // Threads: G groups of S x nc slots (S = the power of two >= nc, the shuffle segment); thread (x', y') of a group
     // computes P(y = y', x') and gets P(y, x') for every y from its segment by shuffles. The groups split the
@@ -475,7 +474,7 @@ namespace methods::solvers::dynbse_cuda {
     // (at nj = gnode[j]) accumulate over the group's components in registers, are summed over the groups in shared
     // memory and added once; the component-indexed targets (at the component's node a) accumulate over the poles in
     // registers and are added once per chunk, the groups in turn. Every term is the scatter's product with the
-    // scatter's coefficient; only the summation order differs from the old passes (rounding class).
+    // scatter's coefficient; only the summation order differs from the batched-gemm passes (rounding level).
     // =================================================================================================================
     constexpr int FZ_NCOEF = 6;
 
@@ -527,8 +526,8 @@ namespace methods::solvers::dynbse_cuda {
     template <bool NU0>
     struct fz_acc { static constexpr int n = NU0 ? 5 : 7; };
 
-    // MINB blocks of 256 threads per SM: the register budget (ncu p1gpu_ncu9: at 176 registers / thread ONE block fitted,
-    // 12.5 % occupancy, 75 % of the cycles without an eligible warp -- latency-bound, not FP64-bound)
+    // MINB blocks of 256 threads per SM: caps the register budget. The kernel is latency-bound, not FP64-bound; without the
+    // cap a high register count leaves one resident block per SM and most cycles without an eligible warp.
     template <bool NU0, int CHG, int MINB>
     __global__ void __launch_bounds__(256, MINB)
     fused_pass_kernel(kdims d, long ik0, long K, int pass, cd inu, bool skip_cst, int S, int G,
@@ -771,9 +770,9 @@ namespace methods::solvers::dynbse_cuda {
       const long nc2 = nc * nc, CH = long(G) * CHG, nacc = nu0 ? 5 : 7;
       return size_t(CH * nc2 + 4 * nc2 + CH * FZ_NCOEF + nacc * long(G) * S * nc) * sizeof(cd);
     }
-    // the fused kernel's variants: cfg = 10 CHG + MINB (components per thread x minimum 256-thread blocks per SM). H100 PCIe,
-    // Si kp444 C = 8 (p1gpu_n3w / n3x): 81 34 ms, 82 25 ms, 42 11.6 ms, 43 9.9 ms, 44 9.3 ms per k-batch; the Sigma-side L0
-    // 68.8 s at 42 vs 65.0 s at 44 over a run -> 44 (4 blocks / SM, 80 registers, spills) is the default
+    // the fused kernel's variants: cfg = 10 CHG + MINB (components per thread x minimum 256-thread blocks per SM). The
+    // default 44 (4 blocks / SM, at the price of register spills) is the fastest variant on H100-class devices; the
+    // fz_bench switch times every variant on the current device.
     template <bool NU0, int CHG, int MINB>
     void fz_launch(dim3 grid, unsigned threads, kdims kd, long ik0, long Kb, int pass, cd inu, bool skip_cst, int S, int G,
                    cd const *Vt, cd const *gk, cd const *gkq, cd const *Ghat, cd const *Gtil, cd const *coef, long const *gnode,
@@ -818,7 +817,7 @@ namespace methods::solvers::dynbse_cuda {
         }
       };
       static bool benched[2] = {false, false};
-      // a representative batch: >= 16 active components (the first batch of a run can be constant-only; p1gpu_n3w benched nca 1)
+      // a representative batch: >= 16 active components (the first batch of a run can be constant-only)
       if (bench and not benched[nu0 ? 1 : 0] and kd.nca >= std::min<long>(16, 1 + kd.np)) {
         benched[nu0 ? 1 : 0] = true;
         const size_t accb = size_t(Kb) * size_t(2 * kd.np * kd.blk) * sizeof(cd);
@@ -955,9 +954,8 @@ namespace methods::solvers::dynbse_cuda {
     if (budget < per_k) K = 1;                           // one k must fit; the allocation will say if not
 
     // The per-batch working set, allocated with a RETRY: the budget above assumes an exclusive device, but
-    // several ranks may share one GPU (P-1 of the gpu port, 2026-09-25: two ranks sized their batches from
-    // the same cudaMemGetInfo at the same instant and the second cudaMalloc of Pj failed with
-    // cudaErrorMemoryAllocation). On a failed allocation everything of the attempt is freed and K is halved,
+    // several ranks may share one GPU (ranks that size their batches from the same cudaMemGetInfo at the same
+    // instant can over-commit it). On a failed allocation everything of the attempt is freed and K is halved,
     // down to K = 1, which must fit (abort otherwise).
     cd *dVt = nullptr, *dPj = nullptr, *dQj = nullptr, *dBj = nullptr, *dgjT = nullptr, *dglT = nullptr, *dGh = nullptr;
     cd *dAU = nullptr, *dAT = nullptr, *dM2 = nullptr, *dA1 = nullptr, *dA3 = nullptr, *dT = nullptr;
@@ -1122,7 +1120,7 @@ namespace methods::solvers::dynbse_cuda {
 
 
   // =====================================================================================================================
-  // THE DEVICE-RESIDENT UNIT (l0_cuda.cuh, gpu port plan section 4d). Part 1: the resident L0 plan -- the kernels above,
+  // THE DEVICE-RESIDENT UNIT (l0_cuda.cuh). Part 1: the resident L0 plan -- the kernels above,
   // driven on DEVICE buffers with the tables uploaded once per unit and the working set allocated once per engine.
   // =====================================================================================================================
   namespace {
@@ -1145,7 +1143,7 @@ namespace methods::solvers::dynbse_cuda {
     __global__ void conj_kernel(long n, cd *__restrict__ x) {
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) x[e] = cuConj(x[e]);
     }
-    // factorize-vertex: tau-slice permutation Fs (nt, D, nR) <-> P (D, nt, nR) with slot order slot_of[i]
+    // tau-slice permutation Fs (nt, D, nR) <-> P (D, nt, nR) with slot order slot_of[i]
     __global__ void rung_perm_kernel(long nt, long D, long nR, long const *__restrict__ slot_of, cd const *__restrict__ Fs,
                                      cd *__restrict__ P, bool inverse) {
       const long tot = nt * D * nR;
@@ -1191,7 +1189,6 @@ namespace methods::solvers::dynbse_cuda {
       for (long i = blockIdx.x * long(blockDim.x) + threadIdx.x; i < D; i += long(gridDim.x) * blockDim.x)
         M[i * D + i] = M[i * D + i] + real(1.0);
     }
-    // max |a - b| and max |a| over n elements into red[0], red[1] (non-negative doubles: the bit patterns order like the values)
     // the max over a block (blockDim.x a multiple of 32, <= 1024); valid in thread 0. Non-negative doubles order like their
     // bit patterns, so the grid-wide max is an atomicMax on the bits (one per block).
     __device__ inline double block_max(double v) {
@@ -1206,9 +1203,10 @@ namespace methods::solvers::dynbse_cuda {
         for (int o = 16; o > 0; o >>= 1) v = fmax(v, __shfl_down_sync(0xffffffffu, v, o));
       return v;
     }
-    // audit B5: fmax drops NaN -- the meters map a non-finite entry to +inf (kept by fmax / atomicMax on the bit pattern), and
+    // fmax drops NaN -- the meters map a non-finite entry to +inf (kept by fmax / atomicMax on the bit pattern), and
     // the host readback (meter_value) aborts on a non-finite meter
     __device__ inline double nan_inf(double x) { return isfinite(x) ? x : __longlong_as_double(0x7ff0000000000000LL); }
+    // max |a - b| and max |a| over n elements into red[0], red[1] (non-negative doubles: the bit patterns order like the values)
     __global__ void maxdiff_kernel(long n, cd const *__restrict__ a, cd const *__restrict__ b, unsigned long long *__restrict__ red) {
       double num = 0.0, den = 0.0;
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) {
@@ -1231,7 +1229,7 @@ namespace methods::solvers::dynbse_cuda {
     inline unsigned grid_for(long n) { return unsigned(std::min<long>((n + 255) / 256, 65535)); }
     inline unsigned grid_red(long n) { return unsigned(std::max<long>(1, std::min<long>((n + 255) / 256, 1024))); }
 
-    /** audit B5: a device meter's value; a non-finite one (NaN / inf in the reduced data) aborts with what was measured */
+    /** a device meter's value; a non-finite one (NaN / inf in the reduced data) aborts with what was measured */
     inline double meter_value(unsigned long long u, char const *what) {
       double d = 0.0;
       std::memcpy(&d, &u, sizeof(d));
@@ -1454,7 +1452,7 @@ namespace methods::solvers::dynbse_cuda {
 
   // ---- Part 2: the engine (l0_cuda.cuh). Column-major cuBLAS on the host's ROW-MAJOR memory: a row-major (r x c) block is the
   // column-major (c x r) transpose, so the host's C = A B is issued as C^T = B^T A^T on the same buffers.
-  // D-3: the Sigma deposits' device state (ue_sd_*); every buffer is in `allocs` (freed by ue_destroy)
+  // the Sigma deposits' device state (ue_sd_*); every buffer is in `allocs` (freed by ue_destroy)
   struct sd_state {
     bool on = false, has_T = false;
     sd_config c;
@@ -1472,7 +1470,7 @@ namespace methods::solvers::dynbse_cuda {
     std::vector<void *> allocs;
   };
 
-  // D-1b: the rung builds' device state (ue_kb_*)
+  // the rung builds' device state (ue_kb_*)
   struct kb_state {
     bool on = false;
     long ns = 0, nq = 0, Nm = 0, nrep = 0, KC = 0;
@@ -1487,7 +1485,7 @@ namespace methods::solvers::dynbse_cuda {
     long legs_ik0 = -1;                                      // the k chunk whose legs U1 / U2 hold (-1: none valid)
   };
 
-  // factorize-vertex: the dressed-leg Gamma_1 readout on the device (ue_dressed_prepare / ue_gamma1_dressed)
+  // the dressed-leg Gamma_1 readout on the device (ue_dressed_prepare / ue_gamma1_dressed)
   struct dressed_state {
     bool on = false;
     long ng = 0, nR_max = 0;
@@ -1502,7 +1500,7 @@ namespace methods::solvers::dynbse_cuda {
     sd_state sd;
     kb_state kb;
     dressed_state dr;
-    // factorize-vertex: the mirror-pair rung (rung_pair) and the frequency-factorized rung (rr = R > 0: Kds holds K_r, ctr (nt, R))
+    // the mirror-pair rung (rung_pair) and the frequency-factorized rung (rr = R > 0: Kds holds K_r, ctr (nt, R))
     bool rung_pair = true;
     long rr = 0;
     cd *ctr = nullptr;
@@ -1550,7 +1548,7 @@ namespace methods::solvers::dynbse_cuda {
     long ncol_max = 0;
     cd *yfam1 = nullptr, *ycst1 = nullptr, *Fbig = nullptr, *Ybig = nullptr;
     long *dslot = nullptr;                                   // slot_of (nt) on the device
-    // stream mode (R1(b)): the rung through the caller's streaming engine; slot i = tau node i, slot nt = W_d0
+    // stream mode: the rung through the caller's streaming engine; slot i = tau node i, slot nt = W_d0
     bool stream = false;
     rung_stream *rs = nullptr;
   };
@@ -1577,7 +1575,7 @@ namespace methods::solvers::dynbse_cuda {
   }
 
 
-  // factorize-vertex: the device bytes of the stages created after the unit (one source of truth for their own checks and for
+  // the device bytes of the stages created after the unit (one source of truth for their own checks and for
   // the unit's memory partition, which keeps exactly this much free for them)
   double ue_kb_bytes(long ns, long nq, long Nm, long nk, long nc, long nrep) {
     const long nc2 = nc * nc;
@@ -1695,7 +1693,7 @@ namespace methods::solvers::dynbse_cuda {
     e->red = dalloc<unsigned long long>(2, "ue red");
     size_t fr = 0, tot = 0;
     cu_check(cudaMemGetInfo(&fr, &tot), "ue memgetinfo");
-    // audit B1: size the resident L0 k-batch from what is left AFTER the bytes kept for the later device stages (rung builds,
+    // size the resident L0 k-batch from what is left AFTER the bytes kept for the later device stages (rung builds,
     // Sigma deposits, dressed legs: c.reserve_bytes, computed by the caller)
     const double l0_room = std::max(0.0, double(fr) - c.reserve_bytes);
     e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, l0_room, c.l0_fused != 0, c.l0_asm_gemm != 0, c.l0_fused == 2);
@@ -1806,7 +1804,7 @@ namespace methods::solvers::dynbse_cuda {
   }
 
   namespace {
-    // the active component list of an L0 input (the host kernels' P-3a scan): flags over (cst, fam) on the device, the
+    // the active component list of an L0 input (the host kernels' active-component scan): flags over (cst, fam) on the device, the
     // list on the host. nu0: component 1 + a is the FOLDED family (fam0 or fam1 of node a non-zero).
     long ue_active(unit_engine *e, long nR, cd const *cst, cd const *fam, std::vector<long> &act) {
       const long np = e->c.np, n = e->D * nR, ncomp = (fam == nullptr) ? 1 : 1 + 2 * np;
@@ -1832,7 +1830,7 @@ namespace methods::solvers::dynbse_cuda {
                                           X, int(nR), (long long)(nc2 * nR), e->Cbk, int(nc2), (long long)(nc2 * nc2), &beta,
                                           out, int(nR), (long long)(nc2 * nR), int(nk)), "ue Cb . X");
     }
-    // L0 of (fam, cst) into (F, Fs), then the constant part's frequency sum through Cb (the production Cb_cst route)
+    // L0 of (fam, cst) into (F, Fs), then the constant part's frequency sum through Cb (the host's Cb_cst route)
     void ue_l0(unit_engine *e, long nR, cd const *fam, cd const *cst, cd *F, cd *Fs, double *tl0) {
       std::vector<long> act;
       const double t0 = wnow();
@@ -1852,7 +1850,7 @@ namespace methods::solvers::dynbse_cuda {
                 "ue transpose Fs");
       if (cusolverDnZgetrs(e->cs, CUBLAS_OP_T, int(D), int(nR), e->M, int(D), e->ipiv, e->Y, int(D), e->dinfo) != CUSOLVER_STATUS_SUCCESS)
         APP_ABORT(std::string(" ue_ts: cusolverDnZgetrs failed."));
-      {   // audit B7: getrs' devInfo (an illegal argument is reported there, not in the status)
+      {   // getrs' devInfo (an illegal argument is reported there, not in the status)
         int info = 0;
         cu_check(cudaMemcpy(&info, e->dinfo, sizeof(int), cudaMemcpyDeviceToHost), "ue_ts getrs info");
         if (info != 0) APP_ABORT(" ue_ts: cusolverDnZgetrs devInfo = " + std::to_string(info) + " -- ABORTING.");
@@ -2189,7 +2187,7 @@ namespace methods::solvers::dynbse_cuda {
     if (want_r1) {
       // the ONE BARE dynamic rung (T_s = 0, one application): y_r1 = K_d(F, Fsum) of L0 D, Gsum_r1 = Fsum[L0(y_r1; D + y_r1.cst)].
       // F / Fsum are only read; y and F2 are scratch here (both are rewritten below). Its refit error is not reported (the
-      // host pass's meter was discarded too).
+      // host pass discards that meter as well).
       (void)ue_kd(e, nR, e->Ffam, e->Fsum, e->yfam, e->ycst, tim);
       t0 = wnow();
       add2_kernel<<<grid_for(W), 256>>>(W, e->Dblk, e->ycst, e->Xcst);
@@ -2234,7 +2232,7 @@ namespace methods::solvers::dynbse_cuda {
   }
 
   // =====================================================================================================================
-  // D-3: the Sigma deposits on the device (l0_cuda.cuh). Row-major host layouts throughout; cuBLAS sees their column-major
+  // The Sigma deposits on the device (l0_cuda.cuh). Row-major host layouts throughout; cuBLAS sees their column-major
   // transposes. Index conventions (D = nk nc2, W = D nR, row = k nc2 + x nc + y):
   //   Acst / DW (D, nR); DWp (nk, i, c, nR) = DW(k; c nc + i, r); Aw (nw_f, D, nR); Fw / Ft (nw_f | nt, nk, y, c, nR)
   //   Y (a, k) col-major (nc2 x nc2): Y(c i, x j); Ym (a, k) col-major: Ym(i j, c x); Mb (a, k, j, q = i nc + j)
@@ -2273,7 +2271,7 @@ namespace methods::solvers::dynbse_cuda {
                   double const *epsG, double free_bytes, char *why, long why_len) {
     auto &s = e->sd;
     if (c.nk != e->c.nk or c.nc != e->c.nc or c.np != e->c.np or c.nt != e->c.nt or c.ng != e->c.ng) {
-      APP_ABORT(std::string(" ue_sd_init: the Sigma deposit sizes differ from the engine's (internal inconsistency) -- ABORTING."));   // audit B3
+      APP_ABORT(std::string(" ue_sd_init: the Sigma deposit sizes differ from the engine's (internal inconsistency) -- ABORTING."));
       std::snprintf(why, size_t(why_len), "the deposit sizes differ from the engine's");
       return false;
     }
@@ -2520,7 +2518,7 @@ namespace methods::solvers::dynbse_cuda {
 
 
   // =====================================================================================================================
-  // D-1b: the rung builds (l0_cuda.cuh). b = (k - k0) nk + k' over a chunk of k; U1 / U2 / WU2 (b, Nm, nc2) and wb (b, nc2, nc2)
+  // The rung builds (l0_cuda.cuh). b = (k - k0) nk + k' over a chunk of k; U1 / U2 / WU2 (b, Nm, nc2) and wb (b, nc2, nc2)
   // row-major; X is the spin slice (nk, Nm, nc).
   // =====================================================================================================================
   namespace {
@@ -2571,7 +2569,7 @@ namespace methods::solvers::dynbse_cuda {
     const long nk = e->c.nk, nc2 = e->nc2;
     if (nrep != e->c.ndist) {
       APP_ABORT(" ue_kb_init: rep count " + std::to_string(nrep) + " differs from the engine's ndist " + std::to_string(e->c.ndist) +
-                " (internal inconsistency) -- ABORTING.");   // audit B3
+                " (internal inconsistency) -- ABORTING.");
       std::snprintf(why, size_t(why_len), "rep count %ld differs from the engine's ndist %ld", nrep, e->c.ndist);
       return false;
     }
@@ -2830,7 +2828,7 @@ namespace methods::solvers::dynbse_cuda {
       fin_scale_kf_kernel<<<grid_for(nt * nb), 256>>>(nt, nsk, np, nc2, dKF, dE);
       launch_check("fin E");
       // ec (npf x nb) = Vs (npf x nkept) . [Ut (nkept x nt) . E (nt x nb)]: the fit's two factors applied in turn, as on the
-      // host -- the explicit product Vs Ut carries rounding ~eps / s_min whatever the data (p1gpu_n3s: E_corr moved 2.6e-8)
+      // host -- the explicit product Vs Ut carries rounding ~eps / s_min whatever the data
       cd *dU = upload_c(Ut, size_t(nkept * nt), "fin Ut");
       cd *dV = upload_c(Vs, size_t(npf * nkept), "fin Vs");
       cd *dg = dalloc<cd>(size_t(nkept * nb), "fin g");
@@ -2887,7 +2885,7 @@ namespace methods::solvers::dynbse_cuda {
 
 
   // =====================================================================================================================
-  // factorize-vertex: THE DRESSED-LEG GAMMA_1 READOUT ON THE DEVICE (the host twin: vertex_dynbse.icc dyn_dressed branch,
+  // THE DRESSED-LEG GAMMA_1 READOUT ON THE DEVICE (the host twin: vertex_dynbse.icc dyn_dressed branch,
   // dynbse.hpp build_dressed_grams / dressed_zt). Per block: d~ = D + T_s Cb D, r = L0 d~, y1 = K_d(r), then
   //   Zt = sum_n [ g_n^T Z^U_n Gh_n^T + (Gt_n^T (inu Z^T_n - Z^U_n) + g_n^T Z^T_n) g'_n^T ] + Cb y1.cst,  Z = H y1.fam,
   //   Pd (nout, nR) = e~^dag Zt.   e~ is built once per unit in conjugate space: conj(e~) = conj(D) + M^-T K_s^T Cb^T conj(D)
@@ -3000,7 +2998,7 @@ namespace methods::solvers::dynbse_cuda {
               "dr u = Ks^T w");
     if (cusolverDnZgetrs(e->cs, CUBLAS_OP_N, int(D), int(nout), e->M, int(D), e->ipiv, u, int(D), e->dinfo) != CUSOLVER_STATUS_SUCCESS)
       APP_ABORT(std::string(" ue_dressed_prepare: cusolverDnZgetrs failed."));
-    {   // audit B7
+    {   // getrs' devInfo (an illegal argument is reported there, not in the status)
       int info = 0;
       cu_check(cudaMemcpy(&info, e->dinfo, sizeof(int), cudaMemcpyDeviceToHost), "dr getrs info");
       if (info != 0) APP_ABORT(" ue_dressed_prepare: cusolverDnZgetrs devInfo = " + std::to_string(info) + " -- ABORTING.");

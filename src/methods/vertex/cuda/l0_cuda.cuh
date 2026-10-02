@@ -23,19 +23,18 @@
 
 /**
  * The device implementation of dynbse::l0_apply_shift_cols (the inu != 0 twisted {U, T} pair-pole
- * application, ~96 % of the Sigma-side dynamic-vertex solve; notes/gpu_port_plan.md section 5).
+ * application, the dominant cost of the Sigma-side dynamic-vertex solve).
  *
  * Plain pointers in, plain pointers out: the caller (dynbse.hpp) owns the nda arrays and hands over
  * their C-contiguous data; this header carries no CoQuí array types so that the .cu stays a small,
  * self-contained CUDA translation unit (built only with ENABLE_CUDA, target vertex_cuda).
  *
- * Structure (from bench/l0_miniapp/l0_gpu.cu, measured 0.64 s per application at the Si 4^3 shape on
- * an H100, 1.6x over the first port): per batch of K k-points, pack X into Vt(k; x, c, r, y), form the
+ * Structure: per batch of K k-points, pack X into Vt(k; x, c, r, y), form the
  * per-pole nc x nc operands, three cuBLAS batched gemms per pass (batch = ng K), the scatter with the
  * component index on the grid and the ng poles looped inside the block (the a-indexed targets reduced
- * in registers, one atomic each at the end), then the assembly. The scatter and the assembly follow the
- * PRODUCTION mulU / mulT / assemble of dynbse.hpp (confluent a == nj branches, the R1/R3 tables, the
- * small-nu fold), not the miniapp's subset.
+ * in registers, one atomic each at the end), then the assembly. The scatter and the assembly follow
+ * mulU / mulT / assemble of dynbse.hpp in full (confluent a == nj branches, the R1/R3 tables, the
+ * small-nu fold).
  */
 
 #include <complex>
@@ -46,14 +45,14 @@ namespace methods::solvers::dynbse_cuda {
 
   struct l0_dims {
     long np = 0, np_fit = 0, nk = 0, nc = 0, ng = 0, nR = 0;
-    long nca = 0;                 // the number of ACTIVE input components packed (P-3a); 1 + 2 np = all
+    long nca = 0;                 // the number of ACTIVE input components packed; 1 + 2 np = all
   };
 
   /** host pointers to C-contiguous data, shapes as in dynbse.hpp */
   struct l0_tables {
     cplx const *Xfam = nullptr;     // (2, np, nk, nc, nc, nR)
     cplx const *Xcst = nullptr;     // (nk, nc, nc, nR)
-    long const *act = nullptr;      // (nca) the ACTIVE input components, global c = 0 (constant) | 1 + f np + a (P-3a)
+    long const *act = nullptr;      // (nca) the ACTIVE input components, global c = 0 (constant) | 1 + f np + a
     double *timing = nullptr;       // optional (4): the driver ADDS its wall times -- [0] alloc, [1] H2D, [2] kernel, [3] D2H
     cplx const *gk = nullptr;       // (ng, nk, nc, nc)
     cplx const *gkq = nullptr;      // (ng, nk, nc, nc)
@@ -81,9 +80,9 @@ namespace methods::solvers::dynbse_cuda {
     double tfold = 0.0;             // the small-nu fold ratio (<= 0: off)
     bool sum_part1 = true;          // assemble: Fsum receives part 1 (the constant component) too
     bool skip_cst = false;          // the constant component is exactly zero: skip c = 0
-    // gpu port 2026-09-27 (the nsys / ncu profile of the device L0): 1 = the FUSED output-stationary passes (the per-pole
-    // products formed in registers / shared memory, no materialized Pj / Qj / Bj, no atomics), 0 = the batched-gemm +
-    // scatter passes; asm_gemm 1 = the nu = 0 assembly's Dsq / Dcb re-expansions as one gemm per k-batch (0 = atomics)
+    // fused: 1 = the FUSED output-stationary passes (the per-pole products formed in registers / shared memory, no
+    // materialized Pj / Qj / Bj, no atomics), 0 = the batched-gemm + scatter passes; asm_gemm 1 = the nu = 0 assembly's
+    // Dsq / Dcb re-expansions as one gemm per k-batch (0 = atomics)
     int fused = 2;                     // 0 = batched gemms + scatter, 1 = the two fused passes, 2 = one merged pass
     int fz_cfg = 44;                   // the fused kernel's variant: 10 x components per thread + minimum blocks per SM
     int fz_bench = 0;                  // 1: time every variant on the first k-batch per nu class (stderr table)
@@ -100,7 +99,7 @@ namespace methods::solvers::dynbse_cuda {
                            double free_bytes);
 
   /**
-   * The inu = 0 twin: dynbse::l0_apply_cols on the device (gpu port R3, notes/gpu_port_plan.md section 4c). The two
+   * The inu = 0 twin: dynbse::l0_apply_cols on the device. The two
    * input families are folded into one on the device (V_a = X.fam(0, a) + X.fam(1, a), the host kernel's order), the
    * passes are the shift kernel's (P_j = g_j^T V, Q_j = P_j Ghat_j, B_j = P_j gkq_j^T; P_l = Gtil_l V, R_l = P_l gkq_l^T)
    * with the nu = 0 partial fractions in the scatter (single poles into F1, the confluent U_j^2 U_a into M2 / M3, the
@@ -112,8 +111,8 @@ namespace methods::solvers::dynbse_cuda {
   long l0_apply_cols(l0_dims const &d, l0_tables const &t, cplx *Ffam, cplx *Fsum, double free_bytes);
 
   // =====================================================================================================================
-  // THE DEVICE-RESIDENT UNIT (gpu port plan section 4d, 2026-09-27; user directive: "the gpu execution should only use
-  // the host for trivially fast things"). One engine per rank holds, ON THE DEVICE:
+  // THE DEVICE-RESIDENT UNIT: the device path uses the host only for trivially cheap work. One engine per rank holds,
+  // ON THE DEVICE:
   //   run-wide   the frequency basis (KF, KF2 on the tau grid, the refit maps Ut / Vs / Kmat of the active pole fit)
   //   (s, q)     the static rung K_s, the dense dynamic rungs K_d(s_r) (PH-sym representatives) and K_d(0)
   //   (s, q, nu) Cb_k, the LU of M = 1 - Cb K_s (cuSOLVER), the L0 tables (a resident L0 plan)
@@ -136,7 +135,7 @@ namespace methods::solvers::dynbse_cuda {
     // the dense tau rungs K_d(s_r): nres of ndist resident on the device (-1 = the most that fit the budget, 90 % of the free
     // memory minus reserve_bytes = what the later device stages need: rung builds, Sigma deposits, dressed legs). The others
     // reach the device per rung application through two staging buffers, rebuilt from the W tables (needs the device rung
-    // builds: partial_ok = 1) or copied from pinned host memory. nonres_src: 0 = both (split by measured cost), 1 = rebuild
+    // builds: partial_ok = 1) or copied from pinned host memory. nonres_src: 0 = both (split by timed cost), 1 = rebuild
     // only, 2 = copy only, 3 = none (every rung must be resident).
     long nres = -1;
     int partial_ok = 0;
@@ -153,7 +152,7 @@ namespace methods::solvers::dynbse_cuda {
   struct rung_stream;
 
   struct sd_config;
-  /** factorize-vertex: the device bytes of the later stages (the unit's partition keeps them free; their own checks use them) */
+  /** the device bytes of the later stages (the unit's partition keeps them free; their own checks use them) */
   double ue_kb_bytes(long ns, long nq, long Nm, long nk, long nc, long nrep);
   double ue_sd_bytes(sd_config const &c, long nR_max);
   double ue_dressed_bytes(long ng, long np, long nk, long nc, long nout, long nR_max);
@@ -194,11 +193,11 @@ namespace methods::solvers::dynbse_cuda {
   double ue_gamma1(unit_engine *e, long nR, cplx const *Dblk, cplx *Gsum0, cplx *Gsum1, cplx *y1fam, cplx *y1cst, double *timing,
                    bool want_r1 = false);
 
-  // ---- D-1b: THE RUNG BUILDS ON THE DEVICE (vertex_dynbse.icc::build_kbig, nosym meshes). Per (s, q) every dense rung
+  // ---- THE RUNG BUILDS ON THE DEVICE (vertex_dynbse.icc::build_kbig, nosym meshes). Per (s, q) every dense rung
   // K[W](k' nc2 + (p1 nc + p3'), k nc2 + (p1' nc + p3)) = [U1^T W(qx(k, k')) U2](p1 nc + p1', p3 nc + p3') with the pair legs
   // U1(P, p1 nc + p1') = X(k', P, p1) conj(X(k, P, p1')), U2(P, p3 nc + p3') = X(k+q, P, p3) conj(X(k'+q, P, p3')) is built
   // straight into the engine: K_s = scale_k K[W0], K_d(r) = K[Wd(rep r)], K_d0 = K[Wd0] -- two batched gemms per W table and
-  // (k-chunk) and a scatter kernel; no host rung arrays, no per-transfer upload of the ~10 GB K_d stack.
+  // (k-chunk) and a scatter kernel; no host rung arrays, no per-transfer upload of the (large) K_d stack.
   /** run-wide: Xb (ns, nk, Nm, nc), qx_of (nk, nk), W0 (nq, Nm, Nm), Wd0 (nq, Nm, Nm), Wds (nrep, nq, Nm, Nm) (the tau
    *  representatives' W in the driver's rep order). false (why) = no room: the host builds and ue_set_rung uploads. */
   bool ue_kb_init(unit_engine *e, long ns, long nq, long Nm, cplx const *Xb, long const *qx_of, cplx const *W0, cplx const *Wd0,
@@ -209,7 +208,7 @@ namespace methods::solvers::dynbse_cuda {
   /** D2H of the resident K_s (D, D) for host consumers (the host Sigma deposits) */
   void ue_get_ks(unit_engine *e, cplx *Ks);
 
-  // ---- D-3: THE SIGMA DEPOSITS ON THE DEVICE (vertex_sigma_dyn.icc::sigma_dyn_accumulate, the production path: the product
+  // ---- THE SIGMA DEPOSITS ON THE DEVICE (vertex_sigma_dyn.icc::sigma_dyn_accumulate: the product
   // route, split accumulators, no IBZ fold, no dump, the DW legs). They read the engine's resident output of the last
   // ue_gamma1 (Gsum0 / Gsum1, y1 = (fam, cst)) and K_s, deposit into device-resident S_cst / RT / RU, and are flushed (ADDED)
   // into the host accumulators before a checkpoint and at the end of the run. Per block (width nR, D = nk nc^2):
@@ -258,7 +257,7 @@ namespace methods::solvers::dynbse_cuda {
                  cplx const *Vs, double const *Kmap, cplx const *S_cst, cplx const *RT, cplx const *RU, bool anyT, cplx pref,
                  cplx *dSig, double *fit_err);
 
-  // ---- factorize-vertex: the DRESSED-LEG Gamma_1 readout on the device (l0_cuda.cu block comment). Per unit, after ue_set_unit and
+  // ---- the DRESSED-LEG Gamma_1 readout on the device (l0_cuda.cu block comment). Per unit, after ue_set_unit and
   // ue_set_legs: H (2 ng, 2 np) the pole-family Grams, Gh / Gt / gk / gkq (ng, nk, nc, nc); ts_zero = the one-bare-rung pass (e~ = D).
   bool ue_dressed_prepare(unit_engine *e, long ng, cplx const *H, cplx const *Gh, cplx const *Gt, cplx const *gk, cplx const *gkq,
                           bool ts_zero, char *why, long why_len);
@@ -267,7 +266,7 @@ namespace methods::solvers::dynbse_cuda {
   double ue_gamma1_dressed(unit_engine *e, long nR, cplx const *Dblk, cplx inu, bool ts_zero, bool want_r1, cplx *Pd, cplx *Pr1,
                            double *timing, bool want_gsum1 = false);
 
-  /** factorize-vertex: the rung form of ue_kd: rung_pair = the two PH-mirror nodes of a representative in one gemm (default); rr = R > 0:
+  /** the rung form of ue_kd: rung_pair = the two PH-mirror nodes of a representative in one gemm (default); rr = R > 0:
    *  the frequency-factorized rung (the engine's K_d slots hold K_r = K[A_r], ndist = R), ctr (nt, R) row-major the time functions. */
   void ue_set_rung_mode(unit_engine *e, bool rung_pair, long rr, cplx const *ctr);
 
