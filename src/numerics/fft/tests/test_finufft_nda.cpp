@@ -678,42 +678,13 @@ void test_3d()
 // ===========================================================================
 // Test D — sign convention (iflag)
 //
-// c[j] = exp(+i * k0 * x[j])
-//   iflag=+1: F[k0 + N/2] = N  (type-1 sum exp(+i*k0*x)*exp(+i*k*x) peaks at k=-k0... wait)
-//
-// Careful: type-1 definition with iflag=+1:
-//   F[k] = sum_j c[j] exp(+i * k * x[j])
-// So for c[j] = exp(+i*k0*x[j]):
-//   F[k] = sum_j exp(+i*(k0+k)*x[j])
-// This peaks at k = -k0 for a uniform grid (orthogonality).
-//
-// Wait — that contradicts test A1.  Let's be precise:
-//   F[k] = sum_j exp(+i*k0*x[j]) * exp(+i*k*x[j])  [iflag=+1 means exp(+ikx)]
-//         = sum_j exp(+i*(k0+k)*x[j])
-// For a uniform grid sum_j exp(+i*m*x[j]) = N * delta(m, 0).
-// So F[k] = N * delta(k0 + k, 0) = N * delta(k, -k0).
-//
-// But A1 uses c[j]=exp(+i*k0*x[j]) with NUFFT_FORWARD (+1) and checks F[k0+N/2].
-// That would be F[k0] = N*delta(k0,-k0) which is only true for k0=0.
-//
-// The correct check is: F[-k0 + N/2] = N.
-// HOWEVER, finufft's definition of type-1 with iflag=+1 is:
-//   f[k] = sum_j c[j] exp(+i * iflag * k * x[j])
-// So for c[j]=exp(+i*k0*x[j]), iflag=+1:
-//   f[k] = sum_j exp(+i*(k0 + k)*x[j]) = N * delta(k, -k0)
-// → F[-k0 + N/2] = N.
-//
-// But wait, in A1 we set c[j]=exp(+i*k0*x[j]) and expect F[k0+N/2]=N.
-// That would require f[k] = sum_j exp(+i*k0*x[j])*exp(-i*k*x[j]) (negative sign).
-// That's iflag=-1 definition: f[k]=sum_j c[j]*exp(-i*k*x[j]).
-//
-// So A1 and A2 needed iflag = NUFFT_BACKWARD (-1) to make c[j]=exp(+i*k0*x[j])
-// produce F[k0+N/2]=N, OR we set c[j]=exp(-i*k0*x[j]) with iflag=+1.
-//
-// We fix all single-mode injection tests to use the correct definition:
-//   With NUFFT_FORWARD (iflag=+1):
-//     f[k] = sum_j c[j] exp(+i*k*x[j])
-//     Set c[j] = exp(-i*k0*x[j])  →  f[k0+N/2] = N
+// finufft's type-1 transform is
+//   f[k] = sum_j c[j] exp(+i * iflag * k * x[j]),
+// and on a uniform grid sum_j exp(+i*m*x[j]) = N * delta(m, 0). Hence a single mode k0
+// lands at F[k0 + N/2] = N when
+//   iflag = +1 (NUFFT_FORWARD)  and  c[j] = exp(-i*k0*x[j]), or
+//   iflag = -1 (NUFFT_BACKWARD) and  c[j] = exp(+i*k0*x[j]).
+// The single-mode injection tests use the first form.
 // ===========================================================================
 template<typename T>
 void test_iflag()

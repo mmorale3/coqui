@@ -766,7 +766,7 @@ inline bool mpi_supports_device_pointers()
  * Whether to log a per-call breakdown of the device-direct exchange
  * (COQUI_REDIST_TIMERS=1). The sections are already bracketed by the device
  * synchronizes the path needs, so the measurement itself costs nothing; it is
- * off by default only to keep production logs quiet.
+ * off by default only to keep logs quiet.
  */
 inline bool redistribute_timers_enabled()
 {
@@ -784,7 +784,7 @@ inline bool redistribute_timers_enabled()
  *      H2D, unpack on device.
  *   1  device-direct: pairwise rounds of CUDA-aware MPI on device buffers.
  * Unset, the default is 1 whenever the MPI reports device-pointer support and 0
- * otherwise. The knob stays as an escape hatch (and to A/B the two paths); it
+ * otherwise. The knob is an escape hatch (and allows comparing the two paths); it
  * is deliberately an environment variable rather than an input option, since it
  * selects a transport rather than any physics.
  */
@@ -816,16 +816,15 @@ inline int redistribute_device_mode()
  * Device-direct all-to-all for redistribute_alltoallv.
  *
  * The host-staging path moves the whole local block through host memory (D2H,
- * host MPI_Alltoallv, H2D). With four redistributes per SCF iteration on
- * ~22 GB/rank tensors that is the single largest cost in the GPU port. Here
+ * host MPI_Alltoallv, H2D). For large device-resident tensors redistributed
+ * several times per SCF iteration that round trip can dominate the run. Here
  * the peers are walked in a fixed pairwise schedule --- in round r every rank
  * sends to (rank+r) and receives from (rank-r) --- and the device buffers are
  * handed straight to CUDA-aware MPI.
  *
  * Only one peer block is in flight, so the extra device memory is bounded by
- * the chunk budget instead of by the tensor size. That is what killed the
- * earlier attempt (0e8fc80): it kept full-size device staging buffers, which
- * doubled device memory and ran the card out. Blocks larger than the budget
+ * the chunk budget instead of by the tensor size (full-size device staging
+ * buffers would double device memory and can exhaust it). Blocks larger than the budget
  * are split along their slowest dimension; sender and receiver describe the
  * same global index box, so both derive the same shape and the same split with
  * no extra metadata exchange. Chunking also keeps every MPI count well inside

@@ -40,10 +40,10 @@
  * metadata travelling with the payload. Each rank's source rectangle is all-gathered up front,
  * following the same approach as redistribute_standard.
  *
- * PERFORMANCE NOTE: pack/unpack currently stage through host memory, so a device-to-device
- * conversion costs one D2H and one H2D of the local block. That is deliberate for a first
- * correct version -- it removes any dependence on CUDA-aware MPI. The follow-up is to reuse
- * redistribute_alltoallv's device-direct pairwise exchange, which already exists.
+ * PERFORMANCE NOTE: pack/unpack stage through host memory, so a device-to-device conversion
+ * costs one D2H and one H2D of the local block. In exchange there is no dependence on
+ * CUDA-aware MPI. (redistribute_alltoallv has a device-direct pairwise exchange that could
+ * be reused here.)
  */
 
 #include <array>
@@ -228,13 +228,14 @@ void redistribute_to_matrix_array(Src_t const& A, Dst_t& B)
   // ---- exchange -----------------------------------------------------------------------
   {
     // byte counts keep this free of datatype plumbing.
-    // TODO: chunk when a single peer message would exceed INT_MAX bytes.
+    // Per-peer messages are limited to INT_MAX bytes (checked below; no chunking).
     constexpr long vs = long(sizeof(value_type));
     std::vector<int> sc(np), rc(np), sd(np), rd(np);
     for (long r = 0; r < np; ++r) {
       utils::check(scount[std::size_t(r)]*vs < 2147483647l and
                    rcount[std::size_t(r)]*vs < 2147483647l,
-          "matrix_array redistribute: per-peer message exceeds INT_MAX bytes; needs chunking.");
+          "matrix_array redistribute: per-peer message exceeds INT_MAX bytes (messages are not "
+          "chunked); use more MPI ranks to reduce the per-rank block size.");
       sc[std::size_t(r)] = int(scount[std::size_t(r)]*vs);
       rc[std::size_t(r)] = int(rcount[std::size_t(r)]*vs);
       sd[std::size_t(r)] = int(sdisp[std::size_t(r)]*vs);
@@ -389,13 +390,14 @@ void redistribute_from_matrix_array(Src_t& A, Dst_t& B)
 
   {
     // byte counts keep this free of datatype plumbing.
-    // TODO: chunk when a single peer message would exceed INT_MAX bytes.
+    // Per-peer messages are limited to INT_MAX bytes (checked below; no chunking).
     constexpr long vs = long(sizeof(value_type));
     std::vector<int> sc(np), rc(np), sd(np), rd(np);
     for (long r = 0; r < np; ++r) {
       utils::check(scount[std::size_t(r)]*vs < 2147483647l and
                    rcount[std::size_t(r)]*vs < 2147483647l,
-          "matrix_array redistribute: per-peer message exceeds INT_MAX bytes; needs chunking.");
+          "matrix_array redistribute: per-peer message exceeds INT_MAX bytes (messages are not "
+          "chunked); use more MPI ranks to reduce the per-rank block size.");
       sc[std::size_t(r)] = int(scount[std::size_t(r)]*vs);
       rc[std::size_t(r)] = int(rcount[std::size_t(r)]*vs);
       sd[std::size_t(r)] = int(sdisp[std::size_t(r)]*vs);

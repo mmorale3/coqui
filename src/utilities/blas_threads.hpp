@@ -4,20 +4,16 @@
 /**
  * @file blas_threads.hpp
  *
- * The `blas_threads` knob -- increment T-2 option (c) of
- * notes/coqui_threading_spec.md (rev 2 section 3), ruled from the T-0 measurements in
- * notes/coqui_threading_t0.md section 4.
+ * The `blas_threads` knob: the thread count of the BLAS/LAPACK layer underneath CoQui.
  *
- * WHY THIS EXISTS. CoQui contains no OpenMP regions of its own (T-0 census); the only
- * threading available to it is the BLAS/LAPACK layer underneath. T-0 measured that layer
- * to be worth 1.35x overall wall on the non-vertex phases at MKL x4, with real BLAS-3
- * calls scaling 1.4-2.7x (Gij->Guv 2.70x, chol 2.40x, ls solve 2.18x) and nothing
- * regressing. Until now the only way to ask for it was an environment variable, so the
- * setting never appeared in the input file and never reached the checkpoint.
+ * WHY THIS EXISTS. Much of CoQui's arithmetic is BLAS-3 / LAPACK (Gij->Guv transforms,
+ * Cholesky, least-squares solves), which scales with a threaded BLAS. Setting this from the
+ * input file, rather than only through an environment variable, makes the setting visible
+ * in the input and recorded in the checkpoint.
  *
  * WHY IT IS **NOT** `OMP_NUM_THREADS`. Raising the global OpenMP thread count activates
  * SLATE's libgomp task layer, whose tasks issue MPI calls; below MPI_THREAD_MULTIPLE that
- * is an immediate UCX SIGSEGV (job 6890365 -- see slate_ops.hpp's guard). The safe recipe
+ * crashes (e.g. a UCX SIGSEGV -- see slate_ops.hpp's guard). The safe recipe
  * is OMP_NUM_THREADS=1 with the BLAS layer threaded on its own knob: inside MKL,
  * MKL_Set_Num_Threads overrides OMP_NUM_THREADS, so SLATE's task layer stays serial while
  * BLAS threads freely. `blas_threads` is that knob, and it deliberately cannot touch
@@ -25,9 +21,9 @@
  *
  * LIBRARY-AGNOSTIC BY RUNTIME LOOKUP. The name is vendor-neutral because the sink is
  * resolved with dlsym(RTLD_DEFAULT, ...) at call time rather than by linking a vendor
- * header: MKL on rusty, OpenBLAS on the Mac dev tree, and neither one is a build
- * dependency. If no known setter is present the knob degrades to a warning and the
- * library's own default (i.e. the environment) stands -- it never aborts a run.
+ * header: MKL and OpenBLAS are both supported, and neither one is a build dependency. If
+ * no known setter is present the knob degrades to a warning and the library's own default
+ * (i.e. the environment) stands -- it never aborts a run.
  */
 
 #include <cstdlib>
@@ -53,7 +49,7 @@ inline std::string blas_threads_backend_name() { return blas_threads_backend(); 
 /**
  * Push `n` into whichever threaded BLAS is loaded.
  *
- * Ordered by the two libraries CoQui is actually built against. MKL_Set_Num_Threads is
+ * Tries the two supported libraries in turn. MKL_Set_Num_Threads is
  * the C entry (int by value); the lowercase `mkl_set_num_threads` symbol is the Fortran
  * binding and takes a POINTER, so it must not be called through this signature.
  *
@@ -62,8 +58,8 @@ inline std::string blas_threads_backend_name() { return blas_threads_backend(); 
 inline bool apply_blas_threads(long n) {
   using set_int_t = void (*)(int);
   static const char *candidates[] = {
-      "MKL_Set_Num_Threads",        // Intel MKL, C API (rusty)
-      "openblas_set_num_threads",   // OpenBLAS (Mac dev tree)
+      "MKL_Set_Num_Threads",        // Intel MKL, C API
+      "openblas_set_num_threads",   // OpenBLAS
   };
   for (const char *nm : candidates) {
     // NOLINTNEXTLINE: dlsym returns void*; the cast is the documented idiom.
@@ -71,8 +67,8 @@ inline bool apply_blas_threads(long n) {
       fn(static_cast<int>(n));
       blas_threads_backend() = nm;
       // MKL_DYNAMIC would let MKL silently use fewer threads than asked; pin it off so the
-      // requested count is the count actually used (mirrors MKL_DYNAMIC=FALSE in the
-      // measurement harnesses). Absent on OpenBLAS -- optional by construction.
+      // requested count is the count actually used (equivalent to MKL_DYNAMIC=FALSE).
+      // Absent on OpenBLAS -- optional by construction.
       if (auto dyn = reinterpret_cast<set_int_t>(dlsym(RTLD_DEFAULT, "MKL_Set_Dynamic")))
         dyn(0);
       return true;
@@ -84,8 +80,7 @@ inline bool apply_blas_threads(long n) {
 
 /**
  * Apply and record the `blas_threads` setting. `n <= 0` is "not requested": nothing is
- * touched and the environment/library default stands, which is the pre-T-2 behaviour and
- * the default for every existing input file.
+ * touched and the environment/library default stands; this is the default.
  */
 inline void set_blas_threads(long n) {
   utils::check(n >= 0, "blas_threads must be >= 0 (0 = leave the library/environment "

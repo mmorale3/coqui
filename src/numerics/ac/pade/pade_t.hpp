@@ -70,26 +70,21 @@ namespace analyt_cont {
       for (long w=0; w<_Nfit; ++w)
         _iw_fit(w) = mp_complex(mp_float(iw_mesh(w).real()), mp_float(iw_mesh(w).imag()));
 
-      // ---------------- T-3b threaded region 1 of 4 ----------------
-      // notes/coqui_threading_t3a.md section 2.3 ROW 1 / section 3.1: the per-state Thiele
-      // reciprocal-difference fit, 84% of the whole QP-map phase and its single largest
-      // parity loss (+11.2 s at 24r x 4t, +25.2 s at 12r x 8t).
+      // ---------------- threaded region (omp_threads) ----------------
+      // The per-state Thiele reciprocal-difference fit; it dominates the cost of the
+      // AC/Pade quasiparticle map.
       //
-      // SAFETY INVENTORY (spec section 7.2 item 2, hazards from t3a section 4.2):
+      // THREAD SAFETY:
       //   * no MPI, no HDF5, no logging, no utils::check on this path -- init's own checks
       //     and pade_driver::init's app_log are all OUTSIDE this loop;
-      //   * `Ad_iw` used to be declared once outside the `d` loop and rewritten every
-      //     iteration (t3a section 4.2 item 1) -> now a per-thread buffer declared INSIDE
-      //     the parallel region;
-      //   * `fit()` used to heap-allocate its (_Nfit,_Nfit) `g` table on every call,
-      //     ~43 KB per state (t3a section 4.2 item 2) -> now a per-thread scratch buffer
-      //     allocated once per thread and passed in, which removes the malloc/free churn
-      //     that would otherwise dominate at 8 threads;
+      //   * `Ad_iw` is a per-thread buffer declared INSIDE the parallel region;
+      //   * `fit()` takes its (_Nfit,_Nfit) `g` table as a per-thread scratch buffer,
+      //     allocated once per thread and passed in, which avoids per-state malloc/free;
       //   * `_coeffs(d,:)` and `_orders(d)` are disjoint per `d`; `_iw_fit` is read-only;
       //   * cpp_dec_float is a fixed-size backend -- no allocation per arithmetic op.
       //
       // DETERMINISM: iterations are independent and nothing is reassociated, so the result
-      // is bitwise identical at any thread count, not merely bit-class identical.
+      // is bitwise identical at any thread count.
       [[maybe_unused]] const long nthr = utils::omp_threads_for(_dim1);
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthr) if (nthr > 1)
@@ -110,10 +105,9 @@ namespace analyt_cont {
       }
     }
 
-    // T-3b: the evaluate family is `const`. It provably only reads _orders/_coeffs/_iw_fit
-    // (t3a section 4.2 item 4), and concurrent calls on one shared kernel are exactly what
-    // the threaded qp_approx / solve_qp_eqn regions do -- so pin that in the type system
-    // instead of leaving it to inspection.
+    // The evaluate family is `const`: it only reads _orders/_coeffs/_iw_fit, and concurrent
+    // calls on one shared kernel are exactly what the threaded qp_approx / solve_qp_eqn
+    // regions do -- so this is pinned in the type system instead of left to inspection.
     template<nda::ArrayOfRank<1> w_mesh_t>
     auto evaluate(w_mesh_t &&w_mesh) const -> nda::array<ComplexType, 2> {
       long Nw = w_mesh.shape(0);
@@ -186,9 +180,9 @@ namespace analyt_cont {
     }
 
     /**
-     * T-3b: `g` is a CALLER-OWNED (_Nfit,_Nfit) scratch table rather than a local
-     * allocation. It was ~43 KB of malloc/free per state (t3a section 4.2 item 2), which is
-     * pure allocator churn once the enclosing `d` loop is threaded. It is fully overwritten
+     * `g` is a CALLER-OWNED (_Nfit,_Nfit) scratch table rather than a local allocation, so
+     * the threaded `d` loop in init() does not malloc/free one table per state (tens of KB
+     * each in multiprecision). It is fully overwritten
      * on entry (the `g() = 0` below), so reuse across calls is arithmetically identical to
      * a fresh allocation. `const` because the fit mutates no member -- only `coeffs` and
      * the caller's scratch.

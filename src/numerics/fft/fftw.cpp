@@ -31,8 +31,8 @@ namespace math::fft::impl::host
 // Note: right now this assumes alignment to 16 Bytes in order to use advanced execute interface, should I check?
 //int fftw_alignment_of(double *p);
 
-// T-3b item 3.3: see the doc comment in fftw.h. One-shot; `nthreads <= 1` leaves the
-// serial planner in place, which is what every pre-T-3b input file gets.
+// See the doc comment in fftw.h. One-shot; `nthreads <= 1` leaves the serial planner in
+// place (the default).
 void init_threads(long nthreads)
 {
   static bool done = false;

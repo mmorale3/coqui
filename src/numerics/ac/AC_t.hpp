@@ -68,9 +68,9 @@ namespace analyt_cont {
       std::visit( [&](auto&& v) { v.init(std::forward<Args>(args)...); }, _ac_var);
     }
 
-    // T-3b: the evaluate family is `const` all the way down (AC_t -> pade_driver ->
-    // pade_t), so a single AC_t can be shared read-only across the threads of the
-    // qp_approx / solve_qp_eqn regions (notes/coqui_threading_t3a.md section 4.2 item 4).
+    // The evaluate family is `const` all the way down (AC_t -> pade_driver -> pade_t), so a
+    // single AC_t can be shared read-only across the threads of the qp_approx /
+    // solve_qp_eqn regions.
     // std::visit over a const variant hands the visitor a `const pade_driver&`.
     template<nda::MemoryArrayOfRank<1> mesh_w_t, nda::MemoryArray Array_w_t>
     void evaluate(mesh_w_t &&w_mesh, Array_w_t &&A_w) const {
