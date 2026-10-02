@@ -1523,6 +1523,9 @@ namespace methods::solvers::dynbse_cuda {
     cudaStream_t cps = nullptr;
     cudaEvent_t ev_ready[2] = {nullptr, nullptr}, ev_free[2] = {nullptr, nullptr};
     double t_copy_est = 0.0, t_rb_est = 0.0;                 // seconds per rep: H2D copy (measured bandwidth), device rebuild
+    double t_gemm_est = 0.0;                                 // seconds per rep: the rung gemm (timed on the resident reps)
+    long napp_cur = 0, napp_prev = 0;                        // rung passes of the current / previous transfer
+    cudaEvent_t ev_t0 = nullptr, ev_t1 = nullptr;            // timing events around the resident gemms
     long ncopy = 0;
     double t_copy_wait = 0.0;
     std::vector<long> trep;
@@ -1658,6 +1661,7 @@ namespace methods::solvers::dynbse_cuda {
         cu_check(cudaEventRecord(e->ev_free[bb], 0), "ue ev free");
       }
       cu_check(cudaStreamCreateWithFlags(&e->cps, cudaStreamNonBlocking), "ue copy stream");
+      cu_check(cudaEventCreate(&e->ev_t0), "ue ev t0"); cu_check(cudaEventCreate(&e->ev_t1), "ue ev t1");
       const bool can_copy_e = (c.nonres_src == 0 or c.nonres_src == 2 or (c.partial_ok == 0));
       if (can_copy_e) {
         e->nhost_cap = nnr;
@@ -1732,6 +1736,8 @@ namespace methods::solvers::dynbse_cuda {
       if (e->ev_free[b]) (void)cudaEventDestroy(e->ev_free[b]);
     }
     if (e->cps) (void)cudaStreamDestroy(e->cps);
+    if (e->ev_t0) (void)cudaEventDestroy(e->ev_t0);
+    if (e->ev_t1) (void)cudaEventDestroy(e->ev_t1);
     delete e;
   }
 
@@ -1897,9 +1903,12 @@ namespace methods::solvers::dynbse_cuda {
                                   int(ld), K, int(D), &zero, e->Ybig + sl * ncol, int(ld)), "rung (node)");
         }
       };
-      for (long r = 0; r < e->nres; ++r) gemm_rep(r, e->Kds + size_t(r) * DD);
       const long nnr = ndist - e->nres;
-      if (nnr <= 0) return;
+      if (nnr <= 0) {
+        for (long r = 0; r < e->nres; ++r) gemm_rep(r, e->Kds + size_t(r) * DD);
+        return;
+      }
+      ++e->napp_cur;
       auto host = [&](long j) { return e->src_host[size_t(j)] != 0; };
       auto issue_copy = [&](long j) {
         const int b = int(j % 2);
@@ -1911,6 +1920,11 @@ namespace methods::solvers::dynbse_cuda {
       };
       for (long j = 0; j < std::min(nnr, 2l); ++j)
         if (host(j)) issue_copy(j);
+      if (e->nres > 0) {                                    // the resident gemms (timed: the planner's per-rep gemm cost)
+        cu_check(cudaEventRecord(e->ev_t0, 0), "rung t0");
+        for (long r = 0; r < e->nres; ++r) gemm_rep(r, e->Kds + size_t(r) * DD);
+        cu_check(cudaEventRecord(e->ev_t1, 0), "rung t1");
+      }
       for (long j = 0; j < nnr; ++j) {
         const int b = int(j % 2);
         const long r = e->nres + j;
@@ -1931,6 +1945,12 @@ namespace methods::solvers::dynbse_cuda {
         if (j + 2 < nnr and host(j + 2)) issue_copy(j + 2);
       }
       if (e->nrebuild > 0) e->t_rb_est = e->t_rebuild / double(e->nrebuild);
+      if (e->nres > 0) {
+        float ms = 0.0f;
+        cu_check(cudaEventSynchronize(e->ev_t1), "rung t1 sync");
+        cu_check(cudaEventElapsedTime(&ms, e->ev_t0, e->ev_t1), "rung gemm time");
+        e->t_gemm_est = 1.0e-3 * double(ms) / double(e->nres);
+      }
     }
 
     // THE RUNG PASS: nin inputs (1, or 2 = the one-bare-rung and the Gamma_1 input of a block), every frequency family, in one
@@ -2643,34 +2663,52 @@ namespace methods::solvers::dynbse_cuda {
   } // namespace
 
   namespace {
-    // the copy / rebuild split of the non-resident rungs for the next transfer: nh copied (pinned host -> device on the copy
-    // stream) and the rest rebuilt on the device, minimising max(nh t_copy, (nnr - nh) t_rebuild) -- the two run on different
-    // engines and overlap; the copied ones are spread evenly through the processing order so each copy overlaps a rebuild.
+    // the copy / rebuild split of the non-resident rungs for the next transfer, chosen by simulating the rung pass of
+    // ue_rung_dense: the resident gemms run first while the copy stream prefetches the first two copied rungs; then rung j
+    // (staging buffer j % 2) either waits for its copy or is rebuilt on the compute stream (serialized with the gemms), and
+    // the copy of rung j + 2 starts once rung j's gemm has freed the buffer. Costs per rung: the gemm (timed on the resident
+    // rungs), the H2D copy (timed at creation) and the rebuild (timed). For every copied count nh two orders are simulated
+    // (copied rungs spread evenly, copied rungs first). The cost of a split is napp simulated passes (napp = the previous
+    // transfer's pass count) plus, once per transfer, the device build and the D2H copy of every copied rung.
     // pol_vertex_dyn_device_memory picks the sources (auto: both; rebuild; host); host-built rungs (no device builds) are copied.
+    double ue_sim_pass(long nres, std::vector<int> const &src, double tg, double tc, double trb) {
+      const long nnr = long(src.size());
+      double T = double(nres) * tg, ce = 0.0;               // compute-stream time, copy-engine free time
+      std::vector<double> done(size_t(nnr), 0.0);
+      for (long j = 0; j < std::min(nnr, 2l); ++j)
+        if (src[size_t(j)]) { ce += tc; done[size_t(j)] = ce; }
+      for (long j = 0; j < nnr; ++j) {
+        T = src[size_t(j)] ? std::max(T, done[size_t(j)]) + tg : T + trb + tg;
+        if (j + 2 < nnr and src[size_t(j + 2)]) { ce = std::max(ce, T) + tc; done[size_t(j + 2)] = ce; }
+      }
+      return T;
+    }
     void ue_plan_sources(unit_engine *e) {
       const long nnr = e->c.ndist - e->nres;
       if (nnr <= 0) return;
       const bool can_rb = e->kb.on and e->c.nonres_src != 2;
       const bool can_cp = (e->Kds_host != nullptr) and e->c.nonres_src != 1;
-      long nh = 0;
       if (not can_rb and not can_cp) APP_ABORT(std::string(" ue_plan_sources: no source for the non-resident rungs -- ABORTING."));
-      if (not can_rb) nh = nnr;
-      else if (not can_cp) nh = 0;
-      else {
-        if (e->t_rb_est <= 0.0) {
-          // first transfer: the rebuild cost from its flop count at an assumed 10 TF/s (replaced by the measured one afterwards)
-          const double nk = double(e->c.nk), nc2 = double(e->nc2), Nm = double(e->kb.Nm);
-          e->t_rb_est = nk * nk * 8.0 * (nc2 * Nm * Nm + nc2 * nc2 * Nm) / 1.0e13;
-        }
+      std::vector<int> best_src(size_t(nnr), can_cp ? 1 : 0);
+      if (can_rb and can_cp) {
+        const double nk = double(e->c.nk), nc2 = double(e->nc2), Nm = double(e->kb.Nm), D = double(e->D);
+        // before the first timings: flop counts at an assumed 10 TF/s (replaced by the timed costs afterwards)
+        if (e->t_rb_est <= 0.0) e->t_rb_est = nk * nk * 8.0 * (nc2 * Nm * Nm + nc2 * nc2 * Nm) / 1.0e13;
+        const double tg = (e->t_gemm_est > 0.0)
+            ? e->t_gemm_est : 8.0 * D * D * double(e->c.nt * e->c.nR_max) / double(std::max(e->c.ndist, 1l)) / 1.0e13;
+        const double napp = double(e->napp_prev > 0 ? e->napp_prev : 4);
         double best = 1e300;
-        for (long h = 0; h <= std::min(nnr, e->nhost_cap); ++h) {
-          const double t = std::max(double(h) * e->t_copy_est, double(nnr - h) * e->t_rb_est);
-          if (t < best - 1e-12) { best = t; nh = h; }
-        }
+        std::vector<int> src(size_t(nnr));
+        for (long h = 0; h <= std::min(nnr, e->nhost_cap); ++h)
+          for (int order = 0; order < 2; ++order) {
+            for (long jj = 0; jj < nnr; ++jj)
+              src[size_t(jj)] = (order == 0) ? (((jj + 1) * h / nnr > jj * h / nnr) ? 1 : 0) : (jj < h ? 1 : 0);
+            const double t = napp * ue_sim_pass(e->nres, src, tg, e->t_copy_est, e->t_rb_est) +
+                             double(h) * (e->t_rb_est + e->t_copy_est);
+            if (t < best * (1.0 - 1e-9)) { best = t; best_src = src; }
+          }
       }
-      e->src_host.assign(size_t(nnr), 0);
-      for (long jj = 0; jj < nnr; ++jj)
-        e->src_host[size_t(jj)] = ((jj + 1) * nh / nnr > jj * nh / nnr) ? 1 : 0;
+      e->src_host = best_src;
     }
   } // namespace
 
@@ -2693,6 +2731,8 @@ namespace methods::solvers::dynbse_cuda {
     kb_build_tables(e, ts.data(), Kts.data(), long(ts.size()), sk);
     const long nnr = e->stream ? 0 : e->c.ndist - e->nres;
     if (nnr > 0) {
+      if (e->napp_cur > 0) e->napp_prev = e->napp_cur;
+      e->napp_cur = 0;
       ue_plan_sources(e);
       const size_t DD = size_t(D) * size_t(D);
       double tb_sum = 0.0;
