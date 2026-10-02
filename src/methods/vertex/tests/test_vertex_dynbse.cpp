@@ -99,6 +99,12 @@ namespace bdft_tests {
 
   inline dyn_toy make_dyn_toy(double zscale, double mscale) {
     dyn_toy T;
+    // larger spaces (2026-09-27): COQUI_DYNBSE_TOY_NC = n runs the toys at nc = n -- a non-power-of-two nc exercises the fused
+    // L0's padded lanes (segment S = 16 > nc = 12, the production C = 12), which nc = 2 / 4 / 8 never reach
+    // the readout width follows: Dc below writes column k nc2 + a nc + b, so nR = nk nc2 (the fixed nR = 8 only fits
+    // nc = 2 -- at nc = 12 / 16 the fill ran 288 / 512 columns past an 8-wide array: the round-13 heap corruption)
+    if (auto *e = std::getenv("COQUI_DYNBSE_TOY_NC")) { T.nc = std::max(1l, std::atol(e)); T.nc2 = T.nc * T.nc; }
+    T.nR = T.nk * T.nc2;
     T.t = {make_toy(T.nc, {-1.5, 1.5}, {0.3, 0.3}, 41u), make_toy(T.nc, {-1.5, 1.5}, {0.3, 0.3}, 43u)};
     T.kmk = nda::array<long, 2>(T.nk, T.nk);
     for (long k = 0; k < T.nk; ++k)
@@ -732,7 +738,9 @@ namespace bdft_tests {
             app_log(1, "dynbse (G) inu = {:.3f}i [{}]: device vs host kernel |dF| {:.3e} (scale {:.3e}), |dFsum| {:.3e} "
                        "(scale {:.3e})", inu.imag(), tag, dh, hs, dhs, hss);
             REQUIRE(dh <= 1e-12 * std::max(hs, 1e-3));
-            REQUIRE(dhs <= 1e-12 * std::max(hss, 1e-3));
+            // the frequency sums cancel terms of the size of F (|F| ~ 3.6e3 vs |Fsum| ~ 1.4 at toy nc = 16): their atomic
+            // roundoff scales with |F|, so the bound carries a 1e-14 |F| term (round 13: 1.59e-12 at nc = 16 = 4e-16 |F|)
+            REQUIRE(dhs <= 1e-12 * std::max(hss, 1e-3) + 1e-14 * hs);
           }
           // gpu port P-3a: a frequency-CONSTANT input takes the active-component fast path (one packed component
           // instead of 1 + 2 np) -- it must reproduce the reference at the gate's class and, on a CUDA build, the
@@ -880,6 +888,12 @@ namespace bdft_tests {
           compare(b2, P2, true, "shared set");
         }
       }
+    }
+    // at a larger toy nc (COQUI_DYNBSE_TOY_NC) only the kernel sections above run: the solver + dense-oracle comparison below
+    // is sized for nc = 2 (its explicit Matsubara system grows as (nk 2N nc^2)^3 and ran past 90 min at nc = 6)
+    if (std::getenv("COQUI_DYNBSE_TOY_NC") != nullptr and T.nc != 2) {
+      app_log(1, "dynbse_oracle: toy nc = {}: the (L) / (K) / (G) kernel sections only (the solver oracle needs nc = 2)", T.nc);
+      return;
     }
     for (cplx inu : {cplx(0.0), I_ * cplx(2.0 * M_PI * 2.0 / beta)}) {
       app_log(1, "dynbse: ---- inu = {:.4f} i ----", inu.imag());

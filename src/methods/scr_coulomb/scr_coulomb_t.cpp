@@ -492,10 +492,47 @@ namespace solvers {
 
     // wall clock of the vertex-side blocks of update_w (the TEMP_UW timers do not separate them)
     auto uw_wall = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    // larger spaces (2026-09-27): the vertex drivers below size their device-resident units (the dense tau rungs, D^2 each)
+    // from the free device memory, and the scGW W (nq nt_half Np^2 / nranks, 11 GB per rank at Si kp444 on 2 ranks) is the
+    // largest other resident -- and none of them reads it (the W-bar caches are filled first). It is PARKED on the host for
+    // the drivers and restored at the end of update_w (two bulk copies). vertex_debug park_W_device = 0 keeps it on the device.
+    bool W_parked = false;
+    const bool W_host_before = mb_state.dW_qtPQ.has_value();
+    [[maybe_unused]] auto park_W = [&]() {
+#if defined(ENABLE_DEVICE)
+      if constexpr (MEM != HOST_MEMORY) {
+        if (W_parked or not mb_state.dW_qtPQ_dev.has_value() or
+            methods::vertex_debug::number("park_W_device", 1.0) == 0.0) return;   // vertex_debug: park_W_device
+        const double t0 = uw_wall();
+        (void)mb_state.W_host();                         // the host copy (from the device W when update_w kept none)
+        mb_state.dW_qtPQ_dev.reset();
+        utils::device_sync();
+        W_parked = true;
+        app_log(1, "  [update_w] the device W parked on the host for the vertex drivers ({:.1f} s)", uw_wall() - t0);
+      }
+#endif
+    };
+    [[maybe_unused]] auto unpark_W = [&]() {
+#if defined(ENABLE_DEVICE)
+      if constexpr (MEM != HOST_MEMORY) {
+        if (not W_parked) return;
+        const double t0 = uw_wall();
+        auto &Wh = mb_state.dW_qtPQ.value();
+        mb_state.dW_qtPQ_dev.emplace(make_distributed_array<memory::array<DEVICE_MEMORY, ComplexType, 4>>(
+            thc.mpi()->comm, Wh.grid(), Wh.global_shape(), Wh.block_size()));
+        mb_state.dW_qtPQ_dev.value().local() = Wh.local();
+        utils::device_sync();
+        if (not W_host_before and not mb_state.keep_host_W) mb_state.dW_qtPQ.reset();
+        W_parked = false;
+        app_log(1, "  [update_w] the device W restored ({:.1f} s)", uw_wall() - t0);
+      }
+#endif
+    };
     if (pol_dyn_readout) {
       const double w0 = uw_wall();
       _pol_vtx->cache_w(mb_state, thc);
       const double w1 = uw_wall();
+      park_W();
       pol_ladder_eps_readout(mb_state, thc, _pol_pi0_qPQ, std::addressof(eps_inv_head_q));
       app_log(1, "  [update_w wall] readout instance: W-bar cache fill {:.1f} s, eps readout (incl. the dynamic-rung driver) {:.1f} s",
               w1 - w0, uw_wall() - w1);
@@ -559,6 +596,11 @@ namespace solvers {
     // this mode (needs_dw_retention() == false -- plain-GW memory profile).
     // (dynamic rung only: the static modes do not use the cache -- see needs_dw_retention)
     const double w_c0 = uw_wall();
+    // the user vertex's W-bar cache reads the device W: bring it back if the readout above parked it (the Sigma pair vertex
+    // below parks it again)
+    if (_vertex != nullptr and _vertex->active() and _vertex->rung() == dynamic_rung and _vertex->secondary() and
+        _vertex->w_cache_enabled())
+      unpark_W();
     if (_vertex != nullptr and _vertex->active() and _vertex->rung() == dynamic_rung
         and _vertex->secondary() and _vertex->w_cache_enabled())
       _vertex->cache_w(mb_state, thc);
@@ -567,10 +609,15 @@ namespace solvers {
     // Sigma vertex, interp-file form: the vertex correction of W for Sigma ONLY, from THIS iteration's W -- after every
     // other consumer of dW (the kernel cache above included), so W, W-bar and the readout are exactly those without it.
     if (_vertex != nullptr and _vertex->sigma_lff_enabled()) build_sigma_lff(mb_state, thc, t_pgrid, t_bsize);
-    // Sigma vertex, pair-resolved form: the static-ladder vertex in Sigma, on the readout instance (same placement)
-    if (_vertex != nullptr and _vertex->sigma_pair_enabled()) build_sigma_pair(mb_state, thc);
+    // Sigma vertex, pair-resolved form: the static-ladder vertex in Sigma, on the readout instance (same placement). The
+    // device W is parked on the host while it runs and restored before returning (park_W / unpark_W).
+    if (_vertex != nullptr and _vertex->sigma_pair_enabled()) {
+      park_W();
+      build_sigma_pair(mb_state, thc);
+    }
     app_log(1, "  [update_w wall] from the eps-head dump to the vertex caches {:.1f} s; the user vertex's W-bar cache fill {:.1f} s; "
                "the Sigma vertex (pol_vertex_sigma = lff / pair) {:.1f} s", w_c0 - w_dump0, w_c1 - w_c0, uw_wall() - w_c1);
+    unpark_W();
 
     print_timers();
   }

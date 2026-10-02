@@ -6,13 +6,14 @@
 if(ENABLE_CUDA)
   set(VERTEX_CUDA_SRCS
     l0_cuda.cu
+    rung_cuda.cu
   )
   foreach( X ${VERTEX_CUDA_SRCS} )
     set_source_files_properties(${X} PROPERTIES LANGUAGE CUDA)
   endforeach()
   add_library(vertex_cuda ${VERTEX_CUDA_SRCS})
   target_include_directories(vertex_cuda PUBLIC ${CMAKE_SOURCE_DIR}/src)
-  target_link_libraries(vertex_cuda PUBLIC io_lib arch_lib CUDA::cudart CUDA::cublas CUDA::cusolver)
+  target_link_libraries(vertex_cuda PUBLIC io_lib arch_lib CUDA::cudart CUDA::cublas CUDA::cusolver CUDA::cufft)
   install(TARGETS vertex_cuda
           LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif(ENABLE_CUDA)

@@ -1930,10 +1930,10 @@ namespace vertex_pi { struct iaft_tools; }
                    "vertex_t::set_ladder_dyn_dressed: pol_vertex_dyn_dressed must be auto | on | off (got \"{}\").", m);
       dyn_dressed_state() = m;
     }
-    /** pol_vertex_dyn_device_memory (default "stream"): resident | stream | managed -- dyn_device_fallback.hpp */
+    /** pol_vertex_dyn_device_memory (default "auto"): auto | rebuild | host | resident -- dyn_device_fallback.hpp */
     void set_ladder_dyn_device_memory(std::string const &m) {
-      utils::check(m == "resident" or m == "stream" or m == "managed",
-                   "vertex_t::set_ladder_dyn_device_memory: pol_vertex_dyn_device_memory must be resident | stream | managed (got \"{}\").", m);
+      utils::check(m == "auto" or m == "rebuild" or m == "host" or m == "resident",
+                   "vertex_t::set_ladder_dyn_device_memory: pol_vertex_dyn_device_memory must be auto | rebuild | host | resident (got \"{}\").", m);
       dyn_device_memory_state() = m;
     }
     void set_ladder_dyn_resolvent(std::string const &m) {

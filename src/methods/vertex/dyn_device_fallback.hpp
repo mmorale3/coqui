@@ -12,16 +12,17 @@ namespace methods::solvers {
     static bool v = false;
     return v;
   }
-  /** pol_vertex_dyn_device_memory (input, default "stream"). Where the dense rung slab K_d(s) of the
-   *  device-resident unit lives when the unit does not fit in device memory -- the partition is computed at run time per GPU
-   *  from the problem size and the free device memory (the later device stages are sized exactly and kept free):
-   *    "resident": all device-resident; a unit that does not fit is a device failure (pol_vertex_dyn_device_fallback decides);
-   *    "stream"  : the reps that fit device-resident, the rest in pinned host memory streamed through two device staging
-   *                buffers overlapping the rung gemms (nothing streams when it all fits);
-   *    "managed" : the slab in CUDA managed memory, the part that fits device-preferred, the rest host-resident and read by the
-   *                device over the link. The split is logged; the answer does not change. */
+  /** pol_vertex_dyn_device_memory (input, default "auto"): how the dense dynamic rungs K_d(s) of the device-resident unit
+   *  use device memory. The resident count is chosen at run time per GPU from the problem size and the free memory (the
+   *  later device stages are sized exactly and kept free); the rungs that do not fit reach the device per rung application:
+   *    "auto"    : rebuilt on the device from the W tables and / or copied from pinned host memory, the split chosen from the
+   *                measured costs (copies and rebuilds overlap); copies only when the device rung builds are unavailable;
+   *    "rebuild" : rebuilt on the device only (needs the device rung builds: full k meshes);
+   *    "host"    : copied from pinned host memory only;
+   *    "resident": every rung resident; a unit that does not fit is a device failure (pol_vertex_dyn_device_fallback decides).
+   *  The answer does not depend on the choice; the resident count and the split are logged. */
   inline std::string &dyn_device_memory_state() {
-    static std::string v = "stream";
+    static std::string v = "auto";
     return v;
   }
   /** pol_vertex_dyn_dressed (input, default "auto"). The dressed-leg Gamma_1 readout (exact: the static ladder is moved

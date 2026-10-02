@@ -135,7 +135,18 @@ namespace solvers {
       nda::array<ComplexType, 5> HS_n;   // (nw_b, ns, np, nk, nsk)
       // the product route's per-call precomputations (sigma_dyn_precompute)
       bool pre_ok = false;
-      nda::array<ComplexType, 5> Gw;     // (nw_f, ns, nk, nc, nc): G on the fermionic Matsubara nodes
+      nda::array<ComplexType, 5> Gw;     // (nw_f, ns, nk, nc, nc): G on the fermionic Matsubara nodes (the CLOSURE's G)
+      // WANNIER MODE (2026-09-29, user: "fix wannier in sigma"): the closure's G is U^T G_W U^* -- the band-window G seen through
+      // the projector in the closure's transposed convention (eval_sigma_pair's G_close, L-6c) -- NOT the ladder's MLWF-frame
+      // G_CC, which stays the pair propagator's G. Empty in window mode. gC_close = its pole residues on the ladder's own G node
+      // set, fitted by the driver next to gC (pair_space_ladder_dyn). Every closure use reads these through gk() / the G the
+      // driver passes (the closure G).
+      nda::array<ComplexType, 5> G_close;   // (nt, ns, nk_full, nc, nc)
+      nda::array<ComplexType, 5> gC_close;  // (ns, ng, nk_full, nc, nc)
+      bool wannier_closure() const { return G_close.size() > 0; }
+      ComplexType gk(dynbse::pair_poles const &P, long is, long j, long ik, long c, long x) const {
+        return (gC_close.size() > 0) ? gC_close(is, j, ik, c, x) : P.gk(j, ik, c, x);
+      }
       nda::array<ComplexType, 1> iw;     // (nw_f)
       nda::array<double, 1> eps_pre;     // the node set of the first unit (every unit must share it: the kappa tables assume it)
       // P1 (2026-09-21): the IBZ solve on a symmetric mesh. The driver's units are the IBZ transfers (identity-frame legs);
@@ -537,7 +548,7 @@ namespace solvers {
             for (long c = 0; c < nc; ++c)
               for (long x = 0; x < nc; ++x) {
                 cplx gp(0.0);
-                for (long j = 0; j < P.ng; ++j) gp += P.gk(j, ik, c, x) / (h.iw(n) - P.epsG(j));
+                for (long j = 0; j < P.ng; ++j) gp += h.gk(P, is, j, ik, c, x) / (h.iw(n) - P.epsG(j));
                 d = std::max(d, std::abs(gp - h.Gw(n, is, ik, c, x)));
                 sc = std::max(sc, std::abs(h.Gw(n, is, ik, c, x)));
               }
@@ -728,7 +739,7 @@ namespace solvers {
               for (long M = 0; M < Nm; ++M) Dconj(c * nc + i, M) = std::conj(Dc(ik, c, i, M));
           for (long j = 0; j < ng; ++j)
             for (long c = 0; c < nc; ++c)
-              for (long x = 0; x < nc; ++x) Gmat(j, c * nc + x) = P.gk(j, ik, c, x);
+              for (long x = 0; x < nc; ++x) Gmat(j, c * nc + x) = h.gk(P, is, j, ik, c, x);
           M3() = cplx(0.0);
           CUj() = cplx(0.0);
           for (long a = 0; a < np; ++a) {
@@ -906,7 +917,7 @@ namespace solvers {
             for (long c = 0; c < nc; ++c)
               for (long x = 0; x < nc; ++x) {
                 cplx gp(0.0);
-                for (long j = 0; j < ng; ++j) gp += P.gk(j, ik, c, x) / (h.iw(n) - P.epsG(j));
+                for (long j = 0; j < ng; ++j) gp += h.gk(P, is, j, ik, c, x) / (h.iw(n) - P.epsG(j));
                 dm = std::max(dm, std::abs(gp - h.Gw(n, is, ik, c, x)));
                 sc = std::max(sc, std::abs(h.Gw(n, is, ik, c, x)));
               }
@@ -914,7 +925,9 @@ namespace solvers {
       }
       if (is != d.is or iq != d.iq) {                     // the transfer's legs, pair map and G residues
         utils::check(Dc.shape(3) == Wout.shape(0), "sigma_dyn_accumulate_device: the legs are not the aux ones.");
-        dynbse_cuda::ue_sd_set_sq(ue, &kpq(iq, 0), P.gk.data(), P.gnode.data());
+        nda::array<cplx, 4> gk_close;                     // Wannier mode: the closure's residues (the device deposits' g_j)
+        if (h.gC_close.size() > 0) gk_close = h.gC_close(is, nda::range::all, nda::range::all, nda::range::all, nda::range::all);
+        dynbse_cuda::ue_sd_set_sq(ue, &kpq(iq, 0), (h.gC_close.size() > 0) ? gk_close.data() : P.gk.data(), P.gnode.data());
         d.is = is; d.iq = iq;
       }
       const int col = (h.col == "static_dyn") ? 0 : ((h.col == "dyn1_bare") ? 1 : 2);

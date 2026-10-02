@@ -863,6 +863,32 @@ namespace solvers {
                 for (long bb2 = 0; bb2 < nc; ++bb2) gC(is, p, k, a, bb2) = c(p, a * nc + bb2);
           }
       }
+      // WANNIER MODE (2026-09-29, the Sigma hook's closure): the closure G = U^T G_W U^* (hook.G_close, set by the Sigma entry
+      // points) fitted on the SAME basis and G node set as gC -- its residues are the closure's g_j; the pair propagator keeps gC
+      if (opt.sigma != nullptr and opt.sigma->wannier_closure()) {
+        auto const &Gc = opt.sigma->G_close;
+        utils::check(not sym and Gc.shape(0) == nt and Gc.shape(1) == ns and Gc.shape(2) == nk and Gc.shape(3) == nc and Gc.shape(4) == nc,
+                     "pair_space_ladder_dyn: the Wannier closure G ({} x {} x {} x {} x {}) does not match G_CC's layout "
+                     "({} x {} x {} x {} x {}; nosym meshes only).", Gc.shape(0), Gc.shape(1), Gc.shape(2), Gc.shape(3), Gc.shape(4),
+                     nt, ns, nk, nc, nc);
+        opt.sigma->gC_close = nda::array<cplx, 5>(ns, ng, nk, nc, nc);
+        double fe_c = 0.0;
+        nda::array<cplx, 2> Fg(nt, nc2);
+        for (long is = 0; is < ns; ++is)
+          for (long k = 0; k < nk; ++k) {
+            for (long i = 0; i < nt; ++i)
+              for (long a = 0; a < nc; ++a)
+                for (long bb2 = 0; bb2 < nc; ++bb2) Fg(i, a * nc + bb2) = Gc(i, is, k, a, bb2);
+            auto c = use_npf ? npf.coeffs(Fg) : db::basis_coeffs(b, Fg);
+            fe_c = std::max(fe_c, use_npf ? npf.fit_error(Fg, c) : db::basis_fit_error(b, Fg, c));
+            for (long p = 0; p < ng; ++p)
+              for (long a = 0; a < nc; ++a)
+                for (long bb2 = 0; bb2 < nc; ++bb2) opt.sigma->gC_close(is, p, k, a, bb2) = c(p, a * nc + bb2);
+          }
+        if (rank == 0)
+          app_log(1, "  [dynbse] Wannier-mode Sigma closure: U^T G_W U^* fitted on the ladder's G node set ({} nodes), fit error {:.2e}",
+                  ng, fe_c);
+      }
       if (rank == 0)
         app_log(2, "  [dynbse] node set: {} ({} vertex nodes, {} G nodes ({} in-gap nodes masked at |eps| < {:.4f} Ha), "
                    "{} total); G fit error {:.2e}, residue ratio {:.2f}",
@@ -1143,6 +1169,65 @@ namespace solvers {
         if (use_ft) thc_rung_apply_ft(Xb, is_, iq_, kpq, kft, Wfn, sc, Fin, Oout, nb, symc);   // P6: symc (nullptr on nosym)
         else thc_rung_apply(Xb, is_, iq_, kpq, qx_of, Wfn, sc, Fin, Oout, nb, symc);
       };
+#if defined(ENABLE_CUDA)
+      // R1(b) step 1 (2026-09-28, notes/gpu_port_plan.md 4h): the STREAMING THC rung on the device. vertex_debug
+      // dynbse_dev_stream = 1 runs the streaming path's rung applications (dense_rung = false) through rs_apply instead of
+      // thc_rung_apply_ft -- nosym full meshes with the FFT k-sum only (else the host route, with the reason logged);
+      // dynbse_dev_stream_nb = the FFT block width (default 16, halved to fit); dynbse_dev_stream_check = 1: the first kd
+      // call of every rank's first unit also runs the host rung on two tau nodes and the constant part, and logs the
+      // device-vs-host difference.
+      std::unique_ptr<dynbse_cuda::rung_stream, void (*)(dynbse_cuda::rung_stream *)> rs(nullptr, dynbse_cuda::rs_destroy);
+      long rs_sq = -1;
+      bool rs_res = false;                           // the transformed tables resident (slot i = tau node i, slot nt = W_d0)
+      double rs_t[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // [0] W transforms, [1] legs in, [2] FFT + product, [3] legs out, [4] H2D/D2H
+      if (not opt.dense_rung and not opt.bubble_only and vertex_debug::flag("dynbse_dev_stream")) {
+        std::string why_rs;
+        if (not use_ft or not kft.fft) why_rs = "no FFT mesh transform";
+        else if (sym) why_rs = "a symmetry-reduced mesh (no per-class device pass)";
+        else if (kft.Uq.shape(1) != nq) why_rs = "transfer count mismatch";
+        else {
+          dynbse_cuda::rs_config rc;
+          rc.ns = ns; rc.nk = nk; rc.nq = nq; rc.Nm = Nm; rc.nc = nc;
+          rc.nb = std::max(1l, long(vertex_debug::number("dynbse_dev_stream_nb", 16.0)));
+          rc.layout = int(vertex_debug::number("dynbse_dev_stream_layout", 2.0));   // 2 fused k-sum | 1 contiguous cuFFT | 0 strided
+          rc.ntab = nt + 1;           // every tau table + W_d0 transformed once per driver call (fixed here), else per call
+          for (int a = 0; a < 3; ++a) rc.ndim[a] = kft.ndim[a];
+          rc.fz_g = long(vertex_debug::number("dynbse_dev_stream_g", 0.0));        // vertex_debug: dynbse_dev_stream_g (layout 2 columns per block)
+          // the fused k-sum (layout 2) covers mesh dimensions <= 16 and nk <= 256; beyond, the contiguous-cuFFT layout 1 computes
+          // the same rung
+          if (rc.layout == 2 and (rc.ndim[0] > 16 or rc.ndim[1] > 16 or rc.ndim[2] > 16 or nk > 256)) {
+            if (rank == 0)
+              app_log(1, "  [dynbse] WARNING: mesh {} x {} x {} is beyond the fused k-sum's limits (dimensions <= 16, nk <= 256): the "
+                         "streaming rung uses layout 1", rc.ndim[0], rc.ndim[1], rc.ndim[2]);
+            rc.layout = 1;
+          }
+          char why[256] = {0};
+          rs.reset(dynbse_cuda::rs_create(rc, nrb, kft.lex_k.data(), kft.lex_q.data(), Xb.data(),
+                                          1.0e6 * double(utils::freemem_device_effective()), why, 256));
+          if (not rs) why_rs = why;
+          else {
+            rs_res = (dynbse_cuda::rs_ntab(rs.get()) == nt + 1);
+            if (rs_res) {
+              for (long i = 0; i < nt; ++i) dynbse_cuda::rs_load_w(rs.get(), i, Wd_s.data() + i * Nm * Nm, nt * Nm * Nm, rs_t);
+              dynbse_cuda::rs_load_w(rs.get(), nt, Wd0.data(), Nm * Nm, rs_t);
+            }
+            if (rank == 0) {
+              rc.ntab = dynbse_cuda::rs_ntab(rs.get());
+              app_log(1, "  [dynbse] streaming THC rung on the DEVICE: ON (layout {}, nb {}, {} rung tables {}, {:.2f} GB; mesh {} x {} x {}, "
+                         "Nm {}, nc {})", rc.layout, dynbse_cuda::rs_nb(rs.get()), rc.ntab, rs_res ? "resident" : "(reloaded per call)",
+                      dynbse_cuda::rs_bytes(rc, nrb) / 1.0e9, rc.ndim[0], rc.ndim[1], rc.ndim[2], Nm, nc);
+            }
+          }
+        }
+        if (not rs) {
+          utils::check(dyn_device_fallback_state(),
+                       "pair_space_ladder_dyn: the device streaming THC rung (vertex_debug dynbse_dev_stream) cannot run: {}. "
+                       "pol_vertex_dyn_device_fallback = false forbids the host rung: ABORTING.", why_rs);
+          if (rank == 0) app_log(1, "  [dynbse] WARNING: the device streaming THC rung cannot run ({}): MOVED TO THE CPU "
+                                    "(pol_vertex_dyn_device_fallback = true)", why_rs);
+        }
+      }
+#endif
       // host threads (the omp_threads knob; the global OMP_NUM_THREADS stays 1 per the T-3b contract): the
       // tau nodes of a rung application are independent; the body holds no MPI, no HDF5, no shared writes
       // (each tau writes its own Ys slice; the rung buffers are per call)
@@ -1391,9 +1476,11 @@ namespace solvers {
       // Sigma deposits). Scope: the dense rung, the Gamma_1-only GMRES path, the unmasked basis, the batched L0; anything
       // else keeps the host path. vertex_debug dynbse_dev_unit = 0 disables it (the A/B).
       std::unique_ptr<dynbse_cuda::unit_engine, void (*)(dynbse_cuda::unit_engine *)> ue(nullptr, dynbse_cuda::ue_destroy);
+      // R1(b): the streaming rung inside the device-resident unit (dense_rung = false with the device streaming rung and its
+      // tables resident); vertex_debug dynbse_dev_stream_unit = 0 keeps the host-driven streaming path (the A/B)
+      const bool ue_stream = (not opt.dense_rung and rs and rs_res and vertex_debug::number("dynbse_dev_stream_unit", 1.0) != 0.0);
       const bool ue_want = db::l0_device_enabled() and vertex_debug::number("dynbse_dev_unit", 1.0) != 0.0 and   // vertex_debug: dynbse_dev_unit
-                           opt.dense_rung and opt.gmres_m > 0 and
-                           opt.gamma1_only and not opt.static_only and
+                           (opt.dense_rung or ue_stream) and opt.gmres_m > 0 and opt.gamma1_only and not opt.static_only and
                            not opt.one_rung_only and db::l0_cols_state() and not b.npf_mask and
                            not (opt.sigma != nullptr and opt.sigma->col == "dyn");
       if (rank == 0 and db::l0_device_enabled() and not ue_want)
@@ -1519,14 +1606,23 @@ namespace solvers {
           uc.l0_fz_cfg = int(vertex_debug::number("dynbse_l0_fz_cfg", 44.0));     // vertex_debug: dynbse_l0_fz_cfg
           uc.l0_fz_bench = int(vertex_debug::number("dynbse_l0_fz_bench", 0.0)); // vertex_debug: dynbse_l0_fz_bench
           uc.l0_asm_gemm = int(vertex_debug::number("dynbse_l0_asm_gemm", 1.0));  // vertex_debug: dynbse_l0_asm_gemm
-          // factorize-vertex: the memory partition of the rung slab (pol_vertex_dyn_device_memory; vertex_debug dyn_um overrides it
-          // for tests: 0 resident, 2 managed, 3 stream) and the device bytes kept free for the later stages, computed exactly
+          // the memory policy of the dense rungs (pol_vertex_dyn_device_memory): the resident count and the sources of the others
+          // (device rebuild, needs the device rung builds = nosym meshes; pinned-host copy), and the device bytes the engine leaves
+          // free for the stages created after it -- rung builds, Sigma deposits, dressed legs -- computed with their own formulas.
+          // vertex_debug dynbse_dev_nres = n forces n resident rungs (an A/B of the non-resident paths); -1 = the most that fit.
           {
             auto const &mpol = dyn_device_memory_state();
-            const double um_dbg = vertex_debug::number("dyn_um", -1.0);              // vertex_debug: dyn_um (test override)
-            uc.um_mode = (um_dbg >= 0.0) ? int(um_dbg) : (mpol == "stream" ? 3 : (mpol == "managed" ? 2 : 0));
-            const long nrep_b = (rrank > 0) ? rrank : ndist;
             const bool kb_will = not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0;
+            uc.nres = long(vertex_debug::number("dynbse_dev_nres", -1.0));   // vertex_debug: dynbse_dev_nres
+            uc.rung_fuse = int(vertex_debug::number("dynbse_dev_rung_fuse", 1.0));   // vertex_debug: dynbse_dev_rung_fuse (two inputs per rung pass)
+            uc.stream = ue_stream ? 1 : 0;
+            if (ue_stream) { uc.rung_fuse = 0; uc.nres = 0; }
+            uc.partial_ok = kb_will ? 1 : 0;
+            uc.nonres_src = (mpol == "auto") ? 0 : (mpol == "rebuild" ? 1 : (mpol == "host" ? 2 : 3));
+            utils::check(not (mpol == "rebuild" and not kb_will and not ue_stream),
+                         "pair_space_ladder_dyn: pol_vertex_dyn_device_memory = rebuild needs the device rung builds ({}). ABORTING: use "
+                         "auto or host.", sym ? "a symmetry-reduced mesh has none" : "vertex_debug dynbse_dev_kbig = 0");
+            const long nrep_b = (rrank > 0) ? rrank : ndist;
             const bool sd_will = opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma);
             const bool dr_will = dressed_req and (opt.sigma == nullptr or sd_will);
             double later = 0.0;
@@ -1538,11 +1634,10 @@ namespace solvers {
               later += dynbse_cuda::ue_sd_bytes(sc, nrb) / 0.9;
             }
             if (dr_will) later += dynbse_cuda::ue_dressed_bytes(ng, np, nk, nc, nout, nrb) / 0.9;
-            uc.um_reserve = later + 0.5e9 + 1.0e9 * vertex_debug::number("dyn_um_extra_gb", 0.0);   // vertex_debug: dyn_um_extra_gb
+            uc.reserve_bytes = later + 0.5e9 + 1.0e9 * vertex_debug::number("dyn_dev_extra_gb", 0.0);   // vertex_debug: dyn_dev_extra_gb
             if (rank == 0)
-              app_log(1, "  [dynbse] device memory policy \"{}\"{}: {:.2f} GB kept free for the later device stages (rung builds {}, "
-                         "Sigma deposits {}, dressed legs {})", mpol, um_dbg >= 0.0 ? " (vertex_debug dyn_um override)" : "",
-                      uc.um_reserve / 1e9, kb_will, sd_will, dr_will);
+              app_log(1, "  [dynbse] device memory policy \"{}\": {:.2f} GB kept free for the later device stages (rung builds {}, "
+                         "Sigma deposits {}, dressed legs {})", mpol, uc.reserve_bytes / 1e9, kb_will, sd_will, dr_will);
           }
           char why[256] = {0};
           ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
@@ -1557,10 +1652,18 @@ namespace solvers {
             Utk() = pf.Ut(nda::range(0, pf.n_kept), all);
             Vsk() = pf.Vs(all, nda::range(0, pf.n_kept));
             dynbse_cuda::ue_set_basis(ue.get(), b.KF.data(), b.KF2.data(), Utk.data(), Vsk.data(), Kck.data());
+            if (ue_stream) dynbse_cuda::ue_set_stream(ue.get(), rs.get());
           }
-          if (rank == 0)
-            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated){}{}", ue ? "ON" : "OFF",
-                    dynbse_cuda::ue_bytes(uc) / 1e9, why[0] ? " -- " : "", why);
+          if (rank == 0) {
+            dynbse_cuda::ue_config ucr = uc;
+            if (ue) { ucr.nres = dynbse_cuda::ue_nres(ue.get()); ucr.rung_fuse = dynbse_cuda::ue_rung_fused(ue.get()) ? 1 : 0; }
+            const std::string resid = (ue and ucr.nres < ndist)
+                ? "; tau rungs resident " + std::to_string(ucr.nres) + " of " + std::to_string(ndist) +
+                  ", the others rebuilt on the device or copied from pinned host memory per application" : std::string();
+            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated{}, {:.1f} GB reserved{}{}){}{}", ue ? "ON" : "OFF",
+                    dynbse_cuda::ue_bytes(ucr) / 1e9, resid, uc.reserve_bytes / 1e9,
+                    (ue and ucr.rung_fuse) ? "; two inputs per rung pass" : "", ue_stream ? "; STREAMING rung" : "", ue ? "" : " -- ", ue ? "" : why);
+          }
           if (not ue) dev_fallback("the device-resident unit", why);
           // D-1b: the rungs built on the device (nosym meshes); vertex_debug dynbse_dev_kbig = 0 keeps the host builds (the A/B)
           if (ue and not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0) {   // vertex_debug: dynbse_dev_kbig
@@ -1589,7 +1692,9 @@ namespace solvers {
           }
           if (ue and opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma)) {
             std::string why_sd;
-            const bool ok = sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, G_CC, nk, nc, ng, epsG, Nm, tools, why_sd);
+            const bool ok = opt.sigma->wannier_closure()   // Wannier mode: the deposits' closure G
+                ? sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, opt.sigma->G_close, nk, nc, ng, epsG, Nm, tools, why_sd)
+                : sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, G_CC, nk, nc, ng, epsG, Nm, tools, why_sd);
             if (rank == 0)
               app_log(1, "  [dynbse] device Sigma deposits: {}{}", ok ? "ON (accumulators resident, flushed at checkpoints and the end)"
                                                                         : "OFF -- ", ok ? "" : why_sd);
@@ -1718,6 +1823,7 @@ namespace solvers {
         last_sq = sq;
 #if defined(ENABLE_CUDA)
         if (ue) {
+          if (ue_stream and rs_sq != is * nq + iq) { dynbse_cuda::rs_set_sq(rs.get(), is, &kpq(iq, 0)); rs_sq = is * nq + iq; }
           if (not kb_dev) dynbse_cuda::ue_set_rung(ue.get(), Ks.data(), Kd_s.data(), Kd0.data(), trep.data(), scale_k);
           dynbse_cuda::ue_set_legs(ue.get(), Dc.data());
         }
@@ -1849,11 +1955,42 @@ namespace solvers {
                 nda::blas::gemm(scale_k, Kd_s(trep[size_t(i)], all, all), Fi, cplx(0.0), Oi);
               }
             } else {
+#if defined(ENABLE_CUDA)
+              if (rs) {
+                if (rs_sq != is * nq + iq) { dynbse_cuda::rs_set_sq(rs.get(), is, &kpq(iq, 0)); rs_sq = is * nq + iq; }
+                const long NN = Nm * Nm;
+                for (long i = 0; i < nt; ++i) {
+                  if (not rs_res) dynbse_cuda::rs_load_w(rs.get(), 0, Wd_s.data() + i * NN, nt * NN, rs_t);
+                  dynbse_cuda::rs_apply(rs.get(), rs_res ? i : 0, scale_k, Fs(i, all, all, all).data(), Ys(i, all, all, all).data(),
+                                        nR, rs_t + 1);
+                }
+                if (dbg and kd_calls == 0 and vertex_debug::flag("dynbse_dev_stream_check")) {
+                  // the device rung against the host one on the same inputs (the gate: a few ulp of the scale)
+                  double dmax = 0.0, hmax = 0.0;
+                  nda::array<cplx, 3> Oh(nk, nc2, nR);
+                  for (long i : {0l, nt / 2}) {
+                    auto Fi = Fs(i, all, all, all);
+                    rung_apply(Wq_s(i), scale_k, Fi, Oh, is, iq);
+                    auto Oi = Ys(i, all, all, all);
+                    for (long k = 0; k < nk; ++k)
+                      for (long r = 0; r < nc2; ++r)
+                        for (long N = 0; N < nR; ++N) {
+                          dmax = std::max(dmax, std::abs(Oi(k, r, N) - Oh(k, r, N)));
+                          hmax = std::max(hmax, std::abs(Oh(k, r, N)));
+                        }
+                  }
+                  app_log(1, "  [dynbse] device streaming rung check (fam {}, tau nodes 0 and {}): max|dev - host| {:.3e}, "
+                             "max|host| {:.3e}, relative {:.3e}", fam, nt / 2, dmax, hmax, (hmax > 0.0) ? dmax / hmax : dmax);
+                }
+              } else
+#endif
+              {
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
               for (long i = 0; i < nt; ++i) {
                 auto Fi = Fs(i, all, all, all);
                 auto Oi = Ys(i, all, all, all);
                 rung_apply(Wq_s(i), scale_k, Fi, Oi, is, iq);
+              }
               }
             }
             if (met) met->t_rung += kwatch.lap();
@@ -1889,6 +2026,26 @@ namespace solvers {
             nda::blas::gemm(-scale_k, Kd0, F2, cplx(0.0), O2);
             bthr(false);
           } else {
+#if defined(ENABLE_CUDA)
+            if (rs) {
+              if (rs_sq != is * nq + iq) { dynbse_cuda::rs_set_sq(rs.get(), is, &kpq(iq, 0)); rs_sq = is * nq + iq; }
+              if (not rs_res) dynbse_cuda::rs_load_w(rs.get(), 0, Wd0.data(), Nm * Nm, rs_t);
+              dynbse_cuda::rs_apply(rs.get(), rs_res ? nt : 0, -scale_k, Fs3.data(), Os3.data(), nR, rs_t + 1);
+              if (dbg and kd_calls == 0 and vertex_debug::flag("dynbse_dev_stream_check")) {
+                nda::array<cplx, 3> Oh(nk, nc2, nR);
+                rung_apply(Wq_0, -scale_k, Fs3, Oh, is, iq);
+                double dmax = 0.0, hmax = 0.0;
+                for (long k = 0; k < nk; ++k)
+                  for (long r = 0; r < nc2; ++r)
+                    for (long N = 0; N < nR; ++N) {
+                      dmax = std::max(dmax, std::abs(Os3(k, r, N) - Oh(k, r, N)));
+                      hmax = std::max(hmax, std::abs(Oh(k, r, N)));
+                    }
+                app_log(1, "  [dynbse] device streaming rung check (the constant part K_d0): max|dev - host| {:.3e}, max|host| "
+                           "{:.3e}, relative {:.3e}", dmax, hmax, (hmax > 0.0) ? dmax / hmax : dmax);
+              }
+            } else
+#endif
             rung_apply(Wq_0, -scale_k, Fs3, Os3, is, iq);
           }
           for (long k = 0; k < nk; ++k)
@@ -1979,7 +2136,7 @@ namespace solvers {
             // audit B2: its bytes are reserved up front (ue_dressed_bytes in the unit's partition), so a failure here is an estimate
             // error, not a configuration the user can route to the CPU mid-transfer: abort with the reason
             utils::check(dressed_dev, "pair_space_ladder_dyn: the device dressed-leg readout could not be prepared: {} (its memory was "
-                         "reserved when the unit was created -- raise vertex_debug dyn_um_extra_gb or report this). ABORTING.", whyd);
+                         "reserved when the unit was created -- raise vertex_debug dyn_dev_extra_gb or report this). ABORTING.", whyd);
             if (rank == 0 and units_taken == 1) app_log(1, "  [factorize-vertex] dressed-leg Gamma_1 readout ON THE DEVICE UNIT");
           }
 #endif
@@ -2291,7 +2448,12 @@ namespace solvers {
                 sigma_dyn_accumulate_device(*opt.sigma, sd_dev, ue.get(), b, P, inu, Dc, N0, N1, Wout, kpq, is, iq, m, tools);
               else
 #endif
-              sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools);
+              {
+              if (opt.sigma->wannier_closure())   // Wannier mode: the closure G (U^T G_W U^*), not the ladder's G_CC
+                sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, opt.sigma->G_close, kpq, is, iq, m, tools);
+              else
+                sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools);
+              }
             }
 #if defined(ENABLE_CUDA)
             if (ue) {
@@ -2405,11 +2567,80 @@ namespace solvers {
           }
         }
       }
+#if defined(ENABLE_CUDA)
+      if (ue and dynbse_cuda::ue_nres(ue.get()) < ndist) {   // larger spaces: what the partial rung residency cost this rank
+        long nrb_ = 0, nhr = 0, ncp = 0;
+        double trb = 0.0, tcp_e = 0.0, trb_e = 0.0;
+        dynbse_cuda::ue_rebuild_stats(ue.get(), &nrb_, &trb);
+        dynbse_cuda::ue_source_stats(ue.get(), &nhr, &ncp, &tcp_e, &trb_e);
+        if (rank == 0)
+          app_log(1, "  [dynbse] partial rung residency ({} of {} tau rungs resident; last plan: {} copied from pinned host memory, {} "
+                     "rebuilt): rank 0 did {} rebuilds ({:.1f} s, {:.1f} ms each) and {} copies (estimated {:.1f} ms each)",
+                  dynbse_cuda::ue_nres(ue.get()), ndist, nhr, ndist - dynbse_cuda::ue_nres(ue.get()) - nhr, nrb_, trb,
+                  nrb_ > 0 ? 1e3 * trb / double(nrb_) : 0.0, ncp, 1e3 * tcp_e);
+      }
+#endif
+#if defined(ENABLE_CUDA)
+      if (rs and rank == 0)
+        app_log(1, "  [dynbse] device streaming rung on rank 0: W transforms {:.1f} s, legs in {:.1f} s, FFT + product {:.1f} s, "
+                   "legs out {:.1f} s, H2D/D2H {:.1f} s", rs_t[0], rs_t[1], rs_t[2], rs_t[3], rs_t[4]);
+#endif
       write_sig_ckpt();                                         // P20: the finished run's accumulators (a restart loads them)
       if (dyn_sched) {
         MPI_Win_fence(0, win);
         MPI_Win_free(&win);
       }
+    }
+
+    /** WANNIER MODE (2026-09-29): the Sigma closure's G, U^T G_W U^* (eval_sigma_pair's G_close, L-6c), from the loop's
+     *  band-window G (G_W, nW = |window| bands) and the projector U(s, k) = U_skia(s, k, :, :) (nW x M); full-BZ k axis. */
+    inline void wannier_closure_G(nda::MemoryArrayOfRank<5> auto const &G_tskij, nda::range band_window, bool sym_mesh,
+                                  auto const &kp_to_ibz, auto const &kp_trev, nda::array<ComplexType, 4> const &U_skia,
+                                  long nt, long ns, long nk_full, long M, nda::array<ComplexType, 5> &out) {
+      decltype(nda::range::all) all;
+      const long nW = long(band_window.size());
+      utils::check(U_skia.shape(0) == ns and U_skia.shape(1) >= nk_full and U_skia.shape(2) == nW and U_skia.shape(3) == M,
+                   "wannier_closure_G: projector ({}, {}, {}, {}) vs (ns {}, nk {}, nW {}, M {}).", U_skia.shape(0), U_skia.shape(1),
+                   U_skia.shape(2), U_skia.shape(3), ns, nk_full, nW, M);
+      nda::array<ComplexType, 5> Gw(nt, ns, nk_full, nW, nW);
+      vertex_ladder_detail::expand_G_CC_fullbz(G_tskij, band_window, sym_mesh, kp_to_ibz, kp_trev, Gw);
+      out = nda::array<ComplexType, 5>(nt, ns, nk_full, M, M);
+      nda::array<ComplexType, 2> Ut(M, nW), Uc(nW, M), S(nW, nW), T1(M, nW), R(M, M);
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk_full; ++k) {
+          for (long a = 0; a < nW; ++a)
+            for (long m = 0; m < M; ++m) { Ut(m, a) = U_skia(is, k, a, m); Uc(a, m) = std::conj(U_skia(is, k, a, m)); }
+          for (long it = 0; it < nt; ++it) {
+            S() = Gw(it, is, k, all, all);
+            nda::blas::gemm(Ut, S, T1);                                     // U^T G
+            nda::blas::gemm(T1, Uc, R);                                     // (U^T G) U^*
+            out(it, is, k, all, all) = R;
+          }
+        }
+    }
+
+    /** WANNIER MODE: the closure-convention block dSigma_bar = U^T dSigma U^* (M x M) back to the band window with U^* dSigma_bar U^T
+     *  (the inverse of that map, as eval_sigma_pair; NOT U dSigma_bar U^dag) -- dSig (nt, ns, nk, M, M) -> (nt, ns, nk, nW, nW) */
+    inline void wannier_sigma_to_window(nda::array<ComplexType, 5> &dSig, nda::array<ComplexType, 4> const &U_skia) {
+      decltype(nda::range::all) all;
+      const long nt = dSig.shape(0), ns = dSig.shape(1), nk = dSig.shape(2), M = dSig.shape(3), nW = U_skia.shape(2);
+      utils::check(U_skia.shape(0) == ns and U_skia.shape(1) >= nk and U_skia.shape(3) == M,
+                   "wannier_sigma_to_window: projector ({}, {}, {}, {}) vs dSigma (ns {}, nk {}, M {}).", U_skia.shape(0), U_skia.shape(1),
+                   U_skia.shape(2), U_skia.shape(3), ns, nk, M);
+      nda::array<ComplexType, 5> dSb(nt, ns, nk, nW, nW);
+      nda::array<ComplexType, 2> Uc(nW, M), Ut(M, nW), T1(nW, M), S(M, M), Sb(nW, nW);
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk; ++k) {
+          for (long a = 0; a < nW; ++a)
+            for (long m = 0; m < M; ++m) { Uc(a, m) = std::conj(U_skia(is, k, a, m)); Ut(m, a) = U_skia(is, k, a, m); }
+          for (long it = 0; it < nt; ++it) {
+            S() = dSig(it, is, k, all, all);
+            nda::blas::gemm(Uc, S, T1);                                    // U^* dSigma_bar
+            nda::blas::gemm(T1, Ut, Sb);                                   // (U^* dSigma_bar) U^T
+            dSb(it, is, k, all, all) = Sb;
+          }
+        }
+      dSig = std::move(dSb);
     }
 
   } // namespace vertex_dynbse_detail
@@ -3153,6 +3384,11 @@ namespace solvers {
     std::vector<long> nus;
     auto hook = std::make_shared<vd::sigma_dyn_hook>();
     prepare_sigma_dyn_hook(*hook, opt, thc, tools, symc, sym_, nus);
+    if (_wannier) {                                                  // Wannier mode: the closure G (see eval_sigma_pair_dyn)
+      utils::check(not sym_, "vertex_t::arm_shared_sigma_hook: the Wannier-mode dynamic Sigma vertex runs on nosym meshes only.");
+      vd::wannier_closure_G(mb_state.sG_tskij.value().local(), _band_window, MF->nkpts() != MF->nkpts_ibz(), MF->kp_to_ibz(),
+                            MF->kp_trev(), _U_skia, G_CC.shape(0), G_CC.shape(1), G_CC.shape(2), G_CC.shape(3), hook->G_close);
+    }
     // the P-side nodes that belong to the Sigma node set are deposited by the P-side call
     std::vector<long> shared;
     for (long m : p_nodes) if (std::find(nus.begin(), nus.end(), m) != nus.end()) shared.push_back(m);
@@ -3400,7 +3636,9 @@ namespace solvers {
     namespace vd = vertex_dynbse_detail;
     vertex_ladder_detail::prof_watch twatch;
     utils::check(active() and secondary(), "vertex_t::eval_sigma_pair_dyn: requires an ACTIVE secondary-basis vertex (the readout instance).");
-    utils::check(not _wannier, "vertex_t::eval_sigma_pair_dyn: the dynamic pair-resolved Sigma vertex runs in the band (window) frame only.");
+    // Wannier mode (2026-09-29, user: "fix wannier in sigma"): the contraction runs in the MLWF frame (the ladder's G_CC and legs
+    // X_bar = X U), the closure with U^T G_W U^* (hook.G_close, fitted next to gC by the driver), and dSigma is rotated back to the
+    // band window with U^* dSigma U^T -- eval_sigma_pair's L-6c conventions; nosym meshes (the 4^3 coarse runs) only.
     utils::check(_W0b_qmm.has_value(), "vertex_t::eval_sigma_pair_dyn: W0bar is absent -- build_w0 must run first.");
     utils::check(opt.col == "static_dyn" or opt.col == "dyn1_bare" or opt.col == "dyn1" or opt.col == "dyn",
                  "vertex_t::eval_sigma_pair_dyn: unknown column \"{}\" (static_dyn | dyn1_bare | dyn1 | dyn).", opt.col);
@@ -3450,6 +3688,13 @@ namespace solvers {
     if (vertex_debug::number("sigdyn_test_nq", 0.0) > 0 or vertex_debug::number("sigdyn_test_nnu", 0.0) > 0)
       app_log(1, "  [factorize-vertex] Sigma-side A/B TEST truncation: {} transfers x {} nu nodes (NOT a physical Sigma)", qs.size(), nus.size());
     vd::sigma_dyn_hook &hook = *hook_h;
+    if (_wannier and not hook.wannier_closure()) {
+      utils::check(not sym_, "vertex_t::eval_sigma_pair_dyn: the Wannier-mode dynamic Sigma vertex runs on nosym meshes only.");
+      vd::wannier_closure_G(mb_state.sG_tskij.value().local(), _band_window, MF->nkpts() != MF->nkpts_ibz(), MF->kp_to_ibz(),
+                            MF->kp_trev(), _U_skia, G_CC.shape(0), G_CC.shape(1), G_CC.shape(2), G_CC.shape(3), hook.G_close);
+      app_log(1, "  [LFF-Sigma dyn] Wannier mode: the closure G = U^T G_W U^* (M = {} MLWFs, band window [{}, {}))", G_CC.shape(3),
+              _band_window.first(), _band_window.last());
+    }
     vd::dyn_opts o;
     o.kcrys = std::addressof(kc);
     o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
@@ -3525,6 +3770,11 @@ namespace solvers {
     double e_fit = 0.0;
     const double sw_red = twatch.peek();
     vd::sigma_dyn_finish(hook, opt.scale, MF->nkpts(), dSig, e_fit, opt.dyn_refit, opt.dyn_refit_rtol);   // P12
+    if (_wannier) {                                                  // the MLWF-frame block back to the band window (before the meters)
+      vd::wannier_sigma_to_window(dSig, _U_skia);
+      app_log(1, "  [LFF-Sigma dyn] Wannier mode: dSigma rotated from the MLWF frame to the band window [{}, {}) (nW = {}).",
+              _band_window.first(), _band_window.last(), dSig.shape(3));
+    }
     app_log(1, "  [LFF-Sigma dyn] call walls: preparation (hook, sampled-mode bases) {:.1f} s, the driver {:.1f} s, "
                "the accumulator reductions + dump {:.1f} s, the finish {:.1f} s", sw_pre, sw_drv - sw_pre, sw_red - sw_drv,
             twatch.peek() - sw_red);

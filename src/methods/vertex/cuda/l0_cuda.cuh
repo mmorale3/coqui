@@ -133,15 +133,24 @@ namespace methods::solvers::dynbse_cuda {
     long nout = 0;                  // the external-leg / readout dimension (aux N_m, or the Wannier pair count)
     int l0_fused = 2, l0_asm_gemm = 1;   // the resident L0 plan's kernels (l0_tables::fused / asm_gemm)
     int l0_fz_cfg = 44, l0_fz_bench = 0; // l0_tables::fz_cfg / fz_bench
-    // factorize-vertex TEST (vertex_debug dyn_um): the dense rung slab K_d(s) (ndist D^2) in CUDA managed memory so the unit
-    // runs when it does not fit: 0 = device-resident (default); 1 = managed, preferred on the device (the driver migrates and
-    // evicts on demand); 2 = managed, split: the part that fits preferred on the device (prefetched), the rest host-resident
-    // and read over the link (AccessedBy device, no migration). The rest of the unit stays device-resident.
-    // 3 = streamed: the reps that fit device-resident, the rest in pinned host memory, copied per application through two device
-    // staging buffers on a copy stream overlapping the gemms (needs the mirror-pair rung).
-    int um_mode = 0;
-    double um_reserve = 6.0e9;      // device bytes kept free for the later device stages (rung builds, Sigma deposits, dressed)
+    // the dense tau rungs K_d(s_r): nres of ndist resident on the device (-1 = the most that fit the budget, 90 % of the free
+    // memory minus reserve_bytes = what the later device stages need: rung builds, Sigma deposits, dressed legs). The others
+    // reach the device per rung application through two staging buffers, rebuilt from the W tables (needs the device rung
+    // builds: partial_ok = 1) or copied from pinned host memory. nonres_src: 0 = both (split by measured cost), 1 = rebuild
+    // only, 2 = copy only, 3 = none (every rung must be resident).
+    long nres = -1;
+    int partial_ok = 0;
+    int nonres_src = 0;
+    double reserve_bytes = 0.0;
+    // 1: two inputs per rung pass (the one-bare-rung and the Gamma_1 input of a block, both frequency families packed side by
+    // side: every K_d(s_r) reached once per block); dropped when its buffers would cost residency
+    int rung_fuse = 1;
+    // the STREAMING THC rung (rung_cuda.cu) instead of the dense tau rungs -- no K_d(s) / K_d0 on the device (no partial
+    // residency, no packed pass); the rung and the constant part run through the rung_stream handed over by ue_set_stream.
+    // K_s and the LU of M stay dense (T_s).
+    int stream = 0;
   };
+  struct rung_stream;
 
   struct sd_config;
   /** factorize-vertex: the device bytes of the later stages (the unit's partition keeps them free; their own checks use them) */
@@ -151,8 +160,18 @@ namespace methods::solvers::dynbse_cuda {
   /** nullptr when the device cannot hold the working set (the caller keeps the host path); `why` then says what failed */
   unit_engine *ue_create(ue_config const &c, double free_bytes, char *why, long why_len);
   void ue_destroy(unit_engine *e);
-  /** bytes the engine needs for a configuration (the caller's feasibility check) */
+  /** bytes the engine needs for a configuration (the caller's feasibility check; nres < 0 counts every rung resident) */
   double ue_bytes(ue_config const &c);
+  /** the resident tau rungs of an engine (== ndist: all), and the non-resident rebuilds so far (count, wall seconds) */
+  long ue_nres(unit_engine const *e);
+  /** whether the engine runs the fused rung pass (ue_config::rung_fuse, kept when it fit the budget) */
+  bool ue_rung_fused(unit_engine const *e);
+  void ue_rebuild_stats(unit_engine const *e, long *n, double *seconds);
+  /** the non-resident rungs: how many are copied from pinned host memory (the rest rebuilt), copies so far, the planner's
+   *  per-rep cost estimates (seconds) */
+  void ue_source_stats(unit_engine const *e, long *nhost_reps, long *ncopies, double *t_copy_est, double *t_rb_est);
+  /** stream mode: the streaming rung the engine applies (owned by the caller; its (s, q) legs set by the caller, rs_set_sq) */
+  void ue_set_stream(unit_engine *e, rung_stream *rs);
 
   /** run-wide: KF, KF2 (nt, np) real; the basis' DLR refit (imag_axes_ft::dlr_pole_fit at its fixed rank, the np_fit DLR
    *  nodes): Ut (n_kept, nt) = its first n_kept rows, Vs (np_fit, n_kept) = its first n_kept columns (compacted), Kc (nt, np_fit) */

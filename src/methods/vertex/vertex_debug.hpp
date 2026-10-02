@@ -44,18 +44,20 @@ namespace vertex_debug {
    *  a consumer (set() aborts on anything else). */
   inline std::set<std::string> const &known_keys() {
     static const std::set<std::string> k = {
-        "allreduce_chunk", "cache_w_device", "cache_w_redist", "dyn_dressed", "dyn_fam_fuse", "dyn_lu_threads",
-        "dyn_r1_fuse", "dyn_rung_build_rank", "dyn_rung_pair", "dyn_rung_rank", "dyn_um", "dyn_um_extra_gb",
-        "dynbse_cb_gemm", "dynbse_collapse_loop", "dynbse_dev_kbig", "dynbse_dev_sigma", "dynbse_dev_unit",
-        "dynbse_group_sched", "dynbse_l0_active", "dynbse_l0_asm_gemm", "dynbse_l0_device", "dynbse_l0_fused",
-        "dynbse_l0_fz_bench", "dynbse_l0_fz_cfg", "dynbse_l0_pb", "dynbse_refit_loop", "dynbse_ritz", "dynbse_sq_cache",
-        "dynbse_tfold", "dynbse_tkeep", "dynbse_union", "dynbse_vmask", "eps_readout_device", "eta_device",
-        "inject_device", "interp_cache", "kd_blas_threads", "keep_host_w", "l2_blas_threads", "pi_hooks_device",
-        "rung_rank", "scf_causality_meter", "sigma_allow_nonconserving", "sigdyn_bases_cache", "sigdyn_blas_threads", "sigdyn_families",
-        "sigdyn_finish_device", "sigdyn_gram", "sigdyn_grid_tol", "sigdyn_legs", "sigdyn_route", "sigdyn_sketch",
-        "sigdyn_test_nnu", "sigdyn_test_nq", "sigpair_ibz_diag", "sigpair_ibz_dump", "sym_dt", "sym_fold_conv",
-        "sym_fold_dt", "sym_trev_notrans", "trev_w_check", "vertex_rdecay", "w0_dyson_device", "wbar_dump",
-        "wbar_dump_exit", "wbar_load"};
+        "allreduce_chunk", "cache_w_device", "cache_w_redist", "dyn_dev_extra_gb", "dyn_dressed", "dyn_fam_fuse",
+        "dyn_lu_threads", "dyn_r1_fuse", "dyn_rung_build_rank", "dyn_rung_pair", "dyn_rung_rank", "dynbse_cb_gemm",
+        "dynbse_collapse_loop", "dynbse_dev_kbig", "dynbse_dev_nres", "dynbse_dev_rung_fuse", "dynbse_dev_sigma",
+        "dynbse_dev_stream", "dynbse_dev_stream_check", "dynbse_dev_stream_g", "dynbse_dev_stream_layout", "dynbse_dev_stream_nb",
+        "dynbse_dev_stream_unit", "dynbse_dev_unit", "dynbse_group_sched", "dynbse_l0_active", "dynbse_l0_asm_gemm",
+        "dynbse_l0_device", "dynbse_l0_fused", "dynbse_l0_fz_bench", "dynbse_l0_fz_cfg", "dynbse_l0_pb", "dynbse_refit_loop",
+        "dynbse_ritz", "dynbse_sq_cache", "dynbse_tfold", "dynbse_tkeep", "dynbse_union", "dynbse_vmask", "eps_readout_device",
+        "eta_device", "inject_device", "interp_cache", "kd_blas_threads", "keep_host_w", "l2_blas_threads", "park_w_device",
+        "pi_hooks_device", "rung_rank", "scf_causality_abort", "scf_causality_matrix", "scf_causality_meter",
+        "sigdyn_bases_cache", "sigdyn_blas_threads", "sigdyn_families", "sigdyn_finish_device", "sigdyn_gram",
+        "sigdyn_grid_tol", "sigdyn_legs", "sigdyn_route", "sigdyn_sketch", "sigdyn_test_nnu", "sigdyn_test_nq",
+        "sigma_allow_nonconserving", "sigpair_ibz_diag", "sigpair_ibz_dump", "sym_dt", "sym_fold_conv", "sym_fold_dt",
+        "sym_trev_notrans", "trev_w_check", "vertex_rdecay", "w0_dyson_device", "wbar_dump", "wbar_dump_exit", "wbar_load"
+    };
     return k;
   }
   /** the known keys as one line (for the abort message) */
