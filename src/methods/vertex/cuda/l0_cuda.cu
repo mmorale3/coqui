@@ -2698,7 +2698,7 @@ namespace methods::solvers::dynbse_cuda {
             ? e->t_gemm_est : 8.0 * D * D * double(e->c.nt * e->c.nR_max) / double(std::max(e->c.ndist, 1l)) / 1.0e13;
         const double napp = double(e->napp_prev > 0 ? e->napp_prev : 4);
         double best = 1e300;
-        std::vector<int> src(size_t(nnr));
+        std::vector<int> src(static_cast<size_t>(nnr));
         for (long h = 0; h <= std::min(nnr, e->nhost_cap); ++h)
           for (int order = 0; order < 2; ++order) {
             for (long jj = 0; jj < nnr; ++jj)
