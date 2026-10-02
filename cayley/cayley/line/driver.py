@@ -14,17 +14,23 @@ from .closure import fit_sigma_sectors, lehmann_from_sigma, chemical_potential, 
 
 
 class LineSCGW:
-    def __init__(self, X, Z, qk_to_k2, nk, nelec, H0, mu, theta=np.deg2rad(20), eps=1e-8, lam=3.0, bos_gap=0.02,
-                 sig_gap=(0.03, 0.03), g_gap=(0.01, 0.01), wp=0.11, K=16, tol_gram=None, mixing=0.5, verbose=True, k_weight=None):
+    def __init__(self, X, Z, qk_to_k2, nk, nelec, H0, mu, theta=np.deg2rad(20), eps=1e-8, lam=6.0, bos_lam=4.0, bos_gap=0.02,
+                 sig_gap=(0.02, 0.02), g_gap=(0.01, 0.01), wp=0.11, K=16, tol_gram=None, mixing=0.5, verbose=True, k_weight=None,
+                 nodes_per_ray=120, node_range=(1e-3, 60.0)):
+        """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
+        ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
+        over node_range (Ha) — dense nodes are what pins the weight distribution of the far poles (dev/tune_sigma_fit.txt)."""
         self.X, self.Z, self.qk, self.nk, self.nelec, self.H0 = X, Z, qk_to_k2, nk, nelec, H0
         self.nb = X.shape[2]; self.mu = mu; self.theta, self.eps, self.lam = theta, eps, lam
         self.wp, self.K, self.mixing, self.verbose = wp, K, mixing, verbose
         self.tol_gram = tol_gram if tol_gram is not None else 10 * eps
         self.k_weight = k_weight
-        self.bos = BosonicLineBasis(theta, lam=lam, eps=eps, gap=bos_gap)
-        self.bp = LineBasis(theta, lam=lam, eps=eps, gap=(lam, sig_gap[1])); self.bh = LineBasis(theta, lam=lam, eps=eps, gap=(sig_gap[0], lam))
-        self.gp = LineBasis(theta, lam=lam, eps=eps, gap=(lam, g_gap[1])); self.gh = LineBasis(theta, lam=lam, eps=eps, gap=(g_gap[0], lam))
-        self.fz = np.unique(np.concatenate([self.bp.zeta, self.bh.zeta, self.gp.zeta, self.gh.zeta]))
+        tmax = node_range[1]
+        self.bos = BosonicLineBasis(theta, lam=bos_lam, eps=eps, gap=bos_gap)
+        self.bp = LineBasis(theta, lam=lam, eps=eps, gap=(lam, sig_gap[1]), tmax=tmax); self.bh = LineBasis(theta, lam=lam, eps=eps, gap=(sig_gap[0], lam), tmax=tmax)
+        self.gp = LineBasis(theta, lam=lam, eps=eps, gap=(lam, g_gap[1]), tmax=tmax); self.gh = LineBasis(theta, lam=lam, eps=eps, gap=(g_gap[0], lam), tmax=tmax)
+        t = np.exp(np.linspace(np.log(node_range[0]), np.log(node_range[1]), nodes_per_ray))
+        self.fz = np.concatenate([t * np.exp(1j * theta), t * np.exp(1j * (np.pi - theta))])
         self.gw = LineGW(X, Z, qk_to_k2, nk, mu, theta, theta / 2, self.bos, self.fz)
         self.Sig_prev = None; self.history = []
         if verbose: print(f"LineSCGW: {self.bos}\n  Sigma bases {self.bp.r}+{self.bh.r}, G bases {self.gp.r}+{self.gh.r}, fermionic nodes {len(self.fz)}", flush=True)
