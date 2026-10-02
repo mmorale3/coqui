@@ -169,6 +169,9 @@ namespace methods::solvers::dynbse_cuda {
   /** the non-resident rungs: how many are copied from pinned host memory (the rest rebuilt), copies so far, the planner's
    *  per-rep cost estimates (seconds) */
   void ue_source_stats(unit_engine const *e, long *nhost_reps, long *ncopies, double *t_copy_est, double *t_rb_est);
+  /** the planner's other inputs: the timed rung gemm per representative (seconds) and the rung passes of the last
+   *  completed transfer */
+  void ue_plan_inputs(unit_engine const *e, double *t_gemm_est, long *napp);
   /** stream mode: the streaming rung the engine applies (owned by the caller; its (s, q) legs set by the caller, rs_set_sq) */
   void ue_set_stream(unit_engine *e, rung_stream *rs);
 

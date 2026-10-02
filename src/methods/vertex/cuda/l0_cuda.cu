@@ -1760,6 +1760,7 @@ namespace methods::solvers::dynbse_cuda {
     for (int v : e->src_host) nh += v;
     *nhost_reps = nh; *ncopies = e->ncopy; *t_copy_est = e->t_copy_est; *t_rb_est = e->t_rb_est;
   }
+  void ue_plan_inputs(unit_engine const *e, double *t_gemm_est, long *napp) { *t_gemm_est = e->t_gemm_est; *napp = e->napp_prev; }
   void ue_set_stream(unit_engine *e, rung_stream *rs) {
     if (not e->stream) APP_ABORT(std::string(" ue_set_stream: the engine was not created in stream mode."));
     e->rs = rs;

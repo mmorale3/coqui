@@ -2569,11 +2569,15 @@ namespace solvers {
         double trb = 0.0, tcp_e = 0.0, trb_e = 0.0;
         dynbse_cuda::ue_rebuild_stats(ue.get(), &nrb_, &trb);
         dynbse_cuda::ue_source_stats(ue.get(), &nhr, &ncp, &tcp_e, &trb_e);
+        double tg_e = 0.0;
+        long napp_e = 0;
+        dynbse_cuda::ue_plan_inputs(ue.get(), &tg_e, &napp_e);
         if (rank == 0)
           app_log(1, "  [dynbse] partial rung residency ({} of {} tau rungs resident; last plan: {} copied from pinned host memory, {} "
-                     "rebuilt): rank 0 did {} rebuilds ({:.1f} s, {:.1f} ms each) and {} copies (estimated {:.1f} ms each)",
+                     "rebuilt): rank 0 did {} rebuilds ({:.1f} s, {:.1f} ms each) and {} copies (estimated {:.1f} ms each); planner "
+                     "inputs: rung gemm {:.2f} ms per representative, {} rung passes per transfer",
                   dynbse_cuda::ue_nres(ue.get()), ndist, nhr, ndist - dynbse_cuda::ue_nres(ue.get()) - nhr, nrb_, trb,
-                  nrb_ > 0 ? 1e3 * trb / double(nrb_) : 0.0, ncp, 1e3 * tcp_e);
+                  nrb_ > 0 ? 1e3 * trb / double(nrb_) : 0.0, ncp, 1e3 * tcp_e, 1e3 * tg_e, napp_e);
       }
 #endif
 #if defined(ENABLE_CUDA)
