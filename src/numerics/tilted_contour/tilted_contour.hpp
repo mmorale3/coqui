@@ -23,26 +23,23 @@
 
 /**
  * ===========================================================================
- * THE TILTED CONTOUR (increment TC-1 of notes/tc_coqui_impl_spec.md)
+ * THE TILTED CONTOUR
  * ===========================================================================
  *
- * OFFLINE geometry only: no physics, no MPI, no allocation of anything that
+ * Offline geometry only: no physics, no MPI, no allocation of anything that
  * scales with the basis. Inputs are six numbers (Delta_min, Delta_max,
  * W_target, delta, eps, rho); outputs are the contour nodes {s_j}, the tilt
- * theta, and a least-squares transform F that maps CONTOUR SAMPLES to values
+ * theta, and a least-squares transform F that maps contour samples to values
  * of the same function at a caller-supplied target list {z}:
  *
  *      P(z)  ~  sum_j F[z,j] P(s_j),        t_j = s_j e^{-i theta}.
  *
- * REFERENCE IMPLEMENTATION: tc_validation/contour.py. Every formula below is a
- * line-by-line port of that file, whose module docstring carries the mechanical
- * derivation and whose [verified: ...] tags name the numerical pin that fixes
- * it. The pins themselves are ported into
- * src/numerics/tests/test_tilted_contour.cpp (gate TC-1-b) and the campaign's
- * exported reference numbers are pinned there too (gate TC-1-a).
+ * Analytic checks of the formulas below (exponent, endpoint limits, ID
+ * exactness, mirror rows) and a set of reference numbers are tested in
+ * src/numerics/tests/test_tilted_contour.cpp.
  *
  * ---------------------------------------------------------------------------
- * THE DERIVATION, in the reference implementation's own words
+ * DERIVATION
  * ---------------------------------------------------------------------------
  * Contour   t(s) = s e^{-i th},  s in [0, S].   Target z = w + i d, d > 0.
  * Pole      R(z) = 1/(z - D) for a transition energy D > 0.
@@ -51,62 +48,53 @@
  *   K(s, D; z) = exp[i (z - D) s e^{-i th}]
  *              = exp[-a(D) s] exp[i((w-D) cos th + d sin th) s],
  *   a(D) = (D - w) sin th + d cos th.                                   (eq 2)
- * [verified: contour.py module docstring; pin1 below]
  *
  * Convergence for every transition D >= Dmin and every target w in
  * [Dmin, Dmin+W] needs a > 0 at the worst case (D = Dmin, w = Dmin+W):
  *   tan th < d / W,   rho := tan th * W / d in [0,1),                   (eq 3)
  *   gamma  = d cos th (1 - rho) = a_worst,   S = ln(1/eps_tr)/gamma.    (eq 4)
- * [verified: pin_eq34]
  *
  * Gram (x = D - Dmin, worst-case target so that D - w = x - W):
  *   G(x,x') = 1 / [ a(x) + a(x') - i (x - x') cos th ],                 (eq 5)
  *   a(x)    = (x - W) sin th + d cos th.
- * [verified: pin2_gram_closed_form]
  *
  * Endpoint limits:  th = 0 -> G = 1/[2d - i(x-x')];
  *                   th = pi/2, W = 0 -> G = 1/(x+x')  (Cauchy).
- * [verified: pin3_endpoints]
  *
  * ---------------------------------------------------------------------------
- * THE FOUR BINDING CORRECTIONS (notes/tilted_contour_validation_results.md
- * sections 2 and 7.2 -- each one costs accuracy or correctness if dropped)
+ * FOUR REQUIRED CHOICES (each one costs accuracy or correctness if dropped)
  * ---------------------------------------------------------------------------
  * (1) RANK AT lambda > eps^2 lambda_max, NOT eps lambda_max. The Gram is
  *     G = K^* K, so its eigenvalues are the SQUARES of the kernel's singular
- *     values; the spec's own threshold keeps singular values only down to
- *     sqrt(eps) and delivers sqrt(eps) accuracy. Measured ladder (results
- *     section 2.1): rank 188 -> F rel err 3.9e-02 at eps lambda_max versus
- *     rank 376 -> 2.3e-05 at eps^2 lambda_max. `rank_eps` is reported for
- *     comparison with the spec's tables and is NEVER used.
- * (2) THE CONJUGATE-MIRROR TARGET ROWS. Eq 9 builds P from G^> G^<, which
- *     carries only the RESONANT half R(z) = sum_k w_k/(z - D_k). The physical
- *     P is R(z) + R(-z), and the anti-resonant poles sit BELOW the targets
- *     where a < 0 for essentially the whole spectrum -- the contour integral
- *     diverges. For real D_k and Hermitian residues R(-z) = [R(-conj z)]^dag,
- *     so the anti-resonant half comes from the SAME contour samples through
- *     extra F rows at z' = -conj(z) = -w + i d. `mirror_target` and
+ *     values; a threshold eps lambda_max keeps singular values only down to
+ *     sqrt(eps) and delivers sqrt(eps) accuracy. `rank_eps` is reported for
+ *     comparison only and is never used.
+ * (2) THE CONJUGATE-MIRROR TARGET ROWS. The contour representation of P built
+ *     from G^>(t) G^<(-t) carries only the RESONANT half
+ *     R(z) = sum_k w_k/(z - D_k). The physical P is R(z) + R(-z), and the
+ *     anti-resonant poles sit BELOW the targets where a < 0 for essentially
+ *     the whole spectrum -- the contour integral diverges. For real D_k and
+ *     Hermitian residues R(-z) = [R(-conj z)]^dag, so the anti-resonant half
+ *     comes from the SAME contour samples through extra F rows at
+ *     z' = -conj(z) = -w + i d. `mirror_target` and
  *     `build_transform(..., with_mirror = true)` implement this; the nodes and
- *     the rank are unchanged. [verified: pin_mirror]
- * (3) eps_tr = eps^2 IN THE CONTOUR LENGTH. The spec's Table-2 S column is
- *     reproduced only with eps_tr = 1e-12 at eps = 1e-6; reading eq 4 with
- *     eps_tr = eps truncates the contour at HALF the needed length
- *     (results section 1 item 4). `eps_tr < 0` selects eps*eps.
- * (4) THE RANK IS CAPPED AT THE DOUBLE-PRECISION CONDITIONING CEILING.
- *     Measured LS conditioning (results section 5.1): ~1e4 at the spec rank,
- *     ~1e7 at the eps^2 rank (which is where we run and which is FINE), and
- *     ~3.5e12 at the fully resolved rank -- beyond N_s^sigma(1e-8) the
- *     transform is precision-limited, not rank-limited. The cap is
- *     #{lambda > `rank_ceiling` lambda_max} with rank_ceiling = 1e-16; at
- *     eps = 1e-6 it never binds, which is the point.
+ *     the rank are unchanged.
+ * (3) eps_tr = eps^2 IN THE CONTOUR LENGTH. Reading eq 4 with eps_tr = eps
+ *     truncates the contour at HALF the length needed for eps accuracy.
+ *     `eps_tr < 0` selects eps*eps.
+ * (4) THE RANK IS CAPPED AT THE DOUBLE-PRECISION CONDITIONING CEILING. The
+ *     LS conditioning grows quickly with the rank (~1e7 at the eps^2 rank for
+ *     eps = 1e-6, which is fine; ~1e12 at the fully resolved rank, where the
+ *     transform becomes precision-limited rather than rank-limited). The cap
+ *     is #{lambda > `rank_ceiling` lambda_max} with rank_ceiling = 1e-16; at
+ *     eps = 1e-6 it does not bind.
  *
  * ---------------------------------------------------------------------------
  * ROW WEIGHTING: `gram`, i.e. row k of the LS system scaled by the kernel
  * column norm ||K(.,x_k)||^{-1} = sqrt(2 a(x_k)). This is z-INDEPENDENT, so
- * ONE factorization serves every target, every q and every SCF iteration --
- * the spec's reuse claim. Measured equal in accuracy to the per-target
- * `relative` weighting at the eps^2 rank (1.16e-04 vs 1.18e-04, results
- * section 5.1), so nothing is given up. The alternative is not implemented.
+ * ONE factorization serves every target, every q and every SCF iteration.
+ * Its accuracy at the eps^2 rank matches that of a per-target relative
+ * weighting, which is therefore not implemented.
  * ---------------------------------------------------------------------------
  */
 
@@ -129,7 +117,7 @@ namespace tilted_contour {
 
   using dcomplex = std::complex<double>;
 
-  /** 1 Hartree in eV / hbar in eV.fs (CODATA 2018) -- the reference's constants. */
+  /** 1 Hartree in eV / hbar in eV.fs (CODATA 2018). */
   inline constexpr double hbar_eV_fs = 0.6582119569;
   inline constexpr double ha_to_eV   = 27.211386245988;
 
@@ -139,8 +127,8 @@ namespace tilted_contour {
 
   /**
    * The tilted contour + the target-window geometry it must serve.
-   * Energies are in ONE consistent unit; the campaign works in eV, the CoQui
-   * consumer (TC-2) works in Hartree. Nothing here cares which.
+   * Energies are in ONE consistent unit (the CoQui callers use Hartree);
+   * nothing here depends on which.
    */
   struct contour_params_t {
     double dmin  = 0.0;    ///< Delta_min, bottom of the particle-hole continuum
@@ -149,10 +137,10 @@ namespace tilted_contour {
     double delta = 0.0;    ///< Im z of the target line (the flat value / the floor)
     double rho   = 0.65;   ///< tan(theta) * W / delta, in [0, 1)
     double eps   = 1e-6;   ///< rank tolerance
-    double eps_tr = -1.0;  ///< contour-truncation tolerance; < 0 selects eps*eps (BINDING 3)
-    long   nx    = 2500;   ///< adapted Delta-grid points (spec 4.1 step 2)
+    double eps_tr = -1.0;  ///< contour-truncation tolerance; < 0 selects eps*eps (choice 3)
+    long   nx    = 2500;   ///< adapted Delta-grid points
     double kappa = 0.35;   ///< s-grid grading constant (fraction of an oscillation period)
-    double rank_ceiling = 1e-16;  ///< conditioning ceiling on the rank (BINDING 4)
+    double rank_ceiling = 1e-16;  ///< conditioning ceiling on the rank (choice 4)
     long   rank_max = -1;  ///< hard cap on the rank; < 0 = none (knob for the caller)
     long   rank_force = -1;  ///< DIAGNOSTIC: force this rank, bypassing the rule; < 0 = off
     /**
@@ -160,8 +148,7 @@ namespace tilted_contour {
      * delta cos(theta) (1 - rho). < 0 = use the closed form. REQUIRED whenever an
      * `a_fun` profile is supplied: the growing-delta profile's worst case is
      * a_fun(0), not the flat expression, and S = ln(1/eps_tr)/gamma sets the whole
-     * contour length. [the campaign does the same:
-     *  tc_validation/tests/common.py::Geom, profile != 'flat' branch]
+     * contour length.
      */
     double gamma_override = -1.0;
   };
@@ -179,7 +166,7 @@ namespace tilted_contour {
     utils::check(p.eps > 0.0 and p.eps < 1.0,
                  "tilted_contour: eps = {} must be in (0, 1).", p.eps);
     geometry_t g;
-    g.eps_tr    = (p.eps_tr < 0.0) ? p.eps * p.eps : p.eps_tr;   // BINDING 3
+    g.eps_tr    = (p.eps_tr < 0.0) ? p.eps * p.eps : p.eps_tr;   // choice 3
     utils::check(g.eps_tr > 0.0 and g.eps_tr < 1.0,
                  "tilted_contour: eps_tr = {} must be in (0, 1).", g.eps_tr);
     g.tan_theta = p.rho * p.delta / p.W;                          // eq 3/4
@@ -187,7 +174,8 @@ namespace tilted_contour {
     g.gamma     = (p.gamma_override > 0.0) ? p.gamma_override
                                            : p.delta * std::cos(g.theta) * (1.0 - p.rho);
     utils::check(g.gamma > 0.0,
-                 "tilted_contour: gamma = {} must be > 0 (eq 4).", g.gamma);
+                 "tilted_contour: gamma = {} must be > 0 (gamma = delta cos(theta) (1 - rho), "
+                 "or gamma_override).", g.gamma);
     g.S         = std::log(1.0 / g.eps_tr) / g.gamma;             // eq 4
     return g;
   }
@@ -198,11 +186,9 @@ namespace tilted_contour {
   }
 
   /**
-   * Semiclassical point count, spec eq 6:
+   * Semiclassical estimate of the node count (eq 6):
    *   N_s ~= ln(1/eps) W / (4 pi rho d) * ln[1 + rho (Dmax-Dmin)/((1-rho) W)],
    * with the rho -> 0 limit ln(1/eps)(Dmax-Dmin)/(4 pi d).
-   * [verified: contour.py::eq6_Ns; pins.py::pin_eq6_table1 reproduces the spec's
-   *  Table-1 "Eq. (6)" row to <1 count]
    */
   inline double eq6_Ns(double dmin, double dmax, double W, double delta,
                        double rho, double eps) {
@@ -218,13 +204,12 @@ namespace tilted_contour {
   // =========================================================================
 
   /**
-   * Grid on [0, xmax] whose local spacing is proportional to a(x)
-   * (spec 4.1 step 2). du = dx/a(x); for the closed-form a of eq 5 with
+   * Grid on [0, xmax] whose local spacing is proportional to a(x):
+   * du = dx/a(x); for the closed-form a of eq 5 with
    * sin th > 0, u(x) = ln(a(x)/a(0))/sin th, invertible in closed form. For
    * sin th = 0 the grid is uniform. A general profile `a_fun` (the growing-delta
-   * profile of TC-2) is handled by numerical inversion of the same cumulative map.
-   * [verified: contour.py::adapted_grid; pins.py::pin_grid -- rank is grid
-   *  converged to <=1 count between n = 750 and n = 6000]
+   * profile) is handled by numerical inversion of the same cumulative map.
+   * The rank is grid-converged to <= 1 count between n = 750 and n = 6000.
    */
   inline nda::array<double, 1> adapted_grid(
       double xmax, double W, double delta, double theta, long n,
@@ -242,7 +227,7 @@ namespace tilted_contour {
       const double amax = (xmax - W) * st + delta * ct;
       utils::check(a0 > 0.0 and amax > 0.0,
                    "tilted_contour::adapted_grid: a(0) = {} and a(xmax) = {} must both "
-                   "be > 0 -- the tilt violates eq 3 (tan theta < delta/W).", a0, amax);
+                   "be > 0 -- the tilt violates tan(theta) < delta/W.", a0, amax);
       const double umax = std::log(amax / a0) / st;
       for (long i = 0; i < n; ++i) {
         const double u = umax * double(i) / double(n - 1);
@@ -275,17 +260,14 @@ namespace tilted_contour {
   }
 
   /**
-   * Fine s-grid for the ID, graded by band truncation along the contour
-   * (spec 4.2 item 2). At contour position s only transitions with
+   * Fine s-grid for the ID, graded by band truncation along the contour. At contour position s only transitions with
    * a(D) s <~ ln(1/eps) survive, D <~ D_alive(s) = w + ln(1/eps)/(s sin th);
    * the integrand oscillates as exp(-i(D-w) s cos th), so the local sampling
    * requirement is h(s) <= kappa 2 pi / ((D_alive(s) - w) cos th), capped at
-   * s = 0 by the full band width.
-   * [verified: contour.py::graded_s_grid; pins.py::pin_id_grid -- doubling the
-   *  grid density does not move the reconstruction error]
+   * s = 0 by the full band width. Doubling the grid density does not move the
+   * reconstruction error.
    *
-   * NOTE the `eps` argument is the contour-truncation tolerance eps_tr, which
-   * is what every campaign call site passes (tc_validation/tests/run_*.py).
+   * The tolerance argument is the contour-truncation tolerance eps_tr.
    */
   inline nda::array<double, 1> graded_s_grid(double S, double dmax, double theta,
                                              double eps_tr, double kappa = 0.35,
@@ -355,7 +337,7 @@ namespace tilted_contour {
     return G;
   }
 
-  /** Unit-diagonal normalization Ghat = G / sqrt(G_xx G_x'x') (spec 2.2). */
+  /** Unit-diagonal normalization Ghat = G / sqrt(G_xx G_x'x'). */
   inline void normalize_gram_in_place(nda::matrix<dcomplex> &G) {
     const long n = G.extent(0);
     nda::array<double, 1> d(n);
@@ -381,8 +363,8 @@ namespace tilted_contour {
     nda::array<double, 1> s_grid;   ///< the graded fine s-grid the ID selects from
     nda::array<double, 1> s;        ///< (rank) selected nodes, ASCENDING
     nda::array<long, 1>   idx;      ///< (rank) their indices into s_grid, same order
-    nda::array<dcomplex, 2> T;      ///< (rank, n_s_grid) ID coefficients (pin4); optional
-    double id_identity = 0.0;       ///< max |T[:,J] - I| (0 by construction; pin4)
+    nda::array<dcomplex, 2> T;      ///< (rank, n_s_grid) ID coefficients; optional
+    double id_identity = 0.0;       ///< max |T[:,J] - I| (0 by construction)
 
     double theta() const { return g.theta; }
     double S()     const { return g.S; }
@@ -390,7 +372,7 @@ namespace tilted_contour {
   };
 
   /**
-   * Column-pivoted QR on K(s,x)^T -> `rank` contour nodes {s_j} (spec 4.1 step 4).
+   * Column-pivoted QR on K(s,x)^T -> `rank` contour nodes {s_j}.
    *
    *   M[i,j] = K(s_j, x_i; z_worst) / ||K(., x_i)||_{L2(ds)},
    *   ||K(., x)||_{L2} = sqrt(G(x,x)) = sqrt(1/(2 a(x))),
@@ -398,10 +380,9 @@ namespace tilted_contour {
    * i.e. relative accuracy at every Delta, matching the unit-diagonal Gram
    * normalization the rank is read from. Column-pivoted QR of M selects `rank`
    * COLUMNS = s-nodes.
-   * [verified: contour.py::id_nodes; pins.py::pin4_F_exactness]
    *
    * @param want_T  also build the ID coefficient matrix T with M ~ M[:,J] T
-   *                (only the pin needs it; production does not).
+   *                (only the ID-exactness test needs it).
    */
   inline void id_nodes(contour_t &c, bool want_T = false) {
     const long nx = c.x.size(), nS = c.s_grid.size();
@@ -479,17 +460,17 @@ namespace tilted_contour {
 
   /**
    * Build the whole contour: geometry -> adapted Delta grid -> Gram (eq 5) ->
-   * Hermitian eigensolve -> rank (BINDING 1 + BINDING 4) -> graded s-grid ->
+   * Hermitian eigensolve -> rank (choices 1 and 4) -> graded s-grid ->
    * column-pivoted QR -> nodes.
    *
-   * Cost is dominated by the (nx x nx) Hermitian eigensolve; nx = 2500 is the
-   * spec's own resolution and pin_grid shows the rank moves by <= 1 count
-   * between 750 and 6000, so nx is a safe cost knob.
+   * Cost is dominated by the (nx x nx) Hermitian eigensolve; the default
+   * nx = 2500 is well converged (the rank moves by <= 1 count between 750 and
+   * 6000), so nx is a safe cost knob.
    *
    * @param a_fun  optional a(x) profile (the growing-delta profile). When empty
    *               the closed form of eq 5 is used. Any positive a(x) still
-   *               gives a genuine PSD Gram -- see the factorization note in
-   *               contour.py's docstring.
+   *               gives a genuine PSD Gram, since G(x,x') = Int_0^inf ds
+   *               K(s,x)^* K(s,x') for any a(x) > 0.
    */
   inline contour_t build_contour(contour_params_t const &p,
                                  std::function<double(double)> const &a_fun = {},
@@ -520,11 +501,11 @@ namespace tilted_contour {
       return n;
     };
     c.rank_eps  = count(p.eps);
-    c.rank_eps2 = count(p.eps * p.eps);               // BINDING 1
-    c.rank_ceil = count(p.rank_ceiling);              // BINDING 4
+    c.rank_eps2 = count(p.eps * p.eps);               // choice 1
+    c.rank_ceil = count(p.rank_ceiling);              // choice 4
     c.rank = std::min(c.rank_eps2, c.rank_ceil);
     if (p.rank_max > 0) c.rank = std::min(c.rank, p.rank_max);
-    if (p.rank_force > 0) c.rank = p.rank_force;      // diagnostic override (pin4)
+    if (p.rank_force > 0) c.rank = p.rank_force;      // diagnostic override
     utils::check(c.rank > 0, "tilted_contour: the eps-rank came out 0.");
 
     c.s_grid = graded_s_grid(c.g.S, p.dmax, c.g.theta, c.g.eps_tr, p.kappa);
@@ -537,7 +518,7 @@ namespace tilted_contour {
   //  The transform F
   // =========================================================================
 
-  /** z' = -conj(z): the conjugate-mirror target of BINDING 2. */
+  /** z' = -conj(z): the conjugate-mirror target of choice 2. */
   inline dcomplex mirror_target(dcomplex z) { return -std::conj(z); }
 
   struct transform_t {
@@ -551,7 +532,7 @@ namespace tilted_contour {
   };
 
   /**
-   * Least-squares transform (spec 4.1 step 5) with the `gram` row weighting:
+   * Least-squares transform with the `gram` row weighting:
    *
    *   min_F || diag(rw) [ A0 F^T - B0 ] ||_F,
    *   A0[k,j] = exp(-i D_k s_j e^{-i th}),   B0[k,t] = 1/(z_t - D_k),
@@ -559,9 +540,8 @@ namespace tilted_contour {
    *
    * The weight is z-INDEPENDENT, so ONE gelss factorization serves every target,
    * every q and every SCF iteration.
-   * [verified: contour.py::build_F, weighting = 'gram']
    *
-   * @param with_mirror  append the conjugate-mirror rows z' = -conj(z) (BINDING 2).
+   * @param with_mirror  append the conjugate-mirror rows z' = -conj(z) (choice 2).
    *                     The physical response is then
    *                        P(z_t) = R_t + [R_{t + n_res}]^dag
    *                     for matrix-valued residues, or R_t + conj(R_{t+n_res})
@@ -601,8 +581,8 @@ namespace tilted_contour {
       }
     nda::matrix<dcomplex, nda::F_layout> Acopy(A);
 
-    // numpy's lstsq(rcond=None) uses rcond = eps_mach * max(m, n); match it so the
-    // C++ and python transforms are the same object, not merely the same formula.
+    // rcond = eps_mach * max(m, n), the numpy lstsq(rcond=None) default; transform_factor_t
+    // uses the same cut, so both paths yield the same minimum-norm solution.
     const double rcond = std::numeric_limits<double>::epsilon() * double(std::max(nD, r));
     nda::array<double, 1> sv(std::min(nD, r));
     int lsrank = 0;
@@ -635,7 +615,8 @@ namespace tilted_contour {
    * A REUSABLE factorization of the least-squares transform.
    *
    * `build_transform` solves for a fixed target list in one `gelss` call, which is right
-   * when the targets are known up front. The eq-1 CD assembly is not like that: its
+   * when the targets are known up front. The contour-deformation self-energy assembly is
+   * not like that: its
    * targets are z = eps_J - omega + i delta and both eps_J and omega move inside the
    * self-consistency loop, so rows are needed ONE AT A TIME, tens of thousands of them.
    *
@@ -645,8 +626,6 @@ namespace tilted_contour {
    * so a row costs one (r x nD) mat-vec instead of a factorization. The pseudo-inverse is
    * formed once from the SAME SVD `gelss` would use, with the same rcond, so a row from
    * here and a row from `build_transform` are the same object.
-   * [verified -- gate: the TC-3-b(1)/TC-3-b(2) legs use this exclusively; a direct
-   *  row-vs-row check against build_transform is `tilted_contour_factor_rows`.]
    */
   struct transform_factor_t {
     nda::array<dcomplex, 2> Ainv;   ///< (r, nD) the pseudo-inverse
@@ -679,13 +658,12 @@ namespace tilted_contour {
      * The rows for a WHOLE target list, as ONE gemm:
      *      Frows = B A^{+T},   B(t, k) = rw_k / (z_t - D_k),
      * which is `apply` for every t and nothing else -- the same pseudo-inverse, the same
-     * right-hand side. The eq-1 CD assembly asks for tens of thousands of rows per
+     * right-hand side. The contour-deformation assembly asks for tens of thousands of rows per
      * evaluation and each one is a (r x nD) BLAS-2 pass here; batching turns the whole
      * chunk into a single (nt x nD) x (nD x r) BLAS-3 call, which is where the nD = 2500
-     * grid stops dominating the residue evaluation.
-     * [gate: tc_contour_batch_scaling scores apply_many against a loop over `apply` at
-     *  the production shape, and the [TC-4 batch] leg of tc3b1_identity_lih222 scores
-     *  the whole batched evaluator against the per-target path.]
+     * grid stops dominating the residue evaluation. test_methods_tc_contour.cpp checks
+     * apply_many against a loop over `apply`, and the batched evaluator against the
+     * per-target path.
      */
     void apply_many(nda::array<dcomplex, 1> const &z,
                     nda::array<dcomplex, 2> &Frows) const {
@@ -751,11 +729,8 @@ namespace tilted_contour {
    * The mirror combination for a SCALAR response:
    *   P(z_t) = R(z_t) + conj(R(z'_t)),   z'_t = -conj(z_t).
    * For a MATRIX response with Hermitian residues the conjugation becomes the
-   * conjugate TRANSPOSE, R(z_t) + R(z'_t)^dag -- the same distinction the RW-2
-   * quadrature had to make (rw2_report section 3.7). Callers holding matrices
-   * must use the dagger; this helper is the scalar case only.
-   * [verified: contour.py / models.py, pins.py::pin_mirror; the campaign's B1
-   *  combination is `Rf = got[:n] + conj(got[n:])`]
+   * conjugate TRANSPOSE, R(z_t) + R(z'_t)^dag. Callers holding matrices must use
+   * the dagger; this helper is the scalar case only.
    */
   inline dcomplex combine_mirror(dcomplex R_res, dcomplex R_mir) {
     return R_res + std::conj(R_mir);

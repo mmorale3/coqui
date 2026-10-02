@@ -19,41 +19,39 @@
  */
 
 /**
- * GATE TC-2-a (spec M3) and GATE TC-2-c of notes/tc_coqui_impl_spec.md.
+ * Tests of the tilted-contour polarizability P(t) and its use in the contour-deformation
+ * (CD) assembly of Sigma^c.
  *
- * Harness pattern: the RW-1 Lehmann gate
- * (methods/GW_real_axis/tests/test_real_axis_w_lehmann.cpp) -- the SAME QP-pole
- * G on both sides, the same THC factorization (common mode, cancels), the same
- * mu, the same beta, div_treatment = ignore_g0 on the imaginary side.
+ * Harness pattern (as in methods/GW_real_axis/tests/test_real_axis_w_lehmann.cpp): the
+ * SAME QP-pole G on both sides, the same THC factorization (common mode, cancels), the
+ * same mu, the same beta, div_treatment = ignore_g0 on the imaginary side.
  *
- *   TC-2-a(i)   THE CONTRACTION. The complex-time kernel evaluated at t = -i tau
- *               against the production Pi(q, tau) from scr_coulomb_t. These are
- *               algebraically the same object (p_contour.hpp section 1), so the
- *               only difference allowed is round-off. This isolates the
- *               contraction -- including the two TRANSPOSES -- from the
- *               transform, and it is what would have caught a conj-vs-transpose
- *               slip.
+ *   contraction   The complex-time kernel evaluated at t = -i tau against the
+ *                 production Pi(q, tau) from scr_coulomb_t. These are algebraically
+ *                 the same object (p_contour.hpp section 1), so the only difference
+ *                 allowed is round-off. This isolates the contraction -- including the
+ *                 two TRANSPOSES -- from the transform, and catches a
+ *                 conj-vs-transpose slip.
  *
- *   TC-2-a(ii)  THE M3 GATE. P(i nu) evaluated THROUGH the tilted transform
- *               against the production imaginary-axis Pi(q, i nu), RESTRICTED to
- *               nu >= gamma = delta (1 - rho) (results section 5.5: below that a
- *               target on the imaginary axis has less damping than the contour's
- *               own design floor, so the contour is simply too short for it).
- *               A per-fixture budget is DERIVED from the fixture's own
- *               transition support and reported next to the measurement.
+ *   P(i nu)       P(i nu) evaluated THROUGH the tilted transform against the production
+ *                 imaginary-axis Pi(q, i nu), RESTRICTED to nu >= gamma = delta (1 - rho):
+ *                 below that a target on the imaginary axis has less damping than the
+ *                 contour's own design floor, so the contour is too short for it.
+ *                 A per-fixture budget is DERIVED from the fixture's own transition
+ *                 support and reported next to the measurement.
  *
- *   TC-2-c      band truncation along the contour on/off: identical to the
- *               truncation tolerance, with the measured band-work speedup.
+ *   truncation    band truncation along the contour on/off: identical to the
+ *                 truncation tolerance, with the band-work speedup reported.
  *
- * The TC-3 gates b(0)/b(1)/b(2) and the TC-4 prerequisites ride in the same file:
+ * The same file checks the CD assembly and its batched / stored variants:
  *
- *   TC-4 batch  the batched residue evaluation against the per-target path
- *               (cd_line_ctx::batch_max = 1), on one context and one contour --
- *               a reordering identity, gated at 1e-14, with the wall times.
+ *   batch         the batched residue evaluation against the per-target path
+ *                 (cd_line_ctx::batch_max = 1), on one context and one contour --
+ *                 a reordering identity, checked at 1e-14, with the wall times.
  *
- *   TC-4 F5     band factors RECOMPUTED (a second context with no store cap at
- *               all) against STORED, scored on B_J(P,a) itself and on Sigma^c
- *               through the same contour objects. Both gated at 1e-14.
+ *   B store       band factors RECOMPUTED (a second context with no store cap at
+ *                 all) against STORED, scored on B_J(P,a) itself and on Sigma^c
+ *                 through the same contour objects. Both checked at 1e-14.
  */
 
 #undef NDEBUG
@@ -103,11 +101,11 @@ namespace bdft_tests {
   using cval_t = std::complex<double>;
 
   // =====================================================================
-  //  The gate body, parameterized by fixture.
+  //  The contour-P checks, parameterized by fixture.
   // =====================================================================
   static void run_tc2_gate(char const *mf_src, double gate_ii) {
     auto &mpi_context = utils::make_unit_test_mpi_context();
-    if (mpi_context->comm.size() != 1) return;      // single-rank gate
+    if (mpi_context->comm.size() != 1) return;      // single-rank test
 
     decltype(nda::range::all) all;
 
@@ -132,7 +130,7 @@ namespace bdft_tests {
       auto kt = mf->kp_trev();
       for (long ik = 0; ik < Nk; ++ik) if (kt(ik)) ++n_trev;
     }
-    app_log(2, "[TC-2] fixture {}: ns={} Nk={} Nk_ibz={} Nq_ibz={} nbnd={} Naux={}; "
+    app_log(2, "[tilted contour] fixture {}: ns={} Nk={} Nk_ibz={} Nq_ibz={} nbnd={} Naux={}; "
                "time-reversal pairs = {} ({} FBZ points carry kp_trev -> eq (T), the "
                "TRANSPOSE fill, is {})",
             mf_src, ns, Nk, Nk_ibz, Nq_ibz, nbnd, Naux, mf->nkpts_trev_pairs(), n_trev,
@@ -176,10 +174,10 @@ namespace bdft_tests {
 
     double mu = 0.0;
     update_G(dyson, *mf, ft, sDm, sG, sF, sSigma, mu, /*const_mu*/ false);
-    app_log(2, "[TC-2] Matsubara mu = {:.10f} Ha", mu);
+    app_log(2, "[tilted contour] Matsubara mu = {:.10f} Ha", mu);
 
-    // PIN P1 (the RW-1 pin): the static Hamiltonian must be diag(eps) with S = 1,
-    // so that "the same E / MO on both sides" is realized with an identity MO.
+    // Precondition: the static Hamiltonian must be diag(eps) with S = 1, so that
+    // "the same E / MO on both sides" is realized with an identity MO.
     {
       auto H0 = dyson.H0();
       auto S = dyson.sS_skij().local();
@@ -198,7 +196,7 @@ namespace bdft_tests {
                 off_S = std::max(off_S, std::abs(S(s, k, i, j)));
               }
             }
-      app_log(2, "[TC-2] PIN P1: |H0+F-diag(eps)| = {:.2e}/{:.2e} (dia/off); "
+      app_log(2, "[tilted contour] precondition: |H0+F-diag(eps)| = {:.2e}/{:.2e} (dia/off); "
                  "|S-1| = {:.2e}/{:.2e}", dia_H, off_H, dia_S, off_S);
       REQUIRE(dia_H < 1e-8);
       REQUIRE(off_H < 1e-8);
@@ -208,8 +206,8 @@ namespace bdft_tests {
 
     // the production Pi(q, tau) and Pi(q, i nu), from the SAME G
     solvers::scr_coulomb_t scr_im(&ft, "rpa", "ignore_g0");
-    // update_w FIRST (the RW-1 gate's order): it fills mb_state.dW_qtPQ, which the
-    // TC-3-b(0) leg below reads as the production W^c reference. eval_Pi_qdep is
+    // update_w FIRST: it fills mb_state.dW_qtPQ, which the W^c-on-the-line check
+    // below reads as the production W^c reference. eval_Pi_qdep is
     // idempotent given sG_tskij, so the Pi it returns is the same bubble.
     scr_im.update_w(mb_state, thc, -1);
     REQUIRE(mb_state.dW_qtPQ.has_value());
@@ -232,7 +230,7 @@ namespace bdft_tests {
       for (long iq = 0; iq < Nq_ibz; ++iq)
         for (long n = 0; n < nw_half; ++n)
           Pi_im_qwPQ(iq, n, all, all) = Pw(n, iq, all, all);
-      app_log(2, "[TC-2] production Pi: (nt_half, nq, P, Q) = ({}, {}, {}, {}); "
+      app_log(2, "[tilted contour] production Pi: (nt_half, nq, P, Q) = ({}, {}, {}, {}); "
                  "nw_half = {}", gsh[0], gsh[1], gsh[2], gsh[3], nw_half);
     }
 
@@ -254,20 +252,20 @@ namespace bdft_tests {
     sE.communicator()->barrier();
     sMO.communicator()->barrier();
 
-    // ---- PROVENANCE PROBE: the complex-time legs at t = -i tau must reproduce
-    // the Dyson G(tau) itself, band by band. It ALSO calibrates gate a(i): the
+    // ---- G probe: the complex-time legs at t = -i tau must reproduce the Dyson
+    // G(tau) itself, band by band. It ALSO calibrates the contraction check: the
     // reference Pi(q,tau) is built from the DLR-REPRESENTED G(tau), whose own
-    // reconstruction error is what a(i) can never go below. Pi is bilinear in G,
-    // so the floor is ~2 g_rel; the gate is set at 10 g_rel.
+    // reconstruction error is a floor for that check. Pi is bilinear in G, so the
+    // floor is ~2 g_rel; the tolerance is set at 10 g_rel.
     double g_rel = 0.0;
     {
       // IAFT's tau_mesh_* carries the RELATIVE coordinate x in [-1, 1];
-      // tau = (x + 1) beta / 2 (qp_scf_common.cpp:1030, the code's own map).
+      // tau = (x + 1) beta / 2 (the same map qp_scf_common.cpp uses).
       auto xm = ft.tau_mesh_f();
       const long ntf = ft.nt_f();
       nda::array<double, 1> tau(ntf);
       for (long i = 0; i < ntf; ++i) tau(i) = (double(xm(i)) + 1.0) * beta / 2.0;
-      app_log(2, "[TC-2 probe] nt_f = {}, x in [{:.6g}, {:.6g}] -> tau in "
+      app_log(2, "[tilted contour] G probe: nt_f = {}, x in [{:.6g}, {:.6g}] -> tau in "
                  "[{:.6g}, {:.6g}], beta = {:.6g}",
               ntf, double(xm(0)), double(xm(ntf - 1)), tau(0), tau(ntf - 1), beta);
       double dg_num = 0.0, dg_den = 0.0, dn_num = 0.0;
@@ -288,14 +286,14 @@ namespace bdft_tests {
             }
       }
       g_rel = std::max(dg_num, dn_num) / std::max(dg_den, 1e-300);
-      app_log(2, "[TC-2 probe] max|fp(-i tau) - G(tau)| = {:.3e}, "
+      app_log(2, "[tilted contour] G probe: max|fp(-i tau) - G(tau)| = {:.3e}, "
                  "max|fn(-i tau) - G(beta-tau)| = {:.3e}, over max|G| = {:.3e} "
                  "-> g_rel = {:.3e} (the DLR reconstruction error of the reference "
-                 "G, i.e. the floor of gate a(i))", dg_num, dn_num, dg_den, g_rel);
+                 "G, i.e. the floor of the contraction check)", dg_num, dn_num, dg_den, g_rel);
     }
 
     // =================================================================
-    //  TC-2-a(i) -- the contraction, at t = -i tau
+    //  the contraction, at t = -i tau
     // =================================================================
     {
       auto xm = ft.tau_mesh_f();
@@ -318,10 +316,10 @@ namespace bdft_tests {
               if (d > num) { num = d; wq = iq; wt = it; }
               den = std::max(den, std::abs(Pi_tau(it, iq, P, Q)));
             }
-      app_log(2, "[TC-2-a(i)] complex-time kernel at t = -i tau vs production "
+      app_log(2, "[tilted contour] contraction check: complex-time kernel at t = -i tau vs production "
                  "Pi(q,tau): max abs dev {:.3e} over max|Pi| {:.3e} = {:.3e} rel "
                  "(worst at q = {}, tau index {} of {}); worst single-leg wrong-branch occupation weight "
-                 "{:.2e}; gate = 10 g_rel = {:.2e}",
+                 "{:.2e}; tolerance = 10 g_rel = {:.2e}",
               num, den, num / den, wq, wt, ntp, dg.thermal_worst, 10.0 * g_rel);
       REQUIRE(num / den < std::max(1e-13, 10.0 * g_rel));
     }
@@ -348,12 +346,12 @@ namespace bdft_tests {
         *mpi_context, {Nq_ibz, r, Naux, Naux});
     pc::ctx_t dg;
     pc::sample_P_at_times(sPc, ctx.t_node, thc, sMO, sE, mu, beta, -1.0, &dg);
-    app_log(2, "[TC-2] contour samples: {} nodes; Pi Hermiticity at node 0 "
+    app_log(2, "[tilted contour] contour samples: {} nodes; Pi Hermiticity at node 0 "
                "max|Pi_PQ - conj(Pi_QP)|/max|Pi| = {:.3e} (REPORTED: Pi is NOT "
                "Hermitian at complex t)", r, dg.herm_rel);
 
     // =================================================================
-    //  TC-2-a(ii) -- P(i nu) through the transform
+    //  P(i nu) through the transform
     // =================================================================
     auto wn_b = ft.wn_mesh_b();
     nda::array<double, 1> nu_n(nw_half);
@@ -365,9 +363,9 @@ namespace bdft_tests {
     std::vector<long> keep;
     for (long n = 0; n < nw_half; ++n)
       if (nu_n(n) >= gamma) keep.push_back(n);
-    app_log(2, "[TC-2-a(ii)] VALIDITY WINDOW: the imaginary-axis cross-check is "
+    app_log(2, "[tilted contour] P(i nu) check, VALIDITY WINDOW: the imaginary-axis cross-check is "
                "restricted to nu >= gamma = delta cos(theta) (1 - rho) = {:.6g} a.u. "
-               "({:.4g} eV) -- results section 5.5. {} of {} bosonic half-mesh nodes "
+               "({:.4g} eV), below which the contour is too short for an imaginary-axis target. {} of {} bosonic half-mesh nodes "
                "qualify; nu in [{:.4g}, {:.4g}] a.u.",
             gamma, gamma * pc::ha_to_eV, keep.size(), nw_half,
             keep.empty() ? 0.0 : nu_n(keep.front()),
@@ -381,7 +379,7 @@ namespace bdft_tests {
     // rows would be duplicates: build the resonant rows only and close the
     // anti-resonant half with the dagger (p_contour.hpp section 3).
     auto tr = tilted_contour::build_transform(ctx.c, ztarg, /*with_mirror*/ false);
-    app_log(2, "[TC-2-a(ii)] transform: {} targets x {} nodes; LS cond = {:.3e}; "
+    app_log(2, "[tilted contour] P(i nu) check, transform: {} targets x {} nodes; LS cond = {:.3e}; "
                "worst LS relative residual = {:.3e}",
             tr.F.shape()[0], tr.F.shape()[1], tr.cond, tr.relres_max);
 
@@ -389,8 +387,8 @@ namespace bdft_tests {
     // The same transform applied to a SCALAR pole model built on THIS fixture's
     // own transition support (every occupied/empty pair of the QP spectrum,
     // uniform weight), scored against its closed form. That is the accuracy the
-    // contour can deliver here; the matrix-valued measurement is reported
-    // against it as well as against the spec's absolute gate.
+    // contour can deliver here; the matrix-valued result is reported against it
+    // as well as checked against the absolute tolerance gate_ii.
     double budget = 0.0;
     {
       std::vector<double> occ, emp;
@@ -452,23 +450,23 @@ namespace bdft_tests {
         cell_worst = std::max(cell_worst, cn / std::max(cd, 1e-300));
       }
     }
-    app_log(2, "[TC-2-a(ii)] P(i nu) THROUGH the tilted transform vs production "
+    app_log(2, "[tilted contour] P(i nu) check: P(i nu) THROUGH the tilted transform vs production "
                "Pi(q, i nu), nu >= gamma: worst Frobenius rel = {:.3e} (q = {}, "
                "nu index {}); worst cell dev / max|Pi_q| = {:.3e}; DERIVED budget "
                "from this fixture's own transition support = {:.3e} "
-               "(measured/budget = {:.2f}); gate {:.1e}",
+               "(measured/budget = {:.2f}); tolerance {:.1e}",
             frob_worst, wq, wn, cell_worst, budget, frob_worst / budget, gate_ii);
     REQUIRE(frob_worst < gate_ii);
     REQUIRE(cell_worst < gate_ii);
 
     // =================================================================
-    //  TC-3-b(0) -- W ON THE LINE, at fixture scale.
-    //  The chain the CD assembly actually rides: contour Pi(q, s_j)
+    //  W ON THE LINE, at fixture scale.
+    //  The chain the CD assembly uses: contour Pi(q, s_j)
     //  -> transform to z = i nu -> eq (SIGN) -> CoQuI's Dyson chain with
     //  Z = thc.Z(q) -> W^c(q, i nu), against the PRODUCTION W^c(q, i nu)
-    //  that the imaginary-axis solver stored in dW_qtPQ. This is Fable
-    //  review point 1 -- "assembled in ONE consistent convention" -- at
-    //  fixture scale, and it needs none of the mode-A band bookkeeping.
+    //  that the imaginary-axis solver stored in dW_qtPQ. This checks that both
+    //  are assembled in ONE consistent convention, at fixture scale, and it
+    //  needs none of the mode-A band bookkeeping.
     // =================================================================
     {
       // the production W^c(q, i nu) from the SAME update_w that ran above
@@ -521,7 +519,7 @@ namespace bdft_tests {
         }
       }
       cond_worst = wst.cond_hint;
-      app_log(2, "[TC-3-b(0)] W^c(q, i nu) via contour Pi -> eq (SIGN) -> CoQuI Dyson "
+      app_log(2, "[tilted contour] W^c on the line: W^c(q, i nu) via contour Pi -> eq (SIGN) -> CoQuI Dyson "
                  "chain, vs the PRODUCTION W^c from dW_qtPQ, nu >= gamma: worst "
                  "Frobenius rel = {:.3e} (q = {}, nu index {}) over {} q x {} targets; "
                  "max |[I - Z.Pi]^-1| = {:.3e}",
@@ -530,7 +528,7 @@ namespace bdft_tests {
     }
 
     // =================================================================
-    //  TC-2-c -- band truncation along the contour
+    //  band truncation along the contour
     // =================================================================
     {
       auto sPt = math::shm::make_shared_array<Array_view_4D_t>(
@@ -546,7 +544,7 @@ namespace bdft_tests {
                                          - sPc.local()(iq, j, P, Q)));
               den = std::max(den, std::abs(sPc.local()(iq, j, P, Q)));
             }
-      app_log(2, "[TC-2-c] band truncation at rel tol {:.0e}: max dev / max|Pi| = "
+      app_log(2, "[tilted contour] band truncation at rel tol {:.0e}: max dev / max|Pi| = "
                  "{:.3e}; kept bands per (s,k,node) -- greater leg [{}, {}], lesser "
                  "leg [{}, {}] of {}; band-work speedup {:.3f}x (untruncated leg "
                  "counts [{}, {}] / [{}, {}], ratio {:.3f})",
@@ -559,15 +557,16 @@ namespace bdft_tests {
   }
 
   // =====================================================================
-  //  GATE TC-3-b(1) -- THE DECOMPOSITION IDENTITY.
+  //  THE DECOMPOSITION IDENTITY.
   //
-  //  The eq-1 CD assembly with the FIT's OWN W^c feeding BOTH terms must
+  //  The CD assembly (Sigma^c = residue term + imaginary-axis Iterm) with the
+  //  FIT's OWN W^c feeding BOTH terms must
   //  reproduce the route-B closed form (modea_sigma_at) exactly, up to the
   //  bosonic leftover and the nu quadrature. No contour is involved: this is
   //  what validates the decomposition, the sigma_m weights, the residue
   //  argument eps_J - z and the imaginary-axis quadrature on a REAL mode-A
-  //  context, before any contour W is attached. It is the TC-3 analogue of
-  //  TC-2-a(i) -- a bare identity rather than a comparison.
+  //  context, before any contour W is attached. Like the contraction check
+  //  for P, it is a bare identity rather than a comparison.
   // =====================================================================
   static void run_tc3b1_gate(char const *mf_src) {
     auto &mpi_context = utils::make_unit_test_mpi_context();
@@ -632,7 +631,7 @@ namespace bdft_tests {
     qp_modea::modea_opts opts;
     opts.wfit = "tau";
     opts.level = 3;
-    opts.cd_bstore_cap_gb = 4.0;      // TC-3: capture B_J(P,a) in stage 2
+    opts.cd_bstore_cap_gb = 4.0;      // capture B_J(P,a) in stage 2
     qp_modea::build_modea_context(ctx, mb_state, thc, sMO, sE, mu, ft, opts,
                                   "ignore_g0", false);
     REQUIRE(ctx.blocks.size() > 0);
@@ -684,10 +683,10 @@ namespace bdft_tests {
         ++nz_used;
       }
     }
-    app_log(2, "[TC-3-b(1)] {}: eq-1 CD assembly (fit W on BOTH terms) vs route-B "
+    app_log(2, "[tilted contour] decomposition identity, {}: CD assembly (fit W on BOTH terms) vs route-B "
                "modea_sigma_at, {} evaluation points over {} blocks, nbnd = {}, "
                "npk = {}, nJ = {}: worst rel = {:.3e} (over max|Sigma| = {:.4g}); "
-               "Iterm CLOSED FORM (eq K); bosonic leftover exp(-beta*min|om_p|) = {:.2e}; "
+               "Iterm CLOSED FORM; bosonic leftover exp(-beta*min|om_p|) = {:.2e}; "
                "residue evaluations {} of {} (skipped {} where sigma_J = 0, "
                "{:.1f}%); max |sigma_J| = {:.4f}; strictly fractional sigma_J at "
                "{} state-evaluations",
@@ -696,7 +695,7 @@ namespace bdft_tests {
             cl.n_res_eval + cl.n_res_skip, cl.n_res_skip,
             100.0 * double(cl.n_res_skip) / double(std::max(1L, cl.n_res_eval + cl.n_res_skip)),
             cl.sigma_abs_max, cl.n_frac);
-    app_log(2, "[TC-3-b(1)] CD branch-point tripwire: min |Re A_J| over all evaluations = "
+    app_log(2, "[tilted contour] decomposition identity, CD branch-point tripwire: min |Re A_J| over all evaluations = "
                "{:.3e} a.u.; {} (J, z) pairs within 1e-6 of the branch point",
             cl.min_absReA, cl.n_branch);
     REQUIRE(nz_used >= 4);
@@ -705,17 +704,16 @@ namespace bdft_tests {
     REQUIRE(ctx.bstore.size() == ctx.blocks.size());
 
     // =================================================================
-    //  GATE TC-3-b(2) -- the CONTOUR residue source.
+    //  the CONTOUR residue source.
     //
     //  Four Sigma^c's on the SAME mode-A context, so the two error
     //  sources separate cleanly:
     //    (1) route B                                    -- the reference
-    //    (2) eq-1, FIT source, delta = 0                -- = (1), the identity above
-    //    (3) eq-1, FIT source, delta = delta_contour    -- (3)-(1) is the BROADENING
-    //    (4) eq-1, CONTOUR source, delta = delta_contour-- (4)-(3) is the TRANSFORM
+    //    (2) CD, FIT source, delta = 0                  -- = (1), the identity above
+    //    (3) CD, FIT source, delta = delta_contour      -- (3)-(1) is the BROADENING
+    //    (4) CD, CONTOUR source, delta = delta_contour  -- (4)-(3) is the TRANSFORM
     //  Comparing (4) against (1) directly would charge the transform for the
-    //  broadening, which is the mistake models.py's `delta_eval` flag exists to
-    //  prevent ("that mistake cost 15 meV of spurious error in an earlier C2").
+    //  broadening, which is a spurious error at the meV scale.
     // =================================================================
     {
       pc::opts_t po;
@@ -737,10 +735,11 @@ namespace bdft_tests {
       pc::ctx_t dg2;
       pc::sample_P_at_times(sPc, pctx.t_node, thc, sMO, sE, mu, beta, -1.0, &dg2);
       auto tf = tilted_contour::factor_transform(pctx.c);
-      app_log(2, "[TC-3-b(2)] transform factorization: {} nodes x {} grid points, "
+      app_log(2, "[tilted contour] residue source, transform factorization: {} nodes x {} grid points, "
                  "cond = {:.3e}", tf.r, tf.nD, tf.cond);
-      // TC-4 livelock fix: thc.Z(q) is COLLECTIVE, so the tiles are gathered once here
-      // (all ranks in lockstep) and the evaluator never touches the reader again.
+      // thc.Z(q) is COLLECTIVE, so the tiles are gathered once here (all ranks in
+      // lockstep) and the evaluator never touches the reader again; calling it from
+      // a per-rank evaluation loop would deadlock.
       auto sZt = pc::gather_Z_tiles(thc);
 
       methods::wc_line::solve_opts_t sopt;
@@ -825,34 +824,35 @@ namespace bdft_tests {
           ++npt;
         }
       }
-      app_log(2, "[TC-3-b(2)] {}: Sigma^c over {} evaluation points, delta = {:.6g} a.u. "
+      app_log(2, "[tilted contour] residue source, {}: Sigma^c over {} evaluation points, delta = {:.6g} a.u. "
                  "({:.4g} eV); CONTRIBUTING residue targets (sigma_J != 0) have Re z in "
                  "[{:.4g}, {:.4g}] a.u.; the contour's design window is |Re z| in "
                  "[Dmin, Dmin+W] = [{:.4g}, {:.4g}] a.u.",
               mf_src, npt, dlt, dlt * pc::ha_to_eV, zre_lo, zre_hi,
               pctx.geom.dmin, pctx.geom.dmin + pctx.geom.W_target);
-      app_log(2, "[TC-3-b(2)] {}: TRANSFORM IN-BASIS ACCURACY at the contributing targets "
+      app_log(2, "[tilted contour] residue source, {}: TRANSFORM IN-BASIS ACCURACY at the contributing targets "
                  "(F applied to 1/(z-Delta) over the adapted grid): worst = {:.3e} over {} "
                  "probed targets. SPLIT BY WINDOW: targets with |Re z| >= Dmin = {:.4g} "
                  "(inside) give {:.3e}; the {} of {} targets with |Re z| BELOW Dmin give "
                  "{:.3e}",
               mf_src, tf_inbasis, n_probe, pctx.geom.dmin, tf_inside, n_below_dmin,
               n_probe, tf_below);
-      app_log(2, "[TC-3-b(2)] {}: Sigma^c differences, all relative to max|Sigma^c| = "
+      app_log(2, "[tilted contour] residue source, {}: Sigma^c differences, all relative to max|Sigma^c| = "
                  "{:.4g}:  (a) delta BROADENING, fit-W on the delta line vs route B = "
                  "{:.3e};  (b) FIT-vs-CONTOUR on the SAME line = {:.3e};  (c) total, "
                  "contour vs route B = {:.3e}",
               mf_src, den_w, d_broad, d_trans, d_total);
-      app_log(2, "[TC-3-b(2)] {}: READ (b) AS THE MAP-CLASS DIFFERENCE, NOT AN ERROR. The "
+      app_log(2, "[tilted contour] residue source, {}: READ (b) AS THE MAP-CLASS DIFFERENCE, NOT AN ERROR. The "
                  "transform is accurate at these targets ({:.3e} in-basis, above), and the "
-                 "contour W^c agrees with the PRODUCTION imaginary-axis W^c to 2.1e-06 "
-                 "(gate TC-3-b(0)). Both W's are evaluated on the SAME line, so (b) is the "
-                 "LS pole fit's own real-axis error -- the standing QM3-b caveat "
-                 "(sigma_route_b.hpp) quantified, and the defect this route removes.",
+                 "contour W^c agrees with the PRODUCTION imaginary-axis W^c (W^c-on-the-line "
+                 "check). Both W's are evaluated on the SAME line, so (b) is the "
+                 "LS pole fit's own real-axis error -- the known limitation of the pole-fit "
+                 "route (sigma_route_b.hpp) quantified, and the defect this route removes.",
               mf_src, tf_inbasis);
 
-      // (a) is dominated by delta itself: at N_k = 2 the eq-8 recipe gives delta = 1.19 eV.
-      // Scan the fit source alone (no contour rebuild) to show the broadening collapsing.
+      // (a) is dominated by delta itself, which is large (~1 eV) at N_k = 2 under the
+      // contour's delta recipe. Scan the fit source alone (no contour rebuild) to show
+      // the broadening collapsing.
       {
         std::string trail;
         for (double fac : {1.0, 0.25, 0.0625, 0.015625}) {
@@ -883,10 +883,10 @@ namespace bdft_tests {
           trail += std::format("  delta = {:.4g} eV -> {:.3e}",
                                co.delta * pc::ha_to_eV, db / std::max(dn, 1e-300));
         }
-        app_log(2, "[TC-3-b(2)] {}: the delta BROADENING collapses with delta (fit source, "
+        app_log(2, "[tilted contour] residue source, {}: the delta BROADENING collapses with delta (fit source, "
                    "same contour geometry):{}", mf_src, trail);
       }
-      app_log(2, "[TC-3-b(2)] {}: line solves {} (dense), max |[I - Z.Pi]^-1| = {:.3e}; "
+      app_log(2, "[tilted contour] residue source, {}: line solves {} (dense), max |[I - Z.Pi]^-1| = {:.3e}; "
                  "residue evaluations {} of {} ({:.1f}% skipped where sigma_J = 0)",
               mf_src, sstat.n_solve, sstat.cond_hint, cl_ctr.n_res_eval,
               cl_ctr.n_res_eval + cl_ctr.n_res_skip,
@@ -894,16 +894,16 @@ namespace bdft_tests {
                   / double(std::max(1L, cl_ctr.n_res_eval + cl_ctr.n_res_skip)));
       REQUIRE(npt >= 4);
       REQUIRE(n_probe > 100);
-      // THE GATE is the transform's accuracy at the targets the CD actually asks for.
-      // (b) is a map-class difference and is reported, not gated.
+      // The check is the transform's accuracy at the targets the CD actually asks for.
+      // (b) is a map-class difference and is reported, not checked.
       REQUIRE(tf_inbasis < 1e-3);
 
       // =================================================================
-      //  TC-4 (i) -- THE BATCHED TRANSFORM.
+      //  THE BATCHED TRANSFORM.
       //
       //  The residue source contracts R(z) = sum_j F(z,j) Pi(q, s_j) and
-      //  builds F's rows from the (r x nD) pseudo-inverse. Both were a
-      //  BLAS-2 pass per target; batched they are one gemm per call (the
+      //  builds F's rows from the (r x nD) pseudo-inverse. Per target both
+      //  are a BLAS-2 pass; batched they are one gemm per call (the
       //  rows) and one gemm per (q, chunk) (the contraction). Grouping the
       //  targets by transfer is a pure REORDERING of independent solves, so
       //  the two paths must agree at the gemm reassociation class.
@@ -954,20 +954,20 @@ namespace bdft_tests {
           }
         }
         const double rel_b = (den_b > 0.0) ? num_b / den_b : 0.0;
-        app_log(2, "[TC-4 batch] {}: batched vs per-target residue evaluation over {} "
+        app_log(2, "[tilted contour] batch, {}: batched vs per-target residue evaluation over {} "
                    "evaluation points, {} residue targets: worst |dSigma^c| = {:.3e} over "
-                   "max|Sigma^c| = {:.4g} -> {:.3e} RELATIVE (gate 1e-14; the two differ "
+                   "max|Sigma^c| = {:.4g} -> {:.3e} RELATIVE (tolerance 1e-14; the two differ "
                    "only by gemm reassociation)",
                 mf_src, nb_pt, cbN.n_res_eval, num_b, den_b, rel_b);
-        app_log(2, "[TC-4 batch] {}: END-TO-END Sigma^c wall {:.3f} s per-target vs {:.3f} "
+        app_log(2, "[tilted contour] batch, {}: END-TO-END Sigma^c wall {:.3f} s per-target vs {:.3f} "
                    "s batched -> {:.2f}x. The batch depth here is one evaluation point's "
                    "targets ({:.1f} on average over {} IBZ q), and the closed-form Iterm "
                    "-- which batching cannot touch -- is in both numbers.",
                 mf_src, t1, tN, (tN > 0.0 ? t1 / tN : 0.0),
                 double(cbN.n_res_eval) / double(std::max(1L, nb_pt)), mf->nqpts_ibz());
 
-        // the residue SOURCE alone, on one long target list: what the refactor actually
-        // changed, with the Iterm and the assembly out of the way.
+        // the residue SOURCE alone, on one long target list: the batched part in
+        // isolation, with the Iterm and the assembly out of the way.
         {
           const long off2 = (ctx.blocks[0].is * ctx.nk + ctx.blocks[0].ik) * ctx.nJ;
           std::vector<long> Jl;
@@ -1014,7 +1014,7 @@ namespace bdft_tests {
               }
           const double ts1 = std::chrono::duration<double>(d1 - d0).count();
           const double tsN = std::chrono::duration<double>(d2 - d1).count();
-          app_log(2, "[TC-4 batch] {}: RESIDUE SOURCE alone, {} targets in one call vs one "
+          app_log(2, "[tilted contour] batch, {}: RESIDUE SOURCE alone, {} targets in one call vs one "
                      "at a time: {:.4f} s vs {:.4f} s -> {:.2f}x; worst |dMs| = {:.3e} over "
                      "max|Ms| = {:.4g}. At Np = {} the (rank x Np^2) Pi slab is {:.2f} MB "
                      "and fits in cache, so this fixture cannot show the production win, "
@@ -1031,7 +1031,7 @@ namespace bdft_tests {
       }
 
       // =================================================================
-      //  TC-4 (ii) -- F5, THE BAND-FACTOR RECOMPUTE PATH.
+      //  THE BAND-FACTOR RECOMPUTE PATH.
       //
       //  A SECOND mode-A context, built with cd_bfactor = "recompute" and
       //  NO store cap at all, so modea_ctx::cd_band_store carries only the
@@ -1122,14 +1122,14 @@ namespace bdft_tests {
           }
         }
         const double rel_S = (den_S > 0.0) ? num_S / den_S : 0.0;
-        app_log(2, "[TC-4 F5] {}: band factors RECOMPUTED vs STORED. (a) B_J(P,a) over "
+        app_log(2, "[tilted contour] B store, {}: band factors RECOMPUTED vs STORED. (a) B_J(P,a) over "
                    "{} internal states x {} blocks: worst |dB| = {:.3e} over max|B| = "
                    "{:.4g} -> {:.3e} RELATIVE. (b) Sigma^c through the same contour over "
                    "{} evaluation points: worst |dSigma^c| = {:.3e} over max|Sigma^c| = "
-                   "{:.4g} -> {:.3e} RELATIVE. Gate 1e-14 on both.",
+                   "{:.4g} -> {:.3e} RELATIVE. Tolerance 1e-14 on both.",
                 mf_src, ctx.nJ, ctx.bstore.size(), num_B, den_B, rel_B,
                 ns_pt, num_S, den_S, rel_S);
-        app_log(2, "[TC-4 F5] {}: the store this replaces is nJ {} x Np {} x nbnd {} = "
+        app_log(2, "[tilted contour] B store, {}: the stored path keeps nJ {} x Np {} x nbnd {} = "
                    "{:.3f} MB per owned (s,k) block; the recompute path keeps nsym x Np x "
                    "nbnd per block plus ONE shared ns*nkpts x Np x nbnd.",
                 mf_src, ctx.nJ, thc.Np(), nbnd,
@@ -1140,22 +1140,21 @@ namespace bdft_tests {
         REQUIRE(rel_S < 1e-14);
 
         // ---------------------------------------------------------------
-        //  TC-4 (iii) -- the PRODUCTION WIRING with DEFAULT knobs.
+        //  the PRODUCTION WIRING with DEFAULT knobs.
         //
-        //  Before F5, qp_modea_wfit = "contour" ABORTED unless qp_tc_bstore_gb
-        //  was set to admit the nJ x Np x nbnd store, and the store itself
-        //  aborted unless the stage-2 helper split was off. Here the whole
-        //  route is built with the DEFAULTS -- no cap, cd_bfactor = "auto" --
-        //  and its evaluator must reproduce the hand-assembled one above.
+        //  qp_modea_wfit = "contour" must work without admitting the
+        //  nJ x Np x nbnd store. Here the whole route is built with the
+        //  DEFAULTS -- no cap, cd_bfactor = "auto" -- and its evaluator must
+        //  reproduce the hand-assembled one above.
         // ---------------------------------------------------------------
         qp_modea::modea_ctx ctxc;
         qp_modea::modea_opts optc = opts;
         optc.wfit = "contour";
         optc.cd_bstore_cap_gb = 0.0;          // the DEFAULT: no store admitted
         optc.cd_bfactor = "auto";             // the DEFAULT: -> recompute
-        // ⚠ TC-5 cache OFF here: this pin tests the F5 band-factor WIRING, so its
+        // ⚠ W^c grid cache OFF here: this check tests the band-factor WIRING, so its
         // reference must be the exact per-target evaluator. With the cache on it
-        // would be measuring the interpolation error instead (and did: 1.7e-4).
+        // would be measuring the interpolation error instead (~1e-4).
         optc.wgrid_mev = 0.0;
         optc.level = 2;                       // PRINT the production banner: it is the
                                               // only place the band-factor / batching
@@ -1195,17 +1194,17 @@ namespace bdft_tests {
           }
         }
         const double rel_w = (den_w2 > 0.0) ? num_w / den_w2 : 0.0;
-        app_log(2, "[TC-4 wiring] {}: qp_modea_wfit = \"contour\" with DEFAULT knobs "
+        app_log(2, "[tilted contour] wiring, {}: qp_modea_wfit = \"contour\" with DEFAULT knobs "
                    "(qp_tc_bstore_gb = 0, qp_tc_bfactor = auto -> RECOMPUTE, batch_max = "
                    "{}): the context builds and its Sigma^c reproduces the hand-assembled "
                    "contour evaluator over {} evaluation points to {:.3e} RELATIVE "
-                   "(worst |dSigma^c| = {:.3e} over {:.4g}). Before F5 this configuration "
-                   "ABORTED.",
+                   "(worst |dSigma^c| = {:.3e} over {:.4g}); the nJ x Np x nbnd band store "
+                   "is not required.",
                 mf_src, ctxc.cdl->batch_max, nw_pt, rel_w, num_w, den_w2);
         REQUIRE(nw_pt >= 4);
         REQUIRE(rel_w < 1e-12);
 
-        // ---- TC-5 PRODUCTION PATH: cache ON at the DEFAULT knobs -----------
+        // ---- W^c grid PRODUCTION PATH: cache ON at the DEFAULT knobs -------
         // Builds the grid, runs the reflection assert, runs the audit with the
         // hard abort ARMED, and evaluates Sigma^c through the interpolated
         // cache. Reaching the REQUIREs means all three passed on live data.
@@ -1245,7 +1244,7 @@ namespace bdft_tests {
             ++nw2;
           }
         }
-        app_log(2, "[TC-5 production] {}: wfit = contour with DEFAULT knobs (cache ON, "
+        app_log(2, "[W_c grid] production path, {}: wfit = contour with DEFAULT knobs (cache ON, "
                    "target 1.0 meV, audit 16 samples, HARD ABORT ARMED): the context "
                    "builds, the reflection assert and the audit both pass on live data, "
                    "and Sigma^c over {} evaluation points differs from the exact "
@@ -1254,13 +1253,13 @@ namespace bdft_tests {
         REQUIRE(nw2 >= 4);
         REQUIRE(dw2 * 27.211386245988 * 1e3 < 1.0);   // within the requested target
 
-        // ---- GATE: REFLECTED READS AND READS INSIDE THE FIRST CELL -----------
-        // ⚠ WHY SYNTHETIC TARGETS. The _w leg-1 abort landed at |Re z| = 0.014 with
-        // h = 0.042 -- INSIDE the first grid cell, where the dagger reflection, the
-        // omega = 0 origin and the one-sided stencil all meet. A wide-gap fixture
-        // like qe_lih222 has NO contributing target that close to zero, so the
-        // physics gates cannot reach that code path however long they run. This is
-        // a READ-PATH gate, so it constructs the targets directly.
+        // ---- CHECK: REFLECTED READS AND READS INSIDE THE FIRST CELL ----------
+        // ⚠ WHY SYNTHETIC TARGETS. Targets with |Re z| below the grid step h fall
+        // INSIDE the first grid cell, where the dagger reflection, the omega = 0
+        // origin and the one-sided stencil all meet. A wide-gap fixture like
+        // qe_lih222 has NO contributing target that close to zero, so the physics
+        // checks cannot reach that code path. This is a READ-PATH check, so it
+        // constructs the targets directly.
         {
           double zmax6 = 0.0;
           for (long J = 0; J < ctx.nJ; ++J)
@@ -1280,7 +1279,7 @@ namespace bdft_tests {
             for (long P = 0; P < NPq; ++P)
               for (long Q = 0; Q < NPq; ++Q)
                 absd = std::max(absd, std::abs(Wgot6(P, Q) - Wex6(P, Q)));
-            rel = absd / w6->w_max;   // the GRID-GLOBAL scale, as the audit now uses
+            rel = absd / w6->w_max;   // the GRID-GLOBAL scale, as the audit uses
           };
           double worst = 0.0, worst_sym = 0.0;
           std::string trail;
@@ -1302,10 +1301,10 @@ namespace bdft_tests {
                                     - std::conj(w6->W->local()(3, 0, Q, P))));
               hscale = std::max(hscale, std::abs(w6->W->local()(3, 0, P, Q)));
             }
-          app_log(2, "[TC-5 read] {}: reflected + first-cell reads, h = {:.6g} a.u., "
+          app_log(2, "[W_c grid] read path, {}: reflected + first-cell reads, h = {:.6g} a.u., "
                      "grid-global max|W| = {:.3e}. +x/-x rel error:{}", mf_src,
                   w6->g.h, w6->w_max, trail);
-          app_log(2, "[TC-5 read] {}: worst rel = {:.3e} (gate 1e-3 -- a wrong-VALUE "
+          app_log(2, "[W_c grid] read path, {}: worst rel = {:.3e} (tolerance 1e-3 -- a wrong-VALUE "
                      "defect is O(1) or worse, not O(1e-5)); dagger +/- asymmetry = "
                      "{:.3e}; W^c(i delta) Hermiticity = {:.3e} over {:.3e}.",
                   mf_src, worst, worst_sym, herm, hscale);
@@ -1314,16 +1313,16 @@ namespace bdft_tests {
           REQUIRE(herm / std::max(hscale, 1e-300) < 1e-8);   // W(i delta) Hermitian
         }
 
-        // ---- the [Q6] harvest field, populated by the audit ------------------
-        // A unit test emits no [Q6] line (that is scf_driver's qpgw loop), so what
-        // is gated here is the PLUMBING that line reads: last_run() must carry the
-        // measured/predicted pair and the worst sample's location. Without this
-        // the field would render its -1 sentinel forever and nobody would notice.
+        // ---- the qpgw summary field, populated by the audit -------------------
+        // A unit test emits no qpgw iteration summary line (that is scf_driver's
+        // qpgw loop), so what is checked here is the PLUMBING that line reads:
+        // last_run() must carry the measured/predicted pair and the worst sample's
+        // location. Without this the field would silently keep its -1 sentinel.
         {
           auto const &LRw = qp_modea::last_run();
-          app_log(2, "[TC-5 Q6 field] {}: last_run carries wgrid_aud = {:.4g}/{:.4g} meV "
-                     "(worst q = {}, Re z = {:+.6g}) -- exactly as the [Q6] qpgw summary "
-                     "line renders it for harvest scripts.",
+          app_log(2, "[W_c grid] summary field, {}: last_run carries wgrid_aud = {:.4g}/{:.4g} meV "
+                     "(worst q = {}, Re z = {:+.6g}) -- exactly as the qpgw iteration summary "
+                     "line renders it.",
                   mf_src, LRw.wgrid_meas_mev, LRw.wgrid_pred_mev, LRw.wgrid_worst_q,
                   LRw.wgrid_worst_z);
           REQUIRE(LRw.wgrid_meas_mev >= 0.0);   // populated, not the -1 sentinel
@@ -1333,9 +1332,9 @@ namespace bdft_tests {
       }
 
       // =================================================================
-      //  TC-5 -- THE AMORTIZED W^c TILE CACHE, on this fixture.
+      //  THE AMORTIZED W^c TILE CACHE, on this fixture.
       //   (c) IDENTITY: Sigma^c from the interpolated cache vs the
-      //       per-target Dyson path, gated at the law's own prediction.
+      //       per-target Dyson path, checked against the law's own prediction.
       //   (c') the mev = 0 path is the per-target path, BITWISE.
       //   (d) AUDIT vs TRUTH: the audit's measured |dW|/|W| must equal a
       //       directly computed one.
@@ -1366,11 +1365,11 @@ namespace bdft_tests {
 
         methods::wc_line::solve_stats_t stG, stR;
 
-        // ⚠ AN h-SCAN, NOT A SINGLE POINT. The Axis-D law was fitted on the
-        // synthetic RPA model; whether its CONSTANT transfers to CoQuI's actual
-        // W^c is precisely what section 8.7 says cannot be assumed. Scanning h
-        // separates the two questions: the EXPONENT tests the mechanism (delta-
-        // smoothness), the CONSTANT tests the calibration.
+        // ⚠ AN h-SCAN, NOT A SINGLE POINT. The sizing law (wc_grid.hpp) was fitted
+        // on a synthetic RPA model; that its CONSTANT transfers to CoQuI's actual
+        // W^c cannot be assumed. Scanning h separates the two questions: the
+        // EXPONENT tests the mechanism (delta-smoothness), the CONSTANT tests the
+        // calibration.
         {
           std::string trail;
           double e_prev = 0.0, h_prev = 0.0, slope = 0.0;
@@ -1408,8 +1407,8 @@ namespace bdft_tests {
               slope = std::log(e_prev / mev) / std::log(h_prev / hod);
             e_prev = mev; h_prev = hod;
           }
-          app_log(2, "[TC-5 law] {}: Sigma identity vs h on REAL CoQuI W^c (delta = "
-                     "{:.4g} eV):{}  -> last-interval exponent {:.2f} (Axis-D model law "
+          app_log(2, "[W_c grid] sizing law, {}: Sigma identity vs h on REAL CoQuI W^c (delta = "
+                     "{:.4g} eV):{}  -> last-interval exponent {:.2f} (model sizing law "
                      "predicts {:.2f})", mf_src, dlt * 27.211386245988, trail, slope,
                   methods::wc_grid::wgrid_p);
           REQUIRE(slope > 1.5);   // the MECHANISM: delta-smooth convergence in h
@@ -1494,16 +1493,16 @@ namespace bdft_tests {
           }
         }
 
-        app_log(2, "[TC-5] {}: target 1.0 meV -> h/delta = {:.4f}, h = {:.6g} a.u., "
+        app_log(2, "[W_c grid] {}: target 1.0 meV -> h/delta = {:.4f}, h = {:.6g} a.u., "
                    "N = {} grid points over |Re z| <= {:.4g} eV (vs {} residue targets "
                    "per map at this fixture scale); law predicts {:.4g} meV.",
                 mf_src, wg->g.h_over_delta, wg->g.h, wg->g.N, zmax * HA,
                 cR.n_res_eval, wg->g.pred_mev);
-        app_log(2, "[TC-5] {}: IDENTITY, cache vs per-target Dyson over {} evaluation "
+        app_log(2, "[W_c grid] {}: IDENTITY, cache vs per-target Dyson over {} evaluation "
                    "points: max |dSigma^c| = {:.3e} a.u. = {:.4g} meV over max|Sigma^c| = "
                    "{:.4g}; law prediction {:.4g} meV.",
                 mf_src, npt5, dmax, d_mev, smax, wg->g.pred_mev);
-        app_log(2, "[TC-5] {}: REFLECTION assert (inside the fill) measured {:.3e} "
+        app_log(2, "[W_c grid] {}: REFLECTION assert (inside the fill) measured {:.3e} "
                    "relative; AUDIT measured |dW|/|W| = {:.3e} vs an independent "
                    "recomputation {:.3e} (must agree exactly).",
                 mf_src, refl, A.dW_abs, dref_abs);
@@ -1512,7 +1511,7 @@ namespace bdft_tests {
         REQUIRE(refl < 1e-8);            // (b) the bosonic reflection identity
         REQUIRE(A.dW_abs == dref_abs);   // (d) the audit measures what it claims
         REQUIRE(A.n_sample >= 8);
-        // (c) the identity, gated at the law's own prediction with the same 3x
+        // (c) the identity, checked against the law's own prediction with the same 3x
         // margin the sizing already carries
         REQUIRE(d_mev < 3.0 * wg->g.pred_mev + 1e-9);
 
@@ -1533,8 +1532,8 @@ namespace bdft_tests {
           for (long i = 0; i < nbnd; ++i)
             for (long j = 0; j < nbnd; ++j)
               d0 = std::max(d0, std::abs(S0(i, j) - SR(i, j)));
-          app_log(2, "[TC-5] {}: cache-OFF path vs cache-OFF path (the qp_tc_wgrid_mev = 0 "
-                     "reference): max |dSigma^c| = {:.3e} (gate: EXACTLY 0)", mf_src, d0);
+          app_log(2, "[W_c grid] {}: cache-OFF path vs cache-OFF path (the qp_tc_wgrid_mev = 0 "
+                     "reference): max |dSigma^c| = {:.3e} (required: EXACTLY 0)", mf_src, d0);
           REQUIRE(d0 == 0.0);
         }
       }
@@ -1546,29 +1545,21 @@ namespace bdft_tests {
   }
 
   // =====================================================================
-  //  TC-5 (a) -- THE SIZING LAW. Pure function; no fixture.
-  //  The knob is the ACCURACY TARGET, so this pins that h is derived from
-  //  the Axis-D law, that the delta/2 quadratic-validity clamp bites, and
-  //  that the grid actually covers the target set.
-  // =====================================================================
-  // =====================================================================
   //  THE ITERM THERMAL TERM -- why contour-source and tau-source mode-A
-  //  disagree by eV-class on the CLAMPED population (wave-4 inversion).
+  //  can disagree at the eV scale on states whose Sigma is evaluated at
+  //  z = mu (the clamped population).
   //
-  //  MEASURED IN PRODUCTION: at si444nb60 recipe clamp, contour-source mode-A
-  //  sits +2104.6 meV above ac while tau-source sits +179 meV above it -- so the
-  //  two representations differ by ~1.93 eV on states whose Sigma is evaluated at
-  //  z = mu. That is NOT a different pole store: qp_modea.hpp:1241 says the CD
-  //  Iterm is built "from the EXISTING pole rep", and it contracts the SAME
-  //  blk.M via blk.pole(). The routes differ ONLY in the WEIGHT they contract it
+  //  This is NOT a different pole store: the CD Iterm is built from the
+  //  existing pole representation and contracts the SAME blk.M via
+  //  blk.pole(). The routes differ ONLY in the WEIGHT they contract it
   //  with, and only in the NUMERATOR:
   //
-  //     tau   (pole_weights, :659) : ( n_B(om_p) + f_J ) / (z - eps_J + om_p)
-  //     CD    (Iterm,       :1247) : ( theta(Re A_J) - theta(-om_p) ) / (same)
+  //     tau   (pole_weights) : ( n_B(om_p) + f_J ) / (z - eps_J + om_p)
+  //     CD    (Iterm)        : ( theta(Re A_J) - theta(-om_p) ) / (same)
   //
   //  The denominators are identical. The numerators coincide ONLY as T -> 0,
   //  where n_B(om) -> -theta(-om) and f_J -> theta(Re A_J). At z = mu the CD
-  //  residue list is EMPTY for a gapped system (the :1205 predicate skips every J
+  //  residue list is EMPTY for a gapped system (the residue predicate skips every J
   //  with |theta0 - f| < 1e-14), so Sigma^CD(mu) IS the Iterm and the entire
   //  route difference collapses to one term:
   //
@@ -1654,7 +1645,7 @@ namespace bdft_tests {
 
     const long npk = ctx.npk, nJ = ctx.nJ, nP = nJ * npk;
     auto const &blk = ctx.blocks[0];   // the sk_block: the residue store BOTH
-                                       // production paths contract (:1251, :1341)
+                                       // production paths contract
     const long off = (blk.is * ctx.nk + blk.ik) * nJ;
     const double kT = 1.0 / ctx.beta;
 
@@ -1675,13 +1666,13 @@ namespace bdft_tests {
       const double e = ctx.epsJ(off + J), f = ctx.fJ(off + J);
       const double ReA0 = (zmu - e).real();
       const double th0 = (std::abs(ReA0) < 1e-14) ? 0.5 : (ReA0 > 0.0 ? 1.0 : 0.0);
-      if (std::abs(th0 - f) >= 1e-14) ++n_residue_targets;   // :1205's own predicate
+      if (std::abs(th0 - f) >= 1e-14) ++n_residue_targets;   // the CD residue predicate
       for (long p = 0; p < npk; ++p) {
         const double o = ctx.om(p);
         const ComplexType den = zmu - (e - o);
         const double th_neg = (o < 0.0) ? 1.0 : 0.0;
-        w_tau(J * npk + p) = (ctx.nB(p) + f) / den;          // :659  EXACT finite-T
-        w_cd(J * npk + p) = (th0 - th_neg) / den;            // :1247 the CD Iterm
+        w_tau(J * npk + p) = (ctx.nB(p) + f) / den;          // pole_weights: EXACT finite-T
+        w_cd(J * npk + p) = (th0 - th_neg) / den;            // the CD Iterm
       }
     }
 
@@ -1729,10 +1720,10 @@ namespace bdft_tests {
     }
 
     // ---- PROVENANCE: is blk.M the SAME store under wfit = "contour"? --------
-    // The Iterm comment (:1241) says "from the EXISTING pole rep", implying the
+    // The CD Iterm is built from the existing pole representation, so the
     // contour route still builds the tau fit for its Iterm and only REPLACES the
     // residue term. If so the two routes' stores are identical and the clamped
-    // population contributes identically. MEASURED, not inferred.
+    // population contributes identically. Checked directly, not inferred.
     double m_dev = 0.0, m_scale = 0.0;
     long npk_c = -1, nJ_c = -1;
     {
@@ -1758,15 +1749,14 @@ namespace bdft_tests {
     }
 
     // ---- THE POLE GAP: where do the RESIDUE arguments actually land? --------
-    // Structural claim to be checked, not assumed: the :1205 predicate admits J
+    // Structural claim to be checked, not assumed: the residue predicate admits J
     // iff theta(eps_a - eps_J) differs from f_J by >= 1e-14. At T = 0 that is
     // exactly "eps_J lies between eps_a and mu", giving residue arguments confined
     // to [0, D] with D = |eps_a - mu|. AT FINITE T IT IS WIDER: f_J is neither 0
     // nor 1 to 1e-14 within a thermal shell w_T = ln(1e14)/beta ~ 32.2/beta of mu
     // (0.87 eV at beta = 1000), so J inside that shell contributes from EITHER
-    // side and the bound is [0, D + w_T]. My first version of this gate asserted
-    // the T = 0 bound and FAILED at +3.125e-02 a.u. -- which is w_T. The bound
-    // below is the corrected claim, not a loosened one. If D + w_T < min|om_p| the
+    // side and the bound is [0, D + w_T]; the T = 0 bound [0, D] is violated by
+    // exactly w_T on this fixture. If D + w_T < min|om_p| the
     // ENTIRE residue evaluation of that state sits BELOW THE LOWEST FITTED POLE
     // -- and the states with the SMALLEST binding energy sit deepest inside that
     // gap. That inverts the usual "fits fail far from mu" intuition: here what
@@ -1799,28 +1789,28 @@ namespace bdft_tests {
         if (max_arg < om_min) ++n_state_in_gap;       // wholly below the lowest pole
       }
     }
-    app_log(2, "[TC iterm-thermal/pole-gap] W^c pole set, low end (|om_p| sorted): "
+    app_log(2, "[Iterm thermal] pole gap: W^c pole set, low end (|om_p| sorted): "
                "{:.4g} / {:.4g} / {:.4g} / {:.4g} eV. Residue-argument structure over "
                "{} states with a non-empty residue list: max over states of "
                "(max residue argument - binding energy) = {:.3e} a.u. -- this EQUALS the "
-               "finite-T shell below, confirming the corrected claim that every residue "
+               "finite-T shell below, confirming that every residue "
                "argument of a state at binding energy D lies in [0, D + w_T]. States "
                "whose ENTIRE residue evaluation "
                "falls below the lowest fitted pole: {} of {}. ⚠⚠ TWO CAVEATS: the bound is "
                "[0, D + w_T] with the finite-T shell w_T = ln(1e14)/beta = {:.4g} eV, "
-               "NOT [0, D]; and these constants are qe_lih222's -- 0 of 16 states here "
-               "sit wholly inside the pole gap, so THIS FIXTURE DOES NOT EXHIBIT THE "
-               "MECHANISM and the si444 pole set must be measured on its own.",
+               "NOT [0, D]; and these constants are this fixture's -- a wide-gap fixture "
+               "has no state wholly inside the pole gap and DOES NOT EXHIBIT THE "
+               "MECHANISM, so the pole set of a larger system must be measured on its own.",
             om_sorted_lo[0] * 27.211386245988, om_sorted_lo[1] * 27.211386245988,
             om_sorted_lo[2] * 27.211386245988, om_sorted_lo[3] * 27.211386245988,
             n_state_probed, worst_arg_excess, n_state_in_gap, n_state_probed,
             (std::log(1.0e14) / ctx.beta) * 27.211386245988);
     const double w_T = std::log(1.0e14) / ctx.beta;      // the thermal shell
-    REQUIRE(worst_arg_excess <= w_T * 1.01);   // corrected bound: [0, D + w_T]
+    REQUIRE(worst_arg_excess <= w_T * 1.01);   // finite-T bound: [0, D + w_T]
     REQUIRE(worst_arg_excess > 0.0);           // and finite T really does widen it
 
     const double HA = 27.211386245988;
-    app_log(2, "[TC iterm-thermal/provenance] wfit = \"contour\" vs \"tau\": npk {} vs {}, "
+    app_log(2, "[Iterm thermal] provenance: wfit = \"contour\" vs \"tau\": npk {} vs {}, "
                "nJ {} vs {}; max |M_contour - M_tau| = {:.6e} over max|M| = {:.4e}. "
                "A ZERO here means the contour route reuses the tau pole store verbatim "
                "for its Iterm and differs ONLY in the residue term -- so the clamped "
@@ -1828,7 +1818,7 @@ namespace bdft_tests {
                "IDENTICALLY in both routes, and any eV-class route difference must "
                "originate at the IN-STRIP states.",
             npk_c, npk, nJ_c, nJ, m_dev, m_scale);
-    app_log(2, "[TC iterm-thermal] qe_lih222, z = mu, beta = {:.4g} (kT = {:.4g} a.u. = "
+    app_log(2, "[Iterm thermal] qe_lih222, z = mu, beta = {:.4g} (kT = {:.4g} a.u. = "
                "{:.4g} eV). W^c pole set: npk = {}, min |om_p| = {:.4g} a.u. = {:.4g} eV, "
                "min|om_p|/kT = {:.4g}; max |n_B(om_p) + theta(-om_p)| = {:.4g}. "
                "CD residue targets at z = mu: {} (0 = Sigma^CD(mu) IS the Iterm). "
@@ -1847,20 +1837,25 @@ namespace bdft_tests {
     REQUIRE(npk > 0);
   }
 
-  TEST_CASE("tc5_sizing_law", "[methods][tc_contour]") {
+  // =====================================================================
+  //  THE W^c GRID SIZING LAW. Pure function; no fixture.
+  //  The knob is the ACCURACY TARGET, so this checks that h is derived from
+  //  the fitted sizing law, that the delta/2 quadratic-validity clamp bites,
+  //  and that the grid actually covers the target set.
+  // =====================================================================
+  TEST_CASE("tc_wgrid_sizing_law", "[methods][tc_contour]") {
     using namespace methods::wc_grid;
     const double HA = 27.211386245988;
 
     // (i) the law is reproduced exactly: h/delta = (T d_eV / (3 K))^(1/p)
     {
-      const double delta = 3.6325 / HA;          // si444's delta, in a.u.
+      const double delta = 3.6325 / HA;          // a Si 4x4x4-like delta, in a.u.
       const double zmax = 50.0 / HA;
       auto g = size_wc_grid(1.0, delta, zmax);
       const double d_eV = delta * HA;
-      // ⚠ the delta CREDIT is capped at wgrid_delta_sat_eV (Axis D3). si444's
-      // 3.63 eV is ABOVE it, so the law's effective divisor is the ceiling, not
-      // d_eV. This is not a loosened gate -- it is the corrected law, and the
-      // uncapped form is what sized d35_w into its hard abort.
+      // ⚠ the delta CREDIT is capped at wgrid_delta_sat_eV. This delta (3.63 eV)
+      // is ABOVE it, so the law's effective divisor is the ceiling, not d_eV.
+      // The uncapped form sizes large-delta grids far too coarse (see (iii-b)).
       const double d_eff = std::min(d_eV, wgrid_delta_sat_eV);
       const double want = std::pow(1.0 * d_eff / (wgrid_safety * wgrid_K), 1.0 / wgrid_p);
       REQUIRE(std::abs(g.h_over_delta - want) < 1e-12);
@@ -1872,7 +1867,7 @@ namespace bdft_tests {
       // and the grid covers zmax with the pad + stencil margin
       REQUIRE(g.omega(g.N - 1) >= zmax);
       REQUIRE(g.N >= 3);
-      app_log(2, "[TC-5 sizing] si444-like: delta = {:.6g} a.u. ({:.4g} eV), target 1 meV "
+      app_log(2, "[W_c grid] sizing, Si 4x4x4-like: delta = {:.6g} a.u. ({:.4g} eV), target 1 meV "
                  "-> h/delta = {:.6f}, h = {:.6g} a.u., N = {} (covers |Re z| <= {:.4g} eV); "
                  "predicted {:.4g} meV = target/{:.0f}",
               delta, d_eV, g.h_over_delta, g.h, g.N, zmax * HA, g.pred_mev, wgrid_safety);
@@ -1882,7 +1877,7 @@ namespace bdft_tests {
       auto g = size_wc_grid(1e6, 3.6325 / HA, 50.0 / HA);
       REQUIRE(g.clamped);
       REQUIRE(std::abs(g.h_over_delta - wgrid_hmax_over_delta) < 1e-15);
-      app_log(2, "[TC-5 sizing] CLAMP: a 1e6 meV target resolves to h/delta = {:.3f}, not "
+      app_log(2, "[W_c grid] sizing, CLAMP: a 1e6 meV target resolves to h/delta = {:.3f}, not "
                  "past the {:.2f} quadratic-validity bound", g.h_over_delta,
               wgrid_hmax_over_delta);
     }
@@ -1893,18 +1888,18 @@ namespace bdft_tests {
       const double ratio = a.h / b.h;
       REQUIRE(std::abs(ratio - std::pow(10.0, 1.0 / wgrid_p)) < 1e-9);
       REQUIRE(b.N > a.N);
-      app_log(2, "[TC-5 sizing] 1.0 -> 0.1 meV: h shrinks {:.4f}x = 10^(1/{:.2f}), N grows "
+      app_log(2, "[W_c grid] sizing, 1.0 -> 0.1 meV: h shrinks {:.4f}x = 10^(1/{:.2f}), N grows "
                  "{} -> {}", ratio, wgrid_p, a.N, b.N);
     }
-    // (iii-b) ⚠ THE delta-CREDIT CEILING -- the d35_w regression.
+    // (iii-b) ⚠ THE delta-CREDIT CEILING.
     // The law's 1/delta prefactor claims the Sigma error falls as 1/delta at fixed
-    // h/delta. Axis D3 measured that this STOPS being true above ~2 eV (error flat
-    // or rising where the law predicts a 0.15x fall), so the credit is capped. The
-    // uncapped law sized tc4_444nb60_d35_w to h = 6.32 eV at delta = 12.95 eV and
-    // the run-time audit hard-aborted at 14.93 meV against a 0.333 meV prediction.
+    // h/delta. This STOPS being true above ~2 eV (error flat or rising where the
+    // law predicts a 0.15x fall), so the credit is capped. Uncapped, the law sizes
+    // a delta = 12.95 eV case to h > 6 eV, a grid far too coarse for the 1 meV
+    // target (the run-time audit aborts it).
     {
       // (a) BELOW the ceiling: BIT-IDENTICAL. min() is the identity there, so every
-      //     small-delta result the campaign validated is untouched.
+      //     small-delta sizing is the plain law.
       const double dlo = 2.0 / HA;                 // 2.0 eV < 2.4 eV ceiling
       auto glo = size_wc_grid(1.0, dlo, 40.0 / HA);
       const double want_lo =
@@ -1913,7 +1908,7 @@ namespace bdft_tests {
       REQUIRE(not glo.delta_sat);
 
       // (b) ABOVE the ceiling: strictly finer than the uncapped law would give
-      const double dhi = 12.95 / HA;               // d35_w's delta
+      const double dhi = 12.95 / HA;               // a large-delta case
       auto ghi = size_wc_grid(1.0, dhi, 78.0 / HA);
       const double uncapped =
           std::pow(1.0 * (dhi * HA) / (wgrid_safety * wgrid_K), 1.0 / wgrid_p);
@@ -1922,18 +1917,17 @@ namespace bdft_tests {
       REQUIRE(ghi.delta_sat);
       REQUIRE(std::abs(ghi.h_over_delta - capped) < 1e-15);
       REQUIRE(ghi.h_over_delta < uncapped);        // the ceiling BIT
-      // the concrete d35 numbers: h must land far below the 6.32 eV that aborted
+      // h must land far below the uncapped law's > 6 eV
       const double h_eV = ghi.h * HA, h_unc_eV = uncapped * dhi * HA;
       REQUIRE(h_eV < 4.0);
-      REQUIRE(h_unc_eV > 6.0);                     // what the old law would have picked
+      REQUIRE(h_unc_eV > 6.0);                     // what the uncapped law would pick
       REQUIRE(ghi.N > long(std::ceil(78.0 / h_unc_eV)) + 3);   // strictly more points
-      app_log(2, "[TC-5 sizing/D3] delta-credit ceiling = {:.2f} eV. BELOW it "
+      app_log(2, "[W_c grid] sizing, delta-credit ceiling = {:.2f} eV. BELOW it "
                  "(delta = 2.0 eV) h/delta = {:.6f}, bit-identical to the uncapped "
-                 "law. ABOVE it, at d35_w's delta = 12.95 eV and target 1 meV: "
+                 "law. ABOVE it, at delta = 12.95 eV and target 1 meV: "
                  "h = {:.3f} eV (N = {}) vs the UNCAPPED law's h = {:.3f} eV "
-                 "(N = {}) -- the sizing that the run-time audit hard-aborted at "
-                 "14.93 meV. Uncapped under-prediction across the D3 envelope was "
-                 "11.45x; capped it is 2.09x, inside the {:.0f}x safety factor.",
+                 "(N = {}), which is too coarse for the target. The capped law's "
+                 "under-prediction stays inside the {:.0f}x safety factor.",
               wgrid_delta_sat_eV, glo.h_over_delta, h_eV, ghi.N, h_unc_eV,
               long(std::ceil(78.0 / h_unc_eV)) + 3, wgrid_safety);
     }
@@ -1946,20 +1940,20 @@ namespace bdft_tests {
   }
 
   // =====================================================================
-  //  F6 -- THE SLICEABLE CONSUME. The de-risking pin for the blk.M
-  //  partition (notes/tc4_si_tier.md §13/§15).
+  //  THE SLICEABLE CONSUME: the algebraic precondition for partitioning
+  //  blk.M.
   //
-  //  blk.M is owner-only and carries BOTH walls: memory ∝ nbnd³ and, through
-  //  its contraction, serialization ∝ nbnd⁴. The fix partitions the flat pole
+  //  blk.M is owner-only and carries BOTH limits: memory ∝ nbnd³ and, through
+  //  its contraction, serialization ∝ nbnd⁴. Partitioning the flat pole
   //  index P (equivalently the internal state J, since P is qp-major) across
-  //  the block's helper group. This pin is the algebraic precondition for
-  //  that: summing partials over ANY partition must reproduce the whole call.
+  //  the block's helper group removes both. This test is the algebraic
+  //  precondition: summing partials over ANY partition must reproduce the whole call.
   //
   //  Two kernels, because the two routes have different hot paths:
   //    (a) modea_sigma_at_range      -- the tau/route-B P-contraction
   //    (b) modea_sigma_at_cdline_range -- the contour assembly, where BOTH
   //        the closed-form Iterm AND the residue targets are sums over J, so
-  //        one J-partition distributes the 2.66 s/target residue work too.
+  //        one J-partition distributes the (dominant) residue work too.
   // =====================================================================
   TEST_CASE("tc_f6_slice_identity", "[methods][tc_contour]") {
     auto &mpi_context = utils::make_unit_test_mpi_context();
@@ -2055,7 +2049,7 @@ namespace bdft_tests {
     }
 
     // ---- (b) the CONTOUR assembly, partitioned over J --------------------
-    // Both eq-1 terms are sums over J, so ONE J-partition distributes the
+    // Both CD terms (residue and Iterm) are sums over J, so ONE J-partition distributes the
     // Iterm AND the residue targets.
     qp_modea::cd_line_opts clo;
     clo.on = true;
@@ -2091,7 +2085,7 @@ namespace bdft_tests {
     // evaluated, only grouped differently.
     const long ev_full = clf.n_res_eval, ev_part = clp.n_res_eval;
 
-    app_log(2, "[F6 slice] qe_lih222 block ({},{}): nJ = {}, npk = {}, nP = {}. "
+    app_log(2, "[mode-A slice] qe_lih222 block ({},{}): nJ = {}, npk = {}, nP = {}. "
                "(a) tau P-contraction, partials vs whole:{}  -> worst {:.3e} over "
                "max|Sigma| = {:.4g}. (b) CONTOUR assembly partitioned over J:{}  -> "
                "worst {:.3e} over max|Sigma| = {:.4g}. Residue evaluations: whole {} vs "
@@ -2100,14 +2094,13 @@ namespace bdft_tests {
             blk.is, blk.ik, ctx.nJ, ctx.npk, nP, trail_a, worst_a, mag_a,
             trail_b, worst_b, mag_b, ev_full, ev_part);
 
-    // ---- (c) ACCESSOR EXACTNESS -- the encapsulation's own bit-identity statement ----
-    // contract_elem() takes the ROW-VIEW path (textually the loop it replaced); pole()
+    // ---- (c) ACCESSOR EXACTNESS -- the accessors' bit-identity statement ----------
+    // contract_elem() takes the ROW-VIEW path (the plain contraction loop); pole()
     // takes the per-element path. They are independent implementations over the same
-    // data, so exact agreement is the statement "the accessors reduce to the loop they
-    // replaced". It is a WITHIN-RUN check and therefore immune to this tree's
-    // PRE-EXISTING run-to-run nondeterminism (the randomized W^c slab sketch,
-    // qp_modea_wsketch = 0 = automatic), which makes a cross-build byte comparison
-    // impossible for reasons that have nothing to do with this refactor.
+    // data, so exact agreement states that the accessors reduce to the plain loop.
+    // It is a WITHIN-RUN check and therefore immune to the run-to-run
+    // nondeterminism of the randomized W^c slab sketch (qp_modea_wsketch = 0 =
+    // automatic), which makes a cross-run byte comparison impossible.
     double d_acc = 0.0, m_acc = 0.0;
     {
       nda::array<ComplexType, 1> w(nP);
@@ -2121,26 +2114,26 @@ namespace bdft_tests {
           m_acc = std::max(m_acc, std::abs(ref));
         }
     }
-    app_log(2, "[F6 slice] ACCESSOR EXACTNESS: contract_elem (row-view path) vs pole() "
+    app_log(2, "[mode-A slice] ACCESSOR EXACTNESS: contract_elem (row-view path) vs pole() "
                "(per-element path) over all {}x{} elements: max|d| = {:.3e} over "
-               "max|S| = {:.4g} (gate: EXACTLY 0).", nbnd, nbnd, d_acc, m_acc);
+               "max|S| = {:.4g} (required: EXACTLY 0).", nbnd, nbnd, d_acc, m_acc);
 
     REQUIRE(worst_a / std::max(mag_a, 1e-300) < 1e-14);
     REQUIRE(worst_b / std::max(mag_b, 1e-300) < 1e-14);
     REQUIRE(ev_part == 4 * ev_full);   // 4 partitions, same target set each time
-    REQUIRE(d_acc == 0.0);             // the accessors ARE the loop they replaced
+    REQUIRE(d_acc == 0.0);             // the accessors ARE the plain loop
   }
 
   // =====================================================================
-  //  TC-4 -- THE EXPLICIT STRIP WINDOW (qp_modea_strip_lo / _hi).
+  //  THE EXPLICIT STRIP WINDOW (qp_modea_strip_lo / _hi).
   //
-  //  Two pins, on the TAU route: the strip machinery lives in strip_of /
+  //  Two checks, on the TAU route: the strip machinery lives in strip_of /
   //  modea_vxc_cd and is route-INDEPENDENT, so this exercises exactly the
   //  knob without paying for a contour build.
   //
   //  (i)  DEFAULT IDENTITY. Knob unset => strip_of returns the E_PH-derived
   //       bounds EXACTLY (operator==, not a tolerance) and the census is the
-  //       one the old formula predicts. This is the "bit-identical when
+  //       one the E_PH formula predicts. This is the "bit-identical when
   //       unset" guarantee.
   //  (ii) WINDOWED. A window sized to pull a KNOWN set of states in-strip:
   //       the census must match the count computed independently from eps,
@@ -2237,7 +2230,7 @@ namespace bdft_tests {
     for (long a = 0; a < nbnd; ++a)
       if (eps(a) >= lo_ref and eps(a) <= hi_ref) ++n_in_ref;
     REQUIRE(cc0.n_eval == nbnd);
-    REQUIRE(cc0.n_eval - cc0.n_clamp == n_in_ref);   // the census the old formula predicts
+    REQUIRE(cc0.n_eval - cc0.n_clamp == n_in_ref);   // the census the E_PH formula predicts
 
     // ---- (ii) WINDOWED: pull a KNOWN state set in-strip -------------------
     // A window wide enough to admit every band of this block, so the expected
@@ -2279,7 +2272,7 @@ namespace bdft_tests {
         vmag = std::max(vmag, std::abs(Vr(a, b)));
       }
 
-    // and the windowed map must DIFFER from the clamped one -- otherwise the pin
+    // and the windowed map must DIFFER from the clamped one -- otherwise the check
     // would pass on a knob that does nothing.
     double dcl = 0.0;
     for (long a = 0; a < nbnd; ++a)
@@ -2298,12 +2291,12 @@ namespace bdft_tests {
     for (long a = 0; a < nbnd; ++a)
       for (long b = 0; b < nbnd; ++b) dback = std::max(dback, std::abs(V2(a, b) - V0(a, b)));
 
-    app_log(2, "[TC-4 strip] qe_lih222, block ({},{}): E_PH = {:.6f} a.u.; DEFAULT strip "
+    app_log(2, "[strip window] qe_lih222, block ({},{}): E_PH = {:.6f} a.u.; DEFAULT strip "
                "({:+.6f}, {:+.6f}) a.u. = {:.4f} eV wide -> IN-STRIP {} of {} states. "
                "EXPLICIT window +-{:.4f} a.u. ({:.4f} eV) -> IN-STRIP {} of {}. "
                "Windowed V vs DIRECT evaluation at eps + i*eta: {:.3e} over max|V| = {:.4g} "
-               "(gate: bit-identical). Windowed vs clamped: {:.3e} (must be NON-zero, else "
-               "the knob does nothing). Default restored: {:.3e} (gate: exactly 0).",
+               "(required: bit-identical). Windowed vs clamped: {:.3e} (must be NON-zero, else "
+               "the knob does nothing). Default restored: {:.3e} (required: exactly 0).",
             blk.is, blk.ik, ctx.diag.gap_edge, lo_ref, hi_ref,
             (hi_ref - lo_ref) * 27.211386245988, n_in_ref, nbnd,
             ctx.opts.strip_lo == 0.0 ? emax_off + 0.05 : ctx.opts.strip_lo,
@@ -2316,10 +2309,10 @@ namespace bdft_tests {
     REQUIRE(n_in_ref < nbnd);    // the fixture really is strip-limited by default
 
     // =================================================================
-    //  DIAGNOSTIC (not a gate): WAS THE TC-3 @@MODEA_GAP PIN ITSELF
-    //  CLAMP-MEASURED? The +54.5 meV contour-vs-ac_pade number of the
-    //  TC-3 report is read from the per-k HOMO/LUMO of this fixture. If
-    //  those states are OUT of the default strip, that pin is measuring
+    //  DIAGNOSTIC (not checked): IS A GAP READ FROM THIS FIXTURE
+    //  CLAMP-MEASURED? The @@MODEA_GAP contour-vs-ac_pade comparison
+    //  (test_qp_map_ab.cpp) is read from the per-k HOMO/LUMO of this
+    //  fixture. If those states are OUT of the default strip, it measures
     //  Sigma^c(mu) for the very states that define it.
     //  Census EVERY block at the DEFAULT strip.
     // =================================================================
@@ -2350,7 +2343,7 @@ namespace bdft_tests {
       }
       const bool vbm_in = (vbm_e >= lo_ref and vbm_e <= hi_ref);
       const bool cbm_in = (cbm_e >= lo_ref and cbm_e <= hi_ref);
-      app_log(2, "[TC-4 strip/TC-3 audit] qe_lih222 DEFAULT strip ({:+.6f}, {:+.6f}) a.u. "
+      app_log(2, "[strip window] census, qe_lih222 DEFAULT strip ({:+.6f}, {:+.6f}) a.u. "
                  "over ALL {} blocks: IN-STRIP {} of {} states ({:.1f}%). THE JUDGE STATES: "
                  "per-k HOMO out of strip in {} of {} blocks, per-k LUMO in {} of {}. "
                  "GLOBAL VBM (block {}, band {}, eps-mu = {:+.4f} eV) is {}; GLOBAL CBM "
@@ -2366,19 +2359,18 @@ namespace bdft_tests {
       //  (1) are the states that DEFINE the metric evaluated exactly?
       //  (2) was the self-consistent map they were read from built with those states
       //      -- and the rest of the spectrum -- evaluated exactly?
-      app_log(2, "[TC-4 strip/TC-3 audit] VERDICT (1) THE METRIC STATES: the @@MODEA_GAP "
+      app_log(2, "[strip window] census, VERDICT (1) THE METRIC STATES: the @@MODEA_GAP "
                  "fundamental gap is global VBM -> global CBM, and both are {}. So the "
-                 "+54.5 meV contour-vs-ac_pade number is {} a direct clamp artefact.",
+                 "contour-vs-ac_pade gap difference is {} a direct clamp artefact.",
               (vbm_in and cbm_in) ? "IN STRIP (evaluated exactly, eta -> 0)"
                                   : "NOT both in strip",
               (vbm_in and cbm_in) ? "NOT" : "PARTLY");
-      app_log(2, "[TC-4 strip/TC-3 audit] VERDICT (2) THE MAP THEY WERE READ FROM: {} of {} "
+      app_log(2, "[strip window] census, VERDICT (2) THE MAP THEY WERE READ FROM: {} of {} "
                  "states ({:.1f}%) were clamped to mu, and per-k HOMO/LUMO were clamped in "
                  "{}/{} of {} blocks. Those all feed H_eff through self-consistency, so the "
-                 "pin is NOT clamp-FREE either: the metric states are exact, the map around "
-                 "them is not. Re-taking it with an explicit window is worth doing, but it "
-                 "is a SECOND-ORDER correction here -- unlike si444/nb60, where the band "
-                 "edges THEMSELVES were clamped and the metric was first-order invalid.",
+                 "gap is NOT clamp-FREE either: the metric states are exact, the map around "
+                 "them is not. An explicit window removes this SECOND-ORDER effect; when the "
+                 "band edges THEMSELVES are clamped the gap is invalid at first order.",
               nb_tot - n_in_tot, nb_tot,
               100.0 * double(nb_tot - n_in_tot) / double(std::max(1L, nb_tot)),
               n_homo_out, n_lumo_out, ctx.blocks.size());
@@ -2386,24 +2378,23 @@ namespace bdft_tests {
   }
 
   // =====================================================================
-  //  TC-4 -- THE MULTI-RANK COLLECTIVE-FREE GATE.  ⚠ THE LIVELOCK REGRESSION.
+  //  THE MULTI-RANK COLLECTIVE-FREE CHECK.  ⚠ GUARDS AGAINST AN MPI DEADLOCK.
   //
   //  WHAT IT CATCHES. thc_reader_t::Z(iq) is an MPI COLLECTIVE over the THC
-  //  array's communicator (thc_reader_t.hpp:720: it loops over EVERY rank,
-  //  broadcasting the requested iq from each in turn). The contour residue
+  //  array's communicator (it loops over EVERY rank, broadcasting the
+  //  requested iq from each in turn). The contour residue
   //  evaluator runs inside the per-rank work loop of modea_vxc_cd, where
   //  ranks carry different (s,k) blocks, different target counts and
   //  different q-transfer sets -- so calling Z(q) there gives mismatched
   //  collective sequences and MPI deadlocks as a 100 %-CPU spin.
   //
-  //  MEASURED IN PRODUCTION: the m3d SVO run, 60 ranks, hung 19 h in
-  //  PMPI_Gather <- gather_sub_matrix <- thc_reader_t::Z <- contour_residue_batch.
-  //  The single-rank gates cannot see it -- the gather degenerates at size 1 --
-  //  which is exactly why this case exists.
+  //  The symptom is a hang in PMPI_Gather <- gather_sub_matrix <-
+  //  thc_reader_t::Z <- contour_residue_batch. The single-rank tests cannot
+  //  see it -- the gather degenerates at size 1 -- which is why this case exists.
   //
   //  IT RUNS AT ANY SIZE so the single-process suite exercises the code path,
-  //  but the DIVERGENCE only bites at > 1 rank. Under mpiexec -n 2..4 the
-  //  pre-fix evaluator HANGS here; the fixed one completes.
+  //  but the DIVERGENCE only bites at > 1 rank. Under mpiexec -n 2..4 an
+  //  evaluator that calls Z(q) per rank HANGS here; the tile-gathering one completes.
   //
   //  Three checks, in order of what they isolate:
   //    (Z1) the pre-gathered tiles equal thc.Z(iq) on EVERY rank, all iq;
@@ -2500,7 +2491,7 @@ namespace bdft_tests {
     pc::sample_P_at_times(sPc, pctx.t_node, thc, sMO, sE, mu, beta, -1.0, &dg);
     auto tf = tilted_contour::factor_transform(pctx.c);
 
-    // ---- the fix under test: ONE lockstep acquisition of every Z tile ----
+    // ---- under test: ONE lockstep acquisition of every Z tile ----------
     auto sZt = pc::gather_Z_tiles(thc);
 
     // ---- (Z1) the table equals thc.Z(iq) on every rank, for every iq -------
@@ -2535,8 +2526,8 @@ namespace bdft_tests {
 
     // ---- (Z3) DELIBERATELY DIVERGENT per-rank batches ----------------------
     // Rank r evaluates a DIFFERENT NUMBER of targets, in a DIFFERENT q order, on
-    // a block IT owns. Pre-fix, each rank then issues its own count of collective
-    // thc.Z(q) calls and the job deadlocks right here. There is no assertion that
+    // a block IT owns. An evaluator that calls thc.Z(q) itself would issue a per-rank
+    // count of collective calls and deadlock right here. There is no assertion that
     // can be written for a hang: COMPLETING IS THE ASSERTION.
     REQUIRE(ctx.blocks.size() > 0);
     methods::wc_line::solve_opts_t sopt;
@@ -2554,12 +2545,11 @@ namespace bdft_tests {
       Js(i) = ((long(crank) + 1) * 37 + i * 11) % ctx.nJ;
       zs(i) = ComplexType(ctx.epsJ(off + Js(i)) - ctx.vbm, pctx.geom.delta);
     }
-    // ⚠ THE MECHANISM, MEASURED. Inserting `for (i < nloc) thc.Z(i % nq);` right here --
-    // i.e. exactly what the evaluator used to do, a per-rank number of collective Z
-    // calls -- deadlocks this case at 2 ranks in seconds: rank 0 (nloc = 1) leaves its
-    // loop while rank 1 (nloc = 2) still waits inside its second Z, and both spin at
-    // 99-100 % CPU indefinitely (killed at 2 m 41 s). That is the m3d signature
-    // reproduced on a fixture. The lines below must therefore never reach a collective.
+    // ⚠ THE MECHANISM. Inserting `for (i < nloc) thc.Z(i % nq);` right here -- a
+    // per-rank number of collective Z calls -- deadlocks this case at 2 ranks: rank 0
+    // (nloc = 1) leaves its loop while rank 1 (nloc = 2) still waits inside its second
+    // Z, and both spin at full CPU indefinitely. The lines below must therefore never
+    // reach a collective.
     nda::array<ComplexType, 3> MA(nloc, nbnd, nbnd), MB(nloc, nbnd, nbnd);
     srcA(blk.is, blk.ik, nloc, Js, zs, MA);          // one call, all targets
     srcB(blk.is, blk.ik, nloc, Js, zs, MB);          // nchunk = 1, target by target
@@ -2576,10 +2566,10 @@ namespace bdft_tests {
     mmag = mpi_context->comm.all_reduce_value(mmag, boost::mpi3::max<>{});
     const long ntot = mpi_context->comm.all_reduce_value(nloc, std::plus<>{});
 
-    // ---- (Z4) THE STORED BAND-FACTOR PATH IS EQUALLY AFFECTED, AND EQUALLY FIXED ----
-    // thc.Z(q) sat on the SHARED code path: `bs.band()` is the only representation-
+    // ---- (Z4) THE STORED BAND-FACTOR PATH SHARES THE Z ACCESS ---------------------
+    // The Z access is on the SHARED code path: `bs.band()` is the only representation-
     // dependent call in the evaluator and it is purely local, so "store" and "recompute"
-    // reached the same collective and were broken identically at > 1 rank. One context
+    // reach the same Z access and must both be collective-free at > 1 rank. One context
     // per representation, the same divergent batch through both.
     qp_modea::modea_ctx ctxs;
     qp_modea::modea_opts opts_s = opts;
@@ -2604,24 +2594,23 @@ namespace bdft_tests {
           z4 = std::max(z4, std::abs(MA(i, a, b) - MS(i, a, b)));
     z4 = mpi_context->comm.all_reduce_value(z4, boost::mpi3::max<>{});
 
-    app_log(2, "[TC-4 mrank] qe_lih222 on {} rank(s): NO DEADLOCK. Z tiles {} x {} x {} "
+    app_log(2, "[tilted contour] multi-rank, qe_lih222 on {} rank(s): NO DEADLOCK. Z tiles {} x {} x {} "
                "({:.2f} MB/node). (Z1) table vs thc.Z(iq), worst over all ranks and all "
                "iq = {:.3e} over max|Z| = {:.4g}. (Z2) inter-rank tile spread = {:.3e}. "
                "(Z3) {} divergent targets total ({} on rank {}), batched vs nchunk=1 "
                "worst = {:.3e} over max|Ms| = {:.4g}. (Z4) STORED band factors vs "
                "RECOMPUTE through the same divergent batch = {:.3e} -- both "
-               "representations share the Z access, so both were broken and both are "
-               "fixed.",
+               "representations share the Z access, so both must be collective-free.",
             csize, nq, NP, NP, double(nq) * NP * NP * 16.0 / 1.048576e6,
             z1, zmag, z2, ntot, nloc, crank, z3, mmag, z4);
     if (csize == 1)
-      app_log(2, "[TC-4 mrank] NOTE: at 1 rank the collective degenerates and the "
-                 "divergence cannot bite. Run under mpiexec -n 2..4 for the regression "
-                 "this case exists for.");
+      app_log(2, "[tilted contour] multi-rank NOTE: at 1 rank the collective degenerates and the "
+                 "divergence cannot bite. Run under mpiexec -n 2..4 to exercise the deadlock "
+                 "this case guards against.");
 
-    // ---- (Z5) TC-5: THE COLLECTIVE GRID FILL AT >1 RANK --------------------
+    // ---- (Z5) THE COLLECTIVE W^c GRID FILL AT >1 RANK -----------------------
     // The fill partitions (iq, j) across ranks and assembles with ONE reduction.
-    // Trip counts differ per rank BY DESIGN, so this is the gate that the fill is
+    // Trip counts differ per rank BY DESIGN, so this checks that the fill is
     // lockstep-safe (no collective inside the loop) and that every rank ends up
     // with the SAME table -- and then that DIVERGENT per-rank reads still agree.
     double z5_spread = 0.0, z5_read = 0.0;
@@ -2650,7 +2639,7 @@ namespace bdft_tests {
       }
       z5_read = mpi_context->comm.all_reduce_value(z5_read, boost::mpi3::max<>{});
       mpi_context->comm.barrier();
-      app_log(2, "[TC-4 mrank/(Z5)] TC-5 grid fill at {} rank(s): N = {}, nq = {}, "
+      app_log(2, "[W_c grid] multi-rank (Z5), grid fill at {} rank(s): N = {}, nq = {}, "
                  "{} fill solves partitioned; inter-rank table spread = {:.3e}; "
                  "divergent per-rank cache reads completed (max |W(0,0)| = {:.4g}).",
               csize, w5->g.N, w5->nq, w5->nq * w5->g.N, z5_spread, z5_read);
@@ -2658,21 +2647,19 @@ namespace bdft_tests {
       REQUIRE(z5_read > 0.0);
     }
 
-    // ---- (Z6) TC-5: THE AUDIT WHEN SOME RANKS OWN NO BLOCK -----------------
-    // ⚠ THE REGRESSION THIS CASE EXISTS FOR. The audit's reduces once sat inside
-    // `if (ctx.bstore.size() > 0)`, i.e. under "does THIS rank own a block". Blocks
-    // number ns*nk_ibz, which on production layouts is FAR smaller than the rank
-    // count: the si444 _w leg had 13 blocks on 60 ranks, so 47 ranks skipped the
-    // region, the reduces did not pair up, and the run hard-aborted reporting
-    // -4432936712292794320 samples and |dW| = 9.043e+02 against a grid whose global
-    // max|W| was 2.513e-03 -- a "physics breach" that was pure reduction garbage.
+    // ---- (Z6) THE W^c GRID AUDIT WHEN SOME RANKS OWN NO BLOCK ---------------
+    // ⚠ WHAT THIS CATCHES. The audit's reductions must not sit under "does THIS
+    // rank own a block". Blocks number ns*nk_ibz, which on production layouts is
+    // FAR smaller than the rank count, so ranks without a block would skip the
+    // region, the reductions would not pair up, and the audit would report a
+    // garbage sample count and |dW| -- a spurious "physics breach" that is pure
+    // reduction garbage.
     //
     // NO RANK COUNT AVAILABLE HERE CAN REPRODUCE THAT BY OWNERSHIP ALONE: qe_lih222
-    // has nblk = ns*nk_ibz = 8, so at 1/2/4 ranks every rank owns a block and the
-    // old guard was uniform BY ACCIDENT. The condition is therefore INJECTED: the
-    // sampler contributes nothing on odd ranks, which is exactly what a rank without
-    // a block does. Pre-fix the equivalent structure hangs or reduces garbage; the
-    // driver reduces unconditionally, so the count must come out EXACTLY right.
+    // has nblk = ns*nk_ibz = 8, so at 1/2/4 ranks every rank owns a block. The
+    // condition is therefore INJECTED: the sampler contributes nothing on odd ranks,
+    // which is exactly what a rank without a block does. The driver reduces
+    // unconditionally, so the count must come out EXACTLY right.
     {
       double zmax6 = 0.0;
       for (long J = 0; J < ctx.nJ; ++J)
@@ -2698,7 +2685,7 @@ namespace bdft_tests {
       };
       auto A6 = methods::wc_grid::run_wc_grid_audit(
           mpi_context->comm, *w6, thc, *sZt, sPc, tf, pctx.c.rank, nsamp6, nq, g6,
-          false /* never abort: this gate is about the reduce, not the verdict */,
+          false /* never abort: this check is about the reduce, not the verdict */,
           4, sampler6);
       mpi_context->comm.barrier();        // reaching here at all = collectives paired
 
@@ -2739,12 +2726,12 @@ namespace bdft_tests {
           [](long, long, std::vector<double> &, std::vector<long> &) {});
       mpi_context->comm.barrier();
 
-      app_log(2, "[TC-4 mrank/(Z6)] TC-5 audit with {} of {} rank(s) owning no "
+      app_log(2, "[W_c grid] multi-rank (Z6), audit with {} of {} rank(s) owning no "
                  "samples: reduced count = {} (expected {}, bound {}); reduced "
                  "max|dW| = {:.3e} vs independent reference {:.3e}; worst at q = {}, "
                  "Re z = {:+.6g} (reference q = {}, Re z = {:+.6g}); empty-sampler "
-                 "leg reduced count = {}. Pre-fix this structure reduced across a "
-                 "SUBSET and produced a garbage count.",
+                 "leg reduced count = {}. A reduction across only a SUBSET of ranks "
+                 "would produce a garbage count.",
               csize - long(mpi_context->comm.all_reduce_value(long(contributes),
                                                               std::plus<>{})),
               csize, A6.n_sample, expect, ntot6, A6.dW_abs, dref, A6.worst_q,
@@ -2752,7 +2739,7 @@ namespace bdft_tests {
 
       REQUIRE(A6.n_sample == expect);          // the reduce paired up, exactly
       REQUIRE(A6.n_sample >= 0);
-      REQUIRE(A6.n_sample <= ntot6);           // the bound the driver now asserts
+      REQUIRE(A6.n_sample <= ntot6);           // the bound the driver asserts
       REQUIRE(A6.dW_abs == dref);              // and the error reduce likewise
       REQUIRE(A6.worst_q == long(std::lrint(lref[0])));   // location follows the max
       REQUIRE(A6.worst_z == lref[1]);
@@ -2768,7 +2755,7 @@ namespace bdft_tests {
   }
 
   // =====================================================================
-  //  TC-4 -- the batched transform at PRODUCTION SHAPE.
+  //  the batched transform at PRODUCTION SHAPE.
   //
   //  The unit fixture runs at Np = 32, where the (rank x Np^2) Pi slab is
   //  ~1 MB and never leaves cache, so it cannot show what the batching is
@@ -2777,8 +2764,8 @@ namespace bdft_tests {
   //  that shape on synthetic data -- no fixture, no physics.
   //
   //  `apply_many` vs `apply` is the PRODUCTION code, verbatim. The
-  //  contraction leg compares the gemm this file now issues against the
-  //  triple loop it replaced, at the same shape; it is a SHAPE PROBE of
+  //  contraction leg compares the gemm the evaluator issues against the
+  //  equivalent per-target loop, at the same shape; it is a SHAPE PROBE of
   //  the kernel, not a call into the evaluator.
   // =====================================================================
   TEST_CASE("tc_contour_batch_scaling", "[methods][tc_contour]") {
@@ -2786,7 +2773,7 @@ namespace bdft_tests {
     if (mpi_context->comm.size() != 1) return;
     decltype(nda::range::all) all;
 
-    // the tc3_report production row; the two batch depths are the 64 MB default and the
+    // a production-sized shape; the two batch depths are the 64 MB default and the
     // 256 MB setting of qp_tc_batch_mb at these sizes
     const long NP = 364, r = 101, nD = 2500;
     const long nt = 59;
@@ -2836,7 +2823,7 @@ namespace bdft_tests {
                                     double((j * 3 + pq) % 11) - 5.0) * 1e-3;
     nda::array<ComplexType, 2> Rb(2 * nt, NP * NP), Rl(2 * nt, NP * NP);
     auto b0 = std::chrono::steady_clock::now();
-    for (long t = 0; t < 2 * nt; ++t) {                 // the loop this replaced
+    for (long t = 0; t < 2 * nt; ++t) {                 // the per-target loop
       for (long pq = 0; pq < NP * NP; ++pq) Rl(t, pq) = ComplexType(0.0);
       for (long j = 0; j < r; ++j) {
         const ComplexType a = F(t, j);
@@ -2855,11 +2842,11 @@ namespace bdft_tests {
     const double t_loop = std::chrono::duration<double>(b1 - b0).count();
     const double t_gemm = std::chrono::duration<double>(b2 - b1).count();
 
-    app_log(2, "[TC-4 shape] production shape Np = {}, rank = {}, nD = {}, {} targets "
+    app_log(2, "[tilted contour] batch shape, production shape Np = {}, rank = {}, nD = {}, {} targets "
                "(x2 with the conjugate mirrors). TRANSFORM ROWS: {:.4f} s one at a time "
                "vs {:.4f} s in one gemm -> {:.2f}x; max|dF| = {:.3e} over max|F| = {:.3e}",
             NP, r, nD, nt, t_row, t_bat, (t_bat > 0.0 ? t_row / t_bat : 0.0), dF, mF);
-    app_log(2, "[TC-4 shape] CONTRACTION R = F.Pi: {:.4f} s per-target loop vs {:.4f} s "
+    app_log(2, "[tilted contour] batch shape, CONTRACTION R = F.Pi: {:.4f} s per-target loop vs {:.4f} s "
                "one gemm -> {:.2f}x; max|dR| = {:.3e} over max|R| = {:.3e}. The Pi slab is "
                "{:.0f} MB, streamed once per target by the loop and once per chunk by the "
                "gemm -- {}x less traffic at this batch depth.",
@@ -2889,19 +2876,19 @@ namespace bdft_tests {
       auto c2 = std::chrono::steady_clock::now();
       const double tl = std::chrono::duration<double>(c1 - c0).count();
       const double tg = std::chrono::duration<double>(c2 - c1).count();
-      app_log(2, "[TC-4 shape] the same contraction at the SHIPPED 64 MB default "
+      app_log(2, "[tilted contour] batch shape, the same contraction at the SHIPPED 64 MB default "
                  "({} targets): {:.4f} s loop vs {:.4f} s gemm -> {:.2f}x",
               nc, tl, tg, (tg > 0.0 ? tl / tg : 0.0));
     }
   }
 
   // =====================================================================
-  //  qp_tc_profile = "growing" -- the eq-8 growing-delta profile.
+  //  qp_tc_profile = "growing" -- the growing-delta profile.
   //  No fixture needed: the contour builder consumes only (E, mu, N_k, beta).
   //  The profile bites only once 0.05|zeta| exceeds the mesh floor
   //  1.2 W_band / N_k somewhere in the target window, i.e. once
-  //  N_k >~ 1.4 W_band/eV (results section 4.2) -- so it is exercised HERE at
-  //  N_k = 24 and reduces exactly to "flat" at the N_k = 1..2 of the fixtures.
+  //  N_k >~ 1.4 W_band/eV -- so it is exercised HERE at N_k = 24 and reduces
+  //  exactly to "flat" at the N_k = 1..2 of the fixtures.
   // =====================================================================
   TEST_CASE("tc_contour_growing_profile", "[methods][tc_contour]") {
     auto &mpi_context = utils::make_unit_test_mpi_context();
@@ -2930,11 +2917,11 @@ namespace bdft_tests {
       auto cf = pc::build_contour_for_spectrum(E, mu, nk_lin, beta, o);
       o.profile = "growing";
       auto cg = pc::build_contour_for_spectrum(E, mu, nk_lin, beta, o);
-      app_log(2, "[TC-2 growing] N_k = {:>2}: delta_mesh = {:.4g} eV; flat  tan(th) = "
+      app_log(2, "[tilted contour] growing profile, N_k = {:>2}: delta_mesh = {:.4g} eV; flat  tan(th) = "
                  "{:.4g}, gamma = {:.4g}, S = {:.4g}, rank = {}",
               nk_lin, cf.geom.delta_mesh * pc::ha_to_eV, cf.c.g.tan_theta,
               cf.c.g.gamma, cf.c.g.S, cf.c.rank);
-      app_log(2, "[TC-2 growing] N_k = {:>2}: {:>27} growing tan(th) = {:.4g}, gamma = "
+      app_log(2, "[tilted contour] growing profile, N_k = {:>2}: {:>27} growing tan(th) = {:.4g}, gamma = "
                  "{:.4g}, S = {:.4g}, rank = {} -> gain {:.3f}x",
               nk_lin, "", cg.c.g.tan_theta, cg.c.g.gamma, cg.c.g.S, cg.c.rank,
               double(cf.c.rank) / double(cg.c.rank));
@@ -2951,12 +2938,11 @@ namespace bdft_tests {
         rank_grow = cg.c.rank;
       }
     }
-    // at N_k = 24 the profile must actually buy something (results section 4.2
-    // measured 1.25-2.79x there); never worse than flat.
+    // at N_k = 24 the profile must actually buy something; never worse than flat.
     REQUIRE(rank_grow <= rank_flat);
-    app_log(2, "[TC-2 growing] VERDICT: at N_k = 24 the growing profile takes the rank "
-               "from {} to {} ({:.3f}x); at N_k = 2 it is identical to flat, which is "
-               "the mechanism of results section 4.2 (the profile bites only once "
+    app_log(2, "[tilted contour] growing profile, VERDICT: at N_k = 24 the growing profile takes the rank "
+               "from {} to {} ({:.3f}x); at N_k = 2 it is identical to flat (the profile "
+               "bites only once "
                "0.05|zeta| exceeds the mesh floor inside the target window)",
             rank_flat, rank_grow, double(rank_flat) / double(rank_grow));
   }
@@ -2965,10 +2951,10 @@ namespace bdft_tests {
     run_tc2_gate("qe_lih222", 1e-4);
   }
 
-  // The spec asks for a "qe_si222-class" fixture. The Si fixtures the repo ships
-  // are qe_si111 / qe_si211 / qe_si222_so (spin-orbit); qe_si211 is the one the
-  // RW-1 Lehmann gate uses for its Si leg, so it is the like-for-like choice.
-  // [DEVIATION, flagged in notes/tc12_report.md]
+  // The Si fixtures the repo ships are qe_si111 / qe_si211 / qe_si222_so
+  // (spin-orbit); qe_si211 is the one the real-axis Lehmann test
+  // (test_real_axis_w_lehmann.cpp) uses for its Si leg, so it is the
+  // like-for-like choice.
   TEST_CASE("tc_contour_p_si211", "[methods][tc_contour]") {
     run_tc2_gate("qe_si211", 1e-4);
   }

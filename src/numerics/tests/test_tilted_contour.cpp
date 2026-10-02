@@ -19,27 +19,29 @@
  */
 
 /**
- * GATES TC-1-a and TC-1-b of notes/tc_coqui_impl_spec.md.
+ * Unit tests of the offline tilted-contour builder.
  *
- * TC-1-a  the port against the campaign's own numbers, on all 18 fixtures of
- *         tc_validation (the spec asks for >= 6):
+ * tilted_contour_reference  the C++ builder against an independent Python
+ *         implementation, on every fixture of the reference file (at least 6):
  *           * the rank at lambda > eps^2 lambda_max EQUAL to the reference,
- *             and so are the spec-convention rank and the conditioning ceiling;
+ *             and so is the rank at lambda > eps lambda_max;
  *           * the nodes {s_j} equal to the reference to the local resolution of
  *             the graded s-grid they are selected from;
  *           * F applied to the analytic in-basis poles reproduces 1/(z - D_k)
- *             at the campaign's error class (the reference number is the pin);
+ *             at the reference error level;
  *           * an independent analytic pole model transformed through F, scored
- *             against its closed form AND against the python transform.
+ *             against its closed form AND against the Python transform.
  *
- * TC-1-b  the ported unit pins (tc_validation/tests/pins.py):
- *           pin1  the eq-2 exponent algebra + a brute-force rotated contour
+ * the analytic checks:
+ *           pin1  the kernel exponent algebra + a brute-force rotated contour
  *                 quadrature of one pole against 1/(z-D);
  *           pin3  the two endpoint limits, theta = 0 and (theta = pi/2, W = 0);
  *           pin4  the ID identity T[:,J] = I, the exponential rank ladder, and
- *                 F exactness at the fully resolved rank.
+ *                 F exactness at the fully resolved rank;
+ *           mirror  the anti-resonant half from the same contour samples.
  *
- * The reference file is written by tc_validation/tests/export_tc1_reference.py.
+ * The reference file tests/unit_test_files/tilted_contour/tc1_reference.json is
+ * exported from the Python implementation.
  */
 
 #undef NDEBUG
@@ -72,7 +74,7 @@ namespace bdft_tests {
 
 
   // =======================================================================
-  //  GATE TC-1-a -- the campaign reference
+  //  the reference comparison
   // =======================================================================
   TEST_CASE("tilted_contour_reference", "[numerics][tilted_contour]") {
     const std::string path = std::string(PROJECT_SOURCE_DIR)
@@ -81,8 +83,8 @@ namespace bdft_tests {
     auto const &meta = doc["meta"];
     auto const &cases = doc["cases"];
     const long ncase = long(cases.size());
-    REQUIRE(ncase >= 6);          // the spec's floor
-    app_log(2, "[TC-1-a] reference: {} cases, rho = {}, eps = {:.0e}, eps_tr = {:.0e}, "
+    REQUIRE(ncase >= 6);          // minimum fixture count
+    app_log(2, "[tilted contour] reference: {} cases, rho = {}, eps = {:.0e}, eps_tr = {:.0e}, "
                "nx = {}, rule '{}' capped by '{}', weighting '{}'",
             ncase, meta["rho"].d(), meta["eps"].d(), meta["eps_tr"].d(),
             meta["nx"].i(), meta["rank_rule"].s(), meta["rank_cap_rule"].s(),
@@ -127,12 +129,11 @@ namespace bdft_tests {
 
       // ---- rank: EQUAL --------------------------------------------------
       // The two ACCURACY-CARRYING counts (eps and eps^2) must be equal to the
-      // reference. The 1e-16 CEILING count is NOT gated for equality: at that
+      // reference. The 1e-16 CEILING count is NOT checked for equality: at that
       // threshold the Gram eigenvalues sit in the eigensolver's own round-off
-      // floor, and nda's zheev and numpy's zheevd do not agree there (measured
-      // 44 vs 33 on si_kp222_nbnd60). What the ceiling has to do -- guard the
-      // conditioning -- is gated instead: it must exceed the eps^2 rank, i.e.
-      // it must NOT bind at eps = 1e-6. [DEVIATION, flagged in notes/tc12_report.md]
+      // floor, and nda's zheev and numpy's zheevd do not agree there. What the
+      // ceiling has to do -- guard the conditioning -- is checked instead: it
+      // must exceed the eps^2 rank, i.e. it must NOT bind at eps = 1e-6.
       auto const &rk = r["rank"];
       REQUIRE(c.rank_eps  == rk["eps"].i());
       REQUIRE(c.rank_eps2 == rk["eps2"].i());
@@ -219,7 +220,7 @@ namespace bdft_tests {
       worst_probe_ratio = std::max(worst_probe_ratio, probe / probe_ref);
 
       // cross-implementation agreement at three sampled targets. The LS system
-      // is conditioned at ~1e6-1e7 (results section 5.1), so the two transforms
+      // is conditioned at ~1e6-1e7, so the two transforms
       // agree to cond * eps_mach, not bitwise -- this is a meter, not a pin.
       const long sel[3] = {0, ntarg / 2, ntarg - 1};
       auto Rre = r["probe"]["R_re"].vd(), Rim = r["probe"]["R_im"].vd();
@@ -230,7 +231,7 @@ namespace bdft_tests {
       }
       worst_xpy = std::max(worst_xpy, xpy);
 
-      app_log(2, "[TC-1-a] {:<22} rank {:>3}/{:>3}/{:>3} (eps/eps2/ceil; ref ceil {:>3}) "
+      app_log(2, "[tilted contour] {:<22} rank {:>3}/{:>3}/{:>3} (eps/eps2/ceil; ref ceil {:>3}) "
                  " nodes exact "
                  "{:>3}/{:<3} dev {:.2f}h  F_inbasis {:.3e} (ref {:.3e}, x{:.2f})  "
                  "probe {:.3e} (ref {:.3e})  cond {:.3e} (ref {:.3e})  vs-python {:.2e}",
@@ -239,17 +240,17 @@ namespace bdft_tests {
               inb, inb_ref, inb / inb_ref, probe, probe_ref, tr.cond,
               r["F"]["ls_cond"].d(), xpy);
 
-      // THE GATES. "at the campaign's error class" -- the reference number is
-      // the pin; a factor 2 covers the LS round-off of an equally-conditioned
-      // but not bitwise-identical factorization.
+      // THE CHECKS. The reference error level is the target; a factor 2 covers
+      // the LS round-off of an equally-conditioned but not bitwise-identical
+      // factorization.
       REQUIRE(inb   <= 2.0 * inb_ref);
       REQUIRE(probe <= 2.0 * probe_ref);
       REQUIRE(tr.cond <= 5.0 * r["F"]["ls_cond"].d());
-      REQUIRE(tr.cond < 1e9);          // BINDING 4: nowhere near the 1e12 ceiling
+      REQUIRE(tr.cond < 1e9);          // nowhere near the 1e12 conditioning ceiling
       REQUIRE(xpy < 1e-6);
     }
 
-    app_log(2, "[TC-1-a] SUMMARY: {} cases; nodes bit-identical {}/{}; worst node "
+    app_log(2, "[tilted contour] SUMMARY: {} cases; nodes bit-identical {}/{}; worst node "
                "deviation {:.3f} grid spacings; worst geometry rel dev {:.2e}; worst "
                "F/ref {:.3f}; worst probe/ref {:.3f}; worst C++-vs-python {:.2e}",
             ncase, n_node_exact, n_node_total, worst_node_dev, worst_geom,
@@ -257,14 +258,13 @@ namespace bdft_tests {
   }
 
   // =======================================================================
-  //  GATE TC-1-b -- the ported unit pins
+  //  the analytic checks
   // =======================================================================
   TEST_CASE("tilted_contour_pin1_exponent", "[numerics][tilted_contour]") {
     // |K(s)| = exp(-a(D) s) with a = (D-w) sin th + d cos th, and the rotated
     // contour integral of a single pole reproduces 1/(z-D).
-    // [port of tc_validation/tests/pins.py::pin1_exponent_algebra]
     double worst_mod = 0.0, worst_int = 0.0;
-    // a deterministic sweep in place of the reference's rng(0) draw
+    // a deterministic parameter sweep
     for (int a1 = 0; a1 < 4; ++a1)
       for (int a2 = 0; a2 < 4; ++a2)
         for (int a3 = 0; a3 < 3; ++a3) {
@@ -291,7 +291,7 @@ namespace bdft_tests {
           const dcomplex ex = 1.0 / (z - D);
           worst_int = std::max(worst_int, std::abs(num - ex) / std::abs(ex));
         }
-    app_log(2, "[TC-1-b pin1] max ||K| - e^-as| = {:.3e}; max rel err of the brute-force "
+    app_log(2, "[tilted contour pin1] max ||K| - e^-as| = {:.3e}; max rel err of the brute-force "
                "rotated contour integral = {:.3e}", worst_mod, worst_int);
     REQUIRE(worst_mod < 1e-12);
     REQUIRE(worst_int < 1e-9);
@@ -299,7 +299,6 @@ namespace bdft_tests {
 
   TEST_CASE("tilted_contour_pin3_endpoints", "[numerics][tilted_contour]") {
     // th = 0 -> G = 1/[2d - i(x-x')];  th = pi/2, W = 0 -> G = 1/(x+x') (Cauchy).
-    // [port of tc_validation/tests/pins.py::pin3_endpoints]
     const long n = 41;
     const double d = 0.7;
     {
@@ -314,7 +313,7 @@ namespace bdft_tests {
         for (long j = 0; j < n; ++j)
           e0 = std::max(e0, std::abs(G(i, j)
                                      - 1.0 / dcomplex(2.0 * d, -(x(i) - x(j)))));
-      app_log(2, "[TC-1-b pin3] theta = 0 line limit: max dev = {:.3e}", e0);
+      app_log(2, "[tilted contour pin3] theta = 0 line limit: max dev = {:.3e}", e0);
       REQUIRE(e0 < 1e-13);
     }
     {
@@ -331,7 +330,7 @@ namespace bdft_tests {
           num = std::max(num, std::abs(G(i, j) - ref));
           den = std::max(den, std::abs(ref));
         }
-      app_log(2, "[TC-1-b pin3] theta = pi/2, W = 0 Cauchy limit: max rel dev = {:.3e}",
+      app_log(2, "[tilted contour pin3] theta = pi/2, W = 0 Cauchy limit: max rel dev = {:.3e}",
               num / den);
       REQUIRE(num / den < 1e-13);
     }
@@ -339,10 +338,8 @@ namespace bdft_tests {
 
   TEST_CASE("tilted_contour_pin4_F_exactness", "[numerics][tilted_contour]") {
     // ID identity T[:,J] = I, exponential collapse of the ID reconstruction along
-    // the rank ladder, and F exactness at the fully resolved rank.
-    // [port of tc_validation/tests/pins.py::pin4_F_exactness, with the `gram` row
-    //  weighting (the BINDING choice) in place of the reference's `relative`;
-    //  measured python ladder at `gram`: 9.64e-02 / 3.70e-05 / 2.34e-07]
+    // the rank ladder, and F exactness at the fully resolved rank, with the
+    // `gram` row weighting the builder uses.
     tc::contour_params_t p;
     p.dmin = 2.5; p.dmax = 150.0; p.W = 20.0; p.delta = 0.5; p.rho = 0.65;
     p.eps = 1e-6; p.eps_tr = 1e-12; p.nx = 2000; p.kappa = 0.35;
@@ -355,12 +352,12 @@ namespace bdft_tests {
     // one build for the eigen-spectrum (the rank ladder reads it three times)
     auto c0 = tc::build_contour(p);
     const long r_eps = c0.rank_eps, r_eps2 = c0.rank_eps2, r_full = c0.rank_ceil;
-    app_log(2, "[TC-1-b pin4] rank ladder: eps -> {}, eps^2 -> {}, 1e-16 -> {} "
+    app_log(2, "[tilted contour pin4] rank ladder: eps -> {}, eps^2 -> {}, 1e-16 -> {} "
                "(reference 188 / 376 / 520; the 1e-16 rung sits in the eigensolver "
                "round-off floor and is NOT reproducible across zheev/zheevd -- "
-               "reported, not gated)", r_eps, r_eps2, r_full);
-    REQUIRE(r_eps  == 188);        // results section 2.1, the spec-convention rank
-    REQUIRE(r_eps2 == 376);        // results section 2.1, the accuracy rank N_s^sigma
+               "reported, not checked)", r_eps, r_eps2, r_full);
+    REQUIRE(r_eps  == 188);        // reference value: the rank at lambda > eps lambda_max
+    REQUIRE(r_eps2 == 376);        // reference value: the accuracy rank N_s^sigma
     REQUIRE(r_full > r_eps2);
 
     double id_ident = 0.0;
@@ -410,7 +407,7 @@ namespace bdft_tests {
         }
       }
       ferr.push_back(e);
-      app_log(2, "[TC-1-b pin4] rank {:>3}: |T[:,J]-I| = {:.2e}  id_recon = {:.3e}  "
+      app_log(2, "[tilted contour pin4] rank {:>3}: |T[:,J]-I| = {:.2e}  id_recon = {:.3e}  "
                  "F_relerr = {:.3e}  cond = {:.3e}",
               r, c.id_identity, rec.back(), e, tr.cond);
     }
@@ -424,10 +421,9 @@ namespace bdft_tests {
   }
 
   TEST_CASE("tilted_contour_mirror", "[numerics][tilted_contour]") {
-    // BINDING 2: the anti-resonant half from the SAME contour samples.
-    // (a) a(-Delta) < 0 at production geometry -- the divergence the mirror avoids;
+    // The anti-resonant half comes from the SAME contour samples.
+    // (a) a(-Delta) < 0 at a realistic geometry -- the divergence the mirror avoids;
     // (b) P(z) = R(z) + conj(R(-conj z)) exactly, for a real-Delta pole model.
-    // [port of tc_validation/tests/pins.py::pin_mirror]
     tc::contour_params_t p;
     p.dmin = 2.5; p.dmax = 150.0; p.W = 20.0; p.delta = 0.5; p.rho = 0.65;
     p.eps = 1e-6; p.eps_tr = 1e-12; p.nx = 600;
@@ -435,7 +431,7 @@ namespace bdft_tests {
     // the anti-resonant pole at -Dmax seen from the worst target w = Dmin + W
     const double a_anti = (-p.dmax - (p.dmin + p.W)) * std::sin(g.theta)
                         + p.delta * std::cos(g.theta);
-    app_log(2, "[TC-1-b mirror] a(-Delta_max) = {:.4f} (< 0: the anti-resonant half "
+    app_log(2, "[tilted contour mirror] a(-Delta_max) = {:.4f} (< 0: the anti-resonant half "
                "diverges on this contour)", a_anti);
     REQUIRE(a_anti < 0.0);
 
@@ -454,7 +450,7 @@ namespace bdft_tests {
       }
       worst = std::max(worst, std::abs(tc::combine_mirror(R, Rm) - P) / std::abs(P));
     }
-    app_log(2, "[TC-1-b mirror] max rel dev of R(z) + conj(R(-conj z)) from R(z)+R(-z) "
+    app_log(2, "[tilted contour mirror] max rel dev of R(z) + conj(R(-conj z)) from R(z)+R(-z) "
                "= {:.3e}", worst);
     REQUIRE(worst < 1e-14);
   }

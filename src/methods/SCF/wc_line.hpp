@@ -23,13 +23,14 @@
 
 /**
  * ===========================================================================
- * W^c ON THE LINE  (increment TC-3 / spec M4, notes/tc_coqui_impl_spec.md)
+ * W^c ON THE LINE
  * ===========================================================================
  *
  * Given the polarization Pi(q, z) at an arbitrary complex z -- which
  * methods/SCF/p_contour.hpp supplies on the tilted contour's target list --
  * this file produces the screened interaction there, and the contracted band
- * elements <nm|W^c(q,z)|mn> that the eq-1 CD assembly consumes.
+ * elements <nm|W^c(q,z)|mn> that the contour-deformation (CD) assembly
+ * consumes.
  *
  * ---------------------------------------------------------------------------
  * 1. ONE CONVENTION, AND IT IS THE CODE'S OWN
@@ -44,7 +45,7 @@
  *      W^c = A . Z                                                       (v)
  *
  * i.e. W^c = ([I - Z.Pi]^{-1} - I).Z, with Z = thc.Z(q) the bare Coulomb
- * kernel in the THC auxiliary basis. That is ALGEBRAICALLY the spec's
+ * kernel in the THC auxiliary basis. That is ALGEBRAICALLY the textbook
  * v[1 - v P]^{-1} v P v:
  *
  *      ([1-ZP]^{-1} - 1) Z = [1-ZP]^{-1} (1 - (1-ZP)) Z = [1-ZP]^{-1} Z P Z
@@ -58,15 +59,15 @@
  * Pi -- the one `scr_coulomb_t::eval_Pi_qdep` stores, negative semi-definite
  * on the imaginary axis. From the tilted contour that is
  *
- *      Pi(z) = -[ R(z) + R(-conj z)^dag ]                          (TC-2 eq SIGN)
+ *      Pi(z) = -[ R(z) + R(-conj z)^dag ]
  *
  * which is exactly what `p_contour::polarization_from_contour` returns. Feeding
- * the raw resonant half R, or the campaign's P(z) with the opposite overall
- * sign, silently produces a W^c with the wrong screening sign; gate TC-3-a(W)
+ * the raw resonant half R, or a P(z) with the opposite overall sign, silently
+ * produces a W^c with the wrong screening sign; test_methods_tc_wline.cpp
  * scores this whole chain against an independently generated reference.
  *
  * ---------------------------------------------------------------------------
- * 2. THE CONTRACTED ELEMENTS, AND WHY THE KRYLOV PATH IS THE PRODUCTION ONE
+ * 2. THE CONTRACTED ELEMENTS, AND WHY THE KRYLOV PATH IS THE LARGE-SCALE ONE
  * ---------------------------------------------------------------------------
  * The CD assembly never needs W^c as a matrix -- it needs the scalars
  * <nm|W^c(q,z)|mn> = gl^dag W^c gr for a handful of band-pair vectors g. With
@@ -78,13 +79,13 @@
  * (q, z, vector), never an inverse and never an (Np x Np) intermediate. At test
  * scale `wc_sandwich_dense` forms the inverse once per (q,z) and applies it to
  * every vector, which is cheaper when the vector count approaches Np and is the
- * reference the Krylov path is gated against (the campaign measured the two
- * agreeing to 9e-13). Neighbouring targets z on the line differ little, so the
+ * reference the Krylov path is tested against (the two agree to ~1e-12).
+ * Neighbouring targets z on the line differ little, so the
  * previous z's solution is the natural initial guess -- that is the warm start,
  * and it is what makes (K) cost a few iterations instead of a factorization.
  *
  * `gmres_solve` below is a compact restarted GMRES with modified Gram-Schmidt
- * and Givens rotations; the repository had no Krylov solver to reuse.
+ * and Givens rotations, self-contained so this header needs no Krylov library.
  */
 
 #include <algorithm>
@@ -173,7 +174,7 @@ namespace wc_line {
   }
 
   // =========================================================================
-  //  restarted GMRES  (the repository had none to reuse)
+  //  restarted GMRES
   // =========================================================================
 
   /**
@@ -183,7 +184,7 @@ namespace wc_line {
    *
    * Modified Gram-Schmidt Arnoldi + Givens rotations on the Hessenberg least
    * squares -- the textbook construction, written out because it must be
-   * auditable next to the dense reference it is gated against.
+   * auditable next to the dense reference it is tested against.
    */
   inline double gmres_solve(nda::matrix<dcomplex> const &A,
                             nda::array<dcomplex, 1> const &b,
