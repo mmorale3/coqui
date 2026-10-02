@@ -15,7 +15,7 @@ from .closure import fit_sigma_sectors, lehmann_from_sigma, chemical_potential, 
 
 class LineSCGW:
     def __init__(self, X, Z, qk_to_k2, nk, nelec, H0, mu, theta=np.deg2rad(20), eps=1e-8, lam=6.0, bos_lam=4.0, bos_gap=0.02,
-                 sig_gap=(0.02, 0.02), g_gap=(0.01, 0.01), wp=0.11, K=16, tol_gram=None, mixing=0.5, verbose=True, k_weight=None,
+                 sig_gap=(0.02, 0.02), g_gap=(0.01, 0.01), wp=0.11, K=24, tol_gram=1e-10, mixing=0.5, verbose=True, k_weight=None,
                  nodes_per_ray=120, node_range=(1e-3, 60.0)):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
@@ -23,7 +23,7 @@ class LineSCGW:
         self.X, self.Z, self.qk, self.nk, self.nelec, self.H0 = X, Z, qk_to_k2, nk, nelec, H0
         self.nb = X.shape[2]; self.mu = mu; self.theta, self.eps, self.lam = theta, eps, lam
         self.wp, self.K, self.mixing, self.verbose = wp, K, mixing, verbose
-        self.tol_gram = tol_gram if tol_gram is not None else 10 * eps
+        self.tol_gram = tol_gram if tol_gram is not None else 1e-10
         self.k_weight = k_weight
         tmax = node_range[1]
         self.bos = BosonicLineBasis(theta, lam=bos_lam, eps=eps, gap=bos_gap)
