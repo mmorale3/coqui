@@ -2430,7 +2430,7 @@ namespace methods::solvers::dynbse_cuda {
           for (long j = 0; j < ng; ++j)
             if (std::abs(s.eps[size_t(a)] - s.epsG[size_t(j)]) <= 1e-10)
               APP_ABORT(std::string(" sigma_dyn_accumulate (device): confluent U_j T_a (e_a = e_j = ") + std::to_string(s.eps[size_t(a)]) +
-                        ") is not supported (R1).");
+                        ") is not supported.");
         }
       for (long a0 = 0; a0 < a_hi; a0 += s.AC) {
         const long na = std::min(s.AC, a_hi - a0), nb = na * nk;
