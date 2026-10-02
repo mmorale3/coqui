@@ -222,7 +222,8 @@ namespace methods::solvers::dynbse_cuda {
     }
     // G column pairs (n, Q) per block (consecutive columns, Q fastest), nk threads per column (thread = (g, R)); XqR(:, Q, R) is
     // P-independent and lives in registers; A and XPR are read per P from L2. Shared: twiddles (2 x 3 x MAXNC) + 2 G nk.
-    // (A100, Si kp444 C = 12, Nm 291: G = 1 fastest; staging A / XPR in shared memory per P was 3x slower -- 2026-09-28.)
+    // G = 1 is the default (the fastest choice on A100-class devices); staging A / XPR in shared memory per P is slower than
+    // reading them from L2.
     constexpr int FZ_THREADS = 256;
     __global__ void __launch_bounds__(FZ_THREADS)
     fused_rung_kernel(long nk, long Nm, long nb, long nc, long G, mesh_dft m, cd const *__restrict__ A,
@@ -380,7 +381,7 @@ namespace methods::solvers::dynbse_cuda {
     auto *e = new rung_stream;
     e->c = c;
     e->layout = c.layout;
-    // the fused kernel's columns per block: G nk threads <= 512 (rs_config::fz_g > 0 overrides, a tuning knob)
+    // the fused kernel's columns per block: G nk threads <= FZ_THREADS (rs_config::fz_g > 0 overrides, a tuning knob)
     e->G_fz = (c.fz_g > 0) ? std::max(1l, std::min(long(FZ_THREADS) / c.nk, c.fz_g)) : 1;
     for (int d = 0; d < 3; ++d) {
       e->mdft.n[d] = c.ndim[d];

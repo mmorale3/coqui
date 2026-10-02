@@ -1,5 +1,5 @@
 #//////////////////////////////////////////////////////////////////////////////////////
-# The device kernels of the vertex code (gpu port step 5, notes/gpu_port_plan.md section 5).
+# The device kernels of the vertex code.
 # Built the way numerics/device_kernels/cuda builds its kernels: a small CUDA-language library that
 # vertex_lib links; only with ENABLE_CUDA.
 #//////////////////////////////////////////////////////////////////////////////////////

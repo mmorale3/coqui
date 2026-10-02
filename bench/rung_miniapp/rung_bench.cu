@@ -1,6 +1,6 @@
 // The device streaming THC rung (src/methods/vertex/cuda/rung_cuda.cu) on random data at a production shape, timed per phase.
-//   nvcc -O3 -std=c++17 -arch=sm_80 -Ishim -I../../src rung_bench.cu -lcublas -lcufft -o rung_bench   (RS_LAYOUT=0/1/2, COQUI_RS_FZ_G)
-//   ./rung_bench [n1 n2 n3 Nm nc nR nb reps]      (default: Si kp444, C = 12, Nm 291, one RHS block of 32)
+//   nvcc -O3 -std=c++17 -arch=sm_80 -Ishim -I../../src rung_bench.cu -lcublas -lcufft -o rung_bench   (env RS_LAYOUT=0/1/2, RS_NOCHECK)
+//   ./rung_bench [n1 n2 n3 Nm nc nR nb reps]      (default: 4 4 4 291 12 32 16 10, a Si 4x4x4 production shape)
 // The engine source is compiled in directly (the shim replaces CoQui's AppAbort); checks the result against a direct
 // k-sum on a few output entries.
 #include "methods/vertex/cuda/rung_cuda.cu"   // -I<src tree or a private copy>

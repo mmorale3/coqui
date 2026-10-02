@@ -22,7 +22,7 @@
 #define COQUI_VERTEX_RUNG_CUDA_CUH
 
 /**
- * The STREAMING THC rung on the device (gpu port R1(b), notes/gpu_port_plan.md section 4h): the device twin of
+ * The STREAMING THC rung on the device: the device twin of
  * vertex_dynbse.icc::thc_rung_apply_ft on a full nosym Gamma-centred mesh with the FFT k-sum,
  *   out(k', (p1 p3'), N) = scale sum_k sum_PQ X(k',P,p1) conj(X(k'+q,Q,p3')) W_PQ(k-k')
  *                                     sum_{p1' p3} conj(X(k,P,p1')) F(k,(p1'p3),N) X(k+q,Q,p3),
@@ -48,8 +48,8 @@ namespace methods::solvers::dynbse_cuda {
     int layout = 2;                 // 2 (default): the FUSED k-sum -- one kernel per (n, Q) column: legs in, the separable 3-D mesh
                                     //    DFT in shared memory, the product with A, the inverse DFT, legs out; no (nk Nm^2 nb) buffer;
                                     // 1: buffers (P n Q, R), contiguous cuFFT transforms, custom leg kernels;
-                                    // 0: (R, P n Q) as the host route (strided cuFFT, cuBLAS legs). A100, Si kp444 C = 12, Nm 291,
-                                    //    nR 32 (bench/rung_miniapp): 57.7 / 51.0 / 38.8 ms per application for layouts 0 / 1 / 2
+                                    // 0: (R, P n Q) as the host route (strided cuFFT, cuBLAS legs).
+                                    //    bench/rung_miniapp times the three layouts on random data
     int ndim[3] = {0, 0, 0};        // the mesh (ndim[0] ndim[1] ndim[2] == nk), lex row = (m0 n1 + m1) n2 + m2
     long fz_g = 0;                  // layout 2: columns per block (0 = the default 1)
   };
