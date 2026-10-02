@@ -39,7 +39,7 @@
 
 #include "methods/ERI/mb_eri_context.h"
 #include "methods/tools/chkpt_utils.h"
-#include "methods/SCF/qp_modea.hpp"   // Q6 §1.4(b): qp_modea::last_run(), read-only
+#include "methods/SCF/qp_modea.hpp"   // qp_modea::last_run(), read-only
 #include "simple_dyson.h"
 #include "dca_dyson.h"
 #include "scf_driver.hpp"
@@ -61,7 +61,7 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   utils::check(&FT == mb_state.ft,
                "SCF loop: imag_axes_ft of mb_state and scf_loop should be the same!");
   // HERMITIZE and ENERGY exist so the children sum to SCF_TOTAL: without them
-  // ~2% of the loop sat in the gap between the four phase timers.
+  // part of the loop falls in the gap between the four phase timers.
   for( auto& v: {"SCF_TOTAL", "DYSON", "MBPT_SOLVERS", "ITERATIVE", "WRITE",
                  "HERMITIZE", "ENERGY"} ) {
     Timer.add(v);
@@ -115,7 +115,7 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   if (!restart) { // write metadata and the MF solution
     chkpt::write_metadata(mpi->comm, *mf, FT, dyson.sH0_skij(), dyson.sS_skij(), mb_state.coqui_prefix);
     // force_sync: read_input_iterations quiesces this write a few lines below, with no compute
-    // in between, so the async path would copy ~8.9 GB and overlap none of it.
+    // in between, so the async path would copy the whole checkpoint and overlap none of it.
     chkpt::dump_scf(mpi->comm, 0, sDm_skij, sG_tskij, sF_skij, sSigma_tskij, mu,
                     mb_state.coqui_prefix, "scf", -1, true);
   }
@@ -138,8 +138,8 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   // 2) The output iteration is scf/final_iter + 1
   // Every rank reads the file here, but the iteration-0 checkpoint above may
   // still be in flight on the writing rank, so the join has to be collective:
-  // with only a local join the other ranks sailed past and aborted with
-  // 'h5 group "scf" does not exist'.
+  // with only a local join the other ranks could read before the write lands and
+  // fail with 'h5 group "scf" does not exist'.
   utils::h5_quiesce_collective(mpi->comm);
   std::tie(mb_state.mbpt_iter, mb_state.df_1e_iter, mb_state.df_2e_iter, mb_state.embed_iter) =
       chkpt::read_input_iterations(mb_state.coqui_prefix+".mbpt.h5");
@@ -160,15 +160,14 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   }
 
   // Snapshot of the previous iteration's F and Sigma, so simple mixing does not
-  // read them back from the checkpoint it just wrote: that read is 4.4 GB of
-  // serial HDF5 at Si 2x2x2/500b and was ~40 s of the 43 s ITERATIVE phase. One
-  // shm copy per iteration replaces it. Skipped when node memory is tight (the
-  // arrays are 35 GB at kp444/500b), in which case mixing falls back to the
-  // checkpoint read as before. DIIS is unaffected: it needs a history, not just
-  // the previous iterate, and keeps reading the checkpoint.
+  // read them back from the checkpoint it just wrote: that serial HDF5 read can
+  // dominate the ITERATIVE phase for large Sigma_tskij. One shm copy per iteration
+  // replaces it. Skipped when node memory is tight, in which case mixing reads
+  // the previous iterate from the checkpoint. DIIS is unaffected: it needs a
+  // history, not just the previous iterate, and keeps reading the checkpoint.
   std::optional<sArray_t<Array_view_4D_t>> sF_prev;
   std::optional<sArray_t<Array_view_5D_t>> sSigma_prev;
-  // COQUI_NO_PREV_SNAPSHOT=1 forces the old behaviour (read the previous iterate
+  // COQUI_NO_PREV_SNAPSHOT=1 disables the snapshot (the previous iterate is read
   // back from the checkpoint), so the two paths can be compared directly.
   const bool snapshot_disabled = [] {
     const char* v = std::getenv("COQUI_NO_PREV_SNAPSHOT");
@@ -241,7 +240,7 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
         mb_solver.corr->template evaluate<MEM>(mb_state, mb_eri.corr_eri->get());
       } else {
         static_assert(MEM == HOST_MEMORY,
-                      "scf_loop: only gw_t supports DEVICE_MEMORY today");
+                      "scf_loop: only gw_t supports DEVICE_MEMORY");
         mb_solver.corr->evaluate(mb_state, mb_eri.corr_eri->get());
       }
       // deallocate mb_state.dW_qtPQ after this since it's only used in the corr solver and can be very large for GW.
@@ -480,19 +479,19 @@ double qp_scf_loop(
   utils::check(qp_params.qp_type=="sc" or qp_params.qp_type=="sc_newton" or
                qp_params.qp_type=="sc_bisection" or qp_params.qp_type=="linearized" or qp_params.qp_type=="spectral",
                "qp_scf_loop: unknown qp_type {}: sc or linearized.", qp_params.qp_type);
-  // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
-  // re-QP-ization knobs. gf_grp EMPTY (the default) = INERT -- iteration 1 builds its own
-  // analytic QP G exactly as before. When set ("scf"/"embed"), iteration 1 consumes the
-  // EXTERNAL G of that checkpoint group for the HF density matrix (eq 3's Sigma^H[rho_latt])
-  // and for the Sigma^GW/W build; iterations >= 2 revert to the loop's own QP G.
+  // Re-quasiparticle-ization of an external Green's function. gf_grp empty (the default):
+  // iteration 1 builds its own analytic QP G. When set ("scf"/"embed"), iteration 1 consumes
+  // the EXTERNAL G of that checkpoint group for the HF density matrix (the Hartree term of
+  // the lattice density) and for the Sigma^GW/W build; iterations >= 2 revert to the loop's
+  // own QP G.
   const bool ext_gf = not gf_grp.empty();
   utils::check(not ext_gf or gf_grp == "scf" or gf_grp == "embed",
                "qp_scf_loop: greens_func_source = \"{}\" is not supported. Valid options: "
                "\"\" (inert, the loop's own analytic QP G), \"scf\", \"embed\".", gf_grp);
   utils::check(not ext_gf or qp_params.qp_scf_mode != "evscf",
                "qp_scf_loop: the external Green's function injection (greens_func_source = "
-               "\"{}\") is not implemented for qp_scf_mode = \"evscf\" -- evGW keeps its own "
-               "convention (notes/q5_option2_outer_loop_spec.md §4).", gf_grp);
+               "\"{}\") is not implemented for qp_scf_mode = \"evscf\" -- use qp_scf_mode = "
+               "\"qpscf\" or leave greens_func_source empty.", gf_grp);
   // http://patorjk.com/software/taag/#p=display&f=Calvin%20S&t=COQUI%20qp-scf
   app_log(1, "\n"
              "╔═╗╔═╗╔═╗ ╦ ╦╦  ┌─┐ ┌─┐   ┌─┐┌─┐┌─┐\n"
@@ -543,15 +542,15 @@ double qp_scf_loop(
   update_Dm(sDm_skij, sMO_skia, sE_ska, mu, FT.beta());
   Timer.stop("CANONICALIZATION");
 
-  // Project 2 increment Q5 (spec §1 piece 1): ITERATION 1 consumes an EXTERNAL G instead of
-  // the restart-H_eff's analytic QP G. Two consumers, one object:
-  //   (a) sDm_skij <- Dm[G_ext] here, for the HF stage (eq 3's Sigma^H[rho_latt]);
+  // ITERATION 1 consumes an EXTERNAL G instead of the restart-H_eff's analytic QP G. Two
+  // consumers, one object:
+  //   (a) sDm_skij <- Dm[G_ext] here, for the HF stage (Hartree term of the lattice density);
   //   (b) sG_ext handed to add_qpscf_vcorr below, so update_w AND the Sigma^GW build screen
   //       with the SAME G (W_corr = W[P^RPA[G_ext] + P^lad + P_C(P_imp-P_dc)P_C^dag]).
-  // Dm-from-G follows the Dyson convention verbatim (simple_dyson.cpp:143-145,
-  // dca_dyson.cpp:227): Dm = -G(tau -> beta). NOTE: mu is NOT taken from the external
-  // checkpoint -- the qp/map stage keeps the loop's OWN spectrum and chemical potential
-  // (spec §1: the CD kernel evaluates Sigma at the MAP stage from the loop's spectrum).
+  // Dm-from-G follows the Dyson convention verbatim (simple_dyson.cpp, dca_dyson.cpp):
+  // Dm = -G(tau -> beta). NOTE: mu is NOT taken from the external checkpoint -- the qp/map
+  // stage keeps the loop's OWN spectrum and chemical potential (the CD kernel evaluates
+  // Sigma at the MAP stage from the loop's spectrum).
   std::optional<sArray_t<Array_view_5D_t> > sG_ext;
   if (ext_gf) {
     const std::string filename = mb_state.coqui_prefix + ".mbpt.h5";
@@ -566,7 +565,7 @@ double qp_scf_loop(
                    "qp_scf_loop: greens_func_iteration = -1 with greens_func_source = \"{}\", "
                    "but {} carries no \"{}/final_iter\".", gf_grp, filename, gf_grp);
     }
-    app_log(1, "\n  Q5 re-QP-ization (Option 2): iteration {} consumes the external Green's "
+    app_log(1, "\n  External-G re-QP-ization: iteration {} consumes the external Green's "
                "function {}/iter{} of {}.\n", init_it+1, gf_grp, gf_iter, filename);
     sG_ext.emplace(read_greens_function(*mpi, mf.get(), filename, gf_iter, gf_grp));
     FT.check_leakage(sG_ext.value(), imag_axes_ft::fermion, "external Green's function");
@@ -623,10 +622,10 @@ double qp_scf_loop(
       sHeff_skij.win().fence();
       mpi->comm.barrier();
     }
-    // Q6 §1.3: the lineshape meter is populated by qp_approx, i.e. by the qpscf MAP stage.
-    // Reset it here so an iteration that never reaches that stage (evscf mode, or no corr
-    // solver at all) reports the MISSING sentinel in the Q6 summary line below instead of a
-    // stale value left by an earlier loop in the same process.
+    // The lineshape meter is populated by qp_approx, i.e. by the qpscf MAP stage. Reset it
+    // here so an iteration that never reaches that stage (evscf mode, or no corr solver at
+    // all) reports the MISSING sentinel in the summary line below instead of a stale value
+    // left by an earlier loop in the same process.
     q6_lineshape() = q6_lineshape_t{};
     if (mb_solver.corr != nullptr) { // GW
       mb_solver.corr->iter() = it;
@@ -637,8 +636,8 @@ double qp_scf_loop(
         add_evscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params, qp_params.keep_scr_coulomb_fixed);
       } else {
         // add_qpscf_vcorr only updates sHeff_skij. MO_skia and E_ska are updated later.
-        // Q5: sG_ext is non-null in ITERATION 1 ONLY -- it is released right after, so
-        // iterations >= 2 fall back to the loop's own analytic QP G (spec §1).
+        // sG_ext is non-null in ITERATION 1 ONLY -- it is released right after, so
+        // iterations >= 2 fall back to the loop's own analytic QP G.
         add_qpscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params,
                         sG_ext? std::addressof(sG_ext.value()) : nullptr);
         sG_ext.reset();
@@ -674,15 +673,15 @@ double qp_scf_loop(
     app_log(1, "energy difference:                {} a.u.", e_diff);
     app_log(1, "abs max diff of QP Hamiltonian:    {} a.u.\n", Heff_conv);
 
-    // ---- Project 2 increment Q6 (notes/q6_diagnostics_closeout_spec.md §1.4(b)) --------
+    // ---- qpGW iteration summary --------
     // ONE consolidated summary line per qp iteration. Strictly a READ of meters that already
-    // exist: Heff_conv (this loop), qp_modea::last_run() (the mode-A inner loop + the rev-3
-    // strip census; -1/0 for every other map), q6_lineshape() (the Q6 map-stage meter, which
-    // qp_approx populates for EVERY map), and the scr_coulomb_t Q3 injection meters. Nothing
-    // here is computed.
+    // exist: Heff_conv (this loop), qp_modea::last_run() (the mode-A inner loop + the strip
+    // census; -1/0 for every other map), q6_lineshape() (the map-stage meter, which
+    // qp_approx populates for EVERY map), and the scr_coulomb_t ladder-injection meters.
+    // Nothing here is computed.
     // NOT AVAILABLE IN C++: the band-reordering count is a PYTHON-side meter
-    // (dmft/outer_loop.py::count_band_reorderings, Q5/R-Q5-2) and §1.4(b) forbids computing
-    // anything new, so it is reported as the -1 MISSING sentinel rather than duplicated.
+    // (dmft/outer_loop.py::count_band_reorderings); it is reported as the -1 MISSING
+    // sentinel rather than duplicated here.
     {
       auto const &LR = qp_modea::last_run();
       auto const &LS = q6_lineshape();
@@ -690,7 +689,7 @@ double qp_scf_loop(
       const double lam_max   = has_scr ? mb_solver.scr_eri->pol_lambda_max()   : -1.0;
       const double lad_ratio = has_scr ? mb_solver.scr_eri->pol_ladder_ratio() : -1.0;
       const double r_rt      = has_scr ? mb_solver.scr_eri->pol_round_trip()   : -1.0;
-      app_log(1, "[Q6] qpgw iteration summary  it = {}: dmax(H_eff) = {:.3e} a.u., "
+      app_log(1, "[qpGW summary] iteration {}: dmax(H_eff) = {:.3e} a.u., "
                  "dmax(map inner) = {:.3e}, inner-consist iters = {}, band-reorder = {} "
                  "(python-side meter), strip census in-strip/eta-far/clamped = {}/{}/{}, "
                  "wgrid_aud = {:.4g}/{:.4g} meV (worst q = {}, Re z = {:+.6g}), "

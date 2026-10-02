@@ -67,7 +67,7 @@ namespace {
   }
 
   /**
-   * Project 2 increment QM3: build the mode-A evaluator context, if and only if the map asks
+   * Build the mode-A evaluator context, if and only if the map asks
    * for it. MUST be called inside the live-W window of the caller (mb_state.dW_qtPQ alive).
    * `need_diag` also produces the replicated DIAGONAL residues, which the evGW leg needs
    * because solve_qp_eqn distributes (s,k,a) on a processor grid of its own.
@@ -95,7 +95,7 @@ namespace {
     opts.wrank = qp_params.qp_modea_wrank;
     opts.wsketch = qp_params.qp_modea_wsketch;
     opts.wunion = qp_params.qp_modea_wunion;
-    // TC-2 (notes/tc_coqui_impl_spec.md): the tilted-contour route's knob family.
+    // The tilted-contour route's knob family.
     opts.tc_eps = qp_params.qp_tc_eps;
     opts.tc_delta = qp_params.qp_tc_delta;
     opts.tc_rho = qp_params.qp_tc_rho;
@@ -127,7 +127,7 @@ namespace {
                  "\"spectral\", \"contour\".", opts.wfit);
 #ifndef ENABLE_FINUFFT
     utils::check(opts.wfit != "spectral",
-                 "qp_modea: qp_modea_wfit = \"spectral\" (the RW-2 spectral-quadrature W^c "
+                 "qp_modea: qp_modea_wfit = \"spectral\" (the spectral-quadrature W^c "
                  "representation) needs the real-axis W chain, which is only compiled with "
                  "-DENABLE_FINUFFT=ON. This binary was built without it. Rebuild with the "
                  "flag, or use qp_modea_wfit = \"tau\" / \"nu\".");
@@ -138,14 +138,14 @@ namespace {
                  "qp_modea: unknown qp_modea_spectral_gamma = {}. Valid: \"ls\", "
                  "\"spectral\".", opts.spectral_gamma);
     utils::check(opts.eta_far >= 0.0,
-                 "qp_modea: qp_modea_eta_far = {} must be >= 0 (0 = the rev-3.1 mu fallback).",
+                 "qp_modea: qp_modea_eta_far = {} must be >= 0 (0 = out-of-strip states at mu).",
                  opts.eta_far);
-    // TC-2: the tilted-contour knobs. Validated unconditionally so a typo is caught at
+    // The tilted-contour knobs. Validated unconditionally so a typo is caught at
     // parse time on every route, but they steer nothing unless wfit == "contour".
     utils::check(opts.tc_eps > 0.0 and opts.tc_eps < 1.0,
                  "qp_modea: qp_tc_eps = {} must be in (0, 1).", opts.tc_eps);
     utils::check(opts.tc_delta >= 0.0,
-                 "qp_modea: qp_tc_delta = {} must be >= 0 (0 selects the eq-8 recipe).",
+                 "qp_modea: qp_tc_delta = {} must be >= 0 (0 selects the default recipe).",
                  opts.tc_delta);
     utils::check(opts.tc_rho >= 0.0 and opts.tc_rho < 1.0,
                  "qp_modea: qp_tc_rho = {} must be in [0, 1).", opts.tc_rho);
@@ -170,7 +170,7 @@ namespace {
                  opts.wgrid_h);
     utils::check(opts.wgrid_audit >= 0,
                  "qp_modea: qp_tc_wgrid_audit = {} must be >= 0.", opts.wgrid_audit);
-    // TC-4: the explicit strip window. Both or neither -- a one-sided window silently
+    // The explicit strip window. Both or neither -- a one-sided window silently
     // paired with an E_PH bound is exactly the kind of mis-set that reads as physics.
     utils::check(opts.strip_lo >= 0.0 and opts.strip_hi >= 0.0,
                  "qp_modea: qp_modea_strip_lo = {} / qp_modea_strip_hi = {} are HALF-WIDTHS "
@@ -182,17 +182,17 @@ namespace {
                  "strip). A one-sided window is never intended.",
                  opts.strip_lo, opts.strip_hi);
 
-    app_log(2, "\n* {} quasiparticle map (Project 2 increment QM3): building the "
+    app_log(2, "\n* {} quasiparticle map: building the "
                "evaluator context", qp_params.qp_map);
     if (opts.eta_far > 0.0)
-      app_log(2, "  - FAR-STATE EVALUATION (spec rev 4): states outside (VBM - 0.95 E_PH, "
+      app_log(2, "  - FAR-STATE EVALUATION: states outside (VBM - 0.95 E_PH, "
                  "CBM + 0.95 E_PH) are evaluated at z = eps + i eta_far with eta_far = "
                  "{:.4e} a.u. ({:.4g} eV); in-strip states stay exact (eta = 0). Census and "
                  "the pole-spacing validity floor are logged below.",
               opts.eta_far, opts.eta_far * 27.211386245988);
     else if (qp_params.qp_map == "mode_a")
-      app_log(2, "  - evaluation energies are STRIP-CLAMPED TO mu (spec rev 3.1, addendum "
-                 "item 2): states inside (VBM - 0.95 E_PH, CBM + 0.95 E_PH) are exact mode A, "
+      app_log(2, "  - evaluation energies are STRIP-CLAMPED TO mu: "
+                 "states inside (VBM - 0.95 E_PH, CBM + 0.95 E_PH) are exact mode A, "
                  "states outside it are evaluated at mu; census logged below.");
     if (opts.route == "expansion") {
       // pure diagnostic: the whole map is solved from the route-A z0 = 0 re-expansion of the
@@ -223,14 +223,14 @@ namespace {
   }
 
   // ---------------------------------------------------------------------------------------
-  // Project 2 increment QM3: the mode-A driver (notes/qm3_mode_a_loop_spec.md sections 4/5/7)
+  // The mode-A driver.
   //
   // Runs, per external (s,k) block owned by this rank:
   //   (1) the inner QP-consistency loop at FIXED Sigma data -> the LAST V^xc;
-  //   (2) THE ANCHOR (gate QM3-b(ii)): route-B Sigma^c_ab at the first few FERMIONIC nodes
+  //   (2) THE ANCHOR: route-B Sigma^c_ab at the first few FERMIONIC nodes
   //       vs the gathered solver Sigma(i w_n). Pins prefactor, spin, q-star/trev rule, the
   //       MO rotation and the head in one number;
-  //   (3) the A/B cross-validation harness of spec section 5: delta_i = |Sigma^A_ii(eps_i) -
+  //   (3) the route-A / route-B cross-validation harness: delta_i = |Sigma^A_ii(eps_i) -
   //       Sigma^B_ii(eps_i)| against the A-side TRUNCATION CLASS |Sigma^A_(p+1) - Sigma^A_(p)|,
   //       plus one off-diagonal spot check.
   // Everything here is LOGGED; the only hard failure is a route/knob misuse.
@@ -269,7 +269,7 @@ namespace {
         mine.emplace_back(sk / nkpts, sk % nkpts);
     }
 
-    // the A-side window: order p and p+1 on the SAME node window (spec section 5)
+    // the A-side window: order p and p+1 on the SAME node window
     sigma_real_axis::fit_opts optA, optA1;
     optA.p = 2;
     optA1.p = 3;
@@ -285,9 +285,8 @@ namespace {
     double tau_dev_worst = 0.0;
     // WHERE the gate quantity is attained: the (s,k) block and the element of the probed set
     // that carries max|Sigma_B - Sigma^GW|. Reduced together with the value (see below) so
-    // the abort names its own element -- the kp444 false fire of 2026-08-13 was invisible
-    // precisely because the offending block was owned by a non-root rank and app_log is
-    // root-only, while the gate maxes over every rank's blocks.
+    // the abort names its own element: app_log is root-only while the gate maxes over every
+    // rank's blocks, so the offending block may be owned by a rank whose rows are not logged.
     long tau_dev_is = -1, tau_dev_ik = -1, tau_dev_a = -1, tau_dev_b = -1;
     // the per-isym anchor breakdown, kept for the gate message (see the TAU ISYM block)
     double isym_ratio_worst = 0.0;
@@ -295,10 +294,10 @@ namespace {
     long iters_worst = 0, n_noconv = 0, n_flag = 0, n_flag_in = 0;
     long n_fallback = 0, n_fallback_win = 0, n_sanity_trip = 0;
     long n_homo_fb = 0, n_lumo_fb = 0, n_blocks = 0;
-    // mode_a STRIP CLAMP census (spec rev 3 addendum item 2)
+    // mode_a STRIP CLAMP census
     long n_clamp = 0, n_clamp_win = 0, n_eval = 0, n_homo_cl = 0, n_lumo_cl = 0;
     double exc_lo_worst = 0.0, exc_hi_worst = 0.0;
-    // rev 4: the graded-eta far-state census
+    // the graded-eta far-state census
     long n_eta = 0, n_anti_in = 0;
     double im_off_worst = 0.0, anti_in_worst = 0.0, spacing_worst = 0.0;
     const qp_modea::strip_t strip = qp_modea::strip_of(*ctx);
@@ -322,15 +321,14 @@ namespace {
 
       // The RAW incoming QP spectrum. Everything DIAGNOSTIC below is read here: it is the
       // physical band structure of the current outer iteration, and it is what "gap window"
-      // means. The route-A start refinement is applied afterwards, to the inner loop's
-      // starting point only, so that a bad refinement cannot silently move the diagnostics.
+      // means. The inner loop also starts from it.
       for (long a = 0; a < nbnd; ++a) eps(a) = sE_ska.local()(is, ik, a).real();
 
       const sk_block *blk = nullptr;
       if (cd) blk = std::addressof(ctx->blocks[ctx->block_index(is, ik)]);
 
       // ------- the gap window: two occupied + two empty states straddling mu -----------
-      // Built from the INCOMING (route-A refined) spectrum, i.e. before the inner loop can
+      // Built from the INCOMING spectrum, i.e. before the inner loop can
       // move anything: it is the physically meaningful window, and it must not depend on the
       // outcome of the loop it is used to diagnose.
       std::vector<long> win;
@@ -344,7 +342,7 @@ namespace {
         std::sort(win.begin(), win.end());
       }
 
-      // ------- THE ANCHOR (gate QM3-b(ii)) ---------------------------------------------
+      // ------- THE ANCHOR -------------------------------------------------------------
       // Evaluated at FERMIONIC nodes, so it is independent of eps; only the window is not.
       if (cd) {
         double num = 0.0, den = 0.0;
@@ -365,14 +363,14 @@ namespace {
                      "class {:.4e})", is, ik, nanch, dev, den, ctx->diag.rec_rel_worst);
       }
 
-      // ------- the A/B harness AT THE INCOMING ENERGIES (spec section 5) ----------------
+      // ------- the route-A / route-B harness AT THE INCOMING ENERGIES -------------------
       // This is the near-gap real-axis accuracy of route B: close to mu the A-side
       // truncation class is tight, so delta_i there IS the B-side error scale. It must be
       // read BEFORE the inner loop, whose divergence would otherwise evaluate both sides at
       // meaningless energies.
       {
         // Both sides are read AT THE ACTUAL EVALUATION POINT of the map, i.e. at the strip
-        // evaluation point (rev 3 addendum item 2 / rev 4): comparing an out-of-strip A-side
+        // evaluation point: comparing an out-of-strip A-side
         // extrapolation against a B side evaluated at mu would compare two different
         // arguments. The A side can only be evaluated at REAL energies, so with eta_far > 0
         // it is read at Re z (the same eps_i) while the B side carries the i eta_far.
@@ -403,15 +401,13 @@ namespace {
         }
       }
 
-      // ---- THE CANCELLATION METER (RW-2, notes/rw_real_axis_w_spec.md gate RW-2-c(i)) ---
-      // Promoted from the throwaway M-0b probe patch (runs/edmft_q45/metal_mode/m0b/
-      // m0b_probe.patch) so the RW-2 acceptance number is measurable on a production binary.
+      // ---- THE CANCELLATION METER -----------------------------------------------------
       // Env-gated on QPGW_SABS_PROBE, so with the variable unset NOTHING changes -- no code
       // path, no output. Reports, per gap-window state and per evaluation offset eta:
       //   Sabs = sum_{J,p} |M_ii,Jp| |n_B(om_p) + f(eps_J)| / |z - (eps_J - om_p)|
       // against the actual |Sigma^c_ii(z)| from the SAME pole slab. Sabs/|Sigma| is the
-      // number of digits of cancellation the representation demands: the LS routes read
-      // 1e4-1e5 on the SVO metal, the spectral quadrature is expected O(1-10) because its
+      // number of digits of cancellation the representation demands: the LS routes can need
+      // several digits on a metal, the spectral quadrature is expected O(1-10) because its
       // numerators are sign-definite (wc_spectral.hpp section 5). The head sector is split
       // out because it is the one part of the spectral rep that is still a least-squares
       // object (poles p >= 2*nbin, i.e. |om_p| on the DLR auxiliary grid at q = Gamma).
@@ -428,7 +424,7 @@ namespace {
             nB_tot += std::abs(ctx->nB(p));
             if (std::abs(o) < om_cut) { ++nlow; nB_low += std::abs(ctx->nB(p)); }
           }
-          app_log(lvl, "  M0B WPOLES (s,k) = ({},{}): npk = {}, |om_p| in [{:.4e}, {:.4e}] a.u.; "
+          app_log(lvl, "  Sabs probe W poles (s,k) = ({},{}): npk = {}, |om_p| in [{:.4e}, {:.4e}] a.u.; "
                        "3 pi/beta = {:.4e} a.u.; {} poles below it carry sum|n_B| = {:.4e} of "
                        "{:.4e} ({:.2f} %)", is, ik, ctx->npk, om_min, om_max, om_cut, nlow,
                   nB_low, nB_tot, (nB_tot > 0.0 ? 100.0 * nB_low / nB_tot : 0.0));
@@ -459,7 +455,7 @@ namespace {
                 if (sgn >= 0.0) npos_num += std::abs(sgn); else nneg_num += std::abs(sgn);
               }
             }
-            app_log(lvl, "  M0B SIGMA  ({},{}): i = {:>3}  eps-mu = {:+9.4f} eV  eta = "
+            app_log(lvl, "  Sabs probe SIGMA  ({},{}): i = {:>3}  eps-mu = {:+9.4f} eV  eta = "
                          "{:.4e}  |Sigma_B| = {:.6e}  Sabs = {:.6e}  Sabs/|Sigma| = {:.4e}  "
                          "low-om share = {:6.2f} %  head share = {:6.2f} %  neg-numerator "
                          "share = {:6.2f} %  max term = {:.6e}  min|den| = {:.4e}  "
@@ -474,25 +470,21 @@ namespace {
         }
       }
 
-      // NOTE: the route-A z0 = 0 start refinement that the spec adopted as a default here
-      // has been DELETED -- see the reversal note in qp_modea.hpp. The inner loop starts
-      // unconditionally from the raw incoming sE_ska.
-      // ------- THE TAU-DOMAIN ORACLE (coordinator request 2026-08-12) ------------------
+      // The inner loop starts from the raw incoming sE_ska (see the note at the end of
+      // qp_modea.hpp on why the z0 = 0 start refinement is not used).
+      // ------- THE TAU-DOMAIN ORACLE ---------------------------------------------------
       // Same elements, two domains: tau (no transform on either side) vs the first fermionic
       // nodes (the anchor). Runs on EVERY block this rank owns; only the root rank's rows
       // reach the log (app_log), while the gate below maxes over all ranks -- which is why
-      // the gate quantity now carries its argmax (s,k,a,b) with it.
+      // the gate quantity carries its argmax (s,k,a,b) with it.
       //
-      // NORMALIZATION -- GATE-SEMANTICS CORRECTION, 2026-08-13 (spec-author ruling; see
-      // notes/qm3_mode_a_loop_spec.md rev 4 and "THE GATE'S NORMALIZATION" in
-      // wc_band_elements.hpp). The GATE quantity is normalized ONCE PER BLOCK, by the largest
-      // |Sigma^GW| of the probed set, exactly like the i w anchor it replaced (:270-283). The
-      // per-element ratios below are KEPT as log lines -- they are what identified the kp444
-      // false fire -- but they are diagnostics, not the gate: dividing each element by ITS OWN
-      // magnitude lets a symmetry-suppressed off-diagonal (kp444 block (0,0): the largest
-      // gap-window off-diagonal was 1860x below the diagonal) turn a uniform 5.6e-09 a.u.
-      // absolute deviation into a 6.6e-05 "relative" one, and the gate fired on the smallness
-      // of the element rather than on any error.
+      // NORMALIZATION (see "THE GATE'S NORMALIZATION" in wc_band_elements.hpp). The GATE
+      // quantity is normalized ONCE PER BLOCK, by the largest |Sigma^GW| of the probed set,
+      // exactly like the i w anchor above. The per-element ratios below are kept as log lines,
+      // but they are diagnostics, not the gate: dividing each element by ITS OWN magnitude
+      // lets a symmetry-suppressed off-diagonal (orders of magnitude below the diagonal) turn
+      // a uniform, tiny absolute deviation into a large "relative" one, and the gate would
+      // fire on the smallness of the element rather than on any error.
       if (cd) {
         nda::array<double, 1> tau_ph(FT.nt_f());
         {
@@ -558,19 +550,15 @@ namespace {
           tau_dev_is = is; tau_dev_ik = ik;
           tau_dev_a = worst_ab.first; tau_dev_b = worst_ab.second;
         }
-        // ---- THE PER-ISYM BREAKDOWN (permanent, level 2; the kp444 post-mortem) ---------
+        // ---- THE PER-ISYM BREAKDOWN (level 2) -------------------------------------------
         // The route-B side of the element with the largest ABSOLUTE deviation, split over the
         // symmetry classes of the star loop (ctx->q_isym; the classes partition the full
         // transfer mesh, so the rows sum back to the total -- printed as the bookkeeping
-        // check), against that same absolute deviation. Under the block normalization adopted
-        // on 2026-08-13 that element IS the one that sets the gate (numerator and gate share
-        // the same max), so the breakdown and the gate now describe the same thing -- they did
-        // NOT before: the census picked the largest absolute deviation while the gate maxed
-        // per-element ratios, so at kp444 the census described the diagonal (3,3) while the
-        // gate fired on the suppressed off-diagonal (2,5). The reference cannot be split (the
-        // solver sums the isym loop
-        // internally), so there is no per-class deviation; what discriminates is each class's
-        // own MAGNITUDE:
+        // check), against that same absolute deviation. Under the block normalization that
+        // element IS the one that sets the gate (numerator and gate share the same max), so
+        // the breakdown and the gate describe the same thing. The reference cannot be split
+        // (the solver sums the isym loop internally), so there is no per-class deviation;
+        // what discriminates is each class's own MAGNITUDE:
         //   share       = max_tau |Sigma_B^(isym)| / max_tau |Sigma^GW|
         //   dev/|class| = how wrong THAT CLASS ALONE would have to be, relatively, to carry
         //                 the entire deviation.
@@ -620,7 +608,7 @@ namespace {
       }
 
       if (mode_b) {
-        // ---- MODE B (spec rev 2, the user ruling): no inner-consistency loop ----
+        // ---- MODE B: no inner-consistency loop ----
         auto br = modeb_vxc(*ctx, *blk, eps, win, V);
         sVcorr_skij.local()(is, ik, all, all) = V;
         n_fallback += br.n_fallback;
@@ -672,7 +660,7 @@ namespace {
       anti_worst = std::max(anti_worst, cr.anti_herm);
       if (not cr.converged) ++n_noconv;
 
-      // ------- THE STRIP CLAMP CENSUS (spec rev 3 addendum item 2) ---------------------
+      // ------- THE STRIP CLAMP CENSUS -------------------------------------------------
       // Read off the LAST inner sweep, i.e. the map actually returned to the caller.
       if (cd) {
         n_clamp += cc.n_clamp;
@@ -750,7 +738,7 @@ namespace {
     class_in_worst = comm.all_reduce_value(class_in_worst, boost::mpi3::max<>{});
     n_flag_in = comm.all_reduce_value(n_flag_in, std::plus<>{});
 
-    // rev 4: the far-state census travels with the anti-Hermitian rescope below.
+    // The far-state census travels with the anti-Hermitian rescope below.
     n_eta = comm.all_reduce_value(n_eta, std::plus<>{});
     im_off_worst = comm.all_reduce_value(im_off_worst, boost::mpi3::max<>{});
     spacing_worst = comm.all_reduce_value(spacing_worst, boost::mpi3::max<>{});
@@ -771,12 +759,12 @@ namespace {
             iters_worst, ctx->opts.nconsist, dmax_worst, min_den_worst);
     app_log(lvl, "  - anti-Hermitian residual:    max|V - V^dag|/max|V| = {:.3e} over {} "
                  "(expected at the W-fit class {:.3e}; O(1) would be a routing error)",
-            anti_gate, anti_rescoped ? "the IN-STRIP elements (rev 4 rescope; the full-matrix "
+            anti_gate, anti_rescoped ? "the IN-STRIP elements (rescoped; the full-matrix "
                                        "value below is dominated by the eta-broadened far "
                                        "states and is NOT an error)" : "all elements",
             ctx->diag.rec_rel_worst);
     if (eta_far > 0.0)
-      app_log(lvl, "  - rev-4 far-state physics:    {} out-of-strip evaluations at eps + i "
+      app_log(lvl, "  - far-state physics:          {} out-of-strip evaluations at eps + i "
                    "eta_far ({:.4e} a.u. = {:.4g} eV); max|Im Sigma^c| there = {:.4e} a.u. "
                    "({:.4g} eV) [= eta x the smoothed spectral density, a DIAGNOSTIC]; "
                    "full-matrix anti-Hermitian residual = {:.3e}; worst local fitted-pole "
@@ -792,8 +780,7 @@ namespace {
                   "evaluation points. Sigma^c(eps + i eta_far) is then dominated by individual "
                   "poles of the FIT rather than by the eta-smoothed spectral density, i.e. the "
                   "far-state values are representation artefacts. Raise eta_far above {:.4e} "
-                  "a.u. ({:.4g} eV) or sharpen the W^c fit. See notes/qm3_mode_a_loop_spec.md "
-                  "rev 4 (validity floor).",
+                  "a.u. ({:.4g} eV) or sharpen the W^c fit.",
                   map_name, eta_far, qp_modea::modea_eta_far_mult, spacing_worst,
                   qp_modea::modea_eta_far_mult * spacing_worst,
                   qp_modea::modea_eta_far_mult * spacing_worst * HA2EV);
@@ -806,7 +793,7 @@ namespace {
                    "TAU anchor above.", anchor_worst, anchor_expect);
     {   // MAXLOC: reduce the gate quantity together with WHERE it was attained. Only the
         // root rank's oracle rows reach the log, so without this the offending block of a
-        // multi-rank run is unnameable -- the 2026-08-13 kp444 post-mortem.
+        // multi-rank run is unnameable.
       const double local = tau_dev_worst;
       tau_dev_worst = comm.all_reduce_value(tau_dev_worst, boost::mpi3::max<>{});
       if (local < tau_dev_worst) { tau_dev_is = tau_dev_ik = tau_dev_a = tau_dev_b = -1; }
@@ -823,8 +810,7 @@ namespace {
                  "the solver's Sigma^c(tau) (no transform on either side) = {:.4e}, attained "
                  "on block (s,k) = ({},{}) at element ({},{}); the same elements at the first "
                  "fermionic nodes deviate by {:.4e} (the anchor). [Both are normalized by the "
-                 "largest |Sigma^GW| of the probed set -- gate-semantics correction of "
-                 "2026-08-13, see wc_band_elements.hpp.]",
+                 "largest |Sigma^GW| of the probed set, see wc_band_elements.hpp.]",
             tau_dev_worst, tau_dev_is, tau_dev_ik, tau_dev_a, tau_dev_b, anchor_worst);
     app_log(lvl, "  - A/B harness [IN, gap window]: max delta_i = {:.4e} a.u. ({:.4g} meV), "
                  "max class_i = {:.4e} a.u. ({:.4g} meV), worst ratio = {:.3g} ({} states "
@@ -834,7 +820,7 @@ namespace {
     app_log(lvl, "  - A/B harness [OUT]:          worst delta_i/class_i over gap-window "
                  "states = {:.3g} ({} states above 10x); off-diagonal spot check rel dev = "
                  "{:.3e}", ratio_worst, n_flag, dev_off_worst);
-    // ONE machine-greppable line per outer iteration: the knob-matrix harness scrapes this.
+    // ONE machine-greppable line per outer iteration, for scripted parameter scans.
     app_log(1, "@@MODEA_CELL wfit={} wrtol={:.1e} eta={:.4e} | ratio={:.4e} rec={:.4e} "
                "gapedge={:.6g} npk={} | dmax={:.4e} iters={} minden={:.4e} anchor={:.4e} "
                "antiherm={:.4e} taudev={:.4e} | dIN={:.4e} clIN={:.4e} rIN={:.4e} | "
@@ -855,11 +841,11 @@ namespace {
             ctx->diag.sp_headrec, ctx->diag.sp_wall);
     if (n_noconv > 0)
       app_warning("qp_approx (mode_a): the inner QP-consistency loop hit the cap ({}) on {} "
-                  "(s,k) blocks with max|d eps| = {:.3e}. This is the physical "
-                  "multi-solution flag of the spec, not an error.",
+                  "(s,k) blocks with max|d eps| = {:.3e}. This flags physical "
+                  "multiple quasiparticle solutions, not an error.",
                   ctx->opts.nconsist, n_noconv, dmax_worst);
 
-    // ---- THE STRIP CLAMP CENSUS, summary (spec rev 3 addendum item 2) ----
+    // ---- THE STRIP CLAMP CENSUS, summary ----
     // n_blocks is shared with the mode_b census below and is reduced HERE, once.
     n_blocks = comm.all_reduce_value(n_blocks, std::plus<>{});
     n_clamp = comm.all_reduce_value(n_clamp, std::plus<>{});
@@ -881,7 +867,7 @@ namespace {
               ctx->vbm, ctx->cbm, ctx->diag.gap_edge,
               strip.active ? "ACTIVE" : "INACTIVE (no support constraint this iteration)");
       if (swin)
-        app_log(lvl, "  - mode_a STRIP WINDOW (TC-4): EXPLICIT: strip_lo = {:.6f} a.u. "
+        app_log(lvl, "  - mode_a STRIP WINDOW:        EXPLICIT: strip_lo = {:.6f} a.u. "
                      "({:.4f} eV) below mu, strip_hi = {:.6f} a.u. ({:.4f} eV) above mu. The "
                      "E_PH strip it REPLACES would have been ({:+.6f}, {:+.6f}) a.u. -- "
                      "{:.4f} eV wide against {:.4f} eV now. gap_edge and the W^c support "
@@ -896,7 +882,7 @@ namespace {
       app_log(lvl, "  - mode_a strip census:        IN-STRIP {} / eta-far {} / CLAMPED {} of "
                    "{} evaluation energies; out of strip {} "
                    "({} in the gap window; {} evaluated at eps + i eta_far, {} clamped to mu) "
-                   "over {} (s,k) blocks; THE JUDGE STATES: per-k HOMO out of strip in {} of "
+                   "over {} (s,k) blocks; BAND-EDGE STATES: per-k HOMO out of strip in {} of "
                    "{} blocks, LUMO in {} of {}; worst excursion {:.4f} a.u. below / {:.4f} "
                    "a.u. above",
               n_eval - n_clamp, n_eta, n_clamp - n_eta, n_eval,
@@ -906,7 +892,7 @@ namespace {
         app_warning("qp_approx (mode_a): {} GAP-WINDOW evaluation energies were OUT OF STRIP "
                     "(evaluated at {}). Near mu the particle-hole edge should guarantee a "
                     "clearance of E_PH = {:.4g} a.u., so this means the QP spectrum has moved "
-                    "a band-edge state outside the analyticity strip -- the judge states are "
+                    "a band-edge state outside the analyticity strip -- the band-edge states are "
                     "then NOT exact mode A. Check the gap and the inner-consistency numbers "
                     "above.", n_clamp_win,
                     eta_far > 0.0 ? "eps + i eta_far" : "mu", ctx->diag.gap_edge);
@@ -923,7 +909,7 @@ namespace {
     LR.converged_inner = (n_noconv == 0);
     LR.anchor_expect = anchor_expect;
     LR.ratio_worst = ratio_worst;
-    LR.anti_herm = anti_gate;      // rev 4: IN-STRIP only once eta_far > 0 (see above)
+    LR.anti_herm = anti_gate;      // IN-STRIP only once eta_far > 0 (see above)
     LR.eta_far = eta_far;
     LR.n_eta = n_eta;
     LR.im_off = im_off_worst;
@@ -949,7 +935,7 @@ namespace {
                    "{:.6f}", ctx->vbm - 0.95 * ctx->diag.gap_edge,
               ctx->cbm + 0.95 * ctx->diag.gap_edge, ctx->vbm, ctx->cbm, ctx->diag.gap_edge);
       app_log(lvl, "  - mode_b out-of-strip diag:   {} states ({} in the gap window; {} "
-                   "evaluated at eps + i eta_far, {} demoted to z = mu); THE JUDGE STATES: "
+                   "evaluated at eps + i eta_far, {} demoted to z = mu); BAND-EDGE STATES: "
                    "per-k HOMO out of strip in {} of {} blocks, LUMO in {} of {}",
               n_fallback, n_fallback_win, n_eta, n_fallback - n_eta, n_homo_fb, n_blocks,
               n_lumo_fb, n_blocks);
@@ -963,16 +949,15 @@ namespace {
                     n_fallback_win, min_den_worst);
     }
 
-    // THE GATE (spec rev 2): the TAU-DOMAIN anchor. The tau image of the route-B pole rep is
-    // compared against the solver's Sigma^c(tau) with NO transform on either side, so it
-    // isolates the contraction from the reference's tau -> i w aliasing. Measured 2026-08-12:
-    // tau agreement 5.6e-05 at DLR prec "low" (per-element normalization, retired 2026-08-13
-    // -- the block-normalized number is smaller), two orders below that grid's W-fit class,
-    // while the i w deviation was 2.3e-01 on the SAME elements and halved with every prec
-    // notch. The i w comparison is therefore a LOGGED DIAGNOSTIC ONLY -- never a gate.
+    // THE GATE: the TAU-DOMAIN anchor. The tau image of the route-B pole rep is compared
+    // against the solver's Sigma^c(tau) with NO transform on either side, so it isolates the
+    // contraction from the reference's tau -> i w aliasing. The tau agreement sits well below
+    // the W-fit class, while the i w deviation on the SAME elements is dominated by the
+    // reference's transform and shrinks with every DLR precision step. The i w comparison is
+    // therefore a LOGGED DIAGNOSTIC ONLY -- never a gate.
     //
-    // NORMALIZED PER BLOCK since 2026-08-13 (spec-author ruling, rev 4 note): one denominator
-    // for the probed set, exactly as the i w anchor at :270-283. See the oracle above.
+    // NORMALIZED PER BLOCK: one denominator for the probed set, exactly as the i w anchor.
+    // See the oracle above.
     if (cd) {
       utils::check(tau_dev_worst < qp_modea::modea_tau_anchor_mult * ctx->diag.rec_rel_worst,
                    "qp_approx ({}): THE TAU ANCHOR FAILED -- the analytic tau image of the "
@@ -990,19 +975,16 @@ namespace {
                    "class {}. A structurally wrong symmetry class is wrong by O(1), so a "
                    "value << 1 for EVERY class rules the symmetry path out -- and the "
                    "contraction is identical to the GW assembly term by term for any D, see "
-                   "\"THE SYMMETRY PATH\" in wc_band_elements.hpp (measured: the lih223 "
-                   "ladder, 6e-09 absolute).\n"
-                   "  * the head: gated since 2026-08-13 by test_qp_map_ab "
-                   "\"qp_map_modeb_head_anchor\" (agrees with Sigma_div_correction to 8e-09).\n"
+                   "\"THE SYMMETRY PATH\" in wc_band_elements.hpp.\n"
+                   "  * the head: checked by the unit test "
+                   "\"qp_map_modeb_head_anchor\" against Sigma_div_correction.\n"
                    "  * the W representation: its own ERROR BUDGET sum_q |dW_q| / sum_q "
                    "max|W_q| = {:.3e} is the anchor scale it predicts on its own -- compare "
                    "it with the {:.4e} above BEFORE reading this as a routing error. Backing "
                    "numbers: tau-domain fit residual {:.3e}, worst slab truncation {:.3e} "
                    "(Frobenius {:.3e}), union projection tail {:.3e}. The gate's yardstick is "
                    "the per-q RELATIVE bosonic-mesh class, which is a different object from "
-                   "the budget.\n"
-                   "See notes/qm3_mode_a_loop_spec.md rev 2 (and its rev-4 note on the "
-                   "2026-08-13 block-normalization correction).",
+                   "the budget.",
                    map_name, tau_dev_worst, tau_dev_is, tau_dev_ik, tau_dev_a, tau_dev_b,
                    qp_modea::modea_tau_anchor_mult,
                    ctx->diag.rec_rel_worst, isym_ratio_worst, isym_class_worst,
@@ -1020,7 +1002,7 @@ namespace {
                    "consistency numbers (this iteration: worst count {}, max|d eps| = {:.3e} "
                    "a.u., min_den = {:.4e} a.u.).\nOtherwise this is a CONTRACTION ROUTING "
                    "error (prefactor, spin, q-star/trev rule, MO rotation, or the Gamma head), "
-                   "not a tolerance to loosen. See notes/qm3_mode_a_loop_spec.md section 7(ii).",
+                   "not a tolerance to loosen.",
                    anchor_worst, qp_modea::modea_anchor_gate, anchor_expect, iters_worst,
                    dmax_worst, min_den_worst);
   }
@@ -1268,8 +1250,7 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
 
     if (qp_params.qp_map != "ac_pade") {
 
-    // Project 2 increment Q2 (notes/qpgw_edmft_implementation_plan.md): the
-    // Matsubara-native quasiparticle maps (qp_maps_matsubara.hpp), scalar form
+    // The Matsubara-native quasiparticle maps (qp_maps_matsubara.hpp), scalar form
     // -- the qp_type solvers belong to the AC route only.
     auto [wp, widx] = positive_wn_nodes(iw_mesh);
     const long npos = wp.shape(0);
@@ -1283,7 +1264,7 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
     app_log(2, "  - positive fermionic nodes:                   {} (w0 = {:.6f}, w1 = {:.6f})", npos, wp(0), wp(1));
     if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") {
 
-    // ---- Project 2 increment QM3: the evGW diagonal leg (spec section 4) ----
+    // ---- mode A / mode B: the evGW diagonal leg ----
     // The QP equation E = Vhf + Sigma_ii(E) is solved by the EXISTING generic helpers; only
     // the sampler changes. The functor bridges to the route-B closed form on the cached
     // DIAGONAL residues (z = (w - mu) + mu is ABSOLUTE, the sigma_route_b mu rider).
@@ -1301,17 +1282,16 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
                  "function, which route B does not produce).", qp_params.qp_type);
     app_log(2, "  - route-B (CD) diagonal sampler:              nJ x npk = {} poles, "
                "eta = {:.3g}", modea_ctx->nJ * modea_ctx->npk, modea_ctx->eta);
-    // GUARD, spec rev 3 addendum item 4 (measured, 2026-08-12). This leg is reached only by
-    // evGW (qp_mode = "evscf"); the qsGW leg goes through modea_run.
-    app_warning("solve_qp_eqn (qp_map = {}): THE evGW LEG IS KNOWN-INCOMPLETE AND "
-                "PATHOLOGICALLY SLOW -- measured >75 min per outer iteration on qe_lih222 "
-                "against ~7 s for the qsGW (qpscf) leg of the same fixture, __divdc3-bound: "
+    // GUARD. This leg is reached only by evGW (qp_scf_mode = "evscf"); the qsGW leg goes
+    // through modea_run.
+    app_warning("solve_qp_eqn (qp_map = {}): THE evGW LEG IS INCOMPLETE AND VERY SLOW -- "
                 "the route-B diagonal sampler rebuilds the full nJ x npk = {} pole-weight "
-                "vector at EVERY secant/bisection step of EVERY (s,k,a). It is neither "
-                "optimized nor gated in this increment -- the live QM3 gates cover the qpscf "
-                "leg only (the evscf fixture cases are hidden behind [.modeb_evscf]). Results "
-                "from this path are diagnostic, not deliverable. See "
-                "notes/qm3_mode_a_loop_spec.md rev 3 addendum item 4.",
+                "vector at EVERY secant/bisection step of EVERY (s,k,a), so an outer "
+                "iteration can take orders of magnitude longer than on the qsGW "
+                "(qp_scf_mode = \"qpscf\") leg. It is neither optimized nor covered by "
+                "the regression tests (the evscf test cases are hidden behind "
+                "[.modeb_evscf]). Results from this path are diagnostic only; use "
+                "qp_scf_mode = \"qpscf\" for production.",
                 qp_params.qp_map, modea_ctx->nJ * modea_ctx->npk);
 
     struct modea_diag_sampler {
@@ -1405,27 +1385,23 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
     app_log(2, "  - tolerance for quasi-particle equation:      {}\n", qp_params.tol);
     AC.init(iw_mesh, Sigma_loc_2D, qp_params.Nfit);
 
-    // ---------------- T-3b threaded regions 2-3 of 4 ----------------
-    // notes/coqui_threading_t3a.md section 2.3 ROW 6 / section 3.1: the four per-state
-    // root-finding loops. Not on the A-leg hot path (the `gw` + qp_type=sc* run modes reach
-    // them), but they are the same code family as the qp_approx map region and R-T3-1 item 1
-    // puts them in scope.
+    // ---------------- OpenMP-threaded per-state root finding ----------------
+    // The four per-state root-finding loops (reached by the qp_type = sc* run modes), threaded
+    // like the per-state map evaluation in qp_approx.
     //
-    // SAFETY INVENTORY (spec section 7.2 item 2, hazards from t3a section 4.4):
+    // THREAD SAFETY:
     //   * the bodies make no MPI call -- E_loc_1D is rank-local and every I writes one
     //     distinct element; the all_reduce/barrier tail sits after the dispatch;
-    //   * `AC` is shared and read-only: AC_t/pade_driver/pade_t::evaluate are all `const`
-    //     as of this increment, and AC.init ran above the loops;
-    //   * the shared `res`/`conv` scratch declared OUTSIDE each loop is now declared inside
-    //     the body (they were never read after the loop);
-    //   * app_warning moved OUT: non-convergent states are collected and logged after the
-    //     loop, sorted by I so the message order is thread-count independent.
+    //   * `AC` is shared and read-only: AC_t/pade_driver/pade_t::evaluate are all `const`,
+    //     and AC.init ran above the loops;
+    //   * the `res`/`conv` scratch is declared inside the body;
+    //   * no logging inside the region: non-convergent states are collected and logged after
+    //     the loop, sorted by I so the message order is thread-count independent.
     //
-    // THE ONE VERBOSITY CAVEAT: qp_eqn_bisection logs its iterations with app_log(6, ...)
-    // from inside its own while loops (qp_solvers.hpp:159/168/177/185/194). Logging from a
-    // worker thread is forbidden by spec section 7.2 item 2, and at verbosity >= 6 those
-    // lines are the point of the run -- so the regions fall back to the serial path there
-    // instead of dropping or interleaving them.
+    // VERBOSITY CAVEAT: qp_eqn_bisection logs its iterations with app_log(6, ...) from
+    // inside its own while loops (qp_solvers.hpp). Worker threads must not log, and at
+    // verbosity >= 6 those lines are the point of the run -- so the regions fall back to the
+    // serial path there instead of dropping or interleaving them.
     auto qp_nthr = [&](long niter) -> long {
       return (__app_output_level__ >= 6) ? 1l : utils::omp_threads_for(niter);
     };
@@ -1554,7 +1530,7 @@ void add_evscf_vcorr(MBState &mb_state,
     mpi->comm.barrier();
   }
 
-  // Project 2 increment QM3: the mode-A context must be built while dW is still alive
+  // The mode-A context must be built while dW is still alive
   // (it is freed just below when keep_scr_coulomb_fixed is off). evGW needs the DIAGONAL
   // residues replicated -- solve_qp_eqn distributes (s,k,a) on its own processor grid.
   qp_modea::modea_ctx modea_ctx;
@@ -1638,7 +1614,7 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   auto b_rng = dSigma_wskab.local_range(4);
   auto [nw_loc, ns_loc, nk_loc, na_loc, nb_loc] = dSigma_wskab.local_shape();
 
-  // Project 2 increment QM3: the tau-domain ORACLE for the anchor discrepancy needs the
+  // The mode-A tau-domain ORACLE for the anchor discrepancy needs the
   // MO-basis Sigma^c(tau) BEFORE tau_to_w, i.e. the reference as the solver actually built
   // it, with no fermionic transform applied. Only allocated for mode_a.
   std::optional<sArray_t<Array_view_5D_t>> sSigma_tskab_shm;
@@ -1701,7 +1677,7 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   auto n_to_iw = nda::map([&](int n) { return FT.omega(n); });
   nda::array<ComplexType, 1> iw_mesh(n_to_iw(FT.wn_mesh()));
 
-  // ---- Project 2 increment Q6 (notes/q6_diagnostics_closeout_spec.md §1.3), part 1 ----
+  // ---- lineshape meter (see q6_lineshape_t in scf_common.hpp), part 1 ----
   // THE LINESHAPE METER, input half: the MO-basis DIAGONAL Sigma^c_aa at the first and the
   // highest positive fermionic node. Gathered HERE because this is the only point at which
   // dSigma_wskab is alive for EVERY map -- the Matsubara branch below resets it, and the
@@ -1748,8 +1724,7 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
 
   if (qp_params.qp_map != "ac_pade") {
 
-  // Project 2 increment Q2 (notes/qpgw_edmft_implementation_plan.md): the
-  // Matsubara-native maps (qp_maps_matsubara.hpp) act on whole (a,b) blocks per
+  // The Matsubara-native maps (qp_maps_matsubara.hpp) act on whole (a,b) blocks per
   // (s,k), so gather the MO-basis Sigma(iw) tiles into a shared array (disjoint
   // writes + zeros-elsewhere all_reduce) and round-robin the blocks over ranks.
   utils::check(qp_params.qp_map == "mats_lin" or sHstat_skij != nullptr,
@@ -1785,34 +1760,34 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
             qp_params.qp_modea_wrank, qp_params.qp_modea_wsketch,
             qp_params.qp_modea_wunion);
   if (qp_params.qp_modea_wfit == "contour")
-    app_log(2, "  - contour knobs (TC-2):   qp_tc_eps = {:.1e}, qp_tc_delta = {:.4g} a.u. "
+    app_log(2, "  - contour knobs:          qp_tc_eps = {:.1e}, qp_tc_delta = {:.4g} a.u. "
                "({}), qp_tc_rho = {:.3g}, qp_tc_profile = {}, qp_tc_trunc = {}",
             qp_params.qp_tc_eps, qp_params.qp_tc_delta,
             qp_params.qp_tc_delta > 0.0 ? "explicit"
-                                        : "0 = the eq-8 recipe, 1.2 W_band/N_k floor",
+                                        : "0 = the default recipe, 1.2 W_band/N_k floor",
             qp_params.qp_tc_rho, qp_params.qp_tc_profile,
             qp_params.qp_tc_trunc ? "on" : "off");
   if (qp_params.qp_modea_wfit == "contour")
-    app_log(2, "  - contour solver (TC-3):  line solver = {} (tol {:.1e}), band-factor "
+    app_log(2, "  - contour solver:         line solver = {} (tol {:.1e}), band-factor "
                "store cap = {:.2f} GB",
             qp_params.qp_tc_krylov ? "warm-started GMRES" : "dense",
             qp_params.qp_tc_krylov_tol, qp_params.qp_tc_bstore_gb);
   if (qp_params.qp_modea_wfit == "contour")
-    app_log(2, "  - W^c grid (TC-5):        qp_tc_wgrid_mev = {:.4g} meV{}, audit = {} "
+    app_log(2, "  - W^c grid:               qp_tc_wgrid_mev = {:.4g} meV{}, audit = {} "
                "samples/q (hard abort {}); the knob is the ACCURACY TARGET -- h is derived "
-               "from the measured law dSigma = K (h/delta)^2.81 / delta",
+               "from the empirical law dSigma = K (h/delta)^2.81 / delta",
             qp_params.qp_tc_wgrid_mev,
             qp_params.qp_tc_wgrid_mev <= 0.0 ? " (CACHE OFF: per-target Dyson)"
               : (qp_params.qp_tc_wgrid_h > 0.0 ? " (EXPERT h override)" : ""),
             qp_params.qp_tc_wgrid_audit,
             qp_params.qp_tc_wgrid_audit_hard ? "ON" : "off");
   if (qp_params.qp_modea_wfit == "contour")
-    app_log(2, "  - contour evaluator (TC-4): band factors = {}, residue batch budget = "
+    app_log(2, "  - contour evaluator:      band factors = {}, residue batch budget = "
                "{:.0f} MB (the evaluator's persistent work space; it sets how many "
                "residue targets one batched call carries)",
             qp_params.qp_tc_bfactor, qp_params.qp_tc_batch_mb);
   if (qp_params.qp_modea_wfit == "spectral")
-    app_log(2, "  - spectral knobs (RW-2):  spectral_eta = {:.4g} a.u. ({:.4g} eV), "
+    app_log(2, "  - spectral knobs:         spectral_eta = {:.4g} a.u. ({:.4g} eV), "
                "spectral_npole = {} positive-Omega nodes after coarsening, spectral_gamma = {}",
             qp_params.qp_modea_spectral_eta,
             qp_params.qp_modea_spectral_eta * 27.211386245988,
@@ -1821,8 +1796,8 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   sVcorr_skij.win().fence();
   if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") {
 
-  // ---- Project 2 increment QM3 (notes/qm3_mode_a_loop_spec.md): the MODE-A map ----
-  // V^xc_ab = 1/2 [ Sigma^c_ab(eps_a) + Sigma^c_ab(eps_b) ] with Sigma^c from the QM2
+  // ---- the MODE-A map ----
+  // V^xc_ab = 1/2 [ Sigma^c_ab(eps_a) + Sigma^c_ab(eps_b) ] with Sigma^c from the
   // contour-deformation kernel, driven to inner QP consistency at FIXED Sigma data. The
   // Hermitize + MO -> primary tail below is the existing one, unchanged.
   modea_run(sVcorr_skij, sSigma_wskab, sSigma_tskab_shm.value(), sMO_skia, sE_ska,
@@ -1851,7 +1826,7 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
       nda::blas::gemm(ComplexType(1.0), sHstat_skij->local()(is, ik, nda::ellipsis{}), MO,
                       ComplexType(0.0), tmp);
       nda::blas::gemm(ComplexType(1.0), nda::dagger(MO), tmp, ComplexType(0.0), Hstat_ab);
-      // the target G^GW on the positive nodes (spec principle 2: Sigma^GW only)
+      // the target G^GW on the positive nodes (built from Sigma^GW only)
       for (long m = 0; m < npos; ++m) {
         auto Sw = sSigma_wskab.local()(widx[m], is, ik, all, all);
         for (long i = 0; i < nbnd; ++i)
@@ -1892,29 +1867,22 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   auto Sigma_loc_2D = nda::reshape(dSigma_wskab.local(), std::array<long, 2>{nw, dim1});
   AC.init(iw_mesh, Sigma_loc_2D, qp_params.Nfit);
 
-  // ---------------- T-3b threaded region 4 of 4 ----------------
-  // notes/coqui_threading_t3a.md section 2.3 ROW 2 / section 3.1: the per-state map
-  // evaluation, 14% of the QP-map phase (+1.9 s at 24r x 4t, +4.3 s at 12r x 8t).
-  //
-  // SAFETY INVENTORY (spec section 7.2 item 2, hazards from t3a section 4.3):
-  //   * ⚠ CORRECTION TO t3a section 4.3, found by measurement during T-3b. That note said
-  //     "the body itself makes no MPI call -- the writes are plain stores". THE WRITES are,
-  //     but `shared_array::local()` is NOT: it is
+  // ---------------- OpenMP-threaded per-state map evaluation ----------------
+  // THREAD SAFETY:
+  //   * `shared_array::local()` is NOT a plain accessor: it is
   //         Array_view_t(_shape, _win->base(0))
   //     and mpi3::shared_window::base() -> query() -> **MPI_Win_shared_query**
-  //     (numerics/shared_array/nda.hpp:194, extern/mpi_wrapper/mpi3/shared_window.hpp:47-57).
-  //     The original loop called sE_ska.local() twice and sVcorr_skij.local() once PER
-  //     ITERATION, so threading it as written put three MPI calls per state on worker threads
-  //     at MPI_THREAD_SINGLE -- undefined behaviour, and a spec section 7.2 item 2 violation.
-  //     Both views are therefore hoisted to locals BEFORE the region; the body now touches
-  //     nothing but the window's memory. (It is also strictly less work per state.)
-  //   * the loop sits BETWEEN the two win().fence() calls, and I_to_skab (:1511-1519) maps
-  //     every I to a distinct (s,k,a,b), so the stores are disjoint element stores;
+  //     (numerics/shared_array/nda.hpp, extern/mpi_wrapper/mpi3/shared_window.hpp).
+  //     Calling it inside the region would put MPI calls on worker threads at
+  //     MPI_THREAD_SINGLE -- undefined behaviour. Both views are therefore hoisted to locals
+  //     BEFORE the region; the body touches nothing but the window's memory.
+  //   * the loop sits BETWEEN the two win().fence() calls, and I_to_skab maps every I to a
+  //     distinct (s,k,a,b), so the stores are disjoint element stores;
   //   * no HDF5, no logging;
   //   * `AC` is shared and read-only (AC_t/pade_driver/pade_t::evaluate are `const`);
-  //   * the off_diag_mode string dispatch and its utils::check(false, ...) else-branch used
-  //     to be INSIDE the body -- hoisted out, because an abort raised from a worker thread
-  //     is a bad failure mode (and it removes a per-I string compare).
+  //   * the off_diag_mode string dispatch and its error check are hoisted out of the body,
+  //     because an abort raised from a worker thread is a bad failure mode (and it removes a
+  //     per-I string compare).
   //
   // DETERMINISM: iterations are independent, nothing is reassociated.
   utils::check(qp_params.off_diag_mode == "qp_energy" or qp_params.off_diag_mode == "fermi",
@@ -1945,7 +1913,7 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
 
   } // qp_map dispatch
 
-  // ---- Project 2 increment Q6 (spec §1.3), part 2: THE LINESHAPE METER, output half ----
+  // ---- lineshape meter, part 2: output half ----
   // sVcorr_skij still holds V^xc in the MO BASIS here (the Hermitize + MO -> primary tail is
   // below), i.e. the map's own output measured against the map's own input -- which is what
   // "what the static map discards" means. Reading it AFTER the Hermitization would only drop
@@ -1957,7 +1925,7 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
     LS.w0 = q6_w0;
     LS.wtop = q6_wtop;
     if (q6_w0 > 0.0) {
-      // eps_floor: the denominator guard of spec §1.3. At 1e-12 a.u. it sits ~10 orders below
+      // eps_floor: the denominator guard. At 1e-12 a.u. it sits ~10 orders below
       // any Sigma^c this map is applied to, so it fires only on an exact zero.
       constexpr double eps_floor = 1e-12;
       double m0 = 0.0, mt = 0.0, s0 = 0.0, st = 0.0;
@@ -1966,8 +1934,8 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
       std::vector<long> occ, emp, win;
       for (long is = 0; is < ns; ++is)
         for (long ik = 0; ik < nkpts; ++ik) {
-          // The gap window, built with the SAME rule as the mode-A diagnostics
-          // (qp_scf_common.cpp:255-267): the two highest occupied + the two lowest empty
+          // The gap window, built with the SAME rule as the mode-A diagnostics in
+          // modea_run (above): the two highest occupied + the two lowest empty
           // states of the INCOMING qp spectrum. Map-independent by construction, so the
           // meter compares the same states across ac_pade / mats_* / mode_a / mode_b.
           occ.clear(); emp.clear(); win.clear();
@@ -2009,7 +1977,7 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
         LS.n_states = cnt;
       }
     }
-    app_log(2, "  [Q6] lineshape meter ({} gap-window diagonals): "
+    app_log(2, "  [qpGW lineshape] meter ({} gap-window diagonals): "
                "|Sigma^c_aa - V^xc_aa| / |Sigma^c_aa| at iw_0 = {:.6f} a.u.: max {:.6e}, "
                "mean {:.6e}; at iw_top = {:.6f} a.u.: max {:.6e}, mean {:.6e}. "
                "ABSOLUTE discard |Sigma^c_aa - V^xc_aa| (a.u.): iw_0 max {:.6e} mean {:.6e}, "
@@ -2070,7 +2038,7 @@ void add_qpscf_vcorr(MBState &mb_state,
   auto [ns, nkpts, nbnd, nbnd2] = sHeff_skij.shape();
   auto nt = FT.nt_f();
 
-  auto &qpt = qp_stage_timer();   // T-1 item 2: instrument the previously untimed QP stage
+  auto &qpt = qp_stage_timer();   // per-stage timers of the QP iteration
   qpt.start("QP_G_BUILD");
 
   mb_state.sSigma_tskij.emplace(make_shared_array<Array_view_5D_t>(*mpi, {nt, ns, nkpts, nbnd, nbnd}));
@@ -2078,12 +2046,12 @@ void add_qpscf_vcorr(MBState &mb_state,
   if (sG_ext == nullptr) {
     update_G(mb_state.sG_tskij.value(), sMO_skia, sE_ska, mu, FT);
   } else {
-    // Project 2 increment Q5 (spec §1): the re-QP-ization step. The external G replaces the
+    // The re-QP-ization step. The external G replaces the
     // analytic QP G for BOTH consumers below -- update_w (so W_corr screens with
     // P^RPA[G_ext] + P^lad + P_C(P_imp-P_dc)P_C^dag) and the Sigma^GW build. The MAP stage
     // downstream (qp_approx / the mode-A CD kernel) is untouched: it consumes the MO-basis
     // Sigma gather + mb_state.dW_qtPQ, both built from whatever G is here.
-    // element-wise dims: rusty's bundled fmt has no std::array formatter
+    // element-wise dims: some bundled fmt versions have no std::array formatter
     auto gx = sG_ext->shape();
     auto ge = mb_state.sG_tskij.value().shape();
     utils::check(gx == ge,
@@ -2111,7 +2079,7 @@ void add_qpscf_vcorr(MBState &mb_state,
   FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
   qpt.stop("QP_SIGMA");
 
-  // Project 2 increment QM3: build the mode-A evaluator context HERE -- this is the only
+  // Build the mode-A evaluator context HERE -- this is the only
   // window in which mb_state.dW_qtPQ is alive (it is reset below).
   qpt.start("QP_MAP");
   qp_modea::modea_ctx modea_ctx;
@@ -2204,15 +2172,14 @@ double solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf
   // it = init_it + 1 with init_it > 0, so it never sees the it == 1 branch below. The
   // else branch then asks the iterative solver for "scf/iter{it-1}/Heff_skij", but a
   // checkpoint written by the DYSON scf holds F_skij (+ system/H0_skij), never Heff_skij.
-  // nda::h5_read then threw INSIDE the `node_comm.root()` guard, i.e. on one rank only:
-  // the root unwound qp_scf_loop's shared arrays into MPI_Win_free while every other rank
-  // sat in the node_comm.broadcast_n below -- a hard deadlock, no error message
-  // (observed 2026-08-17 on svo kp444 restart, qp_map=mode_a, iteration 13).
+  // nda::h5_read would then throw INSIDE the `node_comm.root()` guard, i.e. on one rank
+  // only: the root would unwind qp_scf_loop's shared arrays into MPI_Win_free while every
+  // other rank sits in the node_comm.broadcast_n below -- a hard deadlock with no error
+  // message.
   //
   // Treat "no QP Hamiltonian in the previous iteration" exactly like the first qp
   // iteration: there is nothing to damp against yet, so report the change w.r.t. the
-  // reference Hamiltonian and (for DIIS) start the history here. it == 1 keeps ref_it = 0
-  // and is therefore bit-identical to the previous behaviour.
+  // reference Hamiltonian and (for DIIS) start the history here. it == 1 keeps ref_it = 0.
   const long ref_it = (it == 1) ? 0 : it - 1;
   const std::string ref_grp_name = "scf/iter" + std::to_string(ref_it);
   bool prev_is_qp = false;

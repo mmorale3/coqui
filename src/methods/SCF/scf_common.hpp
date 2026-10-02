@@ -42,7 +42,7 @@
 namespace methods {
   // TODO Put everything in "scf" namespace to isolate using directives
 
-// Project 2 increment QM3: the mode-A evaluator context is an opaque pointer here -- its
+// The mode-A evaluator context is an opaque pointer here -- its
 // definition (methods/SCF/qp_modea.hpp) is only needed by the .cpp that builds and consumes it.
 namespace qp_modea { struct modea_ctx; }
 
@@ -53,10 +53,10 @@ auto bracket_mu_root(double old_mu, double delta, eval_t &&eval_f)
   -> std::tuple<double, double, double, double> {
   
   double f_old = eval_f(old_mu);
-  // A wrong Sigma makes N(mu) monotone-but-never-crossing, or NaN. Both used to spin here: the
-  // bracketing walk had no limit, and a NaN falls through every comparison, so the search returned
-  // a NaN mu without a word. Cap the walk and fail loudly (origin/gpu ec3f7ab, ported to the refactored
-  // search): 200 steps of delta = 40 a.u. at the default delta, far beyond any real band.
+  // A wrong Sigma makes N(mu) monotone-but-never-crossing, or NaN. An unbounded bracketing walk
+  // would spin forever, and a NaN falls through every comparison, so the search would return a NaN
+  // mu silently. Cap the walk and fail loudly: 200 steps of delta = 40 a.u. at the default delta,
+  // far beyond any real band.
   constexpr int max_bracket_steps = 200;
   utils::check(std::isfinite(f_old),
                "update_mu: nelec is not finite at the starting mu = {}. The self-energy or the "
@@ -286,11 +286,10 @@ double update_mu(double old_mu, const mf::MF &mf, const X_t &sE_ski, double beta
 double compute_Nelec(double mu, const mf::MF &mf, const sArray_t<Array_view_3D_t> &sE_ski, double beta);
 
 /**
- * Project 2 increment Q6 (notes/q6_diagnostics_closeout_spec.md §1.3, PDF §9): THE
- * LINESHAPE METER -- the size of what the static quasiparticle map throws away.
+ * Lineshape meter: the size of what the static quasiparticle map throws away.
  *
  * Over the gap-window DIAGONAL states (the same "two occupied + two empty straddling mu"
- * window the mode-A diagnostics use, qp_scf_common.cpp:255-267), per qp iteration:
+ * window the mode-A diagnostics in qp_scf_common.cpp use), per qp iteration:
  *
  *     f(iw) = |Sigma^c_aa(iw) - V^xc,c_aa| / max(|Sigma^c_aa(iw)|, eps_floor)
  *
@@ -299,17 +298,16 @@ double compute_Nelec(double mu, const mf::MF &mf, const sArray_t<Array_view_3D_t
  * HIGHEST node (tail sanity). Both are read in the MO basis at the map stage, where the
  * Sigma(iw) gather and the assembled V^xc coexist.
  *
- * This is a REPORTING hook ONLY -- exactly the qp_modea::last_run() pattern. No code path
+ * This is a reporting hook only, following the qp_modea::last_run() pattern. No code path
  * branches on it and qp_approx computes nothing extra for the map. Populated by qp_approx
- * for EVERY map (ac_pade and the Matsubara-native ones alike); the Q6 iteration-summary
- * line in qp_scf_loop reads it back.
+ * for every map (ac_pade and the Matsubara-native ones alike); the lineshape line of the
+ * iteration summary in qp_scf_loop reads it back.
  *
  * The ABSOLUTE discard |Sigma^c_aa(iw) - V^xc,c_aa| (a.u.) is carried alongside the ratio,
- * and it is the one that answers "does the map discard more at low frequency". MEASURED
- * 2026-08-14 (qe_lih222, ac_pade): the RATIO is larger at iw_top than at iw_0, which is a
- * NORMALIZATION artifact and not a physics failure -- Sigma^c(iw) -> 0 in the tail, so at
- * iw_top the ratio degenerates to |V^xc| / |Sigma^c(iw_top)| >> 1 with a vanishing
- * denominator. See the Q6 test file for the numbers and the flag.
+ * and it is the one that answers "does the map discard more at low frequency". The RATIO
+ * is typically larger at iw_top than at iw_0; this is a normalization artifact, not a
+ * physics failure -- Sigma^c(iw) -> 0 in the tail, so at iw_top the ratio degenerates to
+ * |V^xc| / |Sigma^c(iw_top)| >> 1 with a vanishing denominator.
  */
 struct q6_lineshape_t {
   double frac_w0_max = -1.0;    // max_a f(iw_0)   over the gap-window diagonals
@@ -329,12 +327,10 @@ inline q6_lineshape_t &q6_lineshape() { static q6_lineshape_t x; return x; }
 /**
  * Process-wide timers for the quasi-particle stage of a qpGW iteration.
  *
- * T-1 item 2 of notes/coqui_threading_spec.md (rev 2). add_qpscf_vcorr is a free function,
- * so there is no object to hang a TimerManager on; this follows the q6_lineshape()
- * accessor pattern directly above. The stage it covers -- the analytic-continuation /
- * QP map -- was part of the 59% that T-0 could only measure by subtraction
- * (notes/coqui_threading_t0.md section 2.1). Cumulative over iterations, like every other
- * timer block in the code.
+ * add_qpscf_vcorr is a free function, so there is no object to hang a TimerManager on;
+ * this follows the q6_lineshape() accessor pattern directly above. The timers split the
+ * stage into G build, W, Sigma and the analytic-continuation / QP map. Cumulative over
+ * iterations, like every other timer block in the code.
  */
 inline utils::TimerManager &qp_stage_timer() {
   static utils::TimerManager t = [] {
@@ -443,11 +439,10 @@ void add_evscf_vcorr(MBState &mb_state,
  * @param FT             - [INPUT] Fourier transform driver on imaginary axes
  * @param mu             - [INPUT] chemical potential
  * @param qp_params     - [INPUT] setups for quasiparitcle eqn
- * @param sG_ext        - [INPUT] Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md
- *                        §1): when non-null, the EXTERNAL Green's function replaces the
+ * @param sG_ext        - [INPUT] when non-null, the EXTERNAL Green's function replaces the
  *                        analytic QP G that update_G would build from (sMO_skia, sE_ska, mu).
- *                        Both update_w and the Sigma^GW build then see it. nullptr (default)
- *                        = the pre-Q5 path, bit for bit.
+ *                        Both update_w and the Sigma^GW build then see it. nullptr (default):
+ *                        the analytic QP G is used.
  * @return new qp energies in share memory sE_ska(ns, nkpts, nbnd)
  */
 template<typename eri_t, typename corr_solver_t>
@@ -545,7 +540,7 @@ double solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf
  * @param sF_prev      - [INPUT] previous iterate of F, if the caller still has it
  * @param sSigma_prev  - [INPUT] previous iterate of Sigma, likewise
  * When both are given, simple mixing uses them instead of reading them back from
- * the checkpoint (4.4 GB of serial HDF5 per iteration at Si 2x2x2/500b).
+ * the checkpoint, which avoids a large serial HDF5 read per iteration.
  */
 template<typename comm_t, typename X_t, typename Xt_t>
 auto solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t& iter_solver,

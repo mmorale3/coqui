@@ -48,16 +48,15 @@ struct qp_params_t {
   double mu_tolerance = 1e-9;
   std::string mu_update_alg = "bisection";
 
-  // Project 2 increment Q0 (notes/qpgw_edmft_implementation_plan.md): the
-  // quasiparticle-map selector.
-  // - "ac_pade":     today's route -- Pade AC of Sigma(iw) evaluated near the
-  //                  real axis (solve_qp_eqn / qp_approx unchanged). DEFAULT.
-  // - "mats_lin":    Matsubara-native omega~0 linearization (spec eq 13;
-  //                  qp_maps_matsubara.hpp map (i)) -- no analytic continuation.
+  // Quasiparticle-map selector.
+  // - "ac_pade":     Pade AC of Sigma(iw) evaluated near the real axis
+  //                  (solve_qp_eqn / qp_approx). DEFAULT.
+  // - "mats_lin":    Matsubara-native omega ~ 0 linearization
+  //                  (qp_maps_matsubara.hpp map (i)) -- no analytic continuation.
   // - "mats_gmatch": Matsubara-native variational Green's-function matching
-  //                  (spec eq 14; map (ii)) -- no analytic continuation.
-  // Wired into the solvers at increment Q2; parsed and validated from Q0 so the
-  // default path is pinned bitwise before any dispatch lands.
+  //                  (qp_maps_matsubara.hpp map (ii)) -- no analytic continuation.
+  // - "mode_a" / "mode_b": real-axis evaluation of Sigma^c at the quasiparticle
+  //                  energies from a pole representation of W^c (qp_modea.hpp).
   std::string qp_map = "ac_pade";
 
   // mats_gmatch weight exponent: w_n = (w0/w_n)^qp_map_wpow on the positive
@@ -65,79 +64,68 @@ struct qp_params_t {
   // behavior); 0.0 weights all nodes equally, exposing the QP-pole window
   // omega ~ |eps - mu| (closer to the real-axis Sigma(eps_QP) map). The
   // residual's leading 1/(i omega) tails cancel, so any wpow >= 0 is
-  // well-posed. Scanned against the real-axis qsGW references (Q2-c).
+  // well-posed.
   double qp_map_wpow = 2.0;
 
-  // ---- Project 2 increment QM3: qp_map = "mode_a" (notes/qm3_mode_a_loop_spec.md) ----
+  // ---- qp_map = "mode_a" ----
   // NOTE ON ORDER: qp_params_t is an aggregate and the drivers use parenthesized aggregate
   // initialization positionally (MBPT_drivers.cpp), so new members must be APPENDED.
   //
   // Sigma^c evaluator for mode_a:
-  // - "cd":        the QM2 contour-deformation closed form (sigma_route_b::sigma_cd) fed by
-  //                the state-resolved W^c band elements. PRODUCTION default.
-  // - "expansion": solve the same map with the route-A z0 = 0 re-expansion of the stored
+  // - "cd":        the contour-deformation closed form (sigma_route_b::sigma_cd) fed by
+  //                the state-resolved W^c band elements. Production default.
+  // - "expansion": solve the same map with the z0 = 0 re-expansion of the stored
   //                Sigma(iw) only (sigma_real_axis). Pure diagnostic -- needs no W data.
   std::string qp_modea_route = "cd";
-  // inner QP-consistency cap at FIXED Sigma data (spec section 4). Non-convergence at the
-  // cap is a physical multi-solution flag (app_warning), never a hard error.
+  // inner QP-consistency cap at FIXED Sigma data. Non-convergence at the cap is a
+  // physical multi-solution flag (app_warning), never a hard error.
   long qp_modea_nconsist = 5;
   // inner-consistency tolerance on max_a |d eps|, a.u.
   double qp_modea_consist_tol = 1e-8;
-  // evaluation offset i*eta for the real-axis evaluation. Default 0.0; the QM3-c judge
-  // protocol runs eta = 0. Stress knob only.
+  // evaluation offset i*eta for the real-axis evaluation. Default 0.0; stress knob only.
   double qp_modea_eta = 0.0;
-  // W^c support constraint (BINDING, QM2 measurement): auxiliary pole nodes inside the
-  // particle-hole gap are dropped from the fit -- prior physical information, not
-  // regularization. "auto" takes the indirect gap of the CURRENT QP spectrum; "off"
-  // disables it (the plain fit is O(1e4) wrong at real z -- do not use in production);
-  // any other value is parsed as an explicit gap edge in a.u.
+  // W^c support constraint: auxiliary pole nodes inside the particle-hole gap are dropped
+  // from the fit -- prior physical information, not regularization. "auto" takes the
+  // indirect gap of the CURRENT QP spectrum; "off" disables it (the unconstrained fit can be
+  // orders of magnitude wrong at real z -- do not use in production); any other value is
+  // parsed as an explicit gap edge in a.u.
   std::string qp_modea_wsupp = "auto";
-  // pole-fit route: "tau" = the QM2-b tested chain (bosonic mesh -> Ttw_bb -> fermionic tau
-  // kernel -> residues x tanh(hw/2)); "nu" = the support-constrained LS directly on the
-  // bosonic Matsubara nodes. Both are MEASURED by gate QM3-b.
+  // pole-fit route: "tau" = bosonic mesh -> Ttw_bb -> fermionic tau kernel -> residues x
+  // tanh(hw/2); "nu" = the support-constrained LS directly on the bosonic Matsubara nodes;
+  // "spectral" and "contour" are described below.
   std::string qp_modea_wfit = "tau";
-  // RW-2 (notes/rw_real_axis_w_spec.md): qp_modea_wfit = "spectral" replaces the least-
-  // squares pole fit above by a SIGN-DEFINITE quadrature of the computed Im W^c(Omega, q)
-  // from the real-axis module (needs -DENABLE_FINUFFT=ON). Motivation: on a metal the LS
-  // residues are mixed sign and the contracted Sigma^c needs 4-5.5 digits of cancellation
-  // (notes/qpgw_metal_mode_m0.md section 8b). The two knobs below are FLAGGED defaults:
+  // qp_modea_wfit = "spectral" replaces the least-squares pole fit above by a SIGN-DEFINITE
+  // quadrature of the computed Im W^c(Omega, q) from the real-axis W module (needs
+  // -DENABLE_FINUFFT=ON). Motivation: on a metal the LS residues are mixed sign and the
+  // contracted Sigma^c needs several digits of cancellation. Knobs:
   //   spectral_eta   -- Lorentzian width of the QP-pole A(w), a.u. Drives the whole grid
   //                     stack; smaller is more accurate and quadratically more expensive.
   //   spectral_npole -- target positive-Omega node count after coarsening (pole count is
   //                     2x this plus the head sector). <= 0 keeps every Omega node.
-  //   spectral_gamma -- "spectral" (default; FABLE RULING 2026-08-21 on the section-4.5d
-  //                     A/B, flipping the earlier protective ruling now that the data is
-  //                     in) takes the Gamma BODY from the quadrature and leaves only the
-  //                     scalar head on LS poles; "ls" keeps the whole q = Gamma column on
-  //                     an appended support-constrained LS pole set. Measured on SVO
-  //                     (notes/rw2_report.md section 4.5d): "ls" reintroduces the
-  //                     mixed-sign LS cancellation on the ONE transfer that dominates
-  //                     Sabs (100% head share, 49.97% negative numerators, transient
-  //                     U(0) = -15 eV at the first map) while "spectral" passes every
-  //                     RW-2-c gate (Sabs/|Sigma| 2.4-3.6 at map 2, neg share 0.11%,
-  //                     U(0) positive both maps, causality at machine zero). The Gamma
-  //                     hole "ls" guarded against does not exist on this path -- the
-  //                     Gamma body is COMPUTED on the real axis (the section-3.3 fix),
-  //                     not dropped. Known open item: the "spectral" mode's scalar-head
-  //                     LS fit is unconstrained (6 sub-3pi/beta poles on SVO
-  //                     contaminating eta=0 PROBE rows only, not the map) -- the support
-  //                     constraint there is the filed follow-up, report section 7 item 1.
+  //   spectral_gamma -- "spectral" (default) takes the Gamma BODY from the quadrature and
+  //                     leaves only the scalar head on LS poles; "ls" keeps the whole
+  //                     q = Gamma column on an appended support-constrained LS pole set.
+  //                     "ls" reintroduces the mixed-sign LS cancellation on the q = Gamma
+  //                     transfer, which typically dominates the absolute sum on a metal;
+  //                     the Gamma body is computed on the real axis on the "spectral"
+  //                     path, so nothing is dropped there. Caveat: the scalar-head LS fit
+  //                     of the "spectral" mode is not support-constrained, so it can carry
+  //                     poles below 3 pi / beta; these affect eta = 0 probe rows only, not
+  //                     the map.
   std::string qp_modea_spectral_gamma = "spectral";
   double qp_modea_spectral_eta = 0.0125;
   long   qp_modea_spectral_npole = 64;
   // truncated-SVD cut of the SUPPORT-CONSTRAINED W^c pole fit, relative to the largest
-  // singular value. Negative selects the shared doctrine value, imag_axes_ft::
-  // dlr_pole_fit_rel_tol = 1e-8, which is the DEFAULT and reproduces the QM2-b chain.
+  // singular value. Negative selects the shared default, imag_axes_ft::
+  // dlr_pole_fit_rel_tol = 1e-8.
   //
-  // WHY IT IS EXPOSED (measured, QM3-b on lih222): 1e-8 maximizes IMAGINARY-axis accuracy and
-  // is the right doctrine for the residue algebras of project 1, which never leave that axis.
-  // Route B does: it evaluates the same rational function at REAL quasiparticle energies,
-  // where a near-interpolatory fit is a wild function with thousands of poles and residues
-  // 1e2-1e4 times the data it represents. Measured on lih222/q=0 (bosonic-mesh reconstruction,
-  // residue ratio): tau route 1e-8 -> (4.4e-3, 6.0e3), 1e-6 -> (1.4e-2, 1.2e2),
-  // 1e-4 -> (5.0e-2, 9.2); nu route 1e-8 -> (1.2e-3, 4.3e2), 1e-6 -> (3.0e-3, 1.2e1),
-  // 1e-4 -> (8.5e-3, 7.7e-1). The knob is the imaginary-accuracy vs real-axis-smoothness
-  // trade-off; the production value is a spec decision, NOT an agent default.
+  // Why it is exposed: 1e-8 maximizes IMAGINARY-axis accuracy, which is what residue
+  // algebras that never leave that axis need. The mode-A map instead evaluates the same
+  // rational function at REAL quasiparticle energies, where a near-interpolatory fit is a
+  // wild function with very many poles and residues orders of magnitude larger than the
+  // data it represents. Loosening the cut (1e-6, 1e-4) trades imaginary-axis
+  // reconstruction accuracy for much smaller residues; the knob is that
+  // imaginary-accuracy vs real-axis-smoothness trade-off.
   double qp_modea_wrtol = -1.0;
 
   // W^c RESIDUE-SLAB COMPRESSION (stage 1b of wc_band_elements.hpp). Relative eigenvalue cut
@@ -164,88 +152,74 @@ struct qp_params_t {
   //     < 0  -> the restructure is OFF (the per-slab stage-1b path)   <-- THE DEFAULT
   //     = 0  -> take qp_modea_wrank
   //     > 0  -> that tolerance
-  // WHY THE DEFAULT IS OFF (measured, qe_lih222 / mode_a / qpscf, the scan case
-  // "qp_map_modea_wunion_scan" plus the rank ladder in wc_band_elements.hpp): the achieved
-  // basis is R/Np = 1.00 at wunion = 1e-10 and still 0.81 at 1e-8, so at the accuracy class
-  // the QM3 gates require the restructure has nothing to compress -- it only adds the
-  // stage-1c build (measured +0.46 s against a 1.70 s stage 2 on the fixture). It becomes a
-  // real speedup only where R << Np, i.e. at cuts of 1e-6 and looser, which is a spec
-  // decision and not an agent default. It is a TRUNCATION trade, tau-anchor interlocked like
+  // Why the default is off: at tight cuts (1e-10 .. 1e-8) the union basis spans nearly all
+  // of Np, so the restructure has nothing to compress and only adds the stage-1c build. It
+  // pays only where R << Np, i.e. at cuts of 1e-6 and looser. It is a truncation trade like
   // every other cut, and R, R/Np and the projection residual are logged on every build.
   double qp_modea_wunion = -1.0;
 
-  // ---- spec rev 4 (2026-08-13): GRADED-eta FAR-STATE EVALUATION ----
+  // ---- GRADED-eta FAR-STATE EVALUATION ----
   // Imaginary offset, in a.u., applied to the evaluation energies of states OUTSIDE the
   // analyticity strip (VBM - 0.95 E_PH, CBM + 0.95 E_PH):
   //
-  //     eta_far  = 0   -> out-of-strip states are evaluated at z = mu   (rev 3.1, THE DEFAULT)
+  //     eta_far  = 0   -> out-of-strip states are evaluated at z = mu   (THE DEFAULT)
   //     eta_far  > 0   -> out-of-strip states are evaluated at z = eps + i eta_far
   //
   // In-strip states are unaffected and stay exact (eta -> 0). Applies to mode_a (both indices
   // of 1/2[Sigma(eps_a) + Sigma(eps_b)]) and to the mode_b diagonal.
   //
-  // WHY (QM3-c judge verdict, kp222, matched heads): mode_a == mode_b = 3.714/1.219 eV against
-  // a real-axis reference series of 3.10-3.37/0.70-0.94 eV with a tau oracle of 2.6e-08, i.e.
-  // the whole 0.35/0.45 eV offset is the mu fallback of the 471 out-of-strip evaluations. The
-  // reference's own far-state object is Re Sigma(eps + i eta), so ours must be too.
+  // Why: evaluating out-of-strip states at mu biases band edges and gaps; a real-axis
+  // reference evaluates far states as Re Sigma(eps + i eta), and this knob does the same.
   //
   // VALIDITY FLOOR (logged, warned, never fatal): eta_far must exceed ~3x the local fitted-pole
-  // spacing (~1e-3 a.u. at kp222) or the evaluation rides single poles of the fit instead of
-  // the eta-smoothed spectral density. The measured spacing is reported every outer iteration.
+  // spacing or the evaluation rides single poles of the fit instead of the eta-smoothed
+  // spectral density. The pole spacing is reported every outer iteration.
   double qp_modea_eta_far = 0.0;
 
-  // ---- increment TC-2 (notes/tc_coqui_impl_spec.md): P ON THE TILTED CONTOUR ----
-  // Reached only through qp_modea_wfit = "contour", which is a SIBLING of the RW-2
-  // "spectral" route: same knob family, same G provenance (the current QP spectrum
-  // and MOs), same downstream consumption. ENABLE-flag-free -- it is plain complex
-  // arithmetic in the existing THC kernels. With the knob absent every value below
-  // is inert and the tau/nu/spectral paths are bit-for-bit unchanged (gate TC-2-b).
+  // ---- P ON THE TILTED CONTOUR ----
+  // Reached only through qp_modea_wfit = "contour", which is a SIBLING of the "spectral"
+  // route: same knob family, same G provenance (the current QP spectrum and MOs), same
+  // downstream consumption. Needs no build flag -- it is plain complex arithmetic in the
+  // existing THC kernels. With the knob absent every value below is inert and the
+  // tau/nu/spectral paths are unchanged.
   //
   //   qp_tc_eps      rank tolerance of the contour builder. The rank is taken at
-  //                  lambda > eps^2 lambda_max (BINDING correction 1 of
-  //                  notes/tilted_contour_validation_results.md section 2.1 -- the
-  //                  spec's own lambda > eps lambda_max delivers only sqrt(eps)),
-  //                  and the contour length uses eps_tr = eps^2 (correction 4).
-  //   qp_tc_delta    Im z of the target line, a.u. 0 selects the eq-8 recipe
-  //                  delta = eta_targ with the mesh floor 1.2 W_band / N_k.
-  //                  FLAGGED CONSTANT: the spec writes 0.7; results section 5.4
-  //                  measured the 1 %-crossing at 0.81-3.99 x that prediction,
-  //                  median 1.69, i.e. a fitted constant of ~1.2. And the adopted
-  //                  sub-meV tier samples at eta_targ, NOT 3.5 eta_targ
-  //                  (section 7.2 item 5), so there is no 3.5x continuation here.
-  //   qp_tc_rho      tan(theta) W_target / delta, in [0, 1). 0.65 is the spec's
-  //                  no-tuning value; the campaign confirmed rho* = 0.60-0.80 at
-  //                  production meshes and rho = 0.65 within 15 % of optimal for
-  //                  the semiconductor and the metal, 26 % for the wide-gap
-  //                  insulator (section 4.1a).
-  //   qp_tc_profile  "flat" (the adopted tier) or "growing" (the eq-8 growing-eta
-  //                  profile). MEASURED gain 1.00x at 8^3 rising to 1.25-2.79x at
-  //                  24^3 -- it pays only at >= 16^3 (section 4.2), so the default
-  //                  is flat.
+  //                  lambda > eps^2 lambda_max (a cut at lambda > eps lambda_max
+  //                  delivers only sqrt(eps) accuracy), and the contour length uses
+  //                  eps_tr = eps^2.
+  //   qp_tc_delta    Im z of the target line, a.u. 0 selects the default recipe
+  //                  delta = eta_targ with the mesh floor 1.2 W_band / N_k (the
+  //                  constant 1.2 is empirical). The target line is sampled at
+  //                  eta_targ itself, with no further continuation factor.
+  //   qp_tc_rho      tan(theta) W_target / delta, in [0, 1). 0.65 is a no-tuning
+  //                  value, close to optimal (optimum ~0.60-0.80 at production
+  //                  meshes) for semiconductors and metals and somewhat less so for
+  //                  wide-gap insulators.
+  //   qp_tc_profile  "flat" (default) or "growing" (growing-eta profile along the
+  //                  contour). The growing profile pays only on dense k meshes
+  //                  (>= 16^3), so the default is flat.
   //   qp_tc_trunc    band truncation along the contour: at node s only transitions
   //                  with a(Delta) s <~ ln(1/eps) survive, so the band sums shrink.
-  //                  Measured 1.2-1.6x in the campaign, 2.1-2.6x here on the unit
-  //                  fixtures (gate TC-2-c); the deviation from the samples it
-  //                  drops is at the qp_tc_eps class.
+  //                  The deviation from the samples it drops is at the qp_tc_eps
+  //                  class.
   double      qp_tc_eps = 1e-6;
   double      qp_tc_delta = 0.0;
   double      qp_tc_rho = 0.65;
   std::string qp_tc_profile = "flat";
   bool        qp_tc_trunc = false;
-  // ---- increment TC-3: the line solver and the eq-1 residue band-factor store ----
+  // ---- the line solver and the residue band-factor store ----
   //   qp_tc_krylov      warm-started GMRES instead of the dense inverse for the
-  //                     contracted <nm|W^c|mn>. The economics (measured, notes/
-  //                     tc3_report.md): the DIAGONAL path needs nbnd right-hand sides
-  //                     per (q, z) and Krylov wins at ~5 iterations per solve; a full
-  //                     qpscf block needs nbnd^2 and the dense inverse amortizes.
-  //   qp_tc_krylov_tol  its relative-residual target. dense == Krylov measured 3.3e-13.
-  //   qp_tc_bstore_gb   cap, in GB per owned (s,k) block, on the eq-1 residue term's
+  //                     contracted <nm|W^c|mn>. The DIAGONAL path needs nbnd right-hand
+  //                     sides per (q, z), where Krylov wins at a few iterations per solve;
+  //                     a full qpscf block needs nbnd^2 and the dense inverse amortizes.
+  //   qp_tc_krylov_tol  its relative-residual target.
+  //   qp_tc_bstore_gb   cap, in GB per owned (s,k) block, on the residue term's
   //                     band-factor STORE B_J(P,a) -- nJ x Np x nbnd complex, ~1 MB on
-  //                     qe_lih222 but ~1.25 GB at (64 k-points, Np 364, nbnd 60). It is
-  //                     0 by default, which under qp_tc_bfactor = "auto" selects the
+  //                     a small fixture but ~1.25 GB at (64 k-points, Np 364, nbnd 60). It
+  //                     is 0 by default, which under qp_tc_bfactor = "auto" selects the
   //                     recompute path.
-  // ---- increment TC-4: the band-factor representation and the residue batching ----
-  //   qp_tc_bfactor     "auto" (default) | "store" | "recompute". The eq-1 residue term
+  // ---- the band-factor representation and the residue batching ----
+  //   qp_tc_bfactor     "auto" (default) | "store" | "recompute". The residue term
   //                     needs the band-pair factor B_J(P,a) for every internal state it
   //                     visits. "recompute" keeps only B's two factors -- XCe at
   //                     nsym x Np x nbnd per owned block and XCi at ns*nkpts x Np x nbnd
@@ -273,20 +247,19 @@ struct qp_params_t {
   double      qp_tc_bstore_gb = 0.0;
   std::string qp_tc_bfactor = "auto";
   double      qp_tc_batch_mb = 64.0;
-  // ---- TC-4: THE EXPLICIT STRIP WINDOW (mode-A CD route) ----
+  // ---- THE EXPLICIT STRIP WINDOW (mode-A CD route) ----
   //   qp_modea_strip_lo / qp_modea_strip_hi   HALF-WIDTHS below and above mu, a.u.
   //   Both 0 (DEFAULT) = unset = the E_PH-derived strip
-  //   (VBM - 0.95 E_PH, CBM + 0.95 E_PH) EXACTLY, bit for bit. Both > 0 replaces it with
+  //   (VBM - 0.95 E_PH, CBM + 0.95 E_PH) exactly. Both > 0 replaces it with
   //   [mu - strip_lo, mu + strip_hi] and forces the strip active. Exactly one set is a
   //   parse error -- a one-sided window is never intended and pairing it with an E_PH
   //   bound would hide the mistake.
   //
   //   ⚠ WHY IT EXISTS. The E_PH strip is a window of order the GAP, so on a gapped system
-  //   with a wide band window it admits almost nothing: MEASURED on the TC-4 si444/nb60
-  //   legs, 12-15 of 780 states were in strip and the BAND EDGES were clamped to mu, i.e.
-  //   the harvested VBM/CBM/gap were reading Sigma^c(mu), not the contour. The default is
-  //   correct for a METAL (SVO) and wrong for any insulator QP or band-structure study.
-  //   [notes/tc4_si_tier.md section 11]
+  //   with a wide band window it admits only a few percent of the states, and the BAND
+  //   EDGES can be clamped to mu, i.e. the reported VBM/CBM/gap then read Sigma^c(mu), not
+  //   the contour. The default is correct for a METAL and wrong for any insulator QP or
+  //   band-structure study.
   //
   //   It overrides the STRIP ONLY. gap_edge, the W^c support constraint, the retained pole
   //   set, the fit and the contour geometry are untouched -- an evaluation-coverage knob,
@@ -295,43 +268,42 @@ struct qp_params_t {
   //   manifold guts the constrained fit (and is silently disabled past the outermost
   //   auxiliary node).
   //
-  //   SIZING, for a QP tier: cover the full valence manifold plus the conduction bands the
-  //   metric names, with margin --
+  //   SIZING, for a QP calculation: cover the full valence manifold plus the conduction
+  //   bands of interest, with margin --
   //       strip_lo ~ (mu - VBM) + valence bandwidth + margin
   //       strip_hi ~ (CBM - mu) + (top of the needed conduction bands - CBM) + margin
   //   The resolved window and the census are printed in the banner; check them, because a
   //   mis-sized window fails silently as a clamp artefact rather than as an error.
   //
   //   ⚠ CAVEAT: states outside the window are still clamped and still feed H_eff through
-  //   self-consistency. That residual is second order for delta-tier DIFFERENCES at a fixed
-  //   clamp policy; a band-structure deliverable must WIDEN THE WINDOW rather than rely on
+  //   self-consistency. That residual is second order for energy DIFFERENCES at a fixed
+  //   clamp policy; a band-structure calculation must WIDEN THE WINDOW rather than rely on
   //   qp_modea_eta_far, whose cost is ~10^3 x at a 60-band window (the residue-target count
   //   grows with |eps - mu| and the deep conduction tail dominates).
   double      qp_modea_strip_lo = 0.0;
   double      qp_modea_strip_hi = 0.0;
-  // ---- TC-5: THE AMORTIZED W^c TILE CACHE (methods/SCF/wc_grid.hpp) ----
+  // ---- THE AMORTIZED W^c TILE CACHE (methods/SCF/wc_grid.hpp) ----
   //   ⚠ THE KNOB IS THE ACCURACY TARGET, NOT THE GRID SPACING.
-  //   qp_tc_wgrid_mev   the ABSOLUTE residue-tier accuracy target in meV
-  //                     (default 1.0). h is derived from the MEASURED sizing law
+  //   qp_tc_wgrid_mev   the ABSOLUTE residue accuracy target in meV
+  //                     (default 1.0). h is derived from the empirical sizing law
   //                        dSigma[meV] = K (h/delta)^p / delta[eV],  p = 2.81,
-  //                     with K = 32.4 (SVO's -- conservative for ANY system by
-  //                     ruling; no metallicity auto-detection), a 3x safety
-  //                     factor for the measured fit spread, and h clamped to
+  //                     with K = 32.4 (a conservative constant used for every
+  //                     system; there is no metallicity auto-detection), a 3x
+  //                     safety factor for the spread of the fit, and h clamped to
   //                     delta/2 (past which the 3-point stencil overshoots and
   //                     can be worse than linear).
-  //                     0 DISABLES the cache and restores the per-target Np^3
-  //                     Dyson path exactly -- the identity pin's reference.
-  //                     [notes/tilted_contour_validation_results.md section 8]
+  //                     0 DISABLES the cache and uses the per-target Np^3 Dyson
+  //                     path exactly -- the reference for the cache.
   //   qp_tc_wgrid_h     EXPERT override: h directly, a.u. > 0 bypasses the law.
   //   qp_tc_wgrid_audit samples per (q, outer iteration) at which W^c is
   //                     evaluated EXACTLY and compared with the interpolation
   //                     (default 16; 0 = off, NOT recommended).
-  //                     ⚠ WHY IT EXISTS: section 8.7 measured K/|Sigma| spanning
-  //                     1.3-417. On a spectrum whose weight is CONCENTRATED on a
-  //                     single in-range pole a fixed constant is wrong by 75x and
-  //                     NOTHING in the sizing inputs reveals it -- the grid is
-  //                     silently under-resolved and Sigma still looks plausible.
-  //                     The law sizes; the sample proves.
+  //                     ⚠ WHY IT EXISTS: the error constant varies by orders of
+  //                     magnitude between systems. On a spectrum whose weight is
+  //                     CONCENTRATED on a single in-range pole a fixed constant is
+  //                     badly wrong and NOTHING in the sizing inputs reveals it --
+  //                     the grid is silently under-resolved and Sigma still looks
+  //                     plausible. The law sizes; the sample proves.
   //   qp_tc_wgrid_audit_hard  (default true) ABORT when the measured error
   //                     exceeds 10x the target. Failure behaviour is defined:
   //                     always log predicted-vs-measured and the worst (q, Re z);
@@ -339,12 +311,12 @@ struct qp_params_t {
   //                     an order-of-magnitude breach means every downstream number
   //                     is untrustworthy. Set false to push through deliberately
   //                     on a diagnostic run.
-  //                     ⚠ HARVESTABLE: the audit result is carried into the
-  //                     [Q6] qpgw summary line as
+  //                     The audit result is carried into the qpGW iteration
+  //                     summary line as
   //                         wgrid_aud = <measured>/<predicted> meV (worst q = ..,
   //                                     Re z = ..)
   //                     -- measured FIRST -- so a breach is actionable from the
-  //                     log alone and harvest scripts can grep `wgrid_aud`.
+  //                     log alone and can be grepped as `wgrid_aud`.
   //                     Both values read -1 when the cache or the audit is off.
   double      qp_tc_wgrid_mev = 1.0;
   double      qp_tc_wgrid_h = 0.0;
