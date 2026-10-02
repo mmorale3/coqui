@@ -15,7 +15,7 @@ from .closure import fit_sigma_sectors, lehmann_from_sigma, chemical_potential, 
 
 class LineSCGW:
     def __init__(self, X, Z, qk_to_k2, nk, nelec, H0, mu, theta=np.deg2rad(20), eps=1e-8, lam=6.0, bos_lam=4.0, bos_gap=0.02,
-                 sig_gap=(0.02, 0.02), g_gap=(0.01, 0.01), wp=0.11, K=24, tol_gram=1e-10, mixing=0.5, verbose=True, k_weight=None,
+                 sig_gap=(0.02, 0.02), g_gap=(0.0, 0.0), wp=0.11, K=24, tol_gram=1e-10, mixing=0.5, verbose=True, k_weight=None,
                  nodes_per_ray=120, node_range=(1e-3, 60.0)):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
