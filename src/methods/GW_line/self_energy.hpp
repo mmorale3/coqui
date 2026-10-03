@@ -49,6 +49,8 @@
  *   3. per k, per t: partial(k,t) = (left X) acc(k,t) (right X), nb x nb (two gemms)        timer Sigma_contract
  *   4. ONE all_reduce of the host buffer [N_k, t_chunk, nb, nb] over the grid               timer Sigma_allreduce
  *   5. Sigma(k, :) += (sign/N_k) F[:, chunk] . partial(k)   (host gemm [N_zeta x t_chunk] . [t_chunk x nb^2]) timer Sigma_transform
+ *   Device: 4-5 are replaced by the transform of the rank-local partials on the device (one strided-batched gemm per
+ *   chunk) and ONE copy + all_reduce of [N_k, N_zeta, nb, nb] per sector at the end.
  * Memory per rank: G~ and acc, 2 N_k t_chunk blocks, plus one W(q, chunk) (and one temp on device).
  *
  * t_chunk <= 0 selects the chunk automatically (host 8; device from the free device memory, <= 256). Device: Hadamard as one
@@ -143,8 +145,17 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
     [[maybe_unused]] arr3_t t1b;                  // device: the batched first contraction factor, all t of a chunk
     if constexpr (MEM != HOST_MEMORY) t1b = arr3_t(tc, nb, nQ);
     arr4_t part_m(nk, tc, nb, nb);                // contraction output in MEM (host: IS the reduce buffer)
-    nda::array<ComplexType, 4> part(nk, tc, nb, nb), partT;
-    if (leg.transposed) partT = nda::array<ComplexType, 4>(nk, tc, nb, nb);
+    nda::array<ComplexType, 4> part, partT;
+    [[maybe_unused]] arr2_t Fm;                   // device: the transform matrix (nz, nt)
+    [[maybe_unused]] arr4_t Sig_m;                // device: this rank's (unreduced) Sigma of the leg, (nk, nz, nb, nb)
+    if constexpr (MEM == HOST_MEMORY) {
+      part = nda::array<ComplexType, 4>(nk, tc, nb, nb);
+      if (leg.transposed) partT = nda::array<ComplexType, 4>(nk, tc, nb, nb);
+    } else {
+      Fm    = memory::to_memory_space<MEM>(F);
+      Sig_m = arr4_t(nk, nz, nb, nb);
+      nda::tensor::set(ComplexType(0.0), Sig_m);
+    }
     if constexpr (MEM != HOST_MEMORY) device_mem_probe();
     app_log(3, "  gw_line::self_energy: {} sector, {} time nodes in chunks of {}", leg.s == sector_t::particle ? "particle" : "hole",
             nt, tc);
@@ -223,7 +234,17 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
       }
       if constexpr (MEM != HOST_MEMORY) {
         utils::device_sync();
-        part = memory::to_memory_space<HOST_MEMORY>(part_m);
+        Timer.stop("Sigma_contract");
+        // 4'-5'. device: transform the rank-local partials on the device, Sig_m(k) += alpha F[:, chunk] part_m(k, chunk)
+        //        for all k in one strided-batched gemm (F broadcast); column-major: Sig(k)^T = part(k)^T F_chunk^T.
+        //        No per-chunk device->host copy or all_reduce: one of each at the end of the leg (Sigma is linear in
+        //        the partials, so reducing after the transform is the same sum).
+        Timer.start("Sigma_transform");
+        detail::gemm_strided_cm('N', 'N', nb * nb, nz, n, alpha, part_m.data(), nb * nb, tc * nb * nb, Fm.data() + i0, nt, 0,
+                                ComplexType(1.0), Sig_m.data(), nb * nb, nz * nb * nb, nk);
+        utils::device_sync();
+        Timer.stop("Sigma_transform");
+        continue;
       } else {
         part = part_m;
       }
@@ -247,6 +268,18 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
         nda::blas::gemm(alpha, F(all, nda::range(i0, i0 + n)), P2, ComplexType(1.0), S2);
       }
       Timer.stop("Sigma_transform");
+    }
+
+    if constexpr (MEM != HOST_MEMORY) {   // device: one copy + one all_reduce of [N_k, N_zeta, nb, nb] per leg
+      Timer.start("Sigma_allreduce");
+      nda::array<ComplexType, 4> S_h = memory::to_memory_space<HOST_MEMORY>(Sig_m);
+      comm.all_reduce_in_place_n(S_h.data(), S_h.size(), std::plus<>{});
+      for (long ik = 0; ik < nk; ++ik)
+        for (long iz = 0; iz < nz; ++iz) {
+          if (leg.transposed) Sigma(ik, iz, all, all) += nda::transpose(S_h(ik, iz, all, all));
+          else Sigma(ik, iz, all, all) += S_h(ik, iz, all, all);
+        }
+      Timer.stop("Sigma_allreduce");
     }
   }
 }

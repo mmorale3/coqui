@@ -31,11 +31,12 @@
  *   F = V_H + Sigma_x   hartree_exchange<HOST> vs <DEVICE>
  * Gate: max|dev - host| / max|host| <= 1e-12 for each. Host and device timers are printed side by side (rank 0).
  *
- * [.bench] (hidden): one Pi -> W -> Sigma -> F pass in the memory space of the build (device if ENABLE_DEVICE, unless
- * COQUI_GWLINE_BENCH_HOST=1) on a larger THC: COQUI_GWLINE_BENCH_DIR / _PREFIX (h5 input, default the si_kp222_nbnd60
- * data set of the project), COQUI_GWLINE_BENCH_NP (nIpts, default 640), COQUI_GWLINE_BENCH_TCHUNK (default 0: the
- * kernels' automatic choice). [device] uses t_chunk 8 on the host and COQUI_GWLINE_DEV_TCHUNK (default 0 = automatic)
- * on the device. Prints per-phase times, the plan 6.7 memory model and the device high-water mark.
+ * [.bench] (hidden; deliberately NOT tagged [gw_line], since Catch2 runs hidden tests matched by a tag filter): one
+ * Pi -> W -> Sigma -> F pass in the memory space of the build (device if ENABLE_DEVICE, unless COQUI_GWLINE_BENCH_HOST=1)
+ * on a larger THC: COQUI_GWLINE_BENCH_DIR / _PREFIX (h5 input, default the si_kp222_nbnd60 data set of the project),
+ * COQUI_GWLINE_BENCH_NP (nIpts, default 640), COQUI_GWLINE_BENCH_TCHUNK (default 0: the kernels' automatic choice).
+ * Prints per-phase times, the plan 6.7 memory model and the device high-water mark.
+ * [device] uses t_chunk 8 on the host and COQUI_GWLINE_DEV_TCHUNK (default 0 = automatic) on the device.
  */
 
 #undef NDEBUG
@@ -429,7 +430,7 @@ void run_bench() {
 
 } // namespace
 
-TEST_CASE("gw_line_bench", "[gw_line][.bench]") {
+TEST_CASE("gw_line_bench", "[.bench]") {
 #if defined(ENABLE_DEVICE)
   if (env_or("COQUI_GWLINE_BENCH_HOST", "0") != "1") {
     run_bench<DEVICE_MEMORY>();

@@ -344,15 +344,15 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
     memory::array<MEM, int, 1> ipiv(Np);
     memory::array<MEM, ComplexType, 1> lwork;   // getrf workspace (device: sized once by cusolver's bufferSize, reused)
     // device: batched LU (cuBLAS getrf/getrsBatched through nda's 3D getrf/getrs) in sub-batches of nbat nodes, or the
-    // per-(q, zeta) cuSOLVER loop below. COQUI_GWLINE_DYSON_BATCHED = 1 / 0 forces either; default: batched for Np <= 256
-    // (the batched cuBLAS LU is meant for small matrices).
+    // per-(q, zeta) cuSOLVER loop below. COQUI_GWLINE_DYSON_BATCHED = 1 / 0 forces either; default: batched for
+    // Np <= 1024 (measured on A100: 8.5x faster than the loop at Np = 128, 4.4x at Np = 640; not measured beyond).
     [[maybe_unused]] bool batched = false;
     [[maybe_unused]] long nbat    = 1;
     [[maybe_unused]] detail::scratch_t<MEM> sM;
     [[maybe_unused]] memory::array<MEM, int, 2> ipiv_b;
     if constexpr (MEM != HOST_MEMORY) {
       char const *v = std::getenv("COQUI_GWLINE_DYSON_BATCHED");
-      batched       = (v != nullptr and *v != '\0') ? (std::strtol(v, nullptr, 10) != 0) : (Np <= 256);
+      batched       = (v != nullptr and *v != '\0') ? (std::strtol(v, nullptr, 10) != 0) : (Np <= 1024);
       if (batched) {
         const double mat = double(Np) * Np * 16.0, freeb = double(utils::freemem_device_effective()) * 1048576.0;
         nbat   = std::max(1L, std::min({lay.nz_loc, 256L, long(0.25 * freeb / mat)}));

@@ -76,7 +76,7 @@ struct scratch_t {
 
 /**
  * Time-chunk length on the device: the largest chunk whose per-chunk arrays (bytes_per_t each) fit in `frac` of the
- * effective free device memory, clamped to [8, min(nt, tmax)]. Host: 8 (the measured CPU optimum of S3-S5).
+ * effective free device memory, clamped to [8, min(nt, tmax)]. Host: 8 (the S3-S5 setting).
  */
 template <MEMORY_SPACE MEM>
 long auto_t_chunk(long nt, double bytes_per_t, double frac = 0.4, long tmax = 256) {
