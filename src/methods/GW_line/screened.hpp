@@ -295,8 +295,10 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
   }
   bosonic_fit_t fit(basis, basis.zeta_nodes);
   const long k = fit.k;
+  // the fit buffer Y holds k x bc: the block columns are processed in chunks of bc so that Y stays <= 1/64 of the Pi group
+  const long bc = std::clamp(long(double(g) * nz * blk / (64.0 * double(std::max(k, 1L)))), std::min(blk, 4096L), blk);
   arr2_t U1H = memory::to_memory_space<MEM>(fit.U1H), U2H = memory::to_memory_space<MEM>(fit.U2H),
-         VS = memory::to_memory_space<MEM>(fit.VS), Y(k, blk);
+         VS = memory::to_memory_space<MEM>(fit.VS), Y(k, bc);
 
   // sub-step plan (w_plan_t); device: the zeta sub-slab is capped so that its block + whole-matrix buffers take <= 40% of
   // the free device memory left after the W^T rows (min over ranks: the plan must be identical everywhere)
@@ -439,9 +441,13 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
       auto W2       = nda::reshape(Pi(ql, all, all, all), std::array<long, 2>{nz, blk});
       auto WT2      = nda::reshape(WT(p, all, all, all), std::array<long, 2>{nz, blk});
       auto w2       = nda::reshape(w(q0 + ql, all, all, all), std::array<long, 2>{r, blk});
-      nda::blas::gemm(ComplexType(1.0), U1H, W2, ComplexType(0.0), Y);
-      nda::blas::gemm(ComplexType(1.0), U2H, WT2, ComplexType(1.0), Y);
-      nda::blas::gemm(ComplexType(1.0), VS, Y, ComplexType(0.0), w2);
+      for (long c0 = 0; c0 < blk; c0 += bc) {
+        const auto cr = nda::range(c0, std::min(blk, c0 + bc));
+        auto Yc       = Y(all, nda::range(cr.size()));
+        nda::blas::gemm(ComplexType(1.0), U1H, W2(all, cr), ComplexType(0.0), Yc);
+        nda::blas::gemm(ComplexType(1.0), U2H, WT2(all, cr), ComplexType(1.0), Yc);
+        nda::blas::gemm(ComplexType(1.0), VS, Yc, ComplexType(0.0), w2(all, cr));
+      }
     }
     if constexpr (MEM != HOST_MEMORY) {
       utils::device_sync();

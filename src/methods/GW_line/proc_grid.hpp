@@ -156,7 +156,7 @@ struct dyson_layout_t {
  * Per sub-step: Pi rows -> block buffer Tb (n_act, nzs, nP, nQ) -> whole-matrix buffer D (Dyson IN PLACE, giving W^T) ->
  * Tb (W^T blocks) -> WT rows; D transposed in place (W) -> Tb -> Pi rows (W blocks). After the zeta loop, the fit of the
  * n_act q's reads W (Pi rows) and W^T (WT). Held besides the resident set: WT (n_act N_zeta blk), Tb (n_act nzs blk),
- * D (ceil(nzs / np_z) Np^2), the Dyson scratch, the fit buffer Y (k blk) and the redistribute staging.
+ * D (ceil(nzs / np_z) Np^2), the Dyson scratch, the fit buffer Y (k x a column chunk, <= S/64) and the redistribute staging.
  * nzs: the largest value that keeps Tb + D within max(S/8, S - WT) (S = g N_zeta blk, the Pi group), >= np_z; the env
  * COQUI_GWLINE_W_ZSUB forces it, nzs_cap (device: from the free memory) caps it. Must be identical on all ranks (callers
  * reduce nzs_cap with a min over the communicator).
@@ -196,10 +196,10 @@ struct w_plan_t {
   long n_zsub() const { return (lay.nz + nzs - 1) / nzs; }
   /// per-rank bytes held by the W stage besides the resident set (k_fit: rows of the fit buffer, nbat: Dyson scratch
   /// matrices, staging: redistribute staging bytes)
-  double transient_bytes(long k_fit, long nbat, double staging) const {
+  double transient_bytes(double k_fit, long nbat, double staging) const {
     const double N2 = double(lay.Np) * lay.Np, nzl = double((nzs + lay.np_z - 1) / lay.np_z);
     return 16.0 * (double(lay.np_q) * lay.nz * blk + double(lay.np_q) * nzs * blk + nzl * N2 + double(nbat) * N2 +
-                   double(k_fit) * blk) + staging;
+                   k_fit * blk) + staging;
   }
   void log() const {
     app_log(3, "  gw_line W sub-steps: {} q sub-steps (<= {} q per step, one per q pool) x {} zeta sub-slabs of <= {} nodes",
@@ -221,7 +221,9 @@ inline double aux_grid_t::log(long nk, long nq, long nzeta, long r_b, long t_chu
   w_plan_t plan(lay, mb);
   const long nbat     = device_fused ? std::min((plan.nzs + lay.np_z - 1) / lay.np_z, 256L) : 1L;
   const double stg    = std::min(2.0 * GB, 2.0 * 16.0 * double(lay.np_q) * plan.nzs * mb);
-  const double w_t    = plan.transient_bytes(nzeta, nbat, np > 1 ? stg : 0.0);
+  // fit buffer (screened_interaction): k x bc with bc = clamp(S / (64 k), min(blk, 4096), blk); in units of blk (k <= N_zeta)
+  const double kfit   = std::min(double(nzeta), std::max(double(g) * nzeta / 64.0, double(nzeta) * std::min(mb, 4096L) / double(mb)));
+  const double w_t    = plan.transient_bytes(kfit, nbat, np > 1 ? stg : 0.0);
   const double res    = z + w + pig + xsl;
   const double peak   = res + std::max({pi_t, w_t, sg_t});
   app_log(2, "  gw_line aux grid: {} ranks -> (P,Q) = ({} x {}), Np = {}, block <= {} x {} ({:.3f} MB)", np, np_P, np_Q, Np,
