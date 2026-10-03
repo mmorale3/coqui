@@ -34,6 +34,9 @@
  * wp 0.11, K 8, tol_gram 1e-10, nphi 8, mixing 0.5, t_chunk 8, ray_decades 36.
  * [restart] 2 iterations + restart + 1 vs 3 uninterrupted iterations: bitwise identical mu, poles, F, Sigma at the nodes;
  *   spectra written by the restarted run and again by a restart with nothing left to iterate (niter reached): identical.
+ * [parity] 6 iterations vs the python driver on the same THC/H0/KS data (coqui/cayley/scripts/gen_lih222_scf_ref.py ->
+ *   tests/unit_test_files/gw_line/lih222_scf_ref.h5): mu and QP gap per iteration within 1 meV, Sigma at the stored nodes
+ *   of k = 0 within 1e-5 relative (max norm over the stored nodes), per iteration.
  */
 
 #undef NDEBUG
@@ -418,3 +421,76 @@ TEST_CASE("gw_line_scf_restart", "[gw_line][scf][restart]") {
   remove_file(comm, fa + ".gw_line.h5");
   remove_file(comm, fb + ".gw_line.h5");
 }
+
+TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
+  const std::string ref = gw_line_dir() + "lih222_scf_ref.h5";
+  if (not std::filesystem::exists(ref)) {
+    app_log(1, "[parity] {} not found: run coqui/cayley/scripts/gen_lih222_scf_ref.py", ref);
+    FAIL("missing python reference");
+  }
+  lih_t L;
+  auto &comm = L.mpi->comm;
+  // reference
+  nda::array<double, 1> mu_r, gap_r, nel_r, dS_r;
+  nda::array<long, 1> idx;
+  nda::array<ComplexType, 4> Sig_r;   // (niter, n_sel, nb, nb), total Sigma at k = 0
+  long niter = 0;
+  {
+    h5::file f(ref, 'r');
+    h5::group g(f);
+    nda::h5_read(g, "mu", mu_r);
+    nda::h5_read(g, "gap", gap_r);
+    nda::h5_read(g, "nelec", nel_r);
+    nda::h5_read(g, "dSigma", dS_r);
+    nda::h5_read(g, "node_index", idx);
+    nda::array<double, 4> re, im;
+    nda::h5_read(g, "Sigma_k0_re", re);
+    nda::h5_read(g, "Sigma_k0_im", im);
+    Sig_r = nda::array<ComplexType, 4>(re.shape());
+    for (long a = 0; a < re.size(); ++a) Sig_r.data()[a] = ComplexType(re.data()[a], im.data()[a]);
+    niter = mu_r.size();
+  }
+  const std::string fo = "gw_line_parity";
+  auto t0 = std::chrono::steady_clock::now();
+  auto R  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fo, niter, false));
+  const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  REQUIRE(long(R.history.size()) == niter);
+  const long nb = R.F.extent(1);
+  app_log(1, "[parity] ranks {}, {} iterations in {:.1f} s ({} stored nodes of k = 0)", comm.size(), niter, dt, idx.size());
+  app_log(1, "  iter |   mu C++ (Ha)    mu py (Ha)   d(meV) |  gap C++ (eV)  gap py (eV)  d(meV) |  N C++      N py     |  "
+             "dSigma C++  dSigma py | Sigma rel");
+  bool ok = true;
+  for (long it = 0; it < niter; ++it) {
+    nda::array<ComplexType, 4> Sp, Sh;
+    if (comm.root()) {
+      h5::file f(fo + ".gw_line.h5", 'r');
+      h5::group g(f);
+      auto gi = g.open_group("scf_line/iter" + std::to_string(it + 1));
+      nda::h5_read(gi, "Sigma_p", Sp);
+      nda::h5_read(gi, "Sigma_h", Sh);
+    }
+    std::array<long, 4> shp{};
+    if (comm.root()) shp = Sp.shape();
+    comm.broadcast_n(shp.data(), 4, 0);
+    if (not comm.root()) { Sp.resize(shp); Sh.resize(shp); }
+    comm.broadcast_n(Sp.data(), Sp.size(), 0);
+    comm.broadcast_n(Sh.data(), Sh.size(), 0);
+    double dmax = 0.0, smax = 0.0;
+    for (long n = 0; n < idx.size(); ++n)
+      for (long i = 0; i < nb; ++i)
+        for (long j = 0; j < nb; ++j) {
+          const ComplexType s = Sp(0, idx(n), i, j) + Sh(0, idx(n), i, j);
+          dmax = std::max(dmax, std::abs(s - Sig_r(it, n, i, j)));
+          smax = std::max(smax, std::abs(Sig_r(it, n, i, j)));
+        }
+    auto const &h     = R.history[it];
+    const double dmu  = (h.mu - mu_r(it)) * 27.211386e3, dgap = (h.gap - gap_r(it)) * 27.211386e3;
+    app_log(1, "  {:4d} | {:.8f}  {:.8f}  {:+7.3f} | {:.6f}     {:.6f}    {:+7.3f} | {:.6f}  {:.6f} | {:.3e}  {:.3e} | {:.2e}",
+            it + 1, h.mu, mu_r(it), dmu, h.gap * 27.211386, gap_r(it) * 27.211386, dgap, h.nelec, nel_r(it), h.dSigma, dS_r(it),
+            dmax / smax);
+    ok = ok and std::abs(dmu) < 1.0 and std::abs(dgap) < 1.0 and dmax / smax < 1e-5;
+  }
+  REQUIRE(ok);
+  remove_file(comm, fo + ".gw_line.h5");
+}
+
