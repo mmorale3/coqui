@@ -34,9 +34,15 @@
  * wp 0.11, K 8, tol_gram 1e-10, nphi 8, mixing 0.5, t_chunk 8, ray_decades 36.
  * [restart] 2 iterations + restart + 1 vs 3 uninterrupted iterations: bitwise identical mu, poles, F, Sigma at the nodes;
  *   spectra written by the restarted run and again by a restart with nothing left to iterate (niter reached): identical.
+ *   Both time grids (S7b): time_grid = "id" (time-node ID, the default) and "gl" (Gauss-Legendre rays).
  * [parity] 6 iterations vs the python driver on the same THC/H0/KS data (coqui/cayley/scripts/gen_lih222_scf_ref.py ->
  *   tests/unit_test_files/gw_line/lih222_scf_ref.h5): mu and QP gap per iteration within 1 meV, Sigma at the stored nodes
- *   of k = 0 within 1e-5 relative (max norm over the stored nodes), per iteration.
+ *   of k = 0 within 1e-5 relative (max norm over the stored nodes), per iteration. Pinned to time_grid = "gl" (python
+ *   uses the GL ray quadrature).
+ * [id_vs_gl] (S7b) 4 iterations with time_grid = "id" (time_eps = eps = 1e-8, and 1e-10) vs "gl": |dmu|, |dgap| and
+ *   max|dSigma| / max|Sigma| at all nodes and k per iteration.
+ * [.time_id_poles] (hidden diagnostic) kernels on the poles of a checkpoint iteration (GW_LINE_DIAG_FILE, GW_LINE_DIAG_ITER):
+ *   default GL rays and ID grids (time_eps 1e-8/1e-10/1e-12, pad 1.25/2) vs a refined GL reference.
  */
 
 #undef NDEBUG
@@ -44,11 +50,13 @@
 #include "catch2/catch.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <complex>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "mpi3/communicator.hpp"
@@ -73,6 +81,12 @@
 #include "numerics/line_dlr/cayley.hpp"
 #include "methods/GW_line/line_state.hpp"
 #include "methods/GW_line/closure.hpp"
+#include "methods/GW_line/proc_grid.hpp"
+#include "methods/GW_line/propagators.hpp"
+#include "methods/GW_line/polarization.hpp"
+#include "methods/GW_line/screened.hpp"
+#include "methods/GW_line/self_energy.hpp"
+#include "methods/GW_line/time_grids.hpp"
 
 namespace {
 
@@ -265,8 +279,9 @@ struct lih_t {
 };
 
 /// small settings shared by the restart and parity tests (and by gen_lih222_scf_ref.py)
-ptree scf_params(std::string const &output, long niter, bool restart) {
+ptree scf_params(std::string const &output, long niter, bool restart, std::string const &time_grid = "id") {
   ptree pt;
+  pt.put("time_grid", time_grid);
   pt.put("theta_deg", 20.0);
   pt.put("eps", 1e-8);
   pt.put("lam", 6.0);
@@ -363,15 +378,16 @@ TEST_CASE("gw_line_dump_lih222", "[.gw_line_dump]") {
   app_log(1, "wrote {} (Np {}) and system.h5 (mu0 {:.8f}, nelec {})", lih_thc_file(), thc.Np(), 0.5 * (homo + lumo), mf->nelec());
 }
 
-TEST_CASE("gw_line_scf_restart", "[gw_line][scf][restart]") {
+namespace {
+void restart_test(std::string const &tg) {
   lih_t L;
   auto &comm = L.mpi->comm;
-  const std::string fa = "gw_line_rsA", fb = "gw_line_rsB";
+  const std::string fa = "gw_line_rsA_" + tg, fb = "gw_line_rsB_" + tg;
   auto t0 = std::chrono::steady_clock::now();
-  auto A  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fa, 3, false));
+  auto A  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fa, 3, false, tg));
   auto t1 = std::chrono::steady_clock::now();
-  auto B2 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fb, 2, false));
-  auto pb = scf_params(fb, 3, true);
+  auto B2 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fb, 2, false, tg));
+  auto pb = scf_params(fb, 3, true, tg);
   enable_spectra(pb, 41);
   auto B3 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pb);
   auto t2 = std::chrono::steady_clock::now();
@@ -381,13 +397,21 @@ TEST_CASE("gw_line_scf_restart", "[gw_line][scf][restart]") {
   const double dmu = std::abs(A.mu - B3.mu), dpo = maxdiff_poles(A.poles, B3.poles);
   const double dF  = nda::max_element(nda::abs(A.F - B3.F));
   const double dSp = nda::max_element(nda::abs(A.Sig_p - B3.Sig_p)), dSh = nda::max_element(nda::abs(A.Sig_h - B3.Sig_h));
-  app_log(1, "[restart] ranks {}: 3 iterations ({:.1f} s) vs 2 + restart + 1 ({:.1f} s): |dmu| {:.1e}, poles {:.1e}, F {:.1e}, "
-             "Sigma_p {:.1e}, Sigma_h {:.1e}",
-          comm.size(), std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count(), dmu, dpo,
+  app_log(1, "[restart] time_grid {}, ranks {}: 3 iterations ({:.1f} s) vs 2 + restart + 1 ({:.1f} s): |dmu| {:.1e}, poles "
+             "{:.1e}, F {:.1e}, Sigma_p {:.1e}, Sigma_h {:.1e}",
+          tg, comm.size(), std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count(), dmu, dpo,
           dF, dSp, dSh);
-  for (long i = 0; i < 3; ++i)
-    app_log(1, "  iter {}: mu {:.10f} / {:.10f}  gap {:.8f} / {:.8f}  dSigma {:.3e} / {:.3e}", i + 1, A.history[i].mu,
-            B3.history[i].mu, A.history[i].gap, B3.history[i].gap, A.history[i].dSigma, B3.history[i].dSigma);
+  for (long i = 0; i < 3; ++i) {
+    app_log(1, "  iter {}: mu {:.10f} / {:.10f}  gap {:.8f} / {:.8f}  dSigma {:.3e} / {:.3e}  t-nodes ({}) {}+{} {}+{}", i + 1,
+            A.history[i].mu, B3.history[i].mu, A.history[i].gap, B3.history[i].gap, A.history[i].dSigma, B3.history[i].dSigma,
+            B3.history[i].time_grid, B3.history[i].nt_pi_p, B3.history[i].nt_pi_h, B3.history[i].nt_sig_p,
+            B3.history[i].nt_sig_h);
+    // the restored history carries the time grid and the node counts
+    REQUIRE(B3.history[i].time_grid == tg);
+    REQUIRE(B3.history[i].nt_pi_p == A.history[i].nt_pi_p);
+    REQUIRE(B3.history[i].nt_sig_h == A.history[i].nt_sig_h);
+    REQUIRE(A.history[i].nt_pi_p > 0);
+  }
   REQUIRE(dmu == 0.0);
   REQUIRE(dpo == 0.0);
   REQUIRE(dF == 0.0);
@@ -421,6 +445,12 @@ TEST_CASE("gw_line_scf_restart", "[gw_line][scf][restart]") {
   remove_file(comm, fa + ".gw_line.h5");
   remove_file(comm, fb + ".gw_line.h5");
 }
+} // namespace
+
+TEST_CASE("gw_line_scf_restart", "[gw_line][scf][restart]") {
+  SECTION("time_grid id") { restart_test("id"); }
+  SECTION("time_grid gl") { restart_test("gl"); }
+}
 
 TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
   const std::string ref = gw_line_dir() + "lih222_scf_ref.h5";
@@ -452,7 +482,7 @@ TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
   }
   const std::string fo = "gw_line_parity";
   auto t0 = std::chrono::steady_clock::now();
-  auto R  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fo, niter, false));
+  auto R  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fo, niter, false, "gl"));
   const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   REQUIRE(long(R.history.size()) == niter);
   const long nb = R.F.extent(1);
@@ -494,3 +524,191 @@ TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
   remove_file(comm, fo + ".gw_line.h5");
 }
 
+
+namespace {
+/// total Sigma at all k and nodes of iteration it from a checkpoint (root reads, broadcast)
+nda::array<ComplexType, 4> read_sigma_total(boost::mpi3::communicator &comm, std::string const &file, long it) {
+  nda::array<ComplexType, 4> Sp, Sh;
+  if (comm.root()) {
+    h5::file f(file, 'r');
+    h5::group g(f);
+    auto gi = g.open_group("scf_line/iter" + std::to_string(it));
+    nda::h5_read(gi, "Sigma_p", Sp);
+    nda::h5_read(gi, "Sigma_h", Sh);
+    Sp += Sh;
+  }
+  std::array<long, 4> shp{};
+  if (comm.root()) shp = Sp.shape();
+  comm.broadcast_n(shp.data(), 4, 0);
+  if (not comm.root()) Sp.resize(shp);
+  comm.broadcast_n(Sp.data(), Sp.size(), 0);
+  return Sp;
+}
+} // namespace
+
+TEST_CASE("gw_line_scf_id_vs_gl", "[gw_line][scf][id_vs_gl]") {
+  lih_t L;
+  auto &comm       = L.mpi->comm;
+  const long niter = 4;
+  const double meV = 27.211386e3;
+  struct run_t {
+    std::string name, file;
+    methods::gw_line::gw_line_result_t R;
+    double time = 0.0;
+  };
+  std::vector<run_t> runs;
+  for (auto const &[nm, tg, teps] : std::vector<std::tuple<std::string, std::string, double>>{
+           {"gl", "gl", 0.0}, {"id(1e-8)", "id", 1e-8}, {"id(1e-10)", "id", 1e-10}}) {
+    run_t r;
+    r.name = nm;
+    r.file = "gw_line_idgl_" + std::to_string(runs.size());
+    auto pt = scf_params(r.file, niter, false, tg);
+    if (teps > 0.0) pt.put("time_eps", teps);
+    auto t0 = std::chrono::steady_clock::now();
+    r.R     = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
+    r.time  = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    REQUIRE(long(r.R.history.size()) == niter);
+    runs.push_back(std::move(r));
+  }
+  auto const &G = runs[0];
+  app_log(1, "[id_vs_gl] lih222, test settings (eps 1e-8, K 8), ranks {}: {} iterations, wall gl {:.1f} s, id(1e-8) {:.1f} s, "
+             "id(1e-10) {:.1f} s",
+          comm.size(), niter, runs[0].time, runs[1].time, runs[2].time);
+  app_log(1, "  run        iter | t-nodes Pi    Sigma   |   mu (Ha)       dmu vs gl (meV) |  gap (eV)   dgap vs gl (meV) | "
+             "max|dSigma|/max|Sigma| vs gl");
+  for (long ir = 0; ir < long(runs.size()); ++ir) {
+    auto const &r = runs[ir];
+    for (long it = 0; it < niter; ++it) {
+      auto const &h = r.R.history[it];
+      auto Sg       = read_sigma_total(comm, G.file + ".gw_line.h5", it + 1);
+      auto Sr       = read_sigma_total(comm, r.file + ".gw_line.h5", it + 1);
+      const double ds = nda::max_element(nda::abs(Sr - Sg)) / nda::max_element(nda::abs(Sg));
+      const double dmu = (h.mu - G.R.history[it].mu) * meV, dgap = (h.gap - G.R.history[it].gap) * meV;
+      app_log(1, "  {:<10s} {:4d} | {:4d}+{:<4d} {:4d}+{:<4d} | {:.8f}  {:+10.4f}     | {:.6f}   {:+10.4f}      | {:.2e}", r.name,
+              it + 1, h.nt_pi_p, h.nt_pi_h, h.nt_sig_p, h.nt_sig_h, h.mu, dmu, h.gap * 27.211386, dgap, ds);
+      if (ir == 0) continue;
+      REQUIRE(h.time_grid == "id");
+      // Sigma at the nodes: ID error (~ time_eps) amplified by the SCF; mu / gap: first two iterations <= 0.1 meV
+      // (later iterations inherit the closure's representation sensitivity, S6: meV-level for O(1e-7) changes)
+      // iteration 1 (same KS poles): the kernel ID error only. Later iterations: the poles are the gapless compressed
+      // representation (near-zero poles with large signed residues, max|Pi| ~ 1e4 at the smallest bosonic nodes), which
+      // amplifies the per-pole ID error ~1e4x in Sigma (diagnostic [.time_id_poles]); measured (2 ranks): id(1e-10)
+      // |dmu|, |dgap| <= 0.04 meV, dSigma <= 2.3e-5; id(1e-8) 0.41 meV, 2e-3.
+      const bool fine = (r.name == "id(1e-10)");
+      const double teps = fine ? 1e-10 : 1e-8;
+      if (it == 0) {
+        REQUIRE(ds <= 10.0 * teps);
+        REQUIRE(std::abs(dmu) <= 1e-3);
+        REQUIRE(std::abs(dgap) <= 1e-3);
+      } else {
+        REQUIRE(ds <= (fine ? 1e-4 : 1e-2));
+        REQUIRE(std::abs(dmu) <= (fine ? 0.1 : 1.0));
+        REQUIRE(std::abs(dgap) <= (fine ? 0.1 : 1.0));
+      }
+    }
+  }
+  for (auto const &r : runs) remove_file(comm, r.file + ".gw_line.h5");
+}
+
+/// Diagnostic (hidden): kernels on the poles of a checkpoint iteration (GW_LINE_DIAG_FILE, GW_LINE_DIAG_ITER), default GL
+/// rays and ID grids vs a refined GL reference (ray_decades 60, smin 1e-7, 6 panels/e-fold, 24 nodes/panel).
+TEST_CASE("gw_line_time_id_poles", "[.time_id_poles]") {
+  using namespace methods::gw_line;
+  using numerics::line_dlr::time_ray_t;
+  using numerics::line_dlr::sector_t;
+  const char *fenv = std::getenv("GW_LINE_DIAG_FILE");
+  if (fenv == nullptr) return;
+  const long iter = std::getenv("GW_LINE_DIAG_ITER") ? std::atol(std::getenv("GW_LINE_DIAG_ITER")) : 1;
+  lih_t L;
+  auto &mpi  = *L.mpi;
+  auto &comm = mpi.comm;
+  auto &mf   = *L.mf;
+  const long nk = mf.nkpts(), nb = mf.nbnd(), nq = mf.nqpts(), Np = L.thc->Np();
+  pole_data_t pd;
+  pd.nk = nk; pd.nb = nb; pd.part.resize(nk); pd.hole.resize(nk);
+  {
+    h5::file f(fenv, 'r');
+    h5::group g(f);
+    auto pg = g.open_group("scf_line/iter" + std::to_string(iter) + "/poles");
+    for (auto s : {sector_t::particle, sector_t::hole}) {
+      const std::string nm = (s == sector_t::particle) ? "particle" : "hole";
+      nda::array<long, 1> cnt; nda::array<double, 1> e; nda::array<ComplexType, 3> c;
+      nda::h5_read(pg, nm + "_counts", cnt); nda::h5_read(pg, nm + "_e", e); nda::h5_read(pg, nm + "_coef", c);
+      long o = 0;
+      for (long ik = 0; ik < nk; ++ik) {
+        auto &ps = (s == sector_t::particle) ? pd.part[ik] : pd.hole[ik];
+        ps.e    = nda::array<double, 1>(e(nda::range(o, o + cnt(ik))));
+        ps.coef = nda::array<ComplexType, 3>(c(nda::range(o, o + cnt(ik)), nda::range::all, nda::range::all));
+        o += cnt(ik);
+      }
+    }
+  }
+  double cmax = 0.0;
+  for (long ik = 0; ik < nk; ++ik) {
+    for (auto const *ps : {&pd.part[ik], &pd.hole[ik]})
+      for (long m = 0; m < ps->size(); ++m) {
+        double nrm = 0.0;
+        for (long i = 0; i < nb; ++i) nrm = std::max(nrm, std::abs(ps->coef(m, i, i)));
+        cmax = std::max(cmax, nrm);
+      }
+  }
+  const double theta = 20.0 * std::numbers::pi / 180.0, theta_t = 0.5 * theta;
+  numerics::line_dlr::bosonic_basis_t bos(theta, 4.0, 1e-8, 0.02);
+  auto fz = numerics::line_dlr::dense_nodes(theta, 1e-3, 60.0, 120);
+  auto pr = pole_ranges_t::from(pd);
+  app_log(1, "[diag] {} iter {}: poles e^> [{:.2e}, {:.3f}], |e^<| [{:.2e}, {:.3f}], max |coef_ii| {:.2e}, emin {:.2e}", fenv, iter,
+          pr.p_min, pr.p_max, pr.h_min, pr.h_max, cmax, pd.emin());
+  aux_grid_t grid(mpi, Np);
+  dyson_layout_t lay(comm.size(), comm.rank(), nq, bos.zeta_nodes.size(), Np);
+  utils::TimerManager T;
+  coulomb_blocks_t<HOST_MEMORY> Zb(*L.thc, grid, lay.q_rng(), T);
+  propagator_t<HOST_MEMORY> prop(*L.thc, grid);
+  const double emin = pd.emin();
+  time_ray_t rp(theta_t, 60.0 / (emin * std::sin(theta_t)), 1e-7, 6.0, 24, sector_t::particle);
+  time_ray_t rh(theta_t, 60.0 / (emin * std::sin(theta_t)), 1e-7, 6.0, 24, sector_t::hole);
+  auto gp = time_ray_t::for_spectrum(theta_t, emin, 36.0, 1e-5, 3.0, 16, sector_t::particle);
+  auto gh = time_ray_t::for_spectrum(theta_t, emin, 36.0, 1e-5, 3.0, 16, sector_t::hole);
+  auto rel = [&](auto const &A, auto const &B) {
+    double d = 0.0, m = 0.0;
+    for (long i = 0; i < A.size(); ++i) { d = std::max(d, std::abs(A.data()[i] - B.data()[i])); m = std::max(m, std::abs(B.data()[i])); }
+    d = comm.all_reduce_value(d, mpi3::max<>{});
+    m = comm.all_reduce_value(m, mpi3::max<>{});
+    return std::array<double, 2>{d / m, m};
+  };
+  memory::array<HOST_MEMORY, ComplexType, 4> Pr_p, Pr_h, w;
+  nda::array<ComplexType, 4> Sr_p, Sr_h;
+  polarization<HOST_MEMORY>(prop, pd, mf, grid, bos.zeta_nodes, rp, rh, 8, Pr_p, T, sector_t::particle);
+  polarization<HOST_MEMORY>(prop, pd, mf, grid, bos.zeta_nodes, rp, rh, 8, Pr_h, T, sector_t::hole);
+  {
+    memory::array<HOST_MEMORY, ComplexType, 4> Pi = Pr_p;
+    Pi += Pr_h;
+    screened_interaction<HOST_MEMORY>(Pi, Zb, bos, grid, mpi, w, T);
+  }
+  self_energy<HOST_MEMORY>(prop, pd, w, bos, mf, grid, mpi, fz, rp, rh, 8, Sr_p, T, sector_t::particle);
+  self_energy<HOST_MEMORY>(prop, pd, w, bos, mf, grid, mpi, fz, rp, rh, 8, Sr_h, T, sector_t::hole);
+  app_log(1, "  reference GL rays {} nodes; default GL {} nodes", rp.size(), gp.size());
+  auto run = [&](std::string const &nm, numerics::line_dlr::time_nodes_t const &pp, numerics::line_dlr::time_nodes_t const &ph,
+                 numerics::line_dlr::time_nodes_t const &sp, numerics::line_dlr::time_nodes_t const &sh) {
+    memory::array<HOST_MEMORY, ComplexType, 4> Pp, Ph;
+    nda::array<ComplexType, 4> Sp, Sh;
+    polarization<HOST_MEMORY>(prop, pd, mf, grid, bos.zeta_nodes, pp, ph, 8, Pp, T, sector_t::particle);
+    polarization<HOST_MEMORY>(prop, pd, mf, grid, bos.zeta_nodes, pp, ph, 8, Ph, T, sector_t::hole);
+    self_energy<HOST_MEMORY>(prop, pd, w, bos, mf, grid, mpi, fz, sp, sh, 8, Sp, T, sector_t::particle);
+    self_energy<HOST_MEMORY>(prop, pd, w, bos, mf, grid, mpi, fz, sp, sh, 8, Sh, T, sector_t::hole);
+    auto a = rel(Pp, Pr_p), b = rel(Ph, Pr_h), c = rel(Sp, Sr_p), d = rel(Sh, Sr_h);
+    app_log(1, "  {:<10s} nodes Pi {}+{} Sigma {}+{}: vs ref Pi^> {:.2e} (max {:.2e}) Pi^< {:.2e} | Sigma^> {:.2e} (max {:.2e}) "
+               "Sigma^< {:.2e} (max {:.2e})",
+            nm, pp.size(), ph.size(), sp.size(), sh.size(), a[0], a[1], b[0], c[0], c[1], d[0], d[1]);
+  };
+  run("GL", gp, gh, gp, gh);
+  for (double te : {1e-8, 1e-10, 1e-12})
+    for (double pad : {1.25, 2.0}) {
+      numerics::line_dlr::time_id_opts_t o;
+      o.pad = pad;
+      line_time_grids_t tg(pd, bos.nu, theta_t, te, o, bos.zeta_nodes, fz, comm);
+      tg.log(1);
+      char nm[32];
+      std::snprintf(nm, sizeof(nm), "ID %.0e p%.2f", te, pad);
+      run(nm, tg.pi_p, tg.pi_h, tg.sig_p, tg.sig_h);
+    }
+}

@@ -49,6 +49,7 @@
 #include "numerics/line_dlr/line_basis.hpp"
 #include "numerics/line_dlr/bosonic_basis.hpp"
 #include "numerics/line_dlr/time_ray.hpp"
+#include "numerics/line_dlr/time_id.hpp"
 #include "methods/GW_line/proc_grid.hpp"
 #include "methods/GW_line/line_state.hpp"
 #include "methods/GW_line/propagators.hpp"
@@ -58,6 +59,7 @@
 #include "methods/GW_line/static_part.hpp"
 #include "methods/GW_line/closure.hpp"
 #include "methods/GW_line/spectra.hpp"
+#include "methods/GW_line/time_grids.hpp"
 #include "methods/GW_line/driver.hpp"
 
 namespace methods::gw_line {
@@ -65,6 +67,7 @@ namespace methods::gw_line {
 using numerics::line_dlr::bosonic_basis_t;
 using numerics::line_dlr::line_basis_t;
 using numerics::line_dlr::time_ray_t;
+using numerics::line_dlr::time_nodes_t;
 
 static constexpr double HA_EV = 27.211386;
 
@@ -93,6 +96,11 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.t_chunk       = io::get_value_with_default<long>(pt, "t_chunk", p.t_chunk);
   p.ray_decades   = io::get_value_with_default<double>(pt, "ray_decades", p.ray_decades);
   p.restart       = io::get_value_with_default<bool>(pt, "restart", p.restart);
+  p.time_grid     = io::get_value_with_default<std::string>(pt, "time_grid", p.time_grid);
+  io::tolower(p.time_grid);
+  p.time_eps        = io::get_value_with_default<double>(pt, "time_eps", p.eps);
+  p.time_pad        = io::get_value_with_default<double>(pt, "time_pad", p.time_pad);
+  p.time_oversample = io::get_value_with_default<double>(pt, "time_oversample", p.time_oversample);
   {
     auto o = pt.get_optional<std::string>("output");
     if (o and not o->empty()) p.output = *o;
@@ -120,6 +128,10 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   utils::check(p.K >= 1 and p.nphi >= 1 and p.wp > 0.0 and p.tol_gram > 0.0, "gw_line: invalid closure parameters");
   utils::check(p.niter >= 0 and p.t_chunk >= 1 and p.ray_decades > 0.0, "gw_line: invalid niter / t_chunk / ray_decades");
   utils::check(p.mixing > 0.0 and p.mixing <= 1.0, "gw_line: mixing must be in (0, 1]");
+  utils::check(p.time_grid == "id" or p.time_grid == "gl", "gw_line: time_grid must be \"id\" or \"gl\" (got \"{}\")",
+               p.time_grid);
+  utils::check(p.time_eps > 0.0 and p.time_eps < 1.0 and p.time_pad >= 1.0 and p.time_oversample >= 1.0,
+               "gw_line: need 0 < time_eps < 1, time_pad >= 1, time_oversample >= 1");
   return p;
 }
 
@@ -133,6 +145,11 @@ void gw_line_params_t::log() const {
   app_log(1, "    closure: wp = {} Ha, K = {}, tol_gram = {:.1e}, nphi = {}", wp, K, tol_gram, nphi);
   app_log(1, "    niter = {} (total), mixing = {}, conv_thr = {:.1e}, t_chunk = {}, ray_decades = {}", niter, mixing, conv_thr,
           t_chunk, ray_decades);
+  if (time_grid == "id")
+    app_log(1, "    time grid: ID (time_eps = {:.1e}, time_pad = {}, time_oversample = {}), rebuilt every iteration", time_eps,
+            time_pad, time_oversample);
+  else
+    app_log(1, "    time grid: GL rays (ray_decades = {}, 3 panels/e-fold, 16 nodes/panel)", ray_decades);
   app_log(1, "    restart = {}, checkpoint = {}.gw_line.h5", restart, output);
   if (do_spectra) {
     std::string e;
@@ -283,6 +300,11 @@ void write_history(h5::group &g, gw_line_iter_t const &r) {
   h5::h5_write(hg, "sigma_gap_p", r.sigma_gap_p);
   h5::h5_write(hg, "sigma_gap_h", r.sigma_gap_h);
   h5::h5_write(hg, "time", r.time);
+  h5::h5_write(hg, "time_grid", r.time_grid);
+  h5::h5_write(hg, "nt_pi_p", r.nt_pi_p);
+  h5::h5_write(hg, "nt_pi_h", r.nt_pi_h);
+  h5::h5_write(hg, "nt_sigma_p", r.nt_sig_p);
+  h5::h5_write(hg, "nt_sigma_h", r.nt_sig_h);
 }
 
 gw_line_iter_t read_history(h5::group &g) {
@@ -306,6 +328,13 @@ gw_line_iter_t read_history(h5::group &g) {
   h5::h5_read(hg, "sigma_gap_p", r.sigma_gap_p);
   h5::h5_read(hg, "sigma_gap_h", r.sigma_gap_h);
   h5::h5_read(hg, "time", r.time);
+  if (hg.has_dataset("time_grid")) {   // absent in S6 checkpoints (GL rays)
+    h5::h5_read(hg, "time_grid", r.time_grid);
+    h5::h5_read(hg, "nt_pi_p", r.nt_pi_p);
+    h5::h5_read(hg, "nt_pi_h", r.nt_pi_h);
+    h5::h5_read(hg, "nt_sigma_p", r.nt_sig_p);
+    h5::h5_read(hg, "nt_sigma_h", r.nt_sig_h);
+  }
   return r;
 }
 
@@ -329,6 +358,10 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "conv_thr", p.conv_thr);
   h5::h5_write(ig, "t_chunk", p.t_chunk);
   h5::h5_write(ig, "ray_decades", p.ray_decades);
+  h5::h5_write(ig, "time_grid", p.time_grid);
+  h5::h5_write(ig, "time_eps", p.time_eps);
+  h5::h5_write(ig, "time_pad", p.time_pad);
+  h5::h5_write(ig, "time_oversample", p.time_oversample);
   nda::h5_write(ig, "fermionic_nodes", zeta, false);
 }
 
@@ -401,14 +434,15 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     st.poles = read_poles(it, nk, nb);
     utils::check(st.F.extent(0) == nk and st.F.extent(1) == nb, "gw_line restart: F shape mismatch");
     nhist = st.iter;
-    hist  = nda::array<double, 2>(nhist, 18);
+    hist  = nda::array<double, 2>(nhist, 23);
     for (long i = 1; i <= st.iter; ++i) {
       auto gi = sg.open_group("iter" + std::to_string(i));
       auto r  = read_history(gi);
-      double v[18] = {double(r.iter), r.dSigma, r.mu, r.dmu, r.gap, r.e_homo, r.e_lumo, r.nelec, r.nelec_lehmann, r.N_mu,
+      double v[23] = {double(r.iter), r.dSigma, r.mu, r.dmu, r.gap, r.e_homo, r.e_lumo, r.nelec, r.nelec_lehmann, r.N_mu,
                       r.dropped, r.heldout_max, double(r.npoles_min), double(r.npoles_max), r.bos_gap, r.sigma_gap_p,
-                      r.sigma_gap_h, r.time};
-      for (int j = 0; j < 18; ++j) hist(i - 1, j) = v[j];
+                      r.sigma_gap_h, r.time, r.time_grid == "id" ? 1.0 : 0.0, double(r.nt_pi_p), double(r.nt_pi_h),
+                      double(r.nt_sig_p), double(r.nt_sig_h)};
+      for (int j = 0; j < 23; ++j) hist(i - 1, j) = v[j];
     }
   }
   std::array<double, 7> sc = {double(st.iter), st.mu, st.mu_sigma, st.dmu, st.e_homo, st.e_lumo, st.have_sigma ? 1.0 : 0.0};
@@ -435,6 +469,9 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     r.e_lumo = hist(i, 6); r.nelec = hist(i, 7); r.nelec_lehmann = hist(i, 8); r.N_mu = hist(i, 9); r.dropped = hist(i, 10);
     r.heldout_max = hist(i, 11); r.npoles_min = long(std::llround(hist(i, 12))); r.npoles_max = long(std::llround(hist(i, 13)));
     r.bos_gap = hist(i, 14); r.sigma_gap_p = hist(i, 15); r.sigma_gap_h = hist(i, 16); r.time = hist(i, 17);
+    r.time_grid = hist(i, 18) > 0.5 ? "id" : "gl";
+    r.nt_pi_p = long(std::llround(hist(i, 19))); r.nt_pi_h = long(std::llround(hist(i, 20)));
+    r.nt_sig_p = long(std::llround(hist(i, 21))); r.nt_sig_h = long(std::llround(hist(i, 22)));
     history.push_back(r);
   }
   return st;
@@ -463,10 +500,10 @@ void write_spectra(boost::mpi3::communicator &comm, std::string const &file, spe
 void print_line(gw_line_iter_t const &r, double tPi, double tW, double tS, double tC, double tF) {
   app_log(1,
           "iter {:3d}: dSigma {:.2e}  mu {:.6f} (dmu {:+.4f} eV)  QP gap {:.4f} eV  nelec {:.6f} (Lehmann {:.6f}, N(mu) {:.6f}, "
-          "dropped {:.1e})  npoles {}-{}  held-out {:.1e}  [Pi {:.1f}s W {:.1f}s Sigma {:.1f}s closure {:.1f}s F {:.1f}s total "
-          "{:.1f}s]",
+          "dropped {:.1e})  npoles {}-{}  held-out {:.1e}  t-nodes ({}) Pi {}+{} Sigma {}+{}  [Pi {:.1f}s W {:.1f}s Sigma "
+          "{:.1f}s closure {:.1f}s F {:.1f}s total {:.1f}s]",
           r.iter, r.dSigma, r.mu, r.dmu * HA_EV, r.gap * HA_EV, r.nelec, r.nelec_lehmann, r.N_mu, r.dropped, r.npoles_min,
-          r.npoles_max, r.heldout_max, tPi, tW, tS, tC, tF, r.time);
+          r.npoles_max, r.heldout_max, r.time_grid, r.nt_pi_p, r.nt_pi_h, r.nt_sig_p, r.nt_sig_h, tPi, tW, tS, tC, tF, r.time);
 }
 
 } // namespace
@@ -494,8 +531,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
                "gw_line: need an even electron count with 0 < nelec/2 < nbnd (nelec {}, nbnd {})", nelec, nb);
 
   utils::TimerManager Timer;
-  for (auto nm : {"total", "H0", "bases", "phase_Pi", "phase_W", "phase_Sigma", "phase_closure", "phase_F", "checkpoint",
-                  "spectra"})
+  for (auto nm : {"total", "H0", "bases", "time_grid", "phase_Pi", "phase_W", "phase_Sigma", "phase_closure", "phase_F",
+                  "checkpoint", "spectra"})
     Timer.add(nm);
   Timer.start("total");
 
@@ -601,18 +638,38 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   while (st.iter < prm.niter) {
     const auto t0 = std::chrono::steady_clock::now();
     update_bases();
-    const double emin = st.poles.emin();
-    auto ray_p = time_ray_t::for_spectrum(theta_t, emin, prm.ray_decades, 1e-5, 3.0, 16, sector_t::particle);
-    auto ray_h = time_ray_t::for_spectrum(theta_t, emin, prm.ray_decades, 1e-5, 3.0, 16, sector_t::hole);
-    if (st.iter == 0 or res.history.empty())
-      app_log(2, "  rays: emin {:.3e} Ha -> {} + {} time nodes", emin, ray_p.size(), ray_h.size());
+    // time nodes of the ray products: GL rays (both kernels) or the four ID grids of the current poles
+    Timer.start("time_grid");
+    std::optional<time_nodes_t> pi_p, pi_h, sig_p, sig_h;
+    if (prm.time_grid == "gl") {
+      const double emin = st.poles.emin();
+      auto ray_p = time_ray_t::for_spectrum(theta_t, emin, prm.ray_decades, 1e-5, 3.0, 16, sector_t::particle);
+      auto ray_h = time_ray_t::for_spectrum(theta_t, emin, prm.ray_decades, 1e-5, 3.0, 16, sector_t::hole);
+      if (st.iter == 0 or res.history.empty())
+        app_log(2, "  rays: emin {:.3e} Ha -> {} + {} time nodes", emin, ray_p.size(), ray_h.size());
+      pi_p.emplace(ray_p);
+      pi_h.emplace(ray_h);
+      sig_p.emplace(ray_p);
+      sig_h.emplace(ray_h);
+    } else {
+      numerics::line_dlr::time_id_opts_t topt;
+      topt.pad        = prm.time_pad;
+      topt.oversample = prm.time_oversample;
+      line_time_grids_t tg(st.poles, bos->nu, theta_t, prm.time_eps, topt, bos->zeta_nodes, zeta, comm);
+      tg.log(1);
+      pi_p.emplace(tg.pi_p);
+      pi_h.emplace(tg.pi_h);
+      sig_p.emplace(tg.sig_p);
+      sig_h.emplace(tg.sig_h);
+    }
+    Timer.stop("time_grid");
 
     auto tic = [&](char const *nm) { Timer.start(nm); return Timer.elapsed(nm); };
     auto toc = [&](char const *nm, double e0) { Timer.stop(nm); return Timer.elapsed(nm) - e0; };
 
     // 1. Pi at the bosonic nodes, W residues
     double e0 = tic("phase_Pi");
-    polarization<MEM>(prop, st.poles, mf, grid, bos->zeta_nodes, ray_p, ray_h, prm.t_chunk, Pi, Timer);
+    polarization<MEM>(prop, st.poles, mf, grid, bos->zeta_nodes, *pi_p, *pi_h, prm.t_chunk, Pi, Timer);
     const double tPi = toc("phase_Pi", e0);
     e0 = tic("phase_W");
     screened_interaction<MEM>(Pi, Zb, *bos, grid, mpi, w, Timer);
@@ -620,8 +677,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
 
     // 2. Sigma per sector at the dense nodes, mixing
     e0 = tic("phase_Sigma");
-    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, ray_p, ray_h, prm.t_chunk, Sp_new, Timer, sector_t::particle);
-    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, ray_p, ray_h, prm.t_chunk, Sh_new, Timer, sector_t::hole);
+    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer, sector_t::particle);
+    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sh_new, Timer, sector_t::hole);
     double dS = 0.0;
     if (st.have_sigma) {
       const double a = prm.mixing, b = 1.0 - prm.mixing;
@@ -681,6 +738,11 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     rec.bos_gap       = bos->gap;
     rec.sigma_gap_p   = bp->gap[1];
     rec.sigma_gap_h   = bh->gap[0];
+    rec.time_grid     = prm.time_grid;
+    rec.nt_pi_p       = pi_p->size();
+    rec.nt_pi_h       = pi_h->size();
+    rec.nt_sig_p      = sig_p->size();
+    rec.nt_sig_h      = sig_h->size();
     rec.time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     res.history.push_back(rec);
     print_line(rec, tPi, tW, tS, tC, tF);
@@ -719,12 +781,13 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
 
   Timer.stop("total");
   app_log(1, "\n  gw_line timers (s, all iterations of this run):");
-  for (auto nm : {"total", "H0", "bases", "phase_Pi", "phase_W", "phase_Sigma", "phase_closure", "phase_F", "checkpoint",
-                  "spectra"})
+  for (auto nm : {"total", "H0", "bases", "time_grid", "phase_Pi", "phase_W", "phase_Sigma", "phase_closure", "phase_F",
+                  "checkpoint", "spectra"})
     app_log(1, "    {:<20s} {:10.3f}", nm, Timer.elapsed(nm));
   app_log(1, "  kernel sub-timers:");
   for (auto const &nm : Timer.timer_names()) {
-    if (nm == "total" or nm == "H0" or nm == "bases" or nm == "checkpoint" or nm == "spectra" or nm.rfind("phase_", 0) == 0)
+    if (nm == "total" or nm == "H0" or nm == "bases" or nm == "time_grid" or nm == "checkpoint" or nm == "spectra" or
+        nm.rfind("phase_", 0) == 0)
       continue;
     app_log(1, "    {:<20s} {:10.3f}", nm, Timer.elapsed(nm));
   }

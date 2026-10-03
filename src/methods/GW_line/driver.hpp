@@ -39,6 +39,11 @@
  *   mixing = 0.5        linear mixing of Sigma^{>/<} at the nodes (F is not mixed, as python)
  *   conv_thr = 1e-5     stop when max|dSigma| at the nodes (after mixing, as python) < conv_thr
  *   t_chunk = 8, ray_decades = 36   time chunk of the ray products; ray length e^{-emin smax sin theta_t} = e^{-decades}
+ *   time_grid = "id"    time nodes of the ray products (S7b): "id" = time-node ID (time_grids.hpp; four grids rebuilt every
+ *                       iteration from the current poles and bosonic poles, ~100-170 nodes each), "gl" = the generic
+ *                       Gauss-Legendre rays for_spectrum(theta_t, emin, ray_decades) (~1000 nodes; the python reference)
+ *   time_eps = eps, time_pad = 1.25, time_oversample = 1.0   ID tolerance, energy-range margin [Emin/pad, pad Emax] and
+ *                       node oversampling (time_id_opts_t); ignored for "gl"
  *   restart = false     resume from <output>.gw_line.h5:/scf_line/final_iter (bitwise identical continuation)
  *   output / outdir + prefix   checkpoint stem (MBPT_drivers resolve_mbpt_output_stem; the driver reads "output")
  *   div_treatment       must be absent or "ignore_g0" (Z(Gamma) without its G = 0 term, no Madelung/head correction)
@@ -54,7 +59,8 @@
  * Checkpoint: <output>.gw_line.h5 (own file), written by the root after every iteration:
  *   system/{nkpts, nbnd, Np, nelec, H0, eigval, qk_to_k2, mu0}, input/{parameters, fermionic_nodes},
  *   scf_line/final_iter, scf_line/iter<N>/{mu, mu_sigma, dmu, e_homo, e_lumo, F, Sigma_p, Sigma_h (N >= 1),
- *   poles/{particle,hole}_{counts,e,coef}, history scalars}, iter0 = the initial state; spectra/ at the end.
+ *   poles/{particle,hole}_{counts,e,coef}, history scalars (incl. time_grid and the node counts nt_{pi,sigma}_{p,h})},
+ *   iter0 = the initial state; spectra/ at the end.
  */
 
 #include <optional>
@@ -83,6 +89,8 @@ struct gw_line_params_t {
   double mixing = 0.5, conv_thr = 1e-5;
   long t_chunk = 8;
   double ray_decades = 36.0;
+  std::string time_grid = "id";          ///< "id" (time-node ID) or "gl" (Gauss-Legendre rays)
+  double time_eps = 1e-10, time_pad = 1.25, time_oversample = 1.0;   ///< time_eps defaults to eps
   bool restart = false;
   std::string output = "./gw_line";
   bool do_spectra = true;
@@ -99,6 +107,8 @@ struct gw_line_iter_t {
   double nelec = 0.0, nelec_lehmann = 0.0, N_mu = 0.0, dropped = 0.0, heldout_max = 0.0;
   long npoles_min = 0, npoles_max = 0;
   double bos_gap = 0.0, sigma_gap_p = 0.0, sigma_gap_h = 0.0, time = 0.0;
+  std::string time_grid = "gl";          ///< time grid used in this iteration
+  long nt_pi_p = 0, nt_pi_h = 0, nt_sig_p = 0, nt_sig_h = 0;   ///< node counts (Pi / Sigma, particle / hole ray)
 };
 
 struct gw_line_result_t {
