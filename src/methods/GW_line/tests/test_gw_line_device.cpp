@@ -33,8 +33,9 @@
  *
  * [.bench] (hidden): one Pi -> W -> Sigma -> F pass in the memory space of the build (device if ENABLE_DEVICE, unless
  * COQUI_GWLINE_BENCH_HOST=1) on a larger THC: COQUI_GWLINE_BENCH_DIR / _PREFIX (h5 input, default the si_kp222_nbnd60
- * data set of the project), COQUI_GWLINE_BENCH_NP (nIpts, default 640), COQUI_GWLINE_BENCH_TCHUNK (default 0: kernel
- * default). Prints per-phase times, the plan 6.7 memory model and the device high-water mark.
+ * data set of the project), COQUI_GWLINE_BENCH_NP (nIpts, default 640), COQUI_GWLINE_BENCH_TCHUNK (default 0: the
+ * kernels' automatic choice). [device] uses t_chunk 8 on the host and COQUI_GWLINE_DEV_TCHUNK (default 0 = automatic)
+ * on the device. Prints per-phase times, the plan 6.7 memory model and the device high-water mark.
  */
 
 #undef NDEBUG
@@ -73,6 +74,7 @@
 #include "methods/GW_line/screened.hpp"
 #include "methods/GW_line/self_energy.hpp"
 #include "methods/GW_line/static_part.hpp"
+#include "methods/GW_line/device_blas.hpp"
 
 namespace {
 
@@ -127,6 +129,11 @@ struct dev_setup_t {
 };
 
 constexpr double deg = std::numbers::pi / 180.0;
+
+std::string env_or(char const *nm, std::string const &def) {
+  char const *v = std::getenv(nm);
+  return (v != nullptr and *v != '\0') ? std::string(v) : def;
+}
 
 template <typename A>
 double local_max_abs(A const &a) {
@@ -184,10 +191,12 @@ void run_device_ab(std::string const &fixture) {
   auto ray_h = time_ray_t::for_spectrum(theta_t, su.poles.emin(), 36.0, 1e-5, 3.0, 16, sector_t::hole);
   auto fz    = numerics::line_dlr::dense_nodes(theta, 1e-3, 60.0, 60);
   aux_grid_t grid(mpi, Np);
-  const long t_chunk = 8;
+  // host: t_chunk 8 (the [V1]-[V3] setting); device: COQUI_GWLINE_DEV_TCHUNK (default 0 = automatic from free memory)
+  const long t_chunk = 8, t_chunk_d = std::stol(env_or("COQUI_GWLINE_DEV_TCHUNK", "0"));
   app_log(2, "\n[device A/B] {} ({} ranks, aux grid {}x{}): nk={} nq={} nb={} Np={}, bosonic rank {} ({} nodes), rays {} + {}, "
-             "{} fermionic nodes, t_chunk {}",
-          fixture, comm.size(), grid.np_P, grid.np_Q, nk, nq, nb, Np, r, nz, ray_p.size(), ray_h.size(), fz.size(), t_chunk);
+             "{} fermionic nodes, t_chunk host {} device {}",
+          fixture, comm.size(), grid.np_P, grid.np_Q, nk, nq, nb, Np, r, nz, ray_p.size(), ray_h.size(), fz.size(), t_chunk,
+          t_chunk_d);
   const double free0 = device_free_bytes();
 
   utils::TimerManager Th, Td;
@@ -203,7 +212,7 @@ void run_device_ab(std::string const &fixture) {
   polarization<HOST_MEMORY>(ph, su.poles, mf, grid, zeta, ray_p, ray_h, t_chunk, Pi_h, Th);
   Th.stop("Pi");
   Td.start("Pi");
-  polarization<DEVICE_MEMORY>(pd, su.poles, mf, grid, zeta, ray_p, ray_h, t_chunk, Pi_d, Td);
+  polarization<DEVICE_MEMORY>(pd, su.poles, mf, grid, zeta, ray_p, ray_h, t_chunk_d, Pi_d, Td);
   utils::device_sync();
   Td.stop("Pi");
   {
@@ -295,8 +304,8 @@ void run_device_ab(std::string const &fixture) {
     self_energy<HOST_MEMORY>(ph, su.poles, w_h, basis, mf, grid, mpi, fz, ray_p, ray_h, t_chunk, Sh_h, Th, sector_t::hole);
     Th.stop("Sigma");
     Td.start("Sigma");
-    self_energy<DEVICE_MEMORY>(pd, su.poles, w_hd, basis, mf, grid, mpi, fz, ray_p, ray_h, t_chunk, Sp_d, Td, sector_t::particle);
-    self_energy<DEVICE_MEMORY>(pd, su.poles, w_hd, basis, mf, grid, mpi, fz, ray_p, ray_h, t_chunk, Sh_d, Td, sector_t::hole);
+    self_energy<DEVICE_MEMORY>(pd, su.poles, w_hd, basis, mf, grid, mpi, fz, ray_p, ray_h, t_chunk_d, Sp_d, Td, sector_t::particle);
+    self_energy<DEVICE_MEMORY>(pd, su.poles, w_hd, basis, mf, grid, mpi, fz, ray_p, ray_h, t_chunk_d, Sh_d, Td, sector_t::hole);
     utils::device_sync();
     Td.stop("Sigma");
     err["Sigma^> (particle)"] = rel_diff(comm, Sp_h, Sp_d);
@@ -339,17 +348,12 @@ TEST_CASE("gw_line_device_si211", "[gw_line][device]") { run_device_ab("qe_si211
 #endif   // ENABLE_DEVICE
 
 // ------------------------------------------------------------------------------------------------------------- [.bench]
-std::string env_or(char const *nm, std::string const &def) {
-  char const *v = std::getenv(nm);
-  return (v != nullptr and *v != '\0') ? std::string(v) : def;
-}
-
 template <MEMORY_SPACE MEM>
 void run_bench() {
   const std::string dir    = env_or("COQUI_GWLINE_BENCH_DIR", "/mnt/ceph/users/mmorales/Cayley_real_axis_scGW/data/si_kp222_nbnd60");
   const std::string prefix = env_or("COQUI_GWLINE_BENCH_PREFIX", "si");
   const long nIpts         = std::stol(env_or("COQUI_GWLINE_BENCH_NP", "640"));
-  const long tc_in         = std::stol(env_or("COQUI_GWLINE_BENCH_TCHUNK", "8"));
+  const long tc_in         = std::stol(env_or("COQUI_GWLINE_BENCH_TCHUNK", "0"));   // 0: automatic
   utils::TimerManager T;
   for (auto nm : {"setup", "Pi", "Z", "W", "Sigma", "HX"}) T.add(nm);
   T.start("setup");
@@ -373,7 +377,11 @@ void run_bench() {
              "nodes, t_chunk {}",
           dir, prefix, comm.size(), MEM == HOST_MEMORY ? "HOST" : "DEVICE", nk, nq, nb, Np, r, nz, ray_p.size(), ray_h.size(),
           fz.size(), t_chunk);
-  grid.log(nk, nq, nz, r, t_chunk, nb);
+  {   // the plan 6.7 memory model at the chunk the kernels will pick (automatic: same rule as polarization)
+    const long tcm = (t_chunk > 0) ? t_chunk
+                                   : detail::auto_t_chunk<MEM>(ray_p.size(), double(2 * nk + 1) * grid.max_block_size() * 16.0);
+    grid.log(nk, nq, nz, r, tcm, nb);
+  }
   [[maybe_unused]] const double free0 = device_free_bytes();
   device_mem_reset();
 

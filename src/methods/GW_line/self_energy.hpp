@@ -51,6 +51,10 @@
  *   5. Sigma(k, :) += (sign/N_k) F[:, chunk] . partial(k)   (host gemm [N_zeta x t_chunk] . [t_chunk x nb^2]) timer Sigma_transform
  * Memory per rank: G~ and acc, 2 N_k t_chunk blocks, plus one W(q, chunk) (and one temp on device).
  *
+ * t_chunk <= 0 selects the chunk automatically (host 8; device from the free device memory, <= 256). Device: Hadamard as one
+ * cuTENSOR elementwise_trinary per (q, k), contraction as two strided-batched gemms per (k, chunk); the residue
+ * exponentials are formed once per chunk (q independent) on both paths.
+ *
  * Output: Sigma (N_k, N_zeta, nb, nb) on the host, identical on every rank (overwritten). `sectors` restricts the sum to one
  * sector (tests). Collective over mpi.comm (all ranks must call with the same rays, zeta and t_chunk).
  */
@@ -72,6 +76,7 @@
 #include "methods/GW_line/line_state.hpp"
 #include "methods/GW_line/propagators.hpp"
 #include "methods/GW_line/screened.hpp"
+#include "methods/GW_line/device_blas.hpp"
 
 namespace methods::gw_line {
 
@@ -94,12 +99,11 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
                mf.nkpts_ibz());
   utils::check(ray_p.sector == sector_t::particle and ray_h.sector == sector_t::hole,
                "gw_line::self_energy: ray_p must be a particle ray and ray_h a hole ray");
-  utils::check(t_chunk > 0, "gw_line::self_energy: t_chunk must be > 0");
   utils::check(prop.grid.P0 == grid.P0 and prop.grid.nP == grid.nP and prop.grid.Q0 == grid.Q0 and prop.grid.nQ == grid.nQ,
                "gw_line::self_energy: propagator and grid blocks differ");
   utils::check(grid.np == comm.size() or comm.size() == 1, "gw_line::self_energy: grid of {} ranks on a communicator of {}",
                grid.np, comm.size());
-  const long nk = prop.nk, nb = prop.nb, nq = mf.nqpts(), nz = zeta.size(), nP = grid.nP, nQ = grid.nQ;
+  const long nk = prop.nk, nb = prop.nb, nq = mf.nqpts(), nz = zeta.size(), nP = grid.nP, nQ = grid.nQ, r = basis.rank;
   utils::check(mf.nkpts() == nk, "gw_line::self_energy: MF nkpts {} != X nkpts {}", mf.nkpts(), nk);
   utils::check(w.extent(0) == nq and w.extent(1) == basis.rank and w.extent(2) == nP and w.extent(3) == nQ,
                "gw_line::self_energy: residues w ({}, {}, {}, {}) vs (N_q, r_b, nP, nQ) = ({}, {}, {}, {})", w.extent(0),
@@ -126,17 +130,24 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
     if (sectors != sector_t::both and sectors != leg.s) continue;
     time_ray_t const &ray = *leg.ray;
     const long nt         = ray.size();
-    const long tc         = std::min(t_chunk, nt);
+    // t_chunk <= 0: automatic (host 8; device from the free device memory: G~, acc of all k, W(q), contraction buffers)
+    const long tc = (t_chunk > 0) ? std::min(t_chunk, nt)
+                                  : detail::auto_t_chunk<MEM>(nt, double(2 * nk + 1) * nP * nQ * 16.0 +
+                                                                      double(nk * nb + nQ) * nb * 16.0);
     const auto form       = leg.transposed ? gtilde_form_t::transposed : gtilde_form_t::plain;
     nda::array<ComplexType, 2> F = ray.transform_matrix(zeta);   // (nz, nt), host
     arr4_t G(nk, tc, nP, nQ), acc(nk, tc, nP, nQ);
     arr3_t Wq(tc, nP, nQ);
-    [[maybe_unused]] arr3_t tmp;
-    if constexpr (MEM != HOST_MEMORY) tmp = arr3_t(tc, nP, nQ);
+    arr2_t Em(tc, r);                             // residue exponentials of the chunk (q independent)
     arr2_t t1(nb, nQ);
+    [[maybe_unused]] arr3_t t1b;                  // device: the batched first contraction factor, all t of a chunk
+    if constexpr (MEM != HOST_MEMORY) t1b = arr3_t(tc, nb, nQ);
     arr4_t part_m(nk, tc, nb, nb);                // contraction output in MEM (host: IS the reduce buffer)
     nda::array<ComplexType, 4> part(nk, tc, nb, nb), partT;
     if (leg.transposed) partT = nda::array<ComplexType, 4>(nk, tc, nb, nb);
+    if constexpr (MEM != HOST_MEMORY) device_mem_probe();
+    app_log(3, "  gw_line::self_energy: {} sector, {} time nodes in chunks of {}", leg.s == sector_t::particle ? "particle" : "hole",
+            nt, tc);
     const ComplexType alpha(leg.sign / double(nk));
 
     for (long i0 = 0; i0 < nt; i0 += tc) {
@@ -150,11 +161,17 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
       if constexpr (MEM != HOST_MEMORY) utils::device_sync();
       Timer.stop("Sigma_G_tilde");
 
-      // 2. acc(k, chunk) = sum_q G~(k-q, chunk) o W(q, chunk)
+      // 2. acc(k, chunk) = sum_q G~(k-q, chunk) o W(q, chunk); the exponentials of the chunk once for all q
+      Timer.start("Sigma_W_time");
+      auto Ev = Em(tr, all);
+      detail::check_orientation(leg.s, leg.transposed, "self_energy");
+      Ev = basis.time_exponentials(t, leg.s);
+      Timer.stop("Sigma_W_time");
+      if constexpr (MEM != HOST_MEMORY) nda::tensor::set(ComplexType(0.0), acc);
       for (long iq = 0; iq < nq; ++iq) {
         Timer.start("Sigma_W_time");
         auto Wv = Wq(tr, all, all);
-        w_time<MEM>(w, basis, iq, t, leg.s, leg.transposed, Wv);
+        detail::pole_contract_m<MEM>(w, iq, Ev, Wv);
         if constexpr (MEM != HOST_MEMORY) utils::device_sync();
         Timer.stop("Sigma_W_time");
 
@@ -166,16 +183,9 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
             if (iq == 0) acc_v = Gv * Wv;
             else acc_v += Gv * Wv;
           } else {
-            // device: copies + tensor::elementwise only (no lazy nda expressions into device arrays)
-            if (iq == 0) {
-              acc_v = Gv;
-              nda::tensor::elementwise(ComplexType(1.0), Wv, ComplexType(1.0), acc_v, nda::tensor::op::MUL);
-            } else {
-              auto tmp_v = tmp(tr, all, all);
-              tmp_v      = Gv;
-              nda::tensor::elementwise(ComplexType(1.0), Wv, ComplexType(1.0), tmp_v, nda::tensor::op::MUL);
-              nda::tensor::elementwise(ComplexType(1.0), tmp_v, ComplexType(1.0), acc_v, nda::tensor::op::SUM);
-            }
+            // device: one cuTENSOR trinary per (q, k), acc <- (G~ o W) + acc (acc zeroed before the q loop)
+            nda::tensor::elementwise_trinary(ComplexType(1.0), Gv, "abc", ComplexType(1.0), Wv, "abc", ComplexType(1.0), acc_v,
+                                             "abc", nda::tensor::op::MUL, nda::tensor::op::SUM);
           }
         }
         if constexpr (MEM != HOST_MEMORY) utils::device_sync();
@@ -185,16 +195,30 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
       // 3. orbital contraction of the local block, per k and t
       Timer.start("Sigma_contract");
       for (long ik = 0; ik < nk; ++ik) {
-        for (long it = 0; it < n; ++it) {
-          auto a = acc(ik, it, all, all);
-          auto o = part_m(ik, it, all, all);
-          if (not leg.transposed) {   // Xp^dagger a Xq
-            nda::blas::gemm(ComplexType(1.0), nda::transpose(prop.Xpc(ik, all, all)), a, ComplexType(0.0), t1);
-            nda::blas::gemm(ComplexType(1.0), t1, nda::transpose(prop.XqT(ik, all, all)), ComplexType(0.0), o);
-          } else {                    // Xp^T a conj(Xq) = (contribution to Sigma)^T
-            nda::blas::gemm(ComplexType(1.0), nda::transpose(prop.Xp(ik, all, all)), a, ComplexType(0.0), t1);
-            nda::blas::gemm(ComplexType(1.0), t1, nda::transpose(prop.XqH(ik, all, all)), ComplexType(0.0), o);
+        if constexpr (MEM == HOST_MEMORY) {
+          for (long it = 0; it < n; ++it) {
+            auto a = acc(ik, it, all, all);
+            auto o = part_m(ik, it, all, all);
+            if (not leg.transposed) {   // Xp^dagger a Xq
+              nda::blas::gemm(ComplexType(1.0), nda::transpose(prop.Xpc(ik, all, all)), a, ComplexType(0.0), t1);
+              nda::blas::gemm(ComplexType(1.0), t1, nda::transpose(prop.XqT(ik, all, all)), ComplexType(0.0), o);
+            } else {                    // Xp^T a conj(Xq) = (contribution to Sigma)^T
+              nda::blas::gemm(ComplexType(1.0), nda::transpose(prop.Xp(ik, all, all)), a, ComplexType(0.0), t1);
+              nda::blas::gemm(ComplexType(1.0), t1, nda::transpose(prop.XqH(ik, all, all)), ComplexType(0.0), o);
+            }
           }
+        } else {
+          // device: two strided-batched gemms over the n times of the chunk (column-major view, device_blas.hpp):
+          //   t1(t) = L a(t),  L = Xp^dagger = Xpc^T (plain) or Xp^T (transposed)  ->  t1(t)^T = a(t)^T L^T
+          //   o(t)  = t1(t) R, R = Xq = XqT^T (plain) or conj(Xq) = XqH^T (transposed) -> o(t)^T = R^T t1(t)^T
+          ComplexType const *xl = (leg.transposed ? prop.Xp : prop.Xpc).data() + ik * nP * nb;
+          ComplexType const *xr = (leg.transposed ? prop.XqH : prop.XqT).data() + ik * nb * nQ;
+          auto a = acc(ik, tr, all, all);
+          auto o = part_m(ik, tr, all, all);
+          detail::gemm_strided_cm('N', 'T', nQ, nb, nP, ComplexType(1.0), a.data(), nQ, nP * nQ, xl, nb, 0, ComplexType(0.0),
+                                  t1b.data(), nQ, nb * nQ, n);
+          detail::gemm_strided_cm('T', 'N', nb, nb, nQ, ComplexType(1.0), xr, nQ, 0, t1b.data(), nQ, nb * nQ, ComplexType(0.0),
+                                  o.data(), nb, nb * nb, n);
         }
       }
       if constexpr (MEM != HOST_MEMORY) {
