@@ -43,6 +43,14 @@
  *                         formed on the host for the chunk ([nt, nb, M], copied once) + ONE batched gemm with V^dagger
  * (same flop count nt M nb^2; V (nb x M) is mirrored to MEM instead of M nb x nb matrices).
  *
+ * Host "XV" form (S7e). For factorized poles the three forms are also
+ *   plain          : L diag(ph(t)) R^dagger,   transposed : conj(L) diag(ph(t)) R^T,   adjoint_conj_t : L diag(conj ph(conj t)) R^dagger
+ * with L = Xp V (nP x M), R = Xq V (nQ x M), ph(tau)_m = e^{-i e_m tau}, formed once per set_poles. Cost per t: nP nQ M
+ * (one gemm, scales with the block), vs nb^2 M (C(t), the SAME on every rank: it does not scale with the number of ranks)
+ * + nP nb^2 + nP nb nQ for the C(t) form. The host picks per (k, sector) the cheaper of the two by this flop count
+ * (env COQUI_GWLINE_GT_XV = 1 / 0 forces XV / C(t); -1 or unset = automatic). Si 4x4x4 nb 60, M ~ 650: C(t) is cheaper on
+ * <= ~200 ranks, XV beyond (3.6x fewer flops at 768 ranks). Results agree to rounding (1e-15 relative).
+ *
  * Device rules (plan 6.4): the X slices, the coefficients and all outputs live in MEM; the heavy work is nda::blas::gemm
  * only (op flags for transpose / dagger of the small nb x nb C(t)); host-side setup is O(N_k nb (Np_loc + Nq_loc)).
  * On the device the per-t products are two strided-batched gemms per call (all nt times at once, the X slice broadcast);
@@ -84,6 +92,9 @@ struct propagator_t {
   std::vector<char> fac_p, fac_h;                     ///< factorized form per k (particle / hole)
   std::vector<nda::array<ComplexType, 2>> vh_p, vh_h; ///< host V (nb, M) of the factorized sectors
   bool poles_set = false;
+  // host XV form (S7e): L = Xp V (nP, M), R = Xq V (nQ, M) per k and sector (empty where the C(t) form is used)
+  std::vector<nda::array<ComplexType, 2>> L_p, L_h, R_p, R_h;
+  long n_xv = 0;                                      ///< (k, sector) pairs using the XV form
 
   // grow-only MEM scratch of build(): phases (or VP), C(t), and the intermediate (host: Xp C; device: C Xq^dagger for all t)
   mutable detail::scratch_t<MEM> s_ph, s_C, s_T;
@@ -145,7 +156,38 @@ struct propagator_t {
         (part ? e_p : e_h).emplace_back(ps.e);
       }
     }
+    // host XV form where it is cheaper (see the file header)
+    L_p.assign(nk, {}); L_h.assign(nk, {}); R_p.assign(nk, {}); R_h.assign(nk, {});
+    n_xv = 0;
+    if constexpr (MEM == HOST_MEMORY) {
+      const long mode = detail::env_long("COQUI_GWLINE_GT_XV", -1);
+      const double nP = double(grid.nP), nQ = double(grid.nQ), b = double(nb);
+      auto all        = nda::range::all;
+      for (long ik = 0; ik < nk; ++ik)
+        for (auto s : {sector_t::particle, sector_t::hole}) {
+          const bool part = (s == sector_t::particle);
+          if (not((part ? fac_p : fac_h)[ik])) continue;
+          auto const &V  = (part ? vh_p : vh_h)[ik];
+          const double M = double(V.extent(1));
+          const bool xv  = (mode == 1) or (mode < 0 and nP * nQ * M + nP * M < b * b * M + nP * b * b + nP * b * nQ);
+          if (not xv or V.extent(1) == 0) continue;
+          nda::array<ComplexType, 2> L(grid.nP, V.extent(1)), R(grid.nQ, V.extent(1));
+          nda::blas::gemm(ComplexType(1.0), Xp(ik, all, all), V, ComplexType(0.0), L);
+          nda::blas::gemm(ComplexType(1.0), nda::transpose(XqT(ik, all, all)), V, ComplexType(0.0), R);
+          (part ? L_p : L_h)[ik] = std::move(L);
+          (part ? R_p : R_h)[ik] = std::move(R);
+          ++n_xv;
+        }
+    }
     poles_set = true;
+  }
+
+  /// bytes of the host XV factors
+  double xv_bytes() const {
+    double b = 0.0;
+    for (auto const *v : {&L_p, &L_h, &R_p, &R_h})
+      for (auto const &c : *v) b += 16.0 * double(c.size());
+    return b;
   }
 
   /// bytes of the pole residues mirrored to MEM
@@ -172,6 +214,43 @@ struct propagator_t {
     if (M == 0) {
       nda::tensor::set(ComplexType(0.0), out);
       return;
+    }
+    if constexpr (MEM == HOST_MEMORY) {
+      auto const &Lx = (s == sector_t::particle) ? L_p[ik] : L_h[ik];
+      if (Lx.size() > 0) {   // XV form (S7e): out(t) = A(t) B^op, A(t) = (conj) L diag(phases), B = R
+        auto const &Rx = (s == sector_t::particle) ? R_p[ik] : R_h[ik];
+        auto all       = nda::range::all;
+        auto A         = s_T.template view<2>({grid.nP, M});
+        for (long it = 0; it < nt; ++it) {
+          switch (form) {
+            case gtilde_form_t::plain: {   // L diag(e^{-i e t}) R^dagger
+              for (long m = 0; m < M; ++m) {
+                const ComplexType ph = std::exp(ComplexType(0.0, -e(m)) * t(it));
+                for (long P = 0; P < grid.nP; ++P) A(P, m) = Lx(P, m) * ph;
+              }
+              nda::blas::gemm(ComplexType(1.0), A, nda::dagger(Rx), ComplexType(0.0), out(it, all, all));
+              break;
+            }
+            case gtilde_form_t::transposed: {   // conj(L) diag(e^{-i e t}) R^T
+              for (long m = 0; m < M; ++m) {
+                const ComplexType ph = std::exp(ComplexType(0.0, -e(m)) * t(it));
+                for (long P = 0; P < grid.nP; ++P) A(P, m) = std::conj(Lx(P, m)) * ph;
+              }
+              nda::blas::gemm(ComplexType(1.0), A, nda::transpose(Rx), ComplexType(0.0), out(it, all, all));
+              break;
+            }
+            case gtilde_form_t::adjoint_conj_t: {   // L diag(conj e^{-i e conj t}) R^dagger
+              for (long m = 0; m < M; ++m) {
+                const ComplexType ph = std::conj(std::exp(ComplexType(0.0, -e(m)) * std::conj(t(it))));
+                for (long P = 0; P < grid.nP; ++P) A(P, m) = Lx(P, m) * ph;
+              }
+              nda::blas::gemm(ComplexType(1.0), A, nda::dagger(Rx), ComplexType(0.0), out(it, all, all));
+              break;
+            }
+          }
+        }
+        return;
+      }
     }
     // C(tau) for tau = t (plain, transposed) or conj(t) (adjoint_conj_t): phases on the host, one (batched) gemm in MEM.
     // All MEM intermediates are views of grow-only scratch buffers (no allocation per call once warm).
