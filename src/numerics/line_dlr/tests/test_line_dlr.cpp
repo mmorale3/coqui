@@ -25,13 +25,18 @@
  *   2. fermionic LS fit on dense nodes: residual, imaginary axis, sector split;
  *   3. Cayley moments from the fitted poles vs exact (the key accuracy test);
  *   4. bosonic odd-symmetric fit: full W and both sectors on the imaginary axis;
- *   5. ray transform of pole-pair products on both rays.
+ *   5. ray transform of pole-pair products on both rays;
+ *   6. time-node ID (session S7a, numerics/line_dlr/time_id.hpp, tag [time_id]): transform error on pole models,
+ *      products (Sigma-like and Pi-like with a conjugate-time factor), agreement with the GL ray, robustness
+ *      (out-of-range energies, noise amplification) and construction time; hidden tag [.time_id_scan]: scaling of
+ *      r_t with log(Emax/Emin) log(1/eps), GL node counts for the same accuracy, accuracy vs number of nodes.
  * Every measured number is printed.
  */
 
 #undef NDEBUG
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <iomanip>
@@ -49,6 +54,7 @@
 #include "numerics/line_dlr/line_basis.hpp"
 #include "numerics/line_dlr/bosonic_basis.hpp"
 #include "numerics/line_dlr/time_ray.hpp"
+#include "numerics/line_dlr/time_id.hpp"
 
 namespace bdft_tests {
 
@@ -535,6 +541,423 @@ TEST_CASE("line_dlr_ray_transform", "[numerics][line_dlr]") {
   CHECK(eh16 <= 2.5e-12);
   CHECK(ep20 <= 1e-12);
   CHECK(eh20 <= 1e-12);
+}
+
+// =======================================================================
+//  6. time-node ID (S7a)
+// =======================================================================
+namespace {
+
+using clk = std::chrono::steady_clock;
+double seconds_since(clk::time_point t0) { return std::chrono::duration<double>(clk::now() - t0).count(); }
+
+/// production-like targets: 240 dense line nodes (both upper rays, |zeta| in [1e-3, 60]) + 40 imaginary-axis points
+nda::array<dcomplex, 1> id_targets(double theta) {
+  auto zl = ldlr::dense_nodes(theta, 1e-3, 60.0, 120);
+  auto zi = imag_axis(1e-3, 60.0, 40);
+  nda::array<dcomplex, 1> z(zl.size() + zi.size());
+  for (long i = 0; i < zl.size(); ++i) z(i) = zl(i);
+  for (long i = 0; i < zi.size(); ++i) z(zl.size() + i) = zi(i);
+  return z;
+}
+
+/// scalar pole model sum_p c_p e^{-i E_p t} <-> sum_p c_p / (zeta - E_p)
+struct exp_model {
+  std::vector<double> E, c;
+  /// log-uniform random magnitudes in [emin, emax] + both ends + nclust poles clustered within 5% above emin;
+  /// positive weights summing to 1; sign = +1 (particle) / -1 (hole)
+  exp_model(double emin, double emax, long nrand, long nclust, double sign, unsigned seed) {
+    std::mt19937_64 gen(seed);
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    E.push_back(emin);
+    E.push_back(emax);
+    for (long p = 0; p < nrand; ++p) E.push_back(std::exp(std::log(emin) + u(gen) * std::log(emax / emin)));
+    for (long p = 0; p < nclust; ++p) E.push_back(emin * (1.0 + 0.05 * u(gen)));
+    double tot = 0.0;
+    for (size_t p = 0; p < E.size(); ++p) {
+      E[p] *= sign;
+      c.push_back(0.1 + u(gen));
+      tot += c.back();
+    }
+    for (auto &x : c) x /= tot;
+  }
+  dcomplex time(dcomplex t) const {
+    dcomplex acc = 0.0;
+    for (size_t p = 0; p < E.size(); ++p) acc += c[p] * std::exp(dcomplex(0.0, -E[p]) * t);
+    return acc;
+  }
+  dcomplex freq(dcomplex z) const {
+    dcomplex acc = 0.0;
+    for (size_t p = 0; p < E.size(); ++p) acc += c[p] / (z - E[p]);
+    return acc;
+  }
+};
+
+/// max_i |sum_j F(i,j) x_j - X(z_i)| / |X(z_i)|
+double transform_rel_err(nda::array<dcomplex, 2> const &F, nda::array<dcomplex, 1> const &x,
+                         nda::array<dcomplex, 1> const &Xex) {
+  double m = 0.0;
+  for (long i = 0; i < F.extent(0); ++i) {
+    dcomplex acc = 0.0;
+    for (long j = 0; j < F.extent(1); ++j) acc += F(i, j) * x(j);
+    m = std::max(m, std::abs(acc - Xex(i)) / std::abs(Xex(i)));
+  }
+  return m;
+}
+
+template <typename Nodes> double model_err(Nodes const &nd, nda::array<dcomplex, 2> const &F, exp_model const &M,
+                                           nda::array<dcomplex, 1> const &z) {
+  nda::array<dcomplex, 1> x(nd.size()), Xex(z.size());
+  for (long j = 0; j < nd.size(); ++j) x(j) = M.time(nd.t(j));
+  for (long i = 0; i < z.size(); ++i) Xex(i) = M.freq(z(i));
+  return transform_rel_err(F, x, Xex);
+}
+
+/// strictest metric: single poles on a log grid of ne energies in [emin, emax] (signed by the sector),
+/// max over targets and poles of |F e^{-iEt} - 1/(z-E)| |z-E|
+template <typename Nodes> double per_pole_err(Nodes const &nd, nda::array<dcomplex, 2> const &F, double emin,
+                                              double emax, long ne, nda::array<dcomplex, 1> const &z) {
+  const double sgn = (nd.sector == sector_t::particle) ? 1.0 : -1.0;
+  auto e           = ldlr::detail::logspace(emin, emax, ne);
+  nda::array<double, 1> Ep(ne);
+  for (long p = 0; p < ne; ++p) Ep(p) = sgn * e(p);
+  nda::array<dcomplex, 2> X(nd.size(), ne);
+  for (long j = 0; j < nd.size(); ++j)
+    for (long p = 0; p < ne; ++p) X(j, p) = std::exp(dcomplex(0.0, -Ep(p)) * nd.t(j));
+  auto Y   = ldlr::detail::matmul(F, X);
+  double m = 0.0;
+  for (long i = 0; i < z.size(); ++i)
+    for (long p = 0; p < ne; ++p) m = std::max(m, std::abs(Y(i, p) * (z(i) - Ep(p)) - 1.0));
+  return m;
+}
+
+struct id_case {
+  const char *name;
+  double emin, emax;
+};
+const std::vector<id_case> id_cases = {{"Pi    [0.04, 6]", 0.04, 6.0}, {"Sigma [0.06,10]", 0.06, 10.0},
+                                       {"smallgap[.005,6]", 0.005, 6.0}};
+const std::vector<double> id_eps = {1e-6, 1e-8, 1e-10};
+
+} // namespace
+
+TEST_CASE("line_dlr_time_id_transform", "[numerics][line_dlr][time_id]") {
+  std::cout << std::scientific << std::setprecision(2);
+  const double theta = 20.0 * deg, theta_t = 10.0 * deg;
+  auto z = id_targets(theta);
+  std::cout << "\n[time_id] 1. transform error on pole models, 240 line nodes + 40 imaginary-axis points, theta=20 "
+               "theta_t=10 deg\n"
+            << "[time_id]   case             sector  eps    over rank r_t  LSres    max|F|   cond     mix-err  "
+               "per-pole  build(s)\n";
+  for (auto const &c : id_cases)
+    for (double eps : id_eps)
+      for (sector_t sec : {sector_t::particle, sector_t::hole})
+        for (double over : {1.0, 1.25}) {
+          const double sgn = (sec == sector_t::particle) ? 1.0 : -1.0;
+          ldlr::time_id_opts_t o;
+          o.oversample = over;
+          auto t0      = clk::now();
+          ldlr::time_id_t id(theta_t, sec, c.emin, c.emax, eps, o);
+          double res = 0.0;
+          auto F     = id.transform_matrix(z, &res);
+          const double tb = seconds_since(t0);
+          exp_model M(c.emin, c.emax, 40, 8, sgn, 11u);
+          const double em = model_err(id, F, M, z);
+          const double ep = per_pole_err(id, F, c.emin, c.emax, 400, z);
+          std::cout << "[time_id]   " << c.name << "  " << (sec == sector_t::particle ? "part" : "hole") << "  "
+                    << std::setprecision(0) << eps << std::setprecision(2) << "  " << over << "  " << id.rank << "  "
+                    << id.size() << "  " << res << " " << max_abs(F) << " " << id.ls_cond() << " " << em << " " << ep
+                    << " " << tb << "\n";
+          CHECK(em <= 10.0 * eps);
+          CHECK(ep <= 10.0 * eps);
+          CHECK(res <= 10.0 * eps);
+        }
+}
+
+TEST_CASE("line_dlr_time_id_products", "[numerics][line_dlr][time_id]") {
+  std::cout << std::scientific << std::setprecision(2);
+  const double theta = 20.0 * deg, theta_t = 10.0 * deg;
+  auto z = id_targets(theta);
+  std::cout << "\n[time_id] 2. products at the ID nodes vs exact pole sums (rel. error)\n";
+  for (double eps : id_eps)
+    for (sector_t sec : {sector_t::particle, sector_t::hole}) {
+      const double sgn = (sec == sector_t::particle) ? 1.0 : -1.0;
+      // Sigma-like: G energies in [0.03, 4], W energies in [0.03, 6] -> summed range [0.06, 10]
+      ldlr::time_id_t ids(theta_t, sec, 0.06, 10.0, eps);
+      exp_model f(0.03, 4.0, 15, 3, sgn, 21u), g(0.03, 6.0, 15, 3, sgn, 22u);
+      auto Fs = ids.transform_matrix(z);
+      nda::array<dcomplex, 1> x(ids.size()), Xex(z.size());
+      for (long j = 0; j < ids.size(); ++j) x(j) = f.time(ids.t(j)) * g.time(ids.t(j));
+      for (long i = 0; i < z.size(); ++i) {
+        dcomplex acc = 0.0;
+        for (size_t p = 0; p < f.E.size(); ++p)
+          for (size_t q = 0; q < g.E.size(); ++q) acc += f.c[p] * g.c[q] / (z(i) - f.E[p] - g.E[q]);
+        Xex(i) = acc;
+      }
+      const double es = transform_rel_err(Fs, x, Xex);
+      // Pi-like: conj(f(conj t)) g(t), f with energies of the OTHER sign (G^< for Pi^>), |e_i|, e_a in [0.02, 3]
+      // -> energies e_a - e_i in [0.04, 6]
+      ldlr::time_id_t idp(theta_t, sec, 0.04, 6.0, eps);
+      exp_model fo(0.02, 3.0, 15, 3, -sgn, 23u), ga(0.02, 3.0, 15, 3, sgn, 24u);
+      auto Fp = idp.transform_matrix(z);
+      nda::array<dcomplex, 1> xp(idp.size()), Xp(z.size());
+      for (long j = 0; j < idp.size(); ++j) xp(j) = std::conj(fo.time(std::conj(idp.t(j)))) * ga.time(idp.t(j));
+      for (long i = 0; i < z.size(); ++i) {
+        dcomplex acc = 0.0;
+        for (size_t p = 0; p < fo.E.size(); ++p)
+          for (size_t q = 0; q < ga.E.size(); ++q) acc += fo.c[p] * ga.c[q] / (z(i) - (ga.E[q] - fo.E[p]));
+        Xp(i) = acc;
+      }
+      const double ep = transform_rel_err(Fp, xp, Xp);
+      std::cout << "[time_id]   eps " << std::setprecision(0) << eps << std::setprecision(2) << " "
+                << (sec == sector_t::particle ? "part" : "hole") << ": Sigma-like G o W (r_t=" << ids.size()
+                << ") " << es << ",  Pi-like conj(G(conj t)) o G (r_t=" << idp.size() << ") " << ep << "\n";
+      CHECK(es <= 10.0 * eps);
+      CHECK(ep <= 10.0 * eps);
+    }
+}
+
+TEST_CASE("line_dlr_time_id_vs_gl", "[numerics][line_dlr][time_id]") {
+  std::cout << std::scientific << std::setprecision(2);
+  const double theta = 20.0 * deg, theta_t = 10.0 * deg;
+  auto z = id_targets(theta);
+  std::cout << "\n[time_id] 3. ID vs GL ray (for_spectrum(Emin), 40 decades, 3 panels/e-fold, 16 GL nodes)\n";
+  for (auto const &c : id_cases)
+    for (double eps : id_eps)
+      for (sector_t sec : {sector_t::particle, sector_t::hole}) {
+        const double sgn = (sec == sector_t::particle) ? 1.0 : -1.0;
+        ldlr::time_id_t id(theta_t, sec, c.emin, c.emax, eps);
+        auto ray = ldlr::time_ray_t::for_spectrum(theta_t, c.emin, 40.0, 1e-5, 3.0, 16, sec);
+        exp_model M(c.emin, c.emax, 40, 8, sgn, 31u);
+        auto Fi = id.transform_matrix(z);
+        auto Fg = ray.transform_matrix(z);
+        double d = 0.0, eg = 0.0;
+        for (long i = 0; i < z.size(); ++i) {
+          dcomplex xi = 0.0, xg = 0.0;
+          for (long j = 0; j < id.size(); ++j) xi += Fi(i, j) * M.time(id.t(j));
+          for (long m = 0; m < ray.size(); ++m) xg += Fg(i, m) * M.time(ray.t(m));
+          const dcomplex ex = M.freq(z(i));
+          d  = std::max(d, std::abs(xi - xg) / std::abs(ex));
+          eg = std::max(eg, std::abs(xg - ex) / std::abs(ex));
+        }
+        std::cout << "[time_id]   " << c.name << " " << (sec == sector_t::particle ? "part" : "hole") << " eps "
+                  << std::setprecision(0) << eps << std::setprecision(2) << ": ID " << id.size() << " nodes, GL "
+                  << ray.size() << " nodes (ratio " << std::setprecision(1) << std::fixed
+                  << double(ray.size()) / double(id.size()) << std::scientific << std::setprecision(2)
+                  << "), |ID - GL| " << d << ", GL err " << eg << "\n";
+        CHECK(d <= 10.0 * eps);
+      }
+}
+
+TEST_CASE("line_dlr_time_id_robustness", "[numerics][line_dlr][time_id]") {
+  std::cout << std::scientific << std::setprecision(2);
+  const double theta = 20.0 * deg, theta_t = 10.0 * deg;
+  auto z = id_targets(theta);
+  std::cout << "\n[time_id] 4. robustness: single poles outside the design range, 1e-12 relative noise on X(t_j)\n";
+  std::mt19937_64 gen(41u);
+  std::normal_distribution<double> nd(0.0, 1.0);
+  for (auto const &c : id_cases)
+    for (double eps : id_eps) {
+      ldlr::time_id_t id(theta_t, sector_t::particle, c.emin, c.emax, eps);
+      auto F            = id.transform_matrix(z);
+      const double ein  = per_pole_err(id, F, c.emin, c.emax, 200, z);
+      const double elo  = per_pole_err(id, F, 0.8 * c.emin, 0.8 * c.emin * 1.0000001, 2, z);
+      const double ehi  = per_pole_err(id, F, 1.2 * c.emax, 1.2 * c.emax * 1.0000001, 2, z);
+      const double elo2 = per_pole_err(id, F, 0.5 * c.emin, 0.5 * c.emin * 1.0000001, 2, z);
+      const double ehi2 = per_pole_err(id, F, 2.0 * c.emax, 2.0 * c.emax * 1.0000001, 2, z);
+      // noise amplification on the mixture model
+      exp_model M(c.emin, c.emax, 40, 8, 1.0, 43u);
+      nda::array<dcomplex, 1> x(id.size()), xn(id.size()), Xex(z.size());
+      for (long j = 0; j < id.size(); ++j) {
+        x(j)  = M.time(id.t(j));
+        xn(j) = x(j) * (1.0 + 1e-12 * dcomplex(nd(gen), nd(gen)) / std::sqrt(2.0));
+      }
+      for (long i = 0; i < z.size(); ++i) Xex(i) = M.freq(z(i));
+      const double e0 = transform_rel_err(F, x, Xex), en = transform_rel_err(F, xn, Xex);
+      double amp = 0.0;   // relative output change caused by the noise alone: max_i |F (xn - x)|_i / |X_i|
+      for (long i = 0; i < z.size(); ++i) {
+        dcomplex acc = 0.0;
+        for (long j = 0; j < id.size(); ++j) acc += F(i, j) * (xn(j) - x(j));
+        amp = std::max(amp, std::abs(acc) / std::abs(Xex(i)));
+      }
+      std::cout << "[time_id]   " << c.name << " eps " << std::setprecision(0) << eps << std::setprecision(2)
+                << ": in-range " << ein << ", E=0.8Emin " << elo << ", E=1.2Emax " << ehi << ", E=0.5Emin " << elo2
+                << ", E=2Emax " << ehi2 << " | noise 1e-12: err " << e0 << " -> " << en << ", noise-only output " << amp
+                << " (max|F| " << max_abs(F) << ")\n";
+      // same with the design range padded by 1.25 on both ends
+      ldlr::time_id_opts_t o;
+      o.pad = 1.25;
+      ldlr::time_id_t idq(theta_t, sector_t::particle, c.emin, c.emax, eps, o);
+      auto Fq            = idq.transform_matrix(z);
+      const double qlo   = per_pole_err(idq, Fq, 0.8 * c.emin, 0.8 * c.emin * 1.0000001, 2, z);
+      const double qhi   = per_pole_err(idq, Fq, 1.2 * c.emax, 1.2 * c.emax * 1.0000001, 2, z);
+      std::cout << "[time_id]       pad 1.25: r_t " << id.size() << " -> " << idq.size() << ", E=0.8Emin " << qlo
+                << ", E=1.2Emax " << qhi << "\n";
+      CHECK(elo <= 1.0);   // information only: unconstrained outside the design range
+      CHECK(ehi <= 1.0);
+      CHECK(qlo <= 10.0 * eps);
+      CHECK(qhi <= 10.0 * eps);
+      CHECK(en <= std::max(10.0 * eps, 1e-9));
+      CHECK(amp <= 1e-10);
+    }
+}
+
+TEST_CASE("line_dlr_time_id_build_time", "[numerics][line_dlr][time_id]") {
+  std::cout << std::scientific << std::setprecision(2);
+  const double theta = 20.0 * deg, theta_t = 10.0 * deg;
+  auto z = id_targets(theta);
+  std::cout << "\n[time_id] 5. construction time (both sectors, nodes + factorization + F for 280 targets)\n";
+  for (auto const &c : id_cases)
+    for (double eps : id_eps) {
+      auto t0 = clk::now();
+      ldlr::time_id_t idp(theta_t, sector_t::particle, c.emin, c.emax, eps);
+      ldlr::time_id_t idh(theta_t, sector_t::hole, c.emin, c.emax, eps);
+      const double tb = seconds_since(t0);
+      auto t1         = clk::now();
+      auto Fp = idp.transform_matrix(z);
+      auto Fh = idh.transform_matrix(z);
+      const double tf = seconds_since(t1);
+      std::cout << "[time_id]   " << c.name << " eps " << std::setprecision(0) << eps << std::setprecision(2)
+                << ": nE " << idp.nE() << ", candidates " << idp.n_cand << ", build " << tb << " s, F " << tf
+                << " s\n";
+      CHECK(tb + tf <= 5.0);
+      CHECK(Fp.extent(1) == idp.size());
+      CHECK(Fh.extent(1) == idh.size());
+    }
+  // the type-erased view accepts both node sets
+  ldlr::time_id_t id(theta_t, sector_t::hole, 0.04, 6.0, 1e-8);
+  auto ray = ldlr::time_ray_t::for_spectrum(theta_t, 0.04, 40.0, 1e-5, 3.0, 16, sector_t::hole);
+  ldlr::time_nodes_t a(id), b(ray);
+  CHECK(a.size() == id.size());
+  CHECK(b.size() == ray.size());
+  CHECK(a.sector == sector_t::hole);
+  CHECK(max_abs_diff(a.transform_matrix(z), id.transform_matrix(z)) == 0.0);
+  CHECK(max_abs_diff(b.transform_matrix(z), ray.transform_matrix(z)) == 0.0);
+  // Gram eps-rank (Eq. gram, closed form) vs the QR rank
+  // (only where eps^2 is above the double-precision floor of the Gram eigenvalues, ~1e-16 lambda_max)
+  for (double eps : {1e-5, 1e-6, 1e-7}) {
+    const long rg = ldlr::gram_rank(theta_t, 0.04, 6.0, eps, 600);
+    const long rq = ldlr::time_id_t(theta_t, sector_t::particle, 0.04, 6.0, eps).rank;
+    std::cout << "[time_id]   eps-rank [0.04, 6] eps " << std::setprecision(0) << eps << ": Gram " << rg << ", QR "
+              << rq << "\n";
+    CHECK(std::abs(rg - rq) <= 5 + rq / 5);
+  }
+}
+
+// hidden: scaling of r_t, GL node counts for the same accuracy, accuracy vs number of nodes
+TEST_CASE("line_dlr_time_id_scan", "[.time_id_scan]") {
+  std::cout << std::scientific << std::setprecision(2);
+  const double theta = 20.0 * deg, theta_t = 10.0 * deg;
+  auto zl = ldlr::dense_nodes(theta, 1e-3, 60.0, 120);
+  struct row {
+    double emin, emax, eps;
+    long rank, r1, r125, ngl, ngl_def;
+    double e1, e125, f1, f125, egl, egl_def;
+  };
+  std::vector<row> rows;
+  // minimal GL quadrature (for_spectrum family) reaching 10 eps on the same metric
+  auto gl_search = [&](double emin, double emax, double eps, double &err_out) {
+    long best = -1;
+    double best_err = 0.0;
+    for (double smin : {1e-5, 1e-2 / emax})
+      for (double pe : {1.0, 1.5, 2.0, 3.0})
+        for (long nn : {6L, 8L, 10L, 12L, 16L, 20L}) {
+          auto ray = ldlr::time_ray_t::for_spectrum(theta_t, emin, std::log(1.0 / eps) + 3.0, smin, pe, nn,
+                                                    sector_t::particle);
+          if (best > 0 and ray.size() >= best) continue;
+          const double e = per_pole_err(ray, ray.transform_matrix(zl), emin, emax, 300, zl);
+          if (e <= 10.0 * eps) {
+            best     = ray.size();
+            best_err = e;
+          }
+        }
+    err_out = best_err;
+    return best;
+  };
+  auto run = [&](double emin, double emax, double eps) {
+    row r{emin, emax, eps, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    ldlr::time_id_opts_t o;
+    ldlr::time_id_t a(theta_t, sector_t::particle, emin, emax, eps, o);
+    o.oversample = 1.25;
+    ldlr::time_id_t b(theta_t, sector_t::particle, emin, emax, eps, o);
+    auto Fa = a.transform_matrix(zl), Fb = b.transform_matrix(zl);
+    r.rank = a.rank;
+    r.r1   = a.size();
+    r.r125 = b.size();
+    r.e1   = per_pole_err(a, Fa, emin, emax, 300, zl);
+    r.e125 = per_pole_err(b, Fb, emin, emax, 300, zl);
+    r.f1   = max_abs(Fa);
+    r.f125 = max_abs(Fb);
+    r.ngl  = gl_search(emin, emax, eps, r.egl);
+    auto rd   = ldlr::time_ray_t::for_spectrum(theta_t, emin, 40.0, 1e-5, 3.0, 16, sector_t::particle);
+    r.ngl_def = rd.size();
+    r.egl_def = per_pole_err(rd, rd.transform_matrix(zl), emin, emax, 300, zl);
+    rows.push_back(r);
+    std::cout << "| " << std::setprecision(3) << std::defaultfloat << emin << " | " << emax << " | "
+              << std::scientific << std::setprecision(0) << eps << std::setprecision(1) << " | " << r.rank << " | "
+              << r.r1 << " | " << r.e1 << " | " << r.f1 << " | " << r.r125 << " | " << r.e125 << " | " << r.f125
+              << " | " << r.ngl << " | " << r.egl << " | " << std::fixed << double(r.ngl) / double(r.r125)
+              << std::scientific << " | " << r.ngl_def << " | " << r.egl_def << " |" << std::endl;
+  };
+  std::cout << "\n[time_id_scan] particle ray, theta=20 theta_t=10 deg, per-pole error on 240 line nodes\n"
+            << "| Emin | Emax | eps | rank | r_t(1.0) | err | max|F| | r_t(1.25) | err | max|F| | GL min (10eps) | "
+               "GL err | GL/ID(1.25) | GL default | GL def err |\n";
+  for (double eps : id_eps) {
+    for (double emax : {1.0, 2.0, 4.0, 6.0, 10.0, 20.0, 50.0, 100.0}) run(0.04, emax, eps);
+    for (double emin : {0.2, 0.1, 0.01, 0.005, 0.001}) run(emin, 6.0, eps);
+  }
+  // fit rank = c L log(1/eps) (through the origin) and rank = a + c L log(1/eps), L = log(Emax/Emin)
+  double sxx = 0, sxy = 0, sx = 0, sy = 0;
+  const double n = double(rows.size());
+  for (auto const &r : rows) {
+    const double x = std::log(r.emax / r.emin) * std::log(1.0 / r.eps);
+    sxx += x * x;
+    sxy += x * double(r.rank);
+    sx += x;
+    sy += double(r.rank);
+  }
+  const double c0 = sxy / sxx;
+  const double c1 = (n * sxy - sx * sy) / (n * sxx - sx * sx), a1 = (sy - c1 * sx) / n;
+  double m0 = 0, m1 = 0;
+  for (auto const &r : rows) {
+    const double x = std::log(r.emax / r.emin) * std::log(1.0 / r.eps);
+    m0 = std::max(m0, std::abs(double(r.rank) - c0 * x) / double(r.rank));
+    m1 = std::max(m1, std::abs(double(r.rank) - a1 - c1 * x) / double(r.rank));
+  }
+  std::cout << std::fixed << std::setprecision(3) << "[time_id_scan] fit rank = c L ln(1/eps): c = " << c0
+            << " (max rel dev " << m0 << ");  rank = a + c L ln(1/eps): a = " << a1 << ", c = " << c1
+            << " (max rel dev " << m1 << ")\n";
+  // two-parameter-in-logs fit: rank = a + b ln(1/eps) + c L + d L ln(1/eps)
+  {
+    nda::array<dcomplex, 2> A(rows.size(), 4), y(rows.size(), 1);
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const double L = std::log(rows[i].emax / rows[i].emin), le = std::log(1.0 / rows[i].eps);
+      A(i, 0) = 1.0;
+      A(i, 1) = le;
+      A(i, 2) = L;
+      A(i, 3) = L * le;
+      y(i, 0) = double(rows[i].rank);
+    }
+    auto p = ldlr::detail::lstsq(A, y);
+    std::cout << "[time_id_scan] fit rank = a + b ln(1/eps) + c L + d L ln(1/eps): a=" << p(0, 0).real()
+              << " b=" << p(1, 0).real() << " c=" << p(2, 0).real() << " d=" << p(3, 0).real() << "\n";
+  }
+  // accuracy vs number of nodes (forced pivot counts), Pi and Sigma ranges at eps = 1e-10 selection
+  std::cout << std::scientific << std::setprecision(2)
+            << "[time_id_scan] accuracy vs nodes (selection eps 1e-10, first r pivots), per-pole err / max|F|\n";
+  for (auto const &c : id_cases) {
+    ldlr::time_id_t base(theta_t, sector_t::particle, c.emin, c.emax, 1e-10);
+    std::cout << "[time_id_scan]   " << c.name << " (rank " << base.rank << "):";
+    for (double f : {0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0}) {
+      ldlr::time_id_opts_t o;
+      o.rank_force = long(std::ceil(f * double(base.rank)));
+      ldlr::time_id_t id(theta_t, sector_t::particle, c.emin, c.emax, 1e-10, o);
+      auto F = id.transform_matrix(zl);
+      std::cout << "  r=" << id.size() << ": " << per_pole_err(id, F, c.emin, c.emax, 300, zl) << "/"
+                << std::setprecision(0) << max_abs(F) << std::setprecision(2);
+    }
+    std::cout << "\n";
+  }
 }
 
 } // namespace bdft_tests
