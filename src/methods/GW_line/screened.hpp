@@ -59,7 +59,9 @@
  * nda::tensor::{add, set}; the fit pseudo-inverse, the exponentials and the kernels are built on the host and copied.
  */
 
+#include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -82,6 +84,7 @@
 #include "utilities/Timer.hpp"
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/GW_line/proc_grid.hpp"
+#include "methods/GW_line/device_blas.hpp"
 
 namespace methods::gw_line {
 
@@ -232,6 +235,45 @@ struct bosonic_fit_t {
   }
 };
 
+namespace detail {
+/**
+ * Device Dyson for the zeta slab of one q (whole matrices, C layout), in sub-batches of nbat nodes:
+ *   M_z = I - Z Pi_z (one strided-batched gemm), LU of all M_z (nda 3D getrf -> cublasZgetrfBatched),
+ *   X_z = M_z^{-1} Z solved IN PLACE in the W^T slab (nda 3D getrs, F-layout right-hand sides: the F-layout X_z IS W'_z^T
+ *   in C order), W^T_z -= Z^T, and W_z = (W^T_z)^T into the Pi slab (one cuTENSOR permutation for the sub-batch).
+ * Same factorization as the per-matrix path (LU of the memory = M^T, solve with op 'T').
+ */
+template <typename Dloc_t, typename ZF_t, typename Id_t, MEMORY_SPACE MEM>
+void dyson_batched_device(Dloc_t &Dl, Dloc_t &DTl, long iql, ZF_t const &ZF, Id_t const &Id, long nbat, scratch_t<MEM> &sM,
+                          memory::array<MEM, int, 2> &ipiv_b, long iq, long z_first) {
+  auto all       = nda::range::all;
+  const long nzl = Dl.extent(1), Np = Dl.extent(2), N2 = Np * Np;
+  auto ZT        = nda::transpose(ZF);
+  for (long z0 = 0; z0 < nzl; z0 += nbat) {
+    const long nzb = std::min(nbat, nzl - z0);
+    const auto zr  = nda::range(z0, z0 + nzb);
+    auto Mb        = sM.template view<3>({nzb, Np, Np});
+    for (long z = 0; z < nzb; ++z) Mb(z, all, all) = Id;
+    // column-major: M_z^T = I - Pi_z^T Z^T (Pi_z C-layout = Pi_z^T col-major; ZF F-layout = Z col-major, op 'T')
+    gemm_strided_cm('N', 'T', Np, Np, Np, ComplexType(-1.0), Dl(iql, z0, all, all).data(), Np, N2, ZF.data(), Np, 0,
+                    ComplexType(1.0), Mb.data(), Np, N2, nzb);
+    auto info = nda::lapack::getrf(Mb, ipiv_b);
+    for (long z = 0; z < nzb; ++z)
+      utils::check(info(z) == 0, "gw_line::screened_interaction: batched getrf of I - Z Pi failed (q={}, node={}, info={})", iq,
+                   z_first + z0 + z, info(z));
+    memory::array_view<MEM, ComplexType, 3, nda::F_layout> Xb(std::array<long, 3>{Np, Np, nzb}, DTl(iql, z0, all, all).data());
+    for (long z = 0; z < nzb; ++z) Xb(all, all, z) = ZF;
+    auto info2 = nda::lapack::getrs(Mb, Xb, ipiv_b);
+    for (long z = 0; z < nzb; ++z)
+      utils::check(info2(z) == 0, "gw_line::screened_interaction: batched getrs failed (q={}, node={}, info={})", iq,
+                   z_first + z0 + z, info2(z));
+    for (long z = 0; z < nzb; ++z) nda::tensor::add(ComplexType(-1.0), ZT, ComplexType(1.0), DTl(iql, z0 + z, all, all));
+    nda::tensor::add(ComplexType(1.0), DTl(iql, zr, all, all), "zab", ComplexType(0.0), Dl(iql, zr, all, all), "zba");
+  }
+}
+
+} // namespace detail
+
 /**
  * W at the bosonic nodes and its residues, for the q group [q0, q0 + g).
  *   Pi      : (g, N_zeta, nP, nQ) block layout in MEM, Pi(q, zeta_i) at zeta_i = basis.zeta_nodes (mu-relative).
@@ -277,7 +319,10 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
                    dD.local_shape()[3] == Np,
                "gw_line::screened_interaction: darray Dyson layout does not match dyson_layout_t");
   math::nda::redistribute(dPi, dD);
-  if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+  if constexpr (MEM != HOST_MEMORY) {
+    utils::device_sync();
+    device_mem_probe();
+  }
   Timer.stop("W_redistribute");
 
   // 2. Dyson per local (q, zeta), five-step order of the imaginary-axis code:
@@ -297,6 +342,26 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
     }
     arrF_t ZF(Np, Np), XF(Np, Np);
     memory::array<MEM, int, 1> ipiv(Np);
+    memory::array<MEM, ComplexType, 1> lwork;   // getrf workspace (device: sized once by cusolver's bufferSize, reused)
+    // device: batched LU (cuBLAS getrf/getrsBatched through nda's 3D getrf/getrs) in sub-batches of nbat nodes, or the
+    // per-(q, zeta) cuSOLVER loop below. COQUI_GWLINE_DYSON_BATCHED = 1 / 0 forces either; default: batched for
+    // Np <= 1024 (measured on A100: 8.5x faster than the loop at Np = 128, 4.4x at Np = 640; not measured beyond).
+    [[maybe_unused]] bool batched = false;
+    [[maybe_unused]] long nbat    = 1;
+    [[maybe_unused]] detail::scratch_t<MEM> sM;
+    [[maybe_unused]] memory::array<MEM, int, 2> ipiv_b;
+    if constexpr (MEM != HOST_MEMORY) {
+      char const *v = std::getenv("COQUI_GWLINE_DYSON_BATCHED");
+      batched       = (v != nullptr and *v != '\0') ? (std::strtol(v, nullptr, 10) != 0) : (Np <= 1024);
+      if (batched) {
+        const double mat = double(Np) * Np * 16.0, freeb = double(utils::freemem_device_effective()) * 1048576.0;
+        nbat   = std::max(1L, std::min({lay.nz_loc, 256L, long(0.25 * freeb / mat)}));
+        ipiv_b = memory::array<MEM, int, 2>(nbat, Np);
+      }
+      app_log(3, "  gw_line::screened_interaction: Dyson on the device {} ({} matrices per batch)",
+              batched ? "batched (cuBLAS getrf/getrsBatched)" : "per matrix (cuSOLVER)", nbat);
+      device_mem_probe();
+    }
     for (long iql = 0; iql < lay.nq_loc; ++iql) {
       const long iq = q0 + lay.q_first + iql;
       {
@@ -304,12 +369,18 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
         ZF = zf_h;
       }
       auto ZT = nda::transpose(ZF);   // C-ordered view of Z^T
+      if constexpr (MEM != HOST_MEMORY) {
+        if (batched) {   // device, batched over the zeta nodes of the slab (see dyson_batched_device)
+          detail::dyson_batched_device(Dl, DTl, iql, ZF, Id, nbat, sM, ipiv_b, iq, lay.z_first);
+          continue;
+        }
+      }
       for (long izl = 0; izl < lay.nz_loc; ++izl) {
         auto Pv  = Dl(iql, izl, all, all);
         auto WTv = DTl(iql, izl, all, all);
         M = Id;
         nda::blas::gemm(ComplexType(-1.0), ZF, Pv, ComplexType(1.0), M);   // M = I - Z Pi
-        int info = nda::lapack::getrf(M, ipiv);
+        int info = nda::lapack::getrf(M, ipiv, lwork);
         utils::check(info == 0, "gw_line::screened_interaction: getrf of I - Z Pi failed (q={}, node={}, info={})", iq,
                      lay.z_first + izl, info);
         XF   = ZF;
@@ -338,7 +409,9 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
   auto dWT = math::nda::make_distributed_array<arr4_t>(comm, bgrid, gshape);
   utils::check(dWT.local_range(2) == grid.P_rng() and dWT.local_range(3) == grid.Q_rng(),
                "gw_line::screened_interaction: W^T block layout does not match aux_grid_t");
+  if constexpr (MEM != HOST_MEMORY) device_mem_probe();
   math::nda::redistribute(dDT, dWT);
+  if constexpr (MEM != HOST_MEMORY) device_mem_probe();
   dDT.reset();
   if constexpr (MEM != HOST_MEMORY) utils::device_sync();
   Timer.stop("W_redistribute");
@@ -383,6 +456,19 @@ void pole_contract(memory::array<MEM, ComplexType, 4> const &w, long iq, nda::ar
   utils::check(out.extent(0) == n and out.extent(1) == w.extent(2) and out.extent(2) == w.extent(3),
                "gw_line::pole_contract: out shape mismatch");
   memory::array<MEM, ComplexType, 2> Cm = memory::to_memory_space<MEM>(C);
+  auto w2 = nda::reshape(w(iq, nda::range::all, nda::range::all, nda::range::all), std::array<long, 2>{r, blk});
+  auto o2 = nda::reshape(out, std::array<long, 2>{n, blk});
+  nda::blas::gemm(ComplexType(1.0), Cm, w2, ComplexType(0.0), o2);
+}
+/// out[n, nP, nQ] = Cm[n, r] . w(iq)[r, nP, nQ]   (Cm already in MEM: precomputed once per time chunk by self_energy)
+template <MEMORY_SPACE MEM>
+void pole_contract_m(memory::array<MEM, ComplexType, 4> const &w, long iq, memory::array_view<MEM, ComplexType, 2> Cm,
+                     memory::array_view<MEM, ComplexType, 3> out) {
+  const long n = Cm.extent(0), r = w.extent(1), blk = w.extent(2) * w.extent(3);
+  utils::check(Cm.extent(1) == r, "gw_line::pole_contract: {} coefficients vs {} poles", Cm.extent(1), r);
+  utils::check(iq >= 0 and iq < w.extent(0), "gw_line::pole_contract: q={} out of range", iq);
+  utils::check(out.extent(0) == n and out.extent(1) == w.extent(2) and out.extent(2) == w.extent(3),
+               "gw_line::pole_contract: out shape mismatch");
   auto w2 = nda::reshape(w(iq, nda::range::all, nda::range::all, nda::range::all), std::array<long, 2>{r, blk});
   auto o2 = nda::reshape(out, std::array<long, 2>{n, blk});
   nda::blas::gemm(ComplexType(1.0), Cm, w2, ComplexType(0.0), o2);

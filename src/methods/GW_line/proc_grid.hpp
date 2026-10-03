@@ -32,6 +32,7 @@
  * blocks without any reshuffling.
  */
 
+#include <algorithm>
 #include <array>
 #include <string>
 
@@ -42,6 +43,7 @@
 #include "utilities/check.hpp"
 #include "utilities/mpi_context.h"
 #include "utilities/proc_grid_partition.hpp"
+#include "utilities/freemem.h"
 
 namespace methods::gw_line {
 
@@ -106,6 +108,27 @@ struct aux_grid_t {
     app_log(2, "      S3 polarization alone (Pi + A,B of one sector + acc,tmp + X): {:.4f}", (pi_s3 + xsl) / GB);
   }
 };
+
+/**
+ * Device memory high-water probe (bring-up / benchmarks): device_mem_reset() records the free device memory as the
+ * baseline, device_mem_probe() (called by the kernels at their allocation peaks, DEVICE instantiations only) keeps the
+ * largest drop below it. Includes everything allocated on the device by this process (cudaMemGetInfo), not only GW_line.
+ */
+namespace detail {
+inline double free_device_bytes() { return double(utils::freemem_device()) * 1048576.0; }   // freemem_device(): MB
+inline double &dev_mem_base() { static double v = 0.0; return v; }
+inline double &dev_mem_hw() { static double v = 0.0; return v; }
+} // namespace detail
+inline void device_mem_reset() {
+  detail::dev_mem_base() = detail::free_device_bytes();
+  detail::dev_mem_hw()   = 0.0;
+}
+inline void device_mem_probe() {
+  if (detail::dev_mem_base() > 0.0)
+    detail::dev_mem_hw() = std::max(detail::dev_mem_hw(), detail::dev_mem_base() - detail::free_device_bytes());
+}
+inline double device_high_water_bytes() { return detail::dev_mem_hw(); }
+inline double device_free_bytes() { return detail::free_device_bytes(); }
 
 } // namespace methods::gw_line
 

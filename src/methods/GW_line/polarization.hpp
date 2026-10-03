@@ -39,6 +39,10 @@
  * 2 N_k t_chunk block), then per q: acc(t) = sum_k A(k) o B(k-q) and Pi(q, :) += (sign 2/N_k) F[:, chunk] acc (one gemm
  * [N_zeta x t_chunk] . [t_chunk x block]).
  *
+ * t_chunk <= 0 selects the chunk automatically: 8 on the host, on the device the largest chunk whose A, B, acc fit in 40%
+ * of the free device memory (<= 256; the transform gemm [N_zeta x t_chunk] . [t_chunk x block] has inner dimension t_chunk).
+ * Device Hadamard: one cuTENSOR elementwise_trinary per (q, k), acc <- A o B + acc.
+ *
  * Output: Pi is the local block in MEM, shape (N_q, N_zeta, nP, nQ) = Pi(q, zeta)[P_rng, Q_rng] (overwritten). It stays
  * in MEM because the next consumer (S4: Dyson for W) redistributes a MEM darray.
  */
@@ -57,6 +61,7 @@
 #include "methods/GW_line/proc_grid.hpp"
 #include "methods/GW_line/line_state.hpp"
 #include "methods/GW_line/propagators.hpp"
+#include "methods/GW_line/device_blas.hpp"
 
 namespace methods::gw_line {
 
@@ -79,7 +84,6 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
                mf.nkpts_ibz());
   utils::check(ray_p.sector == sector_t::particle and ray_h.sector == sector_t::hole,
                "gw_line::polarization: ray_p must be a particle ray and ray_h a hole ray");
-  utils::check(t_chunk > 0, "gw_line::polarization: t_chunk must be > 0");
   utils::check(prop.grid.P0 == grid.P0 and prop.grid.nP == grid.nP and prop.grid.Q0 == grid.Q0 and prop.grid.nQ == grid.nQ,
                "gw_line::polarization: propagator and grid blocks differ");
   const long nk = prop.nk, nq = mf.nqpts(), nz = zeta.size(), nP = grid.nP, nQ = grid.nQ, blk = nP * nQ;
@@ -104,12 +108,13 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
     if (sectors != sector_t::both and sectors != leg.ray->sector) continue;
     time_ray_t const &ray = *leg.ray;
     const long nt         = ray.size();
-    const long tc         = std::min(t_chunk, nt);
+    // t_chunk <= 0: automatic (host 8; device from the free device memory: A, B of all k and acc per time node)
+    const long tc = (t_chunk > 0) ? std::min(t_chunk, nt) : detail::auto_t_chunk<MEM>(nt, double(2 * nk + 1) * blk * 16.0);
     memory::array<MEM, ComplexType, 2> F = memory::to_memory_space<MEM>(ray.transform_matrix(zeta));   // (nz, nt)
     arr4_t A(nk, tc, nP, nQ), B(nk, tc, nP, nQ);
     arr3_t acc(tc, nP, nQ);
-    [[maybe_unused]] arr3_t tmp;
-    if constexpr (MEM != HOST_MEMORY) tmp = arr3_t(tc, nP, nQ);
+    if constexpr (MEM != HOST_MEMORY) device_mem_probe();
+    app_log(3, "  gw_line::polarization: {} sector, {} time nodes in chunks of {}", leg.ray->sector == sector_t::particle ? "particle" : "hole", nt, tc);
     const ComplexType alpha(leg.sign * 2.0 / double(nk));
 
     for (long i0 = 0; i0 < nt; i0 += tc) {
@@ -136,16 +141,12 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
             if (ik == 0) acc_v = Ak * Bk;
             else acc_v += Ak * Bk;
           } else {
-            // device: copies + tensor::elementwise only (no lazy nda expressions into device arrays)
-            if (ik == 0) {
-              acc_v = Ak;
-              nda::tensor::elementwise(ComplexType(1.0), Bk, ComplexType(1.0), acc_v, nda::tensor::op::MUL);
-            } else {
-              auto tmp_v = tmp(tr, all, all);
-              tmp_v      = Ak;
-              nda::tensor::elementwise(ComplexType(1.0), Bk, ComplexType(1.0), tmp_v, nda::tensor::op::MUL);
-              nda::tensor::elementwise(ComplexType(1.0), tmp_v, ComplexType(1.0), acc_v, nda::tensor::op::SUM);
-            }
+            // device: one cuTENSOR trinary per k, acc <- (A o B) + acc (no lazy nda expressions on device arrays)
+            if (ik == 0) nda::tensor::set(ComplexType(0.0), acc_v);
+#if defined(ENABLE_DEVICE)   // device-only: older host nda checkouts lack elementwise_trinary
+            nda::tensor::elementwise_trinary(ComplexType(1.0), Ak, "abc", ComplexType(1.0), Bk, "abc", ComplexType(1.0), acc_v,
+                                             "abc", nda::tensor::op::MUL, nda::tensor::op::SUM);
+#endif
           }
         }
         if constexpr (MEM != HOST_MEMORY) utils::device_sync();

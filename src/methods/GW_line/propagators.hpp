@@ -39,6 +39,8 @@
  *
  * Device rules (plan 6.4): the X slices, the coefficients and all outputs live in MEM; the heavy work is nda::blas::gemm
  * only (op flags for transpose / dagger of the small nb x nb C(t)); host-side setup is O(N_k nb (Np_loc + Nq_loc)).
+ * On the device the per-t products are two strided-batched gemms per call (all nt times at once, the X slice broadcast);
+ * intermediates live in grow-only scratch (no per-call device allocation once warm).
  */
 
 #include <vector>
@@ -51,6 +53,7 @@
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/GW_line/proc_grid.hpp"
 #include "methods/GW_line/line_state.hpp"
+#include "methods/GW_line/device_blas.hpp"
 
 namespace methods::gw_line {
 
@@ -71,6 +74,9 @@ struct propagator_t {
   // pole data mirrored to MEM by set_poles: per k and sector, coef as (M, nb*nb); energies stay on the host
   std::vector<arr_t<2>> coef_p, coef_h;
   std::vector<nda::array<double, 1>> e_p, e_h;
+
+  // grow-only MEM scratch of build(): phases, C(t), and the intermediate (host: Xp C; device: C Xq^dagger for all t)
+  mutable detail::scratch_t<MEM> s_ph, s_C, s_T;
 
   /// X slices of all k for the block of `grid`, from the collinear THC collocation matrices thc.X(0, 0, ik).
   propagator_t(methods::thc_reader_t const &thc, aux_grid_t const &grid_) : grid(grid_) {
@@ -142,36 +148,60 @@ struct propagator_t {
       return;
     }
     // C(tau) for tau = t (plain, transposed) or conj(t) (adjoint_conj_t): phases on the host, one gemm in MEM.
+    // All MEM intermediates are views of grow-only scratch buffers (no allocation per call once warm).
     const bool conj_time = (form == gtilde_form_t::adjoint_conj_t);
     nda::array<ComplexType, 2> ph_h(nt, M);
     for (long it = 0; it < nt; ++it) {
       const ComplexType tau = conj_time ? std::conj(t(it)) : t(it);
       for (long m = 0; m < M; ++m) ph_h(it, m) = std::exp(ComplexType(0.0, -e(m)) * tau);
     }
-    arr_t<2> ph = memory::to_memory_space<MEM>(ph_h);
-    arr_t<3> C(nt, nb, nb);
+    auto ph = s_ph.template view<2>({nt, M});
+    ph      = ph_h;
+    auto C  = s_C.template view<3>({nt, nb, nb});
     auto C2 = nda::reshape(C, std::array<long, 2>{nt, nb * nb});
     nda::blas::gemm(ComplexType(1.0), ph, coef, ComplexType(0.0), C2);
 
-    arr_t<2> tmp(grid.nP, nb);
     auto all = nda::range::all;
-    for (long it = 0; it < nt; ++it) {
-      auto Ct = C(it, all, all);
-      auto ot = out(it, all, all);
-      switch (form) {
-        case gtilde_form_t::plain:
-          nda::blas::gemm(ComplexType(1.0), Xp(ik, all, all), Ct, ComplexType(0.0), tmp);
-          nda::blas::gemm(ComplexType(1.0), tmp, XqH(ik, all, all), ComplexType(0.0), ot);
-          break;
-        case gtilde_form_t::transposed:
-          nda::blas::gemm(ComplexType(1.0), Xpc(ik, all, all), nda::transpose(Ct), ComplexType(0.0), tmp);
-          nda::blas::gemm(ComplexType(1.0), tmp, XqT(ik, all, all), ComplexType(0.0), ot);
-          break;
-        case gtilde_form_t::adjoint_conj_t:
-          nda::blas::gemm(ComplexType(1.0), Xp(ik, all, all), nda::dagger(Ct), ComplexType(0.0), tmp);
-          nda::blas::gemm(ComplexType(1.0), tmp, XqH(ik, all, all), ComplexType(0.0), ot);
-          break;
+    if constexpr (MEM == HOST_MEMORY) {
+      auto tmp = s_T.template view<2>({grid.nP, nb});
+      for (long it = 0; it < nt; ++it) {
+        auto Ct = C(it, all, all);
+        auto ot = out(it, all, all);
+        switch (form) {
+          case gtilde_form_t::plain:
+            nda::blas::gemm(ComplexType(1.0), Xp(ik, all, all), Ct, ComplexType(0.0), tmp);
+            nda::blas::gemm(ComplexType(1.0), tmp, XqH(ik, all, all), ComplexType(0.0), ot);
+            break;
+          case gtilde_form_t::transposed:
+            nda::blas::gemm(ComplexType(1.0), Xpc(ik, all, all), nda::transpose(Ct), ComplexType(0.0), tmp);
+            nda::blas::gemm(ComplexType(1.0), tmp, XqT(ik, all, all), ComplexType(0.0), ot);
+            break;
+          case gtilde_form_t::adjoint_conj_t:
+            nda::blas::gemm(ComplexType(1.0), Xp(ik, all, all), nda::dagger(Ct), ComplexType(0.0), tmp);
+            nda::blas::gemm(ComplexType(1.0), tmp, XqH(ik, all, all), ComplexType(0.0), ot);
+            break;
+        }
       }
+    } else {
+      // device: two strided-batched gemms over the nt times (the X slice broadcast with stride 0), column-major view of
+      // the C-layout blocks (see device_blas.hpp):
+      //   T(t)   = op(C(t)) Xq'     ->  T(t)^T   = Xq'^T op'(C(t)^T):  plain  C XqH   (op 'N'), transposed  C^T XqT ('T'),
+      //                                                              adjoint C^dagger XqH ('C')
+      //   out(t) = Xp' T(t)         ->  out(t)^T = T(t)^T Xp'^T        (Xp' = Xp, or conj(Xp) for transposed)
+      const long nP = grid.nP, nQ = grid.nQ;
+      utils::check(out.indexmap().strides()[1] == nQ and out.indexmap().strides()[2] == 1,
+                   "gw_line::propagator_t::build: out blocks must be contiguous");
+      auto T           = s_T.template view<3>({nt, nb, nQ});
+      const char opC   = (form == gtilde_form_t::plain) ? 'N' : (form == gtilde_form_t::transposed ? 'T' : 'C');
+      auto const &Xq_  = (form == gtilde_form_t::transposed) ? XqT : XqH;
+      auto const &Xp_  = (form == gtilde_form_t::transposed) ? Xpc : Xp;
+      ComplexType const *xq = Xq_.data() + ik * nb * nQ;
+      ComplexType const *xp = Xp_.data() + ik * nP * nb;
+      detail::gemm_strided_cm('N', opC, nQ, nb, nb, ComplexType(1.0), xq, nQ, 0, C.data(), nb, nb * nb, ComplexType(0.0),
+                              T.data(), nQ, nb * nQ, nt);
+      detail::gemm_strided_cm('N', 'N', nQ, nP, nb, ComplexType(1.0), T.data(), nQ, nb * nQ, xp, nb, 0, ComplexType(0.0),
+                              out.data(), nQ, out.indexmap().strides()[0], nt);
+      device_mem_probe();
     }
   }
 
