@@ -31,6 +31,8 @@
 #include <numbers>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <sys/resource.h>
 
 #include "configuration.hpp"
 #include "IO/app_loggers.h"
@@ -590,6 +592,81 @@ void pole_counts(pole_data_t const &pd, long &nmin, long &nmax, double &emin) {
   emin = pd.emin();
 }
 
+
+// ------------------------------------------------------------------------------------------------------------------
+// S7e instrumentation: per-iteration phase timers (min / avg / max over ranks) and host / device high-water memory
+// ------------------------------------------------------------------------------------------------------------------
+/// high-water resident set of this process (bytes): getrusage ru_maxrss (Linux: kB, = VmHWM of /proc/self/status;
+/// macOS: bytes)
+double host_hwm_bytes() {
+  struct rusage ru {};
+  getrusage(RUSAGE_SELF, &ru);
+#if defined(__APPLE__)
+  return double(ru.ru_maxrss);
+#else
+  return double(ru.ru_maxrss) * 1024.0;
+#endif
+}
+/// current resident set (bytes): VmRSS of /proc/self/status (0 where unavailable)
+double host_rss_bytes() {
+  std::ifstream f("/proc/self/status");
+  std::string line;
+  while (std::getline(f, line))
+    if (line.rfind("VmRSS:", 0) == 0) return 1024.0 * std::strtod(line.c_str() + 6, nullptr);
+  return 0.0;
+}
+
+/// the phases of one iteration, in print order (indented names are sub-timers of the preceding phase)
+static const std::vector<std::string> phase_names = {
+    "time_grid",     "bases",          "phase_Pi",        "G_tilde",         "Pi_hadamard",    "Pi_transform",
+    "phase_W",       "W_redistribute", "W_dyson",         "W_fit",           "phase_Sigma",    "Sigma_G_tilde",
+    "Sigma_W_time",  "Sigma_hadamard", "Sigma_contract",  "Sigma_allreduce", "Sigma_transform", "Sigma_mix",
+    "phase_closure", "closure_upfold", "closure_gather",  "closure_mu",      "closure_compress", "phase_F",
+    "checkpoint",    "iteration"};
+
+std::vector<double> phase_snapshot(utils::TimerManager &T) {
+  std::vector<double> v;
+  v.reserve(phase_names.size());
+  for (auto const &nm : phase_names) v.push_back(T.elapsed(nm));
+  return v;
+}
+
+/**
+ * Per-iteration report (level 1): the time of every phase in this iteration, min / avg / max over the ranks (the
+ * max/avg ratio is the load imbalance), and the high-water memory (host VmHWM max / min over ranks; device: the
+ * largest drop of the free device memory since the start of the run, max over ranks) next to the memory model.
+ */
+void report_iteration(boost::mpi3::communicator &comm, long iter, std::vector<double> const &t0, std::vector<double> const &t1,
+                      double rss0, double model_host, double model_dev, bool device) {
+  const long n = long(phase_names.size()), np = comm.size();
+  std::vector<double> d(n), mn(n), mx(n), sm(n);
+  for (long i = 0; i < n; ++i) d[i] = t1[i] - t0[i];
+  comm.all_reduce_n(d.data(), n, mn.data(), boost::mpi3::min<>{});
+  comm.all_reduce_n(d.data(), n, mx.data(), boost::mpi3::max<>{});
+  comm.all_reduce_n(d.data(), n, sm.data(), std::plus<>{});
+  app_log(1, "  phase timers, iteration {} (s over {} ranks; min / avg / max, max/avg):", iter, np);
+  for (long i = 0; i < n; ++i) {
+    if (mx[i] <= 0.0) continue;
+    const bool phase = phase_names[i].rfind("phase_", 0) == 0 or phase_names[i] == "time_grid" or
+                       phase_names[i] == "checkpoint" or phase_names[i] == "iteration" or phase_names[i] == "bases";
+    const double avg = sm[i] / double(np);
+    app_log(1, "    {}{:<18s} {:9.3f} {:9.3f} {:9.3f}  {:5.2f}", phase ? "" : "  ", phase_names[i], mn[i], avg, mx[i],
+            avg > 0.0 ? mx[i] / avg : 1.0);
+  }
+  const double GB = 1024.0 * 1024.0 * 1024.0;
+  double hw = host_hwm_bytes(), hmax = 0.0, hmin = 0.0;
+  comm.all_reduce_n(&hw, 1, &hmax, boost::mpi3::max<>{});
+  comm.all_reduce_n(&hw, 1, &hmin, boost::mpi3::min<>{});
+  app_log(1, "  memory, iteration {}: host VmHWM per rank max {:.3f} GB, min {:.3f} GB (RSS before the GW_line arrays {:.3f} GB "
+             "max; model: that + {:.3f} GB = {:.3f} GB)",
+          iter, hmax / GB, hmin / GB, rss0 / GB, model_host / GB, (rss0 + model_host) / GB);
+  if (device) {
+    double dh = device_high_water_bytes(), dmax = 0.0;
+    comm.all_reduce_n(&dh, 1, &dmax, boost::mpi3::max<>{});
+    app_log(1, "  memory, iteration {}: device high-water per rank max {:.3f} GB (model {:.3f} GB)", iter, dmax / GB, model_dev / GB);
+  }
+}
+
 void print_line(gw_line_iter_t const &r, double tPi, double tW, double tS, double tC, double tF) {
   app_log(1,
           "iter {:3d}: dSigma {:.2e}  mu {:.6f} (dmu {:+.4f} eV)  QP gap {:.4f} eV  nelec {:.6f} (Lehmann {:.6f}, N(mu) {:.6f}, "
@@ -631,9 +708,13 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
 
   utils::TimerManager Timer;
   for (auto nm : {"total", "H0", "bases", "time_grid", "phase_Pi", "phase_W", "phase_Sigma", "phase_closure", "phase_F",
-                  "checkpoint", "spectra"})
+                  "checkpoint", "spectra", "iteration", "Sigma_mix"})
     Timer.add(nm);
   Timer.start("total");
+  // S7e: memory baseline (MF, THC, node-shared arrays) before any GW_line array; device high-water from here on
+  double rss0 = host_rss_bytes();
+  rss0        = comm.all_reduce_value(rss0, boost::mpi3::max<>{});
+  if constexpr (MEM != HOST_MEMORY) device_mem_reset();
 
   app_log(1, "\n╔══════════════════════════════════════════════════════════╗");
   app_log(1, "║  CoQuí: self-consistent GW on the tilted frequency line  ║");
@@ -716,8 +797,22 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
 
   dyson_layout_t lay(comm.size(), comm.rank(), nq, bos->zeta_nodes.size(), Np);
   coulomb_blocks_t<MEM> Zb(thc, grid, lay.q_rng(), Timer);
-  grid.log(nk, nq, bos->zeta_nodes.size(), bos->rank, (prm.t_chunk > 0 ? prm.t_chunk : 32), nb);
+  const bool dev_fused   = (MEM != HOST_MEMORY) and detail::fused_hadamard();
+  const double model_dev = grid.log(nk, nq, bos->zeta_nodes.size(), bos->rank,
+                                    (prm.t_chunk > 0 ? prm.t_chunk : (MEM == HOST_MEMORY ? detail::host_t_chunk_default : 64)),
+                                    nb, -1, dev_fused);
   lay.log();
+  // host model (S7e): the kernel arrays (= model_dev on the host path) + the Sigma arrays of the driver (Sig_p, Sig_h,
+  // Sp_new, Sh_new: 4 N_k N_zeta_f nb^2) + the per-chunk Sigma reduce buffers (2 N_k t_chunk nb^2) + the full Z(q) of the
+  // Dyson slab
+  const double sig_bytes  = 16.0 * double(nk) * double(nz) * double(nb * nb);
+  const double model_host = (MEM == HOST_MEMORY ? model_dev : 0.0) + 4.0 * sig_bytes +
+                            2.0 * 16.0 * double(nk) * double(detail::host_t_chunk_default) * double(nb * nb) +
+                            16.0 * double(lay.nq_loc) * double(Np) * double(Np);
+  app_log(2, "    driver host arrays: Sigma 4 x {:.4f} GB (replicated on every rank), full Z(q) {} x {:.4f} GB; host model "
+             "{:.4f} GB above the baseline RSS {:.4f} GB",
+          sig_bytes / 1073741824.0, lay.nq_loc, 16.0 * double(Np) * Np / 1073741824.0, model_host / 1073741824.0,
+          rss0 / 1073741824.0);
 
   if (not restart) {
     Timer.start("phase_F");
@@ -737,6 +832,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   bool converged = false;
   while (st.iter < prm.niter) {
     const auto t0 = std::chrono::steady_clock::now();
+    const auto ph0 = phase_snapshot(Timer);
+    Timer.start("iteration");
     update_bases();
     // time nodes of the ray products: GL rays (both kernels) or the four ID grids of the current poles
     Timer.start("time_grid");
@@ -788,6 +885,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     e0 = tic("phase_Sigma");
     self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer, sector_t::particle);
     self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sh_new, Timer, sector_t::hole);
+    Timer.start("Sigma_mix");
     double dS = 0.0;
     if (st.have_sigma) {
       const double a = prm.mixing, b = 1.0 - prm.mixing;
@@ -805,6 +903,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     st.Sig_p      = Sp_new;
     st.Sig_h      = Sh_new;
     st.have_sigma = true;
+    Timer.stop("Sigma_mix");
     const double tS = toc("phase_Sigma", e0);
 
     // 3. closure with H_stat - mu = H0 + F - mu
@@ -872,6 +971,11 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     Timer.start("checkpoint");
     write_state(comm, chk, st, &rec);
     Timer.stop("checkpoint");
+    Timer.stop("iteration");
+    if (comm.root() and std::filesystem::exists(chk))
+      app_log(1, "  checkpoint {}: {:.3f} GB after iteration {} (write {:.2f} s)", chk,
+              double(std::filesystem::file_size(chk)) / 1073741824.0, st.iter, Timer.elapsed("checkpoint") - ph0[std::distance(phase_names.begin(), std::find(phase_names.begin(), phase_names.end(), "checkpoint"))]);
+    report_iteration(comm, st.iter, ph0, phase_snapshot(Timer), rss0, model_host, model_dev, MEM != HOST_MEMORY);
 
     if (rec.iter > 1 and dS < prm.conv_thr) {
       converged = true;
