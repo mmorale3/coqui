@@ -37,6 +37,12 @@
  * transpose in (P,Q)); forming them directly avoids any inter-rank transpose of the block layout. None of the forms
  * assumes Hermitian residues.
  *
+ * C(t) from the two residue forms of pole_sector_t (S7c):
+ *   matrix coefficients : C(t) = [nt x M] phases . [M x nb^2] coefficients              (one gemm)
+ *   factorized (Lehmann): C(t) = V diag(e^{-i e_m t}) V^dagger = VP(t) V^dagger,  VP(t)[a, m] = V[a, m] e^{-i e_m t}
+ *                         formed on the host for the chunk ([nt, nb, M], copied once) + ONE batched gemm with V^dagger
+ * (same flop count nt M nb^2; V (nb x M) is mirrored to MEM instead of M nb x nb matrices).
+ *
  * Device rules (plan 6.4): the X slices, the coefficients and all outputs live in MEM; the heavy work is nda::blas::gemm
  * only (op flags for transpose / dagger of the small nb x nb C(t)); host-side setup is O(N_k nb (Np_loc + Nq_loc)).
  * On the device the per-t products are two strided-batched gemms per call (all nt times at once, the X slice broadcast);
@@ -71,12 +77,17 @@ struct propagator_t {
   arr_t<3> XqH;   ///< (nk, nb, nQ)  X(k)[Q_rng, :]^dagger
   arr_t<3> XqT;   ///< (nk, nb, nQ)  X(k)[Q_rng, :]^T
 
-  // pole data mirrored to MEM by set_poles: per k and sector, coef as (M, nb*nb); energies stay on the host
+  // pole data mirrored to MEM by set_poles: per k and sector, coef as (M, nb*nb) (matrix form) or V as (nb, M)
+  // (factorized form; the host copy of V forms VP); energies stay on the host
   std::vector<arr_t<2>> coef_p, coef_h;
   std::vector<nda::array<double, 1>> e_p, e_h;
+  std::vector<char> fac_p, fac_h;                     ///< factorized form per k (particle / hole)
+  std::vector<nda::array<ComplexType, 2>> vh_p, vh_h; ///< host V (nb, M) of the factorized sectors
+  bool poles_set = false;
 
-  // grow-only MEM scratch of build(): phases, C(t), and the intermediate (host: Xp C; device: C Xq^dagger for all t)
+  // grow-only MEM scratch of build(): phases (or VP), C(t), and the intermediate (host: Xp C; device: C Xq^dagger for all t)
   mutable detail::scratch_t<MEM> s_ph, s_C, s_T;
+  mutable detail::scratch_t<HOST_MEMORY> s_VPh;       ///< host staging of VP (device builds only)
 
   /// X slices of all k for the block of `grid`, from the collinear THC collocation matrices thc.X(0, 0, ik).
   propagator_t(methods::thc_reader_t const &thc, aux_grid_t const &grid_) : grid(grid_) {
@@ -107,27 +118,42 @@ struct propagator_t {
     XqT = memory::to_memory_space<MEM>(xqt);
   }
 
-  /// Mirror the pole coefficients to MEM (N_k M nb^2; cheap). Must be called whenever the poles change.
+  /// Mirror the pole residues to MEM (matrix form N_k M nb^2, factorized N_k nb M; cheap). Must be called whenever the
+  /// poles change.
   void set_poles(pole_data_t const &poles) {
     utils::check(poles.nk == nk and poles.nb == nb, "gw_line::propagator_t::set_poles: pole data ({} k, {} bands) vs X ({} k, {} bands)",
                  poles.nk, poles.nb, nk, nb);
     coef_p.clear(); coef_h.clear(); e_p.clear(); e_h.clear();
+    fac_p.clear(); fac_h.clear(); vh_p.clear(); vh_h.clear();
     for (long ik = 0; ik < nk; ++ik) {
       for (auto s : {sector_t::particle, sector_t::hole}) {
-        auto const &ps = poles(ik, s);
-        nda::array<ComplexType, 2> c(ps.size(), nb * nb);
-        for (long m = 0; m < ps.size(); ++m)
-          for (long i = 0; i < nb; ++i)
-            for (long j = 0; j < nb; ++j) c(m, i * nb + j) = ps.coef(m, i, j);
-        if (s == sector_t::particle) {
-          coef_p.emplace_back(memory::to_memory_space<MEM>(c));
-          e_p.emplace_back(ps.e);
+        auto const &ps  = poles(ik, s);
+        const bool part = (s == sector_t::particle);
+        if (ps.is_factorized()) {
+          utils::check(ps.v.extent(0) == nb, "gw_line::propagator_t::set_poles: V has {} rows, nb = {}", ps.v.extent(0), nb);
+          (part ? coef_p : coef_h).emplace_back(memory::to_memory_space<MEM>(ps.v));
+          (part ? vh_p : vh_h).emplace_back(ps.v);
         } else {
-          coef_h.emplace_back(memory::to_memory_space<MEM>(c));
-          e_h.emplace_back(ps.e);
+          nda::array<ComplexType, 2> c(ps.size(), nb * nb);
+          for (long m = 0; m < ps.size(); ++m)
+            for (long i = 0; i < nb; ++i)
+              for (long j = 0; j < nb; ++j) c(m, i * nb + j) = ps.coef(m, i, j);
+          (part ? coef_p : coef_h).emplace_back(memory::to_memory_space<MEM>(c));
+          (part ? vh_p : vh_h).emplace_back();
         }
+        (part ? fac_p : fac_h).push_back(ps.is_factorized() ? 1 : 0);
+        (part ? e_p : e_h).emplace_back(ps.e);
       }
     }
+    poles_set = true;
+  }
+
+  /// bytes of the pole residues mirrored to MEM
+  double pole_bytes() const {
+    double b = 0.0;
+    for (auto const *v : {&coef_p, &coef_h})
+      for (auto const &c : *v) b += 16.0 * double(c.size());
+    return b;
   }
 
   long nP() const { return grid.nP; }
@@ -135,7 +161,7 @@ struct propagator_t {
 
   /// out(it, :, :) = block (P_rng, Q_rng) of the requested form of G~^s(k, t_it); out: (nt, nP, nQ) in MEM.
   void build(long ik, nda::array<ComplexType, 1> const &t, sector_t s, gtilde_form_t form, view_t<3> out) const {
-    utils::check(not coef_p.empty(), "gw_line::propagator_t: set_poles was not called");
+    utils::check(poles_set, "gw_line::propagator_t: set_poles was not called");
     utils::check(s != sector_t::both, "gw_line::propagator_t: sector must be particle or hole");
     const long nt = t.size();
     utils::check(out.extent(0) == nt and out.extent(1) == grid.nP and out.extent(2) == grid.nQ,
@@ -147,19 +173,45 @@ struct propagator_t {
       nda::tensor::set(ComplexType(0.0), out);
       return;
     }
-    // C(tau) for tau = t (plain, transposed) or conj(t) (adjoint_conj_t): phases on the host, one gemm in MEM.
+    // C(tau) for tau = t (plain, transposed) or conj(t) (adjoint_conj_t): phases on the host, one (batched) gemm in MEM.
     // All MEM intermediates are views of grow-only scratch buffers (no allocation per call once warm).
     const bool conj_time = (form == gtilde_form_t::adjoint_conj_t);
+    const bool fact      = (s == sector_t::particle) ? fac_p[ik] != 0 : fac_h[ik] != 0;
+    auto C               = s_C.template view<3>({nt, nb, nb});
     nda::array<ComplexType, 2> ph_h(nt, M);
     for (long it = 0; it < nt; ++it) {
       const ComplexType tau = conj_time ? std::conj(t(it)) : t(it);
       for (long m = 0; m < M; ++m) ph_h(it, m) = std::exp(ComplexType(0.0, -e(m)) * tau);
     }
-    auto ph = s_ph.template view<2>({nt, M});
-    ph      = ph_h;
-    auto C  = s_C.template view<3>({nt, nb, nb});
-    auto C2 = nda::reshape(C, std::array<long, 2>{nt, nb * nb});
-    nda::blas::gemm(ComplexType(1.0), ph, coef, ComplexType(0.0), C2);
+    if (fact) {
+      // factorized: VP(it)[a, m] = V[a, m] ph(it, m) on the host, copied once; C(it) = VP(it) V^dagger
+      auto const &Vh = (s == sector_t::particle) ? vh_p[ik] : vh_h[ik];
+      auto fill_vp   = [&](auto &&VPh) {
+        for (long it = 0; it < nt; ++it)
+          for (long a = 0; a < nb; ++a)
+            for (long m = 0; m < M; ++m) VPh(it, a, m) = Vh(a, m) * ph_h(it, m);
+      };
+      auto VP = s_ph.template view<3>({nt, nb, M});
+      if constexpr (MEM == HOST_MEMORY) {
+        fill_vp(VP);
+        for (long it = 0; it < nt; ++it)
+          nda::blas::gemm(ComplexType(1.0), VP(it, nda::range::all, nda::range::all), nda::dagger(coef), ComplexType(0.0),
+                          C(it, nda::range::all, nda::range::all));
+      } else {
+        auto VPh = s_VPh.template view<3>({nt, nb, M});
+        fill_vp(VPh);
+        VP = VPh;
+        // column-major view (device_blas.hpp): C(it)^T = conj(V) VP(it)^T; V (nb x M, C layout) is the column-major
+        // M x nb matrix V^T (ld M), op 'C' -> conj(V); VP(it) is the column-major VP(it)^T (M x nb, ld M)
+        detail::gemm_strided_cm('C', 'N', nb, nb, M, ComplexType(1.0), coef.data(), M, 0, VP.data(), M, nb * M,
+                                ComplexType(0.0), C.data(), nb, nb * nb, nt);
+      }
+    } else {
+      auto ph = s_ph.template view<2>({nt, M});
+      ph      = ph_h;
+      auto C2 = nda::reshape(C, std::array<long, 2>{nt, nb * nb});
+      nda::blas::gemm(ComplexType(1.0), ph, coef, ComplexType(0.0), C2);
+    }
 
     auto all = nda::range::all;
     if constexpr (MEM == HOST_MEMORY) {

@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <numbers>
 #include <string>
 #include <vector>
@@ -83,6 +84,12 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.sigma_gap     = io::get_value_with_default<double>(pt, "sigma_gap", p.sigma_gap);
   p.bos_gap       = io::get_value_with_default<double>(pt, "bos_gap", p.bos_gap);
   p.g_gap         = io::get_value_with_default<double>(pt, "g_gap", p.g_gap);
+  p.g_repr        = io::get_value_with_default<std::string>(pt, "g_repr", p.g_repr);
+  io::tolower(p.g_repr);
+  p.g_emax        = io::get_value_with_default<double>(pt, "g_emax", p.g_emax);
+  p.g_wtol        = io::get_value_with_default<double>(pt, "g_wtol", p.g_wtol);
+  p.g_emin_frac   = io::get_value_with_default<double>(pt, "g_emin_frac", p.g_emin_frac);
+  p.g_wsmall      = io::get_value_with_default<double>(pt, "g_wsmall", p.g_wsmall);
   p.nodes_per_ray = io::get_value_with_default<long>(pt, "nodes_per_ray", p.nodes_per_ray);
   p.node_tmin     = io::get_value_with_default<double>(pt, "node_tmin", p.node_tmin);
   p.node_tmax     = io::get_value_with_default<double>(pt, "node_tmax", p.node_tmax);
@@ -122,8 +129,17 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
                                    "its G = 0 term and no Madelung/head correction",
                div);
   utils::check(p.theta_deg > 0.0 and p.theta_deg < 90.0, "gw_line: theta_deg must be in (0, 90)");
-  utils::check(p.eps > 0.0 and p.lam > 0.0 and p.lam_b > 0.0, "gw_line: eps, lam, lam_b must be > 0");
+  utils::check(p.eps > 0.0 and p.lam > 0.0, "gw_line: eps, lam must be > 0");
   utils::check(p.g_gap >= 0.0 and p.g_gap < p.lam, "gw_line: g_gap must be in [0, lam)");
+  utils::check(p.g_repr == "lehmann" or p.g_repr == "compressed", "gw_line: g_repr must be \"lehmann\" or \"compressed\" (got \"{}\")",
+               p.g_repr);
+  if (p.g_emax < 0.0) p.g_emax = p.lam;
+  // S7c: the bosonic basis must cover the spectrum of Pi, i.e. the summed energies e^> + |e^<| of the G poles (up to
+  // 2 g_emax / 2 lam); a narrower lam_b makes the W fit residues ill-conditioned (|w_j| ~ 1e5 x W, measured on lih222)
+  // and amplifies every time-grid error in Sigma ~1e5 x. lam_b <= 0 (the default): 2 g_emax (lehmann) / 2 lam (compressed)
+  p.lam_b_auto = (p.lam_b <= 0.0);
+  if (p.lam_b_auto) p.lam_b = 2.0 * (p.g_repr == "lehmann" ? p.g_emax : p.lam);
+  utils::check(p.g_wtol >= 0.0 and p.g_emin_frac >= 0.0 and p.g_wsmall >= 0.0, "gw_line: g_wtol, g_emin_frac, g_wsmall must be >= 0");
   utils::check(p.nodes_per_ray > 1 and p.node_tmin > 0.0 and p.node_tmax > p.node_tmin, "gw_line: invalid node grid");
   utils::check(p.K >= 1 and p.nphi >= 1 and p.wp > 0.0 and p.tol_gram > 0.0, "gw_line: invalid closure parameters");
   utils::check(p.niter >= 0 and p.t_chunk >= 1 and p.ray_decades > 0.0, "gw_line: invalid niter / t_chunk / ray_decades");
@@ -137,10 +153,16 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
 
 void gw_line_params_t::log() const {
   app_log(1, "  gw_line parameters:");
-  app_log(1, "    theta = {} deg (theta_t = {} deg), eps = {:.1e}, lam = {} Ha, lam_b = {} Ha", theta_deg, theta_deg / 2.0, eps,
-          lam, lam_b);
+  app_log(1, "    theta = {} deg (theta_t = {} deg), eps = {:.1e}, lam = {} Ha, lam_b = {} Ha{}", theta_deg, theta_deg / 2.0, eps,
+          lam, lam_b, lam_b_auto ? " (auto: 2 x the G pole range)" : "");
   app_log(1, "    sigma_gap = {}{}, bos_gap = {}{}, g_gap = {}", sigma_gap, sigma_gap < 0.0 ? " (auto)" : "", bos_gap,
           bos_gap < 0.0 ? " (auto)" : "", g_gap);
+  if (g_repr == "lehmann")
+    app_log(1, "    G representation: lehmann (factorized v v^dagger; prune |e| > {} Ha, weight < {:.1e}, |e| < {} x half gap "
+               "with weight < {:.1e})",
+            g_emax, g_wtol, g_emin_frac, g_wsmall);
+  else
+    app_log(1, "    G representation: compressed (gapless per-sector refit, g_gap = {})", g_gap);
   app_log(1, "    fermionic nodes: {} per ray, |t| in [{}, {}] Ha", nodes_per_ray, node_tmin, node_tmax);
   app_log(1, "    closure: wp = {} Ha, K = {}, tol_gram = {:.1e}, nphi = {}", wp, K, tol_gram, nphi);
   app_log(1, "    niter = {} (total), mixing = {}, conv_thr = {:.1e}, t_chunk = {}, ray_decades = {}", niter, mixing, conv_thr,
@@ -212,27 +234,37 @@ template <typename T, int R> void bcast_array(boost::mpi3::communicator &comm, n
   if (A.size() > 0) comm.broadcast_n(A.data(), A.size(), 0);
 }
 
-/// ragged pole storage of one sector: counts (nk), flat e, flat coef (sum M, nb, nb)
+/// ragged pole storage per sector: counts (nk), flat e (sum M), and the residues: flat coef (sum M, nb, nb) (matrix form)
+/// or flat v (sum M, nb) (factorized form; row = v_m)
 void write_poles(h5::group &g, pole_data_t const &pd) {
   auto pg = g.create_group("poles");
   for (auto s : {sector_t::particle, sector_t::hole}) {
     const std::string nm = (s == sector_t::particle) ? "particle" : "hole";
+    bool fact = true;
     nda::array<long, 1> cnt(pd.nk);
     long tot = 0;
-    for (long ik = 0; ik < pd.nk; ++ik) tot += (cnt(ik) = pd(ik, s).size());
+    for (long ik = 0; ik < pd.nk; ++ik) {
+      tot += (cnt(ik) = pd(ik, s).size());
+      fact = fact and pd(ik, s).is_factorized();
+    }
     nda::array<double, 1> e(tot);
-    nda::array<ComplexType, 3> c(tot, pd.nb, pd.nb);
+    nda::array<ComplexType, 3> c(fact ? 0 : tot, pd.nb, pd.nb);
+    nda::array<ComplexType, 2> v(fact ? tot : 0, pd.nb);
     long o = 0;
     for (long ik = 0; ik < pd.nk; ++ik) {
       auto const &ps = pd(ik, s);
       for (long m = 0; m < ps.size(); ++m, ++o) {
-        e(o)                    = ps.e(m);
-        c(o, nda::ellipsis{})   = ps.coef(m, nda::ellipsis{});
+        e(o) = ps.e(m);
+        if (fact)
+          for (long i = 0; i < pd.nb; ++i) v(o, i) = ps.v(i, m);
+        else
+          c(o, nda::ellipsis{}) = ps.coef(m, nda::ellipsis{});
       }
     }
     nda::h5_write(pg, nm + "_counts", cnt, false);
     nda::h5_write(pg, nm + "_e", e, false);
-    nda::h5_write(pg, nm + "_coef", c, false);
+    if (fact) nda::h5_write(pg, nm + "_v", v, false);
+    else nda::h5_write(pg, nm + "_coef", c, false);
   }
 }
 
@@ -245,18 +277,32 @@ pole_data_t read_poles(h5::group &g, long nk, long nb) {
   pd.hole.resize(nk);
   for (auto s : {sector_t::particle, sector_t::hole}) {
     const std::string nm = (s == sector_t::particle) ? "particle" : "hole";
+    const bool fact = pg.has_dataset(nm + "_v");
     nda::array<long, 1> cnt;
     nda::array<double, 1> e;
     nda::array<ComplexType, 3> c;
+    nda::array<ComplexType, 2> v;
     nda::h5_read(pg, nm + "_counts", cnt);
     nda::h5_read(pg, nm + "_e", e);
-    nda::h5_read(pg, nm + "_coef", c);
-    utils::check(cnt.size() == nk and c.extent(1) == nb, "gw_line restart: pole data shape mismatch");
+    if (fact) {
+      nda::h5_read(pg, nm + "_v", v);
+      utils::check(cnt.size() == nk and v.extent(1) == nb and v.extent(0) == e.size(), "gw_line restart: pole data shape mismatch");
+    } else {
+      nda::h5_read(pg, nm + "_coef", c);
+      utils::check(cnt.size() == nk and c.extent(1) == nb, "gw_line restart: pole data shape mismatch");
+    }
     long o = 0;
     for (long ik = 0; ik < nk; ++ik) {
       auto &ps = (s == sector_t::particle) ? pd.part[ik] : pd.hole[ik];
-      ps.e     = nda::array<double, 1>(e(nda::range(o, o + cnt(ik))));
-      ps.coef  = nda::array<ComplexType, 3>(c(nda::range(o, o + cnt(ik)), nda::range::all, nda::range::all));
+      nda::array<double, 1> es(e(nda::range(o, o + cnt(ik))));
+      if (fact) {
+        nda::array<ComplexType, 2> vs(nb, cnt(ik));
+        for (long m = 0; m < cnt(ik); ++m)
+          for (long i = 0; i < nb; ++i) vs(i, m) = v(o + m, i);
+        ps = pole_sector_t::factorized_form(std::move(es), std::move(vs));
+      } else {
+        ps = pole_sector_t(std::move(es), nda::array<ComplexType, 3>(c(nda::range(o, o + cnt(ik)), nda::range::all, nda::range::all)));
+      }
       o += cnt(ik);
     }
   }
@@ -273,10 +319,14 @@ void bcast_poles(boost::mpi3::communicator &comm, pole_data_t &pd) {
     pd.hole.resize(pd.nk);
   }
   for (long ik = 0; ik < pd.nk; ++ik) {
-    bcast_array(comm, pd.part[ik].e);
-    bcast_array(comm, pd.part[ik].coef);
-    bcast_array(comm, pd.hole[ik].e);
-    bcast_array(comm, pd.hole[ik].coef);
+    for (auto *ps : {&pd.part[ik], &pd.hole[ik]}) {
+      int f = ps->factorized ? 1 : 0;
+      comm.broadcast_n(&f, 1, 0);
+      ps->factorized = (f != 0);
+      bcast_array(comm, ps->e);
+      if (ps->factorized) bcast_array(comm, ps->v);
+      else bcast_array(comm, ps->coef);
+    }
   }
 }
 
@@ -305,6 +355,14 @@ void write_history(h5::group &g, gw_line_iter_t const &r) {
   h5::h5_write(hg, "nt_pi_h", r.nt_pi_h);
   h5::h5_write(hg, "nt_sigma_p", r.nt_sig_p);
   h5::h5_write(hg, "nt_sigma_h", r.nt_sig_h);
+  h5::h5_write(hg, "g_repr", r.g_repr);
+  h5::h5_write(hg, "ng_min", r.ng_min);
+  h5::h5_write(hg, "ng_max", r.ng_max);
+  h5::h5_write(hg, "g_emin", r.g_emin);
+  h5::h5_write(hg, "pruned_w", r.pruned_w);
+  h5::h5_write(hg, "pruned_w_weight", r.pruned_w_weight);
+  h5::h5_write(hg, "pruned_near", r.pruned_near);
+  h5::h5_write(hg, "pruned_near_weight", r.pruned_near_weight);
 }
 
 gw_line_iter_t read_history(h5::group &g) {
@@ -335,6 +393,16 @@ gw_line_iter_t read_history(h5::group &g) {
     h5::h5_read(hg, "nt_sigma_p", r.nt_sig_p);
     h5::h5_read(hg, "nt_sigma_h", r.nt_sig_h);
   }
+  if (hg.has_dataset("g_repr")) {   // absent before S7c (compressed poles)
+    h5::h5_read(hg, "g_repr", r.g_repr);
+    h5::h5_read(hg, "ng_min", r.ng_min);
+    h5::h5_read(hg, "ng_max", r.ng_max);
+    h5::h5_read(hg, "g_emin", r.g_emin);
+    h5::h5_read(hg, "pruned_w", r.pruned_w);
+    h5::h5_read(hg, "pruned_w_weight", r.pruned_w_weight);
+    h5::h5_read(hg, "pruned_near", r.pruned_near);
+    h5::h5_read(hg, "pruned_near_weight", r.pruned_near_weight);
+  }
   return r;
 }
 
@@ -347,6 +415,11 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "sigma_gap", p.sigma_gap);
   h5::h5_write(ig, "bos_gap", p.bos_gap);
   h5::h5_write(ig, "g_gap", p.g_gap);
+  h5::h5_write(ig, "g_repr", p.g_repr);
+  h5::h5_write(ig, "g_emax", p.g_emax);
+  h5::h5_write(ig, "g_wtol", p.g_wtol);
+  h5::h5_write(ig, "g_emin_frac", p.g_emin_frac);
+  h5::h5_write(ig, "g_wsmall", p.g_wsmall);
   h5::h5_write(ig, "nodes_per_ray", p.nodes_per_ray);
   h5::h5_write(ig, "node_tmin", p.node_tmin);
   h5::h5_write(ig, "node_tmax", p.node_tmax);
@@ -400,6 +473,8 @@ void write_state(boost::mpi3::communicator &comm, std::string const &file, state
   comm.barrier();
 }
 
+static constexpr int NHIST = 31;   ///< columns of the broadcast history table
+
 /// Root reads scf_line/final_iter (+ the history of iterations 1..final_iter), everything is broadcast.
 state_t read_state(boost::mpi3::communicator &comm, std::string const &file, long nk, long nb,
                    nda::array<ComplexType, 1> const &zeta, std::vector<gw_line_iter_t> &history) {
@@ -434,15 +509,17 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     st.poles = read_poles(it, nk, nb);
     utils::check(st.F.extent(0) == nk and st.F.extent(1) == nb, "gw_line restart: F shape mismatch");
     nhist = st.iter;
-    hist  = nda::array<double, 2>(nhist, 23);
+    hist  = nda::array<double, 2>(nhist, NHIST);
     for (long i = 1; i <= st.iter; ++i) {
       auto gi = sg.open_group("iter" + std::to_string(i));
       auto r  = read_history(gi);
-      double v[23] = {double(r.iter), r.dSigma, r.mu, r.dmu, r.gap, r.e_homo, r.e_lumo, r.nelec, r.nelec_lehmann, r.N_mu,
-                      r.dropped, r.heldout_max, double(r.npoles_min), double(r.npoles_max), r.bos_gap, r.sigma_gap_p,
-                      r.sigma_gap_h, r.time, r.time_grid == "id" ? 1.0 : 0.0, double(r.nt_pi_p), double(r.nt_pi_h),
-                      double(r.nt_sig_p), double(r.nt_sig_h)};
-      for (int j = 0; j < 23; ++j) hist(i - 1, j) = v[j];
+      double v[NHIST] = {double(r.iter), r.dSigma, r.mu, r.dmu, r.gap, r.e_homo, r.e_lumo, r.nelec, r.nelec_lehmann, r.N_mu,
+                         r.dropped, r.heldout_max, double(r.npoles_min), double(r.npoles_max), r.bos_gap, r.sigma_gap_p,
+                         r.sigma_gap_h, r.time, r.time_grid == "id" ? 1.0 : 0.0, double(r.nt_pi_p), double(r.nt_pi_h),
+                         double(r.nt_sig_p), double(r.nt_sig_h), r.g_repr == "lehmann" ? 1.0 : 0.0, double(r.ng_min),
+                         double(r.ng_max), r.g_emin, double(r.pruned_w), r.pruned_w_weight, double(r.pruned_near),
+                         r.pruned_near_weight};
+      for (int j = 0; j < NHIST; ++j) hist(i - 1, j) = v[j];
     }
   }
   std::array<double, 7> sc = {double(st.iter), st.mu, st.mu_sigma, st.dmu, st.e_homo, st.e_lumo, st.have_sigma ? 1.0 : 0.0};
@@ -472,6 +549,10 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     r.time_grid = hist(i, 18) > 0.5 ? "id" : "gl";
     r.nt_pi_p = long(std::llround(hist(i, 19))); r.nt_pi_h = long(std::llround(hist(i, 20)));
     r.nt_sig_p = long(std::llround(hist(i, 21))); r.nt_sig_h = long(std::llround(hist(i, 22)));
+    r.g_repr = hist(i, 23) > 0.5 ? "lehmann" : "compressed";
+    r.ng_min = long(std::llround(hist(i, 24))); r.ng_max = long(std::llround(hist(i, 25))); r.g_emin = hist(i, 26);
+    r.pruned_w = long(std::llround(hist(i, 27))); r.pruned_w_weight = hist(i, 28);
+    r.pruned_near = long(std::llround(hist(i, 29))); r.pruned_near_weight = hist(i, 30);
     history.push_back(r);
   }
   return st;
@@ -497,6 +578,18 @@ void write_spectra(boost::mpi3::communicator &comm, std::string const &file, spe
   comm.barrier();
 }
 
+/// retained G poles per k and sector (min, max) and the smallest retained |e|
+void pole_counts(pole_data_t const &pd, long &nmin, long &nmax, double &emin) {
+  nmin = std::numeric_limits<long>::max();
+  nmax = 0;
+  for (long ik = 0; ik < pd.nk; ++ik)
+    for (auto const *ps : {&pd.part[ik], &pd.hole[ik]}) {
+      nmin = std::min(nmin, ps->size());
+      nmax = std::max(nmax, ps->size());
+    }
+  emin = pd.emin();
+}
+
 void print_line(gw_line_iter_t const &r, double tPi, double tW, double tS, double tC, double tF) {
   app_log(1,
           "iter {:3d}: dSigma {:.2e}  mu {:.6f} (dmu {:+.4f} eV)  QP gap {:.4f} eV  nelec {:.6f} (Lehmann {:.6f}, N(mu) {:.6f}, "
@@ -504,6 +597,12 @@ void print_line(gw_line_iter_t const &r, double tPi, double tW, double tS, doubl
           "{:.1f}s closure {:.1f}s F {:.1f}s total {:.1f}s]",
           r.iter, r.dSigma, r.mu, r.dmu * HA_EV, r.gap * HA_EV, r.nelec, r.nelec_lehmann, r.N_mu, r.dropped, r.npoles_min,
           r.npoles_max, r.heldout_max, r.time_grid, r.nt_pi_p, r.nt_pi_h, r.nt_sig_p, r.nt_sig_h, tPi, tW, tS, tC, tF, r.time);
+  if (r.g_repr == "lehmann")
+    app_log(1, "          G lehmann: {}-{} poles per k and sector, min|e| {:.3e} Ha; pruned: weight rule {} ({:.1e}), near-mu rule {} "
+               "({:.1e})",
+            r.ng_min, r.ng_max, r.g_emin, r.pruned_w, r.pruned_w_weight, r.pruned_near, r.pruned_near_weight);
+  else
+    app_log(2, "          G compressed: {}-{} poles per k and sector, min|e| {:.3e} Ha", r.ng_min, r.ng_max, r.g_emin);
 }
 
 } // namespace
@@ -567,6 +666,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   line_basis_t gh(theta, prm.lam, prm.eps, prm.g_gap, prm.lam, -1.0, prm.node_tmax);
   Timer.stop("bases");
   closure_params_t cprm{prm.wp, prm.K, prm.tol_gram, prm.nphi};
+  g_repr_params_t grepr{prm.g_repr, prm.g_emax, prm.g_wtol, prm.g_emin_frac, prm.g_wsmall};
 
   // state: restart or KS start
   state_t st;
@@ -663,6 +763,15 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       sig_h.emplace(tg.sig_h);
     }
     Timer.stop("time_grid");
+    {
+      // S7c: Pi's spectrum (summed pole energies) vs the bosonic range (see from_ptree)
+      auto pr          = pole_ranges_t::from(st.poles);
+      const double emx = pr.p_max + pr.h_max;
+      if (emx > bos->lam * (1.0 + 1e-12))
+        app_log(1, "  WARNING gw_line: the G poles give Pi transitions up to {:.3f} Ha > lam_b = {:.3f} Ha: the W residues are "
+                   "ill-conditioned and amplify the time-grid error in Sigma (S7c); use lam_b >= {:.1f} (or lam_b <= 0: auto)",
+                emx, bos->lam, emx);
+    }
 
     auto tic = [&](char const *nm) { Timer.start(nm); return Timer.elapsed(nm); };
     auto toc = [&](char const *nm, double e0) { Timer.stop(nm); return Timer.elapsed(nm) - e0; };
@@ -704,7 +813,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     for (long ik = 0; ik < nk; ++ik)
       for (long i = 0; i < nb; ++i)
         for (long j = 0; j < nb; ++j) Hrel(ik, i, j) = H0(ik, i, j) + st.F(ik, i, j) - (i == j ? st.mu : 0.0);
-    auto co = closure(comm, Hrel, st.Sig_p, st.Sig_h, zeta, *bp, *bh, gp, gh, cprm, nelec, Timer);
+    auto co = closure(comm, Hrel, st.Sig_p, st.Sig_h, zeta, *bp, *bh, gp, gh, cprm, nelec, Timer, grepr);
     const double tC = toc("phase_closure", e0);
     st.mu_sigma = st.mu;
     st.mu += co.dmu;
@@ -718,6 +827,13 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     auto D = density_matrix(st.poles);
     hartree_exchange<MEM>(prop, Zb, D, mf, grid, mpi, st.F, Timer);
     const double tF = toc("phase_F", e0);
+    {
+      const double np_tot = double(st.poles.total_poles()), MB = 1024.0 * 1024.0;
+      app_log(2, "          pole residues ({}): {:.0f} poles, {:.3f} MB host + the same mirrored by the propagator (matrix form "
+                 "would be {:.3f} MB)",
+              st.poles.is_factorized() ? "factorized nb x M" : "matrix M x nb^2", np_tot, st.poles.residue_bytes() / MB,
+              np_tot * double(nb * nb) * 16.0 / MB);
+    }
 
     st.iter += 1;
     gw_line_iter_t rec;
@@ -743,6 +859,12 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     rec.nt_pi_h       = pi_h->size();
     rec.nt_sig_p      = sig_p->size();
     rec.nt_sig_h      = sig_h->size();
+    rec.g_repr        = co.repr;
+    pole_counts(st.poles, rec.ng_min, rec.ng_max, rec.g_emin);
+    rec.pruned_w           = co.pruned_w;
+    rec.pruned_w_weight    = co.pruned_w_weight;
+    rec.pruned_near        = co.pruned_near;
+    rec.pruned_near_weight = co.pruned_near_weight;
     rec.time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     res.history.push_back(rec);
     print_line(rec, tPi, tW, tS, tC, tF);

@@ -27,13 +27,17 @@
  * sector of a pole = sign of e_m (particle '>' for e_m > 0, hole '<' for e_m < 0).
  * Python oracle: coqui/cayley/cayley/line/thc_gw.py (LineGW.set_poles, poles_from_hamiltonian).
  *
- * Storage (host, replicated on every rank; N_k M nb^2 is small): RAGGED per k and per sector,
- *   part[ik] = {e (M_p(k)), coef (M_p(k), nb, nb)},  hole[ik] = {e (M_h(k)), coef (M_h(k), nb, nb)},
- * so the number of poles may differ per k and per sector (Lehmann form, compressed signed matrices, padded nothing).
+ * Storage (host, replicated on every rank): RAGGED per k and per sector, so the number of poles may differ per k and per
+ * sector (padded nothing). Two forms of the residues (S7c):
+ *   - matrix coefficients: coef (M, nb, nb), arbitrary (signed, non-Hermitian allowed): the gapless per-sector compression
+ *     (g_repr = "compressed") and the python-parity path;
+ *   - FACTORIZED (Lehmann) form: v (nb, M) with coef_m = v_m v_m^dagger (rank-1, positive), never materialized; produced by
+ *     from_ks / from_hamiltonian / from_lehmann and by the closure with g_repr = "lehmann". Memory nb M instead of M nb^2.
  */
 
 #include <cmath>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "configuration.hpp"
@@ -47,11 +51,66 @@ namespace methods::gw_line {
 
 using numerics::line_dlr::sector_t;
 
-/// The poles of one sector at one k.
+/// The poles of one sector at one k: either matrix coefficients coef (M, nb, nb) or the factorized form v (nb, M).
 struct pole_sector_t {
   nda::array<double, 1> e;             ///< (M) mu-relative energies, all of one sign
-  nda::array<ComplexType, 3> coef;     ///< (M, nb, nb) residues
+  nda::array<ComplexType, 3> coef;     ///< (M, nb, nb) residues (matrix-coefficient form; empty when factorized)
+  nda::array<ComplexType, 2> v;        ///< (nb, M) Lehmann vectors (factorized form: coef_m = v_m v_m^dagger)
+  bool factorized = false;
+
+  pole_sector_t() = default;
+  /// matrix-coefficient form
+  pole_sector_t(nda::array<double, 1> e_, nda::array<ComplexType, 3> coef_) : e(std::move(e_)), coef(std::move(coef_)) {
+    utils::check(coef.extent(0) == e.size() and coef.extent(1) == coef.extent(2), "pole_sector_t: coef shape mismatch");
+  }
+  /// factorized form, v (nb, M)
+  static pole_sector_t factorized_form(nda::array<double, 1> e_, nda::array<ComplexType, 2> v_) {
+    utils::check(v_.extent(1) == e_.size(), "pole_sector_t: v has {} columns for {} poles", v_.extent(1), e_.size());
+    pole_sector_t ps;
+    ps.e          = std::move(e_);
+    ps.v          = std::move(v_);
+    ps.factorized = true;
+    return ps;
+  }
+
   long size() const { return e.size(); }
+  bool is_factorized() const { return factorized; }
+  long nb() const { return factorized ? v.extent(0) : coef.extent(1); }
+  /// storage of the residues (bytes): 16 nb M (factorized) or 16 M nb^2
+  double residue_bytes() const { return 16.0 * double(factorized ? v.size() : coef.size()); }
+  /// weight of pole m: Tr coef_m (= |v_m|^2 when factorized)
+  double weight(long m) const {
+    double w = 0.0;
+    if (factorized)
+      for (long i = 0; i < v.extent(0); ++i) w += std::norm(v(i, m));
+    else
+      for (long i = 0; i < coef.extent(1); ++i) w += std::real(coef(m, i, i));
+    return w;
+  }
+  /// sum_m coef_m (nb, nb): one gemm V V^dagger when factorized (the T = 0 density matrix of the hole sector)
+  nda::matrix<ComplexType> density() const {
+    const long n = nb();
+    nda::matrix<ComplexType> D(n, n);
+    D() = ComplexType(0.0);
+    if (size() == 0) return D;
+    if (factorized) {
+      nda::matrix<ComplexType> V(v);
+      nda::blas::gemm(ComplexType(1.0), V, nda::dagger(V), ComplexType(0.0), D);
+    } else {
+      for (long m = 0; m < size(); ++m) D += coef(m, nda::range::all, nda::range::all);
+    }
+    return D;
+  }
+  /// the matrix coefficients (M, nb, nb), materialized from v when factorized (tests / diagnostics only)
+  nda::array<ComplexType, 3> coef_matrices() const {
+    if (not factorized) return coef;
+    const long M = size(), n = nb();
+    nda::array<ComplexType, 3> c(M, n, n);
+    for (long m = 0; m < M; ++m)
+      for (long i = 0; i < n; ++i)
+        for (long j = 0; j < n; ++j) c(m, i, j) = v(i, m) * std::conj(v(j, m));
+    return c;
+  }
 };
 
 struct pole_data_t {
@@ -64,6 +123,39 @@ struct pole_data_t {
   pole_sector_t const &operator()(long ik, sector_t s) const {
     utils::check(s != sector_t::both, "pole_data_t: sector must be particle or hole");
     return (s == sector_t::particle) ? part[ik] : hole[ik];
+  }
+
+  /// true if every sector holds the factorized form (empty sectors count as either)
+  bool is_factorized() const {
+    for (long ik = 0; ik < nk; ++ik)
+      for (auto const *ps : {&part[ik], &hole[ik]})
+        if (ps->size() > 0 and not ps->is_factorized()) return false;
+    return true;
+  }
+  /// total number of poles (both sectors, all k)
+  long total_poles() const {
+    long n = 0;
+    for (long ik = 0; ik < nk; ++ik) n += part[ik].size() + hole[ik].size();
+    return n;
+  }
+  /// storage of all residues (bytes, host; the propagator mirrors the same amount to its memory space)
+  double residue_bytes() const {
+    double b = 0.0;
+    for (long ik = 0; ik < nk; ++ik) b += part[ik].residue_bytes() + hole[ik].residue_bytes();
+    return b;
+  }
+  /// the same poles in the matrix-coefficient form (tests: factorized vs coefficient kernels)
+  pole_data_t to_coefficients() const {
+    pole_data_t pd;
+    pd.nk = nk;
+    pd.nb = nb;
+    pd.part.resize(nk);
+    pd.hole.resize(nk);
+    for (long ik = 0; ik < nk; ++ik) {
+      pd.part[ik] = pole_sector_t(part[ik].e, part[ik].coef_matrices());
+      pd.hole[ik] = pole_sector_t(hole[ik].e, hole[ik].coef_matrices());
+    }
+    return pd;
   }
 
   /// Smallest |e_m| over all k and both sectors (sets s_max of the time rays).
@@ -109,34 +201,69 @@ struct pole_data_t {
     return pd;
   }
 
-  /// Lehmann poles of a Hermitian H(k) (nk, nb, nb): e_m - mu and coef_m = v_m v_m^dagger (python poles_from_hamiltonian).
-  static pole_data_t from_hamiltonian(nda::array<ComplexType, 3> const &H, double mu) {
-    const long nk = H.extent(0), nb = H.extent(1);
-    nda::array<double, 2> e(nk, nb);
-    nda::array<ComplexType, 4> coef(nk, nb, nb, nb);
-    for (long ik = 0; ik < nk; ++ik) {
-      auto [ev, V] = nda::linalg::eigenelements(nda::matrix<ComplexType>(H(ik, nda::range::all, nda::range::all)));
-      for (long m = 0; m < nb; ++m) {
-        e(ik, m) = ev(m) - mu;
-        for (long i = 0; i < nb; ++i)
-          for (long j = 0; j < nb; ++j) coef(ik, m, i, j) = V(i, m) * std::conj(V(j, m));
+  /**
+   * Factorized constructor from the Lehmann form per k: e[ik] (M_k), v[ik] (nb, M_k); poles are split by sign (a pole
+   * exactly at e = 0 is an error), the order within a sector is the input order.
+   */
+  static pole_data_t from_lehmann(std::vector<nda::array<double, 1>> const &e, std::vector<nda::array<ComplexType, 2>> const &v) {
+    utils::check(e.size() == v.size() and not e.empty(), "pole_data_t::from_lehmann: size mismatch");
+    pole_data_t pd;
+    pd.nk = long(e.size());
+    pd.nb = v[0].extent(0);
+    pd.part.resize(pd.nk);
+    pd.hole.resize(pd.nk);
+    for (long ik = 0; ik < pd.nk; ++ik) {
+      utils::check(v[ik].extent(0) == pd.nb and v[ik].extent(1) == e[ik].size(), "pole_data_t::from_lehmann: v shape (k={})", ik);
+      std::vector<long> ip, ih;
+      for (long m = 0; m < e[ik].size(); ++m) {
+        utils::check(e[ik](m) != 0.0, "pole_data_t: pole exactly at mu (k={}, m={})", ik, m);
+        (e[ik](m) > 0.0 ? ip : ih).push_back(m);
       }
+      auto fill = [&](std::vector<long> const &idx) {
+        nda::array<double, 1> es(long(idx.size()));
+        nda::array<ComplexType, 2> vs(pd.nb, long(idx.size()));
+        for (long j = 0; j < long(idx.size()); ++j) {
+          es(j) = e[ik](idx[j]);
+          for (long i = 0; i < pd.nb; ++i) vs(i, j) = v[ik](i, idx[j]);
+        }
+        return pole_sector_t::factorized_form(std::move(es), std::move(vs));
+      };
+      pd.part[ik] = fill(ip);
+      pd.hole[ik] = fill(ih);
     }
-    return from_poles(e, coef);
+    return pd;
   }
 
-  /// Kohn-Sham poles in the KS band basis: e_m = eig(k, m) - mu, coef_m = unit matrix e_m e_m^T.
+  /// Lehmann poles of a Hermitian H(k) (nk, nb, nb): e_m - mu and v_m = the eigenvectors (factorized; python
+  /// poles_from_hamiltonian, coef_m = v_m v_m^dagger).
+  static pole_data_t from_hamiltonian(nda::array<ComplexType, 3> const &H, double mu) {
+    const long nk = H.extent(0), nb = H.extent(1);
+    std::vector<nda::array<double, 1>> e(nk);
+    std::vector<nda::array<ComplexType, 2>> v(nk);
+    for (long ik = 0; ik < nk; ++ik) {
+      auto [ev, V] = nda::linalg::eigenelements(nda::matrix<ComplexType>(H(ik, nda::range::all, nda::range::all)));
+      e[ik] = nda::array<double, 1>(nb);
+      for (long m = 0; m < nb; ++m) e[ik](m) = ev(m) - mu;
+      v[ik] = nda::array<ComplexType, 2>(V);
+    }
+    return from_lehmann(e, v);
+  }
+
+  /// Kohn-Sham poles in the KS band basis: e_m = eig(k, m) - mu, v_m = unit vector (factorized; coef_m = e_m e_m^T).
   static pole_data_t from_ks(nda::array<double, 2> const &eig, double mu) {
     const long nk = eig.extent(0), nb = eig.extent(1);
-    nda::array<double, 2> e(nk, nb);
-    nda::array<ComplexType, 4> coef(nk, nb, nb, nb);
-    coef() = ComplexType(0.0);
-    for (long ik = 0; ik < nk; ++ik)
+    std::vector<nda::array<double, 1>> e(nk);
+    std::vector<nda::array<ComplexType, 2>> v(nk);
+    for (long ik = 0; ik < nk; ++ik) {
+      e[ik] = nda::array<double, 1>(nb);
+      v[ik] = nda::array<ComplexType, 2>(nb, nb);
+      v[ik]() = ComplexType(0.0);
       for (long m = 0; m < nb; ++m) {
-        e(ik, m)          = eig(ik, m) - mu;
-        coef(ik, m, m, m) = ComplexType(1.0);
+        e[ik](m)    = eig(ik, m) - mu;
+        v[ik](m, m) = ComplexType(1.0);
       }
-    return from_poles(e, coef);
+    }
+    return from_lehmann(e, v);
   }
 };
 

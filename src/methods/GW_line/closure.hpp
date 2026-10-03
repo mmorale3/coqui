@@ -30,8 +30,14 @@
  *     -> Cayley moments C^(n), n = 0..K+1, of the TOTAL measure (both sectors in one sum; python lehmann_from_sigma)
  *     -> block-Toeplitz upfolding (d_l, W) -> Htilde = [[H_stat - mu, W], [W^dag, diag d]] -> Lehmann G (e_m, v_m)
  *     -> chemical potential over all k (widest admissible QP gap), re-centring e_m -> e_m - dmu
- *     -> per-sector refit of the Lehmann G on GAPLESS one-sided bases (g_gap = 0) from the dense nodes; poles with
- *        |e_m| > lam are dropped and their weight logged -> the next pole data (matrix coefficients).
+ *     -> the next pole data, by one of two representations (g_repr_params_t, S7c):
+ *        "lehmann"   : the Lehmann (e_m, v_m) themselves, split by the sign of e_m, after PRUNING only (no refit): poles
+ *                      with |e_m| > g_emax (moment-truncation artefacts) and poles of weight |v_m|^2 < g_wtol are dropped
+ *                      (optionally also tiny-weight poles very close to mu, see g_repr_params_t), the dropped weights are
+ *                      logged; factorized residues v_m v_m^dagger (positive, rank 1), D and N exact for the retained poles;
+ *        "compressed": per-sector refit of the Lehmann G on GAPLESS one-sided bases (g_gap = 0) from the dense nodes; poles
+ *                      with |e_m| > lam are dropped and their weight logged -> matrix coefficients (signed; the S6 path,
+ *                      python parity).
  *
  * Everything is on the host and mu-relative: Sigma is sampled at zeta (relative to the centre mu at which it was
  * computed), Hrel = H0 + F - mu, the returned Lehmann energies and compressed poles are relative to the NEW centre
@@ -47,6 +53,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <string>
 #include <vector>
 
 #include "configuration.hpp"
@@ -94,6 +101,21 @@ struct closure_params_t {
   long K          = 24;      ///< moments 0..K (+ the held-out K+1)
   double tol_gram = 1e-10;   ///< relative eigenvalue cutoff of the block-Toeplitz Gram matrix
   long nphi       = 8;       ///< coarse terminal-phase scan (+ golden section)
+};
+
+/**
+ * Representation of G handed to the next iteration (S7c; driver keys g_repr, g_emax, g_wtol, g_emin_frac, g_wsmall).
+ * "lehmann": a pole m (mu-relative energy e_m, weight w_m = |v_m|^2) is dropped if
+ *   (i)   |e_m| > emax (default: lam of the G bases; weight logged as "dropped", as the compressed path), or e_m == 0;
+ *   (ii)  w_m < wtol (count and summed weight logged);
+ *   (iii) |e_m| < emin_frac * (QP half gap) AND w_m < wsmall (count and summed weight logged; off when emin_frac <= 0).
+ */
+struct g_repr_params_t {
+  std::string repr = "compressed";   ///< "lehmann" | "compressed"
+  double emax      = -1.0;           ///< (i); < 0: lam of the particle G basis
+  double wtol      = 1e-12;          ///< (ii)
+  double emin_frac = 0.0;            ///< (iii) fraction of the QP half gap
+  double wsmall    = 0.0;            ///< (iii) weight threshold
 };
 
 /// Result of the closure of one k: the Lehmann G (mu-relative to the closure centre) and the upfolded Sigma_c poles.
@@ -231,8 +253,13 @@ struct closure_out_t {
   double N_mu = 0.0;              ///< electron count of the Lehmann G at the chosen mu (mu finder)
   double nel_lehmann = 0.0;       ///< 2 sum_k w_k sum_{e_m < 0} |v_m|^2 after re-centring
   double nel_compressed = 0.0;    ///< 2 sum_k w_k Tr D(k) of the compressed poles
-  double dropped = 0.0;           ///< max over k of the dropped weight (python)
+  double dropped = 0.0;           ///< max over k of the dropped weight (python; |e| > emax)
   double dropped_sum = 0.0;       ///< sum over k of the dropped weight
+  std::string repr = "compressed";   ///< representation of `poles`
+  long pruned_w = 0;              ///< lehmann: poles dropped by the weight rule (ii), all k
+  double pruned_w_weight = 0.0;   ///<   their summed weight
+  long pruned_near = 0;           ///< lehmann: poles dropped by the near-mu rule (iii), all k
+  double pruned_near_weight = 0.0;   ///< their summed weight
   std::vector<long> npoles;       ///< upfolded poles per k
   std::vector<double> heldout;    ///< held-out moment error per k
 };
@@ -246,7 +273,7 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
                              nda::array<ComplexType, 4> const &Sig_p, nda::array<ComplexType, 4> const &Sig_h,
                              nda::array<ComplexType, 1> const &zeta, line_basis_t const &bp, line_basis_t const &bh,
                              line_basis_t const &gp, line_basis_t const &gh, closure_params_t const &p, double nelec,
-                             utils::TimerManager &Timer) {
+                             utils::TimerManager &Timer, g_repr_params_t const &gr = {}) {
   auto all       = nda::range::all;
   const long nk  = Hrel.extent(0), nb = Hrel.extent(1), nz = zeta.size();
   const long np  = comm.size(), rank = comm.rank();
@@ -298,7 +325,54 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   }
   Timer.stop("closure_mu");
 
-  // 3. per owned k: compression; gather (fixed pole counts: the basis ranks)
+  // 3a. Lehmann representation: pruning only (every rank, same data, k in order -> rank-count independent)
+  if (gr.repr == "lehmann") {
+    Timer.start("closure_compress");
+    out.repr            = "lehmann";
+    const double emax   = (gr.emax < 0.0) ? gp.lam : gr.emax;
+    const double e_near = (gr.emin_frac > 0.0) ? gr.emin_frac * 0.5 * (out.e_lumo - out.e_homo) : 0.0;
+    std::vector<nda::array<double, 1>> ek(nk);
+    std::vector<nda::array<ComplexType, 2>> vk(nk);
+    out.dropped = out.dropped_sum = 0.0;
+    out.nel_compressed = 0.0;
+    for (long ik = 0; ik < nk; ++ik) {
+      auto const &e = out.leh.e[ik];
+      auto const &v = out.leh.v[ik];
+      std::vector<long> keep;
+      double drop = 0.0;
+      for (long m = 0; m < e.size(); ++m) {
+        double w = 0.0;
+        for (long i = 0; i < nb; ++i) w += std::norm(v(i, m));
+        const double ae = std::abs(e(m));
+        if (ae > emax or e(m) == 0.0) {
+          drop += w;
+        } else if (w < gr.wtol) {
+          out.pruned_w += 1;
+          out.pruned_w_weight += w;
+        } else if (ae < e_near and w < gr.wsmall) {
+          out.pruned_near += 1;
+          out.pruned_near_weight += w;
+        } else {
+          keep.push_back(m);
+          if (e(m) < 0.0) out.nel_compressed += 2.0 / double(nk) * w;
+        }
+      }
+      ek[ik] = nda::array<double, 1>(long(keep.size()));
+      vk[ik] = nda::array<ComplexType, 2>(nb, long(keep.size()));
+      for (long j = 0; j < long(keep.size()); ++j) {
+        ek[ik](j) = e(keep[j]);
+        for (long i = 0; i < nb; ++i) vk[ik](i, j) = v(i, keep[j]);
+      }
+      out.dropped = std::max(out.dropped, drop);
+      out.dropped_sum += drop;
+    }
+    out.poles = pole_data_t::from_lehmann(ek, vk);
+    Timer.stop("closure_compress");
+    return out;
+  }
+  utils::check(gr.repr == "compressed", "gw_line::closure: g_repr must be \"lehmann\" or \"compressed\" (got \"{}\")", gr.repr);
+
+  // 3b. per owned k: compression; gather (fixed pole counts: the basis ranks)
   Timer.start("closure_compress");
   const long rp = gp.rank, rh = gh.rank;
   nda::array<ComplexType, 4> cpart(nk, rp, nb, nb), chole(nk, rh, nb, nb);

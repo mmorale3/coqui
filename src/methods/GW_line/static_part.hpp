@@ -25,7 +25,8 @@
  * Static part of the self-energy (notes section 5.5, Eq. hf; plan 6.3(e); python LineGW.density_matrix /
  * hartree_exchange). Spin-restricted: D(k) per spin, total density 2 D.
  *
- *   D(k)     = sum_{m in <} coef_m                       (T = 0 density matrix from the hole-sector poles)
+ *   D(k)     = sum_{m in <} coef_m                       (T = 0 density matrix from the hole-sector poles;
+ *                                                         V_h V_h^dagger in the factorized form)
  *   D~(k)    = X(k) D(k) X(k)^dagger,   rho_Q = (2/N_k) sum_k D~_QQ(k)
  *   V_H,ab(k)  = sum_P conj(X_Pa(k)) [Z(0) rho]_P X_Pb(k)
  *   Sigma_x,ab(k) = -(1/N_k) sum_q sum_PQ conj(X_Pa(k)) D~_PQ(k-q) Z_PQ(q) X_Qb(k)
@@ -62,14 +63,13 @@
 
 namespace methods::gw_line {
 
-/// D(k) = sum over the hole-sector poles of coef_m (per spin, T = 0); (nk, nb, nb), host.
+/// D(k) = sum over the hole-sector poles of coef_m (per spin, T = 0); (nk, nb, nb), host. Factorized hole sectors:
+/// D = V_h V_h^dagger (one gemm, pole_sector_t::density).
 inline nda::array<ComplexType, 3> density_matrix(pole_data_t const &poles) {
   nda::array<ComplexType, 3> D(poles.nk, poles.nb, poles.nb);
   D() = ComplexType(0.0);
-  for (long ik = 0; ik < poles.nk; ++ik) {
-    auto const &h = poles.hole[ik];
-    for (long m = 0; m < h.size(); ++m) D(ik, nda::range::all, nda::range::all) += h.coef(m, nda::range::all, nda::range::all);
-  }
+  for (long ik = 0; ik < poles.nk; ++ik)
+    if (poles.hole[ik].size() > 0) D(ik, nda::range::all, nda::range::all) = poles.hole[ik].density();
   return D;
 }
 

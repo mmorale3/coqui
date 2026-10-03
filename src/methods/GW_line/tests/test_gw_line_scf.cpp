@@ -53,6 +53,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <functional>
 #include <complex>
 #include <random>
 #include <string>
@@ -87,11 +88,13 @@
 #include "methods/GW_line/screened.hpp"
 #include "methods/GW_line/self_energy.hpp"
 #include "methods/GW_line/time_grids.hpp"
+#include "methods/GW_line/static_part.hpp"
 
 namespace {
 
 using namespace methods::gw_line;
 using numerics::line_dlr::line_basis_t;
+using numerics::line_dlr::sector_t;
 
 /// exact G(z) = [(z - Ht)^{-1}]_{nb x nb} with Ht = [[H, B], [B^dag, diag E]]
 nda::matrix<ComplexType> exact_G(nda::matrix<ComplexType> const &Ht, long nb, ComplexType z) {
@@ -229,6 +232,47 @@ void closure_toy(long npk) {
     REQUIRE(std::abs((out.e_lumo - out.e_homo) - cp_ex.gap) < 1e-4);
   }
 
+  // S7c: the Lehmann representation (pruning only): the factorized poles reproduce the Lehmann G up to the pruned poles,
+  // N = 2 sum_k w_k Tr D of the retained poles
+  utils::TimerManager TL;
+  g_repr_params_t grl;
+  grl.repr = "lehmann";
+  auto outL = closure(comm, H, Sp, Sh, zeta, bp, bh, gp, gh, p, nelec, TL, grl);
+  REQUIRE(outL.repr == "lehmann");
+  REQUIRE(outL.poles.is_factorized());
+  REQUIRE(outL.dmu == out.dmu);
+  double errF = 0.0, nF = 0.0;
+  for (long iw = 0; iw < 60; ++iw) {
+    const ComplexType z(0.0, 1e-2 * std::pow(10.0, 3.0 * iw / 59.0));
+    for (long ik = 0; ik < nk; ++ik) {
+      nda::matrix<ComplexType> GL(nb, nb), GF(nb, nb);
+      GL() = ComplexType(0.0);
+      GF() = ComplexType(0.0);
+      for (long m = 0; m < out.leh.e[ik].size(); ++m)
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j)
+            GL(i, j) += out.leh.v[ik](i, m) * std::conj(out.leh.v[ik](j, m)) / (z - out.leh.e[ik](m));
+      for (auto const *ps : {&outL.poles.part[ik], &outL.poles.hole[ik]})
+        for (long m = 0; m < ps->size(); ++m)
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) GF(i, j) += ps->v(i, m) * std::conj(ps->v(j, m)) / (z - ps->e(m));
+      errF = std::max(errF, nda::max_element(nda::abs(GF - GL)));
+    }
+  }
+  {
+    auto D = density_matrix(outL.poles);
+    for (long ik = 0; ik < nk; ++ik)
+      for (long i = 0; i < nb; ++i) nF += 2.0 / double(nk) * std::real(D(ik, i, i));
+  }
+  app_log(1, "  lehmann representation: poles {}+{} / {}+{} (k = 0 / 1), G vs Lehmann {:.2e} (rel), N {:.8f} (Tr D {:.8f}, "
+             "Lehmann {:.8f}), dropped {:.1e}, pruned weight {} ({:.1e})",
+          outL.poles.part[0].size(), outL.poles.hole[0].size(), outL.poles.part[1].size(), outL.poles.hole[1].size(), errF / gmax,
+          outL.nel_compressed, nF, outL.nel_lehmann, outL.dropped, outL.pruned_w, outL.pruned_w_weight);
+  REQUIRE(errF / gmax < 1e-6);
+  REQUIRE(std::abs(nF - outL.nel_compressed) < 1e-12);
+  REQUIRE(std::abs(outL.nel_compressed - outL.nel_lehmann) < 1e-3);
+  if (exact_model) REQUIRE(std::abs(outL.nel_compressed - N_ex) < 1e-3);
+
   // rank-count independence: the same closure on a single-rank communicator (every rank alone)
   if (comm.size() > 1) {
     auto self = comm.split(comm.rank(), 0);
@@ -241,6 +285,14 @@ void closure_toy(long npk) {
       d = std::max(d, nda::max_element(nda::abs(o1.poles.part[ik].coef - out.poles.part[ik].coef)));
       d = std::max(d, nda::max_element(nda::abs(o1.poles.hole[ik].coef - out.poles.hole[ik].coef)));
     }
+    auto oL1 = closure(self, H, Sp, Sh, zeta, bp, bh, gp, gh, p, nelec, T2, grl);
+    for (long ik = 0; ik < nk; ++ik)
+      for (auto s : {sector_t::particle, sector_t::hole}) {
+        REQUIRE(oL1.poles(ik, s).size() == outL.poles(ik, s).size());
+        if (outL.poles(ik, s).size() == 0) continue;
+        d = std::max(d, nda::max_element(nda::abs(oL1.poles(ik, s).e - outL.poles(ik, s).e)));
+        d = std::max(d, nda::max_element(nda::abs(oL1.poles(ik, s).v - outL.poles(ik, s).v)));
+      }
     app_log(1, "  {} ranks vs 1 rank: max |diff| {:.1e}", comm.size(), d);
     REQUIRE(d <= 1e-12);
   }
@@ -279,9 +331,11 @@ struct lih_t {
 };
 
 /// small settings shared by the restart and parity tests (and by gen_lih222_scf_ref.py)
-ptree scf_params(std::string const &output, long niter, bool restart, std::string const &time_grid = "id") {
+ptree scf_params(std::string const &output, long niter, bool restart, std::string const &time_grid = "id",
+                 std::string const &g_repr = "compressed") {
   ptree pt;
   pt.put("time_grid", time_grid);
+  pt.put("g_repr", g_repr);
   pt.put("theta_deg", 20.0);
   pt.put("eps", 1e-8);
   pt.put("lam", 6.0);
@@ -327,8 +381,14 @@ double maxdiff_poles(pole_data_t const &a, pole_data_t const &b) {
     REQUIRE(a.hole[ik].size() == b.hole[ik].size());
     d = std::max(d, nda::max_element(nda::abs(a.part[ik].e - b.part[ik].e)));
     d = std::max(d, nda::max_element(nda::abs(a.hole[ik].e - b.hole[ik].e)));
-    d = std::max(d, nda::max_element(nda::abs(a.part[ik].coef - b.part[ik].coef)));
-    d = std::max(d, nda::max_element(nda::abs(a.hole[ik].coef - b.hole[ik].coef)));
+    for (auto s : {sector_t::particle, sector_t::hole}) {
+      auto const &x = a(ik, s);
+      auto const &y = b(ik, s);
+      REQUIRE(x.is_factorized() == y.is_factorized());
+      if (x.size() == 0) continue;
+      if (x.is_factorized()) d = std::max(d, nda::max_element(nda::abs(x.v - y.v)));
+      else d = std::max(d, nda::max_element(nda::abs(x.coef - y.coef)));
+    }
   }
   return d;
 }
@@ -379,15 +439,15 @@ TEST_CASE("gw_line_dump_lih222", "[.gw_line_dump]") {
 }
 
 namespace {
-void restart_test(std::string const &tg) {
+void restart_test(std::string const &tg, std::string const &gr = "compressed") {
   lih_t L;
   auto &comm = L.mpi->comm;
-  const std::string fa = "gw_line_rsA_" + tg, fb = "gw_line_rsB_" + tg;
+  const std::string fa = "gw_line_rsA_" + tg + gr, fb = "gw_line_rsB_" + tg + gr;
   auto t0 = std::chrono::steady_clock::now();
-  auto A  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fa, 3, false, tg));
+  auto A  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fa, 3, false, tg, gr));
   auto t1 = std::chrono::steady_clock::now();
-  auto B2 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fb, 2, false, tg));
-  auto pb = scf_params(fb, 3, true, tg);
+  auto B2 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fb, 2, false, tg, gr));
+  auto pb = scf_params(fb, 3, true, tg, gr);
   enable_spectra(pb, 41);
   auto B3 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pb);
   auto t2 = std::chrono::steady_clock::now();
@@ -397,9 +457,11 @@ void restart_test(std::string const &tg) {
   const double dmu = std::abs(A.mu - B3.mu), dpo = maxdiff_poles(A.poles, B3.poles);
   const double dF  = nda::max_element(nda::abs(A.F - B3.F));
   const double dSp = nda::max_element(nda::abs(A.Sig_p - B3.Sig_p)), dSh = nda::max_element(nda::abs(A.Sig_h - B3.Sig_h));
-  app_log(1, "[restart] time_grid {}, ranks {}: 3 iterations ({:.1f} s) vs 2 + restart + 1 ({:.1f} s): |dmu| {:.1e}, poles "
-             "{:.1e}, F {:.1e}, Sigma_p {:.1e}, Sigma_h {:.1e}",
-          tg, comm.size(), std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count(), dmu, dpo,
+  REQUIRE(A.poles.is_factorized() == (gr == "lehmann"));
+  REQUIRE(B3.poles.is_factorized() == (gr == "lehmann"));
+  app_log(1, "[restart] time_grid {}, g_repr {}, ranks {}: 3 iterations ({:.1f} s) vs 2 + restart + 1 ({:.1f} s): |dmu| {:.1e}, "
+             "poles {:.1e}, F {:.1e}, Sigma_p {:.1e}, Sigma_h {:.1e}",
+          tg, gr, comm.size(), std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count(), dmu, dpo,
           dF, dSp, dSh);
   for (long i = 0; i < 3; ++i) {
     app_log(1, "  iter {}: mu {:.10f} / {:.10f}  gap {:.8f} / {:.8f}  dSigma {:.3e} / {:.3e}  t-nodes ({}) {}+{} {}+{}", i + 1,
@@ -408,6 +470,9 @@ void restart_test(std::string const &tg) {
             B3.history[i].nt_sig_h);
     // the restored history carries the time grid and the node counts
     REQUIRE(B3.history[i].time_grid == tg);
+    REQUIRE(B3.history[i].g_repr == gr);
+    REQUIRE(B3.history[i].ng_max == A.history[i].ng_max);
+    REQUIRE(B3.history[i].g_emin == A.history[i].g_emin);
     REQUIRE(B3.history[i].nt_pi_p == A.history[i].nt_pi_p);
     REQUIRE(B3.history[i].nt_sig_h == A.history[i].nt_sig_h);
     REQUIRE(A.history[i].nt_pi_p > 0);
@@ -450,6 +515,7 @@ void restart_test(std::string const &tg) {
 TEST_CASE("gw_line_scf_restart", "[gw_line][scf][restart]") {
   SECTION("time_grid id") { restart_test("id"); }
   SECTION("time_grid gl") { restart_test("gl"); }
+  SECTION("time_grid id, g_repr lehmann") { restart_test("id", "lehmann"); }
 }
 
 TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
@@ -482,7 +548,7 @@ TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
   }
   const std::string fo = "gw_line_parity";
   auto t0 = std::chrono::steady_clock::now();
-  auto R  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fo, niter, false, "gl"));
+  auto R  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fo, niter, false, "gl", "compressed"));
   const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   REQUIRE(long(R.history.size()) == niter);
   const long nb = R.F.extent(1);
@@ -632,30 +698,90 @@ TEST_CASE("gw_line_time_id_poles", "[.time_id_poles]") {
     auto pg = g.open_group("scf_line/iter" + std::to_string(iter) + "/poles");
     for (auto s : {sector_t::particle, sector_t::hole}) {
       const std::string nm = (s == sector_t::particle) ? "particle" : "hole";
-      nda::array<long, 1> cnt; nda::array<double, 1> e; nda::array<ComplexType, 3> c;
-      nda::h5_read(pg, nm + "_counts", cnt); nda::h5_read(pg, nm + "_e", e); nda::h5_read(pg, nm + "_coef", c);
+      nda::array<long, 1> cnt; nda::array<double, 1> e; nda::array<ComplexType, 3> c; nda::array<ComplexType, 2> v;
+      const bool fact = pg.has_dataset(nm + "_v");
+      nda::h5_read(pg, nm + "_counts", cnt); nda::h5_read(pg, nm + "_e", e);
+      if (fact) nda::h5_read(pg, nm + "_v", v);
+      else nda::h5_read(pg, nm + "_coef", c);
       long o = 0;
       for (long ik = 0; ik < nk; ++ik) {
         auto &ps = (s == sector_t::particle) ? pd.part[ik] : pd.hole[ik];
-        ps.e    = nda::array<double, 1>(e(nda::range(o, o + cnt(ik))));
-        ps.coef = nda::array<ComplexType, 3>(c(nda::range(o, o + cnt(ik)), nda::range::all, nda::range::all));
+        nda::array<double, 1> es(e(nda::range(o, o + cnt(ik))));
+        if (fact) {
+          nda::array<ComplexType, 2> vs(nb, cnt(ik));
+          for (long m = 0; m < cnt(ik); ++m)
+            for (long i = 0; i < nb; ++i) vs(i, m) = v(o + m, i);
+          ps = pole_sector_t::factorized_form(std::move(es), std::move(vs));
+        } else {
+          ps = pole_sector_t(std::move(es), nda::array<ComplexType, 3>(c(nda::range(o, o + cnt(ik)), nda::range::all, nda::range::all)));
+        }
         o += cnt(ik);
       }
     }
+  }
+  // optional filters of factorized poles (experiments): GW_LINE_DIAG_EMAX (drop |e| > emax), GW_LINE_DIAG_WMIN (drop weight <)
+  if (std::getenv("GW_LINE_DIAG_EMAX") or std::getenv("GW_LINE_DIAG_WMIN")) {
+    const double fe = std::getenv("GW_LINE_DIAG_EMAX") ? std::atof(std::getenv("GW_LINE_DIAG_EMAX")) : 1e300;
+    const double fw = std::getenv("GW_LINE_DIAG_WMIN") ? std::atof(std::getenv("GW_LINE_DIAG_WMIN")) : 0.0;
+    long nd = 0;
+    for (long ik = 0; ik < nk; ++ik)
+      for (auto *ps : {&pd.part[ik], &pd.hole[ik]}) {
+        REQUIRE(ps->is_factorized());
+        std::vector<long> keep;
+        for (long m = 0; m < ps->size(); ++m)
+          if (std::abs(ps->e(m)) <= fe and ps->weight(m) >= fw) keep.push_back(m);
+        nd += ps->size() - long(keep.size());
+        nda::array<double, 1> e(long(keep.size()));
+        nda::array<ComplexType, 2> v(nb, long(keep.size()));
+        for (long j = 0; j < long(keep.size()); ++j) {
+          e(j) = ps->e(keep[j]);
+          for (long i = 0; i < nb; ++i) v(i, j) = ps->v(i, keep[j]);
+        }
+        *ps = pole_sector_t::factorized_form(std::move(e), std::move(v));
+      }
+    app_log(1, "[diag] filter |e| <= {:.3e}, weight >= {:.1e}: {} poles dropped", fe, fw, nd);
   }
   double cmax = 0.0;
   for (long ik = 0; ik < nk; ++ik) {
     for (auto const *ps : {&pd.part[ik], &pd.hole[ik]})
       for (long m = 0; m < ps->size(); ++m) {
         double nrm = 0.0;
-        for (long i = 0; i < nb; ++i) nrm = std::max(nrm, std::abs(ps->coef(m, i, i)));
+        for (long i = 0; i < nb; ++i)
+          nrm = std::max(nrm, ps->is_factorized() ? std::norm(ps->v(i, m)) : std::abs(ps->coef(m, i, i)));
         cmax = std::max(cmax, nrm);
       }
   }
-  const double theta = 20.0 * std::numbers::pi / 180.0, theta_t = 0.5 * theta;
-  numerics::line_dlr::bosonic_basis_t bos(theta, 4.0, 1e-8, 0.02);
-  auto fz = numerics::line_dlr::dense_nodes(theta, 1e-3, 60.0, 120);
+  // run parameters from the checkpoint (S6/S7b checkpoints: test settings)
+  double th_deg = 20.0, eps_r = 1e-8, lam = 6.0, lam_b = 4.0, bgap = 0.02, sgap = 0.02, ntmin = 1e-3, ntmax = 60.0, wp = 0.11;
+  double tolg = 1e-10, mixing = 0.5, mu_n = 0.0, eh_n = 0.0, el_n = 0.0;
+  long npr = 120, Kc = 8, nphi = 8;
+  nda::array<ComplexType, 3> H0, Fn;
+  nda::array<ComplexType, 4> Sig_np, Sig_nh;
+  bool have_sig = false;
+  {
+    h5::file f(fenv, 'r');
+    h5::group g(f);
+    auto ig = g.open_group("input");
+    h5::h5_read(ig, "theta_deg", th_deg); h5::h5_read(ig, "eps", eps_r); h5::h5_read(ig, "lam", lam);
+    h5::h5_read(ig, "lam_b", lam_b); h5::h5_read(ig, "bos_gap", bgap); h5::h5_read(ig, "sigma_gap", sgap);
+    h5::h5_read(ig, "nodes_per_ray", npr); h5::h5_read(ig, "node_tmin", ntmin); h5::h5_read(ig, "node_tmax", ntmax);
+    h5::h5_read(ig, "wp", wp); h5::h5_read(ig, "K", Kc); h5::h5_read(ig, "tol_gram", tolg); h5::h5_read(ig, "nphi", nphi);
+    h5::h5_read(ig, "mixing", mixing);
+    nda::h5_read(g, "system/H0", H0);
+    auto it = g.open_group("scf_line/iter" + std::to_string(iter));
+    h5::h5_read(it, "mu", mu_n); h5::h5_read(it, "e_homo", eh_n); h5::h5_read(it, "e_lumo", el_n);
+    nda::h5_read(it, "F", Fn);
+    have_sig = it.has_dataset("Sigma_p");
+    if (have_sig) { nda::h5_read(it, "Sigma_p", Sig_np); nda::h5_read(it, "Sigma_h", Sig_nh); }
+  }
+  if (bgap < 0.0) bgap = 0.5 * (el_n - eh_n);
+  if (std::getenv("GW_LINE_DIAG_LAMB")) lam_b = std::atof(std::getenv("GW_LINE_DIAG_LAMB"));   // experiment: bosonic range
+  const double theta = th_deg * std::numbers::pi / 180.0, theta_t = 0.5 * theta;
+  numerics::line_dlr::bosonic_basis_t bos(theta, lam_b, eps_r, bgap);
+  auto fz = numerics::line_dlr::dense_nodes(theta, ntmin, ntmax, npr);
   auto pr = pole_ranges_t::from(pd);
+  app_log(1, "[diag] run settings: eps {:.0e}, K {}, bosonic rank {} (gap {:.4f}), {} fermionic nodes, mixing {}", eps_r, Kc,
+          bos.rank, bgap, fz.size(), mixing);
   app_log(1, "[diag] {} iter {}: poles e^> [{:.2e}, {:.3f}], |e^<| [{:.2e}, {:.3f}], max |coef_ii| {:.2e}, emin {:.2e}", fenv, iter,
           pr.p_min, pr.p_max, pr.h_min, pr.h_max, cmax, pd.emin());
   aux_grid_t grid(mpi, Np);
@@ -684,9 +810,28 @@ TEST_CASE("gw_line_time_id_poles", "[.time_id_poles]") {
     Pi += Pr_h;
     screened_interaction<HOST_MEMORY>(Pi, Zb, bos, grid, mpi, w, T);
   }
+  {
+    // size of the W residues vs W at the bosonic nodes (cancellation in the bosonic real-pole fit)
+    double wmax = 0.0, wsum = 0.0;
+    for (long a = 0; a < w.size(); ++a) wmax = std::max(wmax, std::abs(w.data()[a]));
+    const long r = bos.rank, nqw = w.extent(0);
+    for (long iq = 0; iq < nqw; ++iq)
+      for (long P = 0; P < w.extent(2); ++P)
+        for (long Q = 0; Q < w.extent(3); ++Q) {
+          double sm = 0.0;
+          for (long j = 0; j < r; ++j) sm += std::abs(w(iq, j, P, Q));
+          wsum = std::max(wsum, sm);
+        }
+    wmax = comm.all_reduce_value(wmax, mpi3::max<>{});
+    wsum = comm.all_reduce_value(wsum, mpi3::max<>{});
+    app_log(1, "[diag] W residues: max |w_j| {:.3e}, max_PQ sum_j |w_j| {:.3e} (w extents {} x {} x {} x {})", wmax, wsum,
+            w.extent(0), w.extent(1), w.extent(2), w.extent(3));
+  }
   self_energy<HOST_MEMORY>(prop, pd, w, bos, mf, grid, mpi, fz, rp, rh, 8, Sr_p, T, sector_t::particle);
   self_energy<HOST_MEMORY>(prop, pd, w, bos, mf, grid, mpi, fz, rp, rh, 8, Sr_h, T, sector_t::hole);
   app_log(1, "  reference GL rays {} nodes; default GL {} nodes", rp.size(), gp.size());
+  std::vector<std::tuple<std::string, nda::array<ComplexType, 4>, nda::array<ComplexType, 4>>> sig_runs;
+  sig_runs.emplace_back("ref", Sr_p, Sr_h);
   auto run = [&](std::string const &nm, numerics::line_dlr::time_nodes_t const &pp, numerics::line_dlr::time_nodes_t const &ph,
                  numerics::line_dlr::time_nodes_t const &sp, numerics::line_dlr::time_nodes_t const &sh) {
     memory::array<HOST_MEMORY, ComplexType, 4> Pp, Ph;
@@ -699,6 +844,7 @@ TEST_CASE("gw_line_time_id_poles", "[.time_id_poles]") {
     app_log(1, "  {:<10s} nodes Pi {}+{} Sigma {}+{}: vs ref Pi^> {:.2e} (max {:.2e}) Pi^< {:.2e} | Sigma^> {:.2e} (max {:.2e}) "
                "Sigma^< {:.2e} (max {:.2e})",
             nm, pp.size(), ph.size(), sp.size(), sh.size(), a[0], a[1], b[0], c[0], c[1], d[0], d[1]);
+    sig_runs.emplace_back(nm, Sp, Sh);
   };
   run("GL", gp, gh, gp, gh);
   for (double te : {1e-8, 1e-10, 1e-12})
@@ -710,5 +856,257 @@ TEST_CASE("gw_line_time_id_poles", "[.time_id_poles]") {
       char nm[32];
       std::snprintf(nm, sizeof(nm), "ID %.0e p%.2f", te, pad);
       run(nm, tg.pi_p, tg.pi_h, tg.sig_p, tg.sig_h);
+      if (pad == 1.25 and te >= 1e-10) {
+        // the full ID chain as the driver runs it: Pi_ID -> W -> Sigma_ID, vs the reference chain
+        memory::array<HOST_MEMORY, ComplexType, 4> Pp, Ph, wc;
+        nda::array<ComplexType, 4> Sp, Sh;
+        polarization<HOST_MEMORY>(prop, pd, mf, grid, bos.zeta_nodes, tg.pi_p, tg.pi_h, 8, Pp, T, sector_t::particle);
+        polarization<HOST_MEMORY>(prop, pd, mf, grid, bos.zeta_nodes, tg.pi_p, tg.pi_h, 8, Ph, T, sector_t::hole);
+        Pp += Ph;
+        screened_interaction<HOST_MEMORY>(Pp, Zb, bos, grid, mpi, wc, T);
+        self_energy<HOST_MEMORY>(prop, pd, wc, bos, mf, grid, mpi, fz, tg.sig_p, tg.sig_h, 8, Sp, T, sector_t::particle);
+        self_energy<HOST_MEMORY>(prop, pd, wc, bos, mf, grid, mpi, fz, tg.sig_p, tg.sig_h, 8, Sh, T, sector_t::hole);
+        auto c = rel(Sp, Sr_p), d = rel(Sh, Sr_h);
+        app_log(1, "  {:<10s} FULL CHAIN (Pi_ID -> W -> Sigma_ID) vs reference chain: Sigma^> {:.2e} Sigma^< {:.2e}", nm, c[0], d[0]);
+        sig_runs.emplace_back(std::string(nm) + " chain", Sp, Sh);
+      }
     }
+
+  // closure response (S7c): the closure of the NEXT iteration (mixing with the stored Sigma of this iteration, H0 + F - mu)
+  // on the Sigma of each time grid vs on the reference Sigma, and on the reference Sigma + random noise of relative size
+  // 1e-10 / 1e-8: dmu, dgap and the Lehmann G on the imaginary axis (max |dG| / max |G|)
+  if (std::getenv("GW_LINE_DIAG_CLOSURE") == nullptr) return;
+  auto all = nda::range::all;
+  nda::array<ComplexType, 3> Hrel(nk, nb, nb);
+  for (long ik = 0; ik < nk; ++ik)
+    for (long i = 0; i < nb; ++i)
+      for (long j = 0; j < nb; ++j) Hrel(ik, i, j) = H0(ik, i, j) + Fn(ik, i, j) - (i == j ? mu_n : 0.0);
+  double sg_p = sgap, sg_h = sgap;
+  if (sgap < 0.0) { sg_p = 0.8 * (el_n + bos.gap); sg_h = 0.8 * (std::abs(eh_n) + bos.gap); }
+  line_basis_t bp(theta, lam, eps_r, lam, sg_p, -1.0, ntmax), bh(theta, lam, eps_r, sg_h, lam, -1.0, ntmax);
+  line_basis_t gb_p(theta, lam, eps_r, lam, 0.0, -1.0, ntmax), gb_h(theta, lam, eps_r, 0.0, lam, -1.0, ntmax);
+  closure_params_t cp{wp, Kc, tolg, nphi};
+  g_repr_params_t gr;
+  gr.repr = "lehmann";
+  const double nelec = double(mf.nelec()), meV = 27.211386e3;
+  auto mixed = [&](nda::array<ComplexType, 4> const &Sn, nda::array<ComplexType, 4> const &So) {
+    if (not have_sig) return nda::array<ComplexType, 4>(Sn);
+    nda::array<ComplexType, 4> M(Sn.shape());
+    for (long a = 0; a < M.size(); ++a) M.data()[a] = mixing * Sn.data()[a] + (1.0 - mixing) * So.data()[a];
+    return M;
+  };
+  auto do_closure = [&](nda::array<ComplexType, 4> const &Sp, nda::array<ComplexType, 4> const &Sh) {
+    utils::TimerManager Tc;
+    return closure(comm, Hrel, mixed(Sp, Sig_np), mixed(Sh, Sig_nh), fz, bp, bh, gb_p, gb_h, cp, nelec, Tc, gr);
+  };
+  auto G_axis = [&](closure_out_t const &o) {
+    nda::array<ComplexType, 4> G(nk, 40, nb, nb);
+    G() = 0.0;
+    for (long ik = 0; ik < nk; ++ik)
+      for (long iw = 0; iw < 40; ++iw) {
+        const ComplexType z(0.0, 1e-3 * std::pow(10.0, 4.0 * iw / 39.0));
+        for (long m = 0; m < o.leh.e[ik].size(); ++m) {
+          const ComplexType f = 1.0 / (z - o.leh.e[ik](m));
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) G(ik, iw, i, j) += o.leh.v[ik](i, m) * std::conj(o.leh.v[ik](j, m)) * f;
+        }
+      }
+    return G;
+  };
+  auto o_ref = do_closure(Sr_p, Sr_h);
+  auto G_ref = G_axis(o_ref);
+  app_log(1, "  closure response (next iteration, {} on every rank): reference mu {:.8f}, gap {:.6f} eV, upfolded poles {}-{}, "
+             "held-out {:.1e}",
+          "lehmann", mu_n + o_ref.dmu, (o_ref.e_lumo - o_ref.e_homo) * 27.211386,
+          *std::min_element(o_ref.npoles.begin(), o_ref.npoles.end()), *std::max_element(o_ref.npoles.begin(), o_ref.npoles.end()),
+          *std::max_element(o_ref.heldout.begin(), o_ref.heldout.end()));
+  auto report = [&](std::string const &nm, nda::array<ComplexType, 4> const &Sp, nda::array<ComplexType, 4> const &Sh) {
+    auto o  = do_closure(Sp, Sh);
+    auto Gx = G_axis(o);
+    nda::array<ComplexType, 4> St = Sp + Sh, Sr = Sr_p + Sr_h;
+    long dnp = 0;
+    for (long ik = 0; ik < nk; ++ik) dnp = std::max(dnp, std::abs(o.npoles[ik] - o_ref.npoles[ik]));
+    app_log(1, "    {:<14s} dSigma_new {:.2e} -> dmu {:+.4f} meV, dgap {:+.4f} meV, Lehmann G(i w) {:.2e}, max |d upfold rank| {}", nm,
+            nda::max_element(nda::abs(St - Sr)) / nda::max_element(nda::abs(Sr)), (o.dmu - o_ref.dmu) * meV,
+            ((o.e_lumo - o.e_homo) - (o_ref.e_lumo - o_ref.e_homo)) * meV,
+            nda::max_element(nda::abs(Gx - G_ref)) / nda::max_element(nda::abs(G_ref)), dnp);
+  };
+  for (auto const &[nm, Sp, Sh] : sig_runs)
+    if (nm != "ref") report(nm, Sp, Sh);
+  std::mt19937 gen(7);
+  std::normal_distribution<double> N01;
+  const double smax = nda::max_element(nda::abs(Sr_p + Sr_h));
+  for (double amp : {1e-12, 1e-10, 1e-8}) {
+    nda::array<ComplexType, 4> Np = Sr_p, Nh = Sr_h;
+    for (long a = 0; a < Np.size(); ++a) {
+      Np.data()[a] += amp * smax * ComplexType(N01(gen), N01(gen));
+      Nh.data()[a] += amp * smax * ComplexType(N01(gen), N01(gen));
+    }
+    char nm[32];
+    std::snprintf(nm, sizeof(nm), "noise %.0e", amp);
+    report(nm, Np, Nh);
+  }
+  (void)all;
+}
+
+// ======================================================================================================================
+// S7c: G representation study (lehmann vs compressed, gl vs id)
+// ======================================================================================================================
+namespace {
+
+/// production settings of runs/lih222_gw_line/lih222_gw_line.toml (eps 1e-10, K 24), conv_thr off
+ptree prod_params(std::string const &output, long niter, std::string const &time_grid, std::string const &g_repr) {
+  auto pt = scf_params(output, niter, false, time_grid, g_repr);
+  pt.put("eps", 1e-10);
+  pt.put("K", 24);
+  return pt;
+}
+
+struct variant_t {
+  std::string name, repr;
+  double emin_frac = 0.0, wsmall = 0.0;
+};
+
+struct study_run_t {
+  variant_t var;
+  std::string tg, file;
+  methods::gw_line::gw_line_result_t R;
+  double time = 0.0;
+};
+
+/**
+ * Runs every variant with time_grid "gl" and "id" for niter iterations (settings from mk), prints the per-iteration table
+ * and the id-vs-gl differences per variant; returns the runs (checkpoints removed unless GW_LINE_TEST_KEEP is set).
+ * idgl[v][it] = {|dmu| meV, |dgap| meV, max|dSigma|/max|Sigma|}.
+ */
+std::vector<study_run_t> repr_study(lih_t &L, std::string const &tag, std::vector<variant_t> const &vars, long niter,
+                                    std::function<ptree(std::string const &, std::string const &, std::string const &)> const &mk,
+                                    std::vector<std::vector<std::array<double, 3>>> &idgl) {
+  auto &comm       = L.mpi->comm;
+  const double meV = 27.211386e3;
+  std::vector<study_run_t> runs;
+  for (auto const &v : vars)
+    for (std::string tg : {"gl", "id"}) {
+      study_run_t r;
+      r.var  = v;
+      r.tg   = tg;
+      r.file = "gw_line_repr_" + tag + "_" + v.name + "_" + tg;
+      auto pt = mk(r.file, tg, v.repr);
+      pt.put("g_emin_frac", v.emin_frac);
+      pt.put("g_wsmall", v.wsmall);
+      if (std::getenv("GW_LINE_LAMB")) pt.put("lam_b", std::atof(std::getenv("GW_LINE_LAMB")));
+      auto t0 = std::chrono::steady_clock::now();
+      r.R     = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
+      r.time  = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      REQUIRE(long(r.R.history.size()) == niter);
+      runs.push_back(std::move(r));
+    }
+  app_log(1, "\n[repr {}] lih222, ranks {}, {} iterations per run, lam_b {}", tag, comm.size(), niter,
+          runs.empty() ? 0.0 : mk("x", "gl", "lehmann").get<double>("lam_b"));
+  if (std::getenv("GW_LINE_LAMB")) app_log(1, "  (lam_b overridden by GW_LINE_LAMB = {})", std::getenv("GW_LINE_LAMB"));
+  app_log(1, "  run          it |   mu (Ha)     gap (eV)  N(mu)     Tr D      dSigma   | G poles/k&s  min|e| (Ha) | t-nodes Pi  "
+             "Sigma   | pruned near-mu (w)   | dropped | time (s)");
+  for (auto const &r : runs)
+    for (long it = 0; it < niter; ++it) {
+      auto const &h = r.R.history[it];
+      app_log(1, "  {:<5s} {:<3s} {:4d} | {:.7f}  {:.5f}  {:.6f}  {:.6f}  {:.2e} | {:4d}-{:<4d}   {:.2e}    | {:4d}+{:<4d} {:4d}+{:<4d} | "
+                 "{:4d} ({:.1e})        | {:.1e} | {:.1f}",
+              r.var.name, r.tg, it + 1, h.mu, h.gap * 27.211386, h.N_mu, h.nelec, h.dSigma, h.ng_min, h.ng_max, h.g_emin, h.nt_pi_p,
+              h.nt_pi_h, h.nt_sig_p, h.nt_sig_h, h.pruned_near, h.pruned_near_weight, h.dropped, h.time);
+    }
+  app_log(1, "  id vs gl per representation:   run    it |  dmu (meV)   dgap (meV) | max|dSigma|/max|Sigma|");
+  idgl.assign(vars.size(), {});
+  for (long iv = 0; iv < long(vars.size()); ++iv) {
+    auto const &G = runs[2 * iv], &I = runs[2 * iv + 1];
+    for (long it = 0; it < niter; ++it) {
+      auto Sg = read_sigma_total(comm, G.file + ".gw_line.h5", it + 1);
+      auto Si = read_sigma_total(comm, I.file + ".gw_line.h5", it + 1);
+      const double ds   = nda::max_element(nda::abs(Si - Sg)) / nda::max_element(nda::abs(Sg));
+      const double dmu  = (I.R.history[it].mu - G.R.history[it].mu) * meV;
+      const double dgap = (I.R.history[it].gap - G.R.history[it].gap) * meV;
+      idgl[iv].push_back({std::abs(dmu), std::abs(dgap), ds});
+      app_log(1, "                                 {:<5s} {:3d} | {:+10.4f}  {:+10.4f} | {:.2e}", vars[iv].name, it + 1, dmu, dgap, ds);
+    }
+  }
+  if (vars.size() > 1) {
+    app_log(1, "  representation vs {} (same time grid):  run     it |  dmu (meV)   dgap (meV) | max|dSigma|/max|Sigma|", vars[0].name);
+    for (long iv = 1; iv < long(vars.size()); ++iv)
+      for (long ig = 0; ig < 2; ++ig) {
+        auto const &A = runs[ig], &B = runs[2 * iv + ig];
+        for (long it = 0; it < niter; ++it) {
+          auto Sa = read_sigma_total(comm, A.file + ".gw_line.h5", it + 1);
+          auto Sb = read_sigma_total(comm, B.file + ".gw_line.h5", it + 1);
+          app_log(1, "                                       {:<5s} {:<3s} {:3d} | {:+10.4f}  {:+10.4f} | {:.2e}", vars[iv].name,
+                  B.tg, it + 1, (B.R.history[it].mu - A.R.history[it].mu) * meV, (B.R.history[it].gap - A.R.history[it].gap) * meV,
+                  nda::max_element(nda::abs(Sb - Sa)) / nda::max_element(nda::abs(Sa)));
+        }
+      }
+  }
+  for (auto const &r : runs) app_log(1, "  wall {:<5s} {:<3s}: {:.1f} s", r.var.name, r.tg, r.time);
+  for (auto const &r : runs) remove_file(comm, r.file + ".gw_line.h5");
+  return runs;
+}
+
+double env_or(char const *nm, double d) { return std::getenv(nm) ? std::atof(std::getenv(nm)) : d; }
+
+} // namespace
+
+/**
+ * (S7c) test settings (eps 1e-8, K 8) with the automatic bosonic range (lam_b = 2 x 6 Ha), 4 iterations: lehmann vs
+ * compressed, gl vs id. Gates (measured, 2 ranks, lam_b 12): iteration 1 (KS poles, identical for both representations)
+ * id vs gl dSigma 2.1e-9 (= the ID error); iteration 2: dSigma 7.8e-5, |dmu|, |dgap| <= 0.07 meV for BOTH representations:
+ * not the kernels (fixed-pole ID error ~ 10 eps_t once lam_b covers Pi's spectrum, [.time_id_poles]) but the closure's
+ * response to the 2e-9 difference of iteration 1 (K = 8: x 1e4); iterations 3-4: closure noise floor of K = 8, 1-2 meV.
+ * lehmann vs compressed on the same grid: iteration 2 6.5e-9 (the gapless refit reproduces the Lehmann G), then the same
+ * closure noise.
+ */
+TEST_CASE("gw_line_scf_lehmann", "[gw_line][scf][lehmann]") {
+  lih_t L;
+  const long niter = 4;
+  std::vector<variant_t> vars = {{"cmp", "compressed"}, {"leh", "lehmann", env_or("GW_LINE_EMIN_FRAC", 0.5), env_or("GW_LINE_WSMALL", 1e-4)}};
+  std::vector<std::vector<std::array<double, 3>>> idgl;
+  auto runs = repr_study(L, "test", vars, niter,
+                         [&](std::string const &f, std::string const &tg, std::string const &gr) {
+                           auto pt = scf_params(f, niter, false, tg, gr);
+                           pt.put("lam_b", -1.0);   // auto: 2 x 6 Ha
+                           return pt;
+                         },
+                         idgl);
+  for (auto const &r : runs) {
+    REQUIRE(r.R.poles.is_factorized() == (r.var.repr == "lehmann"));
+    for (auto const &h : r.R.history) {
+      REQUIRE(h.g_repr == r.var.repr);
+      if (r.var.repr == "lehmann" and h.iter > 1) REQUIRE(h.g_emin > 0.25 * 0.5 * h.gap);   // no in-gap poles left
+    }
+  }
+  for (long iv = 0; iv < 2; ++iv)
+    for (long it = 0; it < niter; ++it) {
+      auto const &d = idgl[iv][it];
+      if (it == 0) {
+        REQUIRE(d[2] <= 10.0 * 1e-8);
+        REQUIRE(d[0] <= 1e-3);
+        REQUIRE(d[1] <= 1e-3);
+      } else if (it == 1) {
+        REQUIRE(d[2] <= 3e-4);
+        REQUIRE(d[0] <= 0.3);
+        REQUIRE(d[1] <= 0.3);
+      } else {
+        REQUIRE(d[2] <= 2e-2);
+        REQUIRE(d[0] <= 5.0);
+        REQUIRE(d[1] <= 5.0);
+      }
+    }
+}
+
+/// (S7c, hidden) production settings (eps 1e-10, K 24), GW_LINE_STUDY_NITER iterations (default 4): compressed, lehmann
+/// with the near-mu rule (GW_LINE_EMIN_FRAC / GW_LINE_WSMALL, default 0.5 / 1e-4) and lehmann without it.
+TEST_CASE("gw_line_scf_lehmann_prod", "[.lehmann_prod]") {
+  lih_t L;
+  const long niter = long(env_or("GW_LINE_STUDY_NITER", 4));
+  std::vector<variant_t> vars = {{"cmp", "compressed"},
+                                 {"leh", "lehmann", env_or("GW_LINE_EMIN_FRAC", 0.5), env_or("GW_LINE_WSMALL", 1e-4)},
+                                 {"leh0", "lehmann", 0.0, 0.0}};
+  std::vector<std::vector<std::array<double, 3>>> idgl;
+  repr_study(L, "prod", vars, niter,
+             [&](std::string const &f, std::string const &tg, std::string const &gr) { return prod_params(f, niter, tg, gr); }, idgl);
 }

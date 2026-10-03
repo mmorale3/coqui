@@ -27,11 +27,24 @@
  *
  *   theta_deg = 20      line angle (deg); the time rays use theta_t = theta / 2
  *   eps = 1e-10         tolerance of all real-pole bases (fermionic, bosonic)
- *   lam = 6.0           fermionic pole range (Ha);  lam_b = 4.0 bosonic range
+ *   lam = 6.0           fermionic pole range (Ha)
+ *   lam_b = auto        bosonic pole range (Ha); must cover Pi's spectrum e^> + |e^<| of the G poles (S7c: lam_b = 4 with
+ *                       G poles up to 6 Ha gave W residues 1e5 x W and a 1e5 x amplification of the time-grid error in
+ *                       Sigma); <= 0 or absent: 2 g_emax (lehmann) / 2 lam (compressed). A warning is logged per iteration
+ *                       if the poles exceed it.
  *   sigma_gap = 0.02    Sigma-basis gap on each side (Ha). < 0: auto, gap_p = 0.8 (e_lumo + nu_min),
  *                       gap_h = 0.8 (|e_homo| + nu_min), e_homo/e_lumo the current QP edges (mu-relative), nu_min = bos gap
  *   bos_gap = 0.02      gap of the bosonic basis (Ha). < 0: auto, 0.5 x the current QP gap
- *   g_gap = 0.0         gap of the G compression bases (notes 6.4: keep 0)
+ *   g_gap = 0.0         gap of the G compression bases (notes 6.4: keep 0; g_repr = "compressed" only)
+ *   g_repr = "lehmann"  representation of G between iterations (S7c): "lehmann" = the Lehmann (e_m, v_m) of the
+ *                       closure, factorized residues v v^dagger, pruned only (closure.hpp g_repr_params_t):
+ *                         g_emax = lam      drop |e_m| > g_emax (moment-truncation artefacts; logged as "dropped")
+ *                         g_wtol = 1e-12    drop poles of weight |v_m|^2 < g_wtol (count and weight logged)
+ *                         g_emin_frac = 0.5, g_wsmall = 1e-4   drop in-gap poles: |e_m| < g_emin_frac x (QP half gap) AND
+ *                                           weight < g_wsmall (count and weight logged; 0 = off). lih222 (K 24): ~280 such
+ *                                           poles, total weight 4e-6..8e-6, each <= 8e-7, down to |e| = 3e-6 Ha; they
+ *                                           set the ray length / the ID E_min (Pi nodes 235-291 -> 146, GL 1184-1440 -> 992)
+ *                       "compressed" = per-sector refit on the gapless G bases (signed matrix coefficients; S6; parity)
  *   nodes_per_ray = 120, node_tmin = 1e-3, node_tmax = 60   dense fermionic nodes (log grid per ray); node_tmax is also
  *                       the tmax of the fermionic bases (python node_range)
  *   wp = 0.11, K = 24, tol_gram = 1e-10, nphi = 8           Cayley closure
@@ -59,7 +72,9 @@
  * Checkpoint: <output>.gw_line.h5 (own file), written by the root after every iteration:
  *   system/{nkpts, nbnd, Np, nelec, H0, eigval, qk_to_k2, mu0}, input/{parameters, fermionic_nodes},
  *   scf_line/final_iter, scf_line/iter<N>/{mu, mu_sigma, dmu, e_homo, e_lumo, F, Sigma_p, Sigma_h (N >= 1),
- *   poles/{particle,hole}_{counts,e,coef}, history scalars (incl. time_grid and the node counts nt_{pi,sigma}_{p,h})},
+ *   poles/{particle,hole}_{counts,e,coef | v}, history scalars (incl. time_grid and the node counts nt_{pi,sigma}_{p,h})},
+ *   poles: matrix coefficients {s}_coef (sum M, nb, nb) or, factorized (g_repr = "lehmann"), {s}_v (sum M, nb) = the
+ *   Lehmann vectors v_m as rows (S6/S7b checkpoints with coefficients stay readable),
  *   iter0 = the initial state; spectra/ at the end.
  */
 
@@ -77,8 +92,11 @@
 namespace methods::gw_line {
 
 struct gw_line_params_t {
-  double theta_deg = 20.0, eps = 1e-10, lam = 6.0, lam_b = 4.0;
+  double theta_deg = 20.0, eps = 1e-10, lam = 6.0, lam_b = -1.0;   ///< lam_b <= 0: auto (2 g_emax / 2 lam), S7c
+  bool lam_b_auto = false;
   double sigma_gap = 0.02, bos_gap = 0.02, g_gap = 0.0;
+  std::string g_repr = "lehmann";        ///< "lehmann" | "compressed" (S7c)
+  double g_emax = -1.0, g_wtol = 1e-12, g_emin_frac = 0.5, g_wsmall = 1e-4;   ///< lehmann pruning (g_emax < 0: lam)
   long nodes_per_ray = 120;
   double node_tmin = 1e-3, node_tmax = 60.0;
   double wp = 0.11;
@@ -109,13 +127,18 @@ struct gw_line_iter_t {
   double bos_gap = 0.0, sigma_gap_p = 0.0, sigma_gap_h = 0.0, time = 0.0;
   std::string time_grid = "gl";          ///< time grid used in this iteration
   long nt_pi_p = 0, nt_pi_h = 0, nt_sig_p = 0, nt_sig_h = 0;   ///< node counts (Pi / Sigma, particle / hole ray)
+  std::string g_repr = "compressed";     ///< representation of the poles produced by this iteration (S7c)
+  long ng_min = 0, ng_max = 0;           ///< retained G poles per k and sector (min, max)
+  double g_emin = 0.0;                   ///< smallest retained |e_m| (sets the ID E_min of the next iteration)
+  long pruned_w = 0, pruned_near = 0;    ///< lehmann: poles pruned by weight / near-mu rule (all k)
+  double pruned_w_weight = 0.0, pruned_near_weight = 0.0;
 };
 
 struct gw_line_result_t {
   std::vector<gw_line_iter_t> history;   ///< all iterations (including those read on restart)
   bool converged = false;
   double mu = 0.0, mu_sigma = 0.0;       ///< final centre; centre at which Sigma_p/h were sampled
-  pole_data_t poles;                     ///< final compressed poles (mu-relative)
+  pole_data_t poles;                     ///< final poles (mu-relative; compressed or factorized Lehmann)
   nda::array<ComplexType, 3> F;          ///< final V_H + Sigma_x
   nda::array<ComplexType, 3> H0;         ///< one-body Hamiltonian (KS band basis)
   nda::array<ComplexType, 4> Sig_p, Sig_h;   ///< last mixed Sigma at the nodes (empty if no iteration was done)
