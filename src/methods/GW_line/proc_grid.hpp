@@ -207,10 +207,11 @@ struct w_plan_t {
   }
 };
 
-/// largest Dyson sub-batch on the device (matrices of the batched LU scratch; env COQUI_GWLINE_DYSON_NBAT, default 128)
+/// largest Dyson sub-batch on the device (matrices of the batched LU scratch; env COQUI_GWLINE_DYSON_NBAT, default 256:
+/// at Np 640 / 1024 on an A100, 256 vs 128 vs 64: W_dyson 2.32 / 2.59 / 3.09 s and 9.7 / 10.7 s (S7d))
 inline long dyson_nbat_max() {
   char const *v = std::getenv("COQUI_GWLINE_DYSON_NBAT");
-  return (v != nullptr and *v != '\0') ? std::max(1L, std::strtol(v, nullptr, 10)) : 128L;
+  return (v != nullptr and *v != '\0') ? std::max(1L, std::strtol(v, nullptr, 10)) : 256L;
 }
 
 inline double aux_grid_t::log(long nk, long nq, long nzeta, long r_b, long t_chunk, long nb, long g, bool device_fused) const {

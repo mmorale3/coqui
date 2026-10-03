@@ -82,6 +82,7 @@
 #include "numerics/line_dlr/bosonic_basis.hpp"
 #include "utilities/check.hpp"
 #include "utilities/freemem.h"
+#include "utilities/device_pool.h"
 #include "utilities/mpi_context.h"
 #include "utilities/proc_grid_partition.hpp"
 #include "utilities/Timer.hpp"
@@ -312,6 +313,18 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
   }
   const w_plan_t plan(lay, grid.max_block_size(), nzs_cap);
   plan.log();
+  // device, several ranks: the redistribute staging buffers (memory::pooled_array, two per call) come from a device pool
+  // reserved for this stage, so every call reuses the SAME buffers. Without it each call cudaMallocs fresh ones, and with
+  // UCX's cuda_ipc transport (NVLink) the peer's IPC-handle cache keeps the freed buffers mapped: measured +2.8 GB per
+  // rank at Np 640 and +10 GB at Np 1024 on 2 A100 (S7d). Skipped when a pool is already active (e.g. an SCF guard).
+  [[maybe_unused]] std::optional<utils::device_pool_guard> stage_pool;
+  if constexpr (MEM != HOST_MEMORY) {
+    if (comm.size() > 1 and utils::device_pool_capacity() == 0) {
+      const double stg = std::min(double(math::nda::detail::redistribute_chunk_bytes()),
+                                  16.0 * double(lay.np_q) * plan.nzs * grid.max_block_size());
+      stage_pool.emplace(std::size_t(2.0 * stg) + (std::size_t(64) << 20), "gw_line W stage");
+    }
+  }
   const long nzl_max = (plan.nzs + lay.np_z - 1) / lay.np_z;
 
   // Dyson workspace
