@@ -34,7 +34,7 @@
 
 namespace methods::gw_line {
 
-using numerics::line_dlr::time_ray_t;
+using time_ray_t = numerics::line_dlr::time_nodes_t;   // the kernels take the type-erased node view (S7b)
 
 template struct propagator_t<HOST_MEMORY>;
 template void polarization<HOST_MEMORY>(propagator_t<HOST_MEMORY> &, pole_data_t const &, mf::MF const &,

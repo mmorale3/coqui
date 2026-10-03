@@ -50,7 +50,7 @@
 #include "nda/blas.hpp"
 #include "nda/tensor.hpp"
 #include "mean_field/MF.hpp"
-#include "numerics/line_dlr/time_ray.hpp"
+#include "numerics/line_dlr/time_id.hpp"
 #include "utilities/check.hpp"
 #include "utilities/freemem.h"
 #include "utilities/Timer.hpp"
@@ -66,10 +66,10 @@ namespace methods::gw_line {
  */
 template <MEMORY_SPACE MEM>
 void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF const &mf, aux_grid_t const &grid,
-                  nda::array<ComplexType, 1> const &zeta, numerics::line_dlr::time_ray_t const &ray_p,
-                  numerics::line_dlr::time_ray_t const &ray_h, long t_chunk, memory::array<MEM, ComplexType, 4> &Pi,
+                  nda::array<ComplexType, 1> const &zeta, numerics::line_dlr::time_nodes_t const &ray_p,
+                  numerics::line_dlr::time_nodes_t const &ray_h, long t_chunk, memory::array<MEM, ComplexType, 4> &Pi,
                   utils::TimerManager &Timer, sector_t sectors = sector_t::both) {
-  using numerics::line_dlr::time_ray_t;
+  using time_ray_t = numerics::line_dlr::time_nodes_t;   // GL ray or ID nodes (S7b)
   using arr4_t = memory::array<MEM, ComplexType, 4>;
   using arr3_t = memory::array<MEM, ComplexType, 3>;
   auto all     = nda::range::all;
@@ -164,14 +164,14 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
 
 extern template void polarization<HOST_MEMORY>(propagator_t<HOST_MEMORY> &, pole_data_t const &, mf::MF const &,
                                                aux_grid_t const &, nda::array<ComplexType, 1> const &,
-                                               numerics::line_dlr::time_ray_t const &,
-                                               numerics::line_dlr::time_ray_t const &, long,
+                                               numerics::line_dlr::time_nodes_t const &,
+                                               numerics::line_dlr::time_nodes_t const &, long,
                                                memory::array<HOST_MEMORY, ComplexType, 4> &, utils::TimerManager &, sector_t);
 #if defined(ENABLE_DEVICE)
 extern template void polarization<DEVICE_MEMORY>(propagator_t<DEVICE_MEMORY> &, pole_data_t const &, mf::MF const &,
                                                  aux_grid_t const &, nda::array<ComplexType, 1> const &,
-                                                 numerics::line_dlr::time_ray_t const &,
-                                                 numerics::line_dlr::time_ray_t const &, long,
+                                                 numerics::line_dlr::time_nodes_t const &,
+                                                 numerics::line_dlr::time_nodes_t const &, long,
                                                  memory::array<DEVICE_MEMORY, ComplexType, 4> &, utils::TimerManager &,
                                                  sector_t);
 #endif

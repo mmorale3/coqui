@@ -62,7 +62,7 @@
 #include "nda/blas.hpp"
 #include "nda/tensor.hpp"
 #include "mean_field/MF.hpp"
-#include "numerics/line_dlr/time_ray.hpp"
+#include "numerics/line_dlr/time_id.hpp"
 #include "numerics/line_dlr/bosonic_basis.hpp"
 #include "utilities/check.hpp"
 #include "utilities/freemem.h"
@@ -80,10 +80,10 @@ namespace methods::gw_line {
 template <MEMORY_SPACE MEM>
 void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::array<MEM, ComplexType, 4> const &w,
                  bosonic_basis_t const &basis, mf::MF const &mf, aux_grid_t const &grid, boost::mpi3::communicator &comm,
-                 nda::array<ComplexType, 1> const &zeta, numerics::line_dlr::time_ray_t const &ray_p,
-                 numerics::line_dlr::time_ray_t const &ray_h, long t_chunk, nda::array<ComplexType, 4> &Sigma,
+                 nda::array<ComplexType, 1> const &zeta, numerics::line_dlr::time_nodes_t const &ray_p,
+                 numerics::line_dlr::time_nodes_t const &ray_h, long t_chunk, nda::array<ComplexType, 4> &Sigma,
                  utils::TimerManager &Timer, sector_t sectors = sector_t::both) {
-  using numerics::line_dlr::time_ray_t;
+  using time_ray_t = numerics::line_dlr::time_nodes_t;   // GL ray or ID nodes (S7b)
   using arr4_t = memory::array<MEM, ComplexType, 4>;
   using arr3_t = memory::array<MEM, ComplexType, 3>;
   using arr2_t = memory::array<MEM, ComplexType, 2>;
@@ -232,7 +232,7 @@ template <MEMORY_SPACE MEM>
 void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::array<MEM, ComplexType, 4> const &w,
                  bosonic_basis_t const &basis, mf::MF const &mf, aux_grid_t const &grid,
                  utils::mpi_context_t<boost::mpi3::communicator> &mpi, nda::array<ComplexType, 1> const &zeta,
-                 numerics::line_dlr::time_ray_t const &ray_p, numerics::line_dlr::time_ray_t const &ray_h, long t_chunk,
+                 numerics::line_dlr::time_nodes_t const &ray_p, numerics::line_dlr::time_nodes_t const &ray_h, long t_chunk,
                  nda::array<ComplexType, 4> &Sigma, utils::TimerManager &Timer, sector_t sectors = sector_t::both) {
   utils::check(grid.np == mpi.comm.size() and grid.rank == mpi.comm.rank(), "gw_line::self_energy: grid/communicator mismatch");
   self_energy<MEM>(prop, poles, w, basis, mf, grid, mpi.comm, zeta, ray_p, ray_h, t_chunk, Sigma, Timer, sectors);
@@ -242,8 +242,8 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
   extern template void self_energy<MEM>(propagator_t<MEM> &, pole_data_t const &, memory::array<MEM, ComplexType, 4> const &, \
                                         bosonic_basis_t const &, mf::MF const &, aux_grid_t const &,                      \
                                         boost::mpi3::communicator &,                                                      \
-                                        nda::array<ComplexType, 1> const &, numerics::line_dlr::time_ray_t const &,       \
-                                        numerics::line_dlr::time_ray_t const &, long, nda::array<ComplexType, 4> &,       \
+                                        nda::array<ComplexType, 1> const &, numerics::line_dlr::time_nodes_t const &,     \
+                                        numerics::line_dlr::time_nodes_t const &, long, nda::array<ComplexType, 4> &,     \
                                         utils::TimerManager &, sector_t);
 
 GW_LINE_SIGMA_EXTERN(HOST_MEMORY)
