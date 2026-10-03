@@ -19,14 +19,15 @@
  */
 
 /**
- * gw_line_lib (notes/line_gw_cpp_plan.md, S3): explicit instantiations of the MEM-templated line-GW kernels
- * (propagators, polarization) for HOST_MEMORY and, in device builds, DEVICE_MEMORY.
+ * gw_line_lib (notes/line_gw_cpp_plan.md, S3-S4): explicit instantiations of the MEM-templated line-GW kernels
+ * (propagators, polarization, screened interaction) for HOST_MEMORY and, in device builds, DEVICE_MEMORY.
  */
 
 #include "methods/GW_line/proc_grid.hpp"
 #include "methods/GW_line/line_state.hpp"
 #include "methods/GW_line/propagators.hpp"
 #include "methods/GW_line/polarization.hpp"
+#include "methods/GW_line/screened.hpp"
 
 namespace methods::gw_line {
 
@@ -45,5 +46,24 @@ template void polarization<DEVICE_MEMORY>(propagator_t<DEVICE_MEMORY> &, pole_da
                                           time_ray_t const &, long, memory::array<DEVICE_MEMORY, ComplexType, 4> &,
                                           utils::TimerManager &, sector_t);
 #endif
+
+#define GW_LINE_SCREENED_INST(MEM)                                                                                       \
+  template struct coulomb_blocks_t<MEM>;                                                                                 \
+  template void screened_interaction<MEM>(memory::array<MEM, ComplexType, 4> &, coulomb_blocks_t<MEM> const &,            \
+                                          bosonic_basis_t const &, aux_grid_t const &,                                    \
+                                          utils::mpi_context_t<boost::mpi3::communicator> &,                              \
+                                          memory::array<MEM, ComplexType, 4> &, utils::TimerManager &,                    \
+                                          memory::array<MEM, ComplexType, 4> *, long);                                    \
+  template void w_time<MEM>(memory::array<MEM, ComplexType, 4> const &, bosonic_basis_t const &, long,                    \
+                            nda::array<ComplexType, 1> const &, sector_t, bool, memory::array_view<MEM, ComplexType, 3>); \
+  template void eval_poles<MEM>(memory::array<MEM, ComplexType, 4> const &, bosonic_basis_t const &, long,                \
+                                nda::array<ComplexType, 1> const &, sector_t, bool,                                       \
+                                memory::array_view<MEM, ComplexType, 3>);
+
+GW_LINE_SCREENED_INST(HOST_MEMORY)
+#if defined(ENABLE_DEVICE)
+GW_LINE_SCREENED_INST(DEVICE_MEMORY)
+#endif
+#undef GW_LINE_SCREENED_INST
 
 } // namespace methods::gw_line
