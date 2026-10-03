@@ -48,6 +48,7 @@
 
 #include "SCF/scf_driver.hpp"
 #include "MBPT_drivers.h"
+#include "methods/GW_line/driver.hpp"
 
 namespace mpi3 = boost::mpi3;
 namespace methods
@@ -427,6 +428,25 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
   using corr_t = std::decay_t<decltype(eri.corr_eri->get())>;
   constexpr MEMORY_SPACE SCF_MEM =
       std::is_same_v<corr_t, thc_reader_t> ? MEM : HOST_MEMORY;
+  if (solver_type == "gw_line") {
+    // self-consistent GW on the tilted frequency line (separate module src/methods/GW_line, THC only; options: driver.hpp)
+    if constexpr (std::is_same_v<corr_t, thc_reader_t>) {
+      ptree pt_line = pt;
+      pt_line.put("output", resolve_mbpt_output_stem(pt));
+      if constexpr (MEM == HOST_MEMORY) {
+        gw_line::gw_line_scf<HOST_MEMORY>(eri.corr_eri->get(), *mf, pt_line);
+      } else {
+#if defined(ENABLE_DEVICE)
+        gw_line::gw_line_scf<DEVICE_MEMORY>(eri.corr_eri->get(), *mf, pt_line);
+#else
+        APP_ABORT("gw_line: device memory space requested in a host-only build");
+#endif
+      }
+    } else {
+      APP_ABORT("gw_line: requires a THC interaction ([interaction] of type thc)");
+    }
+    return;
+  }
   std::string err = std::string("mbpt - Incorrect input - ");
   auto div_treatment = io::get_value_with_default<std::string>(pt, "div_treatment", "gygi");
   auto hf_div_treatment = io::get_value_with_default<std::string>(pt, "hf_div_treatment", "gygi");
