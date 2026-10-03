@@ -53,9 +53,13 @@
  *   chunk) and ONE copy + all_reduce of [N_k, N_zeta, nb, nb] per sector at the end.
  * Memory per rank: G~ and acc, 2 N_k t_chunk blocks, plus one W(q, chunk) (and one temp on device).
  *
- * t_chunk <= 0 selects the chunk automatically (host 8; device from the free device memory, <= 256). Device: Hadamard as one
- * cuTENSOR elementwise_trinary per (q, k), contraction as two strided-batched gemms per (k, chunk); the residue
- * exponentials are formed once per chunk (q independent) on both paths.
+ * t_chunk <= 0 selects the chunk automatically (host host_t_chunk_default; device from the free device memory, <= 256).
+ * Device: contraction as two strided-batched gemms per (k, chunk); the residue exponentials are formed once per chunk (q
+ * independent) on both paths. Device Hadamard (S7d, the fused kernel of cuda/gw_line_cuda.cuh): default
+ * (COQUI_GWLINE_SIGMA_KOUTER = 1) W(q, chunk) of ALL q is formed by one strided-batched gemm (memory N_q t_chunk block)
+ * and ONE launch forms acc(k) = sum_q G~(k-q) o W(q) for all k (G~, W read once, acc written once, no zeroing);
+ * KOUTER = 0: per q one launch updating acc(k) += G~(k-q) o W(q) for all k (W(q) transient). COQUI_GWLINE_FUSED = 0:
+ * one cuTENSOR elementwise_trinary per (q, k) (the bring-up path).
  *
  * Output: Sigma (N_k, N_zeta, nb, nb) on the host, identical on every rank (overwritten). `sectors` restricts the sum to one
  * sector (tests). Collective over mpi.comm (all ranks must call with the same rays, zeta and t_chunk).
@@ -128,18 +132,36 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
   };
   const leg_t legs[2] = {{&ray_p, +1.0, sector_t::particle, false}, {&ray_h, -1.0, sector_t::hole, true}};
 
+  // ---- S7d Hadamard setup (device fused kernel; see the file header)
+  const long blk = nP * nQ;
+  [[maybe_unused]] const bool fused  = (MEM != HOST_MEMORY) and detail::fused_hadamard();
+  [[maybe_unused]] const bool kouter = fused and detail::env_long("COQUI_GWLINE_SIGMA_KOUTER", 1) != 0;
+  [[maybe_unused]] memory::array<MEM, int, 1> pairs;   // kouter: (N_k, N_q, 2) = (k-q, q); else (N_q, N_k, 1, 2) = (k-q, 0)
+  if (fused) {
+    nda::array<int, 1> ph(2 * nq * nk);
+    for (long iq = 0; iq < nq; ++iq)
+      for (long ik = 0; ik < nk; ++ik) {
+        const long i = kouter ? (ik * nq + iq) : (iq * nk + ik);
+        ph(2 * i)     = int(qk(iq, ik));
+        ph(2 * i + 1) = kouter ? int(iq) : 0;
+      }
+    pairs = memory::to_memory_space<MEM>(ph);
+  }
+  const long nwq = kouter ? nq : 1;   // W(q, chunk) arrays held
+
   for (auto const &leg : legs) {
     if (sectors != sector_t::both and sectors != leg.s) continue;
     time_ray_t const &ray = *leg.ray;
     const long nt         = ray.size();
-    // t_chunk <= 0: automatic (host 8; device from the free device memory: G~, acc of all k, W(q), contraction buffers)
+    // t_chunk <= 0: automatic (host default; device from the free device memory: G~, acc of all k, W(q) (all q when
+    // fused k-outer), contraction buffers)
     const long tc = (t_chunk > 0) ? std::min(t_chunk, nt)
-                                  : detail::auto_t_chunk<MEM>(nt, double(2 * nk + 1) * nP * nQ * 16.0 +
+                                  : detail::auto_t_chunk<MEM>(nt, double(2 * nk + nwq) * nP * nQ * 16.0 +
                                                                       double(nk * nb + nQ) * nb * 16.0);
     const auto form       = leg.transposed ? gtilde_form_t::transposed : gtilde_form_t::plain;
     nda::array<ComplexType, 2> F = ray.transform_matrix(zeta);   // (nz, nt), host
     arr4_t G(nk, tc, nP, nQ), acc(nk, tc, nP, nQ);
-    arr3_t Wq(tc, nP, nQ);
+    arr4_t Wq(nwq, tc, nP, nQ);                   // W(q, chunk): all q (fused k-outer) or the current q
     arr2_t Em(tc, r);                             // residue exponentials of the chunk (q independent)
     arr2_t t1(nb, nQ);
     [[maybe_unused]] arr3_t t1b;                  // device: the batched first contraction factor, all t of a chunk
@@ -178,31 +200,51 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
       detail::check_orientation(leg.s, leg.transposed, "self_energy");
       Ev = basis.time_exponentials(t, leg.s);
       Timer.stop("Sigma_W_time");
-      if constexpr (MEM != HOST_MEMORY) nda::tensor::set(ComplexType(0.0), acc);
-      for (long iq = 0; iq < nq; ++iq) {
+      if (kouter) {   // device, fused: W(q, chunk) for all q (one gemm), then acc(k) for all k in one launch
         Timer.start("Sigma_W_time");
-        auto Wv = Wq(tr, all, all);
-        detail::pole_contract_m<MEM>(w, iq, Ev, Wv);
-        if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+        // column-major: W(q)^T (blk x n) = w(q)^T (blk x r) . E^T (r x n), batched over q
+        detail::gemm_strided_cm('N', 'N', blk, n, r, ComplexType(1.0), w.data(), blk, r * blk, Em.data(), r, 0,
+                                ComplexType(0.0), Wq.data(), blk, tc * blk, nq);
+        utils::device_sync();
         Timer.stop("Sigma_W_time");
-
         Timer.start("Sigma_hadamard");
-        for (long ik = 0; ik < nk; ++ik) {
-          auto Gv   = G(qk(iq, ik), tr, all, all);
-          auto acc_v = acc(ik, tr, all, all);
-          if constexpr (MEM == HOST_MEMORY) {
-            if (iq == 0) acc_v = Gv * Wv;
-            else acc_v += Gv * Wv;
-          } else {
-            // device: one cuTENSOR trinary per (q, k), acc <- (G~ o W) + acc (acc zeroed before the q loop)
-#if defined(ENABLE_DEVICE)   // device-only: older host nda checkouts lack elementwise_trinary
-            nda::tensor::elementwise_trinary(ComplexType(1.0), Gv, "abc", ComplexType(1.0), Wv, "abc", ComplexType(1.0), acc_v,
-                                             "abc", nda::tensor::op::MUL, nda::tensor::op::SUM);
-#endif
-          }
-        }
-        if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+        detail::slab_conv<MEM>(n * blk, nk, G.data(), tc * blk, nq, Wq.data(), tc * blk, nk, acc.data(), tc * blk, nq, pairs,
+                               0, ComplexType(1.0), false);
+        utils::device_sync();
         Timer.stop("Sigma_hadamard");
+      } else {
+        if constexpr (MEM != HOST_MEMORY)
+          if (not fused) nda::tensor::set(ComplexType(0.0), acc);
+        for (long iq = 0; iq < nq; ++iq) {
+          Timer.start("Sigma_W_time");
+          auto Wv = Wq(0, tr, all, all);
+          detail::pole_contract_m<MEM>(w, iq, Ev, Wv);
+          if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+          Timer.stop("Sigma_W_time");
+
+          Timer.start("Sigma_hadamard");
+          if (fused) {   // device, fused: acc(k) (+)= G~(k-q) o W(q) for all k in one launch
+            detail::slab_conv<MEM>(n * blk, nk, G.data(), tc * blk, 1, Wq.data(), tc * blk, nk, acc.data(), tc * blk, 1, pairs,
+                                   2 * iq * nk, ComplexType(1.0), iq > 0);
+          } else {
+            for (long ik = 0; ik < nk; ++ik) {
+              auto Gv    = G(qk(iq, ik), tr, all, all);
+              auto acc_v = acc(ik, tr, all, all);
+              if constexpr (MEM == HOST_MEMORY) {
+                if (iq == 0) acc_v = Gv * Wv;
+                else acc_v += Gv * Wv;
+              } else {
+                // device: one cuTENSOR trinary per (q, k), acc <- (G~ o W) + acc (acc zeroed before the q loop)
+#if defined(ENABLE_DEVICE)   // device-only: older host nda checkouts lack elementwise_trinary
+                nda::tensor::elementwise_trinary(ComplexType(1.0), Gv, "abc", ComplexType(1.0), Wv, "abc", ComplexType(1.0),
+                                                 acc_v, "abc", nda::tensor::op::MUL, nda::tensor::op::SUM);
+#endif
+              }
+            }
+          }
+          if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+          Timer.stop("Sigma_hadamard");
+        }
       }
 
       // 3. orbital contraction of the local block, per k and t

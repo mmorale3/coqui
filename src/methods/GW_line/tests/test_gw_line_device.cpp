@@ -30,6 +30,9 @@
  *   Sigma(k, zeta)      self_energy<HOST> vs <DEVICE> per sector, on the SAME residues
  *   F = V_H + Sigma_x   hartree_exchange<HOST> vs <DEVICE>
  * Gate: max|dev - host| / max|host| <= 1e-12 for each. Host and device timers are printed side by side (rank 0).
+ * S7d: Pi and Sigma on the device for every Hadamard variant -- fused (default: Pi all q per launch, Sigma k-outer), fused
+ * one q per launch, fused with the direct kernel variant, cuTENSOR trinary (COQUI_GWLINE_FUSED=0) -- and W with forced
+ * zeta sub-slabs (COQUI_GWLINE_W_ZSUB=37: uneven sub-slabs) on the device and on the host, all against the default host.
  *
  * [.bench] (hidden; deliberately NOT tagged [gw_line], since Catch2 runs hidden tests matched by a tag filter): one
  * Pi -> W -> Sigma -> F pass in the memory space of the build (device if ENABLE_DEVICE, unless COQUI_GWLINE_BENCH_HOST=1)
@@ -46,6 +49,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <map>
+#include <optional>
+#include <utility>
 #include <numbers>
 #include <string>
 #include <vector>
@@ -130,6 +135,24 @@ struct dev_setup_t {
 };
 
 constexpr double deg = std::numbers::pi / 180.0;
+
+/// sets environment variables for its lifetime (restores the previous values)
+struct scoped_env_t {
+  std::vector<std::pair<std::string, std::optional<std::string>>> saved;
+  explicit scoped_env_t(std::vector<std::pair<std::string, std::string>> const &kv) {
+    for (auto const &[k, v] : kv) {
+      char const *o = std::getenv(k.c_str());
+      saved.emplace_back(k, o ? std::optional<std::string>(o) : std::nullopt);
+      ::setenv(k.c_str(), v.c_str(), 1);
+    }
+  }
+  ~scoped_env_t() {
+    for (auto const &[k, o] : saved) {
+      if (o) ::setenv(k.c_str(), o->c_str(), 1);
+      else ::unsetenv(k.c_str());
+    }
+  }
+};
 
 std::string env_or(char const *nm, std::string const &def) {
   char const *v = std::getenv(nm);
@@ -220,6 +243,19 @@ void run_device_ab(std::string const &fixture) {
     nda::array<ComplexType, 4> Pi_dh = memory::to_memory_space<HOST_MEMORY>(Pi_d);
     err["Pi(q,zeta)"] = rel_diff(comm, Pi_h, Pi_dh);
   }
+  // S7d: the other Hadamard variants (timers not recorded)
+  using env_list_t = std::vector<std::pair<std::string, std::string>>;
+  const std::vector<std::pair<std::string, env_list_t>> hvariants = {
+      {"fused 1q/launch", {{"COQUI_GWLINE_PI_QFOLD", "0"}, {"COQUI_GWLINE_SIGMA_KOUTER", "0"}}},
+      {"fused direct", {{"COQUI_GWLINE_FUSED_VARIANT", "1"}}},
+      {"cuTENSOR", {{"COQUI_GWLINE_FUSED", "0"}}}};
+  for (auto const &[nm, kv] : hvariants) {
+    scoped_env_t env(kv);
+    utils::TimerManager Tv;
+    polarization<DEVICE_MEMORY>(pd, su.poles, mf, grid, zeta, ray_p, ray_h, t_chunk_d, Pi_d, Tv);
+    nda::array<ComplexType, 4> Pi_dh = memory::to_memory_space<HOST_MEMORY>(Pi_d);
+    err["Pi(q,zeta) [" + nm + "]"] = rel_diff(comm, Pi_h, Pi_dh);
+  }
   Pi_d = memory::array<DEVICE_MEMORY, ComplexType, 4>{};
 
   // ---- W from the SAME Pi
@@ -244,6 +280,17 @@ void run_device_ab(std::string const &fixture) {
     err["W(q,zeta_i) nodes"] = rel_diff(comm, Wn_h, Wn_dh);
   }
   Wn_d = memory::array<DEVICE_MEMORY, ComplexType, 4>{};
+  {   // S7d: forced (uneven) zeta sub-slabs of the W stage, device and host, vs the default host W
+    scoped_env_t env({{"COQUI_GWLINE_W_ZSUB", "37"}});
+    utils::TimerManager Tv;
+    memory::array<HOST_MEMORY, ComplexType, 4> Pz_h(Pi_h), wz_h, Wz_h;
+    memory::array<DEVICE_MEMORY, ComplexType, 4> Pz_d = memory::to_memory_space<DEVICE_MEMORY>(Pi_h), wz_d, Wz_d;
+    screened_interaction<HOST_MEMORY>(Pz_h, Zb_h, basis, grid, mpi, wz_h, Tv, &Wz_h);
+    screened_interaction<DEVICE_MEMORY>(Pz_d, Zb_d, basis, grid, mpi, wz_d, Tv, &Wz_d);
+    nda::array<ComplexType, 4> Wz_dh = memory::to_memory_space<HOST_MEMORY>(Wz_d);
+    err["W(q,zeta_i) nodes [zsub 37, device]"] = rel_diff(comm, Wn_h, Wz_dh);
+    err["W(q,zeta_i) nodes [zsub 37, host]"]   = rel_diff(comm, Wn_h, Wz_h);
+  }
   // residues as pole sums at the nodes + 12 ray points, both orientations; device residues evaluated by the device kernel
   {
     auto rr = numerics::line_dlr::detail::logspace(0.05, 5.0, 6);
@@ -311,6 +358,14 @@ void run_device_ab(std::string const &fixture) {
     Td.stop("Sigma");
     err["Sigma^> (particle)"] = rel_diff(comm, Sp_h, Sp_d);
     err["Sigma^< (hole)"]     = rel_diff(comm, Sh_h, Sh_d);
+    for (auto const &[nm, kv] : hvariants) {   // S7d: the other Hadamard variants
+      scoped_env_t env(kv);
+      utils::TimerManager Tv;
+      self_energy<DEVICE_MEMORY>(pd, su.poles, w_hd, basis, mf, grid, mpi, fz, ray_p, ray_h, t_chunk_d, Sp_d, Tv, sector_t::particle);
+      self_energy<DEVICE_MEMORY>(pd, su.poles, w_hd, basis, mf, grid, mpi, fz, ray_p, ray_h, t_chunk_d, Sh_d, Tv, sector_t::hole);
+      err["Sigma^> (particle) [" + nm + "]"] = rel_diff(comm, Sp_h, Sp_d);
+      err["Sigma^< (hole) [" + nm + "]"]     = rel_diff(comm, Sh_h, Sh_d);
+    }
   }
 
   // ---- F = V_H + Sigma_x
@@ -378,10 +433,14 @@ void run_bench() {
              "nodes, t_chunk {}",
           dir, prefix, comm.size(), MEM == HOST_MEMORY ? "HOST" : "DEVICE", nk, nq, nb, Np, r, nz, ray_p.size(), ray_h.size(),
           fz.size(), t_chunk);
-  {   // the plan 6.7 memory model at the chunk the kernels will pick (automatic: same rule as polarization)
-    const long tcm = (t_chunk > 0) ? t_chunk
-                                   : detail::auto_t_chunk<MEM>(ray_p.size(), double(2 * nk + 1) * grid.max_block_size() * 16.0);
-    grid.log(nk, nq, nz, r, tcm, nb);
+  // the plan 6.7 memory model at the chunk the kernels will pick (automatic: same rule as polarization)
+  const bool dev_fused = (MEM != HOST_MEMORY) and detail::fused_hadamard();
+  double model_peak    = 0.0;
+  {
+    const long nacc = (dev_fused and detail::env_long("COQUI_GWLINE_PI_QFOLD", 1) != 0) ? nq : 1;
+    const long tcm  = (t_chunk > 0) ? t_chunk
+                                    : detail::auto_t_chunk<MEM>(ray_p.size(), double(2 * nk + nacc) * grid.max_block_size() * 16.0);
+    model_peak = grid.log(nk, nq, nz, r, tcm, nb, -1, dev_fused);
   }
   [[maybe_unused]] const double free0 = device_free_bytes();
   device_mem_reset();
@@ -425,6 +484,9 @@ void run_bench() {
     const double free1 = device_free_bytes();
     app_log(2, "  [bench] device free memory at start / end: {:.3f} / {:.3f} GB; kernel high-water (rank 0): {:.3f} GB", free0 / 1073741824.0,
             free1 / 1073741824.0, device_high_water_bytes() / 1073741824.0);
+    const double hw_max = comm.all_reduce_value(device_high_water_bytes(), mpi3::max<>{});
+    app_log(2, "  [bench] device memory per rank: model (plan 6.7, proc_grid.hpp) {:.3f} GB vs measured high-water (max over "
+               "ranks) {:.3f} GB", model_peak / 1073741824.0, hw_max / 1073741824.0);
   }
 }
 

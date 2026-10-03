@@ -35,6 +35,9 @@
  * five steps of the imaginary-axis code are done on full matrices; besides W the transposed copy W^T is formed locally
  * (a plain transpose), and BOTH are redistributed back to the block layout. Block (I,J) of the redistributed W^T is
  * (W_JI)^T, i.e. exactly the mirror block the coupled (PQ, QP) fit needs: there is no inter-rank transpose logic anywhere.
+ * S7d: the stage runs in sub-steps (w_plan_t, proc_grid.hpp): one q per q pool and a zeta sub-slab at a time, Dyson IN
+ * PLACE in the whole-matrix buffer (W^T), the in-place transpose giving W, the fit per q sub-step. Besides the resident
+ * Pi group (reused for W) only one q row per pool of W^T and the sub-slab buffers are held (before: two extra slabs).
  *
  * The fit (Eq. bfit) for all pairs at once, from the truncated SVD of the stacked 2 N_zeta x 2 r kernel
  * [[K^-, -K^+], [-K^+, K^-]] = U S V^dagger (same rcond = DBL_EPSILON max(2 N_zeta, 2 r) as bosonic_basis_t::fit /
@@ -91,51 +94,7 @@ namespace methods::gw_line {
 using numerics::line_dlr::bosonic_basis_t;
 using numerics::line_dlr::sector_t;
 
-/**
- * Whole-matrix layout of the Dyson step: 4D darray {g, N_zeta, Np, Np} with grid {np_q, np_z, 1, 1}. np_q is the
- * largest number of q pools (<= g, dividing np, load imbalance <= 20%: find_proc_grid_max_npools), so that each rank's
- * full-Z footprint (its q subset x Np^2) is minimal; np_z = np / np_q. Rank -> coordinates and the chunks follow
- * math::nda::make_distributed_array for a C-layout darray with block size 1 (ip_z = rank % np_z, ip_q = rank / np_z).
- * q indices are relative to the group (q0 of screened_interaction).
- */
-struct dyson_layout_t {
-  long np = 1, rank = 0, g = 0, nz = 0, Np = 0;
-  long np_q = 1, np_z = 1, ip_q = 0, ip_z = 0;
-  long q_first = 0, nq_loc = 0;   ///< local q slab [q_first, q_first + nq_loc) (group-relative)
-  long z_first = 0, nz_loc = 0;   ///< local zeta slab
-
-  dyson_layout_t() = default;
-  dyson_layout_t(long np_, long rank_, long g_, long nz_, long Np_) : np(np_), rank(rank_), g(g_), nz(nz_), Np(Np_) {
-    utils::check(np > 0 and rank >= 0 and rank < np and g > 0 and nz > 0 and Np > 0,
-                 "dyson_layout_t: invalid np={} rank={} g={} nz={} Np={}", np, rank, g, nz, Np);
-    np_q = utils::find_proc_grid_max_npools(np, g, 0.2);
-    np_z = np / np_q;
-    utils::check(np_q * np_z == np, "dyson_layout_t: np_q*np_z != np");
-    utils::check(np_q <= g and np_z <= nz, "dyson_layout_t: too many ranks ({} x {}) for g={} nz={}", np_q, np_z, g, nz);
-    ip_z = rank % np_z;
-    ip_q = rank / np_z;
-    auto [q0, q1] = itertools::chunk_range(0, g, np_q, ip_q);
-    auto [z0, z1] = itertools::chunk_range(0, nz, np_z, ip_z);
-    q_first = q0; nq_loc = q1 - q0;
-    z_first = z0; nz_loc = z1 - z0;
-  }
-  template <typename comm_t>
-  dyson_layout_t(utils::mpi_context_t<comm_t> const &mpi, long g_, long nz_, long Np_)
-     : dyson_layout_t(long(mpi.comm.size()), long(mpi.comm.rank()), g_, nz_, Np_) {}
-
-  std::array<long, 4> pgrid() const { return {np_q, np_z, 1, 1}; }
-  nda::range q_rng() const { return nda::range(q_first, q_first + nq_loc); }
-  nda::range z_rng() const { return nda::range(z_first, z_first + nz_loc); }
-  /// largest slab over the grid (elements)
-  long max_slab() const { return ((g + np_q - 1) / np_q) * ((nz + np_z - 1) / np_z) * Np * Np; }
-
-  void log() const {
-    app_log(2, "  gw_line Dyson layout: {} ranks -> (q, zeta) pools = ({} x {}) over (g, N_zeta) = ({}, {}); slab <= {} "
-               "matrices ({:.3f} GB), full Z for <= {} q per rank",
-            np, np_q, np_z, g, nz, max_slab() / (Np * Np), double(max_slab()) * 16.0 / 1024.0 / 1024.0 / 1024.0,
-            (g + np_q - 1) / np_q);
-  }
-};
+// dyson_layout_t (the whole-matrix layout of the Dyson step) and w_plan_t (its S7d sub-steps): proc_grid.hpp
 
 /**
  * Coulomb matrices of all q in the block layout (resident in MEM), Z[iq] = Z(q)[P_rng, Q_rng], plus the FULL Z(q) (host)
@@ -237,38 +196,55 @@ struct bosonic_fit_t {
 
 namespace detail {
 /**
- * Device Dyson for the zeta slab of one q (whole matrices, C layout), in sub-batches of nbat nodes:
- *   M_z = I - Z Pi_z (one strided-batched gemm), LU of all M_z (nda 3D getrf -> cublasZgetrfBatched),
- *   X_z = M_z^{-1} Z solved IN PLACE in the W^T slab (nda 3D getrs, F-layout right-hand sides: the F-layout X_z IS W'_z^T
- *   in C order), W^T_z -= Z^T, and W_z = (W^T_z)^T into the Pi slab (one cuTENSOR permutation for the sub-batch).
+ * Device Dyson IN PLACE for the nzl matrices D(z) = Pi(q, zeta_z) of one q (whole matrices, C layout), in sub-batches of
+ * nbat nodes: M_z = I - Z Pi_z into the scratch (one strided-batched gemm), LU of all M_z (nda 3D getrf ->
+ * cublasZgetrfBatched), then the right-hand sides Z are copied INTO the Pi_z slots (F layout: the F-layout solution X_z
+ * IS W'_z^T in C order), solved in place (nda 3D getrs) and W^T_z = W'^T_z - Z^T. On return D(z) = W(q, zeta_z)^T.
  * Same factorization as the per-matrix path (LU of the memory = M^T, solve with op 'T').
  */
-template <typename Dloc_t, typename ZF_t, typename Id_t, MEMORY_SPACE MEM>
-void dyson_batched_device(Dloc_t &Dl, Dloc_t &DTl, long iql, ZF_t const &ZF, Id_t const &Id, long nbat, scratch_t<MEM> &sM,
+template <typename Dv_t, typename ZF_t, typename Id_t, MEMORY_SPACE MEM>
+void dyson_batched_device(Dv_t &Dv, ZF_t const &ZF, Id_t const &Id, long nbat, scratch_t<MEM> &sM,
                           memory::array<MEM, int, 2> &ipiv_b, long iq, long z_first) {
   auto all       = nda::range::all;
-  const long nzl = Dl.extent(1), Np = Dl.extent(2), N2 = Np * Np;
+  const long nzl = Dv.extent(0), Np = Dv.extent(1), N2 = Np * Np;
   auto ZT        = nda::transpose(ZF);
   for (long z0 = 0; z0 < nzl; z0 += nbat) {
     const long nzb = std::min(nbat, nzl - z0);
-    const auto zr  = nda::range(z0, z0 + nzb);
     auto Mb        = sM.template view<3>({nzb, Np, Np});
     for (long z = 0; z < nzb; ++z) Mb(z, all, all) = Id;
     // column-major: M_z^T = I - Pi_z^T Z^T (Pi_z C-layout = Pi_z^T col-major; ZF F-layout = Z col-major, op 'T')
-    gemm_strided_cm('N', 'T', Np, Np, Np, ComplexType(-1.0), Dl(iql, z0, all, all).data(), Np, N2, ZF.data(), Np, 0,
+    gemm_strided_cm('N', 'T', Np, Np, Np, ComplexType(-1.0), Dv(z0, all, all).data(), Np, N2, ZF.data(), Np, 0,
                     ComplexType(1.0), Mb.data(), Np, N2, nzb);
     auto info = nda::lapack::getrf(Mb, ipiv_b);
     for (long z = 0; z < nzb; ++z)
       utils::check(info(z) == 0, "gw_line::screened_interaction: batched getrf of I - Z Pi failed (q={}, node={}, info={})", iq,
                    z_first + z0 + z, info(z));
-    memory::array_view<MEM, ComplexType, 3, nda::F_layout> Xb(std::array<long, 3>{Np, Np, nzb}, DTl(iql, z0, all, all).data());
+    memory::array_view<MEM, ComplexType, 3, nda::F_layout> Xb(std::array<long, 3>{Np, Np, nzb}, Dv(z0, all, all).data());
     for (long z = 0; z < nzb; ++z) Xb(all, all, z) = ZF;
     auto info2 = nda::lapack::getrs(Mb, Xb, ipiv_b);
     for (long z = 0; z < nzb; ++z)
       utils::check(info2(z) == 0, "gw_line::screened_interaction: batched getrs failed (q={}, node={}, info={})", iq,
                    z_first + z0 + z, info2(z));
-    for (long z = 0; z < nzb; ++z) nda::tensor::add(ComplexType(-1.0), ZT, ComplexType(1.0), DTl(iql, z0 + z, all, all));
-    nda::tensor::add(ComplexType(1.0), DTl(iql, zr, all, all), "zab", ComplexType(0.0), Dl(iql, zr, all, all), "zba");
+    for (long z = 0; z < nzb; ++z) nda::tensor::add(ComplexType(-1.0), ZT, ComplexType(1.0), Dv(z0 + z, all, all));
+  }
+}
+
+/// D(z) <- D(z)^T for the nzl matrices of D (whole matrices, C layout), through the scratch in sub-batches of nbat
+/// (device: one cuTENSOR permutation per sub-batch; host: per matrix). Exact copies.
+template <MEMORY_SPACE MEM, typename Dv_t>
+void transpose_in_place(Dv_t &Dv, long nbat, scratch_t<MEM> &sM) {
+  auto all       = nda::range::all;
+  const long nzl = Dv.extent(0), Np = Dv.extent(1);
+  for (long z0 = 0; z0 < nzl; z0 += nbat) {
+    const long nzb = std::min(nbat, nzl - z0);
+    const auto zr  = nda::range(z0, z0 + nzb);
+    auto Tb        = sM.template view<3>({nzb, Np, Np});
+    Tb             = Dv(zr, all, all);
+    if constexpr (MEM == HOST_MEMORY) {
+      for (long z = 0; z < nzb; ++z) Dv(z0 + z, all, all) = nda::transpose(Tb(z, all, all));
+    } else {
+      nda::tensor::add(ComplexType(1.0), Tb, "zab", ComplexType(0.0), Dv(zr, all, all), "zba");
+    }
   }
 }
 
@@ -288,11 +264,12 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
                           bosonic_basis_t const &basis, aux_grid_t const &grid,
                           utils::mpi_context_t<boost::mpi3::communicator> &mpi, memory::array<MEM, ComplexType, 4> &w,
                           utils::TimerManager &Timer, memory::array<MEM, ComplexType, 4> *W_nodes = nullptr, long q0 = 0) {
-  using arr4_t = memory::array<MEM, ComplexType, 4>;
-  using arr2_t = memory::array<MEM, ComplexType, 2>;
-  using arrF_t = memory::array<MEM, ComplexType, 2, nda::F_layout>;
-  auto all     = nda::range::all;
-  auto &comm   = mpi.comm;
+  using arr4_t  = memory::array<MEM, ComplexType, 4>;
+  using arr2_t  = memory::array<MEM, ComplexType, 2>;
+  using arrF_t  = memory::array<MEM, ComplexType, 2, nda::F_layout>;
+  using dview_t = math::nda::distributed_array_view<arr4_t, boost::mpi3::communicator>;
+  auto all      = nda::range::all;
+  auto &comm    = mpi.comm;
 
   const long g = Pi.extent(0), nz = Pi.extent(1), Np = grid.Np, nP = grid.nP, nQ = grid.nQ, r = basis.rank;
   const long blk = nP * nQ;
@@ -306,143 +283,175 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
   utils::check(q0 >= 0 and q0 + g <= Zb.nq, "gw_line::screened_interaction: q group [{}, {}) out of [0, {})", q0, q0 + g, Zb.nq);
   dyson_layout_t lay(comm.size(), comm.rank(), g, nz, Np);
   for (auto nm : {"W_redistribute", "W_dyson", "W_fit"}) Timer.add(nm);
-
-  const std::array<long, 4> gshape = {g, nz, Np, Np}, bgrid = {1, 1, grid.np_P, grid.np_Q}, ones = {1, 1, 1, 1};
-
-  // 1. block layout -> whole-matrix layout
-  Timer.start("W_redistribute");
-  auto dPi = math::nda::make_distributed_array<arr4_t>(comm, bgrid, gshape, ones, std::move(Pi));
-  utils::check(dPi.local_range(2) == grid.P_rng() and dPi.local_range(3) == grid.Q_rng(),
-               "gw_line::screened_interaction: darray block layout does not match aux_grid_t");
-  auto dD = math::nda::make_distributed_array<arr4_t>(comm, lay.pgrid(), gshape);
-  utils::check(dD.local_range(0) == lay.q_rng() and dD.local_range(1) == lay.z_rng() and dD.local_shape()[2] == Np and
-                   dD.local_shape()[3] == Np,
-               "gw_line::screened_interaction: darray Dyson layout does not match dyson_layout_t");
-  math::nda::redistribute(dPi, dD);
-  if constexpr (MEM != HOST_MEMORY) {
-    utils::device_sync();
-    device_mem_probe();
+  if (lay.nq_loc > 0) {
+    utils::check(Zb.has_full(q0 + lay.q_first) and Zb.has_full(q0 + lay.q_first + lay.nq_loc - 1),
+                 "gw_line::screened_interaction: the Coulomb blocks do not hold the full Z of this rank's Dyson q slab");
   }
-  Timer.stop("W_redistribute");
 
-  // 2. Dyson per local (q, zeta), five-step order of the imaginary-axis code:
-  //    A = Z Pi; A <- I - A (one gemm onto the identity); LU(A); solve A W' = Z; W = W' - Z.
-  //    W' comes out of getrs in Fortran layout, i.e. its buffer IS W'^T in C order: W^T is a plain copy, W a transpose.
-  Timer.start("W_dyson");
-  auto dDT = math::nda::make_distributed_array<arr4_t>(comm, lay.pgrid(), gshape);
-  {
-    auto Dl  = dD.local();
-    auto DTl = dDT.local();
-    arr2_t Id(Np, Np), M(Np, Np);
-    {
-      nda::array<ComplexType, 2> Ih(Np, Np);
-      Ih() = ComplexType(0.0);
-      for (long P = 0; P < Np; ++P) Ih(P, P) = ComplexType(1.0);
-      Id = memory::to_memory_space<MEM>(Ih);
-    }
-    arrF_t ZF(Np, Np), XF(Np, Np);
-    memory::array<MEM, int, 1> ipiv(Np);
-    memory::array<MEM, ComplexType, 1> lwork;   // getrf workspace (device: sized once by cusolver's bufferSize, reused)
-    // device: batched LU (cuBLAS getrf/getrsBatched through nda's 3D getrf/getrs) in sub-batches of nbat nodes, or the
-    // per-(q, zeta) cuSOLVER loop below. COQUI_GWLINE_DYSON_BATCHED = 1 / 0 forces either; default: batched for
-    // Np <= 1024 (measured on A100: 8.5x faster than the loop at Np = 128, 4.4x at Np = 640; not measured beyond).
-    [[maybe_unused]] bool batched = false;
-    [[maybe_unused]] long nbat    = 1;
-    [[maybe_unused]] detail::scratch_t<MEM> sM;
-    [[maybe_unused]] memory::array<MEM, int, 2> ipiv_b;
-    if constexpr (MEM != HOST_MEMORY) {
-      char const *v = std::getenv("COQUI_GWLINE_DYSON_BATCHED");
-      batched       = (v != nullptr and *v != '\0') ? (std::strtol(v, nullptr, 10) != 0) : (Np <= 1024);
-      if (batched) {
-        const double mat = double(Np) * Np * 16.0, freeb = double(utils::freemem_device_effective()) * 1048576.0;
-        nbat   = std::max(1L, std::min({lay.nz_loc, 256L, long(0.25 * freeb / mat)}));
-        ipiv_b = memory::array<MEM, int, 2>(nbat, Np);
-      }
-      app_log(3, "  gw_line::screened_interaction: Dyson on the device {} ({} matrices per batch)",
-              batched ? "batched (cuBLAS getrf/getrsBatched)" : "per matrix (cuSOLVER)", nbat);
-      device_mem_probe();
-    }
-    for (long iql = 0; iql < lay.nq_loc; ++iql) {
-      const long iq = q0 + lay.q_first + iql;
-      {
-        nda::matrix<ComplexType, nda::F_layout> zf_h(Zb.full(iq));   // layout change on the host
-        ZF = zf_h;
-      }
-      auto ZT = nda::transpose(ZF);   // C-ordered view of Z^T
-      if constexpr (MEM != HOST_MEMORY) {
-        if (batched) {   // device, batched over the zeta nodes of the slab (see dyson_batched_device)
-          detail::dyson_batched_device(Dl, DTl, iql, ZF, Id, nbat, sM, ipiv_b, iq, lay.z_first);
-          continue;
-        }
-      }
-      for (long izl = 0; izl < lay.nz_loc; ++izl) {
-        auto Pv  = Dl(iql, izl, all, all);
-        auto WTv = DTl(iql, izl, all, all);
-        M = Id;
-        nda::blas::gemm(ComplexType(-1.0), ZF, Pv, ComplexType(1.0), M);   // M = I - Z Pi
-        int info = nda::lapack::getrf(M, ipiv, lwork);
-        utils::check(info == 0, "gw_line::screened_interaction: getrf of I - Z Pi failed (q={}, node={}, info={})", iq,
-                     lay.z_first + izl, info);
-        XF   = ZF;
-        info = nda::lapack::getrs(M, XF, ipiv);   // XF = (I - Z Pi)^{-1} Z
-        utils::check(info == 0, "gw_line::screened_interaction: getrs failed (q={}, node={}, info={})", iq, lay.z_first + izl,
-                     info);
-        WTv = nda::transpose(XF);   // W'^T (contiguous copy)
-        if constexpr (MEM == HOST_MEMORY) {
-          WTv -= ZT;                    // W^T = W'^T - Z^T
-          Pv = nda::transpose(WTv);     // W  (Pi(q, zeta) is no longer needed: overwritten)
-        } else {
-          nda::tensor::add(ComplexType(-1.0), ZT, ComplexType(1.0), WTv);
-          nda::tensor::add(ComplexType(1.0), WTv, "ab", ComplexType(0.0), Pv, "ba");
-        }
-      }
-    }
-  }
-  if constexpr (MEM != HOST_MEMORY) utils::device_sync();
-  Timer.stop("W_dyson");
-
-  // 3. back to the block layout: W into Pi's old buffer, W^T into a new block array (block (I,J) of W^T = (W_JI)^T)
-  Timer.start("W_redistribute");
-  auto dW = math::nda::make_distributed_array<arr4_t>(comm, bgrid, gshape, ones, std::move(dPi.local_()));
-  math::nda::redistribute(dD, dW);
-  dD.reset();
-  auto dWT = math::nda::make_distributed_array<arr4_t>(comm, bgrid, gshape);
-  utils::check(dWT.local_range(2) == grid.P_rng() and dWT.local_range(3) == grid.Q_rng(),
-               "gw_line::screened_interaction: W^T block layout does not match aux_grid_t");
-  if constexpr (MEM != HOST_MEMORY) device_mem_probe();
-  math::nda::redistribute(dDT, dWT);
-  if constexpr (MEM != HOST_MEMORY) device_mem_probe();
-  dDT.reset();
-  if constexpr (MEM != HOST_MEMORY) utils::device_sync();
-  Timer.stop("W_redistribute");
-
-  // 4. symmetric fit, all pairs at once: w(q) = VS (U1H W(q) + U2H W^T(q))
-  Timer.start("W_fit");
-  bosonic_fit_t fit(basis, basis.zeta_nodes);
-  const long k = fit.k;
-  arr2_t U1H = memory::to_memory_space<MEM>(fit.U1H), U2H = memory::to_memory_space<MEM>(fit.U2H),
-         VS = memory::to_memory_space<MEM>(fit.VS), Y(k, blk);
+  // residues: resident (allocated first, so that the stage's high-water includes them as the plan 6.7 model does)
   if (w.extent(0) != Zb.nq or w.extent(1) != r or w.extent(2) != nP or w.extent(3) != nQ) {
     w = arr4_t(Zb.nq, r, nP, nQ);
     nda::tensor::set(ComplexType(0.0), w);
   }
+  bosonic_fit_t fit(basis, basis.zeta_nodes);
+  const long k = fit.k;
+  arr2_t U1H = memory::to_memory_space<MEM>(fit.U1H), U2H = memory::to_memory_space<MEM>(fit.U2H),
+         VS = memory::to_memory_space<MEM>(fit.VS), Y(k, blk);
+
+  // sub-step plan (w_plan_t); device: the zeta sub-slab is capped so that its block + whole-matrix buffers take <= 40% of
+  // the free device memory left after the W^T rows (min over ranks: the plan must be identical everywhere)
+  long nzs_cap = -1;
+  if constexpr (MEM != HOST_MEMORY) {
+    const double freeb = double(utils::freemem_device_effective()) * 1048576.0;
+    const double wt    = 16.0 * double(lay.np_q) * nz * grid.max_block_size();
+    const double per_z = 16.0 * (double(lay.np_q) * grid.max_block_size() + double(Np) * Np / double(lay.np_z));
+    nzs_cap            = std::max(1L, long(0.4 * std::max(0.0, freeb - wt) / per_z));
+    nzs_cap            = comm.all_reduce_value(nzs_cap, boost::mpi3::min<>{});
+  }
+  const w_plan_t plan(lay, grid.max_block_size(), nzs_cap);
+  plan.log();
+  const long nzl_max = (plan.nzs + lay.np_z - 1) / lay.np_z;
+
+  // Dyson workspace
+  arr2_t Id(Np, Np), M(Np, Np);
   {
-    auto Wl  = dW.local();
-    auto WTl = dWT.local();
-    for (long iq = 0; iq < g; ++iq) {
-      auto W2  = nda::reshape(Wl(iq, all, all, all), std::array<long, 2>{nz, blk});
-      auto WT2 = nda::reshape(WTl(iq, all, all, all), std::array<long, 2>{nz, blk});
-      auto w2  = nda::reshape(w(q0 + iq, all, all, all), std::array<long, 2>{r, blk});
+    nda::array<ComplexType, 2> Ih(Np, Np);
+    Ih() = ComplexType(0.0);
+    for (long P = 0; P < Np; ++P) Ih(P, P) = ComplexType(1.0);
+    Id = memory::to_memory_space<MEM>(Ih);
+  }
+  arrF_t ZF(Np, Np), XF(Np, Np);
+  memory::array<MEM, int, 1> ipiv(Np);
+  memory::array<MEM, ComplexType, 1> lwork;   // getrf workspace (device: sized once by cusolver's bufferSize, reused)
+  // device: batched LU (cuBLAS getrf/getrsBatched through nda's 3D getrf/getrs) in sub-batches of nbat nodes, or the
+  // per-(q, zeta) cuSOLVER loop. COQUI_GWLINE_DYSON_BATCHED = 1 / 0 forces either; default: batched for Np <= 1024
+  // (measured on A100: 8.5x faster than the loop at Np = 128, 4.4x at Np = 640; not measured beyond).
+  [[maybe_unused]] bool batched = false;
+  long nbat                     = std::max(1L, std::min(nzl_max, 16L));   // host: matrices per in-place transpose batch
+  detail::scratch_t<MEM> sM, sTb, sD, sWT;
+  [[maybe_unused]] memory::array<MEM, int, 2> ipiv_b;
+  if constexpr (MEM != HOST_MEMORY) {
+    batched = detail::env_long("COQUI_GWLINE_DYSON_BATCHED", Np <= 1024 ? 1 : 0) != 0;
+    const double mat = double(Np) * Np * 16.0, freeb = double(utils::freemem_device_effective()) * 1048576.0;
+    nbat = std::max(1L, std::min({nzl_max, 256L, long(0.25 * freeb / mat)}));
+    if (batched) ipiv_b = memory::array<MEM, int, 2>(nbat, Np);
+    app_log(3, "  gw_line::screened_interaction: Dyson on the device {} ({} matrices per batch)",
+            batched ? "batched (cuBLAS getrf/getrsBatched)" : "per matrix (cuSOLVER)", nbat);
+  }
+
+  const std::array<long, 4> bgrid = {1, 1, grid.np_P, grid.np_Q}, ones = {1, 1, 1, 1};
+  for (long s = 0; s < plan.nsub_q; ++s) {
+    const long na   = plan.n_act(s);
+    const bool act  = s < lay.nq_loc;                // this rank's q pool solves a q in this sub-step
+    const long iq_a = q0 + lay.q_first + s;          // ... namely this one (absolute)
+    auto WT         = sWT.template view<4>({na, nz, nP, nQ});
+    if (act) {
+      Timer.start("W_dyson");
+      nda::matrix<ComplexType, nda::F_layout> zf_h(Zb.full(iq_a));   // layout change on the host
+      ZF = zf_h;
+      Timer.stop("W_dyson");
+    }
+    for (long za = 0; za < nz; za += plan.nzs) {
+      const long nzs           = std::min(plan.nzs, nz - za);
+      const auto zrng          = nda::range(za, za + nzs);
+      const auto [zf, nzl]     = plan.z_chunk(nzs);
+      const std::array<long, 4> gsh = {na, nzs, Np, Np};
+      const bool solve         = act and nzl > 0;
+
+      // 1. Pi rows of the sub-step -> block buffer Tb -> whole-matrix buffer D
+      Timer.start("W_redistribute");
+      auto Tb = sTb.template view<4>({na, nzs, nP, nQ});
+      for (long p = 0; p < na; ++p) Tb(p, all, all, all) = Pi(plan.q_row(p, s), zrng, all, all);
+      dview_t dTb(std::addressof(comm), bgrid, gsh, {0, 0, grid.P0, grid.Q0}, ones, Tb);
+      auto D4 = sD.template view<4>({act ? 1L : 0L, nzl, Np, Np});
+      dview_t dD(std::addressof(comm), lay.pgrid(), gsh, {act ? lay.ip_q : na, zf, 0, 0}, ones, D4);
+      math::nda::redistribute(dTb, dD);
+      if constexpr (MEM != HOST_MEMORY) {
+        utils::device_sync();
+        device_mem_probe();
+      }
+      Timer.stop("W_redistribute");
+
+      // 2. Dyson IN PLACE, five-step order of the imaginary-axis code: A = Z Pi; A <- I - A (one gemm onto the identity);
+      //    LU(A); solve A W' = Z; W = W' - Z. W' comes out of getrs in Fortran layout, i.e. its buffer IS W'^T in C order:
+      //    D(z) <- W'^T - Z^T = W^T.
+      Timer.start("W_dyson");
+      if (solve) {
+        auto Dv = D4(0, all, all, all);
+        bool done = false;
+        if constexpr (MEM != HOST_MEMORY) {
+          if (batched) {
+            detail::dyson_batched_device(Dv, ZF, Id, nbat, sM, ipiv_b, iq_a, za + zf);
+            done = true;
+          }
+        }
+        if (not done) {
+          auto ZT = nda::transpose(ZF);   // C-ordered view of Z^T
+          for (long izl = 0; izl < nzl; ++izl) {
+            auto Pv = Dv(izl, all, all);
+            M = Id;
+            nda::blas::gemm(ComplexType(-1.0), ZF, Pv, ComplexType(1.0), M);   // M = I - Z Pi
+            int info = nda::lapack::getrf(M, ipiv, lwork);
+            utils::check(info == 0, "gw_line::screened_interaction: getrf of I - Z Pi failed (q={}, node={}, info={})", iq_a,
+                         za + zf + izl, info);
+            XF   = ZF;
+            info = nda::lapack::getrs(M, XF, ipiv);   // XF = (I - Z Pi)^{-1} Z
+            utils::check(info == 0, "gw_line::screened_interaction: getrs failed (q={}, node={}, info={})", iq_a,
+                         za + zf + izl, info);
+            Pv = nda::transpose(XF);   // W'^T (contiguous copy; Pi(q, zeta) is no longer needed)
+            if constexpr (MEM == HOST_MEMORY) Pv -= ZT;   // W^T = W'^T - Z^T
+            else nda::tensor::add(ComplexType(-1.0), ZT, ComplexType(1.0), Pv);
+          }
+        }
+      }
+      if constexpr (MEM != HOST_MEMORY) {
+        utils::device_sync();
+        device_mem_probe();
+      }
+      Timer.stop("W_dyson");
+
+      // 3. W^T -> block layout -> the WT rows of the sub-step (block (I,J) of W^T = (W_JI)^T, the fit's mirror block)
+      Timer.start("W_redistribute");
+      math::nda::redistribute(dD, dTb);
+      for (long p = 0; p < na; ++p) WT(p, zrng, all, all) = Tb(p, all, all, all);
+      if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+      Timer.stop("W_redistribute");
+
+      // 4. W = (W^T)^T in place, -> block layout -> the Pi rows (Pi's buffer becomes the block-layout W)
+      Timer.start("W_dyson");
+      if (solve) {
+        auto Dv = D4(0, all, all, all);
+        detail::transpose_in_place<MEM>(Dv, nbat, sM);
+      }
+      if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+      Timer.stop("W_dyson");
+      Timer.start("W_redistribute");
+      math::nda::redistribute(dD, dTb);
+      for (long p = 0; p < na; ++p) Pi(plan.q_row(p, s), zrng, all, all) = Tb(p, all, all, all);
+      if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+      Timer.stop("W_redistribute");
+    }
+
+    // 5. symmetric fit of the sub-step's q, all pairs at once: w(q) = VS (U1H W(q) + U2H W^T(q))
+    Timer.start("W_fit");
+    for (long p = 0; p < na; ++p) {
+      const long ql = plan.q_row(p, s);
+      auto W2       = nda::reshape(Pi(ql, all, all, all), std::array<long, 2>{nz, blk});
+      auto WT2      = nda::reshape(WT(p, all, all, all), std::array<long, 2>{nz, blk});
+      auto w2       = nda::reshape(w(q0 + ql, all, all, all), std::array<long, 2>{r, blk});
       nda::blas::gemm(ComplexType(1.0), U1H, W2, ComplexType(0.0), Y);
       nda::blas::gemm(ComplexType(1.0), U2H, WT2, ComplexType(1.0), Y);
       nda::blas::gemm(ComplexType(1.0), VS, Y, ComplexType(0.0), w2);
     }
+    if constexpr (MEM != HOST_MEMORY) {
+      utils::device_sync();
+      device_mem_probe();
+    }
+    Timer.stop("W_fit");
   }
-  if constexpr (MEM != HOST_MEMORY) utils::device_sync();
-  Timer.stop("W_fit");
 
-  Pi = arr4_t{};   // consumed
-  if (W_nodes != nullptr) *W_nodes = std::move(dW.local_());
+  if (W_nodes != nullptr) *W_nodes = std::move(Pi);   // Pi's buffer holds W(q, zeta_i) in the block layout
+  Pi = arr4_t{};                                       // consumed
 }
 
 namespace detail {
