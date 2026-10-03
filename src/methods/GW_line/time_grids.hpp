@@ -35,8 +35,9 @@
  * [Emin / pad, pad Emax] (opts.pad; the transform is unconstrained outside it, S7a), so pad > 1 is the safety margin for
  * poles that move between the construction and the use (none within an iteration: the grids are rebuilt every iteration).
  *
- * Every rank builds the grids (identical inputs); the root's nodes and LS factors are then broadcast so that all ranks
- * hold bitwise identical nodes (the node COUNT enters the collective of self_energy).
+ * S7e: grid i (0..3) is built by ONE rank, i mod np, and broadcast from it (before: all four on every rank, then the
+ * root's broadcast; the four constructions now run concurrently on four ranks, ~4x less wall time). All ranks hold
+ * bitwise identical nodes and LS factors (the node COUNT enters the collective of self_energy).
  */
 
 #include <array>
@@ -91,29 +92,38 @@ struct time_grid_info_t {
 
 namespace detail {
 
-template <typename T, int R> void bcast_nda(boost::mpi3::communicator &comm, nda::array<T, R> &A) {
+template <typename T, int R> void bcast_nda(boost::mpi3::communicator &comm, nda::array<T, R> &A, int root = 0) {
   std::array<long, R> shp{};
-  if (comm.root()) shp = A.shape();
-  comm.broadcast_n(shp.data(), R, 0);
-  if (not comm.root() and A.shape() != shp) A.resize(shp);
-  if (A.size() > 0) comm.broadcast_n(A.data(), A.size(), 0);
+  if (comm.rank() == root) shp = A.shape();
+  comm.broadcast_n(shp.data(), R, root);
+  if (comm.rank() != root and A.shape() != shp) A.resize(shp);
+  if (A.size() > 0) comm.broadcast_n(A.data(), A.size(), root);
 }
 
-/// root's nodes and LS factors -> all ranks (everything the consumer view and transform_matrix use)
-inline void bcast_time_id(boost::mpi3::communicator &comm, numerics::line_dlr::time_id_t &g) {
+/// the builder's (root's) time_id_t -> all ranks: every member (scalars, nodes, LS factors); opts are input (identical)
+inline void bcast_time_id(boost::mpi3::communicator &comm, numerics::line_dlr::time_id_t &g, int root = 0) {
   if (comm.size() == 1) return;
-  std::array<long, 3> n = {g.rank, g.ls_rank, g.n_cand};
-  comm.broadcast_n(n.data(), 3, 0);
+  std::array<long, 4> n = {g.rank, g.ls_rank, g.n_cand, g.sector == numerics::line_dlr::sector_t::particle ? 0L : 1L};
+  comm.broadcast_n(n.data(), 4, root);
   g.rank    = n[0];
   g.ls_rank = n[1];
   g.n_cand  = n[2];
-  bcast_nda(comm, g.s);
-  bcast_nda(comm, g.t);
-  bcast_nda(comm, g.E);
-  bcast_nda(comm, g.w);
-  bcast_nda(comm, g.Uc);
-  bcast_nda(comm, g.Vs);
-  bcast_nda(comm, g.sv);
+  g.sector  = n[3] == 0 ? numerics::line_dlr::sector_t::particle : numerics::line_dlr::sector_t::hole;
+  std::array<double, 6> x = {g.theta_t, g.Emin, g.Emax, g.eps, g.phase.real(), g.phase.imag()};
+  comm.broadcast_n(x.data(), 6, root);
+  g.theta_t = x[0];
+  g.Emin    = x[1];
+  g.Emax    = x[2];
+  g.eps     = x[3];
+  g.phase   = ComplexType(x[4], x[5]);
+  bcast_nda(comm, g.s, root);
+  bcast_nda(comm, g.t, root);
+  bcast_nda(comm, g.rdiag, root);
+  bcast_nda(comm, g.E, root);
+  bcast_nda(comm, g.w, root);
+  bcast_nda(comm, g.Uc, root);
+  bcast_nda(comm, g.Vs, root);
+  bcast_nda(comm, g.sv, root);
 }
 
 } // namespace detail
@@ -153,22 +163,37 @@ struct line_time_grids_t {
                  "line_time_grids_t: summed-energy ranges must start above 0 (Pi {}, Sigma^> {}, Sigma^< {})", pi_lo, sp_lo,
                  sh_lo);
 
-    auto make = [&](int i, char const *nm, sector_t s, double lo, double hi, nda::array<ComplexType, 1> const &z,
-                    time_id_t &g) {
-      const auto t0 = std::chrono::steady_clock::now();
-      g             = time_id_t(theta_t, s, lo, hi, eps, opts);
-      detail::bcast_time_id(comm, g);
-      double res = 0.0;
-      auto F     = g.transform_matrix(z, &res);
-      double fmax = 0.0;
-      for (auto const &v : F) fmax = std::max(fmax, std::abs(v));
-      info[i] = time_grid_info_t{nm, lo, hi, g.rank, g.size(), res, fmax,
-                                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()};
+    struct spec_t {
+      char const *nm;
+      sector_t s;
+      double lo, hi;
+      nda::array<ComplexType, 1> const *z;
+      time_id_t *g;
     };
-    make(0, "Pi^>", sector_t::particle, pi_lo, pi_hi, zeta_b, pi_p);
-    make(1, "Pi^<", sector_t::hole, pi_lo, pi_hi, zeta_b, pi_h);
-    make(2, "Sigma^>", sector_t::particle, sp_lo, sp_hi, zeta_f, sig_p);
-    make(3, "Sigma^<", sector_t::hole, sh_lo, sh_hi, zeta_f, sig_h);
+    const spec_t spec[4] = {{"Pi^>", sector_t::particle, pi_lo, pi_hi, &zeta_b, &pi_p},
+                            {"Pi^<", sector_t::hole, pi_lo, pi_hi, &zeta_b, &pi_h},
+                            {"Sigma^>", sector_t::particle, sp_lo, sp_hi, &zeta_f, &sig_p},
+                            {"Sigma^<", sector_t::hole, sh_lo, sh_hi, &zeta_f, &sig_h}};
+    // 1. construction + diagnostics on the builder rank i mod np (concurrent on >= 4 ranks)
+    std::array<std::array<double, 3>, 4> diag{};   // LS residual, max|F|, build time
+    for (int i = 0; i < 4; ++i) {
+      if (comm.rank() != i % comm.size()) continue;
+      const auto t0 = std::chrono::steady_clock::now();
+      *spec[i].g    = time_id_t(theta_t, spec[i].s, spec[i].lo, spec[i].hi, eps, opts);
+      double res = 0.0, fmax = 0.0;
+      auto F = spec[i].g->transform_matrix(*spec[i].z, &res);
+      for (auto const &v : F) fmax = std::max(fmax, std::abs(v));
+      diag[i] = {res, fmax, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()};
+    }
+    // 2. builder -> all ranks
+    for (int i = 0; i < 4; ++i) {
+      const int root = int(i % comm.size());
+      if (comm.rank() != root) spec[i].g->opts = opts;
+      detail::bcast_time_id(comm, *spec[i].g, root);
+      if (comm.size() > 1) comm.broadcast_n(diag[i].data(), 3, root);
+      info[i] = time_grid_info_t{spec[i].nm, spec[i].lo, spec[i].hi, spec[i].g->rank, spec[i].g->size(), diag[i][0], diag[i][1],
+                                 diag[i][2]};
+    }
   }
 
   void log(int level = 2) const {
