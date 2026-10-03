@@ -447,10 +447,12 @@ void run_bench() {
 
   propagator_t<MEM> prop(thc, grid);
   memory::array<MEM, ComplexType, 4> Pi, w;
+  [[maybe_unused]] double hw_stage[3] = {0.0, 0.0, 0.0};   // device high-water per stage (Pi, Z + W, Sigma + HX)
   T.start("Pi");
   polarization<MEM>(prop, su.poles, mf, grid, zeta, ray_p, ray_h, t_chunk, Pi, T);
   utils::device_sync();
   T.stop("Pi");
+  if constexpr (MEM != HOST_MEMORY) { device_mem_probe(); hw_stage[0] = device_high_water_bytes(); device_mem_hw_restart(); }
   dyson_layout_t lay(mpi, nq, nz, Np);
   lay.log();
   T.start("Z");
@@ -460,6 +462,7 @@ void run_bench() {
   screened_interaction<MEM>(Pi, Zb, basis, grid, mpi, w, T);
   utils::device_sync();
   T.stop("W");
+  if constexpr (MEM != HOST_MEMORY) { device_mem_probe(); hw_stage[1] = device_high_water_bytes(); device_mem_hw_restart(); }
   nda::array<ComplexType, 4> S;
   T.start("Sigma");
   self_energy<MEM>(prop, su.poles, w, basis, mf, grid, mpi, fz, ray_p, ray_h, t_chunk, S, T);
@@ -483,10 +486,14 @@ void run_bench() {
   if constexpr (MEM != HOST_MEMORY) {
     const double free1 = device_free_bytes();
     app_log(2, "  [bench] device free memory at start / end: {:.3f} / {:.3f} GB; kernel high-water (rank 0): {:.3f} GB", free0 / 1073741824.0,
-            free1 / 1073741824.0, device_high_water_bytes() / 1073741824.0);
-    const double hw_max = comm.all_reduce_value(device_high_water_bytes(), mpi3::max<>{});
+            free1 / 1073741824.0, device_high_water_bytes() / 1073741824.0);   // (Sigma stage: restarted after Pi and W)
+    device_mem_probe();
+    hw_stage[2] = device_high_water_bytes();
+    for (auto &h : hw_stage) h = comm.all_reduce_value(h, mpi3::max<>{});
+    const double hw_max = std::max({hw_stage[0], hw_stage[1], hw_stage[2]});
     app_log(2, "  [bench] device memory per rank: model (plan 6.7, proc_grid.hpp) {:.3f} GB vs measured high-water (max over "
-               "ranks) {:.3f} GB", model_peak / 1073741824.0, hw_max / 1073741824.0);
+               "ranks) {:.3f} GB: Pi stage {:.3f}, W stage {:.3f}, Sigma stage {:.3f} GB", model_peak / 1073741824.0,
+            hw_max / 1073741824.0, hw_stage[0] / 1073741824.0, hw_stage[1] / 1073741824.0, hw_stage[2] / 1073741824.0);
   }
 }
 

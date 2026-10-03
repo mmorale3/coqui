@@ -226,6 +226,7 @@ inline double aux_grid_t::log(long nk, long nq, long nzeta, long r_b, long t_chu
   const double w_t    = plan.transient_bytes(kfit, nbat, np > 1 ? stg : 0.0);
   const double res    = z + w + pig + xsl;
   const double peak   = res + std::max({pi_t, w_t, sg_t});
+  // per stage (the Pi group is consumed by the W stage: not held during Sigma)
   app_log(2, "  gw_line aux grid: {} ranks -> (P,Q) = ({} x {}), Np = {}, block <= {} x {} ({:.3f} MB)", np, np_P, np_Q, Np,
           (Np + np_P - 1) / np_P, (Np + np_Q - 1) / np_Q, blk / 1024.0 / 1024.0);
   app_log(2, "    memory model per rank (N_k={}, N_q={}, N_zeta={}, r_b={}, t_chunk={}, g={}, {}), GB:", nk, nq, nzeta, r_b,
@@ -234,7 +235,8 @@ inline double aux_grid_t::log(long nk, long nq, long nzeta, long r_b, long t_chu
           xsl / GB, res / GB);
   app_log(2, "      transient: Pi stage {:.4f} (A, B {} + acc {} chunks)  W stage {:.4f} ({} x {} sub-steps)  Sigma stage {:.4f}",
           pi_t / GB, 2 * nk, long(nacc), w_t / GB, plan.nsub_q, plan.n_zsub(), sg_t / GB);
-  app_log(2, "      predicted high-water: {:.4f}", peak / GB);
+  app_log(2, "      predicted high-water: {:.4f}  (Pi stage {:.4f}, W stage {:.4f}, Sigma stage {:.4f})", peak / GB,
+          (res + pi_t) / GB, (res + w_t) / GB, (res - pig + sg_t) / GB);
   return peak;
 }
 
@@ -257,6 +259,8 @@ inline void device_mem_probe() {
     detail::dev_mem_hw() = std::max(detail::dev_mem_hw(), detail::dev_mem_base() - detail::free_device_bytes());
 }
 inline double device_high_water_bytes() { return detail::dev_mem_hw(); }
+/// restart the high-water mark (keeps the baseline of device_mem_reset): per-stage high-water marks
+inline void device_mem_hw_restart() { detail::dev_mem_hw() = 0.0; }
 inline double device_free_bytes() { return detail::free_device_bytes(); }
 
 } // namespace methods::gw_line
