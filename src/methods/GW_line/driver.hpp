@@ -1,0 +1,133 @@
+/**
+ * ==========================================================================
+ * CoQuí: Correlated Quantum ínterface
+ *
+ * Copyright (c) 2022-2026 Simons Foundation & The CoQuí developer team
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==========================================================================
+ */
+
+#ifndef COQUI_METHODS_GW_LINE_DRIVER_HPP
+#define COQUI_METHODS_GW_LINE_DRIVER_HPP
+
+/**
+ * Self-consistent GW on the tilted line (notes sections 5-7; plan S6; python coqui/cayley/cayley/line/driver.py::LineSCGW
+ * and scripts/si222c_scgw_line.py). TOML block [gw_line] (plan section 5), read by gw_line_params_t::from_ptree:
+ *
+ *   theta_deg = 20      line angle (deg); the time rays use theta_t = theta / 2
+ *   eps = 1e-10         tolerance of all real-pole bases (fermionic, bosonic)
+ *   lam = 6.0           fermionic pole range (Ha);  lam_b = 4.0 bosonic range
+ *   sigma_gap = 0.02    Sigma-basis gap on each side (Ha). < 0: auto, gap_p = 0.8 (e_lumo + nu_min),
+ *                       gap_h = 0.8 (|e_homo| + nu_min), e_homo/e_lumo the current QP edges (mu-relative), nu_min = bos gap
+ *   bos_gap = 0.02      gap of the bosonic basis (Ha). < 0: auto, 0.5 x the current QP gap
+ *   g_gap = 0.0         gap of the G compression bases (notes 6.4: keep 0)
+ *   nodes_per_ray = 120, node_tmin = 1e-3, node_tmax = 60   dense fermionic nodes (log grid per ray); node_tmax is also
+ *                       the tmax of the fermionic bases (python node_range)
+ *   wp = 0.11, K = 24, tol_gram = 1e-10, nphi = 8           Cayley closure
+ *   niter = 12          TOTAL number of iterations (a restart continues until niter iterations are done)
+ *   mixing = 0.5        linear mixing of Sigma^{>/<} at the nodes (F is not mixed, as python)
+ *   conv_thr = 1e-5     stop when max|dSigma| at the nodes (after mixing, as python) < conv_thr
+ *   t_chunk = 8, ray_decades = 36   time chunk of the ray products; ray length e^{-emin smax sin theta_t} = e^{-decades}
+ *   restart = false     resume from <output>.gw_line.h5:/scf_line/final_iter (bitwise identical continuation)
+ *   output / outdir + prefix   checkpoint stem (MBPT_drivers resolve_mbpt_output_stem; the driver reads "output")
+ *   div_treatment       must be absent or "ignore_g0" (Z(Gamma) without its G = 0 term, no Madelung/head correction)
+ *   spectra = { enable = true, eta = [0.004, 0.01], wmin = -0.45, wmax = 0.45, nw = 601 }   A(k,w) at the end
+ *
+ * Initial guess (as si222c_scgw_line.py): KS poles e_n(k) - mu0 with unit residues in the KS band basis, mu0 = KS
+ * mid-gap (python uses CoQui's Matsubara mu; the gap midpoint is used here, no imaginary-axis checkpoint needed), and
+ * F = V_H + Sigma_x of the KS density matrix. H0 = the non-interacting one-body Hamiltonian (kinetic + pseudopotential, no
+ * Hartree, no xc) in the KS band basis, built exactly as the imaginary-axis SCF builds it (hamilt::set_H0, hermitized).
+ *
+ * Loop (python LineSCGW.iterate): rays from the current poles -> Pi at the bosonic nodes -> W residues -> Sigma^{>/<} at
+ * the dense nodes -> mixing -> closure with H_stat = H0 + F - mu (closure.hpp) -> new mu and compressed poles -> D, F.
+ * Checkpoint: <output>.gw_line.h5 (own file), written by the root after every iteration:
+ *   system/{nkpts, nbnd, Np, nelec, H0, eigval, qk_to_k2, mu0}, input/{parameters, fermionic_nodes},
+ *   scf_line/final_iter, scf_line/iter<N>/{mu, mu_sigma, dmu, e_homo, e_lumo, F, Sigma_p, Sigma_h (N >= 1),
+ *   poles/{particle,hole}_{counts,e,coef}, history scalars}, iter0 = the initial state; spectra/ at the end.
+ */
+
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "configuration.hpp"
+#include "IO/ptree/ptree_utilities.hpp"
+#include "mean_field/MF.hpp"
+#include "methods/ERI/thc_reader_t.hpp"
+#include "methods/GW_line/line_state.hpp"
+#include "methods/GW_line/spectra.hpp"
+
+namespace methods::gw_line {
+
+struct gw_line_params_t {
+  double theta_deg = 20.0, eps = 1e-10, lam = 6.0, lam_b = 4.0;
+  double sigma_gap = 0.02, bos_gap = 0.02, g_gap = 0.0;
+  long nodes_per_ray = 120;
+  double node_tmin = 1e-3, node_tmax = 60.0;
+  double wp = 0.11;
+  long K = 24;
+  double tol_gram = 1e-10;
+  long nphi = 8;
+  long niter = 12;
+  double mixing = 0.5, conv_thr = 1e-5;
+  long t_chunk = 8;
+  double ray_decades = 36.0;
+  bool restart = false;
+  std::string output = "./gw_line";
+  bool do_spectra = true;
+  spectra_params_t spectra;
+
+  static gw_line_params_t from_ptree(ptree const &pt);
+  void log() const;
+};
+
+/// One line of the iteration table (python history record).
+struct gw_line_iter_t {
+  long iter = 0;
+  double dSigma = 0.0, mu = 0.0, dmu = 0.0, gap = 0.0, e_homo = 0.0, e_lumo = 0.0;
+  double nelec = 0.0, nelec_lehmann = 0.0, N_mu = 0.0, dropped = 0.0, heldout_max = 0.0;
+  long npoles_min = 0, npoles_max = 0;
+  double bos_gap = 0.0, sigma_gap_p = 0.0, sigma_gap_h = 0.0, time = 0.0;
+};
+
+struct gw_line_result_t {
+  std::vector<gw_line_iter_t> history;   ///< all iterations (including those read on restart)
+  bool converged = false;
+  double mu = 0.0, mu_sigma = 0.0;       ///< final centre; centre at which Sigma_p/h were sampled
+  pole_data_t poles;                     ///< final compressed poles (mu-relative)
+  nda::array<ComplexType, 3> F;          ///< final V_H + Sigma_x
+  nda::array<ComplexType, 3> H0;         ///< one-body Hamiltonian (KS band basis)
+  nda::array<ComplexType, 4> Sig_p, Sig_h;   ///< last mixed Sigma at the nodes (empty if no iteration was done)
+  nda::array<ComplexType, 1> zeta;       ///< fermionic nodes (mu-relative)
+  std::optional<spectra_out_t> spectra;
+};
+
+/// Non-interacting one-body Hamiltonian (no xc) in the KS band basis, (nk, nb, nb), hermitized; collective.
+nda::array<ComplexType, 3> one_body_h0(mf::MF &mf);
+
+/// Root rank writes system/{nkpts, nbnd, Np, nelec, H0, eigval, qk_to_k2, mu0} into `file` ('w' if truncate, else 'a').
+void write_system_h5(boost::mpi3::communicator &comm, std::string const &file, mf::MF &mf, long Np,
+                     nda::array<ComplexType, 3> const &H0, double mu0, bool truncate);
+
+/// The line scGW driver. Collective over thc.mpi()->comm.
+template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &thc, mf::MF &mf, ptree const &pt);
+
+extern template gw_line_result_t gw_line_scf<HOST_MEMORY>(methods::thc_reader_t &, mf::MF &, ptree const &);
+#if defined(ENABLE_DEVICE)
+extern template gw_line_result_t gw_line_scf<DEVICE_MEMORY>(methods::thc_reader_t &, mf::MF &, ptree const &);
+#endif
+
+} // namespace methods::gw_line
+
+#endif

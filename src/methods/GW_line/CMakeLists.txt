@@ -5,6 +5,7 @@
 
 SET(SRCS
   gw_line.cpp
+  driver.cpp
   )
 
 if(USE_DEVICE_COMPILER)
@@ -20,7 +21,7 @@ endif()
 endif()
 
 add_library(gw_line_lib ${SRCS})
-target_link_libraries(gw_line_lib PUBLIC utils numerics meanfield eri_lib)
+target_link_libraries(gw_line_lib PUBLIC utils numerics meanfield hamilt eri_lib)
 install(TARGETS gw_line_lib
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
