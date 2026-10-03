@@ -40,7 +40,7 @@
  * [N_zeta x t_chunk] . [t_chunk x block]).
  *
  * t_chunk <= 0 selects the chunk automatically: host_t_chunk_default on the host, on the device the largest chunk whose
- * A, B, acc fit in 40% of the free device memory (<= 256; the transform gemm [N_zeta x t_chunk] . [t_chunk x block] has
+ * A, B, acc fit in 40% of the free device memory (<= 128; the transform gemm [N_zeta x t_chunk] . [t_chunk x block] has
  * inner dimension t_chunk).
  * Device Hadamard (S7d): the fused kernel of cuda/gw_line_cuda.cuh. Default (COQUI_GWLINE_PI_QFOLD = 1): ONE launch per
  * chunk forms acc(q) = (sign 2/N_k) sum_k A(k) o B(k-q) for ALL q (A, B of all k read once, acc written once; acc holds

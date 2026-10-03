@@ -53,7 +53,7 @@
  *   chunk) and ONE copy + all_reduce of [N_k, N_zeta, nb, nb] per sector at the end.
  * Memory per rank: G~ and acc, 2 N_k t_chunk blocks, plus one W(q, chunk) (and one temp on device).
  *
- * t_chunk <= 0 selects the chunk automatically (host host_t_chunk_default; device from the free device memory, <= 256).
+ * t_chunk <= 0 selects the chunk automatically (host host_t_chunk_default; device from the free device memory, <= 128).
  * Device: contraction as two strided-batched gemms per (k, chunk); the residue exponentials are formed once per chunk (q
  * independent) on both paths. Device Hadamard (S7d, the fused kernel of cuda/gw_line_cuda.cuh): default
  * (COQUI_GWLINE_SIGMA_KOUTER = 1) W(q, chunk) of ALL q is formed by one strided-batched gemm (memory N_q t_chunk block)

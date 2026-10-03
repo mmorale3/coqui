@@ -129,12 +129,13 @@ void slab_conv([[maybe_unused]] long E, [[maybe_unused]] long nX, [[maybe_unused
 
 /**
  * Time-chunk length: device: the largest chunk whose per-chunk arrays (bytes_per_t each) fit in `frac` of the effective
- * free device memory, clamped to [8, min(nt, tmax)]; host: host_t_chunk (S7d: 32, see notes/line_gw_device_bringup.md
+ * free device memory, clamped to [8, min(nt, tmax)] (S7d: tmax 256 -> 128; at Np 640 on an A100 t_chunk 128 is faster
+ * than ~170 and 256 and holds 7 GB less); host: host_t_chunk (S7d: 32, see notes/line_gw_device_bringup.md
  * S7d; the S3-S5 setting was 8; env COQUI_GWLINE_HOST_TCHUNK overrides).
  */
 inline constexpr long host_t_chunk_default = 32;
 template <MEMORY_SPACE MEM>
-long auto_t_chunk(long nt, double bytes_per_t, double frac = 0.4, long tmax = 256) {
+long auto_t_chunk(long nt, double bytes_per_t, double frac = 0.4, long tmax = 128) {
   long tc = env_long("COQUI_GWLINE_HOST_TCHUNK", host_t_chunk_default);
   if constexpr (MEM != HOST_MEMORY) {
     const double freeb = double(utils::freemem_device_effective()) * 1048576.0;   // MB -> bytes

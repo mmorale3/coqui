@@ -335,7 +335,7 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
   if constexpr (MEM != HOST_MEMORY) {
     batched = detail::env_long("COQUI_GWLINE_DYSON_BATCHED", Np <= 1024 ? 1 : 0) != 0;
     const double mat = double(Np) * Np * 16.0, freeb = double(utils::freemem_device_effective()) * 1048576.0;
-    nbat = std::max(1L, std::min({nzl_max, 256L, long(0.25 * freeb / mat)}));
+    nbat = std::max(1L, std::min({nzl_max, dyson_nbat_max(), long(0.25 * freeb / mat)}));
     if (batched) ipiv_b = memory::array<MEM, int, 2>(nbat, Np);
     app_log(3, "  gw_line::screened_interaction: Dyson on the device {} ({} matrices per batch)",
             batched ? "batched (cuBLAS getrf/getrsBatched)" : "per matrix (cuSOLVER)", nbat);

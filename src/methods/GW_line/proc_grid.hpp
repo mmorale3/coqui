@@ -157,7 +157,7 @@ struct dyson_layout_t {
  * Tb (W^T blocks) -> WT rows; D transposed in place (W) -> Tb -> Pi rows (W blocks). After the zeta loop, the fit of the
  * n_act q's reads W (Pi rows) and W^T (WT). Held besides the resident set: WT (n_act N_zeta blk), Tb (n_act nzs blk),
  * D (ceil(nzs / np_z) Np^2), the Dyson scratch, the fit buffer Y (k x a column chunk, <= S/64) and the redistribute staging.
- * nzs: the largest value that keeps Tb + D within max(S/8, S - WT) (S = g N_zeta blk, the Pi group), >= np_z; the env
+ * nzs: the largest value that keeps Tb + D within max(S/8, (S - WT)/2) (S = g N_zeta blk, the Pi group), >= np_z; the env
  * COQUI_GWLINE_W_ZSUB forces it, nzs_cap (device: from the free memory) caps it. Must be identical on all ranks (callers
  * reduce nzs_cap with a min over the communicator).
  */
@@ -174,7 +174,7 @@ struct w_plan_t {
     utils::check(lay.nq_loc == base + (lay.ip_q < extra ? 1 : 0), "gw_line::w_plan_t: unexpected q pool size {} (g {}, np_q {})",
                  lay.nq_loc, lay.g, lay.np_q);
     const double S = double(lay.g) * lay.nz * blk, WT = double(lay.np_q) * lay.nz * blk;
-    const double avail = std::max(S / 8.0, S - WT);
+    const double avail = std::max(S / 8.0, 0.5 * (S - WT));   // the other half: Dyson scratch, staging, fit buffer
     // Tb + D per zeta node of the sub-slab: np_q blk + Np^2 / np_z (= 2 np_q blk on a square grid)
     const double per_z = double(lay.np_q) * blk + double(lay.Np) * lay.Np / double(lay.np_z);
     nzs = long(avail / per_z);
@@ -207,6 +207,12 @@ struct w_plan_t {
   }
 };
 
+/// largest Dyson sub-batch on the device (matrices of the batched LU scratch; env COQUI_GWLINE_DYSON_NBAT, default 128)
+inline long dyson_nbat_max() {
+  char const *v = std::getenv("COQUI_GWLINE_DYSON_NBAT");
+  return (v != nullptr and *v != '\0') ? std::max(1L, std::strtol(v, nullptr, 10)) : 128L;
+}
+
 inline double aux_grid_t::log(long nk, long nq, long nzeta, long r_b, long t_chunk, long nb, long g, bool device_fused) const {
   if (g < 0) g = nq;
   const double GB  = 1024.0 * 1024.0 * 1024.0;
@@ -219,7 +225,7 @@ inline double aux_grid_t::log(long nk, long nq, long nzeta, long r_b, long t_chu
   const double sg_t = (2.0 * nk + nacc) * t_chunk * blk + double(nk) * t_chunk * nb * nb * 16.0;
   dyson_layout_t lay(np, rank, g, nzeta, Np);
   w_plan_t plan(lay, mb);
-  const long nbat     = device_fused ? std::min((plan.nzs + lay.np_z - 1) / lay.np_z, 256L) : 1L;
+  const long nbat     = device_fused ? std::min((plan.nzs + lay.np_z - 1) / lay.np_z, dyson_nbat_max()) : 1L;
   const double stg    = std::min(2.0 * GB, 2.0 * 16.0 * double(lay.np_q) * plan.nzs * mb);
   // fit buffer (screened_interaction): k x bc with bc = clamp(S / (64 k), min(blk, 4096), blk); in units of blk (k <= N_zeta)
   const double kfit   = std::min(double(nzeta), std::max(double(g) * nzeta / 64.0, double(nzeta) * std::min(mb, 4096L) / double(mb)));
