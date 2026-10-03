@@ -19,8 +19,9 @@
  */
 
 /**
- * gw_line_lib (notes/line_gw_cpp_plan.md, S3-S4): explicit instantiations of the MEM-templated line-GW kernels
- * (propagators, polarization, screened interaction) for HOST_MEMORY and, in device builds, DEVICE_MEMORY.
+ * gw_line_lib (notes/line_gw_cpp_plan.md, S3-S5): explicit instantiations of the MEM-templated line-GW kernels
+ * (propagators, polarization, screened interaction, self-energy, static part) for HOST_MEMORY and, in device builds,
+ * DEVICE_MEMORY.
  */
 
 #include "methods/GW_line/proc_grid.hpp"
@@ -28,6 +29,8 @@
 #include "methods/GW_line/propagators.hpp"
 #include "methods/GW_line/polarization.hpp"
 #include "methods/GW_line/screened.hpp"
+#include "methods/GW_line/self_energy.hpp"
+#include "methods/GW_line/static_part.hpp"
 
 namespace methods::gw_line {
 
@@ -65,5 +68,22 @@ GW_LINE_SCREENED_INST(HOST_MEMORY)
 GW_LINE_SCREENED_INST(DEVICE_MEMORY)
 #endif
 #undef GW_LINE_SCREENED_INST
+
+#define GW_LINE_SIGMA_INST(MEM)                                                                                          \
+  template void self_energy<MEM>(propagator_t<MEM> &, pole_data_t const &, memory::array<MEM, ComplexType, 4> const &,    \
+                                 bosonic_basis_t const &, mf::MF const &, aux_grid_t const &,                             \
+                                 boost::mpi3::communicator &, nda::array<ComplexType, 1> const &,                         \
+                                 time_ray_t const &, time_ray_t const &, long, nda::array<ComplexType, 4> &,              \
+                                 utils::TimerManager &, sector_t);                                                        \
+  template void hartree_exchange<MEM>(propagator_t<MEM> &, coulomb_blocks_t<MEM> const &,                                \
+                                      nda::array<ComplexType, 3> const &, mf::MF const &, aux_grid_t const &,             \
+                                      boost::mpi3::communicator &, nda::array<ComplexType, 3> &,                          \
+                                      utils::TimerManager &);
+
+GW_LINE_SIGMA_INST(HOST_MEMORY)
+#if defined(ENABLE_DEVICE)
+GW_LINE_SIGMA_INST(DEVICE_MEMORY)
+#endif
+#undef GW_LINE_SIGMA_INST
 
 } // namespace methods::gw_line
