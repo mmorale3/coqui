@@ -39,9 +39,13 @@
  * 2 N_k t_chunk block), then per q: acc(t) = sum_k A(k) o B(k-q) and Pi(q, :) += (sign 2/N_k) F[:, chunk] acc (one gemm
  * [N_zeta x t_chunk] . [t_chunk x block]).
  *
- * t_chunk <= 0 selects the chunk automatically: 8 on the host, on the device the largest chunk whose A, B, acc fit in 40%
- * of the free device memory (<= 256; the transform gemm [N_zeta x t_chunk] . [t_chunk x block] has inner dimension t_chunk).
- * Device Hadamard: one cuTENSOR elementwise_trinary per (q, k), acc <- A o B + acc.
+ * t_chunk <= 0 selects the chunk automatically: host_t_chunk_default on the host, on the device the largest chunk whose
+ * A, B, acc fit in 40% of the free device memory (<= 128; the transform gemm [N_zeta x t_chunk] . [t_chunk x block] has
+ * inner dimension t_chunk).
+ * Device Hadamard (S7d): the fused kernel of cuda/gw_line_cuda.cuh. Default (COQUI_GWLINE_PI_QFOLD = 1): ONE launch per
+ * chunk forms acc(q) = (sign 2/N_k) sum_k A(k) o B(k-q) for ALL q (A, B of all k read once, acc written once; acc holds
+ * N_q chunks), then ONE strided-batched gemm over q does the transform. QFOLD = 0: one launch per q (acc of one q).
+ * COQUI_GWLINE_FUSED = 0: one cuTENSOR elementwise_trinary per (q, k), acc <- A o B + acc (the bring-up path).
  *
  * Output: Pi is the local block in MEM, shape (N_q, N_zeta, nP, nQ) = Pi(q, zeta)[P_rng, Q_rng] (overwritten). It stays
  * in MEM because the next consumer (S4: Dyson for W) redistributes a MEM darray.
@@ -76,7 +80,6 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
                   utils::TimerManager &Timer, sector_t sectors = sector_t::both) {
   using time_ray_t = numerics::line_dlr::time_nodes_t;   // GL ray or ID nodes (S7b)
   using arr4_t = memory::array<MEM, ComplexType, 4>;
-  using arr3_t = memory::array<MEM, ComplexType, 3>;
   auto all     = nda::range::all;
 
   utils::check(mf.nkpts() == mf.nkpts_ibz() and mf.nqpts() == mf.nqpts_ibz(),
@@ -104,17 +107,33 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   const leg_t legs[2] = {{&ray_p, +1.0, sector_t::hole, sector_t::particle},
                          {&ray_h, -1.0, sector_t::particle, sector_t::hole}};
 
+  // ---- S7d Hadamard setup (device fused kernel; see the file header)
+  [[maybe_unused]] const bool fused = (MEM != HOST_MEMORY) and detail::fused_hadamard();
+  [[maybe_unused]] const bool qfold = fused and detail::env_long("COQUI_GWLINE_PI_QFOLD", 1) != 0;
+  [[maybe_unused]] memory::array<MEM, int, 1> pairs;   // (N_q, N_k, 2): (k, k-q)
+  if (fused) {
+    nda::array<int, 1> ph(2 * nq * nk);
+    for (long iq = 0; iq < nq; ++iq)
+      for (long ik = 0; ik < nk; ++ik) {
+        ph(2 * (iq * nk + ik))     = int(ik);
+        ph(2 * (iq * nk + ik) + 1) = int(qk(iq, ik));
+      }
+    pairs = memory::to_memory_space<MEM>(ph);
+  }
+  const long nacc = qfold ? nq : 1;   // acc chunks held: all q (qfold) or one
+
   for (auto const &leg : legs) {
     if (sectors != sector_t::both and sectors != leg.ray->sector) continue;
     time_ray_t const &ray = *leg.ray;
     const long nt         = ray.size();
-    // t_chunk <= 0: automatic (host 8; device from the free device memory: A, B of all k and acc per time node)
-    const long tc = (t_chunk > 0) ? std::min(t_chunk, nt) : detail::auto_t_chunk<MEM>(nt, double(2 * nk + 1) * blk * 16.0);
+    // t_chunk <= 0: automatic (host default; device from the free device memory: A, B of all k and acc per time node)
+    const long tc = (t_chunk > 0) ? std::min(t_chunk, nt) : detail::auto_t_chunk<MEM>(nt, double(2 * nk + nacc) * blk * 16.0);
     memory::array<MEM, ComplexType, 2> F = memory::to_memory_space<MEM>(ray.transform_matrix(zeta));   // (nz, nt)
     arr4_t A(nk, tc, nP, nQ), B(nk, tc, nP, nQ);
-    arr3_t acc(tc, nP, nQ);
+    arr4_t acc(nacc, tc, nP, nQ);
     if constexpr (MEM != HOST_MEMORY) device_mem_probe();
-    app_log(3, "  gw_line::polarization: {} sector, {} time nodes in chunks of {}", leg.ray->sector == sector_t::particle ? "particle" : "hole", nt, tc);
+    app_log(3, "  gw_line::polarization: {} sector, {} time nodes in chunks of {}{}", leg.ray->sector == sector_t::particle ? "particle" : "hole", nt, tc,
+            fused ? (qfold ? " (fused Hadamard, all q per launch)" : " (fused Hadamard, one q per launch)") : "");
     const ComplexType alpha(leg.sign * 2.0 / double(nk));
 
     for (long i0 = 0; i0 < nt; i0 += tc) {
@@ -130,32 +149,52 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
       if constexpr (MEM != HOST_MEMORY) utils::device_sync();
       Timer.stop("G_tilde");
 
+      if (qfold) {   // device, fused: acc(q) for all q in one launch (alpha folded in), transform for all q in one gemm
+        Timer.start("Pi_hadamard");
+        detail::slab_conv<MEM>(n * blk, nk, A.data(), tc * blk, nk, B.data(), tc * blk, nq, acc.data(), tc * blk, nk, pairs, 0,
+                               alpha, false);
+        utils::device_sync();
+        Timer.stop("Pi_hadamard");
+        Timer.start("Pi_transform");
+        // column-major: Pi(q)^T (blk x nz) += acc(q)^T (blk x n) . F[:, chunk]^T (n x nz), batched over q
+        detail::gemm_strided_cm('N', 'N', blk, nz, n, ComplexType(1.0), acc.data(), blk, tc * blk, F.data() + i0, nt, 0,
+                                ComplexType(1.0), Pi.data(), blk, nz * blk, nq);
+        utils::device_sync();
+        Timer.stop("Pi_transform");
+        continue;
+      }
+
       for (long iq = 0; iq < nq; ++iq) {
         Timer.start("Pi_hadamard");
-        auto acc_v = acc(tr, all, all);
-        for (long ik = 0; ik < nk; ++ik) {
-          const long ikmq = qk(iq, ik);
-          auto Ak = A(ik, tr, all, all);
-          auto Bk = B(ikmq, tr, all, all);
-          if constexpr (MEM == HOST_MEMORY) {
-            if (ik == 0) acc_v = Ak * Bk;
-            else acc_v += Ak * Bk;
-          } else {
-            // device: one cuTENSOR trinary per k, acc <- (A o B) + acc (no lazy nda expressions on device arrays)
-            if (ik == 0) nda::tensor::set(ComplexType(0.0), acc_v);
+        auto acc_v = acc(0, tr, all, all);
+        if (fused) {   // device, fused: one launch for this q (alpha folded in)
+          detail::slab_conv<MEM>(n * blk, nk, A.data(), tc * blk, nk, B.data(), tc * blk, 1, acc.data(), tc * blk, nk, pairs,
+                                 2 * iq * nk, alpha, false);
+        } else {
+          for (long ik = 0; ik < nk; ++ik) {
+            const long ikmq = qk(iq, ik);
+            auto Ak = A(ik, tr, all, all);
+            auto Bk = B(ikmq, tr, all, all);
+            if constexpr (MEM == HOST_MEMORY) {
+              if (ik == 0) acc_v = Ak * Bk;
+              else acc_v += Ak * Bk;
+            } else {
+              // device: one cuTENSOR trinary per k, acc <- (A o B) + acc (no lazy nda expressions on device arrays)
+              if (ik == 0) nda::tensor::set(ComplexType(0.0), acc_v);
 #if defined(ENABLE_DEVICE)   // device-only: older host nda checkouts lack elementwise_trinary
-            nda::tensor::elementwise_trinary(ComplexType(1.0), Ak, "abc", ComplexType(1.0), Bk, "abc", ComplexType(1.0), acc_v,
-                                             "abc", nda::tensor::op::MUL, nda::tensor::op::SUM);
+              nda::tensor::elementwise_trinary(ComplexType(1.0), Ak, "abc", ComplexType(1.0), Bk, "abc", ComplexType(1.0),
+                                               acc_v, "abc", nda::tensor::op::MUL, nda::tensor::op::SUM);
 #endif
+            }
           }
         }
         if constexpr (MEM != HOST_MEMORY) utils::device_sync();
         Timer.stop("Pi_hadamard");
 
         Timer.start("Pi_transform");
-        auto acc2 = nda::reshape(acc, std::array<long, 2>{tc, blk})(tr, all);
+        auto acc2 = nda::reshape(acc(0, all, all, all), std::array<long, 2>{tc, blk})(tr, all);
         auto Pi2  = nda::reshape(Pi(iq, all, all, all), std::array<long, 2>{nz, blk});
-        nda::blas::gemm(alpha, F(all, nda::range(i0, i0 + n)), acc2, ComplexType(1.0), Pi2);
+        nda::blas::gemm(fused ? ComplexType(1.0) : alpha, F(all, nda::range(i0, i0 + n)), acc2, ComplexType(1.0), Pi2);
         if constexpr (MEM != HOST_MEMORY) utils::device_sync();
         Timer.stop("Pi_transform");
       }

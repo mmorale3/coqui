@@ -22,6 +22,11 @@ endif()
 
 add_library(gw_line_lib ${SRCS})
 target_link_libraries(gw_line_lib PUBLIC utils numerics meanfield hamilt eri_lib)
+# S7d: the fused Hadamard kernel (cuda/gw_line_cuda.cu), CUDA builds only
+if(ENABLE_CUDA)
+  add_subdirectory(cuda)
+  target_link_libraries(gw_line_lib PUBLIC gw_line_cuda)
+endif()
 install(TARGETS gw_line_lib
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 

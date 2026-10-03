@@ -51,7 +51,7 @@
  *   niter = 12          TOTAL number of iterations (a restart continues until niter iterations are done)
  *   mixing = 0.5        linear mixing of Sigma^{>/<} at the nodes (F is not mixed, as python)
  *   conv_thr = 1e-5     stop when max|dSigma| at the nodes (after mixing, as python) < conv_thr
- *   t_chunk = 8, ray_decades = 36   time chunk of the ray products; ray length e^{-emin smax sin theta_t} = e^{-decades}
+ *   t_chunk = 0 (auto), ray_decades = 36   time chunk of the ray products; ray length e^{-emin smax sin theta_t} = e^{-decades}
  *   time_grid = "id"    time nodes of the ray products (S7b): "id" = time-node ID (time_grids.hpp; four grids rebuilt every
  *                       iteration from the current poles and bosonic poles, ~100-170 nodes each), "gl" = the generic
  *                       Gauss-Legendre rays for_spectrum(theta_t, emin, ray_decades) (~1000 nodes; the python reference)
@@ -105,7 +105,7 @@ struct gw_line_params_t {
   long nphi = 8;
   long niter = 12;
   double mixing = 0.5, conv_thr = 1e-5;
-  long t_chunk = 8;
+  long t_chunk = 0;   // 0 = automatic (host: 32, COQUI_GWLINE_HOST_TCHUNK; device: from the free memory, capped)
   double ray_decades = 36.0;
   std::string time_grid = "id";          ///< "id" (time-node ID) or "gl" (Gauss-Legendre rays)
   double time_eps = 1e-10, time_pad = 1.25, time_oversample = 1.0;   ///< time_eps defaults to eps

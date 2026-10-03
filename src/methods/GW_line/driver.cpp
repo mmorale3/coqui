@@ -142,7 +142,7 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   utils::check(p.g_wtol >= 0.0 and p.g_emin_frac >= 0.0 and p.g_wsmall >= 0.0, "gw_line: g_wtol, g_emin_frac, g_wsmall must be >= 0");
   utils::check(p.nodes_per_ray > 1 and p.node_tmin > 0.0 and p.node_tmax > p.node_tmin, "gw_line: invalid node grid");
   utils::check(p.K >= 1 and p.nphi >= 1 and p.wp > 0.0 and p.tol_gram > 0.0, "gw_line: invalid closure parameters");
-  utils::check(p.niter >= 0 and p.t_chunk >= 1 and p.ray_decades > 0.0, "gw_line: invalid niter / t_chunk / ray_decades");
+  utils::check(p.niter >= 0 and p.t_chunk >= 0 and p.ray_decades > 0.0, "gw_line: invalid niter / t_chunk / ray_decades");
   utils::check(p.mixing > 0.0 and p.mixing <= 1.0, "gw_line: mixing must be in (0, 1]");
   utils::check(p.time_grid == "id" or p.time_grid == "gl", "gw_line: time_grid must be \"id\" or \"gl\" (got \"{}\")",
                p.time_grid);
@@ -716,7 +716,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
 
   dyson_layout_t lay(comm.size(), comm.rank(), nq, bos->zeta_nodes.size(), Np);
   coulomb_blocks_t<MEM> Zb(thc, grid, lay.q_rng(), Timer);
-  grid.log(nk, nq, bos->zeta_nodes.size(), bos->rank, prm.t_chunk, nb);
+  grid.log(nk, nq, bos->zeta_nodes.size(), bos->rank, (prm.t_chunk > 0 ? prm.t_chunk : 32), nb);
   lay.log();
 
   if (not restart) {
