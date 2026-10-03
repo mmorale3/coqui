@@ -12,3 +12,10 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+
+# S6: closure (toy), driver checkpoint/restart and python parity on lih222 (gw_line_scf).
+set(TEST_ID gw_line_scf)
+add_executable(test_${TEST_ID} test_gw_line_scf.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib gw_line_lib)
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
