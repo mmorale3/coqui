@@ -25,8 +25,15 @@
  * Screened interaction on the line (notes section 5.3, Eq. dyson_w; section 3.3, Eqs. brep, bfit; plan 6.3(c);
  * python LineGW.dyson_w / screened_interaction):
  *
- *   W(q, zeta_i) = ([1 - Z(q) Pi(q, zeta_i)]^{-1} - 1) Z(q)                     at the bosonic line nodes zeta_i,
- *   W_PQ(zeta)   = sum_j [ w_j,PQ / (zeta - nu_j) - w_j,QP / (zeta + nu_j) ]     (symmetric real-pole fit, all pairs).
+ *   W(q, zeta_i)  = ([1 - Z(q) Pi(q, zeta_i)]^{-1} - 1) Z(q)                          at the bosonic line nodes zeta_i,
+ *   W_PQ(q, zeta) = sum_j [ w_j(q)_PQ / (zeta - nu_j) - w_j(-q)_QP / (zeta + nu_j) ]  (paired real-pole fit, all pairs).
+ *
+ * q <-> -q pairing (fix of 2026-10-04, notes section 3.3). The bosonic propagator of rho_q obeys W(q, -zeta) = W(-q, zeta)^T
+ * (the same for Pi; B(q) = A(-q)^T for the negative / positive frequency residues), NOT W(q, -zeta) = W(q, zeta)^T: the
+ * hole residues of q are the transposed particle residues of -q = qminus(q) (mf::MF::qminus, coulomb_blocks_t::qminus).
+ * The per-q form holds only for self-inverse q (q = -q mod G: every q of the 2x2x2 / 2x1x1 meshes); on Si 4x4x4 it put
+ * Sigma_c 50-62% off. The fit of q therefore needs W(-q)^T at the nodes: a q group must contain -q with every q (q_groups_t
+ * builds pair-closed groups), and the mirror data come from the partner's W (see below).
  *
  * Distribution (plan 6.2 / 6.3(c)). Every Np x Np object lives as the (P_rng, Q_rng) block of the ONE 2D aux grid
  * (aux_grid_t). The Dyson step needs whole matrices: Pi {g, N_zeta, Np, Np} is wrapped as a darray with grid
@@ -41,16 +48,21 @@
  *
  * The fit (Eq. bfit) for all pairs at once, from the truncated SVD of the stacked 2 N_zeta x 2 r kernel
  * [[K^-, -K^+], [-K^+, K^-]] = U S V^dagger (same rcond = DBL_EPSILON max(2 N_zeta, 2 r) as bosonic_basis_t::fit /
- * numpy lstsq; bosonic_fit_t, built once on the host):
- *   w_IJ = VS (U1H W_IJ + U2H (W^T)_IJ)          (three gemms per q: [k x N_zeta] . [N_zeta x block] twice, [r x k] . [k x block]).
+ * numpy lstsq; bosonic_fit_t, built once on the host), unknowns [w(q); w(-q)^T], data [W(q); W(-q)^T]:
+ *   w(q)_IJ = VS (U1H W(q)_IJ + U2H (W(-q)^T)_IJ)   (three gemms per q: [k x N_zeta] . [N_zeta x block] twice, [r x k] . [k x block]).
+ * Mirror data. Self-inverse q: (W(q)^T)_IJ is the block of the Dyson's own W^T (step 3 below), fitted in the Dyson sub-step
+ * as before the fix (bitwise the old path). q != -q: after all Dyson sub-steps of the group (W of every q of the group in the
+ * Pi buffer), a PAIR PASS per sub-step redistributes the block-layout W(-q) rows to the whole-matrix buffer, transposes
+ * them in place and redistributes back: the block of W(-q)^T, then fits q. Same buffers (WT, Tb, D) as the Dyson pass, one
+ * extra pair of redistributions per non-self-inverse q.
  * The explicit pinv blocks A11 = VS U1H, A12 = VS U2H are mathematically the same but numerically unstable (cond ~1e13).
  * The residues themselves are determined only up to the near-threshold singular directions (gesvd here vs gelss in
  * bosonic_basis_t::fit differ by ~1e-5 in w); the pole functions they define agree to ~1e-13 (test [V2](b)).
  *
- * Only w is stored (not w^T). The hole-sector interaction W^<(q,t)_PQ = -sum_j w_j,QP e^{+i nu_j t} needs the mirror
+ * Only w is stored (not w^T). The hole-sector interaction W^<(q,t)_PQ = -sum_j w_j(-q)_QP e^{+i nu_j t} needs the mirror
  * block, so it is consumed (S5) in TRANSPOSED orientation together with the transposed propagator
  * (gtilde_form_t::transposed), exactly as the polarization already does:
- *   Sigma~^<(k,t)^T = -(1/N_k) sum_q G~^<(k-q,t)^T o W^<(q,t)^T,    W^<(q,t)^T = -sum_j w_j(q) e^{+i nu_j t},
+ *   Sigma~^<(k,t)^T = -(1/N_k) sum_q G~^<(k-q,t)^T o W^<(q,t)^T,    W^<(q,t)^T = -sum_j w_j(-q) e^{+i nu_j t},
  * and the orbital contraction of a transposed aux matrix is the transpose of an nb x nb result: with B = Sigma~^T,
  *   Sigma_ab = sum_PQ conj(X_Pa) Sigma~_PQ X_Qb = [X^T B conj(X)]_ba,
  * i.e. S5 contracts B with the plain / conjugated X slices (both mirrored already) and transposes the small nb x nb.
@@ -87,6 +99,7 @@
 #include "utilities/mpi_context.h"
 #include "utilities/proc_grid_partition.hpp"
 #include "utilities/Timer.hpp"
+#include "mean_field/MF.hpp"
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/GW_line/proc_grid.hpp"
 #include "methods/GW_line/device_blas.hpp"
@@ -97,6 +110,18 @@ using numerics::line_dlr::bosonic_basis_t;
 using numerics::line_dlr::sector_t;
 
 // dyson_layout_t (the whole-matrix layout of the Dyson step) and w_plan_t (its S7d sub-steps): proc_grid.hpp
+
+/// -q of every q (mf::MF::qminus: Q_q = G - Q_{qminus[q]}), checked to be an involution (the W pairing, q_groups_t)
+inline std::vector<long> qminus_list(mf::MF const &mf) {
+  auto qm = mf.qminus();
+  const long n = mf.nqpts();
+  utils::check(long(qm.size()) == n, "gw_line: qminus has {} entries for {} q", long(qm.size()), n);
+  std::vector<long> v(n);
+  for (long q = 0; q < n; ++q) v[q] = qm(q);
+  for (long q = 0; q < n; ++q)
+    utils::check(v[q] >= 0 and v[q] < n and v[v[q]] == q, "gw_line: qminus is not an involution at q = {}", q);
+  return v;
+}
 
 /**
  * Coulomb matrices of all q in the block layout (resident in MEM), Z[iq] = Z(q)[P_rng, Q_rng], plus the FULL Z(q) (host)
@@ -110,6 +135,7 @@ struct coulomb_blocks_t {
   long nq = 0, Np = 0;
   memory::array<MEM, ComplexType, 3> Z;     ///< (nq, nP, nQ)
   std::vector<long> q_pos;                   ///< (nq) row of Z_full holding q, or -1
+  std::vector<long> qminus;                  ///< (nq) index of -q (mf::MF::qminus: Q_q = G - Q_qminus[q]); the W pairing
   nda::array<ComplexType, 3> Z_full;         ///< (nq_full, Np, Np) host
 
   coulomb_blocks_t() = default;
@@ -138,6 +164,7 @@ struct coulomb_blocks_t {
     utils::check(thc.Np() == grid.Np, "gw_line::coulomb_blocks_t: grid Np {} != thc Np {}", grid.Np, thc.Np());
     nq = thc.nqpts();
     Np = thc.Np();
+    qminus = qminus_list(*thc.MF());
     q_pos.assign(nq, -1);
     long nfull = 0;
     for (long q : q_list) {
@@ -161,6 +188,7 @@ struct coulomb_blocks_t {
             nfull, double(nfull * Np * Np) * 16.0 / 1073741824.0);
   }
 
+  bool self_inverse(long iq) const { return qminus[iq] == iq; }
   bool has_full(long iq) const { return iq >= 0 and iq < long(q_pos.size()) and q_pos[iq] >= 0; }
   auto full(long iq) const {
     utils::check(has_full(iq), "gw_line::coulomb_blocks_t: full Z(q={}) not kept on this rank", iq);
@@ -269,11 +297,13 @@ void transpose_in_place(Dv_t &Dv, long nbat, scratch_t<MEM> &sM) {
 } // namespace detail
 
 /**
- * W at the bosonic nodes and its residues, for the q group [q0, q0 + g).
- *   Pi      : (g, N_zeta, nP, nQ) block layout in MEM, Pi(q, zeta_i) at zeta_i = basis.zeta_nodes (mu-relative).
+ * W at the bosonic nodes and its residues, for the q group qs (absolute q of the group rows; closed under q -> -q).
+ *   Pi      : (g, N_zeta, nP, nQ) block layout in MEM, row i = Pi(qs[i], zeta) at zeta = basis.zeta_nodes (mu-relative).
  *             CONSUMED: its buffer is reused for the block-layout W(q, zeta_i); on return Pi is empty.
- *   Zb      : Coulomb blocks; must hold the full Z(q) of this rank's Dyson slab (dyson_layout_t(np, rank, g, N_zeta, Np)).
- *   w       : (N_q, r, nP, nQ) residues in MEM; rows q0..q0+g-1 are written (allocated and zeroed if the shape differs).
+ *   Zb      : Coulomb blocks; must hold the full Z(q) of this rank's Dyson slab (dyson_layout_t(np, rank, g, N_zeta, Np)
+ *             over the rows of qs) and qminus.
+ *   w       : (N_q, r, nP, nQ) residues in MEM; rows qs[i] are written (allocated and zeroed if the shape differs).
+ *             w_group (S7e, host-resident residues): w holds only the rows of this group, (g, r, nP, nQ), row i.
  *   W_nodes : optional, receives W(q, zeta_i) blocks (g, N_zeta, nP, nQ) (tests).
  * Collective over mpi.comm.
  */
@@ -281,8 +311,8 @@ template <MEMORY_SPACE MEM>
 void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks_t<MEM> const &Zb,
                           bosonic_basis_t const &basis, aux_grid_t const &grid,
                           utils::mpi_context_t<boost::mpi3::communicator> &mpi, memory::array<MEM, ComplexType, 4> &w,
-                          utils::TimerManager &Timer, memory::array<MEM, ComplexType, 4> *W_nodes = nullptr, long q0 = 0,
-                          bool w_group = false) {
+                          utils::TimerManager &Timer, memory::array<MEM, ComplexType, 4> *W_nodes,
+                          std::vector<long> const &qs, bool w_group) {
   using arr4_t  = memory::array<MEM, ComplexType, 4>;
   using arr2_t  = memory::array<MEM, ComplexType, 2>;
   using arrF_t  = memory::array<MEM, ComplexType, 2, nda::F_layout>;
@@ -299,17 +329,28 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
   utils::check(grid.np == comm.size() and grid.rank == comm.rank(), "gw_line::screened_interaction: grid/communicator mismatch");
   utils::check(Zb.grid.P0 == grid.P0 and Zb.grid.nP == nP and Zb.grid.Q0 == grid.Q0 and Zb.grid.nQ == nQ,
                "gw_line::screened_interaction: Coulomb blocks and grid differ");
-  utils::check(q0 >= 0 and q0 + g <= Zb.nq, "gw_line::screened_interaction: q group [{}, {}) out of [0, {})", q0, q0 + g, Zb.nq);
+  utils::check(long(qs.size()) == g, "gw_line::screened_interaction: {} q in the group, Pi has {} rows", long(qs.size()), g);
+  utils::check(long(Zb.qminus.size()) == Zb.nq, "gw_line::screened_interaction: the Coulomb blocks carry no qminus map");
+  // mirror row of every group row: the group row of -q (the group must be closed under q -> -q)
+  std::vector<long> mrow(g, -1);
+  for (long i = 0; i < g; ++i) {
+    utils::check(qs[i] >= 0 and qs[i] < Zb.nq, "gw_line::screened_interaction: q = {} out of [0, {})", qs[i], Zb.nq);
+    for (long j = 0; j < g; ++j)
+      if (qs[j] == Zb.qminus[qs[i]]) mrow[i] = j;
+    utils::check(mrow[i] >= 0, "gw_line::screened_interaction: the q group does not contain -q = {} of q = {} (the residues of q "
+                               "need W(-q), notes section 3.3: use pair-closed q groups, q_groups_t)",
+                 Zb.qminus[qs[i]], qs[i]);
+  }
   dyson_layout_t lay(comm.size(), comm.rank(), g, nz, Np);
   for (auto nm : {"W_redistribute", "W_dyson", "W_fit"}) Timer.add(nm);
-  if (lay.nq_loc > 0) {
-    utils::check(Zb.has_full(q0 + lay.q_first) and Zb.has_full(q0 + lay.q_first + lay.nq_loc - 1),
+  for (long s = 0; s < lay.nq_loc; ++s)
+    utils::check(Zb.has_full(qs[lay.q_first + s]),
                  "gw_line::screened_interaction: the Coulomb blocks do not hold the full Z of this rank's Dyson q slab");
-  }
 
   // residues: resident (allocated first, so that the stage's high-water includes them as the plan 6.7 model does)
-  // w_group (S7e, host-resident residues): w holds only the rows of this group, (g, r, nP, nQ), row q - q0
-  const long w_rows = w_group ? g : Zb.nq, w_off = w_group ? 0 : q0;
+  // w_group (S7e, host-resident residues): w holds only the rows of this group, (g, r, nP, nQ), row = group row
+  const long w_rows = w_group ? g : Zb.nq;
+  auto w_row        = [&](long ql) { return w_group ? ql : qs[ql]; };
   if (w.extent(0) != w_rows or w.extent(1) != r or w.extent(2) != nP or w.extent(3) != nQ) {
     w = arr4_t(w_rows, r, nP, nQ);
     nda::tensor::set(ComplexType(0.0), w);
@@ -333,6 +374,16 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
   }
   const w_plan_t plan(lay, grid.max_block_size(), nzs_cap);
   plan.log();
+  // q pairing per sub-step (identical on every rank): the self-inverse q of a sub-step are fitted in the Dyson pass from
+  // the Dyson's own W^T (step 3), the others in the pair pass from the transposed W(-q)
+  auto step_has = [&](long s, bool self_inv) {
+    for (long p = 0; p < plan.n_act(s); ++p)
+      if ((mrow[plan.q_row(p, s)] == plan.q_row(p, s)) == self_inv) return true;
+    return false;
+  };
+  long n_pair = 0;
+  for (long i = 0; i < g; ++i) n_pair += (mrow[i] != i) ? 1 : 0;
+  app_log(3, "  gw_line W: {} of {} q of the group are not self-inverse (fitted with the transposed W(-q), pair pass)", n_pair, g);
   // device, several ranks: the redistribute staging buffers (memory::pooled_array, two per call) come from a device pool
   // reserved for this stage, so every call reuses the SAME buffers. Without it each call cudaMallocs fresh ones, and with
   // UCX's cuda_ipc transport (NVLink) the peer's IPC-handle cache keeps the freed buffers mapped: measured +2.8 GB per
@@ -374,12 +425,27 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
             batched ? "batched (cuBLAS getrf/getrsBatched)" : "per matrix (cuSOLVER)", nbat);
   }
 
+  // fit of group row ql (sub-step slot p): w(q) = VS (U1H W(q) + U2H W(-q)^T), W(q) = the Pi row, W(-q)^T = WT(p)
+  auto fit_row = [&](long ql, long p, auto const &WT) {
+    auto W2  = nda::reshape(Pi(ql, all, all, all), std::array<long, 2>{nz, blk});
+    auto WT2 = nda::reshape(WT(p, all, all, all), std::array<long, 2>{nz, blk});
+    auto w2  = nda::reshape(w(w_row(ql), all, all, all), std::array<long, 2>{r, blk});
+    for (long c0 = 0; c0 < blk; c0 += bc) {
+      const auto cr = nda::range(c0, std::min(blk, c0 + bc));
+      auto Yc       = Y(all, nda::range(cr.size()));
+      nda::blas::gemm(ComplexType(1.0), U1H, W2(all, cr), ComplexType(0.0), Yc);
+      nda::blas::gemm(ComplexType(1.0), U2H, WT2(all, cr), ComplexType(1.0), Yc);
+      nda::blas::gemm(ComplexType(1.0), VS, Yc, ComplexType(0.0), w2(all, cr));
+    }
+  };
+
   const std::array<long, 4> bgrid = {1, 1, grid.np_P, grid.np_Q}, ones = {1, 1, 1, 1};
   for (long s = 0; s < plan.nsub_q; ++s) {
-    const long na   = plan.n_act(s);
-    const bool act  = s < lay.nq_loc;                // this rank's q pool solves a q in this sub-step
-    const long iq_a = q0 + lay.q_first + s;          // ... namely this one (absolute)
-    auto WT         = sWT.template view<4>({na, nz, nP, nQ});
+    const long na    = plan.n_act(s);
+    const bool act   = s < lay.nq_loc;                // this rank's q pool solves a q in this sub-step
+    const long iq_a  = qs[lay.q_first + (act ? s : 0)];   // ... namely this one (absolute)
+    const bool wt_now = step_has(s, true);            // the sub-step has self-inverse q: their W^T rows now (step 3)
+    auto WT          = sWT.template view<4>({na, nz, nP, nQ});
     if (act) {
       Timer.start("W_dyson");
       nda::matrix<ComplexType, nda::F_layout> zf_h(Zb.full(iq_a));   // layout change on the host
@@ -445,12 +511,15 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
       }
       Timer.stop("W_dyson");
 
-      // 3. W^T -> block layout -> the WT rows of the sub-step (block (I,J) of W^T = (W_JI)^T, the fit's mirror block)
-      Timer.start("W_redistribute");
-      math::nda::redistribute(dD, dTb);
-      for (long p = 0; p < na; ++p) WT(p, zrng, all, all) = Tb(p, all, all, all);
-      if constexpr (MEM != HOST_MEMORY) utils::device_sync();
-      Timer.stop("W_redistribute");
+      // 3. (sub-steps with self-inverse q) W^T -> block layout -> the WT rows of the sub-step (block (I,J) of W^T =
+      //    (W_JI)^T, the fit's mirror block for q = -q)
+      if (wt_now) {
+        Timer.start("W_redistribute");
+        math::nda::redistribute(dD, dTb);
+        for (long p = 0; p < na; ++p) WT(p, zrng, all, all) = Tb(p, all, all, all);
+        if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+        Timer.stop("W_redistribute");
+      }
 
       // 4. W = (W^T)^T in place, -> block layout -> the Pi rows (Pi's buffer becomes the block-layout W)
       Timer.start("W_dyson");
@@ -467,20 +536,59 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
       Timer.stop("W_redistribute");
     }
 
-    // 5. symmetric fit of the sub-step's q, all pairs at once: w(q) = VS (U1H W(q) + U2H W^T(q))
+    // 5. fit of the sub-step's self-inverse q, all pairs at once: w(q) = VS (U1H W(q) + U2H W^T(q))
+    if (wt_now) {
+      Timer.start("W_fit");
+      for (long p = 0; p < na; ++p) {
+        const long ql = plan.q_row(p, s);
+        if (mrow[ql] == ql) fit_row(ql, p, WT);
+      }
+      if constexpr (MEM != HOST_MEMORY) {
+        utils::device_sync();
+        device_mem_probe();
+      }
+      Timer.stop("W_fit");
+    }
+  }
+
+  // PAIR PASS (q != -q): the W of every q of the group is now in the Pi rows. Per sub-step: the rows of the partners -q
+  // -> whole matrices -> transposed in place -> block layout: the block of W(-q)^T, then the fit of q
+  for (long s = 0; s < plan.nsub_q; ++s) {
+    if (not step_has(s, false)) continue;
+    const long na  = plan.n_act(s);
+    const bool act = s < lay.nq_loc;
+    auto WT        = sWT.template view<4>({na, nz, nP, nQ});
+    for (long za = 0; za < nz; za += plan.nzs) {
+      const long nzs           = std::min(plan.nzs, nz - za);
+      const auto zrng          = nda::range(za, za + nzs);
+      const auto [zf, nzl]     = plan.z_chunk(nzs);
+      const std::array<long, 4> gsh = {na, nzs, Np, Np};
+      Timer.start("W_redistribute");
+      auto Tb = sTb.template view<4>({na, nzs, nP, nQ});
+      for (long p = 0; p < na; ++p) Tb(p, all, all, all) = Pi(mrow[plan.q_row(p, s)], zrng, all, all);
+      dview_t dTb(std::addressof(comm), bgrid, gsh, {0, 0, grid.P0, grid.Q0}, ones, Tb);
+      auto D4 = sD.template view<4>({act ? 1L : 0L, nzl, Np, Np});
+      dview_t dD(std::addressof(comm), lay.pgrid(), gsh, {act ? lay.ip_q : na, zf, 0, 0}, ones, D4);
+      math::nda::redistribute(dTb, dD);
+      if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+      Timer.stop("W_redistribute");
+      Timer.start("W_dyson");
+      if (act and nzl > 0) {
+        auto Dv = D4(0, all, all, all);
+        detail::transpose_in_place<MEM>(Dv, nbat, sM);
+      }
+      if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+      Timer.stop("W_dyson");
+      Timer.start("W_redistribute");
+      math::nda::redistribute(dD, dTb);
+      for (long p = 0; p < na; ++p) WT(p, zrng, all, all) = Tb(p, all, all, all);
+      if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+      Timer.stop("W_redistribute");
+    }
     Timer.start("W_fit");
     for (long p = 0; p < na; ++p) {
       const long ql = plan.q_row(p, s);
-      auto W2       = nda::reshape(Pi(ql, all, all, all), std::array<long, 2>{nz, blk});
-      auto WT2      = nda::reshape(WT(p, all, all, all), std::array<long, 2>{nz, blk});
-      auto w2       = nda::reshape(w(w_off + ql, all, all, all), std::array<long, 2>{r, blk});
-      for (long c0 = 0; c0 < blk; c0 += bc) {
-        const auto cr = nda::range(c0, std::min(blk, c0 + bc));
-        auto Yc       = Y(all, nda::range(cr.size()));
-        nda::blas::gemm(ComplexType(1.0), U1H, W2(all, cr), ComplexType(0.0), Yc);
-        nda::blas::gemm(ComplexType(1.0), U2H, WT2(all, cr), ComplexType(1.0), Yc);
-        nda::blas::gemm(ComplexType(1.0), VS, Yc, ComplexType(0.0), w2(all, cr));
-      }
+      if (mrow[ql] != ql) fit_row(ql, p, WT);
     }
     if constexpr (MEM != HOST_MEMORY) {
       utils::device_sync();
@@ -491,6 +599,18 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
 
   if (W_nodes != nullptr) *W_nodes = std::move(Pi);   // Pi's buffer holds W(q, zeta_i) in the block layout
   Pi = arr4_t{};                                       // consumed
+}
+
+/// The q group [q0, q0 + g) with g = Pi.extent(0) (must be closed under q -> -q; q0 = 0, g = N_q: all q).
+template <MEMORY_SPACE MEM>
+void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks_t<MEM> const &Zb,
+                          bosonic_basis_t const &basis, aux_grid_t const &grid,
+                          utils::mpi_context_t<boost::mpi3::communicator> &mpi, memory::array<MEM, ComplexType, 4> &w,
+                          utils::TimerManager &Timer, memory::array<MEM, ComplexType, 4> *W_nodes = nullptr, long q0 = 0,
+                          bool w_group = false) {
+  std::vector<long> qs(Pi.extent(0));
+  for (long i = 0; i < long(qs.size()); ++i) qs[i] = q0 + i;
+  screened_interaction<MEM>(Pi, Zb, basis, grid, mpi, w, Timer, W_nodes, qs, w_group);
 }
 
 namespace detail {
@@ -530,24 +650,25 @@ inline void check_orientation(sector_t s, bool transposed, char const *who) {
 } // namespace detail
 
 /**
- * Residue exponentials on complex times t (block layout, MEM), out: (nt, nP, nQ):
+ * Residue exponentials on complex times t (block layout, MEM), out: (nt, nP, nQ), for q = iq with -q = iq_minus
+ * (mf::MF::qminus()(iq); rows of w are absolute q):
  *   particle, plain       : W^>(q,t)   =  sum_j w_j(q) e^{-i nu_j t}
- *   hole,     transposed  : W^<(q,t)^T = -sum_j w_j(q) e^{+i nu_j t}     (bosonic_basis_t::time_exponentials(t, hole))
+ *   hole,     transposed  : W^<(q,t)^T = -sum_j w_j(-q) e^{+i nu_j t}    (bosonic_basis_t::time_exponentials(t, hole))
  */
 template <MEMORY_SPACE MEM>
-void w_time(memory::array<MEM, ComplexType, 4> const &w, bosonic_basis_t const &basis, long iq,
+void w_time(memory::array<MEM, ComplexType, 4> const &w, bosonic_basis_t const &basis, long iq, long iq_minus,
             nda::array<ComplexType, 1> const &t, sector_t s, bool transposed, memory::array_view<MEM, ComplexType, 3> out) {
   detail::check_orientation(s, transposed, "w_time");
-  detail::pole_contract<MEM>(w, iq, basis.time_exponentials(t, s), out);
+  detail::pole_contract<MEM>(w, s == sector_t::particle ? iq : iq_minus, basis.time_exponentials(t, s), out);
 }
 
 /**
- * Pole sums at mu-relative zeta (block layout, MEM), out: (nz, nP, nQ):
+ * Pole sums at mu-relative zeta (block layout, MEM), out: (nz, nP, nQ), for q = iq with -q = iq_minus:
  *   particle, plain       : W^>(q,zeta)   =  sum_j w_j(q) / (zeta - nu_j)
- *   hole,     transposed  : W^<(q,zeta)^T = -sum_j w_j(q) / (zeta + nu_j)
+ *   hole,     transposed  : W^<(q,zeta)^T = -sum_j w_j(-q) / (zeta + nu_j)
  */
 template <MEMORY_SPACE MEM>
-void eval_poles(memory::array<MEM, ComplexType, 4> const &w, bosonic_basis_t const &basis, long iq,
+void eval_poles(memory::array<MEM, ComplexType, 4> const &w, bosonic_basis_t const &basis, long iq, long iq_minus,
                 nda::array<ComplexType, 1> const &zeta, sector_t s, bool transposed,
                 memory::array_view<MEM, ComplexType, 3> out) {
   detail::check_orientation(s, transposed, "eval_poles");
@@ -555,7 +676,7 @@ void eval_poles(memory::array<MEM, ComplexType, 4> const &w, bosonic_basis_t con
   if (s == sector_t::particle) detail::pole_contract<MEM>(w, iq, Km, out);
   else {
     Kp *= ComplexType(-1.0);
-    detail::pole_contract<MEM>(w, iq, Kp, out);
+    detail::pole_contract<MEM>(w, iq_minus, Kp, out);
   }
 }
 
@@ -565,11 +686,11 @@ void eval_poles(memory::array<MEM, ComplexType, 4> const &w, bosonic_basis_t con
                                                  bosonic_basis_t const &, aux_grid_t const &,                             \
                                                  utils::mpi_context_t<boost::mpi3::communicator> &,                       \
                                                  memory::array<MEM, ComplexType, 4> &, utils::TimerManager &,             \
-                                                 memory::array<MEM, ComplexType, 4> *, long, bool);                       \
-  extern template void w_time<MEM>(memory::array<MEM, ComplexType, 4> const &, bosonic_basis_t const &, long,             \
+                                                 memory::array<MEM, ComplexType, 4> *, std::vector<long> const &, bool);  \
+  extern template void w_time<MEM>(memory::array<MEM, ComplexType, 4> const &, bosonic_basis_t const &, long, long,       \
                                    nda::array<ComplexType, 1> const &, sector_t, bool,                                    \
                                    memory::array_view<MEM, ComplexType, 3>);                                              \
-  extern template void eval_poles<MEM>(memory::array<MEM, ComplexType, 4> const &, bosonic_basis_t const &, long,         \
+  extern template void eval_poles<MEM>(memory::array<MEM, ComplexType, 4> const &, bosonic_basis_t const &, long, long,   \
                                        nda::array<ComplexType, 1> const &, sector_t, bool,                                \
                                        memory::array_view<MEM, ComplexType, 3>);
 

@@ -29,6 +29,8 @@
  *      CoQui's hf_t("ignore_g0").evaluate(sF, Dm, thc, S = 1, hartree, exchange) on the same thc_reader with the same Dm.
  *      hf_t::evaluate zeroes sF and writes ONLY the two-body part V_H + Sigma_x (no H0; hamilt::set_fock writes the
  *      mean-field V_H + V_xc and is not used here), so the two-body parts are compared: <= 1e-7 Ha max abs.
+ * Fixtures qe_lih222, qe_si211 (q = -q for every q) and qe_lih223 (2x2x3: 8 of 12 q with q != -q, the W pairing of notes
+ * section 3.3; before the fix V3a was 1.6e-1 / 2.1e-1 there).
  * [V3a] Sigma_c(k, zeta) per sector at the dense fermionic nodes dense_nodes(20 deg, 1e-3, 60, 120) vs the EXACT pole sum
  *      from the Casida solution of [V2] (python casida_g0w0.py at T = 0: c_T = -1 particle, +1 hole, mixed terms 0):
  *        Sigma^>_ab(k,z) = +(1/N_k) sum_q sum_{n: e_n(k-q) > 0} sum_{s: lam_s > 0} lam_s A_as conj(A_bs) / (z - e_n(k-q) - lam_s)
@@ -487,3 +489,9 @@ TEST_CASE("gw_line_V0_si211", "[gw_line][V0]") { run_v0("qe_si211"); }
 TEST_CASE("gw_line_V3_lih222", "[gw_line][V3]") { run_v3("qe_lih222", 120, false); }
 
 TEST_CASE("gw_line_V3_si211", "[gw_line][V3]") { run_v3("qe_si211", 120, true); }
+
+// q != -q mesh (2x2x3, 8 of 12 q not self-inverse): the W pairing fix (notes section 3.3); V0 checks the exchange pairing
+// of Z(q) with D~(k-q) on the same mesh
+TEST_CASE("gw_line_V0_lih223", "[gw_line][V0]") { run_v0("qe_lih223"); }
+
+TEST_CASE("gw_line_V3_lih223", "[gw_line][V3]") { run_v3("qe_lih223", 120, false); }

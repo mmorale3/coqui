@@ -22,13 +22,17 @@
 #define COQUI_NUMERICS_LINE_DLR_BOSONIC_BASIS_HPP
 
 /**
- * Odd-symmetric real-pole basis for bosonic functions with B(-nu) = -B(nu)^T (notes section 3.3, Eqs. brep, bfit):
+ * Odd-symmetric real-pole basis for bosonic functions with W(q, -zeta) = W(-q, zeta)^T (notes section 3.3, Eqs. brep, bfit):
  *
- *   W_PQ(zeta) = sum_j [ w_j,PQ / (zeta - nu_j) - w_j,QP / (zeta + nu_j) ],   nu_j > 0.
+ *   W_PQ(q, zeta) = sum_j [ w_j(q)_PQ / (zeta - nu_j) - w_j(-q)_QP / (zeta + nu_j) ],   nu_j > 0,
  *
- * The hole part is tied to the particle part, so the sector split is exact. Poles by pivoted QR of the stacked kernel
- * [K^-; -K^+] on the two upper rays; line nodes (2r) by row-pivoted QR of the odd kernel; the fit solves the coupled
- * (PQ, QP) system for all unordered pairs with ONE gelss factorization.
+ * i.e. the negative-frequency residues of W(q) are the TRANSPOSED positive-frequency residues of W(-q) (Pi and W of the
+ * density fluctuation rho_q: B(q) = A(-q)^T). The hole part is tied to the particle part of the partner -q, so the sector
+ * split is exact. For a self-inverse q (q = -q mod G) this is the per-q form w_j(q)_QP; for q != -q it is NOT (the per-q
+ * form was the bug of 2026-10-04, Si 4x4x4). fit(zeta, W) / eval(w, zeta) are the self-inverse forms; fit(zeta, W, Wm) /
+ * eval(w, wm, zeta) the paired forms (Wm = W(-q) at the same nodes, wm = w(-q)).
+ * Poles by pivoted QR of the stacked kernel [K^-; -K^+] on the two upper rays; line nodes (2r) by row-pivoted QR of the
+ * odd kernel; the fit solves the coupled (PQ, QP) system for all pairs with ONE gelss factorization.
  * Transcription of coqui/cayley/cayley/line/line_dlr.py::BosonicLineBasis.
  */
 
@@ -106,7 +110,8 @@ struct bosonic_basis_t {
   }
 
   /**
-   * Residues w[r, N, N] of the positive poles from samples W[nz, N, N] at mu-relative zeta (Eq. bfit):
+   * Self-inverse q only (W(-q) = W(q)). Residues w[r, N, N] of the positive poles from samples W[nz, N, N] at mu-relative
+   * zeta (Eq. bfit):
    *   [[Km, -Kp], [-Kp, Km]] [w_PQ; w_QP] = [W_PQ(zeta); W_QP(zeta)]   for all P <= Q (row-major upper triangle),
    * one gelss with all pairs as right-hand sides, rcond = DBL_EPSILON max(2 nz, 2 r).
    */
@@ -147,7 +152,56 @@ struct bosonic_basis_t {
     return w;
   }
 
-  /// W(zeta)[nz, N, N]; sector particle: Km w only; hole: -Kp w^T only (transpose on (P, Q)); both: the sum.
+  /**
+   * Paired fit (q != -q): residues w(q) [r, N, N] from W(q) and Wm = W(-q) at the same nodes (Eq. bfit with the partner):
+   *   [[Km, -Kp], [-Kp, Km]] [w(q)_PQ; w(-q)_QP] = [W(q)_PQ(zeta); W(-q)_QP(zeta)]   for all ordered (P, Q),
+   * one gelss with all N^2 right-hand sides. With Wm = W this is the self-inverse fit above (up to the non-unique
+   * near-threshold directions of the residues).
+   */
+  nda::array<ComplexType, 3> fit(nda::array<ComplexType, 1> const &zeta, nda::array<ComplexType, 3> const &W,
+                                 nda::array<ComplexType, 3> const &Wm, double rcond = -1.0) const {
+    const long nz = W.extent(0), N = W.extent(1);
+    utils::check(nz == zeta.size() and W.extent(2) == N, "bosonic_basis_t::fit: W shape mismatch");
+    utils::check(Wm.extent(0) == nz and Wm.extent(1) == N and Wm.extent(2) == N, "bosonic_basis_t::fit: W(-q) shape mismatch");
+    auto [Km, Kp] = kernels(zeta);
+    const long r = rank;
+    nda::array<ComplexType, 2> A(2 * nz, 2 * r);
+    for (long i = 0; i < nz; ++i)
+      for (long j = 0; j < r; ++j) {
+        A(i, j)          = Km(i, j);
+        A(i, r + j)      = -Kp(i, j);
+        A(nz + i, j)     = -Kp(i, j);
+        A(nz + i, r + j) = Km(i, j);
+      }
+    nda::array<ComplexType, 2> data(2 * nz, N * N);
+    for (long i = 0; i < nz; ++i)
+      for (long P = 0; P < N; ++P)
+        for (long Q = 0; Q < N; ++Q) {
+          data(i, P * N + Q)      = W(i, P, Q);
+          data(nz + i, P * N + Q) = Wm(i, Q, P);
+        }
+    auto sol = detail::lstsq(A, data, rcond);   // (2r, N^2)
+    nda::array<ComplexType, 3> w(r, N, N);
+    for (long j = 0; j < r; ++j)
+      for (long P = 0; P < N; ++P)
+        for (long Q = 0; Q < N; ++Q) w(j, P, Q) = sol(j, P * N + Q);
+    return w;
+  }
+
+  /// Paired evaluation W(q, zeta)[nz, N, N] = Km w(q) - Kp w(-q)^T (sector particle: the first term, hole: the second).
+  nda::array<ComplexType, 3> eval(nda::array<ComplexType, 3> const &w, nda::array<ComplexType, 3> const &wm,
+                                  nda::array<ComplexType, 1> const &zeta, sector_t sector = sector_t::both) const {
+    utils::check(wm.extent(0) == w.extent(0) and wm.extent(1) == w.extent(1) and wm.extent(2) == w.extent(2),
+                 "bosonic_basis_t::eval: w(-q) shape mismatch");
+    nda::array<ComplexType, 3> out(zeta.size(), w.extent(1), w.extent(2));
+    out() = ComplexType(0.0);
+    if (sector != sector_t::hole) out += eval(w, zeta, sector_t::particle);
+    if (sector != sector_t::particle) out += eval(wm, zeta, sector_t::hole);
+    return out;
+  }
+
+  /// W(zeta)[nz, N, N] for a self-inverse q (w(-q) = w(q)); sector particle: Km w only; hole: -Kp w^T only (transpose on
+  /// (P, Q)); both: the sum. For q != -q use eval(w(q), w(-q), zeta).
   nda::array<ComplexType, 3> eval(nda::array<ComplexType, 3> const &w, nda::array<ComplexType, 1> const &zeta,
                                   sector_t sector = sector_t::both) const {
     const long r = w.extent(0), N = w.extent(1), nz = zeta.size();
@@ -169,7 +223,8 @@ struct bosonic_basis_t {
     return nda::array<ComplexType, 3>(nda::reshape(out, std::array<long, 3>{nz, N, N}));
   }
 
-  /// [nt, r]: e^{-i nu_j t} (particle, W^>(t) = sum_j w_j e^{-i nu_j t}) or -e^{+i nu_j t} (hole, W^<(t) = sum_j w_j^T (.)).
+  /// [nt, r]: e^{-i nu_j t} (particle, W^>(q,t) = sum_j w_j(q) e^{-i nu_j t}) or -e^{+i nu_j t} (hole,
+  /// W^<(q,t) = sum_j w_j(-q)^T (.): the residues of the partner -q).
   nda::array<ComplexType, 2> time_exponentials(nda::array<ComplexType, 1> const &t, sector_t sector) const {
     utils::check(sector != sector_t::both, "bosonic_basis_t::time_exponentials: sector must be particle or hole");
     const long nt = t.size();
