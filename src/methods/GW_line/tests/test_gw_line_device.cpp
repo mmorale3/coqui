@@ -82,6 +82,7 @@
 #include "methods/GW_line/screened.hpp"
 #include "methods/GW_line/self_energy.hpp"
 #include "methods/GW_line/static_part.hpp"
+#include "methods/GW_line/head.hpp"
 #include "methods/GW_line/device_blas.hpp"
 
 namespace {
@@ -281,6 +282,17 @@ void run_device_ab(std::string const &fixture) {
     nda::array<ComplexType, 4> Wn_dh = memory::to_memory_space<HOST_MEMORY>(Wn_d);
     err["W(q,zeta_i) nodes"] = rel_diff(comm, Wn_h, Wn_dh);
   }
+  // S9a: head h(q, zeta_i) = eps^-1_00 - 1 at the nodes from the block-layout W (head.hpp), device vs host
+  head_basis_t hbas(thc, mf, grid);
+  std::vector<long> q_all(nq);
+  for (long q = 0; q < nq; ++q) q_all[q] = q;
+  {
+    nda::array<ComplexType, 2> Hh, Hd;
+    head_nodes_partial<HOST_MEMORY>(Wn_h, q_all, hbas, Hh);
+    head_nodes_partial<DEVICE_MEMORY>(Wn_d, q_all, hbas, Hd);
+    head_reduce(comm, {&Hh, &Hd});
+    err["head h(q,zeta_i) nodes"] = rel_diff(comm, Hh, Hd);
+  }
   Wn_d = memory::array<DEVICE_MEMORY, ComplexType, 4>{};
   {   // S7d: forced (uneven) zeta sub-slabs of the W stage, device and host, vs the default host W
     scoped_env_t env({{"COQUI_GWLINE_W_ZSUB", "37"}});
@@ -326,6 +338,14 @@ void run_device_ab(std::string const &fixture) {
 
   // ---- w_time on the SAME residues
   memory::array<DEVICE_MEMORY, ComplexType, 4> w_hd = memory::to_memory_space<DEVICE_MEMORY>(w_h);
+  {   // S9a: scalar head residues (particle and hole, q <-> -q pairing) on the SAME residues, device vs host
+    nda::array<ComplexType, 2> hph, hhh, hpd, hhd;
+    head_residues_partial<HOST_MEMORY>(w_h, q_all, hbas, hph, hhh);
+    head_residues_partial<DEVICE_MEMORY>(w_hd, q_all, hbas, hpd, hhd);
+    head_reduce(comm, {&hph, &hhh, &hpd, &hhd});
+    err["head residues hp"] = rel_diff(comm, hph, hpd);
+    err["head residues hh"] = rel_diff(comm, hhh, hhd);
+  }
   {
     double d = 0.0, m = 0.0;
     for (auto const *ray : {&ray_p, &ray_h}) {
