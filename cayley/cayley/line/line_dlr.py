@@ -54,10 +54,15 @@ class LineBasis:
 
 
 class BosonicLineBasis:
-    """Odd-symmetric real-pole basis for bosonic functions W with B(-nu) = -B(nu)^T, i.e.
-         W_PQ(zeta) = sum_j [ w_j,PQ/(zeta - nu_j) - w_j,QP/(zeta + nu_j) ],   nu_j > 0.
-    The hole part is tied to the particle part (no sector-split ambiguity). Poles nu_j > 0 selected by pivoted QR of the
-    stacked kernel [K-, -K+] on the two upper rays; the fit solves the coupled (PQ, QP) pair system for all pairs at once."""
+    """Odd-symmetric real-pole basis for bosonic functions with W(q, -zeta) = W(-q, zeta)^T, i.e.
+         W_PQ(q, zeta) = sum_j [ w_j(q)_PQ/(zeta - nu_j) - w_j(-q)_QP/(zeta + nu_j) ],   nu_j > 0
+    (notes section 3.3, Eqs. brep/bfit as corrected 2026-10-04): the negative-frequency residues of W(q) are the TRANSPOSED
+    positive-frequency residues of W(-q) (B(q) = A(-q)^T for the density propagator of rho_q).
+    NOTE: the per-q form w_j(q)_QP (fit(zeta, W) / eval(w, zeta) without the *_minus arguments) is valid ONLY for a
+    self-inverse q (q = -q mod G, e.g. every q of a 2x2x2 mesh); for q != -q pass the data / residues of -q
+    (W_minus, w_minus). The C++ code (screened.hpp) pairs q with -q (mf.qminus()).
+    Poles nu_j > 0 selected by pivoted QR of the stacked kernel [K-, -K+] on the two upper rays; the fit solves the coupled
+    (PQ, QP) pair system for all pairs at once."""
     def __init__(self, theta, lam, eps=1e-8, gap=0.0, tmin=None, tmax=None, nline=1200, npole=800):
         self.theta, self.lam, self.eps, self.gap = theta, lam, eps, gap
         tmin = 1e-4 * lam if tmin is None else tmin; tmax = 20 * lam if tmax is None else tmax
@@ -78,10 +83,15 @@ class BosonicLineBasis:
         z = np.asarray(zeta, complex)[:, None]
         return 1.0 / (z - self.nu[None, :]), 1.0 / (z + self.nu[None, :])
 
-    def fit(self, zeta, W, rcond=None):
-        """W (nz, N, N) at mu-relative points zeta -> residues w (r, N, N) of the positive poles."""
+    def fit(self, zeta, W, rcond=None, W_minus=None):
+        """W (nz, N, N) at mu-relative points zeta -> residues w (r, N, N) of the positive poles.
+        W_minus: W(-q) at the same points (q != -q: unknowns [w(q)_PQ; w(-q)_QP], data [W(q)_PQ; W(-q)_QP] for all ordered
+        pairs); None = self-inverse q (W(-q) = W(q))."""
         Km, Kp = self.kernels(zeta); nz, N = W.shape[0], W.shape[1]
         A = np.block([[Km, -Kp], [-Kp, Km]])                              # unknowns [w_PQ ; w_QP] per pair, data [W_PQ ; W_QP]
+        if W_minus is not None:
+            data = np.concatenate([W.reshape(nz, -1), np.transpose(W_minus, (0, 2, 1)).reshape(nz, -1)], axis=0)
+            return np.linalg.lstsq(A, data, rcond=rcond)[0][:self.r].reshape(self.r, N, N)
         iu = np.triu_indices(N)
         data = np.concatenate([W[:, iu[0], iu[1]], W[:, iu[1], iu[0]]], axis=0)   # (2 nz, npairs)
         sol = np.linalg.lstsq(A, data, rcond=rcond)[0]                       # (2 r, npairs)
@@ -89,17 +99,20 @@ class BosonicLineBasis:
         w[:, iu[0], iu[1]] = sol[:self.r]; w[:, iu[1], iu[0]] = sol[self.r:]
         return w
 
-    def eval(self, w, zeta, sector=None):
-        """W(zeta) (nz, N, N); sector '>' = positive-pole part only, '<' = negative-pole part only, None = both."""
+    def eval(self, w, zeta, sector=None, w_minus=None):
+        """W(zeta) (nz, N, N); sector '>' = positive-pole part only, '<' = negative-pole part only, None = both.
+        w_minus: residues of -q (the hole part is -Kp w(-q)^T); None = self-inverse q."""
         Km, Kp = self.kernels(zeta); r = w.shape[0]
-        wp = w.reshape(r, -1); wt = np.transpose(w, (0, 2, 1)).reshape(r, -1)
+        wm = w if w_minus is None else w_minus
+        wp = w.reshape(r, -1); wt = np.transpose(wm, (0, 2, 1)).reshape(r, -1)
         out = 0
         if sector in (None, '>'): out = out + Km @ wp
         if sector in (None, '<'): out = out - Kp @ wt
         return out.reshape((len(zeta),) + w.shape[1:])
 
     def time_exponentials(self, t, sector='>'):
-        """Residue-weighted exponentials for the time ray: W^>(t) = sum_j w_j e^{-i nu_j t};  W^<(t) = -sum_j w_j^T e^{+i nu_j t}."""
+        """Residue-weighted exponentials for the time ray: W^>(q,t) = sum_j w_j(q) e^{-i nu_j t};
+        W^<(q,t) = -sum_j w_j(-q)^T e^{+i nu_j t} (the residues of -q; = w_j(q)^T only for a self-inverse q)."""
         t = np.asarray(t, complex)
         return np.exp(-1j * self.nu[None, :] * t[:, None]) if sector == '>' else -np.exp(1j * self.nu[None, :] * t[:, None])
 
