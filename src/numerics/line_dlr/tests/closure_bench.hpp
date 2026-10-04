@@ -29,7 +29,8 @@
  * (24), CAYLEY_BENCH_VARIANTS (list of "<ueig>/<svd>[/dev]", ueig in {schur, cayley}, svd in {gesvd, gesdd, gesvdp};
  * "/dev" = the device hooks, gesvdp only there). Accuracy columns are relative to the FIRST variant at the same thread
  * count (default the python path schur/gesvd): max |dSigma| / max |Sigma| and max |dG| / max |G| (Lehmann G with a random
- * Hermitian H) at 40 points z = x + i y, x in [-1, 1], y in [0.005, 0.1] Ha.
+ * Hermitian H) at 40 points z = x + i y, x in [-1, 1], y in [0.005, 0.1] Ha. CAYLEY_BENCH_KCONC = m > 1: also m copies of
+ * each closure on m concurrent threads with threads / m BLAS threads each (wall and wall / m per k; MKL only).
  */
 
 #include <chrono>
@@ -40,7 +41,9 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+#include <dlfcn.h>
 
 #include "catch2/catch.hpp"
 #include "nda/nda.hpp"
@@ -162,6 +165,25 @@ inline void run(ldlr::lapack_hooks_t const *hooks_svd, ldlr::lapack_hooks_t cons
       CHECK(up.ueig_fallback == 0);
       CHECK(dS < 1e-9);
       CHECK(dG < 1e-9);
+      // concurrent k (closure_k_workers): nkc copies of this closure on nkc std::threads with nt / nkc BLAS threads each
+      const long nkc = env_l("CAYLEY_BENCH_KCONC", 0);
+      if (nkc > 1) {
+        const int bt = int(std::max(1L, nt / nkc));
+        auto tw0     = std::chrono::steady_clock::now();
+        std::vector<std::thread> th;
+        for (long w = 0; w < nkc; ++w)
+          th.emplace_back([&]() {
+            using set_local_t = int (*)(int);
+            if (auto f = reinterpret_cast<set_local_t>(dlsym(RTLD_DEFAULT, "MKL_Set_Num_Threads_Local"))) f(bt);
+            auto u2 = ldlr::upfold_block(C, K, wp, o);
+            auto L2 = ldlr::lehmann(H, u2.d, u2.W, o.hooks);
+          });
+        for (auto &t : th) t.join();
+        const double tw = std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
+        std::cout << std::fixed << std::setprecision(3) << "[closure_bench] " << std::setw(3) << nt << " " << std::setw(17) << v
+                  << " | " << nkc << " concurrent k x " << bt << " BLAS threads: wall " << tw << " s, " << tw / double(nkc)
+                  << " s per k" << std::scientific << std::endl;
+      }
     }
   }
   utils::apply_blas_threads(1);

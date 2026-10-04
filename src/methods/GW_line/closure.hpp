@@ -51,7 +51,11 @@
  */
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <exception>
+#include <thread>
 #include <cmath>
 #include <numeric>
 #include <random>
@@ -118,6 +122,7 @@ struct closure_params_t {
   std::vector<double> force_phi;
   // S7g performance: BLAS threads inside the per-k closure (<= 0: untouched) and the linear-algebra drivers
   long blas_threads      = 0;
+  long k_workers         = 1;         ///< concurrent host threads over the rank's k (each with blas_threads / k_workers)
   std::string svd_driver = "gesvd";   ///< numerics::line_dlr::upfold_opts_t::svd_driver
   std::string ueig       = "schur";   ///< numerics::line_dlr::upfold_opts_t::ueig
   numerics::line_dlr::lapack_hooks_t const *hooks = nullptr;   ///< external (device) eigensolvers; null: host LAPACK
@@ -388,38 +393,70 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   Timer.start("closure_upfold");
   using clk = std::chrono::steady_clock;
   double prof[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // fit, moments, C0, Gram, SVD, U eigen, Lehmann, U-eigen fallbacks
-  blas_threads_scope_t blas_scope(p.blas_threads);
   std::vector<nda::array<double, 1>> e_loc(nk);
   std::vector<nda::array<ComplexType, 2>> v_loc(nk);
   const long ni = 2 + upfold_diag_t::nfields;
   nda::array<double, 2> info(nk, ni);   // (npoles, heldout, diag)
   info() = 0.0;
-  for (long ik = rank; ik < nk; ik += np) {
+  auto do_k = [&](long ik, double *pr) {   // writes only the slots of ik
     const long ks = sig_loc ? ik / np : ik;
     const auto tf0 = clk::now();
     nda::array<ComplexType, 3> Sp(Sig_p(ks, all, all, all)), Sh(Sig_h(ks, all, all, all));
     auto sp = fit_sigma_sectors(bp, bh, zeta, Sp, Sh);
-    prof[0] += std::chrono::duration<double>(clk::now() - tf0).count();
+    pr[0] += std::chrono::duration<double>(clk::now() - tf0).count();
     nda::array<ComplexType, 2> H(Hrel(ik, all, all));
     auto ck   = closure_k(H, sp, p, ik);
-    prof[1] += ck.t_mom; prof[2] += ck.t_c0; prof[3] += ck.t_gram; prof[4] += ck.t_svd; prof[5] += ck.t_ueig;
-    prof[6] += ck.t_leh; prof[7] += double(ck.ueig_fallback);
+    pr[1] += ck.t_mom; pr[2] += ck.t_c0; pr[3] += ck.t_gram; pr[4] += ck.t_svd; pr[5] += ck.t_ueig;
+    pr[6] += ck.t_leh; pr[7] += double(ck.ueig_fallback);
     e_loc[ik] = std::move(ck.e);
     v_loc[ik] = std::move(ck.v);
     info(ik, 0) = double(ck.d.size());
     info(ik, 1) = ck.heldout;
     ck.diag.pack(&info(ik, 2));
+  };
+  // S7g: the owned k on nw concurrent host threads (k_workers), each with blas_threads / nw BLAS threads; every k is
+  // processed by the same code whatever the worker (results depend only on the BLAS thread count, as for nw = 1)
+  const long nown = rank < nk ? (nk - 1 - rank) / np + 1 : 0;
+  const long nw   = std::max(1L, std::min(p.k_workers, nown));
+  const long bt   = (nw == 1) ? p.blas_threads : (p.blas_threads > 0 ? std::max(1L, p.blas_threads / nw) : 1L);
+  std::string blas_backend;
+  if (nw == 1) {
+    blas_threads_scope_t blas_scope(bt);
+    blas_backend = blas_scope.backend();
+    for (long ik = rank; ik < nk; ik += np) do_k(ik, prof);
+  } else {
+    std::atomic<long> next{0};
+    std::vector<std::array<double, 8>> pw(nw);
+    std::vector<std::exception_ptr> err(nw);
+    std::vector<std::string> be(nw);
+    auto worker = [&](long w) {
+      try {
+        pw[w].fill(0.0);
+        blas_threads_scope_t sc(bt);
+        be[w] = sc.backend();
+        for (long j = next++; j < nown; j = next++) do_k(rank + j * np, pw[w].data());
+      } catch (...) { err[w] = std::current_exception(); }
+    };
+    std::vector<std::thread> th;
+    for (long w = 1; w < nw; ++w) th.emplace_back(worker, w);
+    worker(0);
+    for (auto &t : th) t.join();
+    for (auto &e : err)
+      if (e) std::rethrow_exception(e);
+    for (auto const &x : pw)
+      for (int i = 0; i < 8; ++i) prof[i] += x[i];
+    blas_backend = be[0];
   }
   Timer.stop("closure_upfold");
   {   // S7g: per-step profile of the closure (max over ranks of the per-rank sums over the owned k)
     double pmax[8];
     std::copy_n(prof, 8, pmax);
     if (comm.size() > 1) comm.all_reduce_n(prof, 8, pmax, boost::mpi3::max<>{});
-    app_log(2, "          closure profile (s, max over ranks): fit {:.2f} moments {:.2f} C0 {:.2f} Gram {:.2f} SVD {:.2f} U-eigen "
+    app_log(2, "          closure profile (s, max over ranks of the sums over the rank's k): fit {:.2f} moments {:.2f} C0 {:.2f} Gram {:.2f} SVD {:.2f} U-eigen "
                "{:.2f} Lehmann {:.2f} | BLAS threads {} ({}), drivers {} / {}{}, U-eigen Schur fallbacks {}, device fallbacks "
-               "(rank 0, cumulative) {}",
-            pmax[0], pmax[1], pmax[2], pmax[3], pmax[4], pmax[5], pmax[6], p.blas_threads > 0 ? p.blas_threads : 0,
-            blas_scope.backend(), p.svd_driver, p.ueig, p.hooks ? " + GPU" : "", long(pmax[7]), device_lapack_failures());
+               "(rank 0, cumulative) {}; k workers {}",
+            pmax[0], pmax[1], pmax[2], pmax[3], pmax[4], pmax[5], pmax[6], bt > 0 ? bt : 0, blas_backend, p.svd_driver, p.ueig,
+            p.hooks ? " + GPU" : "", long(pmax[7]), device_lapack_failures(), nw);
   }
 
   Timer.start("closure_gather");

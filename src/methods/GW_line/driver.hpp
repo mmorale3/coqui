@@ -62,6 +62,8 @@
  *                       ranks fill the cores; 0 = untouched; n > 0 = n), SVD driver of D+ D-^dagger ("gesdd" = divide and
  *                       conquer), eigenvectors of the unitary U ("cayley" = Hermitian eigenproblem of i (U-1)^{-1} (U+1)
  *                       with Rayleigh-Ritz refinement and a Schur fallback; cayley.hpp unitary_eig_cayley)
+ *   closure_k_workers = 1   S7g: the rank's k processed by this many concurrent host threads (std::thread; each with
+ *                       closure_threads / closure_k_workers BLAS threads; no MPI inside)
  *   closure_device = "off", closure_dev_svd = "gesvd"
  *                       S7g: the Gram / Cayley / Lehmann Hermitian eigenproblems, the LU solve of the "cayley" path and the
  *                       SVD on the GPU (cuSOLVER, cuda/gw_line_lapack.cu; CUDA builds; "auto" = in device runs), each call
@@ -139,6 +141,7 @@ struct gw_line_params_t {
   std::string closure_svd_cut = "hard";  ///< S7f: SVD cut "hard" | "gap"
   double closure_cut_window = 10.0;      ///< S7f: window factor of the gap / smooth cuts
   double phase_keep = 0.0;               ///< S7f: > 0 = phase continuity (keep the previous phi* basin within this factor)
+  long closure_k_workers = 1;            ///< S7g: concurrent host threads over the rank's k in the closure (BLAS threads split)
   long closure_threads = -1;             ///< S7g: BLAS threads of the host closure (-1 auto: device runs the rank's cores, host runs untouched; 0 untouched)
   std::string closure_svd  = "gesvd";    ///< S7g: SVD driver of the upfolding "gesvd" | "gesdd"
   std::string closure_ueig = "schur";    ///< S7g: eigenvectors of U "schur" (zgees) | "cayley" (Hermitian Cayley image)

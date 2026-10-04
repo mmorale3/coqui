@@ -111,6 +111,7 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.closure_cut_window = io::get_value_with_default<double>(pt, "closure_cut_window", p.closure_cut_window);
   p.phase_keep    = io::get_value_with_default<double>(pt, "phase_keep", p.phase_keep);
   p.closure_threads = io::get_value_with_default<long>(pt, "closure_threads", p.closure_threads);
+  p.closure_k_workers = io::get_value_with_default<long>(pt, "closure_k_workers", p.closure_k_workers);
   p.closure_svd   = io::get_value_with_default<std::string>(pt, "closure_svd", p.closure_svd);
   io::tolower(p.closure_svd);
   p.closure_ueig  = io::get_value_with_default<std::string>(pt, "closure_ueig", p.closure_ueig);
@@ -185,6 +186,7 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
                p.closure_svd);
   utils::check(p.closure_ueig == "schur" or p.closure_ueig == "cayley",
                "gw_line: closure_ueig must be \"schur\" or \"cayley\" (got \"{}\")", p.closure_ueig);
+  utils::check(p.closure_k_workers >= 1, "gw_line: closure_k_workers must be >= 1");
   utils::check(p.closure_device == "auto" or p.closure_device == "on" or p.closure_device == "off",
                "gw_line: closure_device must be \"auto\", \"on\" or \"off\" (got \"{}\")", p.closure_device);
   utils::check(p.closure_dev_svd == "gesvd" or p.closure_dev_svd == "gesvdp",
@@ -217,8 +219,9 @@ void gw_line_params_t::log() const {
              "cuts {} / {} (window {}), phase continuity {}",
           wp, K, tol_gram, std::max(tol_gram, tol_gram_eps * eps), tol_gram_eps, nphi, tol_svd, closure_cut, closure_svd_cut, closure_cut_window,
           phase_keep > 0.0 ? "on (x " + std::to_string(phase_keep) + ")" : std::string("off"));
-  app_log(1, "    closure linear algebra: SVD {}, U eigenvectors {}, BLAS threads {}, device {} (SVD {})", closure_svd, closure_ueig,
-          closure_threads < 0 ? std::string("auto") : std::to_string(closure_threads), closure_device, closure_dev_svd);
+  app_log(1, "    closure linear algebra: SVD {}, U eigenvectors {}, BLAS threads {}, k workers {}, device {} (SVD {})", closure_svd,
+          closure_ueig, closure_threads < 0 ? std::string("auto") : std::to_string(closure_threads), closure_k_workers,
+          closure_device, closure_dev_svd);
   if (debug_noise_h0 > 0.0)
     app_log(1, "    DIAGNOSTIC: relative noise {:.1e} on H0 (seed {})", debug_noise_h0, debug_noise_seed);
   if (debug_noise_sigma > 0.0)
@@ -499,6 +502,7 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "closure_svd", p.closure_svd);
   h5::h5_write(ig, "closure_ueig", p.closure_ueig);
   h5::h5_write(ig, "closure_device", p.closure_device);
+  h5::h5_write(ig, "closure_k_workers", p.closure_k_workers);
   h5::h5_write(ig, "closure_dev_svd", p.closure_dev_svd);
   h5::h5_write(ig, "mixing", p.mixing);
   h5::h5_write(ig, "conv_thr", p.conv_thr);
@@ -958,6 +962,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   cprm.phase_keep = prm.phase_keep;
   cprm.svd_driver = prm.closure_svd;
   cprm.ueig       = prm.closure_ueig;
+  cprm.k_workers  = prm.closure_k_workers;
   // S7g: BLAS threads of the host closure. Device runs have one rank per GPU and idle cores; host runs fill the cores
   cprm.blas_threads = prm.closure_threads >= 0 ? prm.closure_threads
                                                : (MEM != HOST_MEMORY ? cores_per_rank(long(mpi.node_comm.size())) : 0);

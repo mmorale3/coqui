@@ -296,6 +296,55 @@ void closure_toy(long npk) {
     app_log(1, "  {} ranks vs 1 rank: max |diff| {:.1e}", comm.size(), d);
     REQUIRE(d <= 1e-12);
   }
+
+  // S7g: concurrent k workers (single-rank communicator: this rank owns every k) give the same closure; the fast drivers
+  // (gesdd SVD, Hermitian U-eigen) agree with the python path to roundoff-level effects
+  {
+    auto self = comm.split(comm.rank(), 0);
+    auto diff = [&](closure_out_t const &a) {
+      double d = std::abs(a.dmu - out.dmu);
+      for (long ik = 0; ik < nk; ++ik) {
+        REQUIRE(a.leh.e[ik].size() == out.leh.e[ik].size());
+        d = std::max(d, nda::max_element(nda::abs(a.leh.e[ik] - out.leh.e[ik])));
+        d = std::max(d, nda::max_element(nda::abs(a.poles.part[ik].coef - out.poles.part[ik].coef)));
+        d = std::max(d, nda::max_element(nda::abs(a.poles.hole[ik].coef - out.poles.hole[ik].coef)));
+      }
+      return d;
+    };
+    utils::TimerManager T3;
+    closure_params_t pw = p;
+    pw.k_workers        = 2;
+    const double dw     = diff(closure(self, H, Sp, Sh, zeta, bp, bh, gp, gh, pw, nelec, T3));
+    closure_params_t pf = p;
+    pf.svd_driver       = "gesdd";
+    pf.ueig             = "cayley";
+    auto of             = closure(self, H, Sp, Sh, zeta, bp, bh, gp, gh, pf, nelec, T3);
+    // Lehmann G on the imaginary axis (relative), dmu, QP edges: the closure amplifies roundoff ~1e5 x at these settings
+    double dG = 0.0, gm = 0.0;
+    for (long iw = 0; iw < 60; ++iw) {
+      const ComplexType z(0.0, 1e-2 * std::pow(10.0, 3.0 * iw / 59.0));
+      for (long ik = 0; ik < nk; ++ik) {
+        nda::matrix<ComplexType> G0(nb, nb), G1(nb, nb);
+        G0() = ComplexType(0.0);
+        G1() = ComplexType(0.0);
+        for (long m = 0; m < out.leh.e[ik].size(); ++m)
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) G0(i, j) += out.leh.v[ik](i, m) * std::conj(out.leh.v[ik](j, m)) / (z - out.leh.e[ik](m));
+        for (long m = 0; m < of.leh.e[ik].size(); ++m)
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) G1(i, j) += of.leh.v[ik](i, m) * std::conj(of.leh.v[ik](j, m)) / (z - of.leh.e[ik](m));
+        dG = std::max(dG, nda::max_element(nda::abs(G1 - G0)));
+        gm = std::max(gm, nda::max_element(nda::abs(G0)));
+      }
+    }
+    const double dmu = std::abs(of.dmu - out.dmu), dedge = std::max(std::abs(of.e_homo - out.e_homo), std::abs(of.e_lumo - out.e_lumo));
+    app_log(1, "  S7g: k_workers 2 vs 1: max |diff| {:.1e}; gesdd + cayley vs gesvd + schur: G(i w) {:.1e} (rel), dmu {:.1e}, "
+               "QP edges {:.1e} Ha (the refit coefficients are ill-conditioned and not compared)", dw, dG / gm, dmu, dedge);
+    REQUIRE(dw <= 1e-12);
+    REQUIRE(dG / gm <= 1e-8);
+    REQUIRE(dmu <= 1e-8);
+    REQUIRE(dedge <= 1e-8);
+  }
 }
 } // namespace
 
