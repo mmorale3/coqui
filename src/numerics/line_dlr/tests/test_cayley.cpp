@@ -392,6 +392,26 @@ TEST_CASE("cayley_ueig_ab", "[numerics][cayley]") {
   CHECK(closure_bench::ab_small(nullptr, "gesdd") <= 1e-11);
   // n_free > 0 (terminal-phase scan): the fast SVD driver hands over to zgesvd (driver-dependent free block)
   CHECK(closure_bench::ab_small(nullptr, "gesdd", 160) <= 1e-9);
+  closure_bench::hooks_accuracy(nullptr, 120);
+  // sensitivity yardstick: the same host zheevd on the index-REVERSED matrix (a different, equally valid roundoff of the
+  // Gram / Lehmann eigenvectors) -- the end-to-end difference of the device hooks should be of this size
+  ldlr::lapack_hooks_t rev;
+  rev.heevd = [](ldlr::cmatrix_F &A, nda::array<double, 1> &w) {
+    const long n = A.extent(0);
+    ldlr::cmatrix_F B(n, n);   // zheevd reads the lower triangle: B = reversed Hermitian completion of A's lower triangle
+    for (long j = 0; j < n; ++j)
+      for (long i = 0; i < n; ++i) {
+        const long a = n - 1 - i, b = n - 1 - j;
+        B(i, j)      = (a >= b) ? A(a, b) : std::conj(A(b, a));
+      }
+    w = ldlr::detail::herm_eig(B);
+    for (long j = 0; j < n; ++j)
+      for (long i = 0; i < n; ++i) A(i, j) = B(n - 1 - i, j);
+    return true;
+  };
+  const double d_rev = closure_bench::ab_small(&rev, "gesvd");
+  std::cout << "[closure_ab] index-reversed host zheevd (roundoff yardstick of the closure): " << d_rev << std::endl;
+  CHECK(d_rev <= 1e-6);
 }
 
 } // namespace bdft_tests

@@ -150,6 +150,7 @@ struct lapack_hooks_t {
   std::function<bool(cmatrix_F &, nda::array<double, 1> &, cmatrix_F &, cmatrix_F &)> gesvd;   ///< A = P diag(s) Qh, square
   std::function<bool(cmatrix_F &, cmatrix_F &)> lu_solve;            ///< B <- A^{-1} B (A may be overwritten on success)
   long min_dim = 256;
+  bool in_ueig = true;   ///< also for the LU solve + Hermitian eigen of the "cayley" U-eigen path
 };
 
 namespace detail {
@@ -303,6 +304,14 @@ inline bool unitary_eig_cayley(cmatrix_F const &U, nda::array<ComplexType, 1> &u
   }
   st.nflag = long(F.size());
   if (st.nflag > std::max(32L, long(n) / 4)) { st.fallback = true; return false; }
+  if (not F.empty()) {   // mixing partners are neighbours in the (ascending) eigenvalues of Hc: add +-2 around each flagged
+    std::vector<char> in(n, 0);
+    for (long l : F)
+      for (long m = std::max(0L, l - 2); m <= std::min(long(n) - 1, l + 2); ++m) in[m] = 1;
+    F.clear();
+    for (long l = 0; l < n; ++l)
+      if (in[l]) F.push_back(l);
+  }
   if (not F.empty()) {   // Rayleigh-Ritz in span(Z[:, F])
     const long f = long(F.size());
     cmatrix_F VF(n, f), UVF(n, f);
@@ -606,7 +615,7 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
     bool done = false;
     if (o.ueig == "cayley") {
       detail::ueig_stats_t st;
-      done           = detail::unitary_eig_cayley(U, u, Z, o.ueig_tol, st, o.hooks);
+      done           = detail::unitary_eig_cayley(U, u, Z, o.ueig_tol, st, (o.hooks and o.hooks->in_ueig) ? o.hooks : nullptr);
       res.ueig_nflag = std::max(res.ueig_nflag, st.nflag);
       if (done) res.ueig_res = std::max(res.ueig_res, st.res_max);
       else ++res.ueig_fallback;
