@@ -62,9 +62,11 @@
  *                       ranks fill the cores; 0 = untouched; n > 0 = n), SVD driver of D+ D-^dagger ("gesdd" = divide and
  *                       conquer), eigenvectors of the unitary U ("cayley" = Hermitian eigenproblem of i (U-1)^{-1} (U+1)
  *                       with Rayleigh-Ritz refinement and a Schur fallback; cayley.hpp unitary_eig_cayley)
- *   closure_k_workers = 1   S7g: the rank's k processed by this many concurrent host threads (std::thread; each with
- *                       closure_threads / closure_k_workers BLAS threads; no MPI inside)
- *   closure_device = "off", closure_dev_svd = "gesvd"
+ *   closure_k_workers = -1  S7g: the rank's k processed by this many concurrent host threads (std::thread; each with
+ *                       closure_threads / closure_k_workers BLAS threads; no MPI inside); -1 = auto: closure_threads / 2
+ *                       in device runs (pairs of cores; si222c bench 4 k x 2 threads 0.59 s per k vs 0.81 s for 1 k x 8),
+ *                       1 in host runs
+ *   closure_device = "auto", closure_dev_svd = "gesvdp"
  *                       S7g: the Gram / Cayley / Lehmann Hermitian eigenproblems, the LU solve of the "cayley" path and the
  *                       SVD on the GPU (cuSOLVER, cuda/gw_line_lapack.cu; CUDA builds; "auto" = in device runs), each call
  *                       falling back to the host LAPACK on any device failure (counted in the closure profile line)
@@ -141,12 +143,12 @@ struct gw_line_params_t {
   std::string closure_svd_cut = "hard";  ///< S7f: SVD cut "hard" | "gap"
   double closure_cut_window = 10.0;      ///< S7f: window factor of the gap / smooth cuts
   double phase_keep = 0.0;               ///< S7f: > 0 = phase continuity (keep the previous phi* basin within this factor)
-  long closure_k_workers = 1;            ///< S7g: concurrent host threads over the rank's k in the closure (BLAS threads split)
+  long closure_k_workers = -1;           ///< S7g: concurrent host threads over the rank's k (-1 auto: device runs threads / 2, host 1)
   long closure_threads = -1;             ///< S7g: BLAS threads of the host closure (-1 auto: device runs the rank's cores, host runs untouched; 0 untouched)
   std::string closure_svd  = "gesdd";    ///< S7g: SVD driver of the upfolding "gesdd" (default) | "gesvd" (python / pre-S7g)
   std::string closure_ueig = "cayley";   ///< S7g: eigenvectors of U "cayley" (default; Hermitian Cayley image) | "schur" (zgees, pre-S7g)
-  std::string closure_device = "off";    ///< S7g: cuSOLVER eigensolvers/SVD in the closure "auto" (device runs) | "on" | "off"
-  std::string closure_dev_svd = "gesvd"; ///< S7g: device SVD "gesvd" | "gesvdp" (polar decomposition)
+  std::string closure_device = "auto";   ///< S7g: cuSOLVER eigensolvers/SVD in the closure "auto" (device runs) | "on" | "off"
+  std::string closure_dev_svd = "gesvdp"; ///< S7g: device SVD "gesvdp" (polar decomposition, default) | "gesvd"
   double debug_noise_h0 = 0.0;           ///< diagnostics: relative Hermitian Gaussian noise on H0 (seed debug_noise_seed)
   long debug_noise_seed = 0;
   double debug_noise_sigma = 0.0;        ///< diagnostics: relative noise on Sigma at the nodes (before mixing) ...

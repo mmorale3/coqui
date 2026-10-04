@@ -447,6 +447,7 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
       for (int i = 0; i < 8; ++i) prof[i] += x[i];
     blas_backend = be[0];
   }
+  if (p.hooks) device_lapack_release();   // the kernels get the device memory back
   Timer.stop("closure_upfold");
   {   // S7g: per-step profile of the closure (max over ranks of the per-rank sums over the owned k)
     double pmax[8];

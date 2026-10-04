@@ -23,7 +23,8 @@
 
 /**
  * S7g: the cuSOLVER drivers of cuda/gw_line_lapack.cuh as numerics::line_dlr::lapack_hooks_t (Gram eigen, SVD of
- * D+ D-^dagger, LU solve and Hermitian eigen of the "cayley" U-eigen path, Lehmann eigen). CUDA builds only; elsewhere
+ * D+ D-^dagger, Lehmann eigen; the LU solve / Hermitian eigen of the "cayley" U-eigen path stay on the host: on the
+ * device they left residuals above ueig_tol and fell back to the Schur form, S7g bench job 7168598). CUDA builds only; elsewhere
  * device_lapack_hooks() returns null (host LAPACK). Each hook falls back to the host on any device failure.
  * svd_variant: 0 = zgesvd, 1 = Xgesvdp (polar-decomposition SVD).
  */
@@ -56,12 +57,20 @@ inline numerics::line_dlr::lapack_hooks_t const *device_lapack_hooks([[maybe_unu
     h.lu_solve = [](cmatrix_F &A, cmatrix_F &B) {
       return cuda::dev_lu_solve(int(A.extent(0)), int(B.extent(1)), A.data(), B.data());
     };
+    h.in_ueig = false;   // the Cayley U-eigen stays on the host (device LU + zheevd of Hc: Schur fallbacks, S7g bench)
     return h;
   };
   static const numerics::line_dlr::lapack_hooks_t h0 = make(0), h1 = make(1);
   return svd_variant == 1 ? &h1 : &h0;
 #else
   return nullptr;
+#endif
+}
+
+/// free the cuSOLVER workspace of the calling thread (worker threads free theirs when they exit)
+inline void device_lapack_release() {
+#if defined(ENABLE_CUDA)
+  cuda::dev_lapack_release();
 #endif
 }
 

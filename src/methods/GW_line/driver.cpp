@@ -186,7 +186,7 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
                p.closure_svd);
   utils::check(p.closure_ueig == "schur" or p.closure_ueig == "cayley",
                "gw_line: closure_ueig must be \"schur\" or \"cayley\" (got \"{}\")", p.closure_ueig);
-  utils::check(p.closure_k_workers >= 1, "gw_line: closure_k_workers must be >= 1");
+  utils::check(p.closure_k_workers >= 1 or p.closure_k_workers == -1, "gw_line: closure_k_workers must be >= 1 or -1 (auto)");
   utils::check(p.closure_device == "auto" or p.closure_device == "on" or p.closure_device == "off",
                "gw_line: closure_device must be \"auto\", \"on\" or \"off\" (got \"{}\")", p.closure_device);
   utils::check(p.closure_dev_svd == "gesvd" or p.closure_dev_svd == "gesvdp",
@@ -962,7 +962,6 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   cprm.phase_keep = prm.phase_keep;
   cprm.svd_driver = prm.closure_svd;
   cprm.ueig       = prm.closure_ueig;
-  cprm.k_workers  = prm.closure_k_workers;
   // S7g: BLAS threads of the host closure. Device runs have one rank per GPU and idle cores; host runs fill the cores
   cprm.blas_threads = prm.closure_threads >= 0 ? prm.closure_threads
                                                : (MEM != HOST_MEMORY ? cores_per_rank(long(mpi.node_comm.size())) : 0);
@@ -972,8 +971,12 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     utils::check(not(prm.closure_device == "on" and cprm.hooks == nullptr),
                  "gw_line: closure_device = \"on\" needs a CUDA build");
   }
-  app_log(1, "  closure: BLAS threads per rank {} ({}), dense eigensolvers/SVD on the {}", cprm.blas_threads,
+  cprm.k_workers = prm.closure_k_workers > 0 ? prm.closure_k_workers
+                                             : (MEM != HOST_MEMORY ? std::max(1L, cprm.blas_threads / 2) : 1L);
+  app_log(1, "  closure: BLAS threads per rank {} ({}), k workers {} (BLAS threads each {}), dense eigensolvers/SVD on the {}",
+          cprm.blas_threads,
           cprm.blas_threads > 0 ? (prm.closure_threads >= 0 ? "closure_threads" : "auto: cores of the rank") : "untouched",
+          cprm.k_workers, cprm.k_workers > 1 ? std::max(1L, cprm.blas_threads / cprm.k_workers) : cprm.blas_threads,
           cprm.hooks ? "GPU (cuSOLVER, host fallback)" : "host");
   g_repr_params_t grepr{prm.g_repr, prm.g_emax, prm.g_wtol, prm.g_emin_frac, prm.g_wsmall};
 
