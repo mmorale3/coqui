@@ -40,14 +40,14 @@ template struct propagator_t<HOST_MEMORY>;
 template void polarization<HOST_MEMORY>(propagator_t<HOST_MEMORY> &, pole_data_t const &, mf::MF const &,
                                         aux_grid_t const &, nda::array<ComplexType, 1> const &, time_ray_t const &,
                                         time_ray_t const &, long, memory::array<HOST_MEMORY, ComplexType, 4> &,
-                                        utils::TimerManager &, sector_t);
+                                        utils::TimerManager &, sector_t, long, long);
 
 #if defined(ENABLE_DEVICE)
 template struct propagator_t<DEVICE_MEMORY>;
 template void polarization<DEVICE_MEMORY>(propagator_t<DEVICE_MEMORY> &, pole_data_t const &, mf::MF const &,
                                           aux_grid_t const &, nda::array<ComplexType, 1> const &, time_ray_t const &,
                                           time_ray_t const &, long, memory::array<DEVICE_MEMORY, ComplexType, 4> &,
-                                          utils::TimerManager &, sector_t);
+                                          utils::TimerManager &, sector_t, long, long);
 #endif
 
 #define GW_LINE_SCREENED_INST(MEM)                                                                                       \
@@ -56,7 +56,7 @@ template void polarization<DEVICE_MEMORY>(propagator_t<DEVICE_MEMORY> &, pole_da
                                           bosonic_basis_t const &, aux_grid_t const &,                                    \
                                           utils::mpi_context_t<boost::mpi3::communicator> &,                              \
                                           memory::array<MEM, ComplexType, 4> &, utils::TimerManager &,                    \
-                                          memory::array<MEM, ComplexType, 4> *, long);                                    \
+                                          memory::array<MEM, ComplexType, 4> *, long, bool);                              \
   template void w_time<MEM>(memory::array<MEM, ComplexType, 4> const &, bosonic_basis_t const &, long,                    \
                             nda::array<ComplexType, 1> const &, sector_t, bool, memory::array_view<MEM, ComplexType, 3>); \
   template void eval_poles<MEM>(memory::array<MEM, ComplexType, 4> const &, bosonic_basis_t const &, long,                \
@@ -74,7 +74,8 @@ GW_LINE_SCREENED_INST(DEVICE_MEMORY)
                                  bosonic_basis_t const &, mf::MF const &, aux_grid_t const &,                             \
                                  boost::mpi3::communicator &, nda::array<ComplexType, 1> const &,                         \
                                  time_ray_t const &, time_ray_t const &, long, nda::array<ComplexType, 4> &,              \
-                                 utils::TimerManager &, sector_t);                                                        \
+                                 utils::TimerManager &, sector_t, bool,                                                   \
+                                 memory::array<HOST_MEMORY, ComplexType, 4> const *, long);                               \
   template void hartree_exchange<MEM>(propagator_t<MEM> &, coulomb_blocks_t<MEM> const &,                                \
                                       nda::array<ComplexType, 3> const &, mf::MF const &, aux_grid_t const &,             \
                                       boost::mpi3::communicator &, nda::array<ComplexType, 3> &,                          \

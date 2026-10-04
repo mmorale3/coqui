@@ -58,6 +58,11 @@
  *   time_eps = eps, time_pad = 1.25, time_oversample = 1.0   ID tolerance, energy-range margin [Emin/pad, pad Emax] and
  *                       node oversampling (time_id_opts_t); ignored for "gl"
  *   restart = false     resume from <output>.gw_line.h5:/scf_line/final_iter (bitwise identical continuation)
+ *   checkpoint_sigma = "last"   Sigma at the nodes in the checkpoint (S7e): "last" = only the last iteration's, in the
+ *                       separate file <output>.gw_line.sigma.h5 rewritten every iteration (constant size); "all" = every
+ *                       iteration's in iter<N>/Sigma_{p,h} (the pre-S7e layout; 2 N_k N_zeta nb^2 x 16 B per iteration)
+ *   sigma_kdist = true  Sigma at the nodes k-distributed over the ranks (S7e, k_dist.hpp: owner(k) = k mod np, the closure's
+ *                       ownership; reduce-scatter in the self-energy); false = replicated on every rank (pre-S7e)
  *   output / outdir + prefix   checkpoint stem (MBPT_drivers resolve_mbpt_output_stem; the driver reads "output")
  *   div_treatment       must be absent or "ignore_g0" (Z(Gamma) without its G = 0 term, no Madelung/head correction)
  *   spectra = { enable = true, eta = [0.004, 0.01], wmin = -0.45, wmax = 0.45, nw = 601 }   A(k,w) at the end
@@ -111,6 +116,8 @@ struct gw_line_params_t {
   double time_eps = 1e-10, time_pad = 1.25, time_oversample = 1.0;   ///< time_eps defaults to eps
   bool restart = false;
   std::string output = "./gw_line";
+  std::string checkpoint_sigma = "last";   ///< "last" | "all" (S7e)
+  bool sigma_kdist = true;                 ///< k-distributed Sigma at the nodes (S7e)
   bool do_spectra = true;
   spectra_params_t spectra;
 
@@ -141,7 +148,8 @@ struct gw_line_result_t {
   pole_data_t poles;                     ///< final poles (mu-relative; compressed or factorized Lehmann)
   nda::array<ComplexType, 3> F;          ///< final V_H + Sigma_x
   nda::array<ComplexType, 3> H0;         ///< one-body Hamiltonian (KS band basis)
-  nda::array<ComplexType, 4> Sig_p, Sig_h;   ///< last mixed Sigma at the nodes (empty if no iteration was done)
+  nda::array<ComplexType, 4> Sig_p, Sig_h;   ///< last mixed Sigma at the nodes (empty if no iteration was done); with
+                                             ///< sigma_kdist (default) the rows of the k owned by this rank (k mod np)
   nda::array<ComplexType, 1> zeta;       ///< fermionic nodes (mu-relative)
   std::optional<spectra_out_t> spectra;
 };

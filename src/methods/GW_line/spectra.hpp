@@ -65,7 +65,7 @@ struct spectra_out_t {
 
 /**
  * Hrel (nk, nb, nb) = H0 + F - mu (final centre); Sig_p / Sig_h (nk, nz, nb, nb) at the nodes zeta about mu_sigma;
- * shift = mu - mu_sigma. Collective over comm.
+ * shift = mu - mu_sigma. Collective over comm. Sig_p / Sig_h may be k-distributed (nloc rows, see closure()).
  */
 inline spectra_out_t line_spectra(boost::mpi3::communicator &comm, nda::array<ComplexType, 3> const &Hrel,
                                   nda::array<ComplexType, 4> const &Sig_p, nda::array<ComplexType, 4> const &Sig_h,
@@ -90,8 +90,10 @@ inline spectra_out_t line_spectra(boost::mpi3::communicator &comm, nda::array<Co
   std::vector<nda::array<ComplexType, 2>> v_loc(nk);
   nda::array<double, 1> npol(nk);
   npol() = 0.0;
+  const bool sig_loc = (Sig_p.extent(0) != nk);   // k-distributed Sigma (S7e)
   for (long ik = rank; ik < nk; ik += np) {
-    nda::array<ComplexType, 3> Sp(Sig_p(ik, all, all, all)), Sh(Sig_h(ik, all, all, all));
+    const long ks = sig_loc ? ik / np : ik;
+    nda::array<ComplexType, 3> Sp(Sig_p(ks, all, all, all)), Sh(Sig_h(ks, all, all, all));
     auto spk = fit_sigma_sectors(bp, bh, zeta, Sp, Sh);
     spk.w -= shift;
     nda::array<ComplexType, 2> H(Hrel(ik, all, all));

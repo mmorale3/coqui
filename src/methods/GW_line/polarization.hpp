@@ -49,6 +49,9 @@
  *
  * Output: Pi is the local block in MEM, shape (N_q, N_zeta, nP, nQ) = Pi(q, zeta)[P_rng, Q_rng] (overwritten). It stays
  * in MEM because the next consumer (S4: Dyson for W) redistributes a MEM darray.
+ * q group (S7e, plan 6.3(b)): q0, g restrict the output to q in [q0, q0 + g): Pi has shape (g, N_zeta, nP, nQ), row
+ * iq - q0. The A, B factors of all k are rebuilt for every group (G_tilde cost x the number of groups); the driver uses
+ * groups only when the Pi group of all q does not fit (device memory, q_groups_t).
  */
 
 #include <array>
@@ -77,7 +80,7 @@ template <MEMORY_SPACE MEM>
 void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF const &mf, aux_grid_t const &grid,
                   nda::array<ComplexType, 1> const &zeta, numerics::line_dlr::time_nodes_t const &ray_p,
                   numerics::line_dlr::time_nodes_t const &ray_h, long t_chunk, memory::array<MEM, ComplexType, 4> &Pi,
-                  utils::TimerManager &Timer, sector_t sectors = sector_t::both) {
+                  utils::TimerManager &Timer, sector_t sectors = sector_t::both, long q0 = 0, long g = -1) {
   using time_ray_t = numerics::line_dlr::time_nodes_t;   // GL ray or ID nodes (S7b)
   using arr4_t = memory::array<MEM, ComplexType, 4>;
   auto all     = nda::range::all;
@@ -92,11 +95,13 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   const long nk = prop.nk, nq = mf.nqpts(), nz = zeta.size(), nP = grid.nP, nQ = grid.nQ, blk = nP * nQ;
   utils::check(mf.nkpts() == nk, "gw_line::polarization: MF nkpts {} != X nkpts {}", mf.nkpts(), nk);
   auto qk = mf.qk_to_k2();   // (nqpts, nkpts): index of k - q
+  if (g < 0) g = nq - q0;
+  utils::check(q0 >= 0 and g > 0 and q0 + g <= nq, "gw_line::polarization: q group [{}, {}) out of [0, {})", q0, q0 + g, nq);
 
   for (auto nm : {"G_tilde", "Pi_hadamard", "Pi_transform"}) Timer.add(nm);
   prop.set_poles(poles);
 
-  if (Pi.extent(0) != nq or Pi.extent(1) != nz or Pi.extent(2) != nP or Pi.extent(3) != nQ) Pi = arr4_t(nq, nz, nP, nQ);
+  if (Pi.extent(0) != g or Pi.extent(1) != nz or Pi.extent(2) != nP or Pi.extent(3) != nQ) Pi = arr4_t(g, nz, nP, nQ);
   nda::tensor::set(ComplexType(0.0), Pi);
 
   struct leg_t {
@@ -110,17 +115,17 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   // ---- S7d Hadamard setup (device fused kernel; see the file header)
   [[maybe_unused]] const bool fused = (MEM != HOST_MEMORY) and detail::fused_hadamard();
   [[maybe_unused]] const bool qfold = fused and detail::env_long("COQUI_GWLINE_PI_QFOLD", 1) != 0;
-  [[maybe_unused]] memory::array<MEM, int, 1> pairs;   // (N_q, N_k, 2): (k, k-q)
+  [[maybe_unused]] memory::array<MEM, int, 1> pairs;   // (g, N_k, 2): (k, k-q) for q = q0 + row
   if (fused) {
-    nda::array<int, 1> ph(2 * nq * nk);
-    for (long iq = 0; iq < nq; ++iq)
+    nda::array<int, 1> ph(2 * g * nk);
+    for (long iqr = 0; iqr < g; ++iqr)
       for (long ik = 0; ik < nk; ++ik) {
-        ph(2 * (iq * nk + ik))     = int(ik);
-        ph(2 * (iq * nk + ik) + 1) = int(qk(iq, ik));
+        ph(2 * (iqr * nk + ik))     = int(ik);
+        ph(2 * (iqr * nk + ik) + 1) = int(qk(q0 + iqr, ik));
       }
     pairs = memory::to_memory_space<MEM>(ph);
   }
-  const long nacc = qfold ? nq : 1;   // acc chunks held: all q (qfold) or one
+  const long nacc = qfold ? g : 1;   // acc chunks held: all q of the group (qfold) or one
 
   for (auto const &leg : legs) {
     if (sectors != sector_t::both and sectors != leg.ray->sector) continue;
@@ -151,25 +156,26 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
 
       if (qfold) {   // device, fused: acc(q) for all q in one launch (alpha folded in), transform for all q in one gemm
         Timer.start("Pi_hadamard");
-        detail::slab_conv<MEM>(n * blk, nk, A.data(), tc * blk, nk, B.data(), tc * blk, nq, acc.data(), tc * blk, nk, pairs, 0,
+        detail::slab_conv<MEM>(n * blk, nk, A.data(), tc * blk, nk, B.data(), tc * blk, g, acc.data(), tc * blk, nk, pairs, 0,
                                alpha, false);
         utils::device_sync();
         Timer.stop("Pi_hadamard");
         Timer.start("Pi_transform");
         // column-major: Pi(q)^T (blk x nz) += acc(q)^T (blk x n) . F[:, chunk]^T (n x nz), batched over q
         detail::gemm_strided_cm('N', 'N', blk, nz, n, ComplexType(1.0), acc.data(), blk, tc * blk, F.data() + i0, nt, 0,
-                                ComplexType(1.0), Pi.data(), blk, nz * blk, nq);
+                                ComplexType(1.0), Pi.data(), blk, nz * blk, g);
         utils::device_sync();
         Timer.stop("Pi_transform");
         continue;
       }
 
-      for (long iq = 0; iq < nq; ++iq) {
+      for (long iqr = 0; iqr < g; ++iqr) {
+        const long iq = q0 + iqr;
         Timer.start("Pi_hadamard");
         auto acc_v = acc(0, tr, all, all);
         if (fused) {   // device, fused: one launch for this q (alpha folded in)
           detail::slab_conv<MEM>(n * blk, nk, A.data(), tc * blk, nk, B.data(), tc * blk, 1, acc.data(), tc * blk, nk, pairs,
-                                 2 * iq * nk, alpha, false);
+                                 2 * iqr * nk, alpha, false);
         } else {
           for (long ik = 0; ik < nk; ++ik) {
             const long ikmq = qk(iq, ik);
@@ -193,7 +199,7 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
 
         Timer.start("Pi_transform");
         auto acc2 = nda::reshape(acc(0, all, all, all), std::array<long, 2>{tc, blk})(tr, all);
-        auto Pi2  = nda::reshape(Pi(iq, all, all, all), std::array<long, 2>{nz, blk});
+        auto Pi2  = nda::reshape(Pi(iqr, all, all, all), std::array<long, 2>{nz, blk});
         nda::blas::gemm(fused ? ComplexType(1.0) : alpha, F(all, nda::range(i0, i0 + n)), acc2, ComplexType(1.0), Pi2);
         if constexpr (MEM != HOST_MEMORY) utils::device_sync();
         Timer.stop("Pi_transform");
@@ -206,14 +212,15 @@ extern template void polarization<HOST_MEMORY>(propagator_t<HOST_MEMORY> &, pole
                                                aux_grid_t const &, nda::array<ComplexType, 1> const &,
                                                numerics::line_dlr::time_nodes_t const &,
                                                numerics::line_dlr::time_nodes_t const &, long,
-                                               memory::array<HOST_MEMORY, ComplexType, 4> &, utils::TimerManager &, sector_t);
+                                               memory::array<HOST_MEMORY, ComplexType, 4> &, utils::TimerManager &, sector_t,
+                                               long, long);
 #if defined(ENABLE_DEVICE)
 extern template void polarization<DEVICE_MEMORY>(propagator_t<DEVICE_MEMORY> &, pole_data_t const &, mf::MF const &,
                                                  aux_grid_t const &, nda::array<ComplexType, 1> const &,
                                                  numerics::line_dlr::time_nodes_t const &,
                                                  numerics::line_dlr::time_nodes_t const &, long,
                                                  memory::array<DEVICE_MEMORY, ComplexType, 4> &, utils::TimerManager &,
-                                                 sector_t);
+                                                 sector_t, long, long);
 #endif
 
 } // namespace methods::gw_line

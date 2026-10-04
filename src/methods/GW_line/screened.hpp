@@ -68,6 +68,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "configuration.hpp"
 #include "IO/app_loggers.h"
@@ -99,21 +100,34 @@ using numerics::line_dlr::sector_t;
 
 /**
  * Coulomb matrices of all q in the block layout (resident in MEM), Z[iq] = Z(q)[P_rng, Q_rng], plus the FULL Z(q) (host)
- * for the q's this rank Dyson-solves (q_full range). Acquired by ONE lockstep loop over all q: thc.Z(iq) is collective
- * (every rank must call it the same number of times, in the same order). Z(Gamma) carries no G=0 term (ignore_g0).
+ * for the q's this rank Dyson-solves (a q range, or, with q groups (S7e), the union of this rank's Dyson q slabs over the
+ * groups: q_list). Acquired by ONE lockstep loop over all q: thc.Z(iq) is collective (every rank must call it the same
+ * number of times, in the same order). Z(Gamma) carries no G=0 term (ignore_g0).
  */
 template <MEMORY_SPACE MEM>
 struct coulomb_blocks_t {
   aux_grid_t grid;
   long nq = 0, Np = 0;
   memory::array<MEM, ComplexType, 3> Z;     ///< (nq, nP, nQ)
-  long q_full0 = 0;                          ///< first (absolute) q of Z_full
+  std::vector<long> q_pos;                   ///< (nq) row of Z_full holding q, or -1
   nda::array<ComplexType, 3> Z_full;         ///< (nq_full, Np, Np) host
 
   coulomb_blocks_t() = default;
 
   /// q_full: absolute q range whose full matrices this rank keeps (dyson_layout_t::q_rng() + q0 of the group).
   coulomb_blocks_t(methods::thc_reader_t const &thc, aux_grid_t const &grid_, nda::range q_full,
+                   utils::TimerManager &Timer)
+     : coulomb_blocks_t(thc, grid_, range_list(q_full), Timer) {}
+
+  static std::vector<long> range_list(nda::range r) {
+    std::vector<long> v;
+    for (long q = r.first(); q < r.last(); ++q) v.push_back(q);
+    return v;
+  }
+
+  /// q_list: absolute q's whose full matrices this rank keeps (any subset of [0, N_q), e.g. the union of the Dyson q slabs
+  /// of all q groups, see q_groups_t).
+  coulomb_blocks_t(methods::thc_reader_t const &thc, aux_grid_t const &grid_, std::vector<long> const &q_list,
                    utils::TimerManager &Timer)
      : grid(grid_) {
     utils::check(thc.nkpts() == thc.nkpts_ibz() and thc.nqpts() == thc.nqpts_ibz(),
@@ -124,30 +138,33 @@ struct coulomb_blocks_t {
     utils::check(thc.Np() == grid.Np, "gw_line::coulomb_blocks_t: grid Np {} != thc Np {}", grid.Np, thc.Np());
     nq = thc.nqpts();
     Np = thc.Np();
-    utils::check(q_full.first() >= 0 and q_full.last() <= nq, "gw_line::coulomb_blocks_t: q_full range out of [0, {})", nq);
-    q_full0 = q_full.first();
+    q_pos.assign(nq, -1);
+    long nfull = 0;
+    for (long q : q_list) {
+      utils::check(q >= 0 and q < nq, "gw_line::coulomb_blocks_t: q = {} out of [0, {})", q, nq);
+      if (q_pos[q] < 0) q_pos[q] = nfull++;
+    }
     Timer.add("Z_gather");
     Timer.start("Z_gather");
     nda::array<ComplexType, 3> zb(nq, grid.nP, grid.nQ);
-    Z_full = nda::array<ComplexType, 3>(q_full.size(), Np, Np);
+    Z_full = nda::array<ComplexType, 3>(nfull, Np, Np);
     for (long iq = 0; iq < nq; ++iq) {   // LOCKSTEP: identical call sequence on every rank
       auto Zq = thc.Z(int(iq));
       zb(iq, nda::range::all, nda::range::all) = Zq(grid.P_rng(), grid.Q_rng());
-      if (iq >= q_full.first() and iq < q_full.last()) Z_full(iq - q_full0, nda::range::all, nda::range::all) = Zq;
+      if (q_pos[iq] >= 0) Z_full(q_pos[iq], nda::range::all, nda::range::all) = Zq;
     }
     Z = memory::to_memory_space<MEM>(zb);
     Timer.stop("Z_gather");
     app_log(2, "  gw_line Coulomb blocks: Z blocks {} x {} x {} in {} ({:.4f} GB per rank), full Z(q) for {} q on the host "
                "({:.4f} GB per rank)",
             nq, grid.nP, grid.nQ, MEM == HOST_MEMORY ? "host" : "device", double(nq * grid.max_block_size()) * 16.0 / 1073741824.0,
-            q_full.size(), double(q_full.size() * Np * Np) * 16.0 / 1073741824.0);
+            nfull, double(nfull * Np * Np) * 16.0 / 1073741824.0);
   }
 
-  bool has_full(long iq) const { return iq >= q_full0 and iq < q_full0 + Z_full.extent(0); }
+  bool has_full(long iq) const { return iq >= 0 and iq < long(q_pos.size()) and q_pos[iq] >= 0; }
   auto full(long iq) const {
-    utils::check(has_full(iq), "gw_line::coulomb_blocks_t: full Z(q={}) not kept on this rank (range [{}, {}))", iq, q_full0,
-                 q_full0 + Z_full.extent(0));
-    return Z_full(iq - q_full0, nda::range::all, nda::range::all);
+    utils::check(has_full(iq), "gw_line::coulomb_blocks_t: full Z(q={}) not kept on this rank", iq);
+    return Z_full(q_pos[iq], nda::range::all, nda::range::all);
   }
   double resident_bytes() const { return double(Z.size() + Z_full.size()) * 16.0; }
 };
@@ -264,7 +281,8 @@ template <MEMORY_SPACE MEM>
 void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks_t<MEM> const &Zb,
                           bosonic_basis_t const &basis, aux_grid_t const &grid,
                           utils::mpi_context_t<boost::mpi3::communicator> &mpi, memory::array<MEM, ComplexType, 4> &w,
-                          utils::TimerManager &Timer, memory::array<MEM, ComplexType, 4> *W_nodes = nullptr, long q0 = 0) {
+                          utils::TimerManager &Timer, memory::array<MEM, ComplexType, 4> *W_nodes = nullptr, long q0 = 0,
+                          bool w_group = false) {
   using arr4_t  = memory::array<MEM, ComplexType, 4>;
   using arr2_t  = memory::array<MEM, ComplexType, 2>;
   using arrF_t  = memory::array<MEM, ComplexType, 2, nda::F_layout>;
@@ -290,8 +308,10 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
   }
 
   // residues: resident (allocated first, so that the stage's high-water includes them as the plan 6.7 model does)
-  if (w.extent(0) != Zb.nq or w.extent(1) != r or w.extent(2) != nP or w.extent(3) != nQ) {
-    w = arr4_t(Zb.nq, r, nP, nQ);
+  // w_group (S7e, host-resident residues): w holds only the rows of this group, (g, r, nP, nQ), row q - q0
+  const long w_rows = w_group ? g : Zb.nq, w_off = w_group ? 0 : q0;
+  if (w.extent(0) != w_rows or w.extent(1) != r or w.extent(2) != nP or w.extent(3) != nQ) {
+    w = arr4_t(w_rows, r, nP, nQ);
     nda::tensor::set(ComplexType(0.0), w);
   }
   bosonic_fit_t fit(basis, basis.zeta_nodes);
@@ -453,7 +473,7 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
       const long ql = plan.q_row(p, s);
       auto W2       = nda::reshape(Pi(ql, all, all, all), std::array<long, 2>{nz, blk});
       auto WT2      = nda::reshape(WT(p, all, all, all), std::array<long, 2>{nz, blk});
-      auto w2       = nda::reshape(w(q0 + ql, all, all, all), std::array<long, 2>{r, blk});
+      auto w2       = nda::reshape(w(w_off + ql, all, all, all), std::array<long, 2>{r, blk});
       for (long c0 = 0; c0 < blk; c0 += bc) {
         const auto cr = nda::range(c0, std::min(blk, c0 + bc));
         auto Yc       = Y(all, nda::range(cr.size()));
@@ -545,7 +565,7 @@ void eval_poles(memory::array<MEM, ComplexType, 4> const &w, bosonic_basis_t con
                                                  bosonic_basis_t const &, aux_grid_t const &,                             \
                                                  utils::mpi_context_t<boost::mpi3::communicator> &,                       \
                                                  memory::array<MEM, ComplexType, 4> &, utils::TimerManager &,             \
-                                                 memory::array<MEM, ComplexType, 4> *, long);                             \
+                                                 memory::array<MEM, ComplexType, 4> *, long, bool);                       \
   extern template void w_time<MEM>(memory::array<MEM, ComplexType, 4> const &, bosonic_basis_t const &, long,             \
                                    nda::array<ComplexType, 1> const &, sector_t, bool,                                    \
                                    memory::array_view<MEM, ComplexType, 3>);                                              \

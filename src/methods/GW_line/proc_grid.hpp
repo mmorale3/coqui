@@ -36,6 +36,7 @@
 #include <array>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include "configuration.hpp"
 #include "IO/app_loggers.h"
@@ -204,6 +205,29 @@ struct w_plan_t {
   void log() const {
     app_log(3, "  gw_line W sub-steps: {} q sub-steps (<= {} q per step, one per q pool) x {} zeta sub-slabs of <= {} nodes",
             nsub_q, lay.np_q, n_zsub(), nzs);
+  }
+};
+
+/**
+ * q groups of the Pi -> W stage (S7e, plan 6.3(b)): q in [0, N_q) in groups of g consecutive q (the last one shorter).
+ * Per group: Pi of the group (polarization with q0, g; the A, B factors are rebuilt), then W and the residues of its q
+ * (screened_interaction with q0). The Pi group then holds g N_zeta blocks instead of N_q N_zeta (device: 172 GB for
+ * Si 4x4x4 nb 60, Np 739 on one GPU). dyson_q_list: the absolute q's this rank Dyson-solves over all groups (the full
+ * Z(q) coulomb_blocks_t must keep).
+ */
+struct q_groups_t {
+  long nq = 0, g = 0, n = 0;
+  q_groups_t() = default;
+  q_groups_t(long nq_, long g_) : nq(nq_), g(std::clamp(g_, 1L, nq_)) { n = (nq + g - 1) / g; }
+  long q0(long G) const { return G * g; }
+  long size(long G) const { return std::min(g, nq - G * g); }
+  std::vector<long> dyson_q_list(long np, long rank, long nz, long Np) const {
+    std::vector<long> v;
+    for (long G = 0; G < n; ++G) {
+      dyson_layout_t lay(np, rank, size(G), nz, Np);
+      for (long q = lay.q_first; q < lay.q_first + lay.nq_loc; ++q) v.push_back(q0(G) + q);
+    }
+    return v;
   }
 };
 

@@ -268,6 +268,8 @@ struct closure_out_t {
  * The closure for all k (python LineSCGW.iterate, step 3). Hrel (nk, nb, nb) = H0 + F - mu; Sig_p / Sig_h (nk, nz, nb, nb)
  * at the mu-relative nodes zeta; bp / bh: one-sided Sigma bases; gp / gh: gapless one-sided G bases; nelec: electrons per
  * cell (both spins). k weights uniform (nosym meshes). Collective over comm.
+ * Sig_p / Sig_h may also be k-DISTRIBUTED (S7e, k_dist.hpp): (nloc, nz, nb, nb) with the rows of the k owned by this rank
+ * (k mod np == rank, the ownership of the loop below); detected by extent(0) != nk (unambiguous for np > 1).
  */
 inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<ComplexType, 3> const &Hrel,
                              nda::array<ComplexType, 4> const &Sig_p, nda::array<ComplexType, 4> const &Sig_h,
@@ -277,7 +279,10 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   auto all       = nda::range::all;
   const long nk  = Hrel.extent(0), nb = Hrel.extent(1), nz = zeta.size();
   const long np  = comm.size(), rank = comm.rank();
-  utils::check(Sig_p.extent(0) == nk and Sig_p.extent(1) == nz and Sig_p.extent(2) == nb and Sig_h.shape() == Sig_p.shape(),
+  const bool sig_loc = (Sig_p.extent(0) != nk);   // k-distributed Sigma (S7e): row of k = k / np
+  const long nloc    = rank < nk ? (nk - 1 - rank) / np + 1 : 0;
+  utils::check((Sig_p.extent(0) == nk or Sig_p.extent(0) == nloc) and Sig_p.extent(1) == nz and Sig_p.extent(2) == nb and
+                   Sig_h.shape() == Sig_p.shape(),
                "gw_line::closure: Sigma shape mismatch");
   for (auto nm : {"closure_upfold", "closure_gather", "closure_mu", "closure_compress"}) Timer.add(nm);
   closure_out_t out;
@@ -289,7 +294,8 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   nda::array<double, 2> info(nk, 2);   // (npoles, heldout)
   info() = 0.0;
   for (long ik = rank; ik < nk; ik += np) {
-    nda::array<ComplexType, 3> Sp(Sig_p(ik, all, all, all)), Sh(Sig_h(ik, all, all, all));
+    const long ks = sig_loc ? ik / np : ik;
+    nda::array<ComplexType, 3> Sp(Sig_p(ks, all, all, all)), Sh(Sig_h(ks, all, all, all));
     auto sp = fit_sigma_sectors(bp, bh, zeta, Sp, Sh);
     nda::array<ComplexType, 2> H(Hrel(ik, all, all));
     auto ck   = closure_k(H, sp, p);

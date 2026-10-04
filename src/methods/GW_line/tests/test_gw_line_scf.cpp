@@ -358,6 +358,7 @@ ptree scf_params(std::string const &output, long niter, bool restart, std::strin
   pt.put("restart", restart);
   pt.put("output", output);
   pt.put("spectra.enable", false);
+  pt.put("checkpoint_sigma", "all");   // S7e: these tests read Sigma of every iteration from the checkpoint
   return pt;
 }
 
@@ -1109,4 +1110,96 @@ TEST_CASE("gw_line_scf_lehmann_prod", "[.lehmann_prod]") {
   std::vector<std::vector<std::array<double, 3>>> idgl;
   repr_study(L, "prod", vars, niter,
              [&](std::string const &f, std::string const &tg, std::string const &gr) { return prod_params(f, niter, tg, gr); }, idgl);
+}
+
+// S7e: k-distributed Sigma (reduce-scatter, sigma_kdist = true, the default) + the separate last-iteration Sigma file
+// (checkpoint_sigma = "last") vs the pre-S7e replicated Sigma written into every iteration (false / "all"): 2 iterations,
+// mu, gap, dSigma per iteration and the owned rows of Sigma; plus a restart from the "last" layout.
+TEST_CASE("gw_line_scf_kdist", "[gw_line][scf][s7e]") {
+  lih_t L;
+  auto &comm = L.mpi->comm;
+  auto pa    = scf_params("gw_line_kdA", 2, false, "id", "lehmann");
+  auto pb    = scf_params("gw_line_kdB", 2, false, "id", "lehmann");
+  pa.put("checkpoint_sigma", "last");   // the S7e defaults (sigma_kdist = true)
+  pb.put("sigma_kdist", false);
+  pb.put("checkpoint_sigma", "all");
+  auto A = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pa);
+  auto B = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pb);
+  const methods::gw_line::k_dist_t kd(L.mf->nkpts(), comm);
+  REQUIRE(A.Sig_p.extent(0) == kd.nloc());
+  REQUIRE(B.Sig_p.extent(0) == L.mf->nkpts());
+  double dS = 0.0, mS = nda::max_element(nda::abs(B.Sig_p));
+  for (long l = 0; l < kd.nloc(); ++l) {
+    const long k = kd.global(l, kd.rank);
+    dS = std::max(dS, double(nda::max_element(nda::abs(A.Sig_p(l, nda::ellipsis{}) - B.Sig_p(k, nda::ellipsis{})))));
+    dS = std::max(dS, double(nda::max_element(nda::abs(A.Sig_h(l, nda::ellipsis{}) - B.Sig_h(k, nda::ellipsis{})))));
+  }
+  dS = comm.all_reduce_value(dS, mpi3::max<>{}) / mS;
+  double dmu = 0.0, dgap = 0.0, ddS = 0.0;
+  for (long i = 0; i < 2; ++i) {
+    dmu  = std::max(dmu, std::abs(A.history[i].mu - B.history[i].mu));
+    dgap = std::max(dgap, std::abs(A.history[i].gap - B.history[i].gap));
+    if (i > 0) ddS = std::max(ddS, std::abs(A.history[i].dSigma - B.history[i].dSigma) / B.history[i].dSigma);
+  }
+  app_log(1, "[s7e] k-distributed vs replicated Sigma, {} ranks, 2 iterations: |dmu| {:.1e} Ha, |dgap| {:.1e} Ha, dSigma rel {:.1e}, "
+             "Sigma (owned rows) {:.1e}",
+          comm.size(), dmu, dgap, ddS, dS);
+  REQUIRE(dmu <= 1e-12);
+  REQUIRE(dgap <= 1e-12);
+  REQUIRE(ddS <= 1e-10);
+  REQUIRE(dS <= 1e-13);
+  // q groups of the Pi -> W stage (COQUI_GWLINE_QGROUP = 3: groups 3, 3, 2) vs all q at once
+  {
+    setenv("COQUI_GWLINE_QGROUP", "3", 1);
+    auto Q = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params("gw_line_kdQ", 2, false, "id", "lehmann"));
+    unsetenv("COQUI_GWLINE_QGROUP");
+    double dq = 0.0;
+    for (long i = 0; i < 2; ++i) dq = std::max(dq, std::abs(Q.history[i].mu - A.history[i].mu));
+    const double dSq = comm.all_reduce_value(double(nda::max_element(nda::abs(Q.Sig_p - A.Sig_p))), mpi3::max<>{}) / mS;
+    app_log(1, "[s7e] q groups of 3 vs all q: |dmu| {:.1e}, Sigma_p {:.1e}", dq, dSq);
+    REQUIRE(dq <= 1e-12);
+    REQUIRE(dSq <= 1e-12);
+    // host-resident residues streamed by Sigma in q groups of 3 (the device fallback, here on the host). The q sum of
+    // Sigma is then split over groups (another summation order): compared after ONE iteration (from the second on, the
+    // closure amplifies 1e-16 differences to ~1e-9, S7c), the kernel-level comparison is in [s7e] of the kernels suite
+    auto A1 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params("gw_line_kdQ", 1, false, "id", "lehmann"));
+    setenv("COQUI_GWLINE_QGROUP", "3", 1);
+    setenv("COQUI_GWLINE_W_HOST", "1", 1);
+    setenv("COQUI_GWLINE_SIGMA_QGROUP", "3", 1);
+    auto H = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params("gw_line_kdQ", 1, false, "id", "lehmann"));
+    unsetenv("COQUI_GWLINE_QGROUP");
+    unsetenv("COQUI_GWLINE_W_HOST");
+    unsetenv("COQUI_GWLINE_SIGMA_QGROUP");
+    const double dh  = std::abs(H.history[0].mu - A1.history[0].mu);
+    const double mS1 = comm.all_reduce_value(double(nda::max_element(nda::abs(A1.Sig_p))), mpi3::max<>{});
+    const double dSh = comm.all_reduce_value(double(nda::max_element(nda::abs(H.Sig_p - A1.Sig_p))), mpi3::max<>{}) / mS1;
+    app_log(1, "[s7e] host-resident residues + Sigma q groups of 3 vs all q resident, 1 iteration: |dmu| {:.1e}, Sigma_p {:.1e}", dh,
+            dSh);
+    REQUIRE(dh <= 1e-12);
+    REQUIRE(dSh <= 1e-13);
+    if (comm.root()) {
+      std::filesystem::remove("gw_line_kdQ.gw_line.h5");
+      std::filesystem::remove("gw_line_kdQ.gw_line.sigma.h5");
+    }
+  }
+  // restart from the "last" layout (Sigma in gw_line_kdA.gw_line.sigma.h5) continues bitwise like 3 straight iterations
+  auto pc = scf_params("gw_line_kdC", 3, false, "id", "lehmann");
+  pc.put("checkpoint_sigma", "last");
+  auto C  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pc);
+  auto pr = scf_params("gw_line_kdA", 3, true, "id", "lehmann");
+  pr.put("checkpoint_sigma", "last");
+  auto R  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pr);
+  REQUIRE(R.history.size() == 3);
+  const double dmu3 = std::abs(R.mu - C.mu);
+  const double dS3  = comm.all_reduce_value(double(nda::max_element(nda::abs(R.Sig_p - C.Sig_p))), mpi3::max<>{});
+  app_log(1, "[s7e] restart from checkpoint_sigma = \"last\": |dmu| {:.1e}, Sigma_p {:.1e} after 2 + restart + 1 vs 3", dmu3, dS3);
+  REQUIRE(dmu3 == 0.0);
+  REQUIRE(dS3 == 0.0);
+  if (comm.root()) {
+    REQUIRE(std::filesystem::exists("gw_line_kdA.gw_line.sigma.h5"));
+    for (auto f : {"gw_line_kdA.gw_line.h5", "gw_line_kdA.gw_line.sigma.h5", "gw_line_kdB.gw_line.h5", "gw_line_kdC.gw_line.h5",
+                   "gw_line_kdC.gw_line.sigma.h5"})
+      std::filesystem::remove(f);
+  }
+  comm.barrier();
 }

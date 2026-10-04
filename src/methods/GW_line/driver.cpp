@@ -63,6 +63,7 @@
 #include "methods/GW_line/closure.hpp"
 #include "methods/GW_line/spectra.hpp"
 #include "methods/GW_line/time_grids.hpp"
+#include "methods/GW_line/k_dist.hpp"
 #include "methods/GW_line/driver.hpp"
 
 namespace methods::gw_line {
@@ -110,6 +111,9 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.time_eps        = io::get_value_with_default<double>(pt, "time_eps", p.eps);
   p.time_pad        = io::get_value_with_default<double>(pt, "time_pad", p.time_pad);
   p.time_oversample = io::get_value_with_default<double>(pt, "time_oversample", p.time_oversample);
+  p.sigma_kdist     = io::get_value_with_default<bool>(pt, "sigma_kdist", p.sigma_kdist);
+  p.checkpoint_sigma = io::get_value_with_default<std::string>(pt, "checkpoint_sigma", p.checkpoint_sigma);
+  io::tolower(p.checkpoint_sigma);
   {
     auto o = pt.get_optional<std::string>("output");
     if (o and not o->empty()) p.output = *o;
@@ -148,6 +152,8 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   utils::check(p.mixing > 0.0 and p.mixing <= 1.0, "gw_line: mixing must be in (0, 1]");
   utils::check(p.time_grid == "id" or p.time_grid == "gl", "gw_line: time_grid must be \"id\" or \"gl\" (got \"{}\")",
                p.time_grid);
+  utils::check(p.checkpoint_sigma == "last" or p.checkpoint_sigma == "all",
+               "gw_line: checkpoint_sigma must be \"last\" or \"all\" (got \"{}\")", p.checkpoint_sigma);
   utils::check(p.time_eps > 0.0 and p.time_eps < 1.0 and p.time_pad >= 1.0 and p.time_oversample >= 1.0,
                "gw_line: need 0 < time_eps < 1, time_pad >= 1, time_oversample >= 1");
   return p;
@@ -174,7 +180,10 @@ void gw_line_params_t::log() const {
             time_pad, time_oversample);
   else
     app_log(1, "    time grid: GL rays (ray_decades = {}, 3 panels/e-fold, 16 nodes/panel)", ray_decades);
-  app_log(1, "    restart = {}, checkpoint = {}.gw_line.h5", restart, output);
+  app_log(1, "    restart = {}, checkpoint = {}.gw_line.h5 (Sigma at the nodes: {})", restart, output,
+          checkpoint_sigma == "last" ? "last iteration only, in " + output + ".gw_line.sigma.h5" : "every iteration");
+  app_log(1, "    Sigma at the nodes {} (sigma_kdist = {})", sigma_kdist ? "k-distributed (owner k mod np)" : "replicated on every rank",
+          sigma_kdist);
   if (do_spectra) {
     std::string e;
     for (auto x : spectra.eta) e += std::to_string(x) + " ";
@@ -437,6 +446,7 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "time_eps", p.time_eps);
   h5::h5_write(ig, "time_pad", p.time_pad);
   h5::h5_write(ig, "time_oversample", p.time_oversample);
+  h5::h5_write(ig, "checkpoint_sigma", p.checkpoint_sigma);
   nda::h5_write(ig, "fermionic_nodes", zeta, false);
 }
 
@@ -450,8 +460,36 @@ struct state_t {
   nda::array<ComplexType, 4> Sig_p, Sig_h;
 };
 
+/// Sigma file of checkpoint_sigma = "last" (S7e): <output>.gw_line.sigma.h5, rewritten every iteration (tmp + rename)
+std::string sigma_file(std::string const &chk) { return chk.substr(0, chk.size() - 3) + ".sigma.h5"; }
+
+/**
+ * Root writes iter<N>. Sigma (k-distributed when kd != nullptr: gathered to the root first, collective) goes to
+ * iter<N>/Sigma_{p,h} (sigma_all) or, checkpoint_sigma = "last" (S7e), to the separate file sigma_file(file) that is
+ * rewritten every iteration (constant size; before S7e the checkpoint grew by 2 N_k N_zeta nb^2 x 16 B per iteration,
+ * 1.8 GB for Si 4x4x4 nb 60).
+ */
 void write_state(boost::mpi3::communicator &comm, std::string const &file, state_t const &st,
-                 gw_line_iter_t const *rec) {
+                 gw_line_iter_t const *rec, k_dist_t const *kd = nullptr, bool sigma_all = true) {
+  nda::array<ComplexType, 4> Sp_full, Sh_full;
+  if (st.have_sigma and kd != nullptr) {
+    Sp_full = kd_gather_full(comm, *kd, st.Sig_p);
+    Sh_full = kd_gather_full(comm, *kd, st.Sig_h);
+  }
+  auto const &Sp = (kd != nullptr) ? Sp_full : st.Sig_p;
+  auto const &Sh = (kd != nullptr) ? Sh_full : st.Sig_h;
+  if (comm.root() and st.have_sigma and not sigma_all) {
+    utils::h5_quiesce();
+    const std::string sf = sigma_file(file), tmp = sf + ".tmp";
+    {
+      h5::file f(tmp, 'w');
+      h5::group g(f);
+      h5::h5_write(g, "iter", st.iter);
+      nda::h5_write(g, "Sigma_p", Sp, false);
+      nda::h5_write(g, "Sigma_h", Sh, false);
+    }
+    std::filesystem::rename(tmp, sf);
+  }
   if (comm.root()) {
     utils::h5_quiesce();
     h5::file f(file, 'a');
@@ -464,10 +502,11 @@ void write_state(boost::mpi3::communicator &comm, std::string const &file, state
     h5::h5_write(it, "e_homo", st.e_homo);
     h5::h5_write(it, "e_lumo", st.e_lumo);
     nda::h5_write(it, "F", st.F, false);
-    if (st.have_sigma) {
-      nda::h5_write(it, "Sigma_p", st.Sig_p, false);
-      nda::h5_write(it, "Sigma_h", st.Sig_h, false);
+    if (st.have_sigma and sigma_all) {
+      nda::h5_write(it, "Sigma_p", Sp, false);
+      nda::h5_write(it, "Sigma_h", Sh, false);
     }
+    h5::h5_write(it, "has_sigma", long(st.have_sigma ? 1 : 0));
     write_poles(it, st.poles);
     if (rec != nullptr) write_history(it, *rec);
     h5::h5_write(sg, "final_iter", st.iter);
@@ -479,7 +518,7 @@ static constexpr int NHIST = 31;   ///< columns of the broadcast history table
 
 /// Root reads scf_line/final_iter (+ the history of iterations 1..final_iter), everything is broadcast.
 state_t read_state(boost::mpi3::communicator &comm, std::string const &file, long nk, long nb,
-                   nda::array<ComplexType, 1> const &zeta, std::vector<gw_line_iter_t> &history) {
+                   nda::array<ComplexType, 1> const &zeta, std::vector<gw_line_iter_t> &history, k_dist_t const *kd = nullptr) {
   state_t st;
   long nhist = 0;
   nda::array<double, 2> hist;
@@ -507,6 +546,22 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     if (st.have_sigma) {
       nda::h5_read(it, "Sigma_p", st.Sig_p);
       nda::h5_read(it, "Sigma_h", st.Sig_h);
+    } else if (it.has_dataset("has_sigma")) {   // S7e checkpoint_sigma = "last": the separate Sigma file
+      long hs = 0;
+      h5::h5_read(it, "has_sigma", hs);
+      if (hs != 0) {
+        const std::string sf = sigma_file(file);
+        utils::check(std::filesystem::exists(sf), "gw_line restart: {} has no Sigma for iteration {} and {} is missing", file,
+                     st.iter, sf);
+        h5::file fs(sf, 'r');
+        h5::group gs(fs);
+        long si = -1;
+        h5::h5_read(gs, "iter", si);
+        utils::check(si == st.iter, "gw_line restart: {} holds Sigma of iteration {}, the checkpoint ends at {}", sf, si, st.iter);
+        nda::h5_read(gs, "Sigma_p", st.Sig_p);
+        nda::h5_read(gs, "Sigma_h", st.Sig_h);
+        st.have_sigma = true;
+      }
     }
     st.poles = read_poles(it, nk, nb);
     utils::check(st.F.extent(0) == nk and st.F.extent(1) == nb, "gw_line restart: F shape mismatch");
@@ -534,7 +589,10 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
   st.e_lumo     = sc[5];
   st.have_sigma = sc[6] > 0.5;
   bcast_array(comm, st.F);
-  if (st.have_sigma) {
+  if (st.have_sigma and kd != nullptr) {   // k-distributed: every rank receives the rows of its k only
+    st.Sig_p = kd_scatter_full(comm, *kd, st.Sig_p);
+    st.Sig_h = kd_scatter_full(comm, *kd, st.Sig_h);
+  } else if (st.have_sigma) {
     bcast_array(comm, st.Sig_p);
     bcast_array(comm, st.Sig_h);
   }
@@ -592,6 +650,55 @@ void pole_counts(pole_data_t const &pd, long &nmin, long &nmax, double &emin) {
   emin = pd.emin();
 }
 
+
+/**
+ * Memory plan of the q loops (S7e):
+ *   g        : q-group size of the Pi -> W stage (polarization + screened_interaction per group of g consecutive q);
+ *   w_host   : residues w of all q kept on the HOST (device runs whose w does not fit), Sigma then streams them per group;
+ *   gs_sigma : q-group size of the Sigma stage with host-resident residues (residues of gs_sigma q copied to the device
+ *              per group and sector; G~ rebuilt per group).
+ * Env overrides: COQUI_GWLINE_QGROUP, COQUI_GWLINE_W_HOST (0/1), COQUI_GWLINE_SIGMA_QGROUP. Host default: g = N_q,
+ * resident w (the Pi group of all q is 2.5 GB per rank for Si 4x4x4 nb 60 at 64 ranks and shrinks with the ranks).
+ * Device: w resident if it takes <= 35% of the free device memory (min over ranks); g = the largest group whose Pi group
+ * plus ~0.8 of it (W-stage sub-step buffers) fits in 80% of the free memory left by the Z blocks, the resident w, the
+ * device Sigma accumulator (N_k N_zeta_f nb^2, N_zeta_f <= 2 nz) and the Pi-stage factors at t_chunk 16; gs_sigma: the
+ * residues of gs_sigma q in <= 25% of the free memory.
+ */
+struct q_plan_t {
+  long g = 0, gs_sigma = 0;
+  bool w_host = false;
+};
+
+template <MEMORY_SPACE MEM>
+q_plan_t choose_q_plan(boost::mpi3::communicator &comm, aux_grid_t const &grid, long nk, long nq, long nz, long r_b, long nb) {
+  q_plan_t qp;
+  const double GB  = 1073741824.0;
+  const double blk = 16.0 * double(grid.max_block_size());
+  const double w   = double(nq) * r_b * blk;
+  qp.g             = nq;
+  qp.w_host        = false;
+  qp.gs_sigma      = nq;
+  if constexpr (MEM != HOST_MEMORY) {
+    double freeb   = double(utils::freemem_device_effective()) * 1048576.0;
+    freeb          = comm.all_reduce_value(freeb, boost::mpi3::min<>{});
+    qp.w_host      = (w > 0.35 * freeb);
+    const double fixed = double(nq) * blk + (qp.w_host ? 0.0 : w) + 16.0 * double(nk) * 2.0 * nz * nb * nb + 2.0 * nk * 16.0 * blk;
+    const double per_q = 1.8 * double(nz) * blk;
+    qp.g               = std::clamp(long((0.8 * freeb - fixed) / per_q), 1L, nq);
+    qp.gs_sigma        = std::clamp(long(0.25 * freeb / (double(r_b) * blk)), 1L, nq);
+    utils::check(0.8 * freeb - fixed > per_q, "gw_line: device memory: Z blocks + residues ({:.2f} GB, {}) + Sigma accumulator + "
+                                              "one q of the Pi group ({:.2f} GB) exceed 80% of the free device memory ({:.2f} GB); "
+                                              "use more GPUs",
+                 w / GB, qp.w_host ? "on the host" : "resident", per_q / GB, freeb / GB);
+    app_log(2, "  q plan (device): free {:.2f} GB (min over ranks), residues {:.2f} GB {}, fixed {:.2f} GB, Pi group per q {:.3f} GB",
+            freeb / GB, w / GB, qp.w_host ? "on the HOST" : "resident", fixed / GB, per_q / GB);
+  }
+  if (long v = detail::env_long("COQUI_GWLINE_QGROUP", 0); v > 0) qp.g = std::min(v, nq);
+  if (long v = detail::env_long("COQUI_GWLINE_W_HOST", -1); v >= 0) qp.w_host = (v != 0);
+  if (long v = detail::env_long("COQUI_GWLINE_SIGMA_QGROUP", 0); v > 0) qp.gs_sigma = std::min(v, nq);
+  if (not qp.w_host) qp.gs_sigma = nq;
+  return qp;
+}
 
 // ------------------------------------------------------------------------------------------------------------------
 // S7e instrumentation: per-iteration phase timers (min / avg / max over ranks) and host / device high-water memory
@@ -703,6 +810,9 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   const long nk = mf.nkpts(), nq = mf.nqpts(), nb = thc.nbnd(), Np = thc.Np();
   const double nelec = double(mf.nelec());
   const long nocc    = long(std::llround(nelec / 2.0));
+  const k_dist_t kd(nk, comm);                         // owner of Sigma(k) (S7e: k-distributed Sigma)
+  k_dist_t const *kdp = prm.sigma_kdist ? &kd : nullptr;
+  const bool sig_all  = (prm.checkpoint_sigma == "all");
   utils::check(std::abs(nelec - 2.0 * nocc) < 1e-8 and nocc > 0 and nocc < nb,
                "gw_line: need an even electron count with 0 < nelec/2 < nbnd (nelec {}, nbnd {})", nelec, nb);
 
@@ -757,7 +867,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   aux_grid_t grid(mpi, Np);
   propagator_t<MEM> prop(thc, grid);
   if (restart) {
-    st = read_state(comm, chk, nk, nb, zeta, res.history);
+    st = read_state(comm, chk, nk, nb, zeta, res.history, kdp);
     app_log(1, "  resumed from {}: {} iterations done, mu {:.6f} Ha", chk, st.iter, st.mu);
   } else {
     st.iter     = 0;
@@ -796,23 +906,30 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
           bos->zeta_nodes.size(), bos->gap, bp->rank, bh->rank, gp.rank, gh.rank, nz);
 
   dyson_layout_t lay(comm.size(), comm.rank(), nq, bos->zeta_nodes.size(), Np);
-  coulomb_blocks_t<MEM> Zb(thc, grid, lay.q_rng(), Timer);
+  // q groups of the Pi -> W stage (S7e): all q at once unless the Pi group does not fit (device) or COQUI_GWLINE_QGROUP
+  const q_plan_t qplan = choose_q_plan<MEM>(comm, grid, nk, nq, long(bos->zeta_nodes.size()), bos->rank, nb);
+  const q_groups_t qg(nq, qplan.g);
+  coulomb_blocks_t<MEM> Zb(thc, grid, qg.dyson_q_list(comm.size(), comm.rank(), long(bos->zeta_nodes.size()), Np), Timer);
+  if (qg.n > 1) app_log(1, "  q groups of the Pi -> W stage: {} groups of <= {} q (Pi group of all q does not fit)", qg.n, qg.g);
+  if (qplan.w_host)
+    app_log(1, "  residues w of all q on the HOST ({:.3f} GB per rank); Sigma streams them in groups of {} q", 16.0 * double(nq) *
+                   bos->rank * grid.max_block_size() / 1073741824.0, qplan.gs_sigma);
   const bool dev_fused   = (MEM != HOST_MEMORY) and detail::fused_hadamard();
   const double model_dev = grid.log(nk, nq, bos->zeta_nodes.size(), bos->rank,
                                     (prm.t_chunk > 0 ? prm.t_chunk : (MEM == HOST_MEMORY ? detail::host_t_chunk_default : 64)),
-                                    nb, -1, dev_fused);
+                                    nb, qg.g, dev_fused);
   lay.log();
   // host model (S7e): the kernel arrays (= model_dev on the host path) + the Sigma arrays of the driver (Sig_p, Sig_h,
   // Sp_new, Sh_new: 4 N_k N_zeta_f nb^2) + the per-chunk Sigma reduce buffers (2 N_k t_chunk nb^2) + the full Z(q) of the
   // Dyson slab
-  const double sig_bytes  = 16.0 * double(nk) * double(nz) * double(nb * nb);
+  const double sig_bytes  = 16.0 * double(prm.sigma_kdist ? kd.nloc(0) : nk) * double(nz) * double(nb * nb);
   const double model_host = (MEM == HOST_MEMORY ? model_dev : 0.0) + 4.0 * sig_bytes +
                             2.0 * 16.0 * double(nk) * double(detail::host_t_chunk_default) * double(nb * nb) +
-                            16.0 * double(lay.nq_loc) * double(Np) * double(Np);
-  app_log(2, "    driver host arrays: Sigma 4 x {:.4f} GB (replicated on every rank), full Z(q) {} x {:.4f} GB; host model "
-             "{:.4f} GB above the baseline RSS {:.4f} GB",
-          sig_bytes / 1073741824.0, lay.nq_loc, 16.0 * double(Np) * Np / 1073741824.0, model_host / 1073741824.0,
-          rss0 / 1073741824.0);
+                            16.0 * double(Zb.Z_full.extent(0)) * double(Np) * double(Np);
+  app_log(2, "    driver host arrays: Sigma 4 x {:.4f} GB ({}), full Z(q) {} x {:.4f} GB; host model {:.4f} GB above the "
+             "baseline RSS {:.4f} GB",
+          sig_bytes / 1073741824.0, prm.sigma_kdist ? "k-distributed, <= ceil(N_k / np) rows" : "replicated on every rank",
+          Zb.Z_full.extent(0), 16.0 * double(Np) * Np / 1073741824.0, model_host / 1073741824.0, rss0 / 1073741824.0);
 
   if (not restart) {
     Timer.start("phase_F");
@@ -820,7 +937,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     hartree_exchange<MEM>(prop, Zb, D, mf, grid, mpi, st.F, Timer);
     Timer.stop("phase_F");
     Timer.start("checkpoint");
-    write_state(comm, chk, st, nullptr);
+    write_state(comm, chk, st, nullptr, kdp, sig_all);
     Timer.stop("checkpoint");
     app_log(1, "  start: KS poles, mu0 = {:.6f} Ha (KS mid-gap), KS gap {:.4f} eV, F = V_H + Sigma_x[D_KS]", mu0,
             (lumo - homo) * HA_EV);
@@ -828,6 +945,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
 
   // ---------------------------------------------------------------------------------------------- the loop
   arr4_t Pi, w;
+  memory::array<HOST_MEMORY, ComplexType, 4> w_h;   // host-resident residues (q_plan_t::w_host)
   nda::array<ComplexType, 4> Sp_new, Sh_new;
   bool converged = false;
   while (st.iter < prm.niter) {
@@ -874,22 +992,36 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     auto toc = [&](char const *nm, double e0) { Timer.stop(nm); return Timer.elapsed(nm) - e0; };
 
     // 1. Pi at the bosonic nodes, W residues
-    double e0 = tic("phase_Pi");
-    polarization<MEM>(prop, st.poles, mf, grid, bos->zeta_nodes, *pi_p, *pi_h, prm.t_chunk, Pi, Timer);
-    const double tPi = toc("phase_Pi", e0);
-    e0 = tic("phase_W");
-    screened_interaction<MEM>(Pi, Zb, *bos, grid, mpi, w, Timer);
-    const double tW = toc("phase_W", e0);
+    double tPi = 0.0, tW = 0.0, e0 = 0.0;
+    for (long G = 0; G < qg.n; ++G) {   // one group (all q) unless the Pi group does not fit
+      e0 = tic("phase_Pi");
+      polarization<MEM>(prop, st.poles, mf, grid, bos->zeta_nodes, *pi_p, *pi_h, prm.t_chunk, Pi, Timer, sector_t::both,
+                        qg.q0(G), qg.size(G));
+      tPi += toc("phase_Pi", e0);
+      e0 = tic("phase_W");
+      screened_interaction<MEM>(Pi, Zb, *bos, grid, mpi, w, Timer, nullptr, qg.q0(G), qplan.w_host);
+      if (qplan.w_host) {   // this group's rows -> the host-resident residues of all q
+        if (w_h.extent(0) != nq or w_h.extent(1) != bos->rank)
+          w_h = memory::array<HOST_MEMORY, ComplexType, 4>(nq, bos->rank, grid.nP, grid.nQ);
+        w_h(nda::range(qg.q0(G), qg.q0(G) + qg.size(G)), nda::range::all, nda::range::all, nda::range::all) =
+           memory::to_memory_space<HOST_MEMORY>(w);
+      }
+      tW += toc("phase_W", e0);
+    }
 
     // 2. Sigma per sector at the dense nodes, mixing
     e0 = tic("phase_Sigma");
-    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer, sector_t::particle);
-    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sh_new, Timer, sector_t::hole);
+    if (qplan.w_host) w = arr4_t{};   // only the last group's rows: free them
+    auto const *whp = qplan.w_host ? &w_h : nullptr;
+    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer, sector_t::particle,
+                     prm.sigma_kdist, whp, qplan.gs_sigma);
+    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sh_new, Timer, sector_t::hole,
+                     prm.sigma_kdist, whp, qplan.gs_sigma);
     Timer.start("Sigma_mix");
     double dS = 0.0;
     if (st.have_sigma) {
       const double a = prm.mixing, b = 1.0 - prm.mixing;
-      for (long ik = 0; ik < nk; ++ik)
+      for (long ik = 0; ik < Sp_new.extent(0); ++ik)   // the rows held by this rank (all k, or the owned k)
         for (long iz = 0; iz < nz; ++iz)
           for (long i = 0; i < nb; ++i)
             for (long j = 0; j < nb; ++j) {
@@ -899,6 +1031,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
               Sp_new(ik, iz, i, j) = sp;
               Sh_new(ik, iz, i, j) = sh;
             }
+      if (prm.sigma_kdist) dS = comm.all_reduce_value(dS, boost::mpi3::max<>{});
     }
     st.Sig_p      = Sp_new;
     st.Sig_h      = Sh_new;
@@ -969,13 +1102,25 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     print_line(rec, tPi, tW, tS, tC, tF);
 
     Timer.start("checkpoint");
-    write_state(comm, chk, st, &rec);
+    write_state(comm, chk, st, &rec, kdp, sig_all);
     Timer.stop("checkpoint");
     Timer.stop("iteration");
-    if (comm.root() and std::filesystem::exists(chk))
-      app_log(1, "  checkpoint {}: {:.3f} GB after iteration {} (write {:.2f} s)", chk,
-              double(std::filesystem::file_size(chk)) / 1073741824.0, st.iter, Timer.elapsed("checkpoint") - ph0[std::distance(phase_names.begin(), std::find(phase_names.begin(), phase_names.end(), "checkpoint"))]);
-    report_iteration(comm, st.iter, ph0, phase_snapshot(Timer), rss0, model_host, model_dev, MEM != HOST_MEMORY);
+    if (comm.root() and std::filesystem::exists(chk)) {
+      const auto ic = std::distance(phase_names.begin(), std::find(phase_names.begin(), phase_names.end(), "checkpoint"));
+      const double sf = std::filesystem::exists(sigma_file(chk)) ? double(std::filesystem::file_size(sigma_file(chk))) : 0.0;
+      app_log(1, "  checkpoint {}: {:.3f} GB (+ Sigma file {:.3f} GB) after iteration {} (write {:.2f} s)", chk,
+              double(std::filesystem::file_size(chk)) / 1073741824.0, sf / 1073741824.0, st.iter, Timer.elapsed("checkpoint") - ph0[ic]);
+    }
+    // + the pole residues mirrored by the propagator and its host XV factors (S7e; they depend on the poles of the iteration)
+    report_iteration(comm, st.iter, ph0, phase_snapshot(Timer), rss0, model_host + prop.pole_bytes() + prop.xv_bytes(), model_dev,
+                     MEM != HOST_MEMORY);
+    {
+      const double xv = comm.all_reduce_value(prop.xv_bytes(), boost::mpi3::max<>{});
+      const long nxv  = comm.all_reduce_value(prop.n_xv, boost::mpi3::max<>{});
+      if (MEM == HOST_MEMORY)
+        app_log(2, "  propagator: G~ blocks in the XV form for {} of {} (k, sector) pairs (XV factors <= {:.3f} GB per rank)", nxv,
+                2 * nk, xv / 1073741824.0);
+    }
 
     if (rec.iter > 1 and dS < prm.conv_thr) {
       converged = true;
