@@ -709,8 +709,9 @@ constexpr double IDGL_K = 5.0;
 using floor_tab_t = std::vector<std::array<double, 3>>;
 // default closure (tol_gram_eps = 1 -> Gram cut 1e-8 at eps 1e-8); time_eps 1e-8 -> 3e-9, 1e-10 -> 3e-11 (lehmann; compressed
 // identical within 1.3x)
+// Mac 3e-9 {1.39, 0.97, 2.9e-3}, 3e-11 {4.4e-3, 5.7e-3, 3.1e-5}; rusty 3e-9 {0.84, 0.26, 2.8e-3}, 3e-11 {4.3e-3, 4.4e-3, 3.2e-5}
 const floor_tab_t floor_3e9  = {{0, 0, 0}, {1.39, 0.97, 2.91e-3}};
-const floor_tab_t floor_3e11 = {{0, 0, 0}, {4.35e-3, 5.69e-3, 3.08e-5}};
+const floor_tab_t floor_3e11 = {{0, 0, 0}, {4.35e-3, 5.69e-3, 3.23e-5}};
 
 namespace {
 /// gates (mu meV, gap meV, Sigma rel) of iteration it (0-based) from a floor table
