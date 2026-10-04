@@ -51,6 +51,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <random>
@@ -67,6 +68,8 @@
 #include "utilities/check.hpp"
 #include "utilities/Timer.hpp"
 #include "methods/GW_line/line_state.hpp"
+#include "methods/GW_line/blas_scope.hpp"
+#include "methods/GW_line/closure_device.hpp"
 
 namespace methods::gw_line {
 
@@ -113,6 +116,11 @@ struct closure_params_t {
   unsigned noise_seed = 0;
   std::vector<long> force_rgram, force_r1;
   std::vector<double> force_phi;
+  // S7g performance: BLAS threads inside the per-k closure (<= 0: untouched) and the linear-algebra drivers
+  long blas_threads      = 0;
+  std::string svd_driver = "gesvd";   ///< numerics::line_dlr::upfold_opts_t::svd_driver
+  std::string ueig       = "schur";   ///< numerics::line_dlr::upfold_opts_t::ueig
+  numerics::line_dlr::lapack_hooks_t const *hooks = nullptr;   ///< external (device) eigensolvers; null: host LAPACK
 
   numerics::line_dlr::upfold_opts_t upfold_opts(long ik) const {
     numerics::line_dlr::upfold_opts_t o;
@@ -123,6 +131,9 @@ struct closure_params_t {
     o.gram_cut   = gram_cut;
     o.svd_cut    = svd_cut;
     o.cut_window = cut_window;
+    o.svd_driver = svd_driver;
+    o.ueig       = ueig;
+    o.hooks      = hooks;
     if (ik >= 0) {
       if (phase_keep > 0.0 and ik < long(phi_prev.size())) {
         o.phi_prev   = phi_prev[ik];
@@ -183,6 +194,9 @@ struct closure_k_t {
   nda::array<ComplexType, 2> W;    ///< [nb, np] couplings
   double heldout = 0.0;            ///< held-out moment error of the upfolding
   upfold_diag_t diag;              ///< hard decisions of the upfolding (S7f)
+  /// S7g profile (s): moments, C0, Gram, SVD, U eigen, Lehmann eigen; U-eigen fallbacks to the Schur form
+  double t_mom = 0.0, t_c0 = 0.0, t_gram = 0.0, t_svd = 0.0, t_ueig = 0.0, t_leh = 0.0;
+  long ueig_fallback = 0;
 };
 
 /// python lehmann_from_sigma: moments of the total measure -> upfold_block -> eig of Htilde. ik: k index (per-k options,
@@ -190,6 +204,8 @@ struct closure_k_t {
 inline closure_k_t closure_k(nda::array<ComplexType, 2> const &Hrel, sigma_poles_t const &sp, closure_params_t const &p,
                              long ik = -1) {
   using namespace numerics::line_dlr;
+  using clk = std::chrono::steady_clock;
+  const auto t0 = clk::now();
   auto C = moments_from_poles(sp.w, sp.g, p.wp, p.K + 1);
   if (p.moment_noise > 0.0) {   // diagnostic: relative complex Gaussian noise on every moment, scale max|C^(0)|
     double c0 = 0.0;
@@ -199,10 +215,21 @@ inline closure_k_t closure_k(nda::array<ComplexType, 2> const &Hrel, sigma_poles
     std::normal_distribution<double> N01;
     for (auto &x : C) x += p.moment_noise * c0 * ComplexType(N01(gen), N01(gen));
   }
+  const auto t1 = clk::now();
   auto up = upfold_block(C, p.K, p.wp, p.upfold_opts(ik));
-  auto L  = lehmann(Hrel, up.d, up.W);
+  const auto t2 = clk::now();
+  auto L  = lehmann(Hrel, up.d, up.W, p.hooks);
+  const auto t3 = clk::now();
   auto dg = upfold_diag_t::from(up);
-  return closure_k_t{std::move(L.e), std::move(L.v), std::move(up.d), std::move(up.W), up.residual, dg};
+  closure_k_t out{std::move(L.e), std::move(L.v), std::move(up.d), std::move(up.W), up.residual, dg};
+  out.t_mom         = std::chrono::duration<double>(t1 - t0).count();
+  out.t_c0          = up.t_c0;
+  out.t_gram        = up.t_gram;
+  out.t_svd         = up.t_svd;
+  out.t_ueig        = up.t_ueig;
+  out.t_leh         = std::chrono::duration<double>(t3 - t2).count();
+  out.ueig_fallback = up.ueig_fallback;
+  return out;
 }
 
 /**
@@ -357,8 +384,11 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   for (auto nm : {"closure_upfold", "closure_gather", "closure_mu", "closure_compress"}) Timer.add(nm);
   closure_out_t out;
 
-  // 1. per owned k: sector fits -> moments -> upfold -> Lehmann
+  // 1. per owned k: sector fits -> moments -> upfold -> Lehmann (S7g: BLAS threads of the rank, p.blas_threads)
   Timer.start("closure_upfold");
+  using clk = std::chrono::steady_clock;
+  double prof[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // fit, moments, C0, Gram, SVD, U eigen, Lehmann, U-eigen fallbacks
+  blas_threads_scope_t blas_scope(p.blas_threads);
   std::vector<nda::array<double, 1>> e_loc(nk);
   std::vector<nda::array<ComplexType, 2>> v_loc(nk);
   const long ni = 2 + upfold_diag_t::nfields;
@@ -366,10 +396,14 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   info() = 0.0;
   for (long ik = rank; ik < nk; ik += np) {
     const long ks = sig_loc ? ik / np : ik;
+    const auto tf0 = clk::now();
     nda::array<ComplexType, 3> Sp(Sig_p(ks, all, all, all)), Sh(Sig_h(ks, all, all, all));
     auto sp = fit_sigma_sectors(bp, bh, zeta, Sp, Sh);
+    prof[0] += std::chrono::duration<double>(clk::now() - tf0).count();
     nda::array<ComplexType, 2> H(Hrel(ik, all, all));
     auto ck   = closure_k(H, sp, p, ik);
+    prof[1] += ck.t_mom; prof[2] += ck.t_c0; prof[3] += ck.t_gram; prof[4] += ck.t_svd; prof[5] += ck.t_ueig;
+    prof[6] += ck.t_leh; prof[7] += double(ck.ueig_fallback);
     e_loc[ik] = std::move(ck.e);
     v_loc[ik] = std::move(ck.v);
     info(ik, 0) = double(ck.d.size());
@@ -377,6 +411,16 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     ck.diag.pack(&info(ik, 2));
   }
   Timer.stop("closure_upfold");
+  {   // S7g: per-step profile of the closure (max over ranks of the per-rank sums over the owned k)
+    double pmax[8];
+    std::copy_n(prof, 8, pmax);
+    if (comm.size() > 1) comm.all_reduce_n(prof, 8, pmax, boost::mpi3::max<>{});
+    app_log(2, "          closure profile (s, max over ranks): fit {:.2f} moments {:.2f} C0 {:.2f} Gram {:.2f} SVD {:.2f} U-eigen "
+               "{:.2f} Lehmann {:.2f} | BLAS threads {} ({}), drivers {} / {}{}, U-eigen Schur fallbacks {}, device fallbacks "
+               "(rank 0, cumulative) {}",
+            pmax[0], pmax[1], pmax[2], pmax[3], pmax[4], pmax[5], pmax[6], p.blas_threads > 0 ? p.blas_threads : 0,
+            blas_scope.backend(), p.svd_driver, p.ueig, p.hooks ? " + GPU" : "", long(pmax[7]), device_lapack_failures());
+  }
 
   Timer.start("closure_gather");
   out.leh = gather_lehmann(comm, nk, nb, e_loc, v_loc);

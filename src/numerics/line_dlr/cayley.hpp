@@ -36,8 +36,10 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
+#include <functional>
 #include <limits>
 #include <numbers>
 #include <numeric>
@@ -49,8 +51,8 @@
 #include "nda/linalg/det_and_inverse.hpp"
 
 /*
- * LAPACK routines without an nda wrapper: Hermitian divide-and-conquer eigensolver (zheevd) and the complex Schur form
- * (zgees). Standard Fortran-77 signatures (LP64 integers, trailing hidden string lengths omitted as nda's own interface
+ * LAPACK routines without an nda wrapper: Hermitian divide-and-conquer eigensolver (zheevd), the complex Schur form
+ * (zgees), the divide-and-conquer SVD (zgesdd) and the LU solve (zgetrf / zgetrs). Standard Fortran-77 signatures (LP64 integers, trailing hidden string lengths omitted as nda's own interface
  * does); provided by OpenBLAS/Accelerate (Mac) and MKL (rusty).
  */
 namespace numerics::line_dlr::detail::f77 {
@@ -61,6 +63,12 @@ void zheevd_(const char *jobz, const char *uplo, const int *n, std::complex<doub
 void zgees_(const char *jobvs, const char *sort, int (*select)(const std::complex<double> *), const int *n,
             std::complex<double> *a, const int *lda, int *sdim, std::complex<double> *w, std::complex<double> *vs,
             const int *ldvs, std::complex<double> *work, const int *lwork, double *rwork, int *bwork, int *info);
+void zgesdd_(const char *jobz, const int *m, const int *n, std::complex<double> *a, const int *lda, double *s,
+             std::complex<double> *u, const int *ldu, std::complex<double> *vt, const int *ldvt, std::complex<double> *work,
+             const int *lwork, double *rwork, int *iwork, int *info);
+void zgetrf_(const int *m, const int *n, std::complex<double> *a, const int *lda, int *ipiv, int *info);
+void zgetrs_(const char *trans, const int *n, const int *nrhs, const std::complex<double> *a, const int *lda, const int *ipiv,
+             std::complex<double> *b, const int *ldb, int *info);
 }
 } // namespace numerics::line_dlr::detail::f77
 
@@ -131,6 +139,19 @@ inline double moment_bound_violation(nda::array<ComplexType, 3> const &C) { retu
 // ------------------------------------------------------------------------------------------------------------------
 // dense linear algebra helpers (F layout)
 // ------------------------------------------------------------------------------------------------------------------
+
+/**
+ * S7g: optional external drivers for the large dense problems of the closure (GW_line installs the cuSOLVER ones of
+ * methods/GW_line/cuda in device builds). Each returns false -- leaving its arguments untouched -- to fall back to the
+ * host LAPACK path; matrices with fewer than min_dim rows always stay on the host.
+ */
+struct lapack_hooks_t {
+  std::function<bool(cmatrix_F &, nda::array<double, 1> &)> heevd;   ///< A <- eigenvectors (ascending eigenvalues w)
+  std::function<bool(cmatrix_F &, nda::array<double, 1> &, cmatrix_F &, cmatrix_F &)> gesvd;   ///< A = P diag(s) Qh, square
+  std::function<bool(cmatrix_F &, cmatrix_F &)> lu_solve;            ///< B <- A^{-1} B (A may be overwritten on success)
+  long min_dim = 256;
+};
+
 namespace detail {
 
 /// Hermitian eigen-decomposition by zheevd: A is overwritten by the eigenvectors (columns), eigenvalues ascending.
@@ -156,6 +177,15 @@ inline nda::array<double, 1> herm_eig(cmatrix_F &A) {
   return lam;
 }
 
+/// herm_eig through the external driver when one is installed (and the matrix is large enough), else the host zheevd.
+inline nda::array<double, 1> herm_eig(cmatrix_F &A, lapack_hooks_t const *h) {
+  if (h and h->heevd and A.extent(0) >= h->min_dim) {
+    nda::array<double, 1> w(A.extent(0));
+    if (h->heevd(A, w)) return w;
+  }
+  return herm_eig(A);
+}
+
 /// Complex Schur form A = Z T Z^dagger (zgees, no sorting): returns diag(T); A is overwritten by T, Z is returned in Z.
 inline nda::array<ComplexType, 1> schur(cmatrix_F &A, cmatrix_F &Z) {
   const int n = int(A.extent(0));
@@ -176,6 +206,28 @@ inline nda::array<ComplexType, 1> schur(cmatrix_F &A, cmatrix_F &Z) {
   return w;
 }
 
+/// SVD A = P diag(s) Qh with all singular vectors by divide and conquer (zgesdd, jobz 'A'); A is destroyed.
+inline void svd_dc(cmatrix_F &A, nda::array<double, 1> &s, cmatrix_F &P, cmatrix_F &Qh) {
+  const int m = int(A.extent(0)), n = int(A.extent(1)), mn = std::min(m, n), mx = std::max(m, n);
+  s.resize(mn);
+  P.resize(m, m);
+  Qh.resize(n, n);
+  if (mn == 0) return;
+  int info = 0, lwork = -1;
+  ComplexType wq;
+  const long lrwork = std::max(1L, long(mn) * std::max(5L * mn + 7, 2L * mx + 2L * mn + 1));
+  nda::array<double, 1> rwork(lrwork);
+  nda::array<int, 1> iwork(8 * long(mn));
+  const char jobz = 'A';
+  f77::zgesdd_(&jobz, &m, &n, A.data(), &m, s.data(), P.data(), &m, Qh.data(), &n, &wq, &lwork, rwork.data(), iwork.data(),
+               &info);
+  lwork = std::max(1, int(std::real(wq)));
+  nda::array<ComplexType, 1> work(lwork);
+  f77::zgesdd_(&jobz, &m, &n, A.data(), &m, s.data(), P.data(), &m, Qh.data(), &n, work.data(), &lwork, rwork.data(),
+               iwork.data(), &info);
+  utils::check(info == 0, "cayley::svd_dc: zgesdd info = {}", info);
+}
+
 /// C = op(A) op(B) for F-layout matrices; op = 'N' or 'C' (conjugate transpose).
 inline cmatrix_F mm(cmatrix_F const &A, cmatrix_F const &B, char opA = 'N', char opB = 'N') {
   const long m = (opA == 'N') ? A.extent(0) : A.extent(1);
@@ -191,6 +243,92 @@ inline cmatrix_F mm(cmatrix_F const &A, cmatrix_F const &B, char opA = 'N', char
   else if (opA == 'N' and opB == 'C') nda::blas::gemm(one, A, nda::dagger(B), zero, C);
   else nda::blas::gemm(one, nda::dagger(A), nda::dagger(B), zero, C);
   return C;
+}
+
+/// statistics of unitary_eig_cayley (S7g)
+struct ueig_stats_t {
+  long nflag      = 0;     ///< columns refined by Rayleigh-Ritz
+  double res_max  = 0.0;   ///< max_l |U z_l - u_l z_l| after the refinement
+  bool fallback   = false; ///< the caller must use the Schur form instead
+};
+
+/**
+ * Eigen-decomposition U = Z diag(u) Z^dag of a unitary (normal) matrix through a HERMITIAN eigenproblem (S7g; replaces the
+ * complex Schur form, ~5x cheaper and well threaded): Hc = i (U - 1)^{-1} (U + 1) is Hermitian with eigenvalues
+ * cot(theta_l / 2) (u_l = e^{i theta_l}) and the eigenvectors of U. The map theta -> cot(theta/2) is INJECTIVE on the circle
+ * minus u = 1, so (near-)degenerate eigenvalues of Hc are (near-)degenerate u's: eigenvector mixing only happens between
+ * poles that are close (harmless for Sigma, exactly as in the Schur form). u_l = z_l^dag U z_l (Rayleigh quotients);
+ * columns with a residual |U z_l - u_l z_l| > tol (mixing of close poles, or loss of accuracy of the solve when an eigenvalue
+ * is close to u = 1) are refined by Rayleigh-Ritz in their span (Schur form of the small projected matrix). Returns false
+ * (stats.fallback) if (U - 1) is singular, more than max(32, n/4) columns are flagged or the refinement does not reach tol:
+ * the caller then uses the Schur form.
+ */
+inline bool unitary_eig_cayley(cmatrix_F const &U, nda::array<ComplexType, 1> &u, cmatrix_F &Z, double tol,
+                               ueig_stats_t &st, lapack_hooks_t const *h = nullptr) {
+  const int n = int(U.extent(0));
+  st = ueig_stats_t{};
+  u.resize(n);
+  Z.resize(n, n);
+  if (n == 0) return true;
+  cmatrix_F A(U), X(U);
+  for (long i = 0; i < n; ++i) {
+    A(i, i) -= 1.0;
+    X(i, i) += 1.0;
+  }
+  if (not(h and h->lu_solve and n >= h->min_dim and h->lu_solve(A, X))) {
+    nda::array<int, 1> ipiv(n);
+    int info = 0;
+    f77::zgetrf_(&n, &n, A.data(), &n, ipiv.data(), &info);
+    if (info != 0) { st.fallback = true; return false; }
+    const char tr = 'N';
+    f77::zgetrs_(&tr, &n, &n, A.data(), &n, ipiv.data(), X.data(), &n, &info);
+    utils::check(info == 0, "cayley::unitary_eig_cayley: zgetrs info = {}", info);
+  }
+  for (auto const &x : X)
+    if (not(std::isfinite(x.real()) and std::isfinite(x.imag()))) { st.fallback = true; return false; }
+  for (long j = 0; j < n; ++j)   // Z = Hermitian part of i X (lower triangle is enough for zheevd 'L')
+    for (long i = j; i < n; ++i) Z(i, j) = 0.5 * (ComplexType(0.0, 1.0) * X(i, j) + std::conj(ComplexType(0.0, 1.0) * X(j, i)));
+  herm_eig(Z, h);
+  auto UZ = mm(U, Z);
+  std::vector<double> res(n);
+  std::vector<long> F;
+  for (long l = 0; l < n; ++l) {
+    ComplexType q(0.0);
+    for (long i = 0; i < n; ++i) q += std::conj(Z(i, l)) * UZ(i, l);
+    u(l)     = q;
+    double r = 0.0;
+    for (long i = 0; i < n; ++i) r += std::norm(UZ(i, l) - q * Z(i, l));
+    res[l] = std::sqrt(r);
+    if (res[l] > tol) F.push_back(l);
+  }
+  st.nflag = long(F.size());
+  if (st.nflag > std::max(32L, long(n) / 4)) { st.fallback = true; return false; }
+  if (not F.empty()) {   // Rayleigh-Ritz in span(Z[:, F])
+    const long f = long(F.size());
+    cmatrix_F VF(n, f), UVF(n, f);
+    for (long c = 0; c < f; ++c)
+      for (long i = 0; i < n; ++i) {
+        VF(i, c)  = Z(i, F[c]);
+        UVF(i, c) = UZ(i, F[c]);
+      }
+    auto Ut = mm(VF, UVF, 'C', 'N');
+    cmatrix_F Zs;
+    auto w  = schur(Ut, Zs);
+    auto ZF = mm(VF, Zs);
+    auto UF = mm(UVF, Zs);
+    for (long c = 0; c < f; ++c) {
+      double r = 0.0;
+      for (long i = 0; i < n; ++i) {
+        Z(i, F[c]) = ZF(i, c);
+        r += std::norm(UF(i, c) - w(c) * ZF(i, c));
+      }
+      u(F[c])    = w(c);
+      res[F[c]]  = std::sqrt(r);
+    }
+  }
+  st.res_max = *std::max_element(res.begin(), res.end());
+  if (st.res_max > tol) { st.fallback = true; return false; }
+  return true;
 }
 
 } // namespace detail
@@ -236,6 +374,11 @@ struct upfold_opts_t {
   // attribution diagnostics (tests only): force the retained Gram rank, r1, or the terminal phase
   long force_rgram = -1, force_r1 = -1;
   double force_phi = std::numeric_limits<double>::quiet_NaN();
+  // S7g linear-algebra drivers (performance; results agree to roundoff-level effects, see notes S7g)
+  std::string svd_driver = "gesvd";   ///< SVD of D+ D-^dagger: "gesvd" (python / numpy path) | "gesdd" (divide and conquer)
+  std::string ueig       = "schur";   ///< eigenvectors of U: "schur" (zgees) | "cayley" (Hermitian Cayley image, zgees fallback)
+  double ueig_tol        = 1e-12;     ///< residual tolerance |U z - u z| of the "cayley" path (Rayleigh-Ritz above it)
+  lapack_hooks_t const *hooks = nullptr;   ///< external (device) drivers of the Gram eigen, SVD and Cayley path; null: host
 };
 
 /// Result of upfold_block: Sigma_c(z) = sum_l W[:, l] W[:, l]^dagger / (z - d_l), d mu-RELATIVE (sorted ascending).
@@ -260,6 +403,13 @@ struct upfold_result_t {
   double phi_tie      = 0.0;         ///< best coarse error of the OTHER local minima / the chosen one (>= 1; ~1 = near tie)
   long n_rejected     = 0;           ///< coarse phases rejected by reject_unity
   bool phi_kept       = false;       ///< phase continuity kept the basin of phi_prev over the best coarse phase
+  // S7g profile (wall seconds of this call) and statistics of the "cayley" eigen path
+  double t_c0 = 0.0, t_gram = 0.0, t_svd = 0.0, t_ueig = 0.0;   ///< C0 + Chat | Toeplitz + Gram eigen + X | SVD + R | realizations
+  long n_realize      = 0;           ///< realizations U(phi) -> (u, W) (1 if n_free = 0)
+  long ueig_nflag     = 0;           ///< "cayley": columns refined by Rayleigh-Ritz (max over realizations)
+  long ueig_fallback  = 0;           ///< "cayley": realizations that fell back to the Schur form
+  double ueig_res     = 0.0;         ///< "cayley": max residual |U z - u z| (max over realizations)
+  bool svd_reference  = false;       ///< a fast SVD driver found n_free > 0 and the SVD was redone with zgesvd
 };
 
 namespace detail {
@@ -302,7 +452,19 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
   utils::check(C.extent(0) >= K + 2, "cayley::upfold_block: need moments 0..K+1 (K = {}), got {}", K, C.extent(0));
   utils::check(K >= 1 and nphi >= 1, "cayley::upfold_block: invalid K = {} or nphi = {}", K, nphi);
   utils::check(o.cut_window >= 1.0, "cayley::upfold_block: cut_window must be >= 1");
+  utils::check(o.svd_driver == "gesvd" or o.svd_driver == "gesdd", "cayley::upfold_block: svd_driver must be \"gesvd\" or "
+               "\"gesdd\" (got \"{}\")", o.svd_driver);
+  utils::check(o.ueig == "schur" or o.ueig == "cayley", "cayley::upfold_block: ueig must be \"schur\" or \"cayley\" (got \"{}\")",
+               o.ueig);
   upfold_result_t res;
+  using clock_t_ = std::chrono::steady_clock;
+  auto tlap      = clock_t_::now();
+  auto lap       = [&tlap]() {
+    const auto t = clock_t_::now();
+    const double x = std::chrono::duration<double>(t - tlap).count();
+    tlap = t;
+    return x;
+  };
 
   // 1. normalize C^(0) = B B^dag
   cmatrix_F V0(n, n);
@@ -333,11 +495,13 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
       for (long j = 0; j < r; ++j) Chat(m, i, j) = Ch(i, j);
   }
 
+  res.t_c0 = lap();
+
   // 2. Gram factorization of the block Toeplitz matrix
   auto T = block_toeplitz(Chat, K);
   utils::check(T.size() > 0, "cayley::upfold_block: moments are empty (C0 rank {})", r);
   for (auto const &x : T) utils::check(std::isfinite(x.real()) and std::isfinite(x.imag()), "cayley::upfold_block: non-finite moments");
-  auto lamT = detail::herm_eig(T);                                 // T now holds the eigenvectors (ascending eigenvalues)
+  auto lamT = detail::herm_eig(T, o.hooks);                        // T now holds the eigenvectors (ascending eigenvalues)
   const long nT = lamT.size();
   const double lamT_max = *std::max_element(lamT.begin(), lamT.end());
   res.gram_lam_min = *std::min_element(lamT.begin(), lamT.end()) / lamT_max;
@@ -372,25 +536,45 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
     const double s = std::sqrt(std::max(lam, 0.0));
     for (long j = 0; j < nT; ++j) X(a, j) = s * std::conj(T(j, ie));
   }
+  res.t_gram = lap();
   cmatrix_F Dm = X(range::all, range(0, K * r)), Dp = X(range::all, range(r, (K + 1) * r));
   auto M = detail::mm(Dp, Dm, 'N', 'C');                            // Nr x Nr
   cmatrix_F P(Nr, Nr), Qh(Nr, Nr);
   nda::array<double, 1> sv(Nr);
-  nda::lapack::gesvd(M, sv, P, Qh);
-  std::vector<double> xs(Nr);
-  for (long i = 0; i < Nr; ++i) xs[i] = (sv(0) > 0.0) ? sv(i) / sv(0) : 0.0;
-  res.svd_margin = std::numeric_limits<double>::infinity();
-  for (long i = 0; i < Nr; ++i) {
-    if (xs[i] > 0.1 * tol_svd and xs[i] < 10.0 * tol_svd) ++res.svd_near;
-    if (xs[i] > 0.0) res.svd_margin = std::min(res.svd_margin, std::abs(std::log10(xs[i] / tol_svd)));
+  // S7g: fast drivers (zgesdd, device hooks). If the SVD has a free block (r1 < Nr), the pairing of its (near-)null left
+  // and right singular vectors -- hence P0 Q0^dagger and the terminal-phase scan -- is driver dependent: the SVD is then
+  // redone with the reference driver (zgesvd, the pre-S7g path), so the fast drivers only act when n_free = 0.
+  const bool fast = (o.svd_driver == "gesdd") or (o.hooks and o.hooks->gesvd and Nr >= o.hooks->min_dim);
+  cmatrix_F Mref;
+  if (fast) Mref = M;
+  if (not(o.hooks and o.hooks->gesvd and Nr >= o.hooks->min_dim and o.hooks->gesvd(M, sv, P, Qh))) {
+    if (o.svd_driver == "gesdd") detail::svd_dc(M, sv, P, Qh);
+    else nda::lapack::gesvd(M, sv, P, Qh);
   }
-  long r1 = detail::cut_boundary(xs, tol_svd, o.svd_cut == "smooth" ? "hard" : o.svd_cut, o.cut_window);
-  if (o.svd_cut == "hard") {   // python: count of sv > tol_svd s0 (identical to the boundary for a descending sequence)
-    r1 = 0;
-    for (long i = 0; i < Nr; ++i)
-      if (sv(i) > tol_svd * sv(0)) ++r1;
+  auto svd_rank = [&]() {
+    std::vector<double> xs(Nr);
+    for (long i = 0; i < Nr; ++i) xs[i] = (sv(0) > 0.0) ? sv(i) / sv(0) : 0.0;
+    res.svd_near   = 0;
+    res.svd_margin = std::numeric_limits<double>::infinity();
+    for (long i = 0; i < Nr; ++i) {
+      if (xs[i] > 0.1 * tol_svd and xs[i] < 10.0 * tol_svd) ++res.svd_near;
+      if (xs[i] > 0.0) res.svd_margin = std::min(res.svd_margin, std::abs(std::log10(xs[i] / tol_svd)));
+    }
+    long r = detail::cut_boundary(xs, tol_svd, o.svd_cut == "smooth" ? "hard" : o.svd_cut, o.cut_window);
+    if (o.svd_cut == "hard") {   // python: count of sv > tol_svd s0 (identical to the boundary for a descending sequence)
+      r = 0;
+      for (long i = 0; i < Nr; ++i)
+        if (sv(i) > tol_svd * sv(0)) ++r;
+    }
+    if (o.force_r1 >= 0) r = std::min(o.force_r1, Nr);
+    return r;
+  };
+  long r1 = svd_rank();
+  if (fast and r1 < Nr) {
+    nda::lapack::gesvd(Mref, sv, P, Qh);
+    r1               = svd_rank();
+    res.svd_reference = true;
   }
-  if (o.force_r1 >= 0) r1 = std::min(o.force_r1, Nr);
   res.r1     = r1;
   res.n_free = Nr - r1;
   cmatrix_F P1 = P(range::all, range(0, r1)), Q1h = Qh(range(0, r1), range::all);
@@ -404,6 +588,7 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
   for (long i = 0; i < n; ++i)
     for (long j = 0; j < n; ++j) Cheld(i, j) = C(K + 1, i, j);
   const double nheld = detail::frob(Cheld);
+  res.t_svd = lap();
 
   struct realization_t {
     double err;
@@ -416,7 +601,17 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
     for (long j = 0; j < Nr; ++j)
       for (long i = 0; i < Nr; ++i) U(i, j) = A1(i, j) + (res.n_free > 0 ? eph * A0(i, j) : ComplexType(0.0));
     cmatrix_F Z;
-    auto u = detail::schur(U, Z);
+    nda::array<ComplexType, 1> u;
+    ++res.n_realize;
+    bool done = false;
+    if (o.ueig == "cayley") {
+      detail::ueig_stats_t st;
+      done           = detail::unitary_eig_cayley(U, u, Z, o.ueig_tol, st, o.hooks);
+      res.ueig_nflag = std::max(res.ueig_nflag, st.nflag);
+      if (done) res.ueig_res = std::max(res.ueig_res, st.res_max);
+      else ++res.ueig_fallback;
+    }
+    if (not done) u = detail::schur(U, Z);
     auto W = detail::mm(R, Z);
     cmatrix_F Wu(n, Nr);
     for (long l = 0; l < Nr; ++l) {
@@ -484,6 +679,7 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
   }
   res.phi      = phi_best;
   res.residual = best.err;
+  res.t_ueig   = lap();
 
   // 3. poles (mu-relative), sorted ascending
   std::vector<double> dl(Nr);
@@ -601,10 +797,10 @@ struct lehmann_t {
 };
 
 inline lehmann_t lehmann(nda::array<ComplexType, 2> const &Hrel, nda::array<double, 1> const &d,
-                         nda::array<ComplexType, 2> const &W) {
+                         nda::array<ComplexType, 2> const &W, lapack_hooks_t const *hooks = nullptr) {
   const long n = Hrel.extent(0);
   cmatrix_F Ht(upfolded_hamiltonian(Hrel, d, W));
-  auto e     = detail::herm_eig(Ht);
+  auto e     = detail::herm_eig(Ht, hooks);
   const long M = e.size();
   lehmann_t out{e, nda::array<ComplexType, 2>(n, M)};
   for (long i = 0; i < n; ++i)

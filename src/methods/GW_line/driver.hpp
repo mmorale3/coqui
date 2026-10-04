@@ -56,6 +56,16 @@
  *                       S7f closure options (closure.hpp closure_params_t, cayley.hpp upfold_opts_t): SVD cutoff, Gram /
  *                       SVD cut placement ("gap": at the largest eigenvalue ratio within a window of the tolerance;
  *                       "smooth": smooth-step weights of the Gram rows in the window), phase continuity (> 0)
+ *   closure_threads = -1, closure_svd = "gesvd", closure_ueig = "schur"
+ *                       S7g closure performance: BLAS threads of the per-k host closure (-1 = auto: the cores of the rank
+ *                       (SLURM_CPUS_PER_TASK, else affinity / node ranks) in device runs, untouched in host runs where the
+ *                       ranks fill the cores; 0 = untouched; n > 0 = n), SVD driver of D+ D-^dagger ("gesdd" = divide and
+ *                       conquer), eigenvectors of the unitary U ("cayley" = Hermitian eigenproblem of i (U-1)^{-1} (U+1)
+ *                       with Rayleigh-Ritz refinement and a Schur fallback; cayley.hpp unitary_eig_cayley)
+ *   closure_device = "off", closure_dev_svd = "gesvd"
+ *                       S7g: the Gram / Cayley / Lehmann Hermitian eigenproblems, the LU solve of the "cayley" path and the
+ *                       SVD on the GPU (cuSOLVER, cuda/gw_line_lapack.cu; CUDA builds; "auto" = in device runs), each call
+ *                       falling back to the host LAPACK on any device failure (counted in the closure profile line)
  *   debug_noise_h0 = 0, debug_noise_seed = 0, debug_noise_sigma = 0, debug_noise_iter = 1, bases_file = ""
  *                       diagnostics: relative Hermitian noise on H0, or relative noise on Sigma at the nodes of iteration
  *                       debug_noise_iter (noise-floor meter, test [.scf_noise]); real-pole bases read from a file instead of built (parity test: the
@@ -129,6 +139,11 @@ struct gw_line_params_t {
   std::string closure_svd_cut = "hard";  ///< S7f: SVD cut "hard" | "gap"
   double closure_cut_window = 10.0;      ///< S7f: window factor of the gap / smooth cuts
   double phase_keep = 0.0;               ///< S7f: > 0 = phase continuity (keep the previous phi* basin within this factor)
+  long closure_threads = -1;             ///< S7g: BLAS threads of the host closure (-1 auto: device runs the rank's cores, host runs untouched; 0 untouched)
+  std::string closure_svd  = "gesvd";    ///< S7g: SVD driver of the upfolding "gesvd" | "gesdd"
+  std::string closure_ueig = "schur";    ///< S7g: eigenvectors of U "schur" (zgees) | "cayley" (Hermitian Cayley image)
+  std::string closure_device = "off";    ///< S7g: cuSOLVER eigensolvers/SVD in the closure "auto" (device runs) | "on" | "off"
+  std::string closure_dev_svd = "gesvd"; ///< S7g: device SVD "gesvd" | "gesvdp" (polar decomposition)
   double debug_noise_h0 = 0.0;           ///< diagnostics: relative Hermitian Gaussian noise on H0 (seed debug_noise_seed)
   long debug_noise_seed = 0;
   double debug_noise_sigma = 0.0;        ///< diagnostics: relative noise on Sigma at the nodes (before mixing) ...

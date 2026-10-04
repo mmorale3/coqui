@@ -37,6 +37,8 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <sstream>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -47,6 +49,7 @@
 #include "nda/h5.hpp"
 #include "nda/nda.hpp"
 #include "numerics/line_dlr/cayley.hpp"
+#include "numerics/line_dlr/tests/closure_bench.hpp"
 
 namespace bdft_tests {
 
@@ -375,6 +378,20 @@ TEST_CASE("cayley_chemical_potential", "[numerics][cayley]") {
   CHECK(std::abs(r.e_lumo - el) <= 1e-14);
   CHECK(std::abs(r.N - N_py) <= 1e-12);
   CHECK(r.gap > 0.4);                                   // the wide gap, not the 1.5e-5 Ha noise split (which has better N)
+}
+
+// =======================================================================
+//  5. (S7g, hidden) closure profile at production size (closure_bench.hpp); host LAPACK only here, the device variants
+//     run from test_gw_line_device "[.closure_bench_dev]"
+// =======================================================================
+TEST_CASE("cayley_closure_bench", "[.closure_bench]") { closure_bench::run(nullptr, nullptr); }
+
+// S7g: the Hermitian ("cayley") eigenvectors of U and the divide-and-conquer SVD vs the python path (schur + gesvd)
+TEST_CASE("cayley_ueig_ab", "[numerics][cayley]") {
+  CHECK(closure_bench::ab_small(nullptr, "gesvd") <= 1e-11);
+  CHECK(closure_bench::ab_small(nullptr, "gesdd") <= 1e-11);
+  // n_free > 0 (terminal-phase scan): the fast SVD driver hands over to zgesvd (driver-dependent free block)
+  CHECK(closure_bench::ab_small(nullptr, "gesdd", 160) <= 1e-9);
 }
 
 } // namespace bdft_tests

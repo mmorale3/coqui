@@ -74,6 +74,8 @@
 #include "numerics/line_dlr/line_basis.hpp"
 #include "numerics/line_dlr/bosonic_basis.hpp"
 #include "methods/GW_line/proc_grid.hpp"
+#include "methods/GW_line/closure_device.hpp"
+#include "numerics/line_dlr/tests/closure_bench.hpp"
 #include "methods/GW_line/line_state.hpp"
 #include "methods/GW_line/propagators.hpp"
 #include "methods/GW_line/polarization.hpp"
@@ -495,6 +497,19 @@ void run_bench() {
                "ranks) {:.3f} GB: Pi stage {:.3f}, W stage {:.3f}, Sigma stage {:.3f} GB", model_peak / 1073741824.0,
             hw_max / 1073741824.0, hw_stage[0] / 1073741824.0, hw_stage[1] / 1073741824.0, hw_stage[2] / 1073741824.0);
   }
+}
+
+// S7g: the closure's dense linear algebra through the cuSOLVER hooks (device builds) vs the host python path
+TEST_CASE("gw_line_closure_device_ab", "[gw_line][device]") {
+  auto const *h0 = methods::gw_line::device_lapack_hooks(0);
+  if (not h0) return;   // host build: nothing to compare
+  CHECK(closure_bench::ab_small(h0, "gesvd") <= 1e-11);
+  CHECK(closure_bench::ab_small(methods::gw_line::device_lapack_hooks(1), "gesvd") <= 1e-11);
+}
+
+// S7g (hidden): the closure profile at production size with the device hooks (closure_bench.hpp; run with 1 rank)
+TEST_CASE("gw_line_closure_bench_dev", "[.closure_bench_dev]") {
+  closure_bench::run(methods::gw_line::device_lapack_hooks(0), methods::gw_line::device_lapack_hooks(1));
 }
 
 } // namespace
