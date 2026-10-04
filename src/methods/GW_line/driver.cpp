@@ -1044,16 +1044,16 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   dyson_layout_t lay(comm.size(), comm.rank(), nq, bos->zeta_nodes.size(), Np);
   // q groups of the Pi -> W stage (S7e): all q at once unless the Pi group does not fit (device) or COQUI_GWLINE_QGROUP
   const q_plan_t qplan = choose_q_plan<MEM>(comm, grid, nk, nq, long(bos->zeta_nodes.size()), bos->rank, nb);
-  const q_groups_t qg(nq, qplan.g);
+  const q_groups_t qg(nq, qplan.g, qminus_list(mf));   // pair-closed groups (W pairing q <-> -q, screened.hpp)
   coulomb_blocks_t<MEM> Zb(thc, grid, qg.dyson_q_list(comm.size(), comm.rank(), long(bos->zeta_nodes.size()), Np), Timer);
-  if (qg.n > 1) app_log(1, "  q groups of the Pi -> W stage: {} groups of <= {} q (Pi group of all q does not fit)", qg.n, qg.g);
+  if (qg.n > 1) app_log(1, "  q groups of the Pi -> W stage: {} groups of <= {} q (Pi group of all q does not fit)", qg.n, qg.max_size());
   if (qplan.w_host)
     app_log(1, "  residues w of all q on the HOST ({:.3f} GB per rank); Sigma streams them in groups of {} q", 16.0 * double(nq) *
                    bos->rank * grid.max_block_size() / 1073741824.0, qplan.gs_sigma);
   const bool dev_fused   = (MEM != HOST_MEMORY) and detail::fused_hadamard();
   const double model_dev = grid.log(nk, nq, bos->zeta_nodes.size(), bos->rank,
                                     (prm.t_chunk > 0 ? prm.t_chunk : (MEM == HOST_MEMORY ? detail::host_t_chunk_default : 64)),
-                                    nb, qg.g, dev_fused);
+                                    nb, qg.max_size(), dev_fused);
   lay.log();
   // host model (S7e): the kernel arrays (= model_dev on the host path) + the Sigma arrays of the driver (Sig_p, Sig_h,
   // Sp_new, Sh_new: 4 N_k N_zeta_f nb^2) + the per-chunk Sigma reduce buffers (2 N_k t_chunk nb^2) + the full Z(q) of the
@@ -1132,15 +1132,16 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     for (long G = 0; G < qg.n; ++G) {   // one group (all q) unless the Pi group does not fit
       e0 = tic("phase_Pi");
       polarization<MEM>(prop, st.poles, mf, grid, bos->zeta_nodes, *pi_p, *pi_h, prm.t_chunk, Pi, Timer, sector_t::both,
-                        qg.q0(G), qg.size(G));
+                        qg.rows(G));
       tPi += toc("phase_Pi", e0);
       e0 = tic("phase_W");
-      screened_interaction<MEM>(Pi, Zb, *bos, grid, mpi, w, Timer, nullptr, qg.q0(G), qplan.w_host);
+      screened_interaction<MEM>(Pi, Zb, *bos, grid, mpi, w, Timer, nullptr, qg.rows(G), qplan.w_host);
       if (qplan.w_host) {   // this group's rows -> the host-resident residues of all q
         if (w_h.extent(0) != nq or w_h.extent(1) != bos->rank)
           w_h = memory::array<HOST_MEMORY, ComplexType, 4>(nq, bos->rank, grid.nP, grid.nQ);
-        w_h(nda::range(qg.q0(G), qg.q0(G) + qg.size(G)), nda::range::all, nda::range::all, nda::range::all) =
-           memory::to_memory_space<HOST_MEMORY>(w);
+        auto wg = memory::to_memory_space<HOST_MEMORY>(w);
+        for (long i = 0; i < qg.size(G); ++i)
+          w_h(qg.rows(G)[i], nda::range::all, nda::range::all, nda::range::all) = wg(i, nda::range::all, nda::range::all, nda::range::all);
       }
       tW += toc("phase_W", e0);
     }

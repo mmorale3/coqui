@@ -174,25 +174,26 @@ void run_s7e(std::string const &fixture) {
       polarization<HOST_MEMORY>(prop, pd, *mf, grid, zb, G.pi_p, G.pi_h, 8, Pi_x, T);
     }
     const double dPi = rel(Pi_x, Pi_c);
-    // q groups (3, 3, 2 for N_q = 8): Pi rows and the residues of a grouped Pi -> W stage vs all q at once
+    // q groups of <= 3 (3, 3, 2 for N_q = 8 on lih222; pair-closed {q, -q} units on lih223): Pi rows and the residues of a
+    // grouped Pi -> W stage vs all q at once
     double dPg = 0.0, dwg = 0.0;
     {
-      const q_groups_t qg(nq, 3);
+      const q_groups_t qg(nq, 3, qminus_list(*mf));
       coulomb_blocks_t<HOST_MEMORY> Zg(thc, grid, qg.dyson_q_list(comm.size(), comm.rank(), zb.size(), Np), T);
       memory::array<HOST_MEMORY, ComplexType, 4> Pg, wg, Pa(Pi_c), wa;
       screened_interaction<HOST_MEMORY>(Pa, Zb, basis, grid, *mpi, wa, T);
       for (long ig = 0; ig < qg.n; ++ig) {
         {
           env_guard e("COQUI_GWLINE_GT_XV", "0");
-          polarization<HOST_MEMORY>(prop, pd, *mf, grid, zb, G.pi_p, G.pi_h, 8, Pg, T, sector_t::both, qg.q0(ig), qg.size(ig));
+          polarization<HOST_MEMORY>(prop, pd, *mf, grid, zb, G.pi_p, G.pi_h, 8, Pg, T, sector_t::both, qg.rows(ig));
         }
         REQUIRE(Pg.extent(0) == qg.size(ig));
         double d = 0.0;
         for (long r = 0; r < qg.size(ig); ++r)
           d = std::max(d, max_diff3(nda::array<ComplexType, 3>(Pg(r, nda::ellipsis{})),
-                                    nda::array<ComplexType, 3>(Pi_c(qg.q0(ig) + r, nda::ellipsis{}))));
+                                    nda::array<ComplexType, 3>(Pi_c(qg.rows(ig)[r], nda::ellipsis{}))));
         dPg = std::max(dPg, d);
-        screened_interaction<HOST_MEMORY>(Pg, Zg, basis, grid, *mpi, wg, T, nullptr, qg.q0(ig));
+        screened_interaction<HOST_MEMORY>(Pg, Zg, basis, grid, *mpi, wg, T, nullptr, qg.rows(ig), false);
       }
       dPg = comm.all_reduce_value(dPg, mpi3::max<>{}) / comm.all_reduce_value(max_abs3(Pi_c), mpi3::max<>{});
       dwg = rel(wg, wa);
@@ -291,3 +292,6 @@ void run_s7e(std::string const &fixture) {
 } // namespace
 
 TEST_CASE("gw_line_s7e_lih222", "[gw_line][s7e]") { run_s7e("qe_lih222"); }
+
+// q != -q mesh (2x2x3): pair-closed q groups of <= 3, host-resident residue groups with the hole rows of -q
+TEST_CASE("gw_line_s7e_lih223", "[gw_line][s7e]") { run_s7e("qe_lih223"); }

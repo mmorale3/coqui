@@ -209,23 +209,61 @@ struct w_plan_t {
 };
 
 /**
- * q groups of the Pi -> W stage (S7e, plan 6.3(b)): q in [0, N_q) in groups of g consecutive q (the last one shorter).
- * Per group: Pi of the group (polarization with q0, g; the A, B factors are rebuilt), then W and the residues of its q
- * (screened_interaction with q0). The Pi group then holds g N_zeta blocks instead of N_q N_zeta (device: 172 GB for
- * Si 4x4x4 nb 60, Np 739 on one GPU). dyson_q_list: the absolute q's this rank Dyson-solves over all groups (the full
- * Z(q) coulomb_blocks_t must keep).
+ * q groups of the Pi -> W stage (S7e, plan 6.3(b)). Per group: Pi of the group (polarization with the group's q list; the
+ * A, B factors are rebuilt), then W and the residues of its q (screened_interaction with the list). The Pi group then holds
+ * g N_zeta blocks instead of N_q N_zeta (device: 172 GB for Si 4x4x4 nb 60, Np 739 on one GPU).
+ * PAIR-CLOSED (fix of 2026-10-04): the residues of q are fitted from W(q) and W(-q)^T (screened.hpp, notes section 3.3),
+ * so every group contains -q with q. One group (g >= N_q): all q in order 0..N_q-1. Several groups: the units {q} (q = -q)
+ * and {q, -q} in the order of their smallest q, packed greedily into groups of <= max(g, 2) q (a pair is never split; a
+ * unit that does not fit opens the next group). On meshes with q = -q for every q (2x2x2, 2x1x1) these are the old
+ * groups of g consecutive q. dyson_q_list: the absolute q's this rank Dyson-solves over all groups (the full Z(q)
+ * coulomb_blocks_t must keep).
  */
 struct q_groups_t {
   long nq = 0, g = 0, n = 0;
+  std::vector<std::vector<long>> qs;   ///< absolute q of each group (row order of Pi / W of the group)
   q_groups_t() = default;
-  q_groups_t(long nq_, long g_) : nq(nq_), g(std::clamp(g_, 1L, nq_)) { n = (nq + g - 1) / g; }
-  long q0(long G) const { return G * g; }
-  long size(long G) const { return std::min(g, nq - G * g); }
+  /// qminus: -q of every q (mf::MF::qminus, see qminus_list in screened.hpp)
+  q_groups_t(long nq_, long g_, std::vector<long> const &qminus) : nq(nq_), g(std::clamp(g_, 1L, nq_)) {
+    utils::check(long(qminus.size()) == nq, "q_groups_t: qminus has {} entries for {} q", long(qminus.size()), nq);
+    if (g >= nq) {
+      qs.emplace_back(nq);
+      for (long q = 0; q < nq; ++q) qs[0][q] = q;
+    } else {
+      std::vector<char> placed(nq, 0);
+      std::vector<long> cur;
+      for (long q = 0; q < nq; ++q) {
+        if (placed[q]) continue;
+        const long qm = qminus[q];
+        utils::check(qm >= 0 and qm < nq and qminus[qm] == q, "q_groups_t: qminus is not an involution at q = {}", q);
+        const long u = (qm == q) ? 1 : 2;
+        if (not cur.empty() and long(cur.size()) + u > g) {
+          qs.push_back(cur);
+          cur.clear();
+        }
+        cur.push_back(q);
+        placed[q] = 1;
+        if (u == 2) {
+          cur.push_back(qm);
+          placed[qm] = 1;
+        }
+      }
+      if (not cur.empty()) qs.push_back(cur);
+    }
+    n = qs.size();
+  }
+  long size(long G) const { return qs[G].size(); }
+  std::vector<long> const &rows(long G) const { return qs[G]; }
+  long max_size() const {
+    long m = 0;
+    for (auto const &v : qs) m = std::max(m, long(v.size()));
+    return m;
+  }
   std::vector<long> dyson_q_list(long np, long rank, long nz, long Np) const {
     std::vector<long> v;
     for (long G = 0; G < n; ++G) {
       dyson_layout_t lay(np, rank, size(G), nz, Np);
-      for (long q = lay.q_first; q < lay.q_first + lay.nq_loc; ++q) v.push_back(q0(G) + q);
+      for (long q = lay.q_first; q < lay.q_first + lay.nq_loc; ++q) v.push_back(qs[G][q]);
     }
     return v;
   }

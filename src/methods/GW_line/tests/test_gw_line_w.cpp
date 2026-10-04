@@ -26,6 +26,7 @@
  *   (a) W at the nodes vs the Dyson of the gathered full Pi done here with nda::inverse:            <= 1e-12
  *   (b) residues vs bosonic_basis_t::fit (gelss) of the gathered full W at the nodes, compared as pole sums on the nodes,
  *       the 12 ray points and the Matsubara nodes (the raw residues are not unique at ~1e-5, see below):  <= 1e-10
+ *       (q != -q: the paired fit / evaluation fit(zeta, W(q), W(-q)), eval(w(q), w(-q), z), notes section 3.3)
  *   (c) the fit evaluated at zeta = i nu_n vs CoQui's own W^c(q, i nu_n) (scr_coulomb_t "rpa", "ignore_g0", KS G at
  *       beta = 1000, DLR IAFT; dW_qtPQ -> tau_to_w_PHsym) on all bosonic Matsubara nodes of the IAFT grid: <= 1e-8 plus
  *       2 max|Pi - Pi^T| / max|Pi| of the exact Pi(q, i nu) (CoQui's PH-symmetric half tau grid treats Pi(beta - tau) =
@@ -33,6 +34,9 @@
  *       exact Dyson(Pi(i nu_n)) <= 1e-8; CoQui W^c = Dyson(CoQui Pi) <= 1e-10; symmetric parts of CoQui Pi vs exact <= 1e-8
  *   (d) W^>(zeta) = sum_j w_j/(zeta - nu_j) vs the positive-pole part of the exact Casida W_dyn at 12 mu-relative points
  *       on the upper rays:                                                                           <= 1e-8
+ *   (e) W^<(q, zeta)^T = -sum_j w_j(-q)/(zeta + nu_j) (eval_poles hole, transposed: the residues of the PARTNER -q) vs the
+ *       transposed negative-pole part of the exact Casida W_dyn(q) at the 12 points:                <= 1e-8
+ *   [V2-sym] exact Casida W_dyn(q, -z) = W_dyn(-q, z)^T and Z(-q) = Z(q)^T (info: vs the pre-fix W(q, -z) = W(q, z)^T)
  * plus (info + loose gate) full W at the nodes vs Casida W_dyn and the time-domain convention of w_time
  * (ray transform of W^>(t) and W^<(t)^T reproduces eval_poles).
  *
@@ -233,14 +237,52 @@ void run_v2(std::string const &fixture, long nI_factor) {
 
   // ---- per q (lockstep: thc.Z is collective)
   double a_pex = 0, e_psym = 0, e_wcq = 0, e_pex = 0, s_pc = 0, e_lex = 0, ewb = 0, ea = 0, sa = 0, eb = 0, sb = 0, ec = 0, sc = 0, ed = 0, sd = 0, ecn = 0, scn = 0, res_fit = 0, et = 0, st = 0;
+  double ee = 0, se = 0, e_wsym = 0, e_wold = 0, s_wsym = 0, e_zsym = 0, e_zold = 0, s_z = 0;
+  auto qm = mf->qminus();
+  long n_self = 0;
+  for (long iq = 0; iq < nq; ++iq) n_self += (qm(iq) == iq) ? 1 : 0;
+  // [V2-sym] the exact Casida solutions of all q (W_dyn(-q) is needed with q; small on the fixtures)
+  std::vector<casida_t> cas_all;
+  std::vector<cmat> Z_all;
+  for (long iq = 0; iq < nq; ++iq) {   // LOCKSTEP: thc.Z is collective
+    Z_all.emplace_back(thc.Z(int(iq)));
+    cas_all.push_back(casida_q(thc, *mf, e_rel, iq, Z_all.back()));
+  }
+  {
+    aux_grid_t g1(1, 0, Np);
+    nda::array<ComplexType, 1> mz(12);
+    for (long i = 0; i < 12; ++i) mz(i) = -z12(i);
+    for (long iq = 0; iq < nq; ++iq) {
+      const long jq = qm(iq);
+      auto Wm = casida_eval(cas_all[iq], g1, mz, false);    // W_dyn(q, -z)
+      auto Wp = casida_eval(cas_all[jq], g1, z12, false);   // W_dyn(-q, z)
+      auto Wq = casida_eval(cas_all[iq], g1, z12, false);   // W_dyn(q, z)
+      for (long i = 0; i < 12; ++i)
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            s_wsym = std::max(s_wsym, std::abs(Wq(i, P, Q)));
+            e_wsym = std::max(e_wsym, std::abs(Wm(i, P, Q) - Wp(i, Q, P)));
+            e_wold = std::max(e_wold, std::abs(Wm(i, P, Q) - Wq(i, Q, P)));
+          }
+      for (long P = 0; P < Np; ++P)
+        for (long Q = 0; Q < Np; ++Q) {
+          s_z    = std::max(s_z, std::abs(Z_all[iq](P, Q)));
+          e_zsym = std::max(e_zsym, std::abs(Z_all[jq](P, Q) - Z_all[iq](Q, P)));
+          e_zold = std::max(e_zold, std::abs(Z_all[jq](P, Q) - Z_all[iq](P, Q)));
+        }
+    }
+  }
   long Tmax = 0, npos = 0;
   double minM = 1e300, lmax = 0.0, lmin = 1e300;
   Timer.add("reference");
   for (long iq = 0; iq < nq; ++iq) {
     Timer.start("reference");
-    cmat Zq(thc.Z(int(iq)));
+    const long jq     = qm(iq);   // -q
+    const bool self_q = (jq == iq);
+    cmat const &Zq = Z_all[iq];
     auto Pf = gather_full(comm, grid, Pi0(iq, all, all, all));
     auto Wf = gather_full(comm, grid, Wn(iq, all, all, all));
+    auto Wfm = self_q ? Wf : gather_full(comm, grid, Wn(jq, all, all, all));   // W(-q) at the nodes
     cmat Id = nda::eye<ComplexType>(Np);
     // (a) Dyson by nda::inverse on the full matrices
     nda::array<ComplexType, 3> Wr(nz, Np, Np);
@@ -256,16 +298,20 @@ void run_v2(std::string const &fixture, long nI_factor) {
     //     12 ray points and the Matsubara nodes (the residues themselves are not unique below ~1e-5: the stacked kernel has
     //     cond ~1e13 and both solvers resolve the near-threshold singular directions from rounding noise; info ewb);
     //     refit residual at the nodes (info)
-    auto wr = basis.fit(zeta, Wf);
-    auto wf = gather_full(comm, grid, w(iq, all, all, all));
+    //     q != -q: the paired fit of q (data W(q), W(-q)^T) and the paired pole sums eval(w(q), w(-q), z)
+    auto wr  = self_q ? basis.fit(zeta, Wf) : basis.fit(zeta, Wf, Wfm);
+    auto wrm = self_q ? wr : basis.fit(zeta, Wfm, Wf);
+    auto wf  = gather_full(comm, grid, w(iq, all, all, all));
+    auto wfm = self_q ? wf : gather_full(comm, grid, w(jq, all, all, all));
+    auto evp = [&](auto const &a, auto const &am, auto const &zz) { return self_q ? basis.eval(a, zz) : basis.eval(a, am, zz); };
     ewb = std::max(ewb, max_diff3(wf, wr) / max_abs3(wr));
     for (auto const *zz : std::array<nda::array<ComplexType, 1> const *, 3>{&zeta, &z12, &zi}) {
-      auto Fr = basis.eval(wr, *zz);
-      eb      = std::max(eb, max_diff3(basis.eval(wf, *zz), Fr));
+      auto Fr = evp(wr, wrm, *zz);
+      eb      = std::max(eb, max_diff3(evp(wf, wfm, *zz), Fr));
       sb      = std::max(sb, max_abs3(Fr));
     }
-    res_fit = std::max(res_fit, max_diff3(basis.eval(wf, zeta), Wf) / max_abs3(Wf));
-    auto cas = casida_q(thc, *mf, e_rel, iq, Zq);
+    res_fit = std::max(res_fit, max_diff3(evp(wf, wfm, zeta), Wf) / max_abs3(Wf));
+    auto const &cas = cas_all[iq];
     // (c) the fit on the Matsubara axis vs CoQui W^c(q, i nu_n). Decomposed with the exact transition-sum Pi(i nu_n):
     //     line vs W_ex = Dyson(exact Pi); CoQui W^c vs Dyson(CoQui's Pi); CoQui's Pi vs the exact Pi, in full and for the
     //     (P,Q)-symmetric part. CoQui keeps Pi(q, tau) on the PH-symmetric half tau grid (tau_to_w_PHsym assumes
@@ -280,7 +326,7 @@ void run_v2(std::string const &fixture, long nI_factor) {
             dW.local()(iq - dW.local_range(0).first(), all, all, all);
       comm.all_reduce_in_place_n(Wt.data(), Wt.size(), std::plus<>{});
       ft.tau_to_w_PHsym(Wt, Ww);
-      auto Wl = basis.eval(wf, zi);
+      auto Wl = evp(wf, wfm, zi);
       nda::array<ComplexType, 3> Wc(Ww(all, 0, all, all));
       ec = std::max(ec, max_diff3(Wl, Wc));
       for (long n = 0; n < nw_half; ++n) {
@@ -313,9 +359,24 @@ void run_v2(std::string const &fixture, long nI_factor) {
       for (long s = 0; s < cas.T; ++s) { lmax = std::max(lmax, std::abs(cas.lam(s))); lmin = std::min(lmin, std::abs(cas.lam(s))); }
       auto Cp = casida_eval(cas, grid, z12, true);
       memory::array<HOST_MEMORY, ComplexType, 3> Lp(12, grid.nP, grid.nQ);
-      eval_poles<HOST_MEMORY>(w, basis, iq, z12, sector_t::particle, false, Lp());
+      eval_poles<HOST_MEMORY>(w, basis, iq, jq, z12, sector_t::particle, false, Lp());
       ed = std::max(ed, comm.all_reduce_value(max_diff3(Lp, Cp), mpi3::max<>{}));
       sd = std::max(sd, comm.all_reduce_value(max_abs3(Cp), mpi3::max<>{}));
+      // (e) hole part, transposed: block (P_rng, Q_rng) of W^<(q, z)^T vs the Casida negative poles of q, transposed
+      {
+        aux_grid_t g1(1, 0, Np);
+        auto Ct = casida_eval(cas, g1, z12, false);
+        auto Cq = casida_eval(cas, g1, z12, true);
+        memory::array<HOST_MEMORY, ComplexType, 3> Lh(12, grid.nP, grid.nQ);
+        eval_poles<HOST_MEMORY>(w, basis, iq, jq, z12, sector_t::hole, true, Lh());
+        nda::array<ComplexType, 3> Ch(12, grid.nP, grid.nQ);
+        for (long i = 0; i < 12; ++i)
+          for (long P = 0; P < grid.nP; ++P)
+            for (long Q = 0; Q < grid.nQ; ++Q)
+              Ch(i, P, Q) = Ct(i, grid.Q0 + Q, grid.P0 + P) - Cq(i, grid.Q0 + Q, grid.P0 + P);
+        ee = std::max(ee, comm.all_reduce_value(max_diff3(Lh, Ch), mpi3::max<>{}));
+        se = std::max(se, comm.all_reduce_value(max_abs3(Ch), mpi3::max<>{}));
+      }
       auto Cn = casida_eval(cas, grid, zeta, false);
       nda::array<ComplexType, 3> Wnb(Wn(iq, all, all, all));
       ecn = std::max(ecn, comm.all_reduce_value(max_diff3(Wnb, Cn), mpi3::max<>{}));
@@ -329,8 +390,8 @@ void run_v2(std::string const &fixture, long nI_factor) {
         auto ray = time_ray_t::for_spectrum(theta_t, basis.nu(0), 36.0, 1e-5, 4.0, 20, s);
         const bool tr = (s == sector_t::hole);
         memory::array<HOST_MEMORY, ComplexType, 3> Wt(ray.size(), grid.nP, grid.nQ), Wz(4, grid.nP, grid.nQ);
-        w_time<HOST_MEMORY>(w, basis, iq, ray.t, s, tr, Wt());
-        eval_poles<HOST_MEMORY>(w, basis, iq, z4, s, tr, Wz());
+        w_time<HOST_MEMORY>(w, basis, iq, jq, ray.t, s, tr, Wt());
+        eval_poles<HOST_MEMORY>(w, basis, iq, jq, z4, s, tr, Wz());
         auto F = ray.transform_matrix(z4);
         nda::array<ComplexType, 2> R(4, grid.nP * grid.nQ);
         nda::blas::gemm(ComplexType(1.0), F, nda::reshape(Wt, std::array<long, 2>{ray.size(), grid.nP * grid.nQ}),
@@ -343,7 +404,7 @@ void run_v2(std::string const &fixture, long nI_factor) {
     Timer.stop("reference");
   }
   const double r_lex = e_lex / sc, r_pex = e_pex / s_pc, r_psym = e_psym / s_pc, r_apex = a_pex / s_pc;
-  const double ra = ea / sa, rb = eb / sb, rc = ec / sc, rd = ed / sd, rcn = ecn / scn, rt = et / st;
+  const double ra = ea / sa, rb = eb / sb, rc = ec / sc, rd = ed / sd, rcn = ecn / scn, rt = et / st, re = ee / se;
   app_log(2, "  [V2] {} ({} ranks, aux grid {}x{}, Dyson pools {}x{}):", fixture, comm.size(), grid.np_P, grid.np_Q, lay.np_q,
           lay.np_z);
   app_log(2, "    (a) W at the {} nodes vs Dyson (nda::inverse) of the gathered Pi: rel {:.2e} (max|W| {:.3e})", nz, ra, sa);
@@ -359,7 +420,13 @@ void run_v2(std::string const &fixture, long nI_factor) {
   app_log(2, "    (d) W^> at 12 ray points vs Casida positive poles:               rel {:.2e} (max|W^>| {:.3e}); Casida dim {} "
              "({} positive), min eig(M) {:.3e}, |RPA poles| in [{:.4f}, {:.4f}] Ha",
           rd, sd, Tmax, npos, minM, lmin, lmax);
+  app_log(2, "    (e) W^<(q)^T at 12 ray points (residues of -q) vs Casida negative poles of q, transposed: rel {:.2e} (max|W^<| {:.3e})",
+          re, se);
   app_log(2, "    info: W at the nodes vs Casida W_dyn {:.2e}; ray transform of w_time vs eval_poles (q=0) {:.2e}", rcn, rt);
+  app_log(2, "    [V2-sym] {} of {} q self-inverse; exact Casida: max|W(q,-z) - W(-q,z)^T| / max|W| = {:.2e}, pre-fix form "
+             "max|W(q,-z) - W(q,z)^T| / max|W| = {:.2e}; THC Coulomb: max|Z(-q) - Z(q)^T| / max|Z| = {:.2e}, "
+             "max|Z(-q) - Z(q)| / max|Z| = {:.2e}",
+          n_self, nq, e_wsym / s_wsym, e_wold / s_wsym, e_zsym / s_z, e_zold / s_z);
   app_log(2, "  [V2] {} timers (rank 0): G_tilde {:.2f} Pi_hadamard {:.2f} Pi_transform {:.2f} | Z_gather {:.3f} W_redistribute {:.3f} "
              "W_dyson {:.3f} W_fit {:.3f} | CoQui W {:.2f} references {:.2f} s",
           fixture, Timer.elapsed("G_tilde"), Timer.elapsed("Pi_hadamard"), Timer.elapsed("Pi_transform"),
@@ -373,6 +440,11 @@ void run_v2(std::string const &fixture, long nI_factor) {
   REQUIRE(r_pex <= 1e-8 + 2.0 * r_apex);  // ... and off only at the size of the antisymmetric part (PH-symmetric tau grid)
   REQUIRE(rc <= 1e-8 + 2.0 * r_apex);     // line vs CoQui W^c: 1e-8 up to CoQui's PH-symmetric approximation
   REQUIRE(rd <= 1e-8);
+  REQUIRE(re <= 1e-8);
+  // Z(-q) = Z(q)^T holds to the THC fit noise (lih222 1.3e-12, lih223 3.5e-12, si211 1.8e-9 even at q = -q, where it is
+  // the imaginary part of Z); the W relation inherits it
+  REQUIRE(e_zsym <= 1e-8 * s_z);
+  REQUIRE(e_wsym / s_wsym <= 1e-10 + 10.0 * e_zsym / s_z);
   REQUIRE(rcn <= 1e-10);
   REQUIRE(rt <= 1e-9);
 }
@@ -382,3 +454,6 @@ void run_v2(std::string const &fixture, long nI_factor) {
 TEST_CASE("gw_line_V2_lih222", "[gw_line][V2]") { run_v2("qe_lih222", 8); }
 
 TEST_CASE("gw_line_V2_si211", "[gw_line][V2]") { run_v2("qe_si211", 8); }
+
+// q != -q mesh (2x2x3, 8 of 12 q not self-inverse): the W pairing fix (notes section 3.3)
+TEST_CASE("gw_line_V2_lih223", "[gw_line][V2]") { run_v2("qe_lih223", 8); }

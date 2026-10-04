@@ -27,6 +27,10 @@
  *      over pairs with different occupation, s_t = +1 for n occupied at k (particle sector, E_t > 0), -1 otherwise (hole).
  *      Each rank checks its own (P,Q) block; with >1 rank the gathered (q=0, zeta_0) matrix is also compared with the
  *      1x1-grid result computed on every rank.
+ * [V1-sym] (q != -q fixtures, lih223: 2x2x3 mesh, 8 of 12 q with q != -q) the symmetry of the bosonic propagator that the
+ *      W fit uses (screened.hpp, notes section 3.3), on the exact transition sum (full matrices):
+ *        Pi(q, -z) = Pi(-q, z)^T  (<= 1e-13)     and NOT  Pi(q, -z) = Pi(q, z)^T  (the pre-fix assumption; O(1) here),
+ *      per sector: Pi^<(q, -z) = Pi^>(-q, z)^T, i.e. the hole residues of q are the transposed particle residues of -q.
  */
 
 #undef NDEBUG
@@ -263,6 +267,37 @@ void run_v1(std::string const &fixture, bool virtual_grid) {
             comm.size(), d, d / m);
     REQUIRE(d <= 1e-14 * m);
   }
+
+  // [V1-sym] symmetry of Pi under zeta -> -zeta, exact transition sums on the full matrices (1x1 grid)
+  {
+    aux_grid_t g1(1, 0, Np);
+    nda::array<ComplexType, 1> mz(zeta.size());
+    for (long i = 0; i < zeta.size(); ++i) mz(i) = -zeta(i);
+    auto Pp_z  = pi_casida_block(thc, *mf, e_rel, g1, zeta, sector_t::particle);
+    auto Ph_mz = pi_casida_block(thc, *mf, e_rel, g1, mz, sector_t::hole);
+    nda::array<ComplexType, 4> P_z = Pp_z + pi_casida_block(thc, *mf, e_rel, g1, zeta, sector_t::hole);
+    nda::array<ComplexType, 4> P_mz = pi_casida_block(thc, *mf, e_rel, g1, mz, sector_t::particle) + Ph_mz;
+    auto qm = mf->qminus();
+    double e_pair = 0.0, e_old = 0.0, e_sec = 0.0, m = 0.0;
+    long n_self = 0;
+    for (long iq = 0; iq < nq; ++iq) {
+      n_self += (qm(iq) == iq) ? 1 : 0;
+      for (long iz = 0; iz < zeta.size(); ++iz)
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            m      = std::max(m, std::abs(P_z(iq, iz, P, Q)));
+            e_pair = std::max(e_pair, std::abs(P_mz(iq, iz, P, Q) - P_z(qm(iq), iz, Q, P)));
+            e_old  = std::max(e_old, std::abs(P_mz(iq, iz, P, Q) - P_z(iq, iz, Q, P)));
+            e_sec  = std::max(e_sec, std::abs(Ph_mz(iq, iz, P, Q) - Pp_z(qm(iq), iz, Q, P)));
+          }
+    }
+    app_log(2, "  [V1-sym] {}: {} of {} q self-inverse; exact Pi: max|Pi(q,-z) - Pi(-q,z)^T| / max|Pi| = {:.2e} (sector form "
+               "Pi^<(q,-z) vs Pi^>(-q,z)^T {:.2e});  max|Pi(q,-z) - Pi(q,z)^T| / max|Pi| = {:.2e} (the pre-fix per-q assumption)",
+            fixture, n_self, nq, e_pair / m, e_sec / m, e_old / m);
+    REQUIRE(e_pair <= 1e-13 * m);
+    REQUIRE(e_sec <= 1e-13 * m);
+    if (n_self == nq) REQUIRE(e_old <= 1e-10 * m);   // q = -q meshes: both forms agree (time reversal of the KS states)
+  }
 }
 
 } // namespace
@@ -270,3 +305,6 @@ void run_v1(std::string const &fixture, bool virtual_grid) {
 TEST_CASE("gw_line_V1_lih222", "[gw_line][V1]") { run_v1("qe_lih222", false); }
 
 TEST_CASE("gw_line_V1_si211", "[gw_line][V1]") { run_v1("qe_si211", true); }
+
+// q != -q mesh (2x2x3, 8 of 12 q not self-inverse): the W pairing fix (notes section 3.3)
+TEST_CASE("gw_line_V1_lih223", "[gw_line][V1]") { run_v1("qe_lih223", false); }

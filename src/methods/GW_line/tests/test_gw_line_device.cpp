@@ -309,8 +309,9 @@ void run_device_ab(std::string const &fixture) {
     for (long iq = 0; iq < nq; ++iq)
       for (auto s : {sector_t::particle, sector_t::hole}) {
         const bool tr = (s == sector_t::hole);
-        eval_poles<HOST_MEMORY>(w_h, basis, iq, zp, s, tr, Eh());
-        eval_poles<DEVICE_MEMORY>(w_d, basis, iq, zp, s, tr, Ed());
+        const long iqm = mf.qminus()(iq);   // W^<(q)^T carries the residues of -q (screened.hpp)
+        eval_poles<HOST_MEMORY>(w_h, basis, iq, iqm, zp, s, tr, Eh());
+        eval_poles<DEVICE_MEMORY>(w_d, basis, iq, iqm, zp, s, tr, Ed());
         nda::array<ComplexType, 3> Edh = memory::to_memory_space<HOST_MEMORY>(Ed);
         d = std::max(d, local_max_diff(Edh, Eh));
         m = std::max(m, local_max_abs(Eh));
@@ -334,8 +335,9 @@ void run_device_ab(std::string const &fixture) {
       memory::array<HOST_MEMORY, ComplexType, 3> Wh(nt, grid.nP, grid.nQ);
       memory::array<DEVICE_MEMORY, ComplexType, 3> Wd(nt, grid.nP, grid.nQ);
       for (long iq = 0; iq < nq; ++iq) {
-        w_time<HOST_MEMORY>(w_h, basis, iq, ray->t, s, tr, Wh());
-        w_time<DEVICE_MEMORY>(w_hd, basis, iq, ray->t, s, tr, Wd());
+        const long iqm = mf.qminus()(iq);
+        w_time<HOST_MEMORY>(w_h, basis, iq, iqm, ray->t, s, tr, Wh());
+        w_time<DEVICE_MEMORY>(w_hd, basis, iq, iqm, ray->t, s, tr, Wd());
         nda::array<ComplexType, 3> Wdh = memory::to_memory_space<HOST_MEMORY>(Wd);
         d = std::max(d, local_max_diff(Wdh, Wh));
         m = std::max(m, local_max_abs(Wh));
@@ -402,6 +404,9 @@ void run_device_ab(std::string const &fixture) {
 TEST_CASE("gw_line_device_lih222", "[gw_line][device]") { run_device_ab("qe_lih222"); }
 
 TEST_CASE("gw_line_device_si211", "[gw_line][device]") { run_device_ab("qe_si211"); }
+
+// q != -q mesh (2x2x3): the paired W fit (pair pass of screened_interaction) and the hole-sector residue rows of -q
+TEST_CASE("gw_line_device_lih223", "[gw_line][device]") { run_device_ab("qe_lih223"); }
 
 #endif   // ENABLE_DEVICE
 

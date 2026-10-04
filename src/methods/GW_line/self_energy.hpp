@@ -26,16 +26,21 @@
  * contraction; python LineGW.sigma):
  *
  *   Sigma~^>(k,t) = +(1/N_k) sum_q G~^>(k-q,t) o W^>(q,t),   W^>(q,t)   =  sum_j w_j(q) e^{-i nu_j t}     (particle ray)
- *   Sigma~^<(k,t) = -(1/N_k) sum_q G~^<(k-q,t) o W^<(q,t),   W^<(q,t)   = -sum_j w_j(q)^T e^{+i nu_j t}  (hole ray)
+ *   Sigma~^<(k,t) = -(1/N_k) sum_q G~^<(k-q,t) o W^<(q,t),   W^<(q,t)   = -sum_j w_j(-q)^T e^{+i nu_j t} (hole ray)
  *   Sigma^{>/<}_ab(k,zeta) = sum_t F_ray(zeta,t) sum_PQ conj(X_Pa(k)) Sigma~^{>/<}_PQ(k,t) X_Qb(k)
  *
  * The minus sign of the hole sector is the T = 0 factor [theta(nu) - theta(-eps)] = -1; with it both sectors have
  * positive residues (Sigma_c is retarded-like, A_Sigma >= 0).
  *
+ * q <-> -q pairing (screened.hpp, notes section 3.3): the hole interaction of q carries the residues of -q. The hole leg
+ * runs over the residue ROWS q' (contiguous, also for the host-resident residue groups) and pairs each with the propagator
+ * of k - q at q = -q' (mf::MF::qminus): sum_q G~^<(k-q) o W^<(q)^T = -sum_q' G~^<(k + q') o sum_j w_j(q') e^{+i nu_j t}.
+ * For self-inverse q this is the old per-q sum.
+ *
  * Orientation (no inter-rank transpose; see the header of screened.hpp). The particle sector is formed in PLAIN
  * orientation: G~(k-q,t) blocks (gtilde_form_t::plain) times W^>(q,t) blocks (w_time(.., particle, false)). Only w (not
  * w^T) is stored, so the hole sector is formed TRANSPOSED: B(k,t) = Sigma~^<(k,t)^T = -(1/N_k) sum_q G~^<(k-q,t)^T o
- * W^<(q,t)^T with gtilde_form_t::transposed and w_time(.., hole, true). The orbital contraction of a transposed aux
+ * W^<(q,t)^T with gtilde_form_t::transposed and w_time(.., hole, true) (residue row -q). The orbital contraction of a transposed aux
  * matrix is the transpose of an nb x nb result:
  *   Sigma_ab = sum_PQ conj(X_Pa) B_QP X_Qb = [X^T B conj(X)]_ba,
  * so the hole sector contracts the local block with Xp^T (left) and conj(Xq) (right) and the small nb x nb matrix is
@@ -135,6 +140,9 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
   // the transform are linear and accumulate over the groups
   const long gsz = (w_host != nullptr and sig_qgroup > 0) ? std::min(sig_qgroup, nq) : nq;
   auto qk = mf.qk_to_k2();   // (nqpts, nkpts): index of k - q
+  auto qm = mf.qminus();     // (nqpts): index of -q
+  // the q whose interaction the residue row iq enters: q for the particle leg, -q for the hole leg (see the header)
+  auto q_of_row = [&](sector_t s, long iq) -> long { return s == sector_t::hole ? long(qm(iq)) : iq; };
 
   for (auto nm : {"Sigma_G_tilde", "Sigma_W_time", "Sigma_hadamard", "Sigma_contract", "Sigma_allreduce", "Sigma_transform"})
     Timer.add(nm);
@@ -162,13 +170,13 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
   [[maybe_unused]] const bool kouter = fused and detail::env_long("COQUI_GWLINE_SIGMA_KOUTER", 1) != 0;
   // kouter: (N_k, gs, 2) = (k-q, q - qs0); else (gs, N_k, 1, 2) = (k-q, 0), for the q group [qs0, qs0 + gs)
   [[maybe_unused]] memory::array<MEM, int, 1> pairs;
-  auto make_pairs = [&](long qs0, long gs) {
+  auto make_pairs = [&](long qs0, long gs, sector_t s) {
     if (not fused) return;
     nda::array<int, 1> ph(2 * gs * nk);
     for (long iqr = 0; iqr < gs; ++iqr)
       for (long ik = 0; ik < nk; ++ik) {
         const long i = kouter ? (ik * gs + iqr) : (iqr * nk + ik);
-        ph(2 * i)     = int(qk(qs0 + iqr, ik));
+        ph(2 * i)     = int(qk(q_of_row(s, qs0 + iqr), ik));
         ph(2 * i + 1) = kouter ? int(iqr) : 0;
       }
     pairs = memory::to_memory_space<MEM>(ph);
@@ -218,7 +226,7 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
 
     for (long qs0 = 0; qs0 < nq; qs0 += gsz) {   // q groups (one group = all q unless host-resident residues)
       const long gs = std::min(gsz, nq - qs0);
-      make_pairs(qs0, gs);
+      make_pairs(qs0, gs, leg.s);
       if (w_host != nullptr) {
         Timer.start("Sigma_W_time");
         wbuf = memory::to_memory_space<MEM>(nda::array<ComplexType, 4>((*w_host)(nda::range(qs0, qs0 + gs), all, all, all)));
@@ -271,7 +279,7 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
                                      2 * (iq - qs0) * nk, ComplexType(1.0), iq > qs0);
             } else {
               for (long ik = 0; ik < nk; ++ik) {
-                auto Gv    = G(qk(iq, ik), tr, all, all);
+                auto Gv    = G(qk(q_of_row(leg.s, iq), ik), tr, all, all);
                 auto acc_v = acc(ik, tr, all, all);
                 if constexpr (MEM == HOST_MEMORY) {
                   if (iq == qs0) acc_v = Gv * Wv;

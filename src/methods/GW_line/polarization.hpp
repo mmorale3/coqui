@@ -50,11 +50,15 @@
  * Output: Pi is the local block in MEM, shape (N_q, N_zeta, nP, nQ) = Pi(q, zeta)[P_rng, Q_rng] (overwritten). It stays
  * in MEM because the next consumer (S4: Dyson for W) redistributes a MEM darray.
  * q group (S7e, plan 6.3(b)): q0, g restrict the output to q in [q0, q0 + g): Pi has shape (g, N_zeta, nP, nQ), row
- * iq - q0. The A, B factors of all k are rebuilt for every group (G_tilde cost x the number of groups); the driver uses
- * groups only when the Pi group of all q does not fit (device memory, q_groups_t).
+ * iq - q0; or an explicit list qs of absolute q (row i = qs[i]: the pair-closed groups of q_groups_t, which the W fit
+ * needs, screened.hpp). The A, B factors of all k are rebuilt for every group (G_tilde cost x the number of groups); the
+ * driver uses groups only when the Pi group of all q does not fit (device memory, q_groups_t).
+ * No q <-> -q assumption: both sectors are built explicitly, Pi(q, -zeta) = Pi(-q, zeta)^T holds by construction
+ * (checked against the exact transition sum on a q != -q mesh, [V1] lih223).
  */
 
 #include <array>
+#include <vector>
 
 #include "configuration.hpp"
 #include "nda/nda.hpp"
@@ -80,7 +84,7 @@ template <MEMORY_SPACE MEM>
 void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF const &mf, aux_grid_t const &grid,
                   nda::array<ComplexType, 1> const &zeta, numerics::line_dlr::time_nodes_t const &ray_p,
                   numerics::line_dlr::time_nodes_t const &ray_h, long t_chunk, memory::array<MEM, ComplexType, 4> &Pi,
-                  utils::TimerManager &Timer, sector_t sectors = sector_t::both, long q0 = 0, long g = -1) {
+                  utils::TimerManager &Timer, sector_t sectors, std::vector<long> const &qs) {
   using time_ray_t = numerics::line_dlr::time_nodes_t;   // GL ray or ID nodes (S7b)
   using arr4_t = memory::array<MEM, ComplexType, 4>;
   auto all     = nda::range::all;
@@ -95,8 +99,9 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   const long nk = prop.nk, nq = mf.nqpts(), nz = zeta.size(), nP = grid.nP, nQ = grid.nQ, blk = nP * nQ;
   utils::check(mf.nkpts() == nk, "gw_line::polarization: MF nkpts {} != X nkpts {}", mf.nkpts(), nk);
   auto qk = mf.qk_to_k2();   // (nqpts, nkpts): index of k - q
-  if (g < 0) g = nq - q0;
-  utils::check(q0 >= 0 and g > 0 and q0 + g <= nq, "gw_line::polarization: q group [{}, {}) out of [0, {})", q0, q0 + g, nq);
+  const long g = qs.size();
+  utils::check(g > 0, "gw_line::polarization: empty q group");
+  for (long q : qs) utils::check(q >= 0 and q < nq, "gw_line::polarization: q = {} out of [0, {})", q, nq);
 
   for (auto nm : {"G_tilde", "Pi_hadamard", "Pi_transform"}) Timer.add(nm);
   prop.set_poles(poles);
@@ -115,13 +120,13 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   // ---- S7d Hadamard setup (device fused kernel; see the file header)
   [[maybe_unused]] const bool fused = (MEM != HOST_MEMORY) and detail::fused_hadamard();
   [[maybe_unused]] const bool qfold = fused and detail::env_long("COQUI_GWLINE_PI_QFOLD", 1) != 0;
-  [[maybe_unused]] memory::array<MEM, int, 1> pairs;   // (g, N_k, 2): (k, k-q) for q = q0 + row
+  [[maybe_unused]] memory::array<MEM, int, 1> pairs;   // (g, N_k, 2): (k, k-q) for q = qs[row]
   if (fused) {
     nda::array<int, 1> ph(2 * g * nk);
     for (long iqr = 0; iqr < g; ++iqr)
       for (long ik = 0; ik < nk; ++ik) {
         ph(2 * (iqr * nk + ik))     = int(ik);
-        ph(2 * (iqr * nk + ik) + 1) = int(qk(q0 + iqr, ik));
+        ph(2 * (iqr * nk + ik) + 1) = int(qk(qs[iqr], ik));
       }
     pairs = memory::to_memory_space<MEM>(ph);
   }
@@ -170,7 +175,7 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
       }
 
       for (long iqr = 0; iqr < g; ++iqr) {
-        const long iq = q0 + iqr;
+        const long iq = qs[iqr];
         Timer.start("Pi_hadamard");
         auto acc_v = acc(0, tr, all, all);
         if (fused) {   // device, fused: one launch for this q (alpha folded in)
@@ -208,19 +213,33 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   }
 }
 
+/// q group [q0, q0 + g) (g < 0: up to N_q); the default: all q
+template <MEMORY_SPACE MEM>
+void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF const &mf, aux_grid_t const &grid,
+                  nda::array<ComplexType, 1> const &zeta, numerics::line_dlr::time_nodes_t const &ray_p,
+                  numerics::line_dlr::time_nodes_t const &ray_h, long t_chunk, memory::array<MEM, ComplexType, 4> &Pi,
+                  utils::TimerManager &Timer, sector_t sectors = sector_t::both, long q0 = 0, long g = -1) {
+  const long nq = mf.nqpts();
+  if (g < 0) g = nq - q0;
+  utils::check(q0 >= 0 and g > 0 and q0 + g <= nq, "gw_line::polarization: q group [{}, {}) out of [0, {})", q0, q0 + g, nq);
+  std::vector<long> qs(g);
+  for (long i = 0; i < g; ++i) qs[i] = q0 + i;
+  polarization<MEM>(prop, poles, mf, grid, zeta, ray_p, ray_h, t_chunk, Pi, Timer, sectors, qs);
+}
+
 extern template void polarization<HOST_MEMORY>(propagator_t<HOST_MEMORY> &, pole_data_t const &, mf::MF const &,
                                                aux_grid_t const &, nda::array<ComplexType, 1> const &,
                                                numerics::line_dlr::time_nodes_t const &,
                                                numerics::line_dlr::time_nodes_t const &, long,
                                                memory::array<HOST_MEMORY, ComplexType, 4> &, utils::TimerManager &, sector_t,
-                                               long, long);
+                                               std::vector<long> const &);
 #if defined(ENABLE_DEVICE)
 extern template void polarization<DEVICE_MEMORY>(propagator_t<DEVICE_MEMORY> &, pole_data_t const &, mf::MF const &,
                                                  aux_grid_t const &, nda::array<ComplexType, 1> const &,
                                                  numerics::line_dlr::time_nodes_t const &,
                                                  numerics::line_dlr::time_nodes_t const &, long,
                                                  memory::array<DEVICE_MEMORY, ComplexType, 4> &, utils::TimerManager &,
-                                                 sector_t, long, long);
+                                                 sector_t, std::vector<long> const &);
 #endif
 
 } // namespace methods::gw_line

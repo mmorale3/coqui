@@ -8,7 +8,11 @@ Polarization (sign/normalization validated against the Casida transition sum, V1
     Pi^>(q,t)_PQ = (2/Nk) sum_k G~^>(k,t)_PQ * conj(G~^<(k-q,t))_PQ,   G~^<(k,t) = X(k)(sum_{m<} v_m v_m^dag e^{-i e_m t})X(k)^dag
     Pi^>(q,zeta) = -i int_0^inf dt e^{i zeta t} Pi^>(q,t);   Pi(zeta) = Pi^>(zeta) + conj(Pi^>(-conj(zeta)))  (elementwise)
 Screened interaction: W(q,zeta) = ([1 - Z Pi(zeta)]^-1 - 1) Z at the bosonic line nodes, refit with BosonicLineBasis
-    W_PQ(zeta) = sum_j [ w_j,PQ/(zeta - nu_j) - w_j,QP/(zeta + nu_j) ],   W^>(t) = sum_j w_j e^{-i nu_j t},  W^<(t) = -sum_j w_j^T e^{+i nu_j t}.
+    W_PQ(q,zeta) = sum_j [ w_j(q)_PQ/(zeta - nu_j) - w_j(-q)_QP/(zeta + nu_j) ],
+    W^>(q,t) = sum_j w_j(q) e^{-i nu_j t},  W^<(q,t) = -sum_j w_j(-q)^T e^{+i nu_j t}
+    (notes section 3.3, corrected 2026-10-04: W(q,-zeta) = W(-q,zeta)^T; -q = qminus[q]). NOTE: screened_interaction(iq)
+    without W_minus and sigma(...) without qminus use the per-q form w_j(q)^T, valid ONLY for self-inverse q (q = -q mod G,
+    every q of the 2x2x2 / 2x1x1 meshes this prototype was run on); for q != -q pass W_minus = W(-q) and qminus.
 Self-energy per sector (contracted to orbitals immediately):
     Sigma~^>(k,t) = (1/Nk) sum_q G~^>(k-q,t) * W^>(q,t);   Sigma^>_ab(k,zeta) = -i int dt e^{i zeta t} [X(k)^dag Sigma~^>(k,t) X(k)]_ab
     Sigma~^<(k,t) = (1/Nk) sum_q G~^<(k-q,t) * W^<(q,t)  on the hole ray t = s e^{+i theta_t}.
@@ -97,15 +101,17 @@ class LineGW:
         Z = self.Z[iq]; I = np.eye(self.Np)
         return np.array([np.linalg.solve(I - Z @ P, Z) - Z for P in Pi])
 
-    def screened_interaction(self, iq, Pi=None):
-        """Residues w_j(q) (r, Np, Np) of the symmetric real-pole fit of W(q) on the bosonic nodes; also returns W at the nodes."""
+    def screened_interaction(self, iq, Pi=None, W_minus=None):
+        """Residues w_j(q) (r, Np, Np) of the symmetric real-pole fit of W(q) on the bosonic nodes; also returns W at the nodes.
+        W_minus: W(-q) at the nodes (required for q != -q, see the module docstring); None = self-inverse q."""
         if Pi is None: Pi = self.polarization(iq, self.bos.zeta)
         W = self.dyson_w(iq, Pi)
-        return self.bos.fit(self.bos.zeta, W), W
+        return self.bos.fit(self.bos.zeta, W, W_minus=W_minus), W
 
     # ---------------------------------------------------------------- self-energy
-    def sigma(self, ik, wres, zeta=None):
-        """Sigma_c(k, zeta)_ab (nz, nb, nb), zeta mu-relative (default fermionic nodes); wres: list over q of residues (r, Np, Np)."""
+    def sigma(self, ik, wres, zeta=None, qminus=None):
+        """Sigma_c(k, zeta)_ab (nz, nb, nb), zeta mu-relative (default fermionic nodes); wres: list over q of residues (r, Np, Np).
+        qminus: index of -q per q (the hole sector uses w(-q)^T); None = every q self-inverse."""
         zeta = self.fz if zeta is None else np.asarray(zeta, complex)
         out = np.zeros((len(zeta), self.nb, self.nb), complex)
         Xk = self.X[ik]
@@ -116,7 +122,7 @@ class LineGW:
                 acc = np.zeros((len(t), self.Np, self.Np), complex)
                 Ew = self.bos.time_exponentials(t, sector)              # (nt, r)
                 for iq in range(self.nk):
-                    w = wres[iq] if sector == '>' else np.transpose(wres[iq], (0, 2, 1))
+                    w = wres[iq] if sector == '>' else np.transpose(wres[iq if qminus is None else qminus[iq]], (0, 2, 1))
                     Wt = (Ew @ w.reshape(w.shape[0], -1)).reshape(Ew.shape[0], w.shape[1], w.shape[2])
                     acc += self.gtilde(self.qk[iq, ik], t, sector) * Wt
                 acc *= (1.0 if sector == '>' else -1.0) / self.nk              # T=0 factor [theta(nu) - theta(-eps)] = -1 in the hole sector
