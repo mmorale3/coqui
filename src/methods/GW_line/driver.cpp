@@ -102,6 +102,7 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.tol_gram      = io::get_value_with_default<double>(pt, "tol_gram", p.tol_gram);
   p.nphi          = io::get_value_with_default<long>(pt, "nphi", p.nphi);
   p.tol_svd       = io::get_value_with_default<double>(pt, "tol_svd", p.tol_svd);
+  p.tol_gram_eps  = io::get_value_with_default<double>(pt, "tol_gram_eps", p.tol_gram_eps);
   p.closure_cut   = io::get_value_with_default<std::string>(pt, "closure_cut", p.closure_cut);
   io::tolower(p.closure_cut);
   p.closure_svd_cut = io::get_value_with_default<std::string>(pt, "closure_svd_cut", p.closure_svd_cut);
@@ -162,6 +163,7 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   utils::check(p.g_wtol >= 0.0 and p.g_emin_frac >= 0.0 and p.g_wsmall >= 0.0, "gw_line: g_wtol, g_emin_frac, g_wsmall must be >= 0");
   utils::check(p.nodes_per_ray > 1 and p.node_tmin > 0.0 and p.node_tmax > p.node_tmin, "gw_line: invalid node grid");
   utils::check(p.K >= 1 and p.nphi >= 1 and p.wp > 0.0 and p.tol_gram > 0.0, "gw_line: invalid closure parameters");
+  utils::check(p.tol_gram_eps >= 0.0, "gw_line: tol_gram_eps must be >= 0");
   utils::check(p.tol_svd > 0.0 and p.closure_cut_window >= 1.0 and p.phase_keep >= 0.0 and p.debug_noise_h0 >= 0.0 and
                    p.debug_noise_sigma >= 0.0,
                "gw_line: invalid tol_svd / closure_cut_window / phase_keep / debug_noise_h0");
@@ -193,9 +195,9 @@ void gw_line_params_t::log() const {
   else
     app_log(1, "    G representation: compressed (gapless per-sector refit, g_gap = {})", g_gap);
   app_log(1, "    fermionic nodes: {} per ray, |t| in [{}, {}] Ha", nodes_per_ray, node_tmin, node_tmax);
-  app_log(1, "    closure: wp = {} Ha, K = {}, tol_gram = {:.1e}, nphi = {}, tol_svd = {:.1e}, cuts {} / {} (window {}), "
-             "phase continuity {}",
-          wp, K, tol_gram, nphi, tol_svd, closure_cut, closure_svd_cut, closure_cut_window,
+  app_log(1, "    closure: wp = {} Ha, K = {}, tol_gram = {:.1e} (used: {:.1e} = max(tol_gram, {} x eps)), nphi = {}, tol_svd = {:.1e}, "
+             "cuts {} / {} (window {}), phase continuity {}",
+          wp, K, tol_gram, std::max(tol_gram, tol_gram_eps * eps), tol_gram_eps, nphi, tol_svd, closure_cut, closure_svd_cut, closure_cut_window,
           phase_keep > 0.0 ? "on (x " + std::to_string(phase_keep) + ")" : std::string("off"));
   if (debug_noise_h0 > 0.0)
     app_log(1, "    DIAGNOSTIC: relative noise {:.1e} on H0 (seed {})", debug_noise_h0, debug_noise_seed);
@@ -469,6 +471,7 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "tol_gram", p.tol_gram);
   h5::h5_write(ig, "nphi", p.nphi);
   h5::h5_write(ig, "tol_svd", p.tol_svd);
+  h5::h5_write(ig, "tol_gram_eps", p.tol_gram_eps);
   h5::h5_write(ig, "closure_cut", p.closure_cut);
   h5::h5_write(ig, "closure_svd_cut", p.closure_svd_cut);
   h5::h5_write(ig, "closure_cut_window", p.closure_cut_window);
@@ -923,7 +926,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   set_line_basis(gp, "g_particle_w");
   set_line_basis(gh, "g_hole_w");
   Timer.stop("bases");
-  closure_params_t cprm{prm.wp, prm.K, prm.tol_gram, prm.nphi};
+  closure_params_t cprm{prm.wp, prm.K, std::max(prm.tol_gram, prm.tol_gram_eps * prm.eps), prm.nphi};
   cprm.tol_svd    = prm.tol_svd;
   cprm.gram_cut   = prm.closure_cut;
   cprm.svd_cut    = prm.closure_svd_cut;

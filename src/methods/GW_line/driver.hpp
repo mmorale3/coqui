@@ -48,6 +48,10 @@
  *   nodes_per_ray = 120, node_tmin = 1e-3, node_tmax = 60   dense fermionic nodes (log grid per ray); node_tmax is also
  *                       the tmax of the fermionic bases (python node_range)
  *   wp = 0.11, K = 24, tol_gram = 1e-10, nphi = 8           Cayley closure
+ *   tol_gram_eps = 1    S7f: the Gram cut actually used is max(tol_gram, tol_gram_eps x eps): the moments come from fits on
+ *                       eps-bases, so Gram eigenvalues below ~eps lambda_max are noise; keeping them amplifies roundoff into
+ *                       G ~1e5 x (lih222 K 8, eps 1e-8). No-op at the production settings (eps = tol_gram = 1e-10); 0 = off
+ *                       (python: tol_gram only; the [parity] test pins 0)
  *   tol_svd = 1e-12, closure_cut = "hard", closure_svd_cut = "hard", closure_cut_window = 10, phase_keep = 0
  *                       S7f closure options (closure.hpp closure_params_t, cayley.hpp upfold_opts_t): SVD cutoff, Gram /
  *                       SVD cut placement ("gap": at the largest eigenvalue ratio within a window of the tolerance;
@@ -120,6 +124,7 @@ struct gw_line_params_t {
   double tol_gram = 1e-10;
   long nphi = 8;
   double tol_svd = 1e-12;                ///< S7f: relative SVD cutoff of the upfolding (python 1e-12)
+  double tol_gram_eps = 1.0;             ///< S7f: Gram cut >= tol_gram_eps x eps (the noise level of the moments); 0 = off
   std::string closure_cut = "hard";      ///< S7f: Gram cut "hard" (python) | "gap" | "smooth" (cayley.hpp upfold_opts_t)
   std::string closure_svd_cut = "hard";  ///< S7f: SVD cut "hard" | "gap"
   double closure_cut_window = 10.0;      ///< S7f: window factor of the gap / smooth cuts

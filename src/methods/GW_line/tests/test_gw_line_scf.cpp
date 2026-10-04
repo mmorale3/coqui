@@ -578,7 +578,8 @@ bool gate_line(std::string const &what, double value, double gate) {
  */
 constexpr double PARITY_K = 10.0;
 constexpr long PARITY_NIT = 3;
-constexpr std::array<std::array<double, 3>, PARITY_NIT> parity_floor = {{{0, 0, 0}, {1e-4, 2e-4, 4.71e-7}, {1.22e-2, 3.2e-3, 6.68e-6}}};
+// Mac it2 {1e-4, 2e-4, 4.7e-7}, it3 {1.2e-2, 3.2e-3, 6.7e-6}; rusty it2 {1.2e-3, 2.0e-3, 2.9e-7}, it3 {1.8e-3, 3.0e-3, 1.2e-5}
+constexpr std::array<std::array<double, 3>, PARITY_NIT> parity_floor = {{{0, 0, 0}, {1.2e-3, 2.0e-3, 4.71e-7}, {1.22e-2, 3.2e-3, 1.2e-5}}};
 
 TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
   const std::string ref = gw_line_dir() + "lih222_scf_ref.h5";
@@ -635,6 +636,7 @@ TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
   auto pt = scf_params(fo, PARITY_NIT, false, "gl", "compressed");
   pt.put("lam_b", lam_b);
   pt.put("bases_file", bfile);
+  pt.put("tol_gram_eps", 0.0);   // python's closure: the Gram cut is tol_gram only
   auto t0 = std::chrono::steady_clock::now();
   auto R  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
   const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -695,20 +697,20 @@ nda::array<ComplexType, 4> read_sigma_total(boost::mpi3::communicator &comm, std
 /**
  * S7f gates of [id_vs_gl] and [lehmann]: the id-vs-gl difference after iteration 1 is the SCF's response to the iteration-1
  * kernel difference (the ID error, ~0.3 time_eps relative in Sigma), which the closure amplifies like any noise (S7f study:
- * no hard decision flips, continuous amplification ~1e5 at K 8). Yardstick = [.scf_noise] GW_LINE_NOISE_MODE=sigma at the
- * amplitude of that difference (3e-9 for time_eps 1e-8, 3e-11 for 1e-10), test settings, lam_b auto, time_grid id, the
- * representation of the run: spread of mu / gap (meV) and max|dSigma|/max|Sigma| per iteration, MAX over the Mac and rusty.
- * Gate of iteration it > 1 = max(strict, IDGL_K x floor(it)); iteration 1 (KS poles): dSigma <= 10 time_eps, |dmu|, |dgap|
- * <= 1e-3 meV. Only 2 iterations are compared: from iteration 3 on the spread for these amplitudes saturates at the size of
- * the K = 8 attractor (5-17 meV in mu and gap, Sigma 5e-3..1e-2), where no gate is meaningful. Measured id-vs-gl at
- * iteration 2 (Mac, 2 ranks): id(1e-8) 0.008 / 0.065 meV, 7.8e-5; id(1e-10) 6e-4 / 3e-4 meV, 7.9e-7 (rusty S7c-era: up to
- * 1.1 meV, 4.2e-4); the tight check of the ID kernels is iteration 1.
+ * no hard decision flips, continuous amplification ~1e5 of moment noise into G at K 8). Yardstick = [.scf_noise]
+ * GW_LINE_NOISE_MODE=sigma at the amplitude of that difference (3e-9 for time_eps 1e-8, 3e-11 for 1e-10), test settings,
+ * lam_b auto, time_grid id, default closure (tol_gram_eps = 1): spread of mu / gap (meV) and max|dSigma|/max|Sigma| at
+ * iteration 2, max over the Mac and rusty. Gate of iteration 2 = max(strict, IDGL_K x floor); iteration 1 (KS poles):
+ * dSigma <= 10 time_eps, |dmu|, |dgap| <= 1e-3 meV. Only 2 iterations are compared: from iteration 3 on the spread grows
+ * to the size of the K = 8 attractor (3e-11: 0.3 meV at it 3, 1-8 meV at it 6; 3e-9: 1-9 meV), where no gate is meaningful.
+ * The time_eps 1e-8 gate (3e-9: 1.4 meV) is loose by nature; the tight checks are iteration 1 and time_eps 1e-10 at iteration 2.
  */
 constexpr double IDGL_K = 5.0;
 using floor_tab_t = std::vector<std::array<double, 3>>;
-const floor_tab_t floor_leh_3e9  = {{0, 0, 0}, {1.97, 3.25, 6.88e-3}};   // Mac {1.97, 0.52, 4.9e-3}, rusty {0.86, 3.25, 6.9e-3}
-const floor_tab_t floor_leh_3e11 = {{0, 0, 0}, {1.28, 1.86, 1.06e-3}};   // Mac {0.75, 0.85, 9.0e-4}, rusty {1.28, 1.86, 1.1e-3}
-const floor_tab_t floor_cmp_3e9  = {{0, 0, 0}, {1.98, 3.24, 6.88e-3}};   // Mac {1.98, 0.51, 4.9e-3}, rusty {0.86, 3.24, 6.9e-3}
+// default closure (tol_gram_eps = 1 -> Gram cut 1e-8 at eps 1e-8); time_eps 1e-8 -> 3e-9, 1e-10 -> 3e-11 (lehmann; compressed
+// identical within 1.3x)
+const floor_tab_t floor_3e9  = {{0, 0, 0}, {1.39, 0.97, 2.91e-3}};
+const floor_tab_t floor_3e11 = {{0, 0, 0}, {4.35e-3, 5.69e-3, 3.08e-5}};
 
 namespace {
 /// gates (mu meV, gap meV, Sigma rel) of iteration it (0-based) from a floor table
@@ -766,7 +768,7 @@ TEST_CASE("gw_line_scf_id_vs_gl", "[gw_line][scf][id_vs_gl]") {
       REQUIRE(h.time_grid == "id");
       const bool fine   = (r.name == "id(1e-10)");
       const double teps = fine ? 1e-10 : 1e-8;
-      auto g            = idgl_gate(fine ? floor_leh_3e11 : floor_leh_3e9, it, teps);
+      auto g            = idgl_gate(fine ? floor_3e11 : floor_3e9, it, teps);
       ok = gate_line("|dmu| (meV)", dmu, g[0]) and ok;
       ok = gate_line("|dgap| (meV)", dgap, g[1]) and ok;
       ok = gate_line("max|dSigma|/max|Sigma|", ds, g[2]) and ok;
@@ -1168,6 +1170,7 @@ TEST_CASE("gw_line_scf_lehmann", "[gw_line][scf][lehmann]") {
                          [&](std::string const &f, std::string const &tg, std::string const &gr) {
                            auto pt = scf_params(f, niter, false, tg, gr);
                            pt.put("lam_b", -1.0);   // auto: 2 x 6 Ha
+                           pt.put("time_eps", 1e-10);   // S7f: the it-1 ID difference 3e-11 keeps the it-2 gate tight
                            return pt;
                          },
                          idgl);
@@ -1183,7 +1186,7 @@ TEST_CASE("gw_line_scf_lehmann", "[gw_line][scf][lehmann]") {
   for (long iv = 0; iv < 2; ++iv)
     for (long it = 0; it < niter; ++it) {
       auto const &d = idgl[iv][it];
-      auto g        = idgl_gate(iv == 0 ? floor_cmp_3e9 : floor_leh_3e9, it, 1e-8);
+      auto g        = idgl_gate(floor_3e11, it, 1e-10);
       app_log(1, "  [lehmann] id vs gl, {} iteration {}:", vars[iv].name, it + 1);
       ok = gate_line("|dmu| (meV)", d[0], g[0]) and ok;
       ok = gate_line("|dgap| (meV)", d[1], g[1]) and ok;
@@ -1316,7 +1319,7 @@ std::vector<std::string> env_list(char const *nm, std::string const &dflt) {
 }
 
 /// closure options from the environment (GW_LINE_CUT, GW_LINE_SVDCUT, GW_LINE_CUTWIN, GW_LINE_PHASE, GW_LINE_TOLSVD,
-/// GW_LINE_TOLGRAM, GW_LINE_TSNAP = time_snap) into a driver ptree: lets the noise meter run the S7f remedies through the whole SCF
+/// GW_LINE_TOLGRAM, GW_LINE_TSNAP = time_snap, GW_LINE_TOLGEPS = tol_gram_eps) into a driver ptree: lets the noise meter run the S7f remedies through the whole SCF
 void closure_opts_from_env(ptree &pt) {
   if (auto *c = std::getenv("GW_LINE_CUT")) pt.put("closure_cut", std::string(c));
   if (auto *c = std::getenv("GW_LINE_SVDCUT")) pt.put("closure_svd_cut", std::string(c));
@@ -1325,6 +1328,7 @@ void closure_opts_from_env(ptree &pt) {
   if (auto *c = std::getenv("GW_LINE_TOLSVD")) pt.put("tol_svd", std::atof(c));
   if (auto *c = std::getenv("GW_LINE_TOLGRAM")) pt.put("tol_gram", std::atof(c));
   if (auto *c = std::getenv("GW_LINE_TSNAP")) pt.put("time_snap", std::atof(c));
+  if (auto *c = std::getenv("GW_LINE_TOLGEPS")) pt.put("tol_gram_eps", std::atof(c));
 }
 
 /// Lehmann G(i w) of a closure output about the OLD centre (the energies shifted back by dmu), [nk, nw, nb, nb]:
