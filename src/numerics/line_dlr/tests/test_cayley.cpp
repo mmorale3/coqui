@@ -282,6 +282,70 @@ TEST_CASE("cayley_si_gamma", "[numerics][cayley]") {
 }
 
 // =======================================================================
+//  3b. (S7f, hidden) the same demo with the alternative cuts of upfold_opts_t (gap / smooth Gram cut, gap SVD cut,
+//      tol_svd 1e-8, tol_gram 1e-10 / 1e-8 instead of the file's 1e-13): window error and held-out residual vs the python
+//      algorithm ("hard"), nphi 8 (report only)
+// =======================================================================
+TEST_CASE("cayley_si_gamma_cuts", "[.cayley_cuts]") {
+  h5::file file(ref_file, 'r');
+  h5::group root(file);
+  auto g = root.open_group("si_k0");
+  const double mu = read_attr<double>(g, "mu"), wp = read_attr<double>(g, "wp"), tol_gram = read_attr<double>(g, "tol_gram");
+  const double eta = read_attr<double>(g, "eta"), hw = read_attr<double>(g, "win_halfwidth");
+  nda::array<double, 3> Cre, Cim;
+  nda::array<double, 2> Hre, Him;
+  nda::array<double, 1> om, Aex;
+  nda::h5_read(g, "C_re", Cre);
+  nda::h5_read(g, "C_im", Cim);
+  nda::h5_read(g, "H_re", Hre);
+  nda::h5_read(g, "H_im", Him);
+  nda::h5_read(g, "om", om);
+  nda::h5_read(g, "Aex_tr_eta0.01", Aex);
+  const long nm = Cre.extent(0), n = Cre.extent(1), nw = om.size();
+  nda::array<dcomplex, 3> C(nm, n, n);
+  for (long a = 0; a < nm; ++a)
+    for (long i = 0; i < n; ++i)
+      for (long j = 0; j < n; ++j) C(a, i, j) = dcomplex(Cre(a, i, j), Cim(a, i, j));
+  nda::array<dcomplex, 2> Hrel(n, n);
+  for (long i = 0; i < n; ++i)
+    for (long j = 0; j < n; ++j) Hrel(i, j) = dcomplex(Hre(i, j), Him(i, j)) - (i == j ? mu : 0.0);
+  nda::array<double, 1> omr(nw);
+  for (long i = 0; i < nw; ++i) omr(i) = om(i) - mu;
+  auto win_err = [&](nda::array<double, 1> const &trA) {
+    double num = 0.0, den = 0.0;
+    for (long i = 0; i < nw; ++i)
+      if (std::abs(om(i) - mu) < hw) {
+        num = std::max(num, std::abs(trA(i) - Aex(i)));
+        den = std::max(den, Aex(i));
+      }
+    return num / den;
+  };
+  std::cout << std::scientific << std::setprecision(3) << "\n[cayley_cuts] Si222 G0W0 k=0, tol_gram=" << tol_gram << ", nphi 8\n"
+            << "[cayley_cuts] K cut           | r_gram r1 | residual | win err\n";
+  for (long K : {8L, 16L}) {
+    double e_hard = 0.0;
+    for (std::string v : {"hard", "gap", "smooth", "gap+svdgap", "tol_svd 1e-8", "tol_gram 1e-10", "tol_gram 1e-8"}) {
+      ldlr::upfold_opts_t o;
+      o.tol_gram = tol_gram;
+      o.nphi     = 8;
+      if (v == "gap" or v == "gap+svdgap") o.gram_cut = "gap";
+      if (v == "smooth") o.gram_cut = "smooth";
+      if (v == "gap+svdgap") o.svd_cut = "gap";
+      if (v == "tol_svd 1e-8") o.tol_svd = 1e-8;
+      if (v == "tol_gram 1e-10") o.tol_gram = 1e-10;
+      if (v == "tol_gram 1e-8") o.tol_gram = 1e-8;
+      auto res = ldlr::upfold_block(C, K, wp, o);
+      auto trA = ldlr::spectral_trace(Hrel, res.d, res.W, omr, eta);
+      const double e = win_err(trA);
+      if (v == "hard") e_hard = e;
+      std::cout << "[cayley_cuts] " << K << " " << std::setw(14) << v << " | " << res.r_gram << " " << res.r1 << " | " << res.residual
+                << " | " << e << " (" << std::fixed << std::setprecision(2) << e / e_hard << " x hard)" << std::scientific
+                << std::setprecision(3) << "\n";
+    }
+  }
+}
+
+// =======================================================================
 //  4. chemical potential: widest admissible QP gap
 // =======================================================================
 TEST_CASE("cayley_chemical_potential", "[numerics][cayley]") {

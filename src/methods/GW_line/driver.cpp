@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <limits>
 #include <numbers>
+#include <random>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -100,6 +101,18 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.K             = io::get_value_with_default<long>(pt, "K", p.K);
   p.tol_gram      = io::get_value_with_default<double>(pt, "tol_gram", p.tol_gram);
   p.nphi          = io::get_value_with_default<long>(pt, "nphi", p.nphi);
+  p.tol_svd       = io::get_value_with_default<double>(pt, "tol_svd", p.tol_svd);
+  p.closure_cut   = io::get_value_with_default<std::string>(pt, "closure_cut", p.closure_cut);
+  io::tolower(p.closure_cut);
+  p.closure_svd_cut = io::get_value_with_default<std::string>(pt, "closure_svd_cut", p.closure_svd_cut);
+  io::tolower(p.closure_svd_cut);
+  p.closure_cut_window = io::get_value_with_default<double>(pt, "closure_cut_window", p.closure_cut_window);
+  p.phase_keep    = io::get_value_with_default<double>(pt, "phase_keep", p.phase_keep);
+  p.debug_noise_h0   = io::get_value_with_default<double>(pt, "debug_noise_h0", p.debug_noise_h0);
+  p.debug_noise_seed = io::get_value_with_default<long>(pt, "debug_noise_seed", p.debug_noise_seed);
+  p.debug_noise_sigma = io::get_value_with_default<double>(pt, "debug_noise_sigma", p.debug_noise_sigma);
+  p.debug_noise_iter  = io::get_value_with_default<long>(pt, "debug_noise_iter", p.debug_noise_iter);
+  p.bases_file    = io::get_value_with_default<std::string>(pt, "bases_file", p.bases_file);
   p.niter         = io::get_value_with_default<long>(pt, "niter", p.niter);
   p.mixing        = io::get_value_with_default<double>(pt, "mixing", p.mixing);
   p.conv_thr      = io::get_value_with_default<double>(pt, "conv_thr", p.conv_thr);
@@ -148,6 +161,13 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   utils::check(p.g_wtol >= 0.0 and p.g_emin_frac >= 0.0 and p.g_wsmall >= 0.0, "gw_line: g_wtol, g_emin_frac, g_wsmall must be >= 0");
   utils::check(p.nodes_per_ray > 1 and p.node_tmin > 0.0 and p.node_tmax > p.node_tmin, "gw_line: invalid node grid");
   utils::check(p.K >= 1 and p.nphi >= 1 and p.wp > 0.0 and p.tol_gram > 0.0, "gw_line: invalid closure parameters");
+  utils::check(p.tol_svd > 0.0 and p.closure_cut_window >= 1.0 and p.phase_keep >= 0.0 and p.debug_noise_h0 >= 0.0 and
+                   p.debug_noise_sigma >= 0.0,
+               "gw_line: invalid tol_svd / closure_cut_window / phase_keep / debug_noise_h0");
+  utils::check(p.closure_cut == "hard" or p.closure_cut == "gap" or p.closure_cut == "smooth",
+               "gw_line: closure_cut must be \"hard\", \"gap\" or \"smooth\" (got \"{}\")", p.closure_cut);
+  utils::check(p.closure_svd_cut == "hard" or p.closure_svd_cut == "gap",
+               "gw_line: closure_svd_cut must be \"hard\" or \"gap\" (got \"{}\")", p.closure_svd_cut);
   utils::check(p.niter >= 0 and p.t_chunk >= 0 and p.ray_decades > 0.0, "gw_line: invalid niter / t_chunk / ray_decades");
   utils::check(p.mixing > 0.0 and p.mixing <= 1.0, "gw_line: mixing must be in (0, 1]");
   utils::check(p.time_grid == "id" or p.time_grid == "gl", "gw_line: time_grid must be \"id\" or \"gl\" (got \"{}\")",
@@ -172,7 +192,16 @@ void gw_line_params_t::log() const {
   else
     app_log(1, "    G representation: compressed (gapless per-sector refit, g_gap = {})", g_gap);
   app_log(1, "    fermionic nodes: {} per ray, |t| in [{}, {}] Ha", nodes_per_ray, node_tmin, node_tmax);
-  app_log(1, "    closure: wp = {} Ha, K = {}, tol_gram = {:.1e}, nphi = {}", wp, K, tol_gram, nphi);
+  app_log(1, "    closure: wp = {} Ha, K = {}, tol_gram = {:.1e}, nphi = {}, tol_svd = {:.1e}, cuts {} / {} (window {}), "
+             "phase continuity {}",
+          wp, K, tol_gram, nphi, tol_svd, closure_cut, closure_svd_cut, closure_cut_window,
+          phase_keep > 0.0 ? "on (x " + std::to_string(phase_keep) + ")" : std::string("off"));
+  if (debug_noise_h0 > 0.0)
+    app_log(1, "    DIAGNOSTIC: relative noise {:.1e} on H0 (seed {})", debug_noise_h0, debug_noise_seed);
+  if (debug_noise_sigma > 0.0)
+    app_log(1, "    DIAGNOSTIC: relative noise {:.1e} on Sigma at the nodes in iteration {} (seed {})", debug_noise_sigma,
+            debug_noise_iter, debug_noise_seed);
+  if (not bases_file.empty()) app_log(1, "    DIAGNOSTIC: real-pole bases read from {}", bases_file);
   app_log(1, "    niter = {} (total), mixing = {}, conv_thr = {:.1e}, t_chunk = {}, ray_decades = {}", niter, mixing, conv_thr,
           t_chunk, ray_decades);
   if (time_grid == "id")
@@ -438,6 +467,11 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "K", p.K);
   h5::h5_write(ig, "tol_gram", p.tol_gram);
   h5::h5_write(ig, "nphi", p.nphi);
+  h5::h5_write(ig, "tol_svd", p.tol_svd);
+  h5::h5_write(ig, "closure_cut", p.closure_cut);
+  h5::h5_write(ig, "closure_svd_cut", p.closure_svd_cut);
+  h5::h5_write(ig, "closure_cut_window", p.closure_cut_window);
+  h5::h5_write(ig, "phase_keep", p.phase_keep);
   h5::h5_write(ig, "mixing", p.mixing);
   h5::h5_write(ig, "conv_thr", p.conv_thr);
   h5::h5_write(ig, "t_chunk", p.t_chunk);
@@ -458,6 +492,7 @@ struct state_t {
   pole_data_t poles;
   bool have_sigma = false;
   nda::array<ComplexType, 4> Sig_p, Sig_h;
+  nda::array<double, 1> phi;   ///< terminal phase phi* of the last closure per k (S7f phase continuity; empty = none)
 };
 
 /// Sigma file of checkpoint_sigma = "last" (S7e): <output>.gw_line.sigma.h5, rewritten every iteration (tmp + rename)
@@ -507,6 +542,7 @@ void write_state(boost::mpi3::communicator &comm, std::string const &file, state
       nda::h5_write(it, "Sigma_h", Sh, false);
     }
     h5::h5_write(it, "has_sigma", long(st.have_sigma ? 1 : 0));
+    if (st.phi.size() > 0) nda::h5_write(it, "closure_phi", st.phi, false);
     write_poles(it, st.poles);
     if (rec != nullptr) write_history(it, *rec);
     h5::h5_write(sg, "final_iter", st.iter);
@@ -564,6 +600,7 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
       }
     }
     st.poles = read_poles(it, nk, nb);
+    if (it.has_dataset("closure_phi")) nda::h5_read(it, "closure_phi", st.phi);
     utils::check(st.F.extent(0) == nk and st.F.extent(1) == nb, "gw_line restart: F shape mismatch");
     nhist = st.iter;
     hist  = nda::array<double, 2>(nhist, NHIST);
@@ -597,6 +634,7 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     bcast_array(comm, st.Sig_h);
   }
   bcast_poles(comm, st.poles);
+  bcast_array(comm, st.phi);
   bcast_array(comm, hist);
   history.clear();
   for (long i = 0; i < hist.extent(0); ++i) {
@@ -836,6 +874,18 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   // one-body Hamiltonian, KS spectrum, initial centre
   Timer.start("H0");
   auto H0 = one_body_h0(mf);
+  if (prm.debug_noise_h0 > 0.0) {   // diagnostic (noise-floor meter): the same Hermitian noise on every rank
+    const double h0max = nda::max_element(nda::abs(H0));
+    std::mt19937_64 gen(0x5eedull + 7919ull * std::uint64_t(prm.debug_noise_seed));
+    std::normal_distribution<double> N01;
+    for (long ik = 0; ik < H0.extent(0); ++ik)
+      for (long i = 0; i < H0.extent(1); ++i)
+        for (long j = 0; j <= i; ++j) {
+          const ComplexType x = prm.debug_noise_h0 * h0max * ComplexType(N01(gen), i == j ? 0.0 : N01(gen));
+          H0(ik, i, j) += x;
+          if (j != i) H0(ik, j, i) += std::conj(x);
+        }
+  }
   Timer.stop("H0");
   nda::array<double, 2> eig(nk, nb);
   double homo = -1e300, lumo = 1e300;
@@ -855,8 +905,28 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   Timer.start("bases");
   line_basis_t gp(theta, prm.lam, prm.eps, prm.lam, prm.g_gap, -1.0, prm.node_tmax);
   line_basis_t gh(theta, prm.lam, prm.eps, prm.g_gap, prm.lam, -1.0, prm.node_tmax);
+  // diagnostics / parity: poles (and bosonic nodes) of the bases from a file (every rank reads it)
+  auto read_w = [&](std::string const &key) {
+    nda::array<double, 1> w;
+    h5::file f(prm.bases_file, 'r');
+    h5::group g(f);
+    nda::h5_read(g, key, w);
+    return w;
+  };
+  auto set_line_basis = [&](line_basis_t &b, std::string const &key) {
+    if (prm.bases_file.empty()) return;
+    b.w    = read_w(key);
+    b.rank = b.w.size();
+  };
+  set_line_basis(gp, "g_particle_w");
+  set_line_basis(gh, "g_hole_w");
   Timer.stop("bases");
   closure_params_t cprm{prm.wp, prm.K, prm.tol_gram, prm.nphi};
+  cprm.tol_svd    = prm.tol_svd;
+  cprm.gram_cut   = prm.closure_cut;
+  cprm.svd_cut    = prm.closure_svd_cut;
+  cprm.cut_window = prm.closure_cut_window;
+  cprm.phase_keep = prm.phase_keep;
   g_repr_params_t grepr{prm.g_repr, prm.g_emax, prm.g_wtol, prm.g_emin_frac, prm.g_wsmall};
 
   // state: restart or KS start
@@ -891,14 +961,29 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   auto update_bases = [&]() {
     Timer.start("bases");
     const double bgap = prm.bos_gap >= 0.0 ? prm.bos_gap : 0.5 * (st.e_lumo - st.e_homo);
-    if (not bos or bos->gap != bgap) bos.emplace(theta, prm.lam_b, prm.eps, bgap);
+    if (not bos or bos->gap != bgap) {
+      bos.emplace(theta, prm.lam_b, prm.eps, bgap);
+      if (not prm.bases_file.empty()) {
+        bos->nu   = read_w("bos_nu");
+        bos->rank = bos->nu.size();
+        h5::file f(prm.bases_file, 'r');
+        h5::group g(f);
+        nda::h5_read(g, "bos_zeta_nodes", bos->zeta_nodes);
+      }
+    }
     double gpp = prm.sigma_gap, ghh = prm.sigma_gap;
     if (prm.sigma_gap < 0.0) {
       gpp = 0.8 * (st.e_lumo + bos->gap);
       ghh = 0.8 * (std::abs(st.e_homo) + bos->gap);
     }
-    if (not bp or bp->gap[1] != gpp) bp.emplace(theta, prm.lam, prm.eps, prm.lam, gpp, -1.0, prm.node_tmax);
-    if (not bh or bh->gap[0] != ghh) bh.emplace(theta, prm.lam, prm.eps, ghh, prm.lam, -1.0, prm.node_tmax);
+    if (not bp or bp->gap[1] != gpp) {
+      bp.emplace(theta, prm.lam, prm.eps, prm.lam, gpp, -1.0, prm.node_tmax);
+      set_line_basis(*bp, "sigma_particle_w");
+    }
+    if (not bh or bh->gap[0] != ghh) {
+      bh.emplace(theta, prm.lam, prm.eps, ghh, prm.lam, -1.0, prm.node_tmax);
+      set_line_basis(*bh, "sigma_hole_w");
+    }
     Timer.stop("bases");
   };
   update_bases();
@@ -1017,6 +1102,21 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
                      prm.sigma_kdist, whp, qplan.gs_sigma);
     self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sh_new, Timer, sector_t::hole,
                      prm.sigma_kdist, whp, qplan.gs_sigma);
+    if (prm.debug_noise_sigma > 0.0 and st.iter + 1 == prm.debug_noise_iter) {
+      // diagnostic (noise-floor meter): relative complex Gaussian noise on the new Sigma, seeded per GLOBAL k (rank-count
+      // independent), scale max|Sigma^> + Sigma^<| over all k and nodes
+      double smax = nda::max_element(nda::abs(Sp_new + Sh_new));
+      if (prm.sigma_kdist) smax = comm.all_reduce_value(smax, boost::mpi3::max<>{});
+      for (long l = 0; l < Sp_new.extent(0); ++l) {
+        const long k = prm.sigma_kdist ? kd.global(l, kd.rank) : l;
+        std::mt19937_64 gen(0xabcdull + 1000003ull * std::uint64_t(prm.debug_noise_seed) + std::uint64_t(k));
+        std::normal_distribution<double> N01;
+        for (auto *S : {&Sp_new, &Sh_new})
+          for (long iz = 0; iz < nz; ++iz)
+            for (long i = 0; i < nb; ++i)
+              for (long j = 0; j < nb; ++j) (*S)(l, iz, i, j) += prm.debug_noise_sigma * smax * ComplexType(N01(gen), N01(gen));
+      }
+    }
     Timer.start("Sigma_mix");
     double dS = 0.0;
     if (st.have_sigma) {
@@ -1045,7 +1145,21 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     for (long ik = 0; ik < nk; ++ik)
       for (long i = 0; i < nb; ++i)
         for (long j = 0; j < nb; ++j) Hrel(ik, i, j) = H0(ik, i, j) + st.F(ik, i, j) - (i == j ? st.mu : 0.0);
+    cprm.phi_prev.assign(st.phi.begin(), st.phi.end());   // S7f phase continuity (used only if phase_keep > 0)
     auto co = closure(comm, Hrel, st.Sig_p, st.Sig_h, zeta, *bp, *bh, gp, gh, cprm, nelec, Timer, grepr);
+    st.phi = nda::array<double, 1>(nk);
+    for (long ik = 0; ik < nk; ++ik) st.phi(ik) = co.diag[ik].phi;
+    {   // S7f: how close the hard decisions of the upfolding are to flipping (closure noise floor)
+      long gn = 0, sn = 0, kept = 0;
+      double gm = 1e300, sm = 1e300, tie = 1e300;
+      for (auto const &d : co.diag) {
+        gn += d.gram_near; sn += d.svd_near; kept += d.phi_kept;
+        gm = std::min(gm, d.gram_margin); sm = std::min(sm, d.svd_margin); tie = std::min(tie, d.phi_tie);
+      }
+      app_log(2, "          closure decisions: Gram eigenvalues within x10 of the cut {} (min margin {:.2e} dec), singular values "
+                 "within x10 of tol_svd {} (min margin {:.2e} dec), closest phase-basin tie {:.3f}, phase basins kept {}",
+              gn, gm, sn, sm, tie, kept);
+    }
     const double tC = toc("phase_closure", e0);
     st.mu_sigma = st.mu;
     st.mu += co.dmu;

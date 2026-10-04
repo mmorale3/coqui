@@ -48,6 +48,15 @@
  *   nodes_per_ray = 120, node_tmin = 1e-3, node_tmax = 60   dense fermionic nodes (log grid per ray); node_tmax is also
  *                       the tmax of the fermionic bases (python node_range)
  *   wp = 0.11, K = 24, tol_gram = 1e-10, nphi = 8           Cayley closure
+ *   tol_svd = 1e-12, closure_cut = "hard", closure_svd_cut = "hard", closure_cut_window = 10, phase_keep = 0
+ *                       S7f closure options (closure.hpp closure_params_t, cayley.hpp upfold_opts_t): SVD cutoff, Gram /
+ *                       SVD cut placement ("gap": at the largest eigenvalue ratio within a window of the tolerance;
+ *                       "smooth": smooth-step weights of the Gram rows in the window), phase continuity (> 0)
+ *   debug_noise_h0 = 0, debug_noise_seed = 0, debug_noise_sigma = 0, debug_noise_iter = 1, bases_file = ""
+ *                       diagnostics: relative Hermitian noise on H0, or relative noise on Sigma at the nodes of iteration
+ *                       debug_noise_iter (noise-floor meter, test [.scf_noise]); real-pole bases read from a file instead of built (parity test: the
+ *                       pivoted-QR pole selection differs between LAPACKs; keys sigma_{particle,hole}_w, g_{particle,hole}_w,
+ *                       bos_nu, bos_zeta_nodes)
  *   niter = 12          TOTAL number of iterations (a restart continues until niter iterations are done)
  *   mixing = 0.5        linear mixing of Sigma^{>/<} at the nodes (F is not mixed, as python)
  *   conv_thr = 1e-5     stop when max|dSigma| at the nodes (after mixing, as python) < conv_thr
@@ -108,6 +117,16 @@ struct gw_line_params_t {
   long K = 24;
   double tol_gram = 1e-10;
   long nphi = 8;
+  double tol_svd = 1e-12;                ///< S7f: relative SVD cutoff of the upfolding (python 1e-12)
+  std::string closure_cut = "hard";      ///< S7f: Gram cut "hard" (python) | "gap" | "smooth" (cayley.hpp upfold_opts_t)
+  std::string closure_svd_cut = "hard";  ///< S7f: SVD cut "hard" | "gap"
+  double closure_cut_window = 10.0;      ///< S7f: window factor of the gap / smooth cuts
+  double phase_keep = 0.0;               ///< S7f: > 0 = phase continuity (keep the previous phi* basin within this factor)
+  double debug_noise_h0 = 0.0;           ///< diagnostics: relative Hermitian Gaussian noise on H0 (seed debug_noise_seed)
+  long debug_noise_seed = 0;
+  double debug_noise_sigma = 0.0;        ///< diagnostics: relative noise on Sigma at the nodes (before mixing) ...
+  long debug_noise_iter = 1;             ///< ... in this iteration
+  std::string bases_file;                ///< diagnostics/parity: real-pole bases read from this file (gen_lih222_scf_ref.py)
   long niter = 12;
   double mixing = 0.5, conv_thr = 1e-5;
   long t_chunk = 0;   // 0 = automatic (host: 32, COQUI_GWLINE_HOST_TCHUNK; device: from the free memory, capped)

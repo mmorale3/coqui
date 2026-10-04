@@ -41,6 +41,7 @@
 #include <limits>
 #include <numbers>
 #include <numeric>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -210,6 +211,33 @@ inline cmatrix_F block_toeplitz(nda::array<ComplexType, 3> const &C, long K) {
   return T;
 }
 
+/// Options of upfold_block (the python defaults reproduce upfold.py; S7f: alternative cuts, phase continuity, diagnostics).
+struct upfold_opts_t {
+  double tol_c0       = 1e-12;   ///< relative eigenvalue cutoff of C^(0)
+  double tol_gram     = 1e-10;   ///< relative eigenvalue cutoff of the block Toeplitz Gram matrix
+  double tol_svd      = 1e-12;   ///< relative singular-value cutoff of D+ D-^dagger (rank r1)
+  long nphi           = 8;       ///< coarse terminal-phase scan
+  double reject_unity = 1e-6;    ///< coarse phases with an eigenvalue |u - 1| < reject_unity are inadmissible
+  /**
+   * Gram cut (S7f): "hard" = keep lambda > tol_gram lambda_max (python); "gap" = cut at the largest ratio
+   * lambda_i / lambda_{i+1} among the boundaries with lambda_i >= tol_gram lambda_max / cut_window and
+   * lambda_{i+1} <= tol_gram lambda_max cut_window (the hard boundary is always a candidate); "smooth" = keep
+   * lambda > tol_gram lambda_max / cut_window and weight the Gram rows by a smooth step s(log lambda) that goes from
+   * 0 at tol_gram / cut_window to 1 at tol_gram cut_window (X = diag(sqrt(lambda s)) V^dagger): a direction crossing
+   * the cut enters with zero weight.
+   */
+  std::string gram_cut = "hard";
+  std::string svd_cut  = "hard";   ///< "hard" (python) | "gap" (largest singular-value ratio within the window)
+  double cut_window    = 10.0;     ///< window factor of the "gap" / "smooth" cuts
+  /// Phase continuity (S7f): if finite, the coarse-scan basin of phi_prev is kept when its held-out error is within
+  /// phase_keep x the best coarse error (the golden-section bracket is then centred on phi_prev).
+  double phi_prev   = std::numeric_limits<double>::quiet_NaN();
+  double phase_keep = 10.0;
+  // attribution diagnostics (tests only): force the retained Gram rank, r1, or the terminal phase
+  long force_rgram = -1, force_r1 = -1;
+  double force_phi = std::numeric_limits<double>::quiet_NaN();
+};
+
 /// Result of upfold_block: Sigma_c(z) = sum_l W[:, l] W[:, l]^dagger / (z - d_l), d mu-RELATIVE (sorted ascending).
 struct upfold_result_t {
   nda::array<double, 1> d;           ///< [np] real poles, mu-relative: d_l = wp cot(theta_l / 2)
@@ -222,7 +250,37 @@ struct upfold_result_t {
   long r1         = 0;               ///< numerical rank of D+ D-^dagger (tol_svd)
   long n_free     = 0;               ///< r_gram - r1: dimension of the free terminal-phase block
   double gram_lam_min = 0.0;         ///< smallest / largest eigenvalue of T
+  // S7f diagnostics of the hard decisions
+  long gram_near      = 0;           ///< Gram eigenvalues within a factor 10 of the threshold tol_gram lambda_max
+  double gram_margin  = 0.0;         ///< min |log10(lambda / (tol_gram lambda_max))| over all eigenvalues (decades)
+  double gram_ratio   = 0.0;         ///< lambda_last_kept / lambda_first_dropped at the chosen cut (inf: nothing dropped)
+  long svd_near       = 0;           ///< singular values within a factor 10 of tol_svd s_max
+  double svd_margin   = 0.0;         ///< min |log10(s / (tol_svd s_max))| (decades)
+  long phi_index      = -1;          ///< coarse-scan index of the chosen basin (-1: no scan)
+  double phi_tie      = 0.0;         ///< best coarse error of the OTHER local minima / the chosen one (>= 1; ~1 = near tie)
+  long n_rejected     = 0;           ///< coarse phases rejected by reject_unity
+  bool phi_kept       = false;       ///< phase continuity kept the basin of phi_prev over the best coarse phase
 };
+
+namespace detail {
+/// boundary b (keep x[0..b)) of a descending sequence x (normalized by x[0]) for the hard / gap cut at threshold t
+inline long cut_boundary(std::vector<double> const &x, double t, std::string const &mode, double window) {
+  const long n = long(x.size());
+  long bh = 0;
+  while (bh < n and x[bh] > t) ++bh;
+  if (mode == "hard" or mode == "smooth") return bh;
+  utils::check(mode == "gap", "cayley::upfold_block: cut must be \"hard\", \"gap\" or \"smooth\" (got \"{}\")", mode);
+  long best = bh;
+  double rbest = -1.0;
+  for (long b = 1; b <= n; ++b) {   // keep at least one
+    const double xk = x[b - 1], xd = (b < n) ? x[b] : 0.0;
+    if (xk < t / window or xd > t * window) continue;
+    const double r = (xd > 0.0) ? xk / xd : std::numeric_limits<double>::infinity();
+    if (r > rbest) { rbest = r; best = b; }
+  }
+  return best;
+}
+} // namespace detail
 
 /**
  * Unitary realization of the block moments C[0..K]; C[K+1] is the held-out moment that fixes the terminal phase (Eq. upfold).
@@ -234,14 +292,16 @@ struct upfold_result_t {
  *   then 30 golden-section steps on [phi0 - 2 pi/nphi, phi0 + 2 pi/nphi]; complex Schur U = Z diag(u) Z^dag, W = R Z,
  *   d = wp cot(arg(u)/2). As in python, reject_unity only screens the coarse-scan phases (the refined phase is not re-screened).
  * Python's default nphi is 72 (kept here for parity); the cost is one Schur form of an r_gram x r_gram matrix per phase.
+ * upfold_opts_t selects the S7f alternatives (gap / smooth cuts, phase continuity); its defaults are the python algorithm.
  */
-inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K, double wp, double tol_c0 = 1e-12,
-                                    double tol_gram = 1e-10, double tol_svd = 1e-12, long nphi = 8,
-                                    double reject_unity = 1e-6) {
+inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K, double wp, upfold_opts_t const &o) {
   using nda::range;
   const long n = C.extent(1);
+  const double tol_c0 = o.tol_c0, tol_gram = o.tol_gram, tol_svd = o.tol_svd, reject_unity = o.reject_unity;
+  const long nphi = o.nphi;
   utils::check(C.extent(0) >= K + 2, "cayley::upfold_block: need moments 0..K+1 (K = {}), got {}", K, C.extent(0));
   utils::check(K >= 1 and nphi >= 1, "cayley::upfold_block: invalid K = {} or nphi = {}", K, nphi);
+  utils::check(o.cut_window >= 1.0, "cayley::upfold_block: cut_window must be >= 1");
   upfold_result_t res;
 
   // 1. normalize C^(0) = B B^dag
@@ -277,28 +337,60 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
   auto T = block_toeplitz(Chat, K);
   utils::check(T.size() > 0, "cayley::upfold_block: moments are empty (C0 rank {})", r);
   for (auto const &x : T) utils::check(std::isfinite(x.real()) and std::isfinite(x.imag()), "cayley::upfold_block: non-finite moments");
-  auto lamT = detail::herm_eig(T);                                 // T now holds the eigenvectors
+  auto lamT = detail::herm_eig(T);                                 // T now holds the eigenvectors (ascending eigenvalues)
   const long nT = lamT.size();
   const double lamT_max = *std::max_element(lamT.begin(), lamT.end());
   res.gram_lam_min = *std::min_element(lamT.begin(), lamT.end()) / lamT_max;
-  std::vector<long> keepT;
-  for (long i = 0; i < nT; ++i)
-    if (lamT(i) > tol_gram * lamT_max) keepT.push_back(i);
-  const long Nr = long(keepT.size());
+  std::vector<double> xg(nT);                                       // normalized eigenvalues, descending
+  for (long i = 0; i < nT; ++i) xg[i] = lamT(nT - 1 - i) / lamT_max;
+  res.gram_margin = std::numeric_limits<double>::infinity();
+  for (long i = 0; i < nT; ++i) {
+    if (xg[i] > 0.1 * tol_gram and xg[i] < 10.0 * tol_gram) ++res.gram_near;
+    if (xg[i] > 0.0) res.gram_margin = std::min(res.gram_margin, std::abs(std::log10(xg[i] / tol_gram)));
+  }
+  long bT = detail::cut_boundary(xg, tol_gram, o.gram_cut, o.cut_window);
+  const bool smooth = (o.gram_cut == "smooth");
+  if (smooth) {
+    bT = 0;
+    while (bT < nT and xg[bT] > tol_gram / o.cut_window) ++bT;
+  }
+  if (o.force_rgram >= 0) bT = std::min(o.force_rgram, nT);
+  utils::check(bT >= 1, "cayley::upfold_block: empty Gram cut");
+  res.gram_ratio = (bT < nT and xg[bT] > 0.0) ? xg[bT - 1] / xg[bT] : std::numeric_limits<double>::infinity();
+  const long Nr = bT;
   res.r_gram = Nr;
-  cmatrix_F X(Nr, nT);                                              // T = X^dag X
+  // rows of X = the Nr largest eigenvalues in ASCENDING order (zheevd order; python's keep mask, bitwise the S6 path)
+  cmatrix_F X(Nr, nT);                                              // T = X^dag X (smooth: filtered)
   for (long a = 0; a < Nr; ++a) {
-    const double s = std::sqrt(lamT(keepT[a]));
-    for (long j = 0; j < nT; ++j) X(a, j) = s * std::conj(T(j, keepT[a]));
+    const long ie = nT - Nr + a;
+    double lam    = lamT(ie);
+    if (smooth) {
+      const double x  = std::log10(lam / lamT_max * o.cut_window / tol_gram) / (2.0 * std::log10(o.cut_window));   // 0..1
+      const double xc = std::clamp(x, 0.0, 1.0);
+      lam *= xc * xc * (3.0 - 2.0 * xc);
+    }
+    const double s = std::sqrt(std::max(lam, 0.0));
+    for (long j = 0; j < nT; ++j) X(a, j) = s * std::conj(T(j, ie));
   }
   cmatrix_F Dm = X(range::all, range(0, K * r)), Dp = X(range::all, range(r, (K + 1) * r));
   auto M = detail::mm(Dp, Dm, 'N', 'C');                            // Nr x Nr
   cmatrix_F P(Nr, Nr), Qh(Nr, Nr);
   nda::array<double, 1> sv(Nr);
   nda::lapack::gesvd(M, sv, P, Qh);
-  long r1 = 0;
-  for (long i = 0; i < Nr; ++i)
-    if (sv(i) > tol_svd * sv(0)) ++r1;
+  std::vector<double> xs(Nr);
+  for (long i = 0; i < Nr; ++i) xs[i] = (sv(0) > 0.0) ? sv(i) / sv(0) : 0.0;
+  res.svd_margin = std::numeric_limits<double>::infinity();
+  for (long i = 0; i < Nr; ++i) {
+    if (xs[i] > 0.1 * tol_svd and xs[i] < 10.0 * tol_svd) ++res.svd_near;
+    if (xs[i] > 0.0) res.svd_margin = std::min(res.svd_margin, std::abs(std::log10(xs[i] / tol_svd)));
+  }
+  long r1 = detail::cut_boundary(xs, tol_svd, o.svd_cut == "smooth" ? "hard" : o.svd_cut, o.cut_window);
+  if (o.svd_cut == "hard") {   // python: count of sv > tol_svd s0 (identical to the boundary for a descending sequence)
+    r1 = 0;
+    for (long i = 0; i < Nr; ++i)
+      if (sv(i) > tol_svd * sv(0)) ++r1;
+  }
+  if (o.force_r1 >= 0) r1 = std::min(o.force_r1, Nr);
   res.r1     = r1;
   res.n_free = Nr - r1;
   cmatrix_F P1 = P(range::all, range(0, r1)), Q1h = Qh(range(0, r1), range::all);
@@ -341,6 +433,9 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
   double phi_best = 0.0;
   if (res.n_free == 0) {
     best = realize(0.0);
+  } else if (std::isfinite(o.force_phi)) {
+    phi_best = o.force_phi;
+    best     = realize(phi_best);
   } else {
     const double twopi = 2.0 * std::numbers::pi;
     std::vector<double> errs(nphi);
@@ -350,10 +445,30 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
       double umin      = std::numeric_limits<double>::infinity();
       for (auto const &ul : rz.u) umin = std::min(umin, std::abs(ul - 1.0));
       errs[ip] = (umin < reject_unity) ? std::numeric_limits<double>::infinity() : rz.err;
+      if (umin < reject_unity) ++res.n_rejected;
     }
-    const long i0 = long(std::min_element(errs.begin(), errs.end()) - errs.begin());
+    long i0 = long(std::min_element(errs.begin(), errs.end()) - errs.begin());
     utils::check(std::isfinite(errs[i0]), "cayley::upfold_block: no admissible terminal phase");
     double phi0 = twopi * double(i0) / double(nphi);
+    if (std::isfinite(o.phi_prev)) {   // phase continuity: keep the basin of the previous phase if it is competitive
+      double pp = std::fmod(o.phi_prev, twopi);
+      if (pp < 0.0) pp += twopi;
+      const long ipv = long(std::llround(pp / (twopi / double(nphi)))) % nphi;
+      if (std::isfinite(errs[ipv]) and errs[ipv] <= o.phase_keep * errs[i0]) {
+        res.phi_kept = (ipv != i0);
+        i0           = ipv;
+        phi0         = pp;
+      }
+    }
+    res.phi_index = i0;
+    // near-tie diagnostic: best error among the other local minima of the circular coarse scan
+    double other = std::numeric_limits<double>::infinity();
+    for (long ip = 0; ip < nphi; ++ip) {
+      if (ip == i0 or not std::isfinite(errs[ip])) continue;
+      const double em = errs[(ip + nphi - 1) % nphi], ep = errs[(ip + 1) % nphi];
+      if (errs[ip] <= em and errs[ip] <= ep) other = std::min(other, errs[ip]);
+    }
+    res.phi_tie = other / errs[i0];
     // golden-section refinement around the grid minimum (30 steps, as upfold.py)
     double a = phi0 - twopi / double(nphi), b = phi0 + twopi / double(nphi);
     auto f          = [&](double p) { return realize(p).err; };
@@ -385,6 +500,19 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
     for (long i = 0; i < n; ++i) res.W(i, l) = best.W(i, order[l]);
   }
   return res;
+}
+
+/// python signature (upfold.py defaults except nphi, see above)
+inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K, double wp, double tol_c0 = 1e-12,
+                                    double tol_gram = 1e-10, double tol_svd = 1e-12, long nphi = 8,
+                                    double reject_unity = 1e-6) {
+  upfold_opts_t o;
+  o.tol_c0       = tol_c0;
+  o.tol_gram     = tol_gram;
+  o.tol_svd      = tol_svd;
+  o.nphi         = nphi;
+  o.reject_unity = reject_unity;
+  return upfold_block(C, K, wp, o);
 }
 
 // ------------------------------------------------------------------------------------------------------------------

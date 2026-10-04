@@ -53,6 +53,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -95,12 +96,68 @@ inline sigma_poles_t fit_sigma_sectors(line_basis_t const &bp, line_basis_t cons
   return out;
 }
 
-/// Parameters of the moment closure (notes section 6; plan section 5).
+/// Parameters of the moment closure (notes section 6; plan section 5; S7f: cut modes, phase continuity, diagnostics).
 struct closure_params_t {
   double wp       = 0.11;    ///< Cayley scale (Ha)
   long K          = 24;      ///< moments 0..K (+ the held-out K+1)
   double tol_gram = 1e-10;   ///< relative eigenvalue cutoff of the block-Toeplitz Gram matrix
   long nphi       = 8;       ///< coarse terminal-phase scan (+ golden section)
+  double tol_svd  = 1e-12;   ///< relative singular-value cutoff of D+ D-^dagger (python 1e-12)
+  std::string gram_cut = "hard";   ///< "hard" (python) | "gap" | "smooth" (numerics::line_dlr::upfold_opts_t)
+  std::string svd_cut  = "hard";   ///< "hard" (python) | "gap"
+  double cut_window    = 10.0;     ///< window factor of the gap / smooth cuts
+  double phase_keep    = 0.0;      ///< > 0: phase continuity with phi_prev (per k) and this tolerance factor
+  std::vector<double> phi_prev;    ///< [nk] terminal phase of the previous closure per k (empty / NaN: none)
+  // diagnostics (tests): relative noise added to the moments of every k (seeded per k), forced decisions per k
+  double moment_noise = 0.0;
+  unsigned noise_seed = 0;
+  std::vector<long> force_rgram, force_r1;
+  std::vector<double> force_phi;
+
+  numerics::line_dlr::upfold_opts_t upfold_opts(long ik) const {
+    numerics::line_dlr::upfold_opts_t o;
+    o.tol_c0     = 1e-12;
+    o.tol_gram   = tol_gram;
+    o.tol_svd    = tol_svd;
+    o.nphi       = nphi;
+    o.gram_cut   = gram_cut;
+    o.svd_cut    = svd_cut;
+    o.cut_window = cut_window;
+    if (ik >= 0) {
+      if (phase_keep > 0.0 and ik < long(phi_prev.size())) {
+        o.phi_prev   = phi_prev[ik];
+        o.phase_keep = phase_keep;
+      }
+      if (ik < long(force_rgram.size())) o.force_rgram = force_rgram[ik];
+      if (ik < long(force_r1.size())) o.force_r1 = force_r1[ik];
+      if (ik < long(force_phi.size())) o.force_phi = force_phi[ik];
+    }
+    return o;
+  }
+};
+
+/// Scalar diagnostics of the upfolding of one k (numerics::line_dlr::upfold_result_t without the arrays; S7f).
+struct upfold_diag_t {
+  long r_gram = 0, r1 = 0, gram_near = 0, svd_near = 0, phi_index = -1, n_rejected = 0, phi_kept = 0;
+  double phi = 0.0, gram_margin = 0.0, gram_ratio = 0.0, svd_margin = 0.0, phi_tie = 0.0;
+  static constexpr long nfields = 13;
+  void pack(double *x) const {
+    double v[nfields] = {double(r_gram), double(r1), double(gram_near), double(svd_near), double(phi_index), double(n_rejected),
+                         double(phi_kept), phi, gram_margin, gram_ratio, svd_margin, phi_tie, 0.0};
+    std::copy_n(v, nfields, x);
+  }
+  void unpack(double const *x) {
+    r_gram = std::llround(x[0]); r1 = std::llround(x[1]); gram_near = std::llround(x[2]); svd_near = std::llround(x[3]);
+    phi_index = std::llround(x[4]); n_rejected = std::llround(x[5]); phi_kept = std::llround(x[6]);
+    phi = x[7]; gram_margin = x[8]; gram_ratio = x[9]; svd_margin = x[10]; phi_tie = x[11];
+  }
+  static upfold_diag_t from(numerics::line_dlr::upfold_result_t const &u) {
+    upfold_diag_t d;
+    d.r_gram = u.r_gram; d.r1 = u.r1; d.gram_near = u.gram_near; d.svd_near = u.svd_near; d.phi_index = u.phi_index;
+    d.n_rejected = u.n_rejected; d.phi_kept = u.phi_kept ? 1 : 0; d.phi = u.phi; d.gram_margin = u.gram_margin;
+    d.gram_ratio = u.gram_ratio; d.svd_margin = u.svd_margin; d.phi_tie = u.phi_tie;
+    return d;
+  }
 };
 
 /**
@@ -125,15 +182,27 @@ struct closure_k_t {
   nda::array<double, 1> d;         ///< [np] upfolded Sigma_c poles
   nda::array<ComplexType, 2> W;    ///< [nb, np] couplings
   double heldout = 0.0;            ///< held-out moment error of the upfolding
+  upfold_diag_t diag;              ///< hard decisions of the upfolding (S7f)
 };
 
-/// python lehmann_from_sigma: moments of the total measure -> upfold_block -> eig of Htilde.
-inline closure_k_t closure_k(nda::array<ComplexType, 2> const &Hrel, sigma_poles_t const &sp, closure_params_t const &p) {
+/// python lehmann_from_sigma: moments of the total measure -> upfold_block -> eig of Htilde. ik: k index (per-k options,
+/// noise seed; -1 = none).
+inline closure_k_t closure_k(nda::array<ComplexType, 2> const &Hrel, sigma_poles_t const &sp, closure_params_t const &p,
+                             long ik = -1) {
   using namespace numerics::line_dlr;
-  auto C  = moments_from_poles(sp.w, sp.g, p.wp, p.K + 1);
-  auto up = upfold_block(C, p.K, p.wp, 1e-12, p.tol_gram, 1e-12, p.nphi);
+  auto C = moments_from_poles(sp.w, sp.g, p.wp, p.K + 1);
+  if (p.moment_noise > 0.0) {   // diagnostic: relative complex Gaussian noise on every moment, scale max|C^(0)|
+    double c0 = 0.0;
+    for (long i = 0; i < C.extent(1); ++i)
+      for (long j = 0; j < C.extent(2); ++j) c0 = std::max(c0, std::abs(C(0, i, j)));
+    std::mt19937_64 gen(std::uint64_t(p.noise_seed) * 1000003ull + std::uint64_t(ik + 1));
+    std::normal_distribution<double> N01;
+    for (auto &x : C) x += p.moment_noise * c0 * ComplexType(N01(gen), N01(gen));
+  }
+  auto up = upfold_block(C, p.K, p.wp, p.upfold_opts(ik));
   auto L  = lehmann(Hrel, up.d, up.W);
-  return closure_k_t{std::move(L.e), std::move(L.v), std::move(up.d), std::move(up.W), up.residual};
+  auto dg = upfold_diag_t::from(up);
+  return closure_k_t{std::move(L.e), std::move(L.v), std::move(up.d), std::move(up.W), up.residual, dg};
 }
 
 /**
@@ -262,6 +331,7 @@ struct closure_out_t {
   double pruned_near_weight = 0.0;   ///< their summed weight
   std::vector<long> npoles;       ///< upfolded poles per k
   std::vector<double> heldout;    ///< held-out moment error per k
+  std::vector<upfold_diag_t> diag;   ///< upfolding decisions per k (S7f; phi = the terminal phase for phase continuity)
 };
 
 /**
@@ -291,18 +361,20 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   Timer.start("closure_upfold");
   std::vector<nda::array<double, 1>> e_loc(nk);
   std::vector<nda::array<ComplexType, 2>> v_loc(nk);
-  nda::array<double, 2> info(nk, 2);   // (npoles, heldout)
+  const long ni = 2 + upfold_diag_t::nfields;
+  nda::array<double, 2> info(nk, ni);   // (npoles, heldout, diag)
   info() = 0.0;
   for (long ik = rank; ik < nk; ik += np) {
     const long ks = sig_loc ? ik / np : ik;
     nda::array<ComplexType, 3> Sp(Sig_p(ks, all, all, all)), Sh(Sig_h(ks, all, all, all));
     auto sp = fit_sigma_sectors(bp, bh, zeta, Sp, Sh);
     nda::array<ComplexType, 2> H(Hrel(ik, all, all));
-    auto ck   = closure_k(H, sp, p);
+    auto ck   = closure_k(H, sp, p, ik);
     e_loc[ik] = std::move(ck.e);
     v_loc[ik] = std::move(ck.v);
     info(ik, 0) = double(ck.d.size());
     info(ik, 1) = ck.heldout;
+    ck.diag.pack(&info(ik, 2));
   }
   Timer.stop("closure_upfold");
 
@@ -312,6 +384,8 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   for (long ik = 0; ik < nk; ++ik) {
     out.npoles.push_back(long(std::llround(info(ik, 0))));
     out.heldout.push_back(info(ik, 1));
+    out.diag.emplace_back();
+    out.diag.back().unpack(&info(ik, 2));
   }
   Timer.stop("closure_gather");
 
