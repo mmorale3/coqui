@@ -124,6 +124,7 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.time_eps        = io::get_value_with_default<double>(pt, "time_eps", p.eps);
   p.time_pad        = io::get_value_with_default<double>(pt, "time_pad", p.time_pad);
   p.time_oversample = io::get_value_with_default<double>(pt, "time_oversample", p.time_oversample);
+  p.time_snap       = io::get_value_with_default<double>(pt, "time_snap", p.time_snap);
   p.sigma_kdist     = io::get_value_with_default<bool>(pt, "sigma_kdist", p.sigma_kdist);
   p.checkpoint_sigma = io::get_value_with_default<std::string>(pt, "checkpoint_sigma", p.checkpoint_sigma);
   io::tolower(p.checkpoint_sigma);
@@ -174,7 +175,7 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
                p.time_grid);
   utils::check(p.checkpoint_sigma == "last" or p.checkpoint_sigma == "all",
                "gw_line: checkpoint_sigma must be \"last\" or \"all\" (got \"{}\")", p.checkpoint_sigma);
-  utils::check(p.time_eps > 0.0 and p.time_eps < 1.0 and p.time_pad >= 1.0 and p.time_oversample >= 1.0,
+  utils::check(p.time_eps > 0.0 and p.time_eps < 1.0 and p.time_pad >= 1.0 and p.time_oversample >= 1.0 and p.time_snap >= 0.0,
                "gw_line: need 0 < time_eps < 1, time_pad >= 1, time_oversample >= 1");
   return p;
 }
@@ -205,8 +206,8 @@ void gw_line_params_t::log() const {
   app_log(1, "    niter = {} (total), mixing = {}, conv_thr = {:.1e}, t_chunk = {}, ray_decades = {}", niter, mixing, conv_thr,
           t_chunk, ray_decades);
   if (time_grid == "id")
-    app_log(1, "    time grid: ID (time_eps = {:.1e}, time_pad = {}, time_oversample = {}), rebuilt every iteration", time_eps,
-            time_pad, time_oversample);
+    app_log(1, "    time grid: ID (time_eps = {:.1e}, time_pad = {}, time_oversample = {}, time_snap = {}), rebuilt every iteration",
+            time_eps, time_pad, time_oversample, time_snap);
   else
     app_log(1, "    time grid: GL rays (ray_decades = {}, 3 panels/e-fold, 16 nodes/panel)", ray_decades);
   app_log(1, "    restart = {}, checkpoint = {}.gw_line.h5 (Sigma at the nodes: {})", restart, output,
@@ -480,6 +481,7 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "time_eps", p.time_eps);
   h5::h5_write(ig, "time_pad", p.time_pad);
   h5::h5_write(ig, "time_oversample", p.time_oversample);
+  h5::h5_write(ig, "time_snap", p.time_snap);
   h5::h5_write(ig, "checkpoint_sigma", p.checkpoint_sigma);
   nda::h5_write(ig, "fermionic_nodes", zeta, false);
 }
@@ -1055,7 +1057,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       numerics::line_dlr::time_id_opts_t topt;
       topt.pad        = prm.time_pad;
       topt.oversample = prm.time_oversample;
-      line_time_grids_t tg(st.poles, bos->nu, theta_t, prm.time_eps, topt, bos->zeta_nodes, zeta, comm);
+      line_time_grids_t tg(st.poles, bos->nu, theta_t, prm.time_eps, topt, bos->zeta_nodes, zeta, comm, prm.time_snap);
       tg.log(1);
       pi_p.emplace(tg.pi_p);
       pi_h.emplace(tg.pi_h);

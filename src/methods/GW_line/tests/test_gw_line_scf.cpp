@@ -35,12 +35,12 @@
  * [restart] 2 iterations + restart + 1 vs 3 uninterrupted iterations: bitwise identical mu, poles, F, Sigma at the nodes;
  *   spectra written by the restarted run and again by a restart with nothing left to iterate (niter reached): identical.
  *   Both time grids (S7b): time_grid = "id" (time-node ID, the default) and "gl" (Gauss-Legendre rays).
- * [parity] 6 iterations vs the python driver on the same THC/H0/KS data (coqui/cayley/scripts/gen_lih222_scf_ref.py ->
- *   tests/unit_test_files/gw_line/lih222_scf_ref.h5): mu and QP gap per iteration within 1 meV, Sigma at the stored nodes
- *   of k = 0 within 1e-5 relative (max norm over the stored nodes), per iteration. Pinned to time_grid = "gl" (python
- *   uses the GL ray quadrature).
- * [id_vs_gl] (S7b) 4 iterations with time_grid = "id" (time_eps = eps = 1e-8, and 1e-10) vs "gl": |dmu|, |dgap| and
- *   max|dSigma| / max|Sigma| at all nodes and k per iteration.
+ * [parity] (S7f) 3 iterations vs the python driver on the same THC/H0/KS data AND the same real-pole bases on every
+ *   platform (bases_file = lih222_thc/bases_lamb12.h5; coqui/cayley/scripts/gen_lih222_scf_ref.py --lam-b 12 ->
+ *   tests/unit_test_files/gw_line/lih222_scf_ref.h5), lam_b 12, compressed, time_grid "gl" (python's GL rays): mu, QP gap
+ *   and Sigma at the stored nodes of k = 0 per iteration within gates = 10 x the measured noise floor (parity_floor).
+ * [id_vs_gl] (S7b, S7f) 2 iterations, lehmann, lam_b auto, time_grid = "id" (time_eps 1e-8 and 1e-10) vs "gl": |dmu|,
+ *   |dgap| and max|dSigma| / max|Sigma| at all nodes and k; gates = 5 x the measured noise floor (idgl_gate).
  * [.time_id_poles] (hidden diagnostic) kernels on the poles of a checkpoint iteration (GW_LINE_DIAG_FILE, GW_LINE_DIAG_ITER):
  *   default GL rays and ID grids (time_eps 1e-8/1e-10/1e-12, pad 1.25/2) vs a refined GL reference.
  */
@@ -553,6 +553,33 @@ TEST_CASE("gw_line_scf_restart", "[gw_line][scf][restart]") {
   SECTION("time_grid id, g_repr lehmann") { restart_test("id", "lehmann"); }
 }
 
+namespace {
+nda::array<ComplexType, 4> read_sigma_total(boost::mpi3::communicator &comm, std::string const &file, long it);
+
+/// S7f: a measured-vs-gate line; returns pass/fail
+bool gate_line(std::string const &what, double value, double gate) {
+  const bool ok = std::abs(value) <= gate;
+  app_log(1, "    {:<34s} {:10.3e} <= gate {:10.3e}  {}", what, std::abs(value), gate, ok ? "ok" : "FAIL");
+  return ok;
+}
+} // namespace
+
+/**
+ * S7f gates. The noise floor of the method at the parity settings (compressed, gl, lam_b 12, K 8, eps 1e-8, test settings):
+ * [.scf_noise] GW_LINE_NOISE_SETTINGS=test LAMB=auto REPR=cmp TG=gl, relative noise 1e-13 on H0, 4 runs, spread of mu and
+ * of the QP gap (meV) and max|dSigma|/max|Sigma| per iteration; the values below are the MAX over the Mac (Accelerate /
+ * OpenBLAS, 2 ranks) and rusty (MKL, gcc, 2 ranks). Gate of iteration it > 1 = max(strict, PARITY_K x floor(it)); iteration 1
+ * (KS poles, identical bases): strict 1e-3 meV and 1e-10 in Sigma. The yardstick is relative noise 2e-14 on Sigma of iteration 1
+ * (GW_LINE_NOISE_MODE=sigma GW_LINE_NOISE_AMP=2e-14) = the measured python-vs-C++ difference of Sigma at iteration 1 (1.9e-14):
+ * noise on H0 (1e-13) is far too weak a probe (it does not pass through the ill-conditioned sector fits: spread <= 3e-4 meV),
+ * noise on Sigma at 1e-12 already saturates (meV at iteration 3). 3 iterations: the 2e-14 floor is 0.49 meV at iteration 4
+ * and 7.5 meV at 5 (the K 8 attractor), so later iterations cannot be gated meaningfully. Measured (Mac, 1 / 2 ranks):
+ * iteration 2 |dmu| 2.2e-5 / 5.3e-5 meV, Sigma 7.7e-8 / 2.2e-7; iteration 3 8.4e-4 meV, 1.1e-6.
+ */
+constexpr double PARITY_K = 10.0;
+constexpr long PARITY_NIT = 3;
+constexpr std::array<std::array<double, 3>, PARITY_NIT> parity_floor = {{{0, 0, 0}, {1e-4, 2e-4, 4.71e-7}, {1.22e-2, 3.2e-3, 6.68e-6}}};
+
 TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
   const std::string ref = gw_line_dir() + "lih222_scf_ref.h5";
   if (not std::filesystem::exists(ref)) {
@@ -566,6 +593,8 @@ TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
   nda::array<long, 1> idx;
   nda::array<ComplexType, 4> Sig_r;   // (niter, n_sel, nb, nb), total Sigma at k = 0
   long niter = 0;
+  double lam_b = 4.0;
+  std::string bases;
   {
     h5::file f(ref, 'r');
     h5::group g(f);
@@ -580,38 +609,49 @@ TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
     Sig_r = nda::array<ComplexType, 4>(re.shape());
     for (long a = 0; a < re.size(); ++a) Sig_r.data()[a] = ComplexType(re.data()[a], im.data()[a]);
     niter = mu_r.size();
+    h5::h5_read_attribute(g, "lam_b", lam_b);
+    h5::h5_read_attribute(g, "bases", bases);
+  }
+  REQUIRE(lam_b == 12.0);          // S7f: the well-conditioned bosonic range (lam_b 4 amplifies roundoff ~1e5 x, S7c)
+  REQUIRE(not bases.empty());      // python ran on the dumped C++ bases
+  REQUIRE(niter >= PARITY_NIT);
+  const std::string bfile = gw_line_dir() + "lih222_thc/" + bases;
+  // platform report: the bases this LAPACK would build vs the dumped ones (pivoted-QR near ties differ between LAPACKs)
+  {
+    const double th = 20.0 * std::numbers::pi / 180.0, eps = 1e-8;
+    line_basis_t bh(th, 6.0, eps, 0.02, 6.0, -1.0, 60.0);
+    numerics::line_dlr::bosonic_basis_t bos(th, lam_b, eps, 0.02);
+    nda::array<double, 1> wh, nu;
+    h5::file f(bfile, 'r');
+    h5::group g(f);
+    nda::h5_read(g, "sigma_hole_w", wh);
+    nda::h5_read(g, "bos_nu", nu);
+    app_log(1, "[parity] bases of this platform vs {}: Sigma hole rank {} / {} (max|dw| {:.1e}), bosonic rank {} / {} (max|dnu| {:.1e}); "
+               "the run uses the file",
+            bases, bh.rank, wh.size(), bh.rank == wh.size() ? double(nda::max_element(nda::abs(bh.w - wh))) : -1.0, bos.rank, nu.size(),
+            bos.rank == nu.size() ? double(nda::max_element(nda::abs(bos.nu - nu))) : -1.0);
   }
   const std::string fo = "gw_line_parity";
+  auto pt = scf_params(fo, PARITY_NIT, false, "gl", "compressed");
+  pt.put("lam_b", lam_b);
+  pt.put("bases_file", bfile);
   auto t0 = std::chrono::steady_clock::now();
-  auto R  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params(fo, niter, false, "gl", "compressed"));
+  auto R  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
   const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  REQUIRE(long(R.history.size()) == niter);
+  REQUIRE(long(R.history.size()) == PARITY_NIT);
   const long nb = R.F.extent(1);
-  app_log(1, "[parity] ranks {}, {} iterations in {:.1f} s ({} stored nodes of k = 0)", comm.size(), niter, dt, idx.size());
+  app_log(1, "[parity] ranks {}, {} of {} reference iterations in {:.1f} s ({} stored nodes of k = 0), lam_b {}, bases {}", comm.size(),
+          PARITY_NIT, niter, dt, idx.size(), lam_b, bases);
   app_log(1, "  iter |   mu C++ (Ha)    mu py (Ha)   d(meV) |  gap C++ (eV)  gap py (eV)  d(meV) |  N C++      N py     |  "
              "dSigma C++  dSigma py | Sigma rel");
   bool ok = true;
-  for (long it = 0; it < niter; ++it) {
-    nda::array<ComplexType, 4> Sp, Sh;
-    if (comm.root()) {
-      h5::file f(fo + ".gw_line.h5", 'r');
-      h5::group g(f);
-      auto gi = g.open_group("scf_line/iter" + std::to_string(it + 1));
-      nda::h5_read(gi, "Sigma_p", Sp);
-      nda::h5_read(gi, "Sigma_h", Sh);
-    }
-    std::array<long, 4> shp{};
-    if (comm.root()) shp = Sp.shape();
-    comm.broadcast_n(shp.data(), 4, 0);
-    if (not comm.root()) { Sp.resize(shp); Sh.resize(shp); }
-    comm.broadcast_n(Sp.data(), Sp.size(), 0);
-    comm.broadcast_n(Sh.data(), Sh.size(), 0);
+  for (long it = 0; it < PARITY_NIT; ++it) {
+    auto S = read_sigma_total(comm, fo + ".gw_line.h5", it + 1);
     double dmax = 0.0, smax = 0.0;
     for (long n = 0; n < idx.size(); ++n)
       for (long i = 0; i < nb; ++i)
         for (long j = 0; j < nb; ++j) {
-          const ComplexType s = Sp(0, idx(n), i, j) + Sh(0, idx(n), i, j);
-          dmax = std::max(dmax, std::abs(s - Sig_r(it, n, i, j)));
+          dmax = std::max(dmax, std::abs(S(0, idx(n), i, j) - Sig_r(it, n, i, j)));
           smax = std::max(smax, std::abs(Sig_r(it, n, i, j)));
         }
     auto const &h     = R.history[it];
@@ -619,12 +659,17 @@ TEST_CASE("gw_line_scf_parity", "[gw_line][scf][parity]") {
     app_log(1, "  {:4d} | {:.8f}  {:.8f}  {:+7.3f} | {:.6f}     {:.6f}    {:+7.3f} | {:.6f}  {:.6f} | {:.3e}  {:.3e} | {:.2e}",
             it + 1, h.mu, mu_r(it), dmu, h.gap * 27.211386, gap_r(it) * 27.211386, dgap, h.nelec, nel_r(it), h.dSigma, dS_r(it),
             dmax / smax);
-    ok = ok and std::abs(dmu) < 1.0 and std::abs(dgap) < 1.0 and dmax / smax < 1e-5;
+    auto const &fl = parity_floor[it];
+    const double gmu = (it == 0) ? 1e-3 : std::max(1e-3, PARITY_K * fl[0]);
+    const double gga = (it == 0) ? 1e-3 : std::max(1e-3, PARITY_K * fl[1]);
+    const double gsi = (it == 0) ? 1e-10 : std::max(1e-10, PARITY_K * fl[2]);
+    ok = gate_line("|dmu| (meV)", dmu, gmu) and ok;
+    ok = gate_line("|dgap| (meV)", dgap, gga) and ok;
+    ok = gate_line("Sigma(k=0) rel", dmax / smax, gsi) and ok;
   }
   REQUIRE(ok);
   remove_file(comm, fo + ".gw_line.h5");
 }
-
 
 namespace {
 /// total Sigma at all k and nodes of iteration it from a checkpoint (root reads, broadcast)
@@ -647,10 +692,37 @@ nda::array<ComplexType, 4> read_sigma_total(boost::mpi3::communicator &comm, std
 }
 } // namespace
 
+/**
+ * S7f gates of [id_vs_gl] and [lehmann]: the id-vs-gl difference after iteration 1 is the SCF's response to the iteration-1
+ * kernel difference (the ID error, ~0.3 time_eps relative in Sigma), which the closure amplifies like any noise (S7f study:
+ * no hard decision flips, continuous amplification ~1e5 at K 8). Yardstick = [.scf_noise] GW_LINE_NOISE_MODE=sigma at the
+ * amplitude of that difference (3e-9 for time_eps 1e-8, 3e-11 for 1e-10), test settings, lam_b auto, time_grid id, the
+ * representation of the run: spread of mu / gap (meV) and max|dSigma|/max|Sigma| per iteration, MAX over the Mac and rusty.
+ * Gate of iteration it > 1 = max(strict, IDGL_K x floor(it)); iteration 1 (KS poles): dSigma <= 10 time_eps, |dmu|, |dgap|
+ * <= 1e-3 meV. Only 2 iterations are compared: from iteration 3 on the spread for these amplitudes saturates at the size of
+ * the K = 8 attractor (5-17 meV in mu and gap, Sigma 5e-3..1e-2), where no gate is meaningful. Measured id-vs-gl at
+ * iteration 2 (Mac, 2 ranks): id(1e-8) 0.008 / 0.065 meV, 7.8e-5; id(1e-10) 6e-4 / 3e-4 meV, 7.9e-7 (rusty S7c-era: up to
+ * 1.1 meV, 4.2e-4); the tight check of the ID kernels is iteration 1.
+ */
+constexpr double IDGL_K = 5.0;
+using floor_tab_t = std::vector<std::array<double, 3>>;
+const floor_tab_t floor_leh_3e9  = {{0, 0, 0}, {1.97, 3.25, 6.88e-3}};   // Mac {1.97, 0.52, 4.9e-3}, rusty {0.86, 3.25, 6.9e-3}
+const floor_tab_t floor_leh_3e11 = {{0, 0, 0}, {1.28, 1.86, 1.06e-3}};   // Mac {0.75, 0.85, 9.0e-4}, rusty {1.28, 1.86, 1.1e-3}
+const floor_tab_t floor_cmp_3e9  = {{0, 0, 0}, {1.98, 3.24, 6.88e-3}};   // Mac {1.98, 0.51, 4.9e-3}, rusty {0.86, 3.24, 6.9e-3}
+
+namespace {
+/// gates (mu meV, gap meV, Sigma rel) of iteration it (0-based) from a floor table
+std::array<double, 3> idgl_gate(floor_tab_t const &fl, long it, double teps) {
+  if (it == 0) return {1e-3, 1e-3, 10.0 * teps};
+  utils::check(it < long(fl.size()), "idgl_gate: no floor for iteration {}", it + 1);
+  return {std::max(1e-3, IDGL_K * fl[it][0]), std::max(1e-3, IDGL_K * fl[it][1]), std::max(10.0 * teps, IDGL_K * fl[it][2])};
+}
+} // namespace
+
 TEST_CASE("gw_line_scf_id_vs_gl", "[gw_line][scf][id_vs_gl]") {
   lih_t L;
   auto &comm       = L.mpi->comm;
-  const long niter = 4;
+  const long niter = 2;   // S7f: from iteration 3 on the spread saturates at ~10 meV (the K 8 attractor), see idgl_gate
   const double meV = 27.211386e3;
   struct run_t {
     std::string name, file;
@@ -663,7 +735,9 @@ TEST_CASE("gw_line_scf_id_vs_gl", "[gw_line][scf][id_vs_gl]") {
     run_t r;
     r.name = nm;
     r.file = "gw_line_idgl_" + std::to_string(runs.size());
-    auto pt = scf_params(r.file, niter, false, tg);
+    // S7f: the production representation and bosonic range (lehmann, lam_b auto = 12) at the test settings
+    auto pt = scf_params(r.file, niter, false, tg, "lehmann");
+    pt.put("lam_b", -1.0);
     if (teps > 0.0) pt.put("time_eps", teps);
     auto t0 = std::chrono::steady_clock::now();
     r.R     = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
@@ -672,11 +746,12 @@ TEST_CASE("gw_line_scf_id_vs_gl", "[gw_line][scf][id_vs_gl]") {
     runs.push_back(std::move(r));
   }
   auto const &G = runs[0];
-  app_log(1, "[id_vs_gl] lih222, test settings (eps 1e-8, K 8), ranks {}: {} iterations, wall gl {:.1f} s, id(1e-8) {:.1f} s, "
-             "id(1e-10) {:.1f} s",
+  app_log(1, "[id_vs_gl] lih222, test settings (eps 1e-8, K 8, lehmann, lam_b auto), ranks {}: {} iterations, wall gl {:.1f} s, "
+             "id(1e-8) {:.1f} s, id(1e-10) {:.1f} s",
           comm.size(), niter, runs[0].time, runs[1].time, runs[2].time);
   app_log(1, "  run        iter | t-nodes Pi    Sigma   |   mu (Ha)       dmu vs gl (meV) |  gap (eV)   dgap vs gl (meV) | "
              "max|dSigma|/max|Sigma| vs gl");
+  bool ok = true;
   for (long ir = 0; ir < long(runs.size()); ++ir) {
     auto const &r = runs[ir];
     for (long it = 0; it < niter; ++it) {
@@ -689,25 +764,15 @@ TEST_CASE("gw_line_scf_id_vs_gl", "[gw_line][scf][id_vs_gl]") {
               it + 1, h.nt_pi_p, h.nt_pi_h, h.nt_sig_p, h.nt_sig_h, h.mu, dmu, h.gap * 27.211386, dgap, ds);
       if (ir == 0) continue;
       REQUIRE(h.time_grid == "id");
-      // Sigma at the nodes: ID error (~ time_eps) amplified by the SCF; mu / gap: first two iterations <= 0.1 meV
-      // (later iterations inherit the closure's representation sensitivity, S6: meV-level for O(1e-7) changes)
-      // iteration 1 (same KS poles): the kernel ID error only. Later iterations: the poles are the gapless compressed
-      // representation (near-zero poles with large signed residues, max|Pi| ~ 1e4 at the smallest bosonic nodes), which
-      // amplifies the per-pole ID error ~1e4x in Sigma (diagnostic [.time_id_poles]); measured (2 ranks): id(1e-10)
-      // |dmu|, |dgap| <= 0.04 meV, dSigma <= 2.3e-5; id(1e-8) 0.41 meV, 2e-3.
-      const bool fine = (r.name == "id(1e-10)");
+      const bool fine   = (r.name == "id(1e-10)");
       const double teps = fine ? 1e-10 : 1e-8;
-      if (it == 0) {
-        REQUIRE(ds <= 10.0 * teps);
-        REQUIRE(std::abs(dmu) <= 1e-3);
-        REQUIRE(std::abs(dgap) <= 1e-3);
-      } else {
-        REQUIRE(ds <= (fine ? 1e-4 : 1e-2));
-        REQUIRE(std::abs(dmu) <= (fine ? 0.1 : 1.0));
-        REQUIRE(std::abs(dgap) <= (fine ? 0.1 : 1.0));
-      }
+      auto g            = idgl_gate(fine ? floor_leh_3e11 : floor_leh_3e9, it, teps);
+      ok = gate_line("|dmu| (meV)", dmu, g[0]) and ok;
+      ok = gate_line("|dgap| (meV)", dgap, g[1]) and ok;
+      ok = gate_line("max|dSigma|/max|Sigma|", ds, g[2]) and ok;
     }
   }
+  REQUIRE(ok);
   for (auto const &r : runs) remove_file(comm, r.file + ".gw_line.h5");
 }
 
@@ -1085,8 +1150,9 @@ std::vector<study_run_t> repr_study(lih_t &L, std::string const &tag, std::vecto
 } // namespace
 
 /**
- * (S7c) test settings (eps 1e-8, K 8) with the automatic bosonic range (lam_b = 2 x 6 Ha), 4 iterations: lehmann vs
- * compressed, gl vs id. Gates (measured, 2 ranks, lam_b 12): iteration 1 (KS poles, identical for both representations)
+ * (S7c) test settings (eps 1e-8, K 8) with the automatic bosonic range (lam_b = 2 x 6 Ha), 2 iterations (S7f; was 4):
+ * lehmann vs compressed, gl vs id, gated by idgl_gate (S7f). S7c measurements (2 ranks, lam_b 12): iteration 1 (KS poles,
+ * identical for both representations)
  * id vs gl dSigma 2.1e-9 (= the ID error); iteration 2: dSigma 7.8e-5, |dmu|, |dgap| <= 0.07 meV for BOTH representations:
  * not the kernels (fixed-pole ID error ~ 10 eps_t once lam_b covers Pi's spectrum, [.time_id_poles]) but the closure's
  * response to the 2e-9 difference of iteration 1 (K = 8: x 1e4); iterations 3-4: closure noise floor of K = 8, 1-2 meV.
@@ -1095,7 +1161,7 @@ std::vector<study_run_t> repr_study(lih_t &L, std::string const &tag, std::vecto
  */
 TEST_CASE("gw_line_scf_lehmann", "[gw_line][scf][lehmann]") {
   lih_t L;
-  const long niter = 4;
+  const long niter = 2;   // S7f: see idgl_gate
   std::vector<variant_t> vars = {{"cmp", "compressed"}, {"leh", "lehmann", env_or("GW_LINE_EMIN_FRAC", 0.5), env_or("GW_LINE_WSMALL", 1e-4)}};
   std::vector<std::vector<std::array<double, 3>>> idgl;
   auto runs = repr_study(L, "test", vars, niter,
@@ -1112,23 +1178,18 @@ TEST_CASE("gw_line_scf_lehmann", "[gw_line][scf][lehmann]") {
       if (r.var.repr == "lehmann" and h.iter > 1) REQUIRE(h.g_emin > 0.25 * 0.5 * h.gap);   // no in-gap poles left
     }
   }
+  // S7f: gates from the measured noise floor of each representation (see idgl_gate)
+  bool ok = true;
   for (long iv = 0; iv < 2; ++iv)
     for (long it = 0; it < niter; ++it) {
       auto const &d = idgl[iv][it];
-      if (it == 0) {
-        REQUIRE(d[2] <= 10.0 * 1e-8);
-        REQUIRE(d[0] <= 1e-3);
-        REQUIRE(d[1] <= 1e-3);
-      } else if (it == 1) {
-        REQUIRE(d[2] <= 3e-4);
-        REQUIRE(d[0] <= 0.3);
-        REQUIRE(d[1] <= 0.3);
-      } else {
-        REQUIRE(d[2] <= 2e-2);
-        REQUIRE(d[0] <= 5.0);
-        REQUIRE(d[1] <= 5.0);
-      }
+      auto g        = idgl_gate(iv == 0 ? floor_cmp_3e9 : floor_leh_3e9, it, 1e-8);
+      app_log(1, "  [lehmann] id vs gl, {} iteration {}:", vars[iv].name, it + 1);
+      ok = gate_line("|dmu| (meV)", d[0], g[0]) and ok;
+      ok = gate_line("|dgap| (meV)", d[1], g[1]) and ok;
+      ok = gate_line("max|dSigma|/max|Sigma|", d[2], g[2]) and ok;
     }
+  REQUIRE(ok);
 }
 
 /// (S7c, hidden) production settings (eps 1e-10, K 24), GW_LINE_STUDY_NITER iterations (default 4): compressed, lehmann
@@ -1255,7 +1316,7 @@ std::vector<std::string> env_list(char const *nm, std::string const &dflt) {
 }
 
 /// closure options from the environment (GW_LINE_CUT, GW_LINE_SVDCUT, GW_LINE_CUTWIN, GW_LINE_PHASE, GW_LINE_TOLSVD,
-/// GW_LINE_TOLGRAM) into a driver ptree: lets the noise meter run the S7f remedies through the whole SCF
+/// GW_LINE_TOLGRAM, GW_LINE_TSNAP = time_snap) into a driver ptree: lets the noise meter run the S7f remedies through the whole SCF
 void closure_opts_from_env(ptree &pt) {
   if (auto *c = std::getenv("GW_LINE_CUT")) pt.put("closure_cut", std::string(c));
   if (auto *c = std::getenv("GW_LINE_SVDCUT")) pt.put("closure_svd_cut", std::string(c));
@@ -1263,6 +1324,7 @@ void closure_opts_from_env(ptree &pt) {
   if (auto *c = std::getenv("GW_LINE_PHASE")) pt.put("phase_keep", std::atof(c));
   if (auto *c = std::getenv("GW_LINE_TOLSVD")) pt.put("tol_svd", std::atof(c));
   if (auto *c = std::getenv("GW_LINE_TOLGRAM")) pt.put("tol_gram", std::atof(c));
+  if (auto *c = std::getenv("GW_LINE_TSNAP")) pt.put("time_snap", std::atof(c));
 }
 
 /// Lehmann G(i w) of a closure output about the OLD centre (the energies shifted back by dmu), [nk, nw, nb, nb]:
@@ -1354,7 +1416,7 @@ TEST_CASE("gw_line_scf_noise", "[.scf_noise]") {
               mn = std::min(mn, mu[r][it]); mx = std::max(mx, mu[r][it]);
               gn = std::min(gn, gap[r][it]); gx = std::max(gx, gap[r][it]);
             }
-            app_log(1, "[scf_noise] {} it {} | mu {:.8f} gap {:.6f} eV | spread mu {:.4f} meV gap {:.4f} meV | max dSigma {:.2e}", cfg,
+            app_log(1, "[scf_noise] {} it {} | mu {:.8f} gap {:.6f} eV | spread mu {:.2e} meV gap {:.2e} meV | max dSigma {:.2e}", cfg,
                     it + 1, mu[0][it], gap[0][it] * 27.211386, (mx - mn) * meV, (gx - gn) * meV, dS[it]);
           }
         }

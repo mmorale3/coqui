@@ -140,11 +140,14 @@ struct line_time_grids_t {
   /**
    * poles: current poles; nu: bosonic basis poles (> 0); theta_t: ray angle; eps, opts: time_id_t tolerance and knobs
    * (opts.pad = safety margin); zeta_b / zeta_f: target points of the Pi / Sigma transforms (only for the diagnostics).
+   * snap > 0 (S7f): the |E| ranges are widened to the enclosing points of a geometric grid with `snap` points per octave
+   * (lo down, hi up), so the grids are piecewise CONSTANT in the pole ranges: roundoff-level changes of the poles no longer
+   * change the pivoted-QR node selection (a discontinuous decision) unless a range crosses a grid point.
    * Collective over comm.
    */
   line_time_grids_t(pole_data_t const &poles, nda::array<double, 1> const &nu, double theta_t, double eps,
                     numerics::line_dlr::time_id_opts_t const &opts, nda::array<ComplexType, 1> const &zeta_b,
-                    nda::array<ComplexType, 1> const &zeta_f, boost::mpi3::communicator &comm) {
+                    nda::array<ComplexType, 1> const &zeta_f, boost::mpi3::communicator &comm, double snap = 0.0) {
     using numerics::line_dlr::time_id_t;
     using numerics::line_dlr::sector_t;
     utils::check(nu.size() > 0, "line_time_grids_t: empty bosonic basis");
@@ -156,9 +159,11 @@ struct line_time_grids_t {
       nu_max = std::max(nu_max, nu(j));
     }
     utils::check(nu_min > 0.0, "line_time_grids_t: bosonic poles must be > 0 (nu_min = {})", nu_min);
-    const double pi_lo = pr.p_min + pr.h_min, pi_hi = pr.p_max + pr.h_max;
-    const double sp_lo = pr.p_min + nu_min, sp_hi = pr.p_max + nu_max;
-    const double sh_lo = pr.h_min + nu_min, sh_hi = pr.h_max + nu_max;
+    auto lo_s = [snap](double x) { return snap > 0.0 ? std::exp2(std::floor(std::log2(x) * snap) / snap) : x; };
+    auto hi_s = [snap](double x) { return snap > 0.0 ? std::exp2(std::ceil(std::log2(x) * snap) / snap) : x; };
+    const double pi_lo = lo_s(pr.p_min + pr.h_min), pi_hi = hi_s(pr.p_max + pr.h_max);
+    const double sp_lo = lo_s(pr.p_min + nu_min), sp_hi = hi_s(pr.p_max + nu_max);
+    const double sh_lo = lo_s(pr.h_min + nu_min), sh_hi = hi_s(pr.h_max + nu_max);
     utils::check(pi_lo > 0.0 and sp_lo > 0.0 and sh_lo > 0.0,
                  "line_time_grids_t: summed-energy ranges must start above 0 (Pi {}, Sigma^> {}, Sigma^< {})", pi_lo, sp_lo,
                  sh_lo);

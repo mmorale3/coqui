@@ -66,6 +66,8 @@
  *                       Gauss-Legendre rays for_spectrum(theta_t, emin, ray_decades) (~1000 nodes; the python reference)
  *   time_eps = eps, time_pad = 1.25, time_oversample = 1.0   ID tolerance, energy-range margin [Emin/pad, pad Emax] and
  *                       node oversampling (time_id_opts_t); ignored for "gl"
+ *   time_snap = 0       S7f: > 0 = the ID |E| ranges widened to a geometric grid of time_snap points per octave, so the
+ *                       grids do not change with roundoff-level changes of the poles (line_time_grids_t)
  *   restart = false     resume from <output>.gw_line.h5:/scf_line/final_iter (bitwise identical continuation)
  *   checkpoint_sigma = "last"   Sigma at the nodes in the checkpoint (S7e): "last" = only the last iteration's, in the
  *                       separate file <output>.gw_line.sigma.h5 rewritten every iteration (constant size); "all" = every
@@ -133,6 +135,7 @@ struct gw_line_params_t {
   double ray_decades = 36.0;
   std::string time_grid = "id";          ///< "id" (time-node ID) or "gl" (Gauss-Legendre rays)
   double time_eps = 1e-10, time_pad = 1.25, time_oversample = 1.0;   ///< time_eps defaults to eps
+  double time_snap = 0.0;                ///< S7f: ID |E| ranges snapped to a geometric grid (points per octave; 0 = off)
   bool restart = false;
   std::string output = "./gw_line";
   std::string checkpoint_sigma = "last";   ///< "last" | "all" (S7e)
