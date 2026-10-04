@@ -55,6 +55,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <mutex>
 #include <thread>
 #include <cmath>
 #include <numeric>
@@ -201,7 +202,8 @@ struct closure_k_t {
   upfold_diag_t diag;              ///< hard decisions of the upfolding (S7f)
   /// S7g profile (s): moments, C0, Gram, SVD, U eigen, Lehmann eigen; U-eigen fallbacks to the Schur form
   double t_mom = 0.0, t_c0 = 0.0, t_gram = 0.0, t_svd = 0.0, t_ueig = 0.0, t_leh = 0.0;
-  long ueig_fallback = 0;
+  long ueig_fallback = 0, ueig_nflag = 0, ueig_reason = 0, ueig_retry = 0;
+  double ueig_res    = 0.0;
 };
 
 /// python lehmann_from_sigma: moments of the total measure -> upfold_block -> eig of Htilde. ik: k index (per-k options,
@@ -234,6 +236,10 @@ inline closure_k_t closure_k(nda::array<ComplexType, 2> const &Hrel, sigma_poles
   out.t_ueig        = up.t_ueig;
   out.t_leh         = std::chrono::duration<double>(t3 - t2).count();
   out.ueig_fallback = up.ueig_fallback;
+  out.ueig_nflag    = up.ueig_nflag;
+  out.ueig_reason   = up.ueig_reason;
+  out.ueig_retry    = up.ueig_retry;
+  out.ueig_res      = up.ueig_res;
   return out;
 }
 
@@ -393,6 +399,8 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   Timer.start("closure_upfold");
   using clk = std::chrono::steady_clock;
   double prof[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // fit, moments, C0, Gram, SVD, U eigen, Lehmann, U-eigen fallbacks
+  std::array<double, 4> ustat{0.0, 0.0, 0.0, 0.0};   // max RR-refined columns, max residual, max reason, retries (sum)
+  std::mutex ustat_mx;
   std::vector<nda::array<double, 1>> e_loc(nk);
   std::vector<nda::array<ComplexType, 2>> v_loc(nk);
   const long ni = 2 + upfold_diag_t::nfields;
@@ -408,6 +416,13 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     auto ck   = closure_k(H, sp, p, ik);
     pr[1] += ck.t_mom; pr[2] += ck.t_c0; pr[3] += ck.t_gram; pr[4] += ck.t_svd; pr[5] += ck.t_ueig;
     pr[6] += ck.t_leh; pr[7] += double(ck.ueig_fallback);
+    {
+      std::lock_guard<std::mutex> lk(ustat_mx);
+      ustat[0] = std::max(ustat[0], double(ck.ueig_nflag));
+      ustat[1] = std::max(ustat[1], ck.ueig_res);
+      ustat[2] = std::max(ustat[2], double(ck.ueig_reason));
+      ustat[3] += double(ck.ueig_retry);
+    }
     e_loc[ik] = std::move(ck.e);
     v_loc[ik] = std::move(ck.v);
     info(ik, 0) = double(ck.d.size());
@@ -450,14 +465,18 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   if (p.hooks) device_lapack_release();   // the kernels get the device memory back
   Timer.stop("closure_upfold");
   {   // S7g: per-step profile of the closure (max over ranks of the per-rank sums over the owned k)
-    double pmax[8];
+    double pmax[8], umax[4];
     std::copy_n(prof, 8, pmax);
-    if (comm.size() > 1) comm.all_reduce_n(prof, 8, pmax, boost::mpi3::max<>{});
+    std::copy_n(ustat.data(), 4, umax);
+    if (comm.size() > 1) {
+      comm.all_reduce_n(prof, 8, pmax, boost::mpi3::max<>{});
+      comm.all_reduce_n(ustat.data(), 4, umax, boost::mpi3::max<>{});
+    }
     app_log(2, "          closure profile (s, max over ranks of the sums over the rank's k): fit {:.2f} moments {:.2f} C0 {:.2f} Gram {:.2f} SVD {:.2f} U-eigen "
-               "{:.2f} Lehmann {:.2f} | BLAS threads {} ({}), drivers {} / {}{}, U-eigen Schur fallbacks {}, device fallbacks "
-               "(rank 0, cumulative) {}; k workers {}",
+               "{:.2f} Lehmann {:.2f} | BLAS threads {} ({}), drivers {} / {}{}, U-eigen Schur fallbacks {} (max RR "
+               "columns {}, residual {:.1e}, reason {}, gap-cut retries {}), device fallbacks (rank 0, cumulative) {}; k workers {}",
             pmax[0], pmax[1], pmax[2], pmax[3], pmax[4], pmax[5], pmax[6], bt > 0 ? bt : 0, blas_backend, p.svd_driver, p.ueig,
-            p.hooks ? " + GPU" : "", long(pmax[7]), device_lapack_failures(), nw);
+            p.hooks ? " + GPU" : "", long(pmax[7]), long(umax[0]), umax[1], long(umax[2]), long(umax[3]), device_lapack_failures(), nw);
   }
 
   Timer.start("closure_gather");

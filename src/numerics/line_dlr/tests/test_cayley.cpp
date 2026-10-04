@@ -36,6 +36,7 @@
 #include <complex>
 #include <iomanip>
 #include <iostream>
+#include <numbers>
 #include <random>
 #include <sstream>
 #include <cstdlib>
@@ -409,6 +410,44 @@ TEST_CASE("cayley_ueig_ab", "[numerics][cayley]") {
       for (long i = 0; i < n; ++i) A(i, j) = B(n - 1 - i, j);
     return true;
   };
+  // the Cayley eigen-decomposition near its cut: U with an eigenvalue at |u - 1| ~ 1e-9 (a pole at |d| ~ 2e8 wp) -- the
+  // cut at u0 = 1 is ill-conditioned; the cut in the largest spectral gap (the retry of upfold_block) is not
+  {
+    const long n = 200;
+    std::mt19937 gen(99);
+    ldlr::cmatrix_F Q(n, n);
+    for (long j = 0; j < n; ++j)
+      for (long i = 0; i < n; ++i) Q(i, j) = dcomplex(closure_bench::unif(gen, -1, 1), closure_bench::unif(gen, -1, 1));
+    nda::array<double, 1> sv;
+    ldlr::cmatrix_F P, Qh;
+    ldlr::detail::svd_dc(Q, sv, P, Qh);   // P: random unitary
+    std::vector<double> th(n);
+    for (long l = 0; l < n; ++l) th[l] = closure_bench::unif(gen, 0.3, 2.0 * std::numbers::pi - 0.3);
+    th[0] = 1e-9;
+    ldlr::cmatrix_F PD(P);
+    for (long j = 0; j < n; ++j)
+      for (long i = 0; i < n; ++i) PD(i, j) *= std::exp(dcomplex(0.0, th[j]));
+    auto U = ldlr::detail::mm(PD, P, 'N', 'C');
+    for (dcomplex u0 : {dcomplex(1.0), std::exp(dcomplex(0.0, 0.15))}) {
+      nda::array<dcomplex, 1> u;
+      ldlr::cmatrix_F Z;
+      ldlr::detail::ueig_stats_t st;
+      const bool ok = ldlr::detail::unitary_eig_cayley(U, u, Z, 1e-12, st, nullptr, u0);
+      double dth = 0.0;
+      if (ok)
+        for (long l = 0; l < n; ++l) {
+          double best = 1e9;
+          for (long m = 0; m < n; ++m) best = std::min(best, std::abs(std::exp(dcomplex(0.0, th[m])) - u(l)));
+          dth = std::max(dth, best);
+        }
+      std::cout << std::scientific << std::setprecision(2) << "[ueig_cut] u0 = " << u0 << ": ok " << ok << " reason " << st.reason
+                << " nflag " << st.nflag << " residual " << st.res_max << " max|u - exact| " << dth << std::endl;
+      if (std::abs(u0 - 1.0) > 0.1) {
+        CHECK(ok);
+        CHECK(dth <= 1e-13);
+      }
+    }
+  }
   const double d_rev = closure_bench::ab_small(&rev, "gesvd");
   std::cout << "[closure_ab] index-reversed host zheevd (roundoff yardstick of the closure): " << d_rev << std::endl;
   CHECK(d_rev <= 1e-6);

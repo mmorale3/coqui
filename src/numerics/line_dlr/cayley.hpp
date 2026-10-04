@@ -251,21 +251,22 @@ struct ueig_stats_t {
   long nflag      = 0;     ///< columns refined by Rayleigh-Ritz
   double res_max  = 0.0;   ///< max_l |U z_l - u_l z_l| after the refinement
   bool fallback   = false; ///< the caller must use the Schur form instead
+  int reason      = 0;     ///< fallback: 1 (U - 1) singular / non-finite solve, 2 too many flagged columns, 3 residual after RR
 };
 
 /**
  * Eigen-decomposition U = Z diag(u) Z^dag of a unitary (normal) matrix through a HERMITIAN eigenproblem (S7g; replaces the
- * complex Schur form, ~5x cheaper and well threaded): Hc = i (U - 1)^{-1} (U + 1) is Hermitian with eigenvalues
- * cot(theta_l / 2) (u_l = e^{i theta_l}) and the eigenvectors of U. The map theta -> cot(theta/2) is INJECTIVE on the circle
- * minus u = 1, so (near-)degenerate eigenvalues of Hc are (near-)degenerate u's: eigenvector mixing only happens between
+ * complex Schur form, ~5x cheaper and well threaded): Hc = i (U - u0)^{-1} (U + u0) (|u0| = 1, default 1) is Hermitian
+ * with eigenvalues cot((theta_l - beta) / 2) (u_l = e^{i theta_l}, u0 = e^{i beta}) and the eigenvectors of U. The map theta -> cot(theta/2) is INJECTIVE on the circle
+ * minus u0, so (near-)degenerate eigenvalues of Hc are (near-)degenerate u's: eigenvector mixing only happens between
  * poles that are close (harmless for Sigma, exactly as in the Schur form). u_l = z_l^dag U z_l (Rayleigh quotients);
  * columns with a residual |U z_l - u_l z_l| > tol (mixing of close poles, or loss of accuracy of the solve when an eigenvalue
- * is close to u = 1) are refined by Rayleigh-Ritz in their span (Schur form of the small projected matrix). Returns false
+ * is close to u0) are refined by Rayleigh-Ritz in their span (Schur form of the small projected matrix). Returns false
  * (stats.fallback) if (U - 1) is singular, more than max(32, n/4) columns are flagged or the refinement does not reach tol:
  * the caller then uses the Schur form.
  */
 inline bool unitary_eig_cayley(cmatrix_F const &U, nda::array<ComplexType, 1> &u, cmatrix_F &Z, double tol,
-                               ueig_stats_t &st, lapack_hooks_t const *h = nullptr) {
+                               ueig_stats_t &st, lapack_hooks_t const *h = nullptr, ComplexType u0 = ComplexType(1.0)) {
   const int n = int(U.extent(0));
   st = ueig_stats_t{};
   u.resize(n);
@@ -273,20 +274,20 @@ inline bool unitary_eig_cayley(cmatrix_F const &U, nda::array<ComplexType, 1> &u
   if (n == 0) return true;
   cmatrix_F A(U), X(U);
   for (long i = 0; i < n; ++i) {
-    A(i, i) -= 1.0;
-    X(i, i) += 1.0;
+    A(i, i) -= u0;
+    X(i, i) += u0;
   }
   if (not(h and h->lu_solve and n >= h->min_dim and h->lu_solve(A, X))) {
     nda::array<int, 1> ipiv(n);
     int info = 0;
     f77::zgetrf_(&n, &n, A.data(), &n, ipiv.data(), &info);
-    if (info != 0) { st.fallback = true; return false; }
+    if (info != 0) { st.fallback = true; st.reason = 1; return false; }
     const char tr = 'N';
     f77::zgetrs_(&tr, &n, &n, A.data(), &n, ipiv.data(), X.data(), &n, &info);
     utils::check(info == 0, "cayley::unitary_eig_cayley: zgetrs info = {}", info);
   }
   for (auto const &x : X)
-    if (not(std::isfinite(x.real()) and std::isfinite(x.imag()))) { st.fallback = true; return false; }
+    if (not(std::isfinite(x.real()) and std::isfinite(x.imag()))) { st.fallback = true; st.reason = 1; return false; }
   for (long j = 0; j < n; ++j)   // Z = Hermitian part of i X (lower triangle is enough for zheevd 'L')
     for (long i = j; i < n; ++i) Z(i, j) = 0.5 * (ComplexType(0.0, 1.0) * X(i, j) + std::conj(ComplexType(0.0, 1.0) * X(j, i)));
   herm_eig(Z, h);
@@ -302,8 +303,9 @@ inline bool unitary_eig_cayley(cmatrix_F const &U, nda::array<ComplexType, 1> &u
     res[l] = std::sqrt(r);
     if (res[l] > tol) F.push_back(l);
   }
-  st.nflag = long(F.size());
-  if (st.nflag > std::max(32L, long(n) / 4)) { st.fallback = true; return false; }
+  st.nflag   = long(F.size());
+  st.res_max = *std::max_element(res.begin(), res.end());
+  if (st.nflag > std::max(32L, long(n) / 4)) { st.fallback = true; st.reason = 2; return false; }
   if (not F.empty()) {   // mixing partners are neighbours in the (ascending) eigenvalues of Hc: add +-2 around each flagged
     std::vector<char> in(n, 0);
     for (long l : F)
@@ -336,7 +338,7 @@ inline bool unitary_eig_cayley(cmatrix_F const &U, nda::array<ComplexType, 1> &u
     }
   }
   st.res_max = *std::max_element(res.begin(), res.end());
-  if (st.res_max > tol) { st.fallback = true; return false; }
+  if (st.res_max > tol) { st.fallback = true; st.reason = 3; return false; }
   return true;
 }
 
@@ -417,7 +419,9 @@ struct upfold_result_t {
   long n_realize      = 0;           ///< realizations U(phi) -> (u, W) (1 if n_free = 0)
   long ueig_nflag     = 0;           ///< "cayley": columns refined by Rayleigh-Ritz (max over realizations)
   long ueig_fallback  = 0;           ///< "cayley": realizations that fell back to the Schur form
-  double ueig_res     = 0.0;         ///< "cayley": max residual |U z - u z| (max over realizations)
+  double ueig_res     = 0.0;         ///< "cayley": max residual |U z - u z| (max over realizations, incl. failed attempts)
+  int ueig_reason     = 0;           ///< "cayley": reason of the last failed attempt (ueig_stats_t::reason; + 10: the retry)
+  long ueig_retry     = 0;           ///< "cayley": realizations retried with the cut u0 in the largest gap of the spectrum
   bool svd_reference  = false;       ///< a fast SVD driver found n_free > 0 and the SVD was redone with zgesvd
 };
 
@@ -615,10 +619,29 @@ inline upfold_result_t upfold_block(nda::array<ComplexType, 3> const &C, long K,
     bool done = false;
     if (o.ueig == "cayley") {
       detail::ueig_stats_t st;
-      done           = detail::unitary_eig_cayley(U, u, Z, o.ueig_tol, st, (o.hooks and o.hooks->in_ueig) ? o.hooks : nullptr);
+      auto const *hk = (o.hooks and o.hooks->in_ueig) ? o.hooks : nullptr;
+      done           = detail::unitary_eig_cayley(U, u, Z, o.ueig_tol, st, hk);
       res.ueig_nflag = std::max(res.ueig_nflag, st.nflag);
-      if (done) res.ueig_res = std::max(res.ueig_res, st.res_max);
-      else ++res.ueig_fallback;
+      res.ueig_res   = std::max(res.ueig_res, st.res_max);
+      if (not done) res.ueig_reason = st.reason;
+      if (not done and st.reason >= 2) {   // retry with the cut u0 in the largest angular gap of the (approximate) spectrum
+        std::vector<double> th(Nr);
+        for (long l = 0; l < Nr; ++l) th[l] = std::arg(u(l));
+        std::sort(th.begin(), th.end());
+        double gap = th[0] + 2.0 * std::numbers::pi - th[Nr - 1], beta = th[Nr - 1] + 0.5 * gap;
+        for (long l = 0; l + 1 < Nr; ++l)
+          if (th[l + 1] - th[l] > gap) {
+            gap  = th[l + 1] - th[l];
+            beta = 0.5 * (th[l] + th[l + 1]);
+          }
+        ++res.ueig_retry;
+        detail::ueig_stats_t st2;
+        done           = detail::unitary_eig_cayley(U, u, Z, o.ueig_tol, st2, hk, std::exp(ComplexType(0.0, beta)));
+        res.ueig_nflag = std::max(res.ueig_nflag, st2.nflag);
+        res.ueig_res   = std::max(res.ueig_res, st2.res_max);
+        if (not done) res.ueig_reason = 10 + st2.reason;
+      }
+      if (not done) ++res.ueig_fallback;
     }
     if (not done) u = detail::schur(U, Z);
     auto W = detail::mm(R, Z);
