@@ -65,6 +65,7 @@
 #include "methods/GW_line/closure_device.hpp"
 #include "methods/GW_line/spectra.hpp"
 #include "methods/GW_line/time_grids.hpp"
+#include "methods/GW_line/head.hpp"
 #include "methods/GW_line/k_dist.hpp"
 #include "methods/GW_line/driver.hpp"
 
@@ -155,11 +156,21 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.spectra.wmax  = io::get_value_with_default<double>(pt, "spectra.wmax", p.spectra.wmax);
   p.spectra.nw    = io::get_value_with_default<long>(pt, "spectra.nw", p.spectra.nw);
 
-  auto div = io::get_value_with_default<std::string>(pt, "div_treatment", "ignore_g0");
-  io::tolower(div);
-  utils::check(div == "ignore_g0", "gw_line: only div_treatment = \"ignore_g0\" is implemented (got \"{}\"): Z(Gamma) without "
-                                   "its G = 0 term and no Madelung/head correction",
-               div);
+  // S9a: q -> 0 divergence (head.hpp). Defaults: ignore_g0 (unchanged); hf_div_treatment follows div_treatment
+  p.div_treatment = io::get_value_with_default<std::string>(pt, "div_treatment", p.div_treatment);
+  io::tolower(p.div_treatment);
+  head_check_variant(p.div_treatment);
+  p.hf_div_treatment = io::get_value_with_default<std::string>(pt, "hf_div_treatment",
+                                                               p.div_treatment == "ignore_g0" ? "ignore_g0" : "gygi");
+  io::tolower(p.hf_div_treatment);
+  utils::check(p.hf_div_treatment == "ignore_g0" or p.hf_div_treatment == "gygi",
+               "gw_line: hf_div_treatment must be \"ignore_g0\" or \"gygi\" (got \"{}\")", p.hf_div_treatment);
+  p.head_extrapolation = io::get_value_with_default<std::string>(pt, "head_extrapolation", p.head_extrapolation);
+  io::tolower(p.head_extrapolation);
+  if (head_div_is_gygi(p.div_treatment)) p.head_extrapolation = p.div_treatment;
+  head_check_variant(p.head_extrapolation);
+  utils::check(head_div_is_gygi(p.head_extrapolation), "gw_line: head_extrapolation must be a gygi variant (got \"{}\")",
+               p.head_extrapolation);
   utils::check(p.theta_deg > 0.0 and p.theta_deg < 90.0, "gw_line: theta_deg must be in (0, 90)");
   utils::check(p.eps > 0.0 and p.lam > 0.0, "gw_line: eps, lam must be > 0");
   utils::check(p.g_gap >= 0.0 and p.g_gap < p.lam, "gw_line: g_gap must be in [0, lam)");
@@ -239,6 +250,8 @@ void gw_line_params_t::log() const {
           checkpoint_sigma == "last" ? "last iteration only, in " + output + ".gw_line.sigma.h5" : "every iteration");
   app_log(1, "    Sigma at the nodes {} (sigma_kdist = {})", sigma_kdist ? "k-distributed (owner k mod np)" : "replicated on every rank",
           sigma_kdist);
+  app_log(1, "    divergence: div_treatment = {} (Sigma_c head term {}), hf_div_treatment = {}; head extrapolation {}", div_treatment,
+          div_treatment == "ignore_g0" ? "off" : "on", hf_div_treatment, head_extrapolation);
   if (do_spectra) {
     std::string e;
     for (auto x : spectra.eta) e += std::to_string(x) + " ";
@@ -514,6 +527,9 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "time_oversample", p.time_oversample);
   h5::h5_write(ig, "time_snap", p.time_snap);
   h5::h5_write(ig, "checkpoint_sigma", p.checkpoint_sigma);
+  h5::h5_write(ig, "div_treatment", p.div_treatment);
+  h5::h5_write(ig, "hf_div_treatment", p.hf_div_treatment);
+  h5::h5_write(ig, "head_extrapolation", p.head_extrapolation);
   nda::h5_write(ig, "fermionic_nodes", zeta, false);
 }
 
@@ -528,6 +544,35 @@ struct state_t {
   nda::array<double, 1> phi;   ///< terminal phase phi* of the last closure per k (S7f phase continuity; empty = none)
 };
 
+/// S9a: the head data of one iteration (scf_line/iter<N>/head/, see driver.hpp)
+struct head_out_t {
+  nda::array<ComplexType, 2> h_nodes, h_res, h_res_hole;   ///< (nq, nz_b), (nq, r_b), (nq, r_b)
+  nda::array<ComplexType, 1> h0_nodes, h0_res, h0_res_hole, zeta;
+  nda::array<double, 1> nu, q_weights;
+  nda::array<double, 2> qpts;
+  double madelung = 0.0, eps_inf = 1.0;
+  std::string extrapolation, div_treatment, hf_div_treatment;
+};
+
+void write_head(h5::group &it, head_out_t const &h) {
+  auto hg = it.create_group("head");
+  nda::h5_write(hg, "h_nodes", h.h_nodes, false);
+  nda::h5_write(hg, "h_res", h.h_res, false);
+  nda::h5_write(hg, "h_res_hole", h.h_res_hole, false);
+  nda::h5_write(hg, "h0_nodes", h.h0_nodes, false);
+  nda::h5_write(hg, "h0_res", h.h0_res, false);
+  nda::h5_write(hg, "h0_res_hole", h.h0_res_hole, false);
+  nda::h5_write(hg, "zeta", h.zeta, false);
+  nda::h5_write(hg, "nu", h.nu, false);
+  nda::h5_write(hg, "q_weights", h.q_weights, false);
+  nda::h5_write(hg, "qpts", h.qpts, false);
+  h5::h5_write(hg, "madelung", h.madelung);
+  h5::h5_write(hg, "eps_inf", h.eps_inf);
+  h5::h5_write(hg, "extrapolation", h.extrapolation);
+  h5::h5_write(hg, "div_treatment", h.div_treatment);
+  h5::h5_write(hg, "hf_div_treatment", h.hf_div_treatment);
+}
+
 /// Sigma file of checkpoint_sigma = "last" (S7e): <output>.gw_line.sigma.h5, rewritten every iteration (tmp + rename)
 std::string sigma_file(std::string const &chk) { return chk.substr(0, chk.size() - 3) + ".sigma.h5"; }
 
@@ -538,7 +583,8 @@ std::string sigma_file(std::string const &chk) { return chk.substr(0, chk.size()
  * 1.8 GB for Si 4x4x4 nb 60).
  */
 void write_state(boost::mpi3::communicator &comm, std::string const &file, state_t const &st,
-                 gw_line_iter_t const *rec, k_dist_t const *kd = nullptr, bool sigma_all = true) {
+                 gw_line_iter_t const *rec, k_dist_t const *kd = nullptr, bool sigma_all = true,
+                 head_out_t const *head = nullptr) {
   nda::array<ComplexType, 4> Sp_full, Sh_full;
   if (st.have_sigma and kd != nullptr) {
     Sp_full = kd_gather_full(comm, *kd, st.Sig_p);
@@ -578,6 +624,7 @@ void write_state(boost::mpi3::communicator &comm, std::string const &file, state
     if (st.phi.size() > 0) nda::h5_write(it, "closure_phi", st.phi, false);
     write_poles(it, st.poles);
     if (rec != nullptr) write_history(it, *rec);
+    if (head != nullptr) write_head(it, *head);
     h5::h5_write(sg, "final_iter", st.iter);
   }
   comm.barrier();
@@ -1067,10 +1114,40 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
           sig_bytes / 1073741824.0, prm.sigma_kdist ? "k-distributed, <= ceil(N_k / np) rows" : "replicated on every rank",
           Zb.Z_full.extent(0), 16.0 * double(Np) * Np / 1073741824.0, model_host / 1073741824.0, rss0 / 1073741824.0);
 
+  // S9a: the Coulomb head (head.hpp): per-q heads eps^-1_00(q) - 1 from W every iteration (checkpoint, eps_inf), the
+  // q -> 0 extrapolation, and the Madelung terms of div_treatment (Sigma_c) / hf_div_treatment (exchange)
+  const double madelung = mf.madelung();
+  const head_basis_t hbasis(thc, mf, grid);
+  const head_extrapolation_t hextra(mf, prm.head_extrapolation);
+  bool sig_div = head_div_is_gygi(prm.div_treatment);
+  if (sig_div and nq == 1) {
+    app_log(1, "  gw_line: nqpts == 1 while div_treatment = {}: the Sigma_c head term is skipped (ignore_g0), as CoQui does",
+            prm.div_treatment);
+    sig_div = false;
+  }
+  const bool hf_div = (prm.hf_div_treatment == "gygi");
+  nda::array<ComplexType, 3> Thead;   // T(k) = X^dagger diag(conj chi_head(Gamma)) X (Sigma_div_correction)
+  if (sig_div) Thead = head_overlap_T(thc, gamma_index(mf));
+  {
+    double dT = 0.0;
+    for (long ik = 0; ik < Thead.extent(0); ++ik)
+      for (long i = 0; i < nb; ++i)
+        for (long j = 0; j < nb; ++j) dT = std::max(dT, std::abs(Thead(ik, i, j) - ComplexType(i == j ? 1.0 : 0.0)));
+    app_log(1, "  head: madelung = {:.8f} Ha; Sigma_c head term {}; exchange Madelung term {}{}", madelung,
+            sig_div ? "ON (" + prm.div_treatment + ")" : std::string("off"), hf_div ? "ON" : "off",
+            sig_div ? ", max|T - 1| = " + std::to_string(dT) : std::string(""));
+    hextra.log(1);
+  }
+  std::vector<long> q_all(nq);
+  for (long q = 0; q < nq; ++q) q_all[q] = q;
+  std::vector<long> k_rows;   // global k of the rows of Sigma on this rank
+  for (long l = 0; l < (prm.sigma_kdist ? kd.nloc() : nk); ++l) k_rows.push_back(prm.sigma_kdist ? kd.global(l, kd.rank) : l);
+
   if (not restart) {
     Timer.start("phase_F");
     auto D = density_matrix(st.poles);
     hartree_exchange<MEM>(prop, Zb, D, mf, grid, mpi, st.F, Timer);
+    if (hf_div) exchange_head_correction(st.F, D, madelung);
     Timer.stop("phase_F");
     Timer.start("checkpoint");
     write_state(comm, chk, st, nullptr, kdp, sig_all);
@@ -1080,8 +1157,10 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   }
 
   // ---------------------------------------------------------------------------------------------- the loop
-  arr4_t Pi, w;
+  arr4_t Pi, w, Wn;
   memory::array<HOST_MEMORY, ComplexType, 4> w_h;   // host-resident residues (q_plan_t::w_host)
+  Timer.add("W_head");
+  Timer.add("Sigma_head");
   nda::array<ComplexType, 4> Sp_new, Sh_new;
   bool converged = false;
   while (st.iter < prm.niter) {
@@ -1127,15 +1206,26 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     auto tic = [&](char const *nm) { Timer.start(nm); return Timer.elapsed(nm); };
     auto toc = [&](char const *nm, double e0) { Timer.stop(nm); return Timer.elapsed(nm) - e0; };
 
-    // 1. Pi at the bosonic nodes, W residues
+    // 1. Pi at the bosonic nodes, W residues; S9a: the heads h(q, zeta_i) from W at the nodes (the Pi buffer, moved out by
+    //    screened_interaction and freed right after) and the scalar head residues from w
     double tPi = 0.0, tW = 0.0, e0 = 0.0;
+    const long nzb = bos->zeta_nodes.size();
+    nda::array<ComplexType, 2> Hn(nq, nzb), hres_p(nq, bos->rank), hres_h(nq, bos->rank);
+    Hn()     = ComplexType(0.0);
+    hres_p() = ComplexType(0.0);
+    hres_h() = ComplexType(0.0);
     for (long G = 0; G < qg.n; ++G) {   // one group (all q) unless the Pi group does not fit
       e0 = tic("phase_Pi");
       polarization<MEM>(prop, st.poles, mf, grid, bos->zeta_nodes, *pi_p, *pi_h, prm.t_chunk, Pi, Timer, sector_t::both,
                         qg.rows(G));
       tPi += toc("phase_Pi", e0);
       e0 = tic("phase_W");
-      screened_interaction<MEM>(Pi, Zb, *bos, grid, mpi, w, Timer, nullptr, qg.rows(G), qplan.w_host);
+      screened_interaction<MEM>(Pi, Zb, *bos, grid, mpi, w, Timer, &Wn, qg.rows(G), qplan.w_host);
+      Timer.start("W_head");
+      head_nodes_partial<MEM>(Wn, qg.rows(G), hbasis, Hn);
+      Wn = arr4_t{};
+      if (qplan.w_host) head_residues_partial<MEM>(w, qg.rows(G), hbasis, hres_p, hres_h);
+      Timer.stop("W_head");
       if (qplan.w_host) {   // this group's rows -> the host-resident residues of all q
         if (w_h.extent(0) != nq or w_h.extent(1) != bos->rank)
           w_h = memory::array<HOST_MEMORY, ComplexType, 4>(nq, bos->rank, grid.nP, grid.nQ);
@@ -1144,6 +1234,42 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
           w_h(qg.rows(G)[i], nda::range::all, nda::range::all, nda::range::all) = wg(i, nda::range::all, nda::range::all, nda::range::all);
       }
       tW += toc("phase_W", e0);
+    }
+    head_out_t hout;
+    {
+      e0 = tic("phase_W");
+      Timer.start("W_head");
+      if (not qplan.w_host) head_residues_partial<MEM>(w, q_all, hbasis, hres_p, hres_h);
+      head_reduce(comm, {&Hn, &hres_p, &hres_h});
+      hout.h_nodes       = std::move(Hn);
+      hout.h_res         = std::move(hres_p);
+      hout.h_res_hole    = std::move(hres_h);
+      hout.h0_nodes      = hextra.apply(hout.h_nodes);
+      hout.h0_res        = hextra.apply(hout.h_res);
+      hout.h0_res_hole   = hextra.apply(hout.h_res_hole);
+      hout.zeta          = bos->zeta_nodes;
+      hout.nu            = bos->nu;
+      hout.q_weights     = hextra.c;
+      hout.qpts          = nda::array<double, 2>(mf.Qpts_ibz());
+      hout.madelung      = madelung;
+      hout.eps_inf       = head_eps_inf(hout.h0_res, hout.h0_res_hole, bos->nu);
+      hout.extrapolation = prm.head_extrapolation;
+      hout.div_treatment = sig_div ? prm.div_treatment : std::string("ignore_g0");
+      hout.hf_div_treatment = prm.hf_div_treatment;
+      Timer.stop("W_head");
+      tW += toc("phase_W", e0);
+      const auto h0r = head_eval(hout.h0_res, hout.h0_res_hole, bos->nu, bos->zeta_nodes);
+      double dh = 0.0, sh = 0.0;
+      for (long i = 0; i < nzb; ++i) {
+        dh = std::max(dh, std::abs(h0r(i) - hout.h0_nodes(i)));
+        sh = std::max(sh, std::abs(hout.h0_nodes(i)));
+      }
+      app_log(1, "  head: eps_inf = {:.6f} (q -> 0 {}; 1 / (1 + Re h0(0)) from the residues), max|h0| at the nodes {:.4e}, "
+                 "residues vs nodes {:.1e}",
+              hout.eps_inf, prm.head_extrapolation, sh, sh > 0.0 ? dh / sh : dh);
+      res.eps_inf.push_back(hout.eps_inf);
+      res.head_hp0 = hout.h0_res;
+      res.head_hh0 = hout.h0_res_hole;
     }
 
     // 2. Sigma per sector at the dense nodes, mixing
@@ -1154,6 +1280,11 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
                      prm.sigma_kdist, whp, qplan.gs_sigma);
     self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sh_new, Timer, sector_t::hole,
                      prm.sigma_kdist, whp, qplan.gs_sigma);
+    if (sig_div) {   // S9a: the q -> 0 head term of Sigma_c (head.hpp), per sector, on the rows of this rank
+      Timer.start("Sigma_head");
+      head_sigma_correction(st.poles, Thead, bos->nu, hout.h0_res, hout.h0_res_hole, madelung, zeta, k_rows, Sp_new, Sh_new);
+      Timer.stop("Sigma_head");
+    }
     if (prm.debug_noise_sigma > 0.0 and st.iter + 1 == prm.debug_noise_iter) {
       // diagnostic (noise-floor meter): relative complex Gaussian noise on the new Sigma, seeded per GLOBAL k (rank-count
       // independent), scale max|Sigma^> + Sigma^<| over all k and nodes
@@ -1224,6 +1355,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     e0 = tic("phase_F");
     auto D = density_matrix(st.poles);
     hartree_exchange<MEM>(prop, Zb, D, mf, grid, mpi, st.F, Timer);
+    if (hf_div) exchange_head_correction(st.F, D, madelung);
     const double tF = toc("phase_F", e0);
     {
       const double np_tot = double(st.poles.total_poles()), MB = 1024.0 * 1024.0;
@@ -1268,7 +1400,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     print_line(rec, tPi, tW, tS, tC, tF);
 
     Timer.start("checkpoint");
-    write_state(comm, chk, st, &rec, kdp, sig_all);
+    write_state(comm, chk, st, &rec, kdp, sig_all, &hout);
     Timer.stop("checkpoint");
     Timer.stop("iteration");
     if (comm.root() and std::filesystem::exists(chk)) {

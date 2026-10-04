@@ -93,7 +93,15 @@
  *   sigma_kdist = true  Sigma at the nodes k-distributed over the ranks (S7e, k_dist.hpp: owner(k) = k mod np, the closure's
  *                       ownership; reduce-scatter in the self-energy); false = replicated on every rank (pre-S7e)
  *   output / outdir + prefix   checkpoint stem (MBPT_drivers resolve_mbpt_output_stem; the driver reads "output")
- *   div_treatment       must be absent or "ignore_g0" (Z(Gamma) without its G = 0 term, no Madelung/head correction)
+ *   div_treatment = "ignore_g0"   q -> 0 divergence of Sigma_c (S9a, head.hpp): "ignore_g0" (Z(Gamma) without its G = 0 term,
+ *                       no head term) or a gygi variant of CoQui ("gygi" = axis-folded polynomial extrapolation of the head
+ *                       eps^-1_00(q) - 1 to q -> 0, "gygi_order_N", "gygi_perdir", "gygi_2d", "gygi_smallest_q", "gygi_average"):
+ *                       dSigma_c = madelung x (extrapolated head) x T G T^dagger per sector (gw_t::Sigma_div_correction).
+ *                       nqpts == 1 forces "ignore_g0" for Sigma_c (as CoQui).
+ *   hf_div_treatment    exchange: "ignore_g0" | "gygi" (Sigma_x -= madelung D, hf_t::HF_K_correction with S = 1); default
+ *                       "ignore_g0" if div_treatment is "ignore_g0", else "gygi"
+ *   head_extrapolation = "gygi"   q -> 0 variant of the head data (checkpoint, eps_inf) when div_treatment = "ignore_g0";
+ *                       with a gygi div_treatment the head uses div_treatment itself
  *   spectra = { enable = true, eta = [0.004, 0.01], wmin = -0.45, wmax = 0.45, nw = 601 }   A(k,w) at the end
  *
  * Initial guess (as si222c_scgw_line.py): KS poles e_n(k) - mu0 with unit residues in the KS band basis, mu0 = KS
@@ -110,6 +118,12 @@
  *   poles: matrix coefficients {s}_coef (sum M, nb, nb) or, factorized (g_repr = "lehmann"), {s}_v (sum M, nb) = the
  *   Lehmann vectors v_m as rows (S6/S7b checkpoints with coefficients stay readable),
  *   iter0 = the initial state; spectra/ at the end.
+ *   S9a: scf_line/iter<N>/head/ (N >= 1, every div_treatment): h_nodes (nq, nz_b) = eps^-1_00(q, zeta_i) - 1 at the bosonic
+ *   nodes from W; h_res, h_res_hole (nq, r_b) scalar residues of the particle (+nu_j) and hole (-nu_j) parts,
+ *   h(q, z) = sum_j h_res_j / (z - nu_j) - h_res_hole_j / (z + nu_j) (raw fit residues: the pole function is determined, the
+ *   individual residues are not, see head.hpp); h0_nodes (nz_b), h0_res, h0_res_hole (r_b): the q -> 0 extrapolation
+ *   (weights q_weights (nq) of the variant `extrapolation`); zeta (nz_b), nu (r_b), qpts (nq, 3), madelung, eps_inf
+ *   = 1 / (1 + Re h0(0)), div_treatment, hf_div_treatment.
  */
 
 #include <optional>
@@ -167,6 +181,9 @@ struct gw_line_params_t {
   bool sigma_kdist = true;                 ///< k-distributed Sigma at the nodes (S7e)
   bool do_spectra = true;
   spectra_params_t spectra;
+  std::string div_treatment = "ignore_g0";      ///< S9a: Sigma_c head term ("ignore_g0" | gygi variants, head.hpp)
+  std::string hf_div_treatment = "ignore_g0";   ///< S9a: exchange Madelung term ("ignore_g0" | "gygi")
+  std::string head_extrapolation = "gygi";      ///< S9a: q -> 0 variant of the head data when div_treatment = "ignore_g0"
 
   static gw_line_params_t from_ptree(ptree const &pt);
   void log() const;
@@ -199,6 +216,8 @@ struct gw_line_result_t {
                                              ///< sigma_kdist (default) the rows of the k owned by this rank (k mod np)
   nda::array<ComplexType, 1> zeta;       ///< fermionic nodes (mu-relative)
   std::optional<spectra_out_t> spectra;
+  std::vector<double> eps_inf;           ///< S9a: 1 / (1 + Re h0(0)) of the iterations done in this run
+  nda::array<ComplexType, 1> head_hp0, head_hh0;   ///< S9a: extrapolated head residues of the last iteration of this run
 };
 
 /// Non-interacting one-body Hamiltonian (no xc) in the KS band basis, (nk, nb, nb), hermitized; collective.

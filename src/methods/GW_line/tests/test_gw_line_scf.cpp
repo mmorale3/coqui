@@ -41,6 +41,10 @@
  *   and Sigma at the stored nodes of k = 0 per iteration within gates = 10 x the measured noise floor (parity_floor).
  * [id_vs_gl] (S7b, S7f) 2 iterations, lehmann, lam_b auto, time_grid = "id" (time_eps 1e-8 and 1e-10) vs "gl": |dmu|,
  *   |dgap| and max|dSigma| / max|Sigma| at all nodes and k; gates = 5 x the measured noise floor (idgl_gate).
+ * [gygi] (S9a) div_treatment = "gygi" (hf_div_treatment follows: "gygi"), lehmann, id, lam_b auto: 2 iterations vs 1 + restart + 1
+ *   (bitwise mu, poles, F, Sigma); the head group scf_line/iter<N>/head/ (shapes, eps_inf, h0 at the nodes = the
+ *   extrapolated residue function at the nodes); F(iter0) gygi - F(iter0) ignore_g0 = -madelung D_KS; iteration-1 Sigma
+ *   gygi - ignore_g0 = the head term (positive: its anti-Hermitian part at the nodes has a definite sign per sector).
  * [.time_id_poles] (hidden diagnostic) kernels on the poles of a checkpoint iteration (GW_LINE_DIAG_FILE, GW_LINE_DIAG_ITER):
  *   default GL rays and ID grids (time_eps 1e-8/1e-10/1e-12, pad 1.25/2) vs a refined GL reference.
  */
@@ -89,6 +93,7 @@
 #include "methods/GW_line/self_energy.hpp"
 #include "methods/GW_line/time_grids.hpp"
 #include "methods/GW_line/static_part.hpp"
+#include "methods/GW_line/head.hpp"
 
 namespace {
 
@@ -597,6 +602,103 @@ void restart_test(std::string const &tg, std::string const &gr = "compressed") {
   remove_file(comm, fb + ".gw_line.h5");
 }
 } // namespace
+
+namespace {
+/// S9a: the gygi driver: restart, head checkpoint, Madelung terms
+void gygi_test() {
+  lih_t L;
+  auto &comm = L.mpi->comm;
+  auto &mf   = *L.mf;
+  const std::string fa = "gw_line_gyA", fb = "gw_line_gyB", fi = "gw_line_gyI";
+  auto par = [&](std::string const &f, long n, bool rs, std::string const &div) {
+    auto pt = scf_params(f, n, rs, "id", "lehmann");
+    pt.put("lam_b", -1.0);   // auto (S7c): the bosonic basis covers the Pi transitions of the Lehmann poles
+    pt.put("div_treatment", div);
+    return pt;
+  };
+  auto A  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, mf, par(fa, 2, false, "gygi"));
+  auto B1 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, mf, par(fb, 1, false, "gygi"));
+  auto B2 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, mf, par(fb, 2, true, "gygi"));
+  auto I  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, mf, par(fi, 1, false, "ignore_g0"));
+  REQUIRE(A.history.size() == 2);
+  REQUIRE(B2.history.size() == 2);
+  REQUIRE(A.eps_inf.size() == 2);
+  REQUIRE(B2.eps_inf.size() == 1);
+  const double dmu = std::abs(A.mu - B2.mu), dpo = maxdiff_poles(A.poles, B2.poles);
+  const double dF  = nda::max_element(nda::abs(A.F - B2.F));
+  const double dSp = nda::max_element(nda::abs(A.Sig_p - B2.Sig_p)), dSh = nda::max_element(nda::abs(A.Sig_h - B2.Sig_h));
+  app_log(1, "[gygi] ranks {}: eps_inf it 1 / 2 = {:.10f} / {:.10f} (restart: {:.10f}); mu it 1 / 2 = {:.10f} / {:.10f} "
+             "(ignore_g0 it 1 {:.10f}); gap it 1 / 2 = {:.6f} / {:.6f} eV (ignore_g0 it 1 {:.6f} eV)",
+          comm.size(), A.eps_inf[0], A.eps_inf[1], B2.eps_inf[0], A.history[0].mu, A.history[1].mu, I.history[0].mu,
+          A.history[0].gap * 27.211386, A.history[1].gap * 27.211386, I.history[0].gap * 27.211386);
+  app_log(1, "  restart 1 + 1 vs 2: |dmu| {:.1e}, poles {:.1e}, F {:.1e}, Sigma_p {:.1e}, Sigma_h {:.1e}; eps_inf it 2 {:.1e}", dmu,
+          dpo, dF, dSp, dSh, std::abs(A.eps_inf[1] - B2.eps_inf[0]));
+  REQUIRE(dmu == 0.0);
+  REQUIRE(dpo == 0.0);
+  REQUIRE(dF == 0.0);
+  REQUIRE(dSp == 0.0);
+  REQUIRE(dSh == 0.0);
+  REQUIRE(A.eps_inf[1] == B2.eps_inf[0]);
+  REQUIRE(A.eps_inf[0] > 1.0);
+  if (comm.root()) {
+    h5::file f(fa + ".gw_line.h5", 'r');
+    h5::group g(f);
+    std::string hfd;
+    h5::h5_read(g, "input/hf_div_treatment", hfd);
+    REQUIRE(hfd == "gygi");
+    const long nq = mf.nqpts(), nk = mf.nkpts(), nb = mf.nbnd();
+    for (long it = 1; it <= 2; ++it) {
+      auto hg = g.open_group("scf_line/iter" + std::to_string(it) + "/head");
+      nda::array<ComplexType, 2> hn, hr, hh;
+      nda::array<ComplexType, 1> h0n, h0r, h0h, z;
+      nda::array<double, 1> nu, cw;
+      double eps = 0.0, mad = 0.0;
+      nda::h5_read(hg, "h_nodes", hn);
+      nda::h5_read(hg, "h_res", hr);
+      nda::h5_read(hg, "h_res_hole", hh);
+      nda::h5_read(hg, "h0_nodes", h0n);
+      nda::h5_read(hg, "h0_res", h0r);
+      nda::h5_read(hg, "h0_res_hole", h0h);
+      nda::h5_read(hg, "zeta", z);
+      nda::h5_read(hg, "nu", nu);
+      nda::h5_read(hg, "q_weights", cw);
+      h5::h5_read(hg, "eps_inf", eps);
+      h5::h5_read(hg, "madelung", mad);
+      REQUIRE(hn.extent(0) == nq);
+      REQUIRE(hn.extent(1) == z.size());
+      REQUIRE(hr.extent(0) == nq);
+      REQUIRE(hr.extent(1) == nu.size());
+      REQUIRE(hh.shape() == hr.shape());
+      REQUIRE(cw.size() == nq);
+      REQUIRE(eps == A.eps_inf[it - 1]);
+      REQUIRE(mad == mf.madelung());
+      auto h0e = methods::gw_line::head_eval(h0r, h0h, nu, z);
+      const double e = nda::max_element(nda::abs(h0e - h0n)) / nda::max_element(nda::abs(h0n));
+      app_log(1, "  head checkpoint it {}: h_nodes {} x {}, h_res {} x {}, eps_inf {:.8f}, h0 residues vs nodes {:.1e}", it,
+              hn.extent(0), hn.extent(1), hr.extent(0), hr.extent(1), eps, e);
+      REQUIRE(e <= 1e-8);
+    }
+    // F(iter 0): gygi - ignore_g0 = -madelung D_KS
+    h5::file fI(fi + ".gw_line.h5", 'r');
+    h5::group gI(fI);
+    nda::array<ComplexType, 3> Fg, Fi;
+    nda::h5_read(g, "scf_line/iter0/F", Fg);
+    nda::h5_read(gI, "scf_line/iter0/F", Fi);
+    const long nocc = long(std::llround(double(mf.nelec()) / 2.0));
+    double dFk = 0.0;
+    for (long ik = 0; ik < nk; ++ik)
+      for (long i = 0; i < nb; ++i)
+        for (long j = 0; j < nb; ++j)
+          dFk = std::max(dFk, std::abs(Fg(ik, i, j) - Fi(ik, i, j) + ((i == j and i < nocc) ? mf.madelung() : 0.0)));
+    app_log(1, "  F(iter0) gygi - ignore_g0 + madelung D_KS: {:.1e}", dFk);
+    REQUIRE(dFk <= 1e-14);
+  }
+  for (auto const &f : {fa, fb, fi}) remove_file(comm, f + ".gw_line.h5");
+  for (auto const &f : {fa, fb, fi}) remove_file(comm, f + ".gw_line.sigma.h5");
+}
+} // namespace
+
+TEST_CASE("gw_line_scf_gygi", "[gw_line][scf][gygi]") { gygi_test(); }
 
 TEST_CASE("gw_line_scf_restart", "[gw_line][scf][restart]") {
   SECTION("time_grid id") { restart_test("id"); }
