@@ -366,10 +366,12 @@ struct lih_t {
   std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi;
   std::shared_ptr<mf::MF> mf;
   std::unique_ptr<methods::thc_reader_t> thc;
-  lih_t() {
+  std::string fixture;
+  /// qe_lih222 (stored THC if present) or another fixture (THC built, nIpts = 8 nbnd), e.g. qe_lih223 (q != -q)
+  explicit lih_t(std::string const &fx = "qe_lih222") : fixture(fx) {
     mpi = utils::make_unit_test_mpi_context();
-    mf  = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih222"));
-    if (std::filesystem::exists(lih_thc_file())) {
+    mf  = std::make_shared<mf::MF>(mf::default_MF(mpi, fixture));
+    if (fixture == "qe_lih222" and std::filesystem::exists(lih_thc_file())) {
       thc = std::make_unique<methods::thc_reader_t>(mf, "incore", lih_thc_file());
     } else {
       app_log(1, "  [gw_line test] {} not found: building the THC (nIpts = 8 nbnd); run [.gw_line_dump] to store it",
@@ -1153,7 +1155,7 @@ std::vector<study_run_t> repr_study(lih_t &L, std::string const &tag, std::vecto
       REQUIRE(long(r.R.history.size()) == niter);
       runs.push_back(std::move(r));
     }
-  app_log(1, "\n[repr {}] lih222, ranks {}, {} iterations per run, lam_b {}", tag, comm.size(), niter,
+  app_log(1, "\n[repr {}] {}, ranks {}, {} iterations per run, lam_b {}", tag, L.fixture, comm.size(), niter,
           runs.empty() ? 0.0 : mk("x", "gl", "lehmann").get<double>("lam_b"));
   if (std::getenv("GW_LINE_LAMB")) app_log(1, "  (lam_b overridden by GW_LINE_LAMB = {})", std::getenv("GW_LINE_LAMB"));
   app_log(1, "  run          it |   mu (Ha)     gap (eV)  N(mu)     Tr D      dSigma   | G poles/k&s  min|e| (Ha) | t-nodes Pi  "
@@ -1242,6 +1244,74 @@ TEST_CASE("gw_line_scf_lehmann", "[gw_line][scf][lehmann]") {
       ok = gate_line("|dgap| (meV)", d[1], g[1]) and ok;
       ok = gate_line("max|dSigma|/max|Sigma|", d[2], g[2]) and ok;
     }
+  REQUIRE(ok);
+}
+
+/**
+ * W pairing fix (2026-10-04, notes section 3.3): the driver on a q != -q mesh (qe_lih223, 2x2x3: 8 of 12 q not
+ * self-inverse; THC nIpts 8 nbnd built here), the settings of gw_line_scf_lehmann, 2 iterations, compressed and lehmann, gl
+ * and id. Sanity per iteration: held-out moment error (Si 4x4x4 before the fix: 0.13 at iteration 1), N(mu) = nelec,
+ * a QP gap near the KS gap, lehmann: a QP pole in every k and sector (largest pole weight >= 0.5; before the fix the 4x4x4
+ * run had only combs of weight 0.05-0.2), and id vs gl / lehmann vs compressed agreeing as on lih222
+ * (idgl_gate of the lih222 noise floor).
+ */
+TEST_CASE("gw_line_scf_qpair_lih223", "[gw_line][scf][qpair]") {
+  lih_t L("qe_lih223");
+  auto &comm = L.mpi->comm;
+  const long niter = 2;
+  std::vector<variant_t> vars = {{"cmp", "compressed"}, {"leh", "lehmann", env_or("GW_LINE_EMIN_FRAC", 0.5), env_or("GW_LINE_WSMALL", 1e-4)}};
+  std::vector<std::vector<std::array<double, 3>>> idgl;
+  auto runs = repr_study(L, "qpair", vars, niter,
+                         [&](std::string const &f, std::string const &tg, std::string const &gr) {
+                           auto pt = scf_params(f, niter, false, tg, gr);
+                           pt.put("lam_b", -1.0);
+                           pt.put("time_eps", 1e-10);
+                           return pt;
+                         },
+                         idgl);
+  // KS gap of the fixture
+  const long nk = L.mf->nkpts(), nb = L.mf->nbnd(), nocc = long(std::llround(double(L.mf->nelec()) / 2.0));
+  double homo = -1e300, lumo = 1e300;
+  for (long ik = 0; ik < nk; ++ik)
+    for (long n = 0; n < nb; ++n) {
+      if (n < nocc) homo = std::max(homo, L.mf->eigval()(0, ik, n));
+      else lumo = std::min(lumo, L.mf->eigval()(0, ik, n));
+    }
+  const double ks_gap = lumo - homo, nel = double(L.mf->nelec());
+  bool ok = true;
+  for (auto const &r : runs) {
+    for (auto const &h : r.R.history) {
+      app_log(1, "  [qpair] {} {} it {}: held-out {:.2e}, N(mu) {:.6f} (nelec {}), gap {:.4f} eV (KS {:.4f} eV), poles {}-{}",
+              r.var.name, r.tg, h.iter, h.heldout_max, h.N_mu, nel, h.gap * 27.211386, ks_gap * 27.211386, h.npoles_min,
+              h.npoles_max);
+      ok = gate_line("held-out moment error", h.heldout_max, 1e-4) and ok;
+      ok = gate_line("|N(mu) / nelec - 1|", std::abs(h.N_mu / nel - 1.0), 2e-2) and ok;
+      ok = gate_line("|gap / KS gap - 1|", std::abs(h.gap / ks_gap - 1.0), 1.0) and ok;
+    }
+    if (r.var.repr == "lehmann") {
+      double wmin = 1e300;
+      for (long ik = 0; ik < nk; ++ik)
+        for (auto s : {sector_t::particle, sector_t::hole}) {
+          auto const &ps = r.R.poles(ik, s);
+          REQUIRE(ps.size() > 0);
+          double wmax = 0.0;
+          for (long m = 0; m < ps.size(); ++m) wmax = std::max(wmax, ps.weight(m));
+          wmin = std::min(wmin, wmax);
+        }
+      app_log(1, "  [qpair] {} {}: min over k and sectors of the largest pole weight (QP) {:.3f}", r.var.name, r.tg, wmin);
+      ok = gate_line("1 - QP weight", 1.0 - wmin, 0.5) and ok;
+    }
+  }
+  for (long iv = 0; iv < 2; ++iv)
+    for (long it = 0; it < niter; ++it) {
+      auto const &d = idgl[iv][it];
+      auto g        = idgl_gate(floor_3e11, it, 1e-10);
+      app_log(1, "  [qpair] id vs gl, {} iteration {}:", vars[iv].name, it + 1);
+      ok = gate_line("|dmu| (meV)", d[0], g[0]) and ok;
+      ok = gate_line("|dgap| (meV)", d[1], g[1]) and ok;
+      ok = gate_line("max|dSigma|/max|Sigma|", d[2], g[2]) and ok;
+    }
+  (void)comm;
   REQUIRE(ok);
 }
 
@@ -1688,4 +1758,57 @@ TEST_CASE("gw_line_closure_noise", "[.closure_noise]") {
     variant("tol_svd " + std::to_string(ts).substr(0, 0) + (ts == 1e-10 ? "1e-10" : "1e-8"), [=](closure_params_t &c) { c.tol_svd = ts; });
   for (double tg : {1e-9, 1e-8})
     variant(std::string("tol_gram ") + (tg == 1e-9 ? "1e-9" : "1e-8"), [=](closure_params_t &c) { c.tol_gram = tg; });
+}
+
+/// (hidden) regression dump for code changes that must leave the q = -q fixtures bitwise unchanged (the q <-> -q pairing
+/// fix of 2026-10-04): on the STORED lih222 THC (deterministic input), KS poles -> Pi -> W residues -> Sigma (both sectors,
+/// GL rays) and a 2-iteration driver run (compressed, gl); writes w, Sigma, the driver's mu / Sigma to $GW_LINE_REGRESSION_H5.
+/// Run with the old and the new binary on 1 rank and compare the files.
+TEST_CASE("gw_line_regression_dump", "[.gw_line_regression_dump]") {
+  lih_t L;
+  using numerics::line_dlr::time_ray_t;
+  auto &mpi = *L.mpi;
+  auto &mf  = *L.mf;
+  char const *fn = std::getenv("GW_LINE_REGRESSION_H5");
+  REQUIRE(fn != nullptr);
+  const long nk = mf.nkpts(), nb = mf.nbnd(), nocc = long(std::llround(double(mf.nelec()) / 2.0));
+  nda::array<double, 2> eig(nk, nb);
+  double homo = -1e300, lumo = 1e300;
+  for (long ik = 0; ik < nk; ++ik)
+    for (long n = 0; n < nb; ++n) {
+      eig(ik, n) = mf.eigval()(0, ik, n);
+      if (n < nocc) homo = std::max(homo, eig(ik, n));
+      else lumo = std::min(lumo, eig(ik, n));
+    }
+  auto pd = pole_data_t::from_ks(eig, 0.5 * (homo + lumo));
+  const double th = 20.0 * std::numbers::pi / 180.0;
+  numerics::line_dlr::bosonic_basis_t bos(th, 4.0, 1e-10, 0.5 * (lumo - homo));
+  auto fz = numerics::line_dlr::dense_nodes(th, 1e-3, 60.0, 120);
+  aux_grid_t grid(mpi, L.thc->Np());
+  dyson_layout_t lay(mpi, mf.nqpts(), bos.zeta_nodes.size(), L.thc->Np());
+  utils::TimerManager T;
+  coulomb_blocks_t<HOST_MEMORY> Zb(*L.thc, grid, lay.q_rng(), T);
+  propagator_t<HOST_MEMORY> prop(*L.thc, grid);
+  auto rp = time_ray_t::for_spectrum(0.5 * th, pd.emin(), 36.0, 1e-5, 3.0, 16, sector_t::particle);
+  auto rh = time_ray_t::for_spectrum(0.5 * th, pd.emin(), 36.0, 1e-5, 3.0, 16, sector_t::hole);
+  memory::array<HOST_MEMORY, ComplexType, 4> Pi, w;
+  polarization<HOST_MEMORY>(prop, pd, mf, grid, bos.zeta_nodes, rp, rh, 8, Pi, T);
+  screened_interaction<HOST_MEMORY>(Pi, Zb, bos, grid, mpi, w, T);
+  nda::array<ComplexType, 4> Sp, Sh;
+  self_energy<HOST_MEMORY>(prop, pd, w, bos, mf, grid, mpi, fz, rp, rh, 8, Sp, T, sector_t::particle);
+  self_energy<HOST_MEMORY>(prop, pd, w, bos, mf, grid, mpi, fz, rp, rh, 8, Sh, T, sector_t::hole);
+  auto pt = scf_params("gw_line_regdump", 2, false, "gl", "compressed");
+  auto R  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, mf, pt);
+  if (mpi.comm.root()) {
+    h5::file f(fn, 'w');
+    h5::group g(f);
+    nda::array<ComplexType, 4> wh(w);
+    nda::h5_write(g, "w", wh, false);
+    nda::h5_write(g, "Sigma_p", Sp, false);
+    nda::h5_write(g, "Sigma_h", Sh, false);
+    nda::h5_write(g, "scf_Sig_p", R.Sig_p, false);
+    nda::h5_write(g, "scf_Sig_h", R.Sig_h, false);
+    h5::h5_write(g, "scf_mu", R.mu);
+  }
+  remove_file(mpi.comm, "gw_line_regdump.gw_line.h5");
 }
