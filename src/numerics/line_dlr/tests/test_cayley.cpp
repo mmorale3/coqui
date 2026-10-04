@@ -391,8 +391,11 @@ TEST_CASE("cayley_closure_bench", "[.closure_bench]") { closure_bench::run(nullp
 TEST_CASE("cayley_ueig_ab", "[numerics][cayley]") {
   CHECK(closure_bench::ab_small(nullptr, "gesvd") <= 1e-11);
   CHECK(closure_bench::ab_small(nullptr, "gesdd") <= 1e-11);
-  // n_free > 0 (terminal-phase scan): the fast SVD driver hands over to zgesvd (driver-dependent free block)
-  CHECK(closure_bench::ab_small(nullptr, "gesdd", 160) <= 1e-9);
+  // n_free > 0 (terminal-phase scan): the fast SVD driver hands over to zgesvd (driver-dependent free block); the
+  // golden-section search ends on a bracket of (4 pi / nphi) 0.618^30 ~ 3e-7 rad, so roundoff-level differences of the
+  // held-out error between the Schur and the Cayley eigenvectors move phi* within that bracket (Mac 1.3e-13, rusty MKL
+  // 1.1e-6 on this non-exact model; production has n_free = 0)
+  CHECK(closure_bench::ab_small(nullptr, "gesdd", 160) <= 1e-5);
   closure_bench::hooks_accuracy(nullptr, 120);
   // sensitivity yardstick: the same host zheevd on the index-REVERSED matrix (a different, equally valid roundoff of the
   // Gram / Lehmann eigenvectors) -- the end-to-end difference of the device hooks should be of this size

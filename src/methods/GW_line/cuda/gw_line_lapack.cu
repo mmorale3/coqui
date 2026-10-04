@@ -37,6 +37,7 @@ using cd = cuDoubleComplex;
 /// per-thread handle + one growing device buffer
 struct ws_t {
   cusolverDnHandle_t h = nullptr;
+  cudaStream_t st      = nullptr;   // own non-blocking stream: the closure's k workers overlap on the GPU
   void *buf            = nullptr;
   size_t bytes         = 0;
   int dev              = -1;
@@ -44,8 +45,10 @@ struct ws_t {
   void release() {
     if (buf) cudaFree(buf);
     if (h) cusolverDnDestroy(h);
+    if (st) cudaStreamDestroy(st);
     buf   = nullptr;
     h     = nullptr;
+    st    = nullptr;
     bytes = 0;
     dev   = -1;
   }
@@ -55,6 +58,10 @@ struct ws_t {
     if (h and cur == dev) return true;
     release();
     if (cusolverDnCreate(&h) != CUSOLVER_STATUS_SUCCESS) { h = nullptr; return false; }
+    if (cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess or cusolverDnSetStream(h, st) != CUSOLVER_STATUS_SUCCESS) {
+      release();
+      return false;
+    }
     dev = cur;
     return true;
   }
@@ -86,6 +93,14 @@ size_t align(size_t x) { return (x + 255) & ~size_t(255); }
 bool ok(cudaError_t e) { return e == cudaSuccess; }
 bool ok(cusolverStatus_t s) { return s == CUSOLVER_STATUS_SUCCESS; }
 
+/// copy on the workspace stream and wait for it (all work of a call is ordered on that stream)
+cudaError_t xfer(void *dst, void const *src, size_t bytes, cudaMemcpyKind kind) {
+  auto &W        = ws();
+  cudaError_t e  = cudaMemcpyAsync(dst, src, bytes, kind, W.st);
+  if (e != cudaSuccess) return e;
+  return cudaStreamSynchronize(W.st);
+}
+
 } // namespace
 
 static bool impl_heevd(int n, cplx *A, double *w) {
@@ -104,13 +119,13 @@ static bool impl_heevd(int n, cplx *A, double *w) {
   auto *dW = reinterpret_cast<double *>(base + oW);
   auto *dK = reinterpret_cast<cd *>(base + oWk);
   auto *dI = reinterpret_cast<int *>(base + oI);
-  if (not ok(cudaMemcpy(dA, A, nA * sizeof(cd), cudaMemcpyHostToDevice))) return false;
+  if (not ok(xfer(dA, A, nA * sizeof(cd), cudaMemcpyHostToDevice))) return false;
   if (not ok(cusolverDnZheevd(W.h, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, n, dA, n, dW, dK, lwork, dI))) return false;
   int info = -1;
-  if (not ok(cudaMemcpy(&info, dI, sizeof(int), cudaMemcpyDeviceToHost)) or info != 0) return false;
+  if (not ok(xfer(&info, dI, sizeof(int), cudaMemcpyDeviceToHost)) or info != 0) return false;
   std::vector<double> wh(n);
-  if (not ok(cudaMemcpy(wh.data(), dW, size_t(n) * sizeof(double), cudaMemcpyDeviceToHost))) return false;
-  if (not ok(cudaMemcpy(A, dA, nA * sizeof(cd), cudaMemcpyDeviceToHost))) return false;   // last: A changes only on success
+  if (not ok(xfer(wh.data(), dW, size_t(n) * sizeof(double), cudaMemcpyDeviceToHost))) return false;
+  if (not ok(xfer(A, dA, nA * sizeof(cd), cudaMemcpyDeviceToHost))) return false;   // last: A changes only on success
   std::copy(wh.begin(), wh.end(), w);
   return true;
 }
@@ -137,16 +152,16 @@ static bool impl_gesvd(int n, cplx const *A, double *s, cplx *P, cplx *Qh, int v
     auto *dI = reinterpret_cast<int *>(base + oI);
     std::vector<char> hw(whost > 0 ? whost : 1);
     double err_sigma = 0.0;
-    good = ok(cudaMemcpy(dA, A, nA * sizeof(cd), cudaMemcpyHostToDevice)) and
+    good = ok(xfer(dA, A, nA * sizeof(cd), cudaMemcpyHostToDevice)) and
            ok(cusolverDnXgesvdp(W.h, prm, CUSOLVER_EIG_MODE_VECTOR, 0, n, n, CUDA_C_64F, dA, n, CUDA_R_64F, dS, CUDA_C_64F, dU, n,
                                 CUDA_C_64F, dV, n, CUDA_C_64F, base + oWk, wdev, hw.data(), whost, dI, &err_sigma));
     cusolverDnDestroyParams(prm);
     int info = -1;
-    if (not good or not ok(cudaMemcpy(&info, dI, sizeof(int), cudaMemcpyDeviceToHost)) or info != 0) return false;
+    if (not good or not ok(xfer(&info, dI, sizeof(int), cudaMemcpyDeviceToHost)) or info != 0) return false;
     std::vector<cplx> V(nA);
-    if (not ok(cudaMemcpy(P, dU, nA * sizeof(cd), cudaMemcpyDeviceToHost)) or
-        not ok(cudaMemcpy(V.data(), dV, nA * sizeof(cd), cudaMemcpyDeviceToHost)) or
-        not ok(cudaMemcpy(s, dS, size_t(n) * sizeof(double), cudaMemcpyDeviceToHost)))
+    if (not ok(xfer(P, dU, nA * sizeof(cd), cudaMemcpyDeviceToHost)) or
+        not ok(xfer(V.data(), dV, nA * sizeof(cd), cudaMemcpyDeviceToHost)) or
+        not ok(xfer(s, dS, size_t(n) * sizeof(double), cudaMemcpyDeviceToHost)))
       return false;
     for (int j = 0; j < n; ++j)   // Qh = V^dagger (column-major)
       for (int i = 0; i < n; ++i) Qh[i + size_t(j) * n] = std::conj(V[j + size_t(i) * n]);
@@ -166,13 +181,13 @@ static bool impl_gesvd(int n, cplx const *A, double *s, cplx *P, cplx *Qh, int v
   auto *dK = reinterpret_cast<cd *>(base + oWk);
   auto *dR = reinterpret_cast<double *>(base + oR);
   auto *dI = reinterpret_cast<int *>(base + oI);
-  if (not ok(cudaMemcpy(dA, A, nA * sizeof(cd), cudaMemcpyHostToDevice))) return false;
+  if (not ok(xfer(dA, A, nA * sizeof(cd), cudaMemcpyHostToDevice))) return false;
   if (not ok(cusolverDnZgesvd(W.h, 'A', 'A', n, n, dA, n, dS, dU, n, dV, n, dK, lwork, dR, dI))) return false;
   int info = -1;
-  if (not ok(cudaMemcpy(&info, dI, sizeof(int), cudaMemcpyDeviceToHost)) or info != 0) return false;
-  return ok(cudaMemcpy(P, dU, nA * sizeof(cd), cudaMemcpyDeviceToHost)) and
-         ok(cudaMemcpy(Qh, dV, nA * sizeof(cd), cudaMemcpyDeviceToHost)) and
-         ok(cudaMemcpy(s, dS, size_t(n) * sizeof(double), cudaMemcpyDeviceToHost));
+  if (not ok(xfer(&info, dI, sizeof(int), cudaMemcpyDeviceToHost)) or info != 0) return false;
+  return ok(xfer(P, dU, nA * sizeof(cd), cudaMemcpyDeviceToHost)) and
+         ok(xfer(Qh, dV, nA * sizeof(cd), cudaMemcpyDeviceToHost)) and
+         ok(xfer(s, dS, size_t(n) * sizeof(double), cudaMemcpyDeviceToHost));
 }
 
 static bool impl_lu_solve(int n, int nrhs, cplx const *A, cplx *B) {
@@ -191,15 +206,15 @@ static bool impl_lu_solve(int n, int nrhs, cplx const *A, cplx *B) {
   auto *dK = reinterpret_cast<cd *>(base + oWk);
   auto *dP = reinterpret_cast<int *>(base + oP);
   auto *dI = reinterpret_cast<int *>(base + oI);
-  if (not ok(cudaMemcpy(dA, A, nA * sizeof(cd), cudaMemcpyHostToDevice)) or
-      not ok(cudaMemcpy(dB, B, nB * sizeof(cd), cudaMemcpyHostToDevice)))
+  if (not ok(xfer(dA, A, nA * sizeof(cd), cudaMemcpyHostToDevice)) or
+      not ok(xfer(dB, B, nB * sizeof(cd), cudaMemcpyHostToDevice)))
     return false;
   if (not ok(cusolverDnZgetrf(W.h, n, n, dA, n, dK, dP, dI))) return false;
   int info = -1;
-  if (not ok(cudaMemcpy(&info, dI, sizeof(int), cudaMemcpyDeviceToHost)) or info != 0) return false;
+  if (not ok(xfer(&info, dI, sizeof(int), cudaMemcpyDeviceToHost)) or info != 0) return false;
   if (not ok(cusolverDnZgetrs(W.h, CUBLAS_OP_N, n, nrhs, dA, n, dP, dB, n, dI))) return false;
-  if (not ok(cudaMemcpy(&info, dI, sizeof(int), cudaMemcpyDeviceToHost)) or info != 0) return false;
-  return ok(cudaMemcpy(B, dB, nB * sizeof(cd), cudaMemcpyDeviceToHost));
+  if (not ok(xfer(&info, dI, sizeof(int), cudaMemcpyDeviceToHost)) or info != 0) return false;
+  return ok(xfer(B, dB, nB * sizeof(cd), cudaMemcpyDeviceToHost));
 }
 
 bool dev_heevd(int n, cplx *A, double *w) {

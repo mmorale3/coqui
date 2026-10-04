@@ -388,7 +388,10 @@ struct upfold_opts_t {
   // S7g linear-algebra drivers (performance; results agree to roundoff-level effects, see notes S7g)
   std::string svd_driver = "gesvd";   ///< SVD of D+ D-^dagger: "gesvd" (python / numpy path) | "gesdd" (divide and conquer)
   std::string ueig       = "schur";   ///< eigenvectors of U: "schur" (zgees) | "cayley" (Hermitian Cayley image, zgees fallback)
-  double ueig_tol        = 1e-12;     ///< residual tolerance |U z - u z| of the "cayley" path (Rayleigh-Ritz above it)
+  /// residual tolerance |U z - u z| of the "cayley" path (Rayleigh-Ritz above it). si222c (job 7168848): accepted residuals
+  /// 1.7e-13..8.4e-13, retried ones 1.1e-12..2.6e-12 at 1e-12 (Schur's backward error ~ n eps ~ 1e-13); a residual of
+  /// 1e-11 moves a pole by <= 1e-11 (d^2 + wp^2) / (2 wp) (1.6e-9 Ha at |d| = 6 Ha), far below the closure's roundoff floor
+  double ueig_tol = 1e-11;
   lapack_hooks_t const *hooks = nullptr;   ///< external (device) drivers of the Gram eigen, SVD and Cayley path; null: host
 };
 
