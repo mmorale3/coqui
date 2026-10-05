@@ -408,7 +408,8 @@ struct optics_line_t {
   nda::array<double, 1> nu;
   nda::array<ComplexType, 2> h_nodes;  ///< (nq, nz)
   nda::array<double, 1> q_weights;     ///< (nq) q -> 0 extrapolation weights
-  nda::array<double, 2> qpts;          ///< (nq, 3)
+  nda::array<double, 2> qpts;          ///< (nq, 3) Cartesian (bohr^-1)
+  nda::array<double, 2> lattv;         ///< (3, 3) lattice vectors (bohr; rows), for the q directions
   std::vector<double> qfac;            ///< (nq) f(q) = Omega |q|^2 / 4 pi (0: Gamma)
   std::vector<long> qminus;
   std::vector<std::string> variant_names;            ///< other q -> 0 variants (optics_params_t::q0_variants)
@@ -528,6 +529,7 @@ inline void write_optics(boost::mpi3::communicator &comm, std::string const &fil
     nda::h5_write(tg, "h_nodes", L.h_nodes, false);
     nda::h5_write(tg, "q_weights", L.q_weights, false);
     nda::h5_write(tg, "qpts", L.qpts, false);
+    if (L.lattv.size() > 0) nda::h5_write(tg, "lattv", L.lattv, false);
     for (auto const &o : R) {
       auto qg = tg.create_group(optics_label(L, o.iq));
       h5::h5_write(qg, "iq", o.iq);

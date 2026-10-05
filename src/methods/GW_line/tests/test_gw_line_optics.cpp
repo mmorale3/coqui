@@ -471,8 +471,9 @@ double vmax(std::vector<double> const &v) { return v.empty() ? 0.0 : *std::max_e
 
 /**
  * Gates of [V6][optics] (MB): max over the finite q and q0 and over loss / eps1 / eps2 of the window errors, per fixture, angle,
- * broadening (0: eta = 0.01 Ha, 1: eta = 0.05 omega) and window (0-5 / 5-10 / 10-20 / 20-40 eV) = 3 x the Mac measurement
- * (2026-10-05, 1 rank, Accelerate; rounded up), floor 1e-4. Error-bar coverage (stored |MB - NNLS| >= true MB error per
+ * broadening (0: eta = 0.01 Ha, 1: eta = 0.05 omega) and window (0-5 / 5-10 / 10-20 / 20-40 eV) = 3 x the max of the Mac (Accelerate, 1 and 2
+ * ranks) and rusty (MKL, 2 ranks) measurements of 2026-10-05, rounded up, floor 1e-4. The MB closure at the K cap amplifies
+ * roundoff-level data differences ~r^-K ~ 2e7 x: lih222 at 10 deg, 0-5 eV, is 4e-4 on the Mac and 1e-2 on rusty. Error-bar coverage (stored |MB - NNLS| >= true MB error per
  * window) >= 0.4 (measured 0.54-0.92); eps_inf(q) <= 1e-9 (LiH; si211 1e-6: its head is not exactly odd, the PH asymmetry of
  * the fixture, r_apex 2.7e-5), f-sum <= 1e-7 (LiH; si211 2e-3).
  */
@@ -483,24 +484,24 @@ struct optics_gate_t {
   std::array<double, 4> g;
 };
 const std::vector<optics_gate_t> optics_gates = {
-    {"qe_lih222", 5.0, 0, {1e-02, 3e-03, 6e-04, 4e-02}},   // measured 3.3e-03 8.6e-04 1.7e-04 1.1e-02
-    {"qe_lih222", 5.0, 1, {2e-02, 3e-03, 4e-04, 4e-04}},   // measured 4.0e-03 1.0e-03 1.3e-04 1.3e-04
-    {"qe_lih222", 10.0, 0, {2e-03, 9e-04, 6e-02, 2e-01}},   // measured 4.0e-04 2.7e-04 2.0e-02 6.3e-02
-    {"qe_lih222", 10.0, 1, {2e-03, 8e-04, 8e-04, 8e-04}},   // measured 4.1e-04 2.5e-04 2.4e-04 2.4e-04
-    {"qe_lih222", 20.0, 0, {7e-04, 2e-04, 2e+00, 4e+00}},   // measured 2.2e-04 4.7e-05 4.2e-01 1.1e+00
-    {"qe_lih222", 20.0, 1, {7e-04, 2e-04, 8e-02, 2e-01}},   // measured 2.2e-04 4.8e-05 2.5e-02 4.4e-02
-    {"qe_lih223", 5.0, 0, {2e-03, 2e-03, 3e-01, 5e-01}},   // measured 4.4e-04 4.2e-04 7.0e-02 1.6e-01
-    {"qe_lih223", 5.0, 1, {2e-03, 2e-03, 2e-04, 2e-04}},   // measured 5.2e-04 4.0e-04 6.6e-05 3.4e-05
-    {"qe_lih223", 10.0, 0, {6e-04, 3e-02, 2e+00, 3e+00}},   // measured 1.8e-04 6.7e-03 3.7e-01 6.9e-01
-    {"qe_lih223", 10.0, 1, {9e-04, 6e-03, 2e-02, 3e-02}},   // measured 3.0e-04 2.0e-03 5.1e-03 7.1e-03
-    {"qe_lih223", 20.0, 0, {2e-03, 5e-01, 3e+00, 4e+00}},   // measured 4.8e-04 1.4e-01 7.3e-01 1.2e+00
-    {"qe_lih223", 20.0, 1, {2e-03, 2e-01, 4e-01, 3e-01}},   // measured 6.1e-04 3.6e-02 1.1e-01 8.7e-02
-    {"qe_si211", 5.0, 0, {6e-04, 1e-03, 5e-03, 4e-02}},   // measured 1.8e-04 3.3e-04 1.4e-03 1.1e-02
-    {"qe_si211", 5.0, 1, {6e-04, 1e-03, 2e-03, 8e-03}},   // measured 1.8e-04 3.2e-04 5.7e-04 2.5e-03
-    {"qe_si211", 10.0, 0, {5e-03, 4e-03, 6e-02, 3e-01}},   // measured 1.6e-03 1.2e-03 1.9e-02 7.4e-02
-    {"qe_si211", 10.0, 1, {6e-03, 3e-03, 8e-03, 2e-02}},   // measured 1.8e-03 9.1e-04 2.4e-03 6.5e-03
-    {"qe_si211", 20.0, 0, {3e-03, 5e-03, 4e+00, 3e+00}},   // measured 9.7e-04 1.4e-03 1.1e+00 6.7e-01
-    {"qe_si211", 20.0, 1, {5e-03, 2e-03, 6e-01, 2e-01}},   // measured 1.6e-03 6.3e-04 1.8e-01 5.8e-02
+    {"qe_lih222", 5.0, 0, {2e-02, 3e-03, 6e-04, 4e-02}},   // measured max(Mac, rusty) 6.4e-03 8.6e-04 1.9e-04 1.1e-02
+    {"qe_lih222", 5.0, 1, {3e-02, 3e-03, 6e-04, 2e-03}},   // measured max(Mac, rusty) 7.8e-03 1.0e-03 1.9e-04 4.1e-04
+    {"qe_lih222", 10.0, 0, {3e-02, 2e-03, 7e-02, 2e-01}},   // measured max(Mac, rusty) 9.2e-03 4.7e-04 2.2e-02 6.3e-02
+    {"qe_lih222", 10.0, 1, {4e-02, 2e-03, 8e-04, 8e-04}},   // measured max(Mac, rusty) 1.1e-02 5.7e-04 2.4e-04 2.4e-04
+    {"qe_lih222", 20.0, 0, {7e-04, 2e-04, 2e+00, 4e+00}},   // measured max(Mac, rusty) 2.2e-04 4.9e-05 4.5e-01 1.1e+00
+    {"qe_lih222", 20.0, 1, {7e-04, 2e-04, 8e-02, 2e-01}},   // measured max(Mac, rusty) 2.2e-04 4.8e-05 2.5e-02 4.4e-02
+    {"qe_lih223", 5.0, 0, {2e-03, 2e-03, 3e-01, 5e-01}},   // measured max(Mac, rusty) 4.4e-04 4.2e-04 7.0e-02 1.6e-01
+    {"qe_lih223", 5.0, 1, {2e-03, 2e-03, 5e-04, 2e-04}},   // measured max(Mac, rusty) 5.2e-04 4.0e-04 1.5e-04 3.6e-05
+    {"qe_lih223", 10.0, 0, {6e-04, 3e-02, 2e+00, 3e+00}},   // measured max(Mac, rusty) 1.8e-04 6.7e-03 3.7e-01 6.9e-01
+    {"qe_lih223", 10.0, 1, {9e-04, 6e-03, 2e-02, 3e-02}},   // measured max(Mac, rusty) 3.0e-04 2.0e-03 5.1e-03 7.1e-03
+    {"qe_lih223", 20.0, 0, {2e-03, 5e-01, 3e+00, 4e+00}},   // measured max(Mac, rusty) 6.5e-04 1.4e-01 7.3e-01 1.2e+00
+    {"qe_lih223", 20.0, 1, {3e-03, 2e-01, 4e-01, 4e-01}},   // measured max(Mac, rusty) 8.9e-04 3.6e-02 1.1e-01 1.0e-01
+    {"qe_si211", 5.0, 0, {6e-04, 1e-03, 5e-03, 4e-02}},   // measured max(Mac, rusty) 1.8e-04 3.3e-04 1.4e-03 1.1e-02
+    {"qe_si211", 5.0, 1, {6e-04, 1e-03, 2e-03, 8e-03}},   // measured max(Mac, rusty) 1.8e-04 3.2e-04 5.7e-04 2.5e-03
+    {"qe_si211", 10.0, 0, {6e-03, 4e-03, 2e-01, 3e-01}},   // measured max(Mac, rusty) 1.7e-03 1.2e-03 4.3e-02 7.4e-02
+    {"qe_si211", 10.0, 1, {6e-03, 3e-03, 2e-02, 2e-02}},   // measured max(Mac, rusty) 1.8e-03 9.1e-04 4.8e-03 6.5e-03
+    {"qe_si211", 20.0, 0, {5e-03, 5e-03, 4e+00, 3e+00}},   // measured max(Mac, rusty) 1.4e-03 1.5e-03 1.1e+00 7.2e-01
+    {"qe_si211", 20.0, 1, {6e-03, 2e-03, 6e-01, 3e-01}},   // measured max(Mac, rusty) 1.8e-03 6.6e-04 1.8e-01 9.1e-02
 };
 
 void report_optics(std::string const &fixture, std::map<double, optics_stats_t> const &S) {

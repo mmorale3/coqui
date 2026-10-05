@@ -1500,6 +1500,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       L.theta_deg = th_deg;
       L.q_weights = hextra.c;
       L.qpts      = nda::array<double, 2>(mf.Qpts_ibz());
+      L.lattv     = nda::array<double, 2>(mf.lattv());
       L.qminus    = qminus_list(mf);
       L.qfac.resize(nq);
       for (long q = 0; q < nq; ++q) L.qfac[q] = hbasis.fac(q);
