@@ -447,10 +447,11 @@ inline std::vector<optics_q_t> optics_line(boost::mpi3::communicator &comm, opti
   for (long q = 0; q < nq; ++q)
     if (L.q_weights(q) != 0.0) h0 += L.q_weights(q) * L.h_nodes(q, nda::range::all);
   std::vector<optics_q_t> out(jobs.size());
+  // 1. every rank computes its own jobs (j mod np), 2. the owners broadcast (computing inside the broadcast loop would
+  //    serialize the jobs: si444 S9b runs, 67 curves in 150-720 s instead of the max per-curve time)
   for (size_t j = 0; j < jobs.size(); ++j) {
-    const int owner = int(j % comm.size());
-    std::vector<double> buf;
-    if (comm.rank() == owner) {
+    if (comm.rank() != int(j % comm.size())) continue;
+    {
       const long q = jobs[j];
       if (q == -1) out[j] = optics_one(-1, L.zeta, L.nu, h0, th, p);
       else if (q <= -2) {
@@ -464,8 +465,12 @@ inline std::vector<optics_q_t> optics_line(boost::mpi3::communicator &comm, opti
         nda::array<ComplexType, 1> hq(L.h_nodes(q, nda::range::all)), hm(L.h_nodes(L.qminus[q], nda::range::all));
         out[j] = optics_one(q, L.zeta, L.nu, hq, th, p, &hm);
       }
-      buf = out[j].pack();
     }
+  }
+  for (size_t j = 0; j < jobs.size(); ++j) {
+    const int owner = int(j % comm.size());
+    std::vector<double> buf;
+    if (comm.rank() == owner) buf = out[j].pack();
     long n = long(buf.size());
     comm.broadcast_n(&n, 1, owner);
     buf.resize(n);

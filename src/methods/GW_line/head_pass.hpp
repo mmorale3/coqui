@@ -108,7 +108,18 @@ inline head_pass_grid_t head_pass_grid(pole_data_t const &poles, head_pass_param
   g.theta_t = 0.5 * g.theta;
   g.kind    = p.time_grid;
   auto t0   = std::chrono::steady_clock::now();
-  g.bos.emplace(g.theta, p.lam_b, p.eps, p.bos_gap, -1.0, -1.0, p.nline_eff(), p.npole_eff());
+  // the pivoted-QR selection (5 deg: 6000 x 2400, ~350 s) on the root only, poles and nodes broadcast (the other ranks
+  // construct a trivial basis and take the root's members; the kernels use theta, lam, eps, gap, rank, nu, zeta_nodes)
+  if (comm.rank() == 0 or comm.size() == 1) g.bos.emplace(g.theta, p.lam_b, p.eps, p.bos_gap, -1.0, -1.0, p.nline_eff(), p.npole_eff());
+  else g.bos.emplace(g.theta, p.lam_b, p.eps, p.bos_gap, -1.0, -1.0, 4L, 4L);
+  if (comm.size() > 1) {
+    long r = g.bos->rank;
+    comm.broadcast_n(&r, 1, 0);
+    g.bos->rank = r;
+    detail::bcast_nda(comm, g.bos->nu, 0);
+    detail::bcast_nda(comm, g.bos->zeta_nodes, 0);
+    detail::bcast_nda(comm, g.bos->zeta_dense, 0);
+  }
   g.t_basis = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   t0        = std::chrono::steady_clock::now();
   auto pr   = pole_ranges_t::from(poles);
