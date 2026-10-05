@@ -700,6 +700,113 @@ void gygi_test() {
 
 TEST_CASE("gw_line_scf_gygi", "[gw_line][scf][gygi]") { gygi_test(); }
 
+namespace {
+ptree arr_child(std::vector<double> const &v) {
+  ptree a;
+  for (double x : v) {
+    ptree c;
+    c.put("", x);
+    a.push_back({"", c});
+  }
+  return a;
+}
+/// S9b: optics in the driver: after the loop (head of the last iteration), from a restart with nothing to iterate (head group of
+/// the checkpoint), from a checkpoint WITHOUT head groups (recomputed from the final poles, = the head of one more iteration),
+/// the flatter-line pass; the h5 layout
+void optics_driver_test() {
+  lih_t L;
+  auto &comm = L.mpi->comm;
+  auto &mf   = *L.mf;
+  const std::string fa = "gw_line_opA", fc = "gw_line_opC", fd = "gw_line_opD";
+  auto par = [&](std::string const &f, long n, bool rs, bool optics) {
+    auto pt = scf_params(f, n, rs, "id", "lehmann");
+    pt.put("lam_b", -1.0);
+    pt.put("div_treatment", "gygi");
+    pt.put("eps", 1e-10);
+    if (optics) {
+      pt.put("optics.enable", true);
+      pt.put("optics.wmin", 0.0);
+      pt.put("optics.wmax", 1.0);
+      pt.put("optics.nw", 201);
+      pt.add_child("optics.eta", arr_child({0.01}));
+      pt.add_child("optics.eta_rel", arr_child({0.05}));
+      pt.put("optics.theta_deg", 10.0);
+    }
+    return pt;
+  };
+  auto A = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, mf, par(fa, 2, false, true));
+  REQUIRE(A.optics_theta.size() == 2);
+  REQUIRE(A.optics_q0.size() == 2);
+  if (comm.root()) {
+    std::filesystem::copy_file(fa + ".gw_line.h5", fc + ".gw_line.h5", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(fa + ".gw_line.h5", fd + ".gw_line.h5", std::filesystem::copy_options::overwrite_existing);
+    h5::file f(fc + ".gw_line.h5", 'a');
+    h5::group g(f);
+    for (long it = 1; it <= 2; ++it) g.open_group("scf_line/iter" + std::to_string(it)).unlink("head");
+    g.unlink("optics");
+  }
+  comm.barrier();
+  // B: restart with nothing to iterate (head group of the checkpoint) -> identical optics
+  auto B = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, mf, par(fa, 2, true, true));
+  REQUIRE(B.history.size() == 2);
+  REQUIRE(B.optics_q0.size() == 2);
+  double dAB = 0.0;
+  for (long l = 0; l < 2; ++l)
+    for (size_t k = 0; k < A.optics_q0[l].val.size(); ++k)
+      dAB = std::max(dAB, double(nda::max_element(nda::abs(A.optics_q0[l].val[k] - B.optics_q0[l].val[k]))));
+  // C: no head groups -> recomputed; D: one more iteration (its head = the same final poles of iteration 2)
+  auto C = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, mf, par(fc, 2, true, true));
+  auto D = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, mf, par(fd, 3, true, false));
+  REQUIRE(C.optics_q0.size() == 2);
+  double dCD = 0.0, sCD = 0.0;
+  if (comm.root()) {
+    nda::array<ComplexType, 2> hc, hd;
+    h5::file f1(fc + ".gw_line.h5", 'r'), f2(fd + ".gw_line.h5", 'r');
+    h5::group g1(f1), g2(f2);
+    nda::h5_read(g1, "optics/theta20.0/h_nodes", hc);
+    nda::h5_read(g2, "scf_line/iter3/head/h_nodes", hd);
+    REQUIRE(hc.shape() == hd.shape());
+    dCD = nda::max_element(nda::abs(hc - hd));
+    sCD = nda::max_element(nda::abs(hd));
+    std::string src;
+    h5::h5_read(g1, "optics/theta20.0/source", src);
+    REQUIRE(src.find("recomputed") != std::string::npos);
+    // layout
+    for (std::string const &t : {"theta20.0", "theta10.0"}) {
+      auto tg = g1.open_group("optics/" + t);
+      REQUIRE(tg.has_subgroup("q0"));
+      long nfin = 0;
+      for (long q = 0; q < mf.nqpts(); ++q) nfin += tg.has_subgroup("iq" + std::to_string(q));
+      REQUIRE(nfin == mf.nqpts() - 1);
+      auto q0 = tg.open_group("q0");
+      nda::array<double, 2> e2, e2e, lo;
+      nda::h5_read(q0, "eps2", e2);
+      nda::h5_read(q0, "eps2_err", e2e);
+      nda::h5_read(q0, "loss", lo);
+      REQUIRE(e2.extent(0) == 2);
+      REQUIRE(e2.extent(1) == 201);
+      REQUIRE(e2e.shape() == e2.shape());
+      REQUIRE(nda::min_element(lo) >= -1e-8 * nda::max_element(lo));
+      REQUIRE(nda::min_element(e2) >= -1e-8 * nda::max_element(e2));
+    }
+  }
+  comm.broadcast_n(&dCD, 1, 0);
+  comm.broadcast_n(&sCD, 1, 0);
+  auto const &o = A.optics_q0[0];
+  app_log(1, "[optics driver] ranks {}: q0 eps_inf {:.8f} (driver eps_inf it 2 {:.8f}), f-sum {:.5f} / {:.5f}, K {} / {}; restart (checkpoint "
+             "head) vs in-run optics {:.1e}; recomputed head vs iteration-3 head {:.1e} (rel); flat pass 10 deg eps_inf {:.8f}",
+          comm.size(), o.eps_inf_h, A.eps_inf.back(), o.fsum_h, o.fsum_m, o.K_h, o.K_m, dAB, dCD / sCD, A.optics_q0[1].eps_inf_h);
+  REQUIRE(dAB == 0.0);
+  REQUIRE(dCD <= 1e-10 * sCD);
+  REQUIRE(std::abs(o.eps_inf_h - A.eps_inf.back()) <= 1e-6 * A.eps_inf.back());
+  REQUIRE(std::abs(A.optics_q0[1].eps_inf_h - D.eps_inf.back()) <= 1e-6 * D.eps_inf.back());
+  for (auto const &f : {fa, fc, fd}) remove_file(comm, f + ".gw_line.h5");
+  for (auto const &f : {fa, fc, fd}) remove_file(comm, f + ".gw_line.sigma.h5");
+}
+} // namespace
+
+TEST_CASE("gw_line_scf_optics", "[gw_line][scf][optics]") { optics_driver_test(); }
+
 TEST_CASE("gw_line_scf_restart", "[gw_line][scf][restart]") {
   SECTION("time_grid id") { restart_test("id"); }
   SECTION("time_grid gl") { restart_test("gl"); }

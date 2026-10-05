@@ -149,6 +149,27 @@ inline nda::array<double, 1> odd_fit(nda::array<ComplexType, 1> const &zeta, nda
   return f;
 }
 
+/// diagnostic: the residual of the odd fit with COMPLEX residues (no reflection symmetry r(conj z) = conj r(z) imposed);
+/// fit_residual >> this means the data carry a non-real (non-Hermitian, e.g. time-reversal breaking) part, not noise
+inline double odd_fit_residual_complex(nda::array<ComplexType, 1> const &zeta, nda::array<ComplexType, 1> const &data,
+                                       nda::array<double, 1> const &nu) {
+  const long nz = zeta.size(), r = nu.size();
+  nda::array<ComplexType, 2> A(nz, r), b(nz, 1);
+  for (long i = 0; i < nz; ++i) {
+    for (long j = 0; j < r; ++j) A(i, j) = odd_k(zeta(i), nu(j));
+    b(i, 0) = data(i);
+  }
+  auto x = detail::lstsq(A, b);
+  double e = 0.0, s = 0.0;
+  for (long i = 0; i < nz; ++i) {
+    ComplexType v(0.0);
+    for (long j = 0; j < r; ++j) v += A(i, j) * x(j, 0);
+    e = std::max(e, std::abs(v - data(i)));
+    s = std::max(s, std::abs(data(i)));
+  }
+  return s > 0.0 ? e / s : e;
+}
+
 /// max |sum_j f_j K(zeta_i, nu_j) - d_i| / max |d_i|: the relative accuracy of the data as seen by the fit
 inline double fit_residual(nda::array<ComplexType, 1> const &zeta, nda::array<ComplexType, 1> const &data,
                            nda::array<double, 1> const &nu, nda::array<double, 1> const &f) {

@@ -66,6 +66,8 @@
 #include "methods/GW_line/spectra.hpp"
 #include "methods/GW_line/time_grids.hpp"
 #include "methods/GW_line/head.hpp"
+#include "methods/GW_line/head_pass.hpp"
+#include "methods/GW_line/optics.hpp"
 #include "methods/GW_line/k_dist.hpp"
 #include "methods/GW_line/driver.hpp"
 
@@ -171,6 +173,7 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   head_check_variant(p.head_extrapolation);
   utils::check(head_div_is_gygi(p.head_extrapolation), "gw_line: head_extrapolation must be a gygi variant (got \"{}\")",
                p.head_extrapolation);
+  p.optics = optics_params_t::from_ptree(pt);   // S9b
   utils::check(p.theta_deg > 0.0 and p.theta_deg < 90.0, "gw_line: theta_deg must be in (0, 90)");
   utils::check(p.eps > 0.0 and p.lam > 0.0, "gw_line: eps, lam must be > 0");
   utils::check(p.g_gap >= 0.0 and p.g_gap < p.lam, "gw_line: g_gap must be in [0, lam)");
@@ -259,6 +262,8 @@ void gw_line_params_t::log() const {
   } else {
     app_log(1, "    spectra: off");
   }
+  if (optics.enable) optics.log();
+  else app_log(1, "    optics: off");
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -571,6 +576,34 @@ void write_head(h5::group &it, head_out_t const &h) {
   h5::h5_write(hg, "extrapolation", h.extrapolation);
   h5::h5_write(hg, "div_treatment", h.div_treatment);
   h5::h5_write(hg, "hf_div_treatment", h.hf_div_treatment);
+}
+
+/// S9b: the head group of scf_line/iter<it>/ (root reads, broadcast); false if the checkpoint has none (pre-S9a)
+bool read_head_nodes(boost::mpi3::communicator &comm, std::string const &file, long it, nda::array<ComplexType, 2> &h,
+                     nda::array<ComplexType, 1> &zeta, nda::array<double, 1> &nu) {
+  long ok = 0;
+  if (comm.root()) {
+    utils::h5_quiesce();
+    h5::file f(file, 'r');
+    h5::group g(f);
+    if (g.has_subgroup("scf_line")) {
+      auto sg = g.open_group("scf_line");
+      const std::string nm = "iter" + std::to_string(it);
+      if (sg.has_subgroup(nm) and sg.open_group(nm).has_subgroup("head")) {
+        auto hg = sg.open_group(nm).open_group("head");
+        nda::h5_read(hg, "h_nodes", h);
+        nda::h5_read(hg, "zeta", zeta);
+        nda::h5_read(hg, "nu", nu);
+        ok = 1;
+      }
+    }
+  }
+  comm.broadcast_n(&ok, 1, 0);
+  if (ok == 0) return false;
+  bcast_array(comm, h);
+  bcast_array(comm, zeta);
+  bcast_array(comm, nu);
+  return true;
 }
 
 /// Sigma file of checkpoint_sigma = "last" (S7e): <output>.gw_line.sigma.h5, rewritten every iteration (tmp + rename)
@@ -1163,6 +1196,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   Timer.add("Sigma_head");
   nda::array<ComplexType, 4> Sp_new, Sh_new;
   bool converged = false;
+  head_out_t hout_last;   // S9b: the head of the last iteration of this run (optics)
+  bool have_hout = false;
   while (st.iter < prm.niter) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto ph0 = phase_snapshot(Timer);
@@ -1268,6 +1303,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
                  "residues vs nodes {:.1e}",
               hout.eps_inf, prm.head_extrapolation, sh, sh > 0.0 ? dh / sh : dh);
       res.eps_inf.push_back(hout.eps_inf);
+      hout_last = hout;
+      have_hout = true;
       res.head_hp0 = hout.h0_res;
       res.head_hh0 = hout.h0_res_hole;
     }
@@ -1448,15 +1485,115 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     app_log(1, "  spectra: no Sigma in the state (no iteration done), skipped");
   }
 
+  // ---------------------------------------------------------------------------------------------- optics (S9b)
+  if (prm.optics.enable) {
+    Timer.add("optics");
+    Timer.add("optics_pass");
+    Timer.start("optics");
+    Pi = arr4_t{};   // the SCF's W-stage buffers are not needed any more
+    w  = arr4_t{};
+    Wn = arr4_t{};
+    w_h = memory::array<HOST_MEMORY, ComplexType, 4>{};
+    auto const &op = prm.optics;
+    auto make_line = [&](double th_deg) {
+      optics_line_t L;
+      L.theta_deg = th_deg;
+      L.q_weights = hextra.c;
+      L.qpts      = nda::array<double, 2>(mf.Qpts_ibz());
+      L.qminus    = qminus_list(mf);
+      L.qfac.resize(nq);
+      for (long q = 0; q < nq; ++q) L.qfac[q] = hbasis.fac(q);
+      return L;
+    };
+    auto pass_params = [&](double th_deg, bool flat) {
+      head_pass_params_t hp;
+      hp.theta_deg = th_deg;
+      hp.lam_b     = prm.lam_b;
+      hp.eps       = prm.eps;
+      hp.bos_gap   = bos->gap;
+      hp.time_grid = flat ? op.time_grid : prm.time_grid;
+      hp.time_eps  = prm.time_eps;
+      hp.time_pad  = prm.time_pad;
+      hp.time_oversample = prm.time_oversample;
+      hp.ray_decades = prm.ray_decades;
+      hp.t_chunk   = prm.t_chunk;
+      hp.mem_gb    = op.mem_gb;
+      if (flat) {
+        hp.nline = op.nline;
+        hp.npole = op.npole;
+      } else {   // the SCF basis (bosonic_basis_t defaults)
+        hp.nline = 1200;
+        hp.npole = 800;
+      }
+      return hp;
+    };
+    auto run_pass = [&](optics_line_t &L, bool flat) {
+      Timer.start("optics_pass");
+      auto hpo = head_pass<MEM>(thc, mf, mpi, grid, prop, st.poles, hbasis, pass_params(L.theta_deg, flat));
+      Timer.stop("optics_pass");
+      L.zeta      = hpo.zeta;
+      L.nu        = hpo.nu;
+      L.h_nodes   = std::move(hpo.h_nodes);
+      L.pass_time = hpo.t_total;
+      L.nt_p      = hpo.nt_p;
+      L.nt_h      = hpo.nt_h;
+      L.time_grid = hpo.time_grid;
+      app_log(1, "  optics: head pass at {} deg from the final poles: bosonic rank {} ({} nodes), Pi time nodes {} + {} ({}), {} q "
+                 "group(s), {:.1f} s (Z {:.1f}, Pi {:.1f}, W {:.1f})",
+              L.theta_deg, hpo.rank, hpo.nz, hpo.nt_p, hpo.nt_h, hpo.time_grid, hpo.ngroups, hpo.t_total, hpo.t_Z, hpo.t_Pi, hpo.t_W);
+    };
+    std::vector<optics_line_t> lines;
+    {   // the SCF angle
+      auto L = make_line(prm.theta_deg);
+      L.time_grid = prm.time_grid;
+      if (have_hout) {
+        L.source  = "head of the last iteration of this run (iteration " + std::to_string(st.iter) + ")";
+        L.zeta    = hout_last.zeta;
+        L.nu      = hout_last.nu;
+        L.h_nodes = hout_last.h_nodes;
+      } else if (read_head_nodes(comm, chk, st.iter, L.h_nodes, L.zeta, L.nu)) {
+        L.source = "checkpoint scf_line/iter" + std::to_string(st.iter) + "/head";
+      } else {
+        L.source = "recomputed from the final poles (checkpoint without a head group)";
+        run_pass(L, false);
+      }
+      lines.push_back(std::move(L));
+    }
+    for (double th : op.theta_deg) {
+      auto L   = make_line(th);
+      L.source = "flatter-line pass from the final poles";
+      run_pass(L, true);
+      lines.push_back(std::move(L));
+    }
+    const double wp2 = wp2_valence(nelec, mf.volume());
+    for (auto const &L : lines) {
+      const auto t0 = std::chrono::steady_clock::now();
+      auto R        = optics_line(comm, L, op);
+      char tag[32];
+      std::snprintf(tag, sizeof(tag), "theta%.1f", L.theta_deg);
+      write_optics(comm, chk, tag, L, R, op, nelec, mf.volume(),
+                   "div_treatment " + prm.div_treatment + ", head extrapolation " + prm.head_extrapolation + ".");
+      log_optics(L, R, wp2);
+      app_log(1, "  optics {} deg ({}): {} curves x {} broadenings x {} omega in {:.1f} s -> {}:/optics/{}", L.theta_deg, L.source,
+              R.size(), op.nbroad(), op.nw, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), chk, tag);
+      res.optics_theta.push_back(L.theta_deg);
+      for (auto const &o : R)
+        if (o.iq < 0) res.optics_q0.push_back(o);
+    }
+    Timer.stop("optics");
+  }
+
   Timer.stop("total");
   app_log(1, "\n  gw_line timers (s, all iterations of this run):");
   for (auto nm : {"total", "H0", "bases", "time_grid", "phase_Pi", "phase_W", "phase_Sigma", "phase_closure", "phase_F",
                   "checkpoint", "spectra"})
     app_log(1, "    {:<20s} {:10.3f}", nm, Timer.elapsed(nm));
+  if (prm.optics.enable)
+    app_log(1, "    {:<20s} {:10.3f} (of which head passes {:.3f})", "optics", Timer.elapsed("optics"), Timer.elapsed("optics_pass"));
   app_log(1, "  kernel sub-timers:");
   for (auto const &nm : Timer.timer_names()) {
     if (nm == "total" or nm == "H0" or nm == "bases" or nm == "time_grid" or nm == "checkpoint" or nm == "spectra" or
-        nm.rfind("phase_", 0) == 0)
+        nm.rfind("phase_", 0) == 0 or nm.rfind("optics", 0) == 0)
       continue;
     app_log(1, "    {:<20s} {:10.3f}", nm, Timer.elapsed(nm));
   }

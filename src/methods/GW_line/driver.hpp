@@ -103,6 +103,15 @@
  *   head_extrapolation = "gygi"   q -> 0 variant of the head data (checkpoint, eps_inf) when div_treatment = "ignore_g0";
  *                       with a gygi div_treatment the head uses div_treatment itself
  *   spectra = { enable = true, eta = [0.004, 0.01], wmin = -0.45, wmax = 0.45, nw = 601 }   A(k,w) at the end
+ *   optics = { enable, wmin = 0, wmax = 1.5, nw = 1501, eta = [0.01], eta_rel = [0.05], scales = "auto" | [..], nscales = 4,
+ *              K = "auto" | int, q0 = true, finite_q = true, theta_deg = <flatter final line(s), deg>, time_grid = "id",
+ *              nline, npole, mem_gb = 2, nnls_n = 1500 }
+ *                       S9b real-axis optics (optics.hpp, head_pass.hpp) after the loop (also from a restart with nothing
+ *                       left to iterate): loss, eps1, eps2, n, kappa, alpha, R, sigma for q -> 0 and every mesh q != Gamma
+ *                       from the head at the SCF angle (the last iteration of this run, else the checkpoint's last head
+ *                       group, else recomputed from the final poles: head_pass) and, for every theta_deg, from ONE extra
+ *                       Pi -> W -> head pass on a flatter bosonic line (own basis, time rays at theta_deg / 2).
+ *                       h5 group optics/theta<deg>/{q0 = q -> 0, iq<n> = mesh q n} of the checkpoint (layout: optics.hpp write_optics).
  *
  * Initial guess (as si222c_scgw_line.py): KS poles e_n(k) - mu0 with unit residues in the KS band basis, mu0 = KS
  * mid-gap (python uses CoQui's Matsubara mu; the gap midpoint is used here, no imaginary-axis checkpoint needed), and
@@ -136,6 +145,7 @@
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/GW_line/line_state.hpp"
 #include "methods/GW_line/spectra.hpp"
+#include "methods/GW_line/optics.hpp"
 
 namespace methods::gw_line {
 
@@ -184,6 +194,7 @@ struct gw_line_params_t {
   std::string div_treatment = "ignore_g0";      ///< S9a: Sigma_c head term ("ignore_g0" | gygi variants, head.hpp)
   std::string hf_div_treatment = "ignore_g0";   ///< S9a: exchange Madelung term ("ignore_g0" | "gygi")
   std::string head_extrapolation = "gygi";      ///< S9a: q -> 0 variant of the head data when div_treatment = "ignore_g0"
+  optics_params_t optics;                       ///< S9b: real-axis optics after the loop (optics.hpp)
 
   static gw_line_params_t from_ptree(ptree const &pt);
   void log() const;
@@ -218,6 +229,8 @@ struct gw_line_result_t {
   std::optional<spectra_out_t> spectra;
   std::vector<double> eps_inf;           ///< S9a: 1 / (1 + Re h0(0)) of the iterations done in this run
   nda::array<ComplexType, 1> head_hp0, head_hh0;   ///< S9a: extrapolated head residues of the last iteration of this run
+  std::vector<double> optics_theta;                ///< S9b: angles of the optics lines (SCF angle first)
+  std::vector<optics_q_t> optics_q0;               ///< S9b: q -> 0 optics per line (same order)
 };
 
 /// Non-interacting one-body Hamiltonian (no xc) in the KS band basis, (nk, nb, nb), hermitized; collective.
