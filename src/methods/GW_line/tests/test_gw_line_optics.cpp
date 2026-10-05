@@ -28,7 +28,7 @@
  *   h(q, zeta_i) vs the exact head, for one (pair-closed) group of q per fixture (memory: N_zeta ~ 1200 at 5 deg);
  *   head_pass (all q, its own q groups) vs the explicit chain. Gates: <= 1e-9 (relative to max) at every angle that passes;
  *   the bosonic rank, node and time-node counts and the kernel times are printed.
- * [V6][optics] see run_optics below.
+ * [V6][optics] see run_optics below (20 / 10 deg; [.optics5]: 5 deg); gates in optics_gates.
  */
 
 #undef NDEBUG
@@ -469,6 +469,40 @@ double med(std::vector<double> v) {
 }
 double vmax(std::vector<double> const &v) { return v.empty() ? 0.0 : *std::max_element(v.begin(), v.end()); }
 
+/**
+ * Gates of [V6][optics] (MB): max over the finite q and q0 and over loss / eps1 / eps2 of the window errors, per fixture, angle,
+ * broadening (0: eta = 0.01 Ha, 1: eta = 0.05 omega) and window (0-5 / 5-10 / 10-20 / 20-40 eV) = 3 x the Mac measurement
+ * (2026-10-05, 1 rank, Accelerate; rounded up), floor 1e-4. Error-bar coverage (stored |MB - NNLS| >= true MB error per
+ * window) >= 0.4 (measured 0.54-0.92); eps_inf(q) <= 1e-9 (LiH; si211 1e-6: its head is not exactly odd, the PH asymmetry of
+ * the fixture, r_apex 2.7e-5), f-sum <= 1e-7 (LiH; si211 2e-3).
+ */
+struct optics_gate_t {
+  std::string fixture;
+  double theta;
+  int eta;
+  std::array<double, 4> g;
+};
+const std::vector<optics_gate_t> optics_gates = {
+    {"qe_lih222", 5.0, 0, {1e-02, 3e-03, 6e-04, 4e-02}},   // measured 3.3e-03 8.6e-04 1.7e-04 1.1e-02
+    {"qe_lih222", 5.0, 1, {2e-02, 3e-03, 4e-04, 4e-04}},   // measured 4.0e-03 1.0e-03 1.3e-04 1.3e-04
+    {"qe_lih222", 10.0, 0, {2e-03, 9e-04, 6e-02, 2e-01}},   // measured 4.0e-04 2.7e-04 2.0e-02 6.3e-02
+    {"qe_lih222", 10.0, 1, {2e-03, 8e-04, 8e-04, 8e-04}},   // measured 4.1e-04 2.5e-04 2.4e-04 2.4e-04
+    {"qe_lih222", 20.0, 0, {7e-04, 2e-04, 2e+00, 4e+00}},   // measured 2.2e-04 4.7e-05 4.2e-01 1.1e+00
+    {"qe_lih222", 20.0, 1, {7e-04, 2e-04, 8e-02, 2e-01}},   // measured 2.2e-04 4.8e-05 2.5e-02 4.4e-02
+    {"qe_lih223", 5.0, 0, {2e-03, 2e-03, 3e-01, 5e-01}},   // measured 4.4e-04 4.2e-04 7.0e-02 1.6e-01
+    {"qe_lih223", 5.0, 1, {2e-03, 2e-03, 2e-04, 2e-04}},   // measured 5.2e-04 4.0e-04 6.6e-05 3.4e-05
+    {"qe_lih223", 10.0, 0, {6e-04, 3e-02, 2e+00, 3e+00}},   // measured 1.8e-04 6.7e-03 3.7e-01 6.9e-01
+    {"qe_lih223", 10.0, 1, {9e-04, 6e-03, 2e-02, 3e-02}},   // measured 3.0e-04 2.0e-03 5.1e-03 7.1e-03
+    {"qe_lih223", 20.0, 0, {2e-03, 5e-01, 3e+00, 4e+00}},   // measured 4.8e-04 1.4e-01 7.3e-01 1.2e+00
+    {"qe_lih223", 20.0, 1, {2e-03, 2e-01, 4e-01, 3e-01}},   // measured 6.1e-04 3.6e-02 1.1e-01 8.7e-02
+    {"qe_si211", 5.0, 0, {6e-04, 1e-03, 5e-03, 4e-02}},   // measured 1.8e-04 3.3e-04 1.4e-03 1.1e-02
+    {"qe_si211", 5.0, 1, {6e-04, 1e-03, 2e-03, 8e-03}},   // measured 1.8e-04 3.2e-04 5.7e-04 2.5e-03
+    {"qe_si211", 10.0, 0, {5e-03, 4e-03, 6e-02, 3e-01}},   // measured 1.6e-03 1.2e-03 1.9e-02 7.4e-02
+    {"qe_si211", 10.0, 1, {6e-03, 3e-03, 8e-03, 2e-02}},   // measured 1.8e-03 9.1e-04 2.4e-03 6.5e-03
+    {"qe_si211", 20.0, 0, {3e-03, 5e-03, 4e+00, 3e+00}},   // measured 9.7e-04 1.4e-03 1.1e+00 6.7e-01
+    {"qe_si211", 20.0, 1, {5e-03, 2e-03, 6e-01, 2e-01}},   // measured 1.6e-03 6.3e-04 1.8e-01 5.8e-02
+};
+
 void report_optics(std::string const &fixture, std::map<double, optics_stats_t> const &S) {
   const char *qn[3] = {"loss", "eps1", "eps2"}, *bn[2] = {"eta 0.01", "eta 0.05w"}, *mn[2] = {"MB", "NNLS"};
   for (auto const &[th, st] : S) {
@@ -486,23 +520,36 @@ void report_optics(std::string const &fixture, std::map<double, optics_stats_t> 
                "exact max {:.1e}, f-sum max {:.1e}",
             fixture, th, st.n_cov_ok, st.n_cov, double(st.n_cov_ok) / st.n_cov, double(st.n_cov_3) / st.n_cov, vmax(st.d_einf),
             vmax(st.d_fsum));
+    // gates
+    for (auto const &gt : optics_gates) {
+      if (gt.fixture != fixture or gt.theta != th) continue;
+      std::string s;
+      for (int win = 0; win < 4; ++win) {
+        double m = 0.0;
+        for (int qq = 0; qq < 3; ++qq) m = std::max(m, vmax(st.e[0][qq][gt.eta][win]));
+        s += std::format(" {:.1e} <= {:.0e}", m, gt.g[win]);
+        INFO(fixture << " " << th << " deg eta " << gt.eta << " window " << win << ": " << m << " gate " << gt.g[win]);
+        CHECK(m <= gt.g[win]);
+      }
+      app_log(2, "  [V6][optics] gate {} {:4.1f} deg {}: MB max error per window (measured <= gate):{}", fixture, th,
+              gt.eta == 0 ? "eta 0.01 " : "eta 0.05w", s);
+    }
+    const bool si = fixture == "qe_si211";
+    CHECK(double(st.n_cov_ok) / st.n_cov >= 0.4);
+    CHECK(vmax(st.d_einf) <= (si ? 1e-6 : 1e-9));
+    CHECK(vmax(st.d_fsum) <= (si ? 2e-3 : 1e-7));
   }
 }
 
 } // namespace
 
-TEST_CASE("gw_line_optics_lih222", "[gw_line][V6][optics]") {
-  auto S = run_optics("qe_lih222", {20.0, 10.0, 5.0});
-  report_optics("qe_lih222", S);
-}
-TEST_CASE("gw_line_optics_si211", "[gw_line][V6][optics]") {
-  auto S = run_optics("qe_si211", {20.0, 10.0, 5.0});
-  report_optics("qe_si211", S);
-}
-TEST_CASE("gw_line_optics_lih223", "[gw_line][V6][optics]") {
-  auto S = run_optics("qe_lih223", {20.0, 10.0, 5.0});
-  report_optics("qe_lih223", S);
-}
+// regular: 20 and 10 deg (~5 min on the Mac, 1 rank); [.optics5]: 5 deg (~12 min: the head passes of all q at 5 deg)
+TEST_CASE("gw_line_optics_lih222", "[gw_line][V6][optics]") { report_optics("qe_lih222", run_optics("qe_lih222", {20.0, 10.0})); }
+TEST_CASE("gw_line_optics_si211", "[gw_line][V6][optics]") { report_optics("qe_si211", run_optics("qe_si211", {20.0, 10.0})); }
+TEST_CASE("gw_line_optics_lih223", "[gw_line][V6][optics]") { report_optics("qe_lih223", run_optics("qe_lih223", {20.0, 10.0})); }
+TEST_CASE("gw_line_optics5_lih222", "[.optics5]") { report_optics("qe_lih222", run_optics("qe_lih222", {5.0})); }
+TEST_CASE("gw_line_optics5_si211", "[.optics5]") { report_optics("qe_si211", run_optics("qe_si211", {5.0})); }
+TEST_CASE("gw_line_optics5_lih223", "[.optics5]") { report_optics("qe_lih223", run_optics("qe_lih223", {5.0})); }
 
 /// [.flat_scan] diagnostic: Pi error vs the time-grid knobs on flat lines (lih222, one q group)
 TEST_CASE("gw_line_flat_scan", "[.flat_scan]") {

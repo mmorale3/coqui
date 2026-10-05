@@ -1503,6 +1503,12 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       L.qminus    = qminus_list(mf);
       L.qfac.resize(nq);
       for (long q = 0; q < nq; ++q) L.qfac[q] = hbasis.fac(q);
+      for (auto const &v : op.q0_variants) {   // sensitivity of q0 to the extrapolation variant
+        if (v == prm.head_extrapolation) continue;
+        head_extrapolation_t hv(mf, v);
+        L.variant_names.push_back(v);
+        L.variant_weights.push_back(hv.c);
+      }
       return L;
     };
     auto pass_params = [&](double th_deg, bool flat) {
@@ -1578,7 +1584,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
               R.size(), op.nbroad(), op.nw, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), chk, tag);
       res.optics_theta.push_back(L.theta_deg);
       for (auto const &o : R)
-        if (o.iq < 0) res.optics_q0.push_back(o);
+        if (o.iq == -1) res.optics_q0.push_back(o);
     }
     Timer.stop("optics");
   }

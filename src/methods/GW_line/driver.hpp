@@ -105,13 +105,13 @@
  *   spectra = { enable = true, eta = [0.004, 0.01], wmin = -0.45, wmax = 0.45, nw = 601 }   A(k,w) at the end
  *   optics = { enable, wmin = 0, wmax = 1.5, nw = 1501, eta = [0.01], eta_rel = [0.05], scales = "auto" | [..], nscales = 4,
  *              K = "auto" | int, q0 = true, finite_q = true, theta_deg = <flatter final line(s), deg>, time_grid = "id",
- *              nline, npole, mem_gb = 2, nnls_n = 1500 }
+ *              nline, npole, mem_gb = 2, nnls_n = 1500, q0_variants = ["gygi_perdir", "gygi_smallest_q", "gygi_average"] }
  *                       S9b real-axis optics (optics.hpp, head_pass.hpp) after the loop (also from a restart with nothing
  *                       left to iterate): loss, eps1, eps2, n, kappa, alpha, R, sigma for q -> 0 and every mesh q != Gamma
  *                       from the head at the SCF angle (the last iteration of this run, else the checkpoint's last head
  *                       group, else recomputed from the final poles: head_pass) and, for every theta_deg, from ONE extra
  *                       Pi -> W -> head pass on a flatter bosonic line (own basis, time rays at theta_deg / 2).
- *                       h5 group optics/theta<deg>/{q0 = q -> 0, iq<n> = mesh q n} of the checkpoint (layout: optics.hpp write_optics).
+ *                       h5 group optics/theta<deg>/{q0 = q -> 0, q0_<variant>, iq<n> = mesh q n} of the checkpoint (layout: optics.hpp write_optics).
  *
  * Initial guess (as si222c_scgw_line.py): KS poles e_n(k) - mu0 with unit residues in the KS band basis, mu0 = KS
  * mid-gap (python uses CoQui's Matsubara mu; the gap midpoint is used here, no imaginary-axis checkpoint needed), and

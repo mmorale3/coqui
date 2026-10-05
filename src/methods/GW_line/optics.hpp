@@ -80,6 +80,8 @@ struct optics_params_t {
   long K = -1;                            ///< < 0: the K rule
   bool q0 = true, finite_q = true;
   std::vector<double> theta_deg;          ///< flatter final line(s) (deg, < the SCF angle); empty: none
+  /// other q -> 0 extrapolation variants evaluated for q0 as well (sensitivity; groups q0_<variant>)
+  std::vector<std::string> q0_variants = {"gygi_perdir", "gygi_smallest_q", "gygi_average"};
   long nnls_n = 1500;
   // head pass of the flatter line (head_pass_params_t)
   long nline = -1, npole = -1;
@@ -121,6 +123,7 @@ struct optics_params_t {
     p.q0        = io::get_value_with_default<bool>(pt, "optics.q0", p.q0);
     p.finite_q  = io::get_value_with_default<bool>(pt, "optics.finite_q", p.finite_q);
     p.theta_deg = opt_list(pt, "optics.theta_deg", {}, a);
+    p.q0_variants = io::get_array_with_default<std::string>(pt, "optics.q0_variants", p.q0_variants);
     p.nnls_n    = io::get_value_with_default<long>(pt, "optics.nnls_n", p.nnls_n);
     p.nline     = io::get_value_with_default<long>(pt, "optics.nline", p.nline);
     p.npole     = io::get_value_with_default<long>(pt, "optics.npole", p.npole);
@@ -200,7 +203,7 @@ inline response_fit_t close_response(nda::array<ComplexType, 1> const &zeta, nda
 
 /// all optics of one q (or q0), packed for the broadcast
 struct optics_q_t {
-  long iq = -1;   ///< -1: q -> 0
+  long iq = -1;   ///< -1: q -> 0; <= -2: q -> 0 with the extrapolation variant -2 - iq of optics_line_t
   long nb = 0, nw = 0;
   // (nbroad, nw) curves: primary (MB) and error bars (|MB - G|), and the consistency meters
   std::vector<std::string> qn = {"eps1", "eps2", "n", "kappa", "alpha", "R", "loss", "sigma1", "sigma2"};
@@ -408,22 +411,33 @@ struct optics_line_t {
   nda::array<double, 2> qpts;          ///< (nq, 3)
   std::vector<double> qfac;            ///< (nq) f(q) = Omega |q|^2 / 4 pi (0: Gamma)
   std::vector<long> qminus;
+  std::vector<std::string> variant_names;            ///< other q -> 0 variants (optics_params_t::q0_variants)
+  std::vector<nda::array<double, 1>> variant_weights;
   double pass_time = 0.0;              ///< cost of the head pass (0: from the checkpoint)
   long nt_p = 0, nt_h = 0;
 };
+
+/// h5 group / log label of a job: q0, q0_<variant>, iq<n>
+inline std::string optics_label(optics_line_t const &L, long iq) {
+  if (iq == -1) return "q0";
+  if (iq <= -2) return "q0_" + L.variant_names[-2 - iq];
+  return "iq" + std::to_string(iq);
+}
 
 /// valence plasma frequency squared 4 pi N / Omega (a.u.)
 inline double wp2_valence(double nelec, double volume) { return 4.0 * std::numbers::pi * nelec / volume; }
 
 /**
  * Optics of one line for q0 and the finite q (q distributed round-robin, owner broadcasts), root writes
- * <file>:/optics/<tag>/{q0 (the q -> 0 extrapolation), iq<n> (mesh q n)}. Collective.
+ * <file>:/optics/<tag>/{q0 (the q -> 0 extrapolation), q0_<variant> (other extrapolation variants), iq<n> (mesh q n)}. Collective.
  */
 inline std::vector<optics_q_t> optics_line(boost::mpi3::communicator &comm, optics_line_t const &L, optics_params_t const &p) {
   const long nq = L.h_nodes.extent(0), nz = L.zeta.size();
   const double th = L.theta_deg * std::numbers::pi / 180.0;
-  std::vector<long> jobs;   // -1 = q0
+  std::vector<long> jobs;   // -1 = q0, <= -2: q0 of the variant -2 - job
   if (p.q0) jobs.push_back(-1);
+  if (p.q0)
+    for (long v = 0; v < long(L.variant_names.size()); ++v) jobs.push_back(-2 - v);
   if (p.finite_q)
     for (long q = 0; q < nq; ++q)
       if (L.qfac[q] > 0.0) jobs.push_back(q);
@@ -437,8 +451,15 @@ inline std::vector<optics_q_t> optics_line(boost::mpi3::communicator &comm, opti
     std::vector<double> buf;
     if (comm.rank() == owner) {
       const long q = jobs[j];
-      if (q < 0) out[j] = optics_one(-1, L.zeta, L.nu, h0, th, p);
-      else {
+      if (q == -1) out[j] = optics_one(-1, L.zeta, L.nu, h0, th, p);
+      else if (q <= -2) {
+        auto const &c = L.variant_weights[-2 - q];
+        nda::array<ComplexType, 1> hv(nz);
+        hv() = ComplexType(0.0);
+        for (long qq = 0; qq < nq; ++qq)
+          if (c(qq) != 0.0) hv += c(qq) * L.h_nodes(qq, nda::range::all);
+        out[j] = optics_one(q, L.zeta, L.nu, hv, th, p);
+      } else {
         nda::array<ComplexType, 1> hq(L.h_nodes(q, nda::range::all)), hm(L.h_nodes(L.qminus[q], nda::range::all));
         out[j] = optics_one(q, L.zeta, L.nu, hq, th, p, &hm);
       }
@@ -508,7 +529,7 @@ inline void write_optics(boost::mpi3::communicator &comm, std::string const &fil
     nda::h5_write(tg, "q_weights", L.q_weights, false);
     nda::h5_write(tg, "qpts", L.qpts, false);
     for (auto const &o : R) {
-      auto qg = tg.create_group(o.iq < 0 ? std::string("q0") : "iq" + std::to_string(o.iq));
+      auto qg = tg.create_group(optics_label(L, o.iq));
       h5::h5_write(qg, "iq", o.iq);
       for (size_t k = 0; k < o.qn.size(); ++k) {
         nda::h5_write(qg, o.qn[k], o.val[k], false);
@@ -580,11 +601,11 @@ inline void write_optics(boost::mpi3::communicator &comm, std::string const &fil
 /// one log line per q (level 1 for q0, 2 for the finite q)
 inline void log_optics(optics_line_t const &L, std::vector<optics_q_t> const &R, double wp2) {
   for (auto const &o : R) {
-    app_log(o.iq < 0 ? 1 : 2,
+    app_log(o.iq == -1 ? 1 : 2,
             "  optics {} deg {}: eps_inf {:.6f} (m channel {:.6f}, NNLS {:.6f}/{:.6f}); f-sum h {:.5f} m {:.5f} (NNLS {:.5f}, MB "
             "{:.5f}; valence 4 pi n {:.5f}); delta h {:.1e} m {:.1e} (complex fit {:.1e}) -> K {}/{}; NNLS {}/{} poles (resid {:.1e}/{:.1e}); MB {}/{} "
             "poles (w(d<=0) {:.1e}/{:.1e}); |h(q)-h(-q)| {:.1e}; {:.2f} s",
-            L.theta_deg, o.iq < 0 ? std::string("q0") : "iq" + std::to_string(o.iq), o.eps_inf_h, o.eps_inf_m, o.eps_inf_Gh,
+            L.theta_deg, optics_label(L, o.iq), o.eps_inf_h, o.eps_inf_m, o.eps_inf_Gh,
             o.eps_inf_Gm, o.fsum_h, o.fsum_m, o.fsum_Gh, o.fsum_mbh, wp2, o.delta_h, o.delta_m, o.delta_c_h, o.K_h, o.K_m, o.nG_h, o.nG_m,
             o.G_resid_h, o.G_resid_m, o.nmb_h, o.nmb_m, o.wneg_h, o.wneg_m, o.h_asym, o.time);
   }
