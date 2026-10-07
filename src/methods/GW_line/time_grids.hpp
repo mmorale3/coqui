@@ -38,11 +38,20 @@
  * S7e: grid i (0..3) is built by ONE rank, i mod np, and broadcast from it (before: all four on every rank, then the
  * root's broadcast; the four constructions now run concurrently on four ranks, ~4x less wall time). All ranks hold
  * bitwise identical nodes and LS factors (the node COUNT enters the collective of self_energy).
+ *
+ * Shared grid (perf 7.1 (d), default; env COQUI_GWLINE_TGRID_SHARED = 0 restores the four grids): ONE particle ID grid on
+ * the union of the three |E| ranges, [min(Pi, Sigma^>, Sigma^<) lo, max(...) hi], serves Pi^> and Sigma^>, and its
+ * CONJUGATE (s identical, t -> conj t, E -> -E, LS factors conjugated) is the hole grid of Sigma^< (and of Pi^< when the
+ * explicit hole leg is used). The conjugate is what an independent hole construction on the same range gives (measured
+ * bitwise: s, t, F_h(z) = -conj F_p(-conj z), [.perf71_rel] (t)); with it the hole factor of Pi^> on the particle ray,
+ * conj G~^<(k, conj t), is the hole propagator at the Sigma^< nodes (the G~ of both kernels live on one node set).
  */
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <string>
 
@@ -126,6 +135,23 @@ inline void bcast_time_id(boost::mpi3::communicator &comm, numerics::line_dlr::t
   bcast_nda(comm, g.sv, root);
 }
 
+/// the hole grid as the conjugate of a particle grid (see the file header): exact, no construction
+inline numerics::line_dlr::time_id_t conjugate_grid(numerics::line_dlr::time_id_t const &p) {
+  numerics::line_dlr::time_id_t h = p;
+  h.sector = numerics::line_dlr::sector_t::hole;
+  h.phase  = std::conj(p.phase);
+  for (auto &x : h.t) x = std::conj(x);
+  for (auto &x : h.E) x = -x;
+  for (auto &x : h.Uc) x = std::conj(x);
+  for (auto &x : h.Vs) x = std::conj(x);
+  return h;
+}
+
+inline bool shared_time_grid() {
+  char const *v = std::getenv("COQUI_GWLINE_TGRID_SHARED");
+  return (v == nullptr or *v == '\0') ? true : std::strtol(v, nullptr, 10) != 0;
+}
+
 } // namespace detail
 
 /// The four ID grids of one iteration (Pi particle/hole, Sigma particle/hole).
@@ -134,6 +160,7 @@ struct line_time_grids_t {
   std::array<time_grid_info_t, 4> info;
   pole_ranges_t pr;
   double nu_min = 0.0, nu_max = 0.0;
+  bool shared = false;   ///< perf 7.1 (d): one particle grid on the union of the ranges, hole = its conjugate
 
   line_time_grids_t() = default;
 
@@ -167,6 +194,32 @@ struct line_time_grids_t {
     utils::check(pi_lo > 0.0 and sp_lo > 0.0 and sh_lo > 0.0,
                  "line_time_grids_t: summed-energy ranges must start above 0 (Pi {}, Sigma^> {}, Sigma^< {})", pi_lo, sp_lo,
                  sh_lo);
+
+    if (detail::shared_time_grid()) {   // perf 7.1 (d): one particle grid on the union, the hole grid its conjugate
+      shared               = true;
+      const double lo      = std::min({pi_lo, sp_lo, sh_lo}), hi = std::max({pi_hi, sp_hi, sh_hi});
+      std::array<double, 3> diag{};
+      if (comm.rank() == 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        pi_p          = time_id_t(theta_t, sector_t::particle, lo, hi, eps, opts);
+        double r1 = 0.0, r2 = 0.0, fmax = 0.0;
+        auto F1 = pi_p.transform_matrix(zeta_b, &r1);
+        auto F2 = pi_p.transform_matrix(zeta_f, &r2);
+        for (auto const &v : F1) fmax = std::max(fmax, std::abs(v));
+        for (auto const &v : F2) fmax = std::max(fmax, std::abs(v));
+        diag = {std::max(r1, r2), fmax, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()};
+      } else
+        pi_p.opts = opts;
+      detail::bcast_time_id(comm, pi_p, 0);
+      if (comm.size() > 1) comm.broadcast_n(diag.data(), 3, 0);
+      pi_h  = detail::conjugate_grid(pi_p);
+      sig_p = pi_p;
+      sig_h = pi_h;
+      char const *nms[4] = {"Pi^>", "Pi^<", "Sigma^>", "Sigma^<"};
+      for (int i = 0; i < 4; ++i)
+        info[i] = time_grid_info_t{std::string(nms[i]) + "*", lo, hi, pi_p.rank, pi_p.size(), diag[0], diag[1], i == 0 ? diag[2] : 0.0};
+      return;
+    }
 
     struct spec_t {
       char const *nm;
@@ -205,6 +258,13 @@ struct line_time_grids_t {
     app_log(level, "  time grids (ID, eps {:.1e}, pad {}, oversample {}): poles e^> [{:.4f}, {:.4f}], |e^<| [{:.4f}, {:.4f}], "
                    "nu [{:.4f}, {:.4f}] Ha",
             pi_p.eps, pi_p.opts.pad, pi_p.opts.oversample, pr.p_min, pr.p_max, pr.h_min, pr.h_max, nu_min, nu_max);
+    if (shared) {
+      auto const &g = info[0];
+      app_log(level, "    shared (Pi^>, Sigma^>; hole grid = conjugate: Pi^<, Sigma^<) |E| in [{:.4f}, {:.4f}] Ha: rank {:4d}, nodes "
+                     "{:4d}, LS residual {:.1e}, max|F| {:7.1f}, {:.2f} s",
+              g.Emin, g.Emax, g.rank, g.size, g.ls_residual, g.maxF, g.time);
+      return;
+    }
     for (auto const &g : info)
       app_log(level, "    {:<8s} |E| in [{:.4f}, {:.4f}] Ha: rank {:4d}, nodes {:4d}, LS residual {:.1e}, max|F| {:7.1f}, {:.2f} s",
               g.name, g.Emin, g.Emax, g.rank, g.size, g.ls_residual, g.maxF, g.time);

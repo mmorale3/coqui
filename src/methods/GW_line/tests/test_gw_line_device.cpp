@@ -249,9 +249,11 @@ void run_device_ab(std::string const &fixture) {
   // S7d: the other Hadamard variants (timers not recorded)
   using env_list_t = std::vector<std::pair<std::string, std::string>>;
   const std::vector<std::pair<std::string, env_list_t>> hvariants = {
-      {"fused 1q/launch", {{"COQUI_GWLINE_PI_QFOLD", "0"}, {"COQUI_GWLINE_SIGMA_KOUTER", "0"}}},
-      {"fused direct", {{"COQUI_GWLINE_FUSED_VARIANT", "1"}}},
-      {"cuTENSOR", {{"COQUI_GWLINE_FUSED", "0"}}}};
+      {"k-space fused", {{"COQUI_GWLINE_RSPACE", "0"}}},
+      {"k-space fused 1q/launch", {{"COQUI_GWLINE_RSPACE", "0"}, {"COQUI_GWLINE_PI_QFOLD", "0"}, {"COQUI_GWLINE_SIGMA_KOUTER", "0"}}},
+      {"k-space fused direct", {{"COQUI_GWLINE_RSPACE", "0"}, {"COQUI_GWLINE_FUSED_VARIANT", "1"}}},
+      {"k-space cuTENSOR", {{"COQUI_GWLINE_RSPACE", "0"}, {"COQUI_GWLINE_FUSED", "0"}}},
+      {"k-space explicit hole leg", {{"COQUI_GWLINE_RSPACE", "0"}, {"COQUI_GWLINE_PI_MIRROR", "0"}}}};
   for (auto const &[nm, kv] : hvariants) {
     scoped_env_t env(kv);
     utils::TimerManager Tv;
@@ -304,6 +306,16 @@ void run_device_ab(std::string const &fixture) {
     nda::array<ComplexType, 4> Wz_dh = memory::to_memory_space<HOST_MEMORY>(Wz_d);
     err["W(q,zeta_i) nodes [zsub 37, device]"] = rel_diff(comm, Wn_h, Wz_dh);
     err["W(q,zeta_i) nodes [zsub 37, host]"]   = rel_diff(comm, Wn_h, Wz_h);
+  }
+  {   // perf 7.1: the full-node W stage (Dyson at every node, pair pass), device vs host
+    scoped_env_t env({{"COQUI_GWLINE_W_MIRROR", "0"}});
+    utils::TimerManager Tv;
+    memory::array<HOST_MEMORY, ComplexType, 4> Pz_h(Pi_h), wz_h, Wz_h;
+    memory::array<DEVICE_MEMORY, ComplexType, 4> Pz_d = memory::to_memory_space<DEVICE_MEMORY>(Pi_h), wz_d, Wz_d;
+    screened_interaction<HOST_MEMORY>(Pz_h, Zb_h, basis, grid, mpi, wz_h, Tv, &Wz_h);
+    screened_interaction<DEVICE_MEMORY>(Pz_d, Zb_d, basis, grid, mpi, wz_d, Tv, &Wz_d);
+    nda::array<ComplexType, 4> Wz_dh = memory::to_memory_space<HOST_MEMORY>(Wz_d);
+    err["W(q,zeta_i) nodes [full-node stage]"] = rel_diff(comm, Wz_h, Wz_dh);
   }
   // residues as pole sums at the nodes + 12 ray points, both orientations; device residues evaluated by the device kernel
   {

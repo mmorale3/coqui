@@ -1313,10 +1313,9 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     e0 = tic("phase_Sigma");
     if (qplan.w_host) w = arr4_t{};   // only the last group's rows: free them
     auto const *whp = qplan.w_host ? &w_h : nullptr;
-    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer, sector_t::particle,
-                     prm.sigma_kdist, whp, qplan.gs_sigma);
-    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sh_new, Timer, sector_t::hole,
-                     prm.sigma_kdist, whp, qplan.gs_sigma);
+    // both sectors in one call (perf 7.1: the real-space residues are transformed once): particle -> Sp_new, hole -> Sh_new
+    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer, sector_t::both,
+                     prm.sigma_kdist, whp, qplan.gs_sigma, &Sh_new);
     if (sig_div) {   // S9a: the q -> 0 head term of Sigma_c (head.hpp), per sector, on the rows of this rank
       Timer.start("Sigma_head");
       head_sigma_correction(st.poles, Thead, bos->nu, hout.h0_res, hout.h0_res_hole, madelung, zeta, k_rows, Sp_new, Sh_new);

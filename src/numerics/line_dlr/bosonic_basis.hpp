@@ -34,12 +34,27 @@
  * Poles by pivoted QR of the stacked kernel [K^-; -K^+] on the two upper rays; line nodes (2r) by row-pivoted QR of the
  * odd kernel; the fit solves the coupled (PQ, QP) system for all pairs with ONE gelss factorization.
  * Transcription of coqui/cayley/cayley/line/line_dlr.py::BosonicLineBasis.
+ *
+ * Mirror-symmetric line nodes (perf 7.1 (b)/(c), notes section 5): W(-q, -conj zeta) = conj W(q, zeta) (exact; Z(-q) =
+ * conj Z(q), Pi(-q, -conj zeta) = conj Pi(q, zeta)), so on a node set closed under zeta -> -conj zeta the Dyson equation
+ * is solved on the ray-1 nodes only and the ray-2 values are conjugates. node_factor > 0 (default: env
+ * COQUI_GWLINE_BOS_NODES, else default_node_factor) selects n1 = ceil(node_factor r / 2) ray-1 nodes and stores
+ *   zeta_nodes = [zeta_1 .. zeta_n1 (ray 1, ascending |zeta|), -conj zeta_1 .. -conj zeta_n1]   (nz = 2 n1),
+ * by a greedy GROUP selection on the pair system of Eq. bfit: a ray-1 candidate zeta contributes the four rows
+ * {a(zeta), b(zeta), conj b(zeta), conj a(zeta)} (a = [K^-, -K^+], b = [-K^+, K^-]; the last two are the rows of the
+ * mirror node -conj zeta), the candidate with the largest residual group norm is taken and its rows are projected out
+ * (block modified Gram-Schmidt, twice); when the pair system's rank is exhausted a fresh pass continues on the remaining
+ * candidates (oversampling). node_factor <= 0: the python node selection above (asymmetric; [parity] / bases files).
+ * mirror_half(zeta) detects the symmetric layout of any node set (0 if not symmetric).
  */
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <utility>
 #include <vector>
+
+#include "nda/blas.hpp"
 
 #include "numerics/line_dlr/line_dlr_utils.hpp"
 #include "numerics/line_dlr/line_basis.hpp"
@@ -53,9 +68,20 @@ struct bosonic_basis_t {
   nda::array<ComplexType, 1> zeta_nodes;       ///< (min(2 rank, 2 nline)) line nodes (mu-relative)
   nda::array<ComplexType, 1> zeta_dense;       ///< (2 nline) the dense selection grid
 
+  long n_mirror = 0;                           ///< n1 > 0: zeta_nodes is mirror-symmetric in the layout above, else 0
+  double node_factor = 0.0;                    ///< nz / rank of the symmetric selection (0: python nodes)
+
+  /// default nz / r of the symmetric node selection (perf 7.1 scan, notes section 5)
+  static constexpr double default_node_factor = 1.25;   // perf 7.1 scan: 1.1-1.5 as accurate as 2 r vs Casida
+  /// env COQUI_GWLINE_BOS_NODES (a number; <= 0 selects the python nodes), else default_node_factor
+  static double env_node_factor() {
+    char const *v = std::getenv("COQUI_GWLINE_BOS_NODES");
+    return (v != nullptr and *v != '\0') ? std::strtod(v, nullptr) : default_node_factor;
+  }
+
   bosonic_basis_t(double theta_, double lam_, double eps_, double gap_, double tmin = -1.0, double tmax = -1.0,
-                  long nline = 1200, long npole = 800)
-     : theta(theta_), lam(lam_), eps(eps_), gap(gap_) {
+                  long nline = 1200, long npole = 800, double node_factor_ = env_node_factor())
+     : theta(theta_), lam(lam_), eps(eps_), gap(gap_), node_factor(node_factor_) {
     utils::check(lam > 0.0 and eps > 0.0 and nline > 1 and npole > 1, "bosonic_basis_t: invalid parameters");
     if (tmin < 0.0) tmin = 1e-4 * lam;
     if (tmax < 0.0) tmax = 20.0 * lam;
@@ -83,6 +109,10 @@ struct bosonic_basis_t {
     nu = nda::array<double, 1>(rank);
     for (long l = 0; l < rank; ++l) nu(l) = ns[l];
 
+    if (node_factor > 0.0) {   // mirror-symmetric nodes (see the file header)
+      select_mirror_nodes(nline);
+      return;
+    }
     // line nodes: row-pivoted QR of the odd kernel 1/(z - nu) - 1/(z + nu); min(2r, nd) nodes
     nda::matrix<ComplexType, nda::F_layout> KT(rank, nd);
     for (long i = 0; i < nd; ++i)
@@ -96,6 +126,91 @@ struct bosonic_basis_t {
   }
 
   long size() const { return rank; }
+
+  /**
+   * n1 = ceil(node_factor r / 2) ray-1 nodes by the greedy group selection of the file header (zeta_dense(0:nline) is ray 1,
+   * zeta_dense(nline + i) = -conj zeta_dense(i) is its mirror).
+   */
+  void select_mirror_nodes(long nline) {
+    const long r = rank, n2r = 2 * r;
+    const long n1 = std::min(nline, std::max(1L, long(std::ceil(0.5 * node_factor * double(r) - 1e-9))));
+    // candidate rows (4 per ray-1 point), row-major (4 nline, 2r)
+    nda::array<ComplexType, 2> C(4 * nline, n2r);
+    for (long c = 0; c < nline; ++c) {
+      const ComplexType z = zeta_dense(c);
+      for (long j = 0; j < r; ++j) {
+        const ComplexType km = 1.0 / (z - nu(j)), kp = 1.0 / (z + nu(j));
+        C(4 * c + 0, j) = km;             C(4 * c + 0, r + j) = -kp;              // a(z)
+        C(4 * c + 1, j) = -kp;            C(4 * c + 1, r + j) = km;               // b(z)
+        C(4 * c + 2, j) = -std::conj(kp); C(4 * c + 2, r + j) = std::conj(km);    // conj b(z) = a(-conj z)
+        C(4 * c + 3, j) = std::conj(km);  C(4 * c + 3, r + j) = -std::conj(kp);   // conj a(z) = b(-conj z)
+      }
+    }
+    std::vector<char> taken(nline, 0);
+    std::vector<long> sel;
+    nda::array<ComplexType, 2> R = C;   // residual rows
+    double s0 = 0.0;
+    auto group_norm = [&](long c) {
+      double s = 0.0;
+      for (long i = 0; i < 4; ++i)
+        for (long j = 0; j < n2r; ++j) s += std::norm(R(4 * c + i, j));
+      return s;
+    };
+    for (long c = 0; c < nline; ++c) s0 = std::max(s0, group_norm(c));
+    long nbasis = 0;
+    while (long(sel.size()) < n1) {
+      long best = -1;
+      double bs = -1.0;
+      for (long c = 0; c < nline; ++c) {
+        if (taken[c]) continue;
+        const double s = group_norm(c);
+        if (s > bs) { bs = s; best = c; }
+      }
+      if (best < 0) break;
+      if (bs <= 1e-26 * s0 or nbasis >= n2r) {   // rank exhausted: fresh pass on the remaining candidates
+        R      = C;
+        nbasis = 0;
+        for (long c : sel)
+          for (long i = 0; i < 4; ++i) R(4 * c + i, nda::range::all) = ComplexType(0.0);
+        continue;
+      }
+      taken[best] = 1;
+      sel.push_back(best);
+      // orthonormal directions of the group's residual rows (MGS twice), projected out of every candidate row
+      std::vector<nda::array<ComplexType, 1>> qv;
+      for (long i = 0; i < 4; ++i) {
+        nda::array<ComplexType, 1> v = R(4 * best + i, nda::range::all);
+        for (int pass = 0; pass < 2; ++pass)
+          for (auto const &u : qv) {
+            ComplexType d = 0.0;
+            for (long j = 0; j < n2r; ++j) d += std::conj(u(j)) * v(j);
+            for (long j = 0; j < n2r; ++j) v(j) -= d * u(j);
+          }
+        double nv = 0.0;
+        for (long j = 0; j < n2r; ++j) nv += std::norm(v(j));
+        if (nv > 1e-24 * s0) {
+          v /= std::sqrt(nv);
+          qv.push_back(v);
+        }
+      }
+      if (qv.empty()) continue;
+      nda::array<ComplexType, 2> Qm(long(qv.size()), n2r), D(4 * nline, long(qv.size()));
+      for (long i = 0; i < long(qv.size()); ++i) Qm(i, nda::range::all) = qv[i];
+      for (int pass = 0; pass < 2; ++pass) {   // R -= (R Q^dagger) Q
+        nda::blas::gemm(ComplexType(1.0), R, nda::dagger(Qm), ComplexType(0.0), D);
+        nda::blas::gemm(ComplexType(-1.0), D, Qm, ComplexType(1.0), R);
+      }
+      for (long i = 0; i < 4; ++i) R(4 * best + i, nda::range::all) = ComplexType(0.0);
+      nbasis += long(qv.size());
+    }
+    std::sort(sel.begin(), sel.end());   // ray-1 dense points are ascending in |zeta|
+    n_mirror   = long(sel.size());
+    zeta_nodes = nda::array<ComplexType, 1>(2 * n_mirror);
+    for (long l = 0; l < n_mirror; ++l) {
+      zeta_nodes(l)            = zeta_dense(sel[l]);
+      zeta_nodes(n_mirror + l) = -std::conj(zeta_dense(sel[l]));
+    }
+  }
 
   /// (Km, Kp): Km[i, j] = 1/(zeta_i - nu_j), Kp[i, j] = 1/(zeta_i + nu_j)
   std::pair<nda::array<ComplexType, 2>, nda::array<ComplexType, 2>> kernels(nda::array<ComplexType, 1> const &zeta) const {
@@ -236,6 +351,21 @@ struct bosonic_basis_t {
     return E;
   }
 };
+
+/**
+ * n1 if zeta = [z_1 .. z_n1, -conj z_1 .. -conj z_n1] with every z_i in the upper right quadrant (the mirror-symmetric
+ * layout of bosonic_basis_t), else 0. Any node set (e.g. read from a bases file) can be tested.
+ */
+inline long mirror_half(nda::array<ComplexType, 1> const &zeta) {
+  const long nz = zeta.size();
+  if (nz < 2 or nz % 2 != 0) return 0;
+  const long n1 = nz / 2;
+  for (long i = 0; i < n1; ++i) {
+    if (not(zeta(i).real() > 0.0 and zeta(i).imag() > 0.0)) return 0;
+    if (std::abs(zeta(n1 + i) + std::conj(zeta(i))) > 1e-14 * std::abs(zeta(i))) return 0;
+  }
+  return n1;
+}
 
 } // namespace numerics::line_dlr
 

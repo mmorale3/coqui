@@ -55,8 +55,16 @@
  * driver uses groups only when the Pi group of all q does not fit (device memory, q_groups_t).
  * No q <-> -q assumption: both sectors are built explicitly, Pi(q, -zeta) = Pi(-q, zeta)^T holds by construction
  * (checked against the exact transition sum on a q != -q mesh, [V1] lih223).
+ *
+ * Mirror mode (perf 7.1 (a), notes section 5; default, env COQUI_GWLINE_PI_MIRROR = 0 restores the explicit hole leg):
+ * with zeta mirror-symmetric (numerics::line_dlr::mirror_half: zeta = [z_1..z_n1, -conj z_1..-conj z_n1]) and the q list
+ * closed under q -> -q, only the PARTICLE ray is built and
+ *   Pi^<(q, zeta) = conj(Pi^>(-q, -conj zeta))      (verified on the exact transition sums to 1.6e-15, [.perf71_rel]),
+ * so Pi(q, z_i) = Pi^>(q, z_i) + conj Pi^>(-q, z_{i +- n1}): half the G~ builds, Hadamards and transforms. ray_h is then
+ * unused. The combination is a local elementwise pass over the pairs of rows (q, -q) (detail::mirror_combine).
  */
 
+#include <algorithm>
 #include <array>
 #include <vector>
 
@@ -66,6 +74,7 @@
 #include "nda/tensor.hpp"
 #include "mean_field/MF.hpp"
 #include "numerics/line_dlr/time_id.hpp"
+#include "numerics/line_dlr/bosonic_basis.hpp"
 #include "utilities/check.hpp"
 #include "utilities/freemem.h"
 #include "utilities/Timer.hpp"
@@ -73,6 +82,7 @@
 #include "methods/GW_line/line_state.hpp"
 #include "methods/GW_line/propagators.hpp"
 #include "methods/GW_line/device_blas.hpp"
+#include "methods/GW_line/kmesh_ft.hpp"
 
 namespace methods::gw_line {
 
@@ -109,6 +119,22 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   if (Pi.extent(0) != g or Pi.extent(1) != nz or Pi.extent(2) != nP or Pi.extent(3) != nQ) Pi = arr4_t(g, nz, nP, nQ);
   nda::tensor::set(ComplexType(0.0), Pi);
 
+  // ---- perf 7.1 (a): the hole sector from the particle sector at the mirror nodes (see the file header)
+  const long n1 = numerics::line_dlr::mirror_half(zeta);
+  std::vector<long> prow(g, -1);   // group row of -q
+  {
+    auto qmv = mf.qminus();
+    for (long i = 0; i < g; ++i)
+      for (long j = 0; j < g; ++j)
+        if (qs[j] == long(qmv(qs[i]))) prow[i] = j;
+  }
+  const bool closed = std::all_of(prow.begin(), prow.end(), [](long v) { return v >= 0; });
+  const bool mirror = detail::env_long("COQUI_GWLINE_PI_MIRROR", 1) != 0 and n1 > 0 and closed;
+  app_log(3, "  gw_line::polarization: {}", mirror ? "hole sector from the particle sector at the mirror nodes (perf 7.1 a)"
+                                                     : (n1 > 0 ? (closed ? "explicit sectors (COQUI_GWLINE_PI_MIRROR = 0)"
+                                                                         : "explicit sectors (q list not closed under -q)")
+                                                               : "explicit sectors (nodes not mirror-symmetric)"));
+
   struct leg_t {
     time_ray_t const *ray;
     double sign;
@@ -117,8 +143,18 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   const leg_t legs[2] = {{&ray_p, +1.0, sector_t::hole, sector_t::particle},
                          {&ray_h, -1.0, sector_t::particle, sector_t::hole}};
 
+  // ---- perf 7.1 (e): the k sum as a convolution in real space (default; COQUI_GWLINE_RSPACE = 0 -> k-space Hadamards)
+  //   A^(R) = sum_k e^{+ikR} A(k), B^(R) = sum_k e^{-ikR} B(k), acc(q) = alpha / N sum_R e^{-iQ_q R} A^(R) o B^(R)
+  const kmesh_ft_t kft(mf);
+  const bool rs = detail::env_long("COQUI_GWLINE_RSPACE", 1) != 0 and kft.ok;
+  [[maybe_unused]] memory::array<MEM, ComplexType, 2> FpM, FmM, GmQ;
+  if (rs) {
+    FpM = memory::to_memory_space<MEM>(kft.Fp);
+    FmM = memory::to_memory_space<MEM>(kft.Fm);
+  }
+
   // ---- S7d Hadamard setup (device fused kernel; see the file header)
-  [[maybe_unused]] const bool fused = (MEM != HOST_MEMORY) and detail::fused_hadamard();
+  [[maybe_unused]] const bool fused = (MEM != HOST_MEMORY) and detail::fused_hadamard() and not rs;
   [[maybe_unused]] const bool qfold = fused and detail::env_long("COQUI_GWLINE_PI_QFOLD", 1) != 0;
   [[maybe_unused]] memory::array<MEM, int, 1> pairs;   // (g, N_k, 2): (k, k-q) for q = qs[row]
   if (fused) {
@@ -130,21 +166,34 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
       }
     pairs = memory::to_memory_space<MEM>(ph);
   }
-  const long nacc = qfold ? g : 1;   // acc chunks held: all q of the group (qfold) or one
+  const long nacc = (qfold or rs) ? g : 1;   // acc chunks held: all q of the group (qfold, real space) or one
 
   for (auto const &leg : legs) {
-    if (sectors != sector_t::both and sectors != leg.ray->sector) continue;
+    if (mirror) {   // the particle leg only (it provides both sectors)
+      if (leg.ray->sector != sector_t::particle) continue;
+    } else if (sectors != sector_t::both and sectors != leg.ray->sector)
+      continue;
     time_ray_t const &ray = *leg.ray;
     const long nt         = ray.size();
     // t_chunk <= 0: automatic (host default; device from the free device memory: A, B of all k and acc per time node)
-    const long tc = (t_chunk > 0) ? std::min(t_chunk, nt) : detail::auto_t_chunk<MEM>(nt, double(2 * nk + nacc) * blk * 16.0);
+    const long tc = (t_chunk > 0) ? std::min(t_chunk, nt)
+                                  : detail::auto_t_chunk<MEM>(nt, double((rs ? 3 : 2) * nk + nacc) * blk * 16.0);
     memory::array<MEM, ComplexType, 2> F = memory::to_memory_space<MEM>(ray.transform_matrix(zeta));   // (nz, nt)
     arr4_t A(nk, tc, nP, nQ), B(nk, tc, nP, nQ);
     arr4_t acc(nacc, tc, nP, nQ);
+    [[maybe_unused]] arr4_t X;   // real space: A^(R)
+    const ComplexType alpha(leg.sign * 2.0 / double(nk));
+    if (rs) {
+      X = arr4_t(nk, tc, nP, nQ);
+      nda::array<ComplexType, 2> gq(g, nk);   // alpha / N e^{-iQ_q R} for the q of the group
+      for (long iqr = 0; iqr < g; ++iqr)
+        for (long R = 0; R < nk; ++R) gq(iqr, R) = alpha / double(nk) * kft.Gm(qs[iqr], R);
+      GmQ = memory::to_memory_space<MEM>(gq);
+    }
     if constexpr (MEM != HOST_MEMORY) device_mem_probe();
     app_log(3, "  gw_line::polarization: {} sector, {} time nodes in chunks of {}{}", leg.ray->sector == sector_t::particle ? "particle" : "hole", nt, tc,
-            fused ? (qfold ? " (fused Hadamard, all q per launch)" : " (fused Hadamard, one q per launch)") : "");
-    const ComplexType alpha(leg.sign * 2.0 / double(nk));
+            rs ? " (real-space convolution, perf 7.1 e)"
+               : (fused ? (qfold ? " (fused Hadamard, all q per launch)" : " (fused Hadamard, one q per launch)") : ""));
 
     for (long i0 = 0; i0 < nt; i0 += tc) {
       const long n = std::min(tc, nt - i0);
@@ -158,6 +207,35 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
       }
       if constexpr (MEM != HOST_MEMORY) utils::device_sync();
       Timer.stop("G_tilde");
+
+      if (rs) {   // perf 7.1 (e): three gemm passes over the k mesh and one elementwise product per R (alpha folded in)
+        Timer.start("Pi_hadamard");
+        const auto cr = nda::range(n * blk);
+        auto A2       = nda::reshape(A, std::array<long, 2>{nk, tc * blk})(all, cr);
+        auto B2       = nda::reshape(B, std::array<long, 2>{nk, tc * blk})(all, cr);
+        auto X2       = nda::reshape(X, std::array<long, 2>{nk, tc * blk})(all, cr);
+        auto C2       = nda::reshape(acc, std::array<long, 2>{g, tc * blk})(all, cr);
+        nda::blas::gemm(ComplexType(1.0), FpM, A2, ComplexType(0.0), X2);   // A^(R)
+        nda::blas::gemm(ComplexType(1.0), FmM, B2, ComplexType(0.0), A2);   // B^(R), into A
+        nda::tensor::elementwise(ComplexType(1.0), X2, ComplexType(1.0), A2, nda::tensor::op::MUL);   // A <- A^ o B^
+        nda::blas::gemm(ComplexType(1.0), GmQ, A2, ComplexType(0.0), C2);   // acc(q) = alpha / N sum_R e^{-iQR} (.)
+        if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+        Timer.stop("Pi_hadamard");
+        Timer.start("Pi_transform");
+        if constexpr (MEM == HOST_MEMORY) {
+          for (long iqr = 0; iqr < g; ++iqr) {
+            auto acc2 = nda::reshape(acc(iqr, all, all, all), std::array<long, 2>{tc, blk})(tr, all);
+            auto Pi2  = nda::reshape(Pi(iqr, all, all, all), std::array<long, 2>{nz, blk});
+            nda::blas::gemm(ComplexType(1.0), F(all, nda::range(i0, i0 + n)), acc2, ComplexType(1.0), Pi2);
+          }
+        } else {
+          detail::gemm_strided_cm('N', 'N', blk, nz, n, ComplexType(1.0), acc.data(), blk, tc * blk, F.data() + i0, nt, 0,
+                                  ComplexType(1.0), Pi.data(), blk, nz * blk, g);
+          utils::device_sync();
+        }
+        Timer.stop("Pi_transform");
+        continue;
+      }
 
       if (qfold) {   // device, fused: acc(q) for all q in one launch (alpha folded in), transform for all q in one gemm
         Timer.start("Pi_hadamard");
@@ -210,6 +288,26 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
         Timer.stop("Pi_transform");
       }
     }
+  }
+
+  // perf 7.1 (a): Pi(q, z_i) = Pi^>(q, z_i) + conj Pi^>(-q, z_{i +- n1}) (both), or the conjugated mirror alone (hole); the
+  // pairs of rows (q, -q) each once, the slabs (ray 1 of q, ray 2 of -q) and (ray 2 of q, ray 1 of -q)
+  if (mirror and sectors != sector_t::particle) {
+    Timer.start("Pi_transform");
+    detail::scratch_t<MEM> scr;
+    const bool add = (sectors == sector_t::both);
+    auto slab      = [&](long row, long half) {
+      return memory::array_view<MEM, ComplexType, 1>(std::array<long, 1>{n1 * blk},
+                                                       Pi.data() + (row * nz + half * n1) * blk);
+    };
+    for (long i = 0; i < g; ++i) {
+      const long j = prow[i];
+      if (j < i) continue;   // the pair (j, i) was done
+      detail::mirror_combine<MEM>(slab(i, 0), slab(j, 1), add, scr);
+      if (j != i) detail::mirror_combine<MEM>(slab(i, 1), slab(j, 0), add, scr);
+    }
+    if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+    Timer.stop("Pi_transform");
   }
 }
 

@@ -13,7 +13,8 @@ set(TEST_ID gw_line_kernels)
 
 add_executable(test_${TEST_ID} test_gw_line_kernels.cpp test_gw_line_w.cpp test_gw_line_sigma.cpp
                               test_gw_line_time_id.cpp test_gw_line_device.cpp test_gw_line_lehmann.cpp
-                              test_gw_line_scaling.cpp test_gw_line_head.cpp test_gw_line_optics.cpp)
+                              test_gw_line_scaling.cpp test_gw_line_head.cpp test_gw_line_optics.cpp
+                              test_gw_line_perf71.cpp)
 target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib gw_lib scf_lib scr_coulomb_lib
                       gw_line_lib)
 

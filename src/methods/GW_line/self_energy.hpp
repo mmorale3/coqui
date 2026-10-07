@@ -100,6 +100,7 @@
 #include "methods/GW_line/screened.hpp"
 #include "methods/GW_line/device_blas.hpp"
 #include "methods/GW_line/k_dist.hpp"
+#include "methods/GW_line/kmesh_ft.hpp"
 
 namespace methods::gw_line {
 
@@ -111,7 +112,8 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
                  nda::array<ComplexType, 1> const &zeta, numerics::line_dlr::time_nodes_t const &ray_p,
                  numerics::line_dlr::time_nodes_t const &ray_h, long t_chunk, nda::array<ComplexType, 4> &Sigma,
                  utils::TimerManager &Timer, sector_t sectors = sector_t::both, bool k_local = false,
-                 memory::array<HOST_MEMORY, ComplexType, 4> const *w_host = nullptr, long sig_qgroup = 0) {
+                 memory::array<HOST_MEMORY, ComplexType, 4> const *w_host = nullptr, long sig_qgroup = 0,
+                 nda::array<ComplexType, 4> *Sigma_h = nullptr) {
   using time_ray_t = numerics::line_dlr::time_nodes_t;   // GL ray or ID nodes (S7b)
   using arr4_t = memory::array<MEM, ComplexType, 4>;
   using arr3_t = memory::array<MEM, ComplexType, 3>;
@@ -150,9 +152,15 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
 
   const k_dist_t kd(nk, comm);
   const long nks = k_local ? kd.nloc() : nk;   // rows of Sigma on this rank
-  if (Sigma.extent(0) != nks or Sigma.extent(1) != nz or Sigma.extent(2) != nb or Sigma.extent(3) != nb)
-    Sigma = nda::array<ComplexType, 4>(nks, nz, nb, nb);
-  Sigma() = ComplexType(0.0);
+  // Sigma_h (perf 7.1): the hole leg goes to *Sigma_h and the particle leg to Sigma (both sectors in one call: the
+  // real-space residues are transformed once); else both legs accumulate into Sigma
+  for (auto *S : {&Sigma, Sigma_h}) {
+    if (S == nullptr) continue;
+    if (S->extent(0) != nks or S->extent(1) != nz or S->extent(2) != nb or S->extent(3) != nb)
+      *S = nda::array<ComplexType, 4>(nks, nz, nb, nb);
+    (*S)() = ComplexType(0.0);
+  }
+  auto out_of = [&](sector_t s) -> nda::array<ComplexType, 4> & { return (s == sector_t::hole and Sigma_h) ? *Sigma_h : Sigma; };
   // contraction order: right factor first when nP < nQ (see the file header); COQUI_GWLINE_CONTRACT_RIGHT = 0/1 forces
   const bool right_first = detail::env_long("COQUI_GWLINE_CONTRACT_RIGHT", nP < nQ ? 1 : 0) != 0;
 
@@ -166,7 +174,21 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
 
   // ---- S7d Hadamard setup (device fused kernel; see the file header)
   const long blk = nP * nQ;
-  [[maybe_unused]] const bool fused  = (MEM != HOST_MEMORY) and detail::fused_hadamard();
+  const kmesh_ft_t kft(mf);
+  bool rs = detail::env_long("COQUI_GWLINE_RSPACE", 1) != 0 and kft.ok and w_host == nullptr;
+  if constexpr (MEM != HOST_MEMORY) {   // the transformed residues w^(R) need N_q r_b blocks of device memory besides w
+    if (rs) {
+      const double need = 16.0 * double(nq) * r * nP * nQ * 1.15 + 16.0 * 4.0 * nk * 8.0 * nP * nQ;
+      double freeb      = double(utils::freemem_device_effective()) * 1048576.0;
+      freeb             = comm.all_reduce_value(freeb, boost::mpi3::min<>{});
+      if (need > 0.8 * freeb) {
+        rs = false;
+        app_log(2, "  gw_line::self_energy: real-space residues ({:.2f} GB) do not fit the free device memory ({:.2f} GB): k-space path",
+                need / 1073741824.0, freeb / 1073741824.0);
+      }
+    }
+  }
+  [[maybe_unused]] const bool fused  = (MEM != HOST_MEMORY) and detail::fused_hadamard() and not rs;
   [[maybe_unused]] const bool kouter = fused and detail::env_long("COQUI_GWLINE_SIGMA_KOUTER", 1) != 0;
   // kouter: (N_k, gs, 2) = (k-q, q - qs0); else (gs, N_k, 1, 2) = (k-q, 0), for the q group [qs0, qs0 + gs)
   [[maybe_unused]] memory::array<MEM, int, 1> pairs;
@@ -181,7 +203,40 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
       }
     pairs = memory::to_memory_space<MEM>(ph);
   };
-  const long nwq = kouter ? gsz : 1;   // W(q, chunk) arrays held
+  // ---- perf 7.1 (e): the q sum as a convolution in real space (default with resident residues; COQUI_GWLINE_RSPACE = 0
+  // -> k-space Hadamards). Residues once per call: w^(R) = sum_q e^{-iQ_q R} w(q); the particle leg uses W^(R, t) =
+  // sum_j w^_j(R) e^{-i nu_j t}, the hole leg sum_q e^{+iQR} (.) = w^(-R) (rows swapped in place before the hole leg);
+  // G^(R) = sum_k e^{-ikR} G(k), acc(k) = 1/N sum_R e^{+ikR} G^(R) o W^(R)  (kmesh_ft.hpp)
+  [[maybe_unused]] memory::array<MEM, ComplexType, 2> FmM, BpM;
+  arr4_t wR;   // real space: w^(R) (N, r, nP, nQ), rows -R after the swap
+  bool wR_minus = false;
+  if (rs) {
+    FmM = memory::to_memory_space<MEM>(kft.Fm);
+    nda::array<ComplexType, 2> bp = kft.Bp;
+    bp *= ComplexType(1.0 / double(nk));
+    BpM = memory::to_memory_space<MEM>(bp);
+    Timer.start("Sigma_W_time");
+    wR = arr4_t(nk, r, nP, nQ);
+    memory::array<MEM, ComplexType, 2> HmM = memory::to_memory_space<MEM>(kft.Hm);
+    auto w2  = nda::reshape(w, std::array<long, 2>{nq, r * blk});
+    auto wR2 = nda::reshape(wR, std::array<long, 2>{nk, r * blk});
+    nda::blas::gemm(ComplexType(1.0), HmM, w2, ComplexType(0.0), wR2);
+    if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+    Timer.stop("Sigma_W_time");
+  }
+  auto swap_wR_minus = [&]() {   // w^(R) <-> w^(-R): rows R and -R exchanged (an involution)
+    arr4_t tmp(1, r, nP, nQ);
+    for (long R = 0; R < nk; ++R) {
+      const long mR = kft.minusR[R];
+      if (mR <= R) continue;
+      tmp(0, all, all, all) = wR(R, all, all, all);
+      wR(R, all, all, all)  = wR(mR, all, all, all);
+      wR(mR, all, all, all) = tmp(0, all, all, all);
+    }
+    wR_minus = not wR_minus;
+  };
+
+  const long nwq = rs ? nk : (kouter ? gsz : 1);   // W(q, chunk) (W^(R, chunk)) arrays held
   arr4_t wbuf;                         // host-resident residues: the group's rows in MEM
 
   for (auto const &leg : legs) {
@@ -193,6 +248,13 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
     const long tc = (t_chunk > 0) ? std::min(t_chunk, nt)
                                   : detail::auto_t_chunk<MEM>(nt, double(2 * nk + nwq) * nP * nQ * 16.0 +
                                                                       double(nk * nb + nQ) * nb * 16.0);
+    auto &Sigma_out = out_of(leg.s);
+    if (rs and ((leg.s == sector_t::hole) != wR_minus)) {   // the hole leg uses w^(-R)
+      Timer.start("Sigma_W_time");
+      swap_wR_minus();
+      if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+      Timer.stop("Sigma_W_time");
+    }
     const auto form       = leg.transposed ? gtilde_form_t::transposed : gtilde_form_t::plain;
     nda::array<ComplexType, 2> F = ray.transform_matrix(zeta);   // (nz, nt), host
     arr4_t G(nk, tc, nP, nQ), acc(nk, tc, nP, nQ);
@@ -220,8 +282,8 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
       nda::tensor::set(ComplexType(0.0), Sig_m);
     }
     if constexpr (MEM != HOST_MEMORY) device_mem_probe();
-    app_log(3, "  gw_line::self_energy: {} sector, {} time nodes in chunks of {}", leg.s == sector_t::particle ? "particle" : "hole",
-            nt, tc);
+    app_log(3, "  gw_line::self_energy: {} sector, {} time nodes in chunks of {}{}", leg.s == sector_t::particle ? "particle" : "hole",
+            nt, tc, rs ? " (real-space convolution, perf 7.1 e)" : "");
     const ComplexType alpha(leg.sign / double(nk));
 
     for (long qs0 = 0; qs0 < nq; qs0 += gsz) {   // q groups (one group = all q unless host-resident residues)
@@ -251,7 +313,33 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
         detail::check_orientation(leg.s, leg.transposed, "self_energy");
         Ev = basis.time_exponentials(t, leg.s);
         Timer.stop("Sigma_W_time");
-        if (kouter) {   // device, fused: W(q, chunk) for all q (one gemm), then acc(k) for all k in one launch
+        if (rs) {   // perf 7.1 (e): W^(R, chunk) for all R from w^(R); G^(R); one product per R; back to k
+          Timer.start("Sigma_W_time");
+          if constexpr (MEM == HOST_MEMORY) {
+            for (long R = 0; R < nk; ++R) {
+              auto w2 = nda::reshape(wR(R, all, all, all), std::array<long, 2>{r, blk});
+              auto W2 = nda::reshape(Wq(R, all, all, all), std::array<long, 2>{tc, blk})(tr, all);
+              nda::blas::gemm(ComplexType(1.0), Ev, w2, ComplexType(0.0), W2);
+            }
+          } else {
+            // column-major: W(R)^T (blk x n) = w(R)^T (blk x r) . E^T (r x n), batched over R
+            detail::gemm_strided_cm('N', 'N', blk, n, r, ComplexType(1.0), wR.data(), blk, r * blk, Em.data(), r, 0,
+                                    ComplexType(0.0), Wq.data(), blk, tc * blk, nk);
+            utils::device_sync();
+          }
+          Timer.stop("Sigma_W_time");
+          Timer.start("Sigma_hadamard");
+          const auto cr = nda::range(n * blk);
+          auto G2       = nda::reshape(G, std::array<long, 2>{nk, tc * blk})(all, cr);
+          auto X2       = nda::reshape(acc, std::array<long, 2>{nk, tc * blk})(all, cr);
+          auto W2       = nda::reshape(Wq, std::array<long, 2>{nk, tc * blk})(all, cr);
+          nda::blas::gemm(ComplexType(1.0), FmM, G2, ComplexType(0.0), X2);   // G^(R)
+          nda::tensor::elementwise(ComplexType(1.0), X2, ComplexType(1.0), W2, nda::tensor::op::MUL);   // W <- G^ o W^
+          nda::blas::gemm(ComplexType(1.0), BpM, W2, ComplexType(0.0), G2);   // acc(k) = 1/N sum_R e^{ikR} (.), into G
+          std::swap(G, acc);
+          if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+          Timer.stop("Sigma_hadamard");
+        } else if (kouter) {   // device, fused: W(q, chunk) for all q (one gemm), then acc(k) for all k in one launch
           Timer.start("Sigma_W_time");
           // column-major: W(q)^T (blk x n) = w(q)^T (blk x r) . E^T (r x n), batched over q
           detail::gemm_strided_cm('N', 'N', blk, n, r, ComplexType(1.0), wsrc.data() + (qs0 - qoff) * r * blk, blk, r * blk,
@@ -380,7 +468,7 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
             if (leg.transposed)
               for (long it = 0; it < n; ++it) P3(it, all, all) = nda::make_regular(nda::transpose(P3(it, all, all)));
             auto P2 = nda::reshape(P3, std::array<long, 2>{n, nb * nb});
-            auto S2 = nda::reshape(Sigma(l, all, all, all), std::array<long, 2>{nz, nb * nb});
+            auto S2 = nda::reshape(Sigma_out(l, all, all, all), std::array<long, 2>{nz, nb * nb});
             nda::blas::gemm(alpha, F(all, nda::range(i0, i0 + n)), P2, ComplexType(1.0), S2);
           }
           Timer.stop("Sigma_transform");
@@ -401,7 +489,7 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
         auto &P = leg.transposed ? partT : part;
         for (long ik = 0; ik < nk; ++ik) {
           auto P2 = nda::reshape(P(ik, all, all, all), std::array<long, 2>{tc, nb * nb})(tr, all);
-          auto S2 = nda::reshape(Sigma(ik, all, all, all), std::array<long, 2>{nz, nb * nb});
+          auto S2 = nda::reshape(Sigma_out(ik, all, all, all), std::array<long, 2>{nz, nb * nb});
           nda::blas::gemm(alpha, F(all, nda::range(i0, i0 + n)), P2, ComplexType(1.0), S2);
         }
         Timer.stop("Sigma_transform");
@@ -417,8 +505,8 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
         kd_reduce_scatter(comm, kd, S_o.data(), S_l.data(), nz * nb * nb);
         for (long l = 0; l < kd.nloc(); ++l)
           for (long iz = 0; iz < nz; ++iz) {
-            if (leg.transposed) Sigma(l, iz, all, all) += nda::transpose(S_l(l, iz, all, all));
-            else Sigma(l, iz, all, all) += S_l(l, iz, all, all);
+            if (leg.transposed) Sigma_out(l, iz, all, all) += nda::transpose(S_l(l, iz, all, all));
+            else Sigma_out(l, iz, all, all) += S_l(l, iz, all, all);
           }
         Timer.stop("Sigma_allreduce");
         continue;
@@ -426,8 +514,8 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
       comm.all_reduce_in_place_n(S_h.data(), S_h.size(), std::plus<>{});
       for (long ik = 0; ik < nk; ++ik)
         for (long iz = 0; iz < nz; ++iz) {
-          if (leg.transposed) Sigma(ik, iz, all, all) += nda::transpose(S_h(ik, iz, all, all));
-          else Sigma(ik, iz, all, all) += S_h(ik, iz, all, all);
+          if (leg.transposed) Sigma_out(ik, iz, all, all) += nda::transpose(S_h(ik, iz, all, all));
+          else Sigma_out(ik, iz, all, all) += S_h(ik, iz, all, all);
         }
       Timer.stop("Sigma_allreduce");
     }
@@ -442,10 +530,10 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
                  numerics::line_dlr::time_nodes_t const &ray_p, numerics::line_dlr::time_nodes_t const &ray_h, long t_chunk,
                  nda::array<ComplexType, 4> &Sigma, utils::TimerManager &Timer, sector_t sectors = sector_t::both,
                  bool k_local = false, memory::array<HOST_MEMORY, ComplexType, 4> const *w_host = nullptr,
-                 long sig_qgroup = 0) {
+                 long sig_qgroup = 0, nda::array<ComplexType, 4> *Sigma_h = nullptr) {
   utils::check(grid.np == mpi.comm.size() and grid.rank == mpi.comm.rank(), "gw_line::self_energy: grid/communicator mismatch");
   self_energy<MEM>(prop, poles, w, basis, mf, grid, mpi.comm, zeta, ray_p, ray_h, t_chunk, Sigma, Timer, sectors, k_local,
-                   w_host, sig_qgroup);
+                   w_host, sig_qgroup, Sigma_h);
 }
 
 #define GW_LINE_SIGMA_EXTERN(MEM)                                                                                        \
@@ -455,7 +543,8 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
                                         nda::array<ComplexType, 1> const &, numerics::line_dlr::time_nodes_t const &,     \
                                         numerics::line_dlr::time_nodes_t const &, long, nda::array<ComplexType, 4> &,     \
                                         utils::TimerManager &, sector_t, bool,                                    \
-                                        memory::array<HOST_MEMORY, ComplexType, 4> const *, long);
+                                        memory::array<HOST_MEMORY, ComplexType, 4> const *, long,                 \
+                                        nda::array<ComplexType, 4> *);
 
 GW_LINE_SIGMA_EXTERN(HOST_MEMORY)
 #if defined(ENABLE_DEVICE)

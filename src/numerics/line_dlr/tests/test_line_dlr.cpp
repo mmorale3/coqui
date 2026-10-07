@@ -293,7 +293,7 @@ TEST_CASE("line_dlr_reference", "[numerics][line_dlr]") {
     nda::h5_read(g, "poles", npy);
     auto zpy = read_nodes(g);
 
-    ldlr::bosonic_basis_t b(theta, lam, eps, gap, tmin, tmax, nline, npole);
+    ldlr::bosonic_basis_t b(theta, lam, eps, gap, tmin, tmax, nline, npole, 0.0);   // python node selection
     auto [pmiss, pd] = match_sets(b.nu, npy, 1e-6);
     auto [zmiss, zd] = match_sets(b.zeta_nodes, zpy, 1e-6);
     const long nd = b.zeta_dense.size();
@@ -477,15 +477,19 @@ TEST_CASE("line_dlr_bosonic_fit", "[numerics][line_dlr]") {
   CHECK(ep <= 10 * eps);
   CHECK(eh <= 10 * eps);
 
-  // the same fit on the basis' own 2r line nodes (the production W fit) instead of the dense set
-  {
-    auto wn       = b.fit(b.zeta_nodes, model(b.zeta_nodes, sector_t::both));
-    const double en  = diff(b.eval(wn, zi, sector_t::both), Wi) / sc;
-    const double enp = diff(b.eval(wn, zi, sector_t::particle), model(zi, sector_t::particle)) / sc;
-    std::cout << "[line_dlr] bosonic fit on the " << b.zeta_nodes.size() << " QR nodes: imag axis full " << en << ", '>' "
-              << enp << "\n";
+  // the same fit on the basis' own line nodes (the production W fit) instead of the dense set: the default
+  // mirror-symmetric nodes (perf 7.1) and the python QR nodes
+  for (double nf : {ldlr::bosonic_basis_t::default_node_factor, 1.0, 1.5, 0.0}) {
+    ldlr::bosonic_basis_t bn(theta, 4.0, eps, 0.02, -1.0, -1.0, 1200, 800, nf);
+    auto wn       = bn.fit(bn.zeta_nodes, model(bn.zeta_nodes, sector_t::both));
+    const double en  = diff(bn.eval(wn, zi, sector_t::both), Wi) / sc;
+    const double enp = diff(bn.eval(wn, zi, sector_t::particle), model(zi, sector_t::particle)) / sc;
+    std::cout << "[line_dlr] bosonic fit on the " << bn.zeta_nodes.size() << " " << (nf > 0 ? "mirror-symmetric" : "QR")
+              << " nodes (node factor " << nf << "): imag axis full " << en << ", '>' " << enp << "\n";
     CHECK(en <= 10 * eps);
     CHECK(enp <= 10 * eps);
+    CHECK(ldlr::mirror_half(bn.zeta_nodes) == (nf > 0 ? bn.zeta_nodes.size() / 2 : 0));
+    CHECK(bn.n_mirror == ldlr::mirror_half(bn.zeta_nodes));
   }
 
   // time exponentials: W^>(t) = sum_j w_j e^{-i nu_j t}, W^<(t) = -sum_j w_j^T e^{+i nu_j t}

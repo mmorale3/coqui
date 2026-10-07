@@ -294,6 +294,256 @@ void transpose_in_place(Dv_t &Dv, long nbat, scratch_t<MEM> &sM) {
   }
 }
 
+/// dst <- conj(src) (equal sizes, MEM; device: cuTENSOR add with the conjugation op)
+template <MEMORY_SPACE MEM>
+void conj_copy(memory::array_view<MEM, ComplexType, 1> dst, memory::array_view<MEM, ComplexType, 1> src) {
+  utils::check(dst.size() == src.size(), "gw_line::conj_copy: size mismatch");
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long i = 0; i < dst.size(); ++i) dst(i) = std::conj(src(i));
+  } else {
+    nda::tensor::set(ComplexType(0.0), dst);   // beta = 0 below: never read uninitialized scratch
+    nda::tensor::add(ComplexType(1.0), nda::conj(src), "a", ComplexType(0.0), dst, "a");
+  }
+}
+
+/// S(z) <- X(z)^T for the n matrices of X (n, a, b) -> S (n, b, a), MEM (host loops; device one cuTENSOR permutation)
+template <MEMORY_SPACE MEM, typename X_t, typename S_t>
+void transpose_blocks(X_t const &X, S_t &&S) {
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long z = 0; z < X.extent(0); ++z) S(z, nda::range::all, nda::range::all) = nda::transpose(X(z, nda::range::all, nda::range::all));
+  } else {
+    nda::tensor::add(ComplexType(1.0), X, "zab", ComplexType(0.0), S, "zba");
+  }
+}
+
+/**
+ * Mirror W stage (perf 7.1 (b)/(c), notes section 5), used by screened_interaction when the nodes are mirror-symmetric
+ * (numerics::line_dlr::mirror_half(zeta) = n1 > 0: zeta = [z_1..z_n1 on ray 1, -conj z_1..-conj z_n1]):
+ *   (b) Dyson on the ray-1 nodes only (redistribute Pi rows -> whole matrices -> Dyson in place -> transpose -> back), the
+ *       ray-2 values by W(q, -conj z_i) = conj W(-q, z_i) (exact: Pi(q, -conj z) = conj Pi(-q, z), Z(-q) = conj Z(q) to the
+ *       THC asymmetry of Z; [.perf71_rel] (b)): half the Dyson solves, half the volume of the two remaining redistributes,
+ *       no W^T redistribute and no pair pass;
+ *   (c) the transposed data of the pair fit, w(q) = VS (U1H W(q) + U2H W(-q)^T), from the ray-1 blocks only:
+ *         W(-q, z_i)^T            at the ray-1 nodes: the transposed ray-1 block of -q,
+ *         W(-q, -conj z_i)^T      at the ray-2 nodes: conj of the transposed ray-1 block of q (= W(q, z_i)^dagger),
+ *       and the transposed ray-1 blocks come from ONE redistribute per unit {q, -q} of the transposed local blocks
+ *       (a darray of W^T with origin (Q0, P0) and grid {np_Q, np_P} -> the (P, Q) block layout). On a square grid this is
+ *       the pairwise exchange with the transposed rank; on any other grid the same volume with a few partners.
+ * Volume per q (Pi-group units, nz = 2 n1 nodes): 1/2 + 1/2 + 1/2 instead of 3 (q = -q) or 4 (q != -q).
+ */
+template <MEMORY_SPACE MEM>
+void screened_mirror(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks_t<MEM> const &Zb, bosonic_basis_t const &basis,
+                     aux_grid_t const &grid, utils::mpi_context_t<boost::mpi3::communicator> &mpi,
+                     memory::array<MEM, ComplexType, 4> &w, utils::TimerManager &Timer,
+                     memory::array<MEM, ComplexType, 4> *W_nodes, std::vector<long> const &qs, bool w_group,
+                     std::vector<long> const &mrow, long n1) {
+  using arr4_t  = memory::array<MEM, ComplexType, 4>;
+  using arr2_t  = memory::array<MEM, ComplexType, 2>;
+  using arrF_t  = memory::array<MEM, ComplexType, 2, nda::F_layout>;
+  using dview_t = math::nda::distributed_array_view<arr4_t, boost::mpi3::communicator>;
+  using v1_t    = memory::array_view<MEM, ComplexType, 1>;
+  auto all      = nda::range::all;
+  auto &comm    = mpi.comm;
+
+  const long g = Pi.extent(0), nz = Pi.extent(1), Np = grid.Np, nP = grid.nP, nQ = grid.nQ, r = basis.rank;
+  const long blk = nP * nQ;
+  utils::check(nz == 2 * n1, "gw_line::screened_mirror: {} nodes, n1 = {}", nz, n1);
+  dyson_layout_t lay(comm.size(), comm.rank(), g, n1, Np);
+  for (auto nm : {"W_redistribute", "W_dyson", "W_fit"}) Timer.add(nm);
+  for (long s = 0; s < lay.nq_loc; ++s)
+    utils::check(Zb.has_full(qs[lay.q_first + s]),
+                 "gw_line::screened_interaction: the Coulomb blocks do not hold the full Z of this rank's Dyson q slab");
+
+  const long w_rows = w_group ? g : Zb.nq;
+  auto w_row        = [&](long ql) { return w_group ? ql : qs[ql]; };
+  if (w.extent(0) != w_rows or w.extent(1) != r or w.extent(2) != nP or w.extent(3) != nQ) {
+    w = arr4_t(w_rows, r, nP, nQ);
+    nda::tensor::set(ComplexType(0.0), w);
+  }
+  bosonic_fit_t fit(basis, basis.zeta_nodes);
+  const long k  = fit.k;
+  const long bc = std::clamp(long(double(g) * nz * blk / (64.0 * double(std::max(k, 1L)))), std::min(blk, 4096L), blk);
+  arr2_t U1H = memory::to_memory_space<MEM>(fit.U1H), U2H = memory::to_memory_space<MEM>(fit.U2H),
+         VS = memory::to_memory_space<MEM>(fit.VS), Y(k, bc);
+
+  long nzs_cap = -1;
+  if constexpr (MEM != HOST_MEMORY) {
+    const double freeb = double(utils::freemem_device_effective()) * 1048576.0;
+    const double per_z = 16.0 * (double(lay.np_q) * grid.max_block_size() + double(Np) * Np / double(lay.np_z));
+    nzs_cap            = std::max(1L, long(0.4 * freeb / per_z));
+    nzs_cap            = comm.all_reduce_value(nzs_cap, boost::mpi3::min<>{});
+  }
+  const w_plan_t plan(lay, grid.max_block_size(), nzs_cap);
+  plan.log();
+  app_log(3, "  gw_line W (mirror, perf 7.1 b/c): Dyson on {} ray-1 nodes of {}, ray 2 by conjugation, transposed fit data by "
+             "one exchange per {{q, -q}}",
+          n1, nz);
+  [[maybe_unused]] std::optional<utils::device_pool_guard> stage_pool;
+  if constexpr (MEM != HOST_MEMORY) {
+    if (comm.size() > 1 and utils::device_pool_capacity() == 0) {
+      const double stg = std::min(double(math::nda::detail::redistribute_chunk_bytes()),
+                                  16.0 * double(lay.np_q) * plan.nzs * grid.max_block_size());
+      stage_pool.emplace(std::size_t(2.0 * stg) + (std::size_t(64) << 20), "gw_line W stage");
+    }
+  }
+  const long nzl_max = (plan.nzs + lay.np_z - 1) / lay.np_z;
+
+  // Dyson workspace (as screened_interaction)
+  arr2_t Id(Np, Np), M(Np, Np);
+  {
+    nda::array<ComplexType, 2> Ih(Np, Np);
+    Ih() = ComplexType(0.0);
+    for (long P = 0; P < Np; ++P) Ih(P, P) = ComplexType(1.0);
+    Id = memory::to_memory_space<MEM>(Ih);
+  }
+  arrF_t ZF(Np, Np), XF(Np, Np);
+  memory::array<MEM, int, 1> ipiv(Np);
+  memory::array<MEM, ComplexType, 1> lwork;
+  [[maybe_unused]] bool batched = false;
+  long nbat                     = std::max(1L, std::min(nzl_max, 16L));
+  scratch_t<MEM> sM, sTb, sD, sS, sT, sC;
+  [[maybe_unused]] memory::array<MEM, int, 2> ipiv_b;
+  if constexpr (MEM != HOST_MEMORY) {
+    batched = env_long("COQUI_GWLINE_DYSON_BATCHED", Np <= 1024 ? 1 : 0) != 0;
+    const double mat = double(Np) * Np * 16.0, freeb = double(utils::freemem_device_effective()) * 1048576.0;
+    nbat = std::max(1L, std::min({nzl_max, dyson_nbat_max(), long(0.25 * freeb / mat)}));
+    if (batched) ipiv_b = memory::array<MEM, int, 2>(nbat, Np);
+  }
+
+  // ---- (b) Dyson on the ray-1 nodes
+  const std::array<long, 4> bgrid = {1, 1, grid.np_P, grid.np_Q}, ones = {1, 1, 1, 1};
+  for (long s = 0; s < plan.nsub_q; ++s) {
+    const long na   = plan.n_act(s);
+    const bool act  = s < lay.nq_loc;
+    const long iq_a = qs[lay.q_first + (act ? s : 0)];
+    if (act) {
+      Timer.start("W_dyson");
+      nda::matrix<ComplexType, nda::F_layout> zf_h(Zb.full(iq_a));
+      ZF = zf_h;
+      Timer.stop("W_dyson");
+    }
+    for (long za = 0; za < n1; za += plan.nzs) {
+      const long nzs                = std::min(plan.nzs, n1 - za);
+      const auto zrng               = nda::range(za, za + nzs);
+      const auto [zf, nzl]          = plan.z_chunk(nzs);
+      const std::array<long, 4> gsh = {na, nzs, Np, Np};
+      const bool solve              = act and nzl > 0;
+
+      Timer.start("W_redistribute");
+      auto Tb = sTb.template view<4>({na, nzs, nP, nQ});
+      for (long p = 0; p < na; ++p) Tb(p, all, all, all) = Pi(plan.q_row(p, s), zrng, all, all);
+      dview_t dTb(std::addressof(comm), bgrid, gsh, {0, 0, grid.P0, grid.Q0}, ones, Tb);
+      auto D4 = sD.template view<4>({act ? 1L : 0L, nzl, Np, Np});
+      dview_t dD(std::addressof(comm), lay.pgrid(), gsh, {act ? lay.ip_q : na, zf, 0, 0}, ones, D4);
+      math::nda::redistribute(dTb, dD);
+      if constexpr (MEM != HOST_MEMORY) {
+        utils::device_sync();
+        device_mem_probe();
+      }
+      Timer.stop("W_redistribute");
+
+      Timer.start("W_dyson");
+      if (solve) {
+        auto Dv   = D4(0, all, all, all);
+        bool done = false;
+        if constexpr (MEM != HOST_MEMORY) {
+          if (batched) {
+            dyson_batched_device(Dv, ZF, Id, nbat, sM, ipiv_b, iq_a, za + zf);
+            done = true;
+          }
+        }
+        if (not done) {
+          auto ZT = nda::transpose(ZF);
+          for (long izl = 0; izl < nzl; ++izl) {
+            auto Pv = Dv(izl, all, all);
+            M       = Id;
+            nda::blas::gemm(ComplexType(-1.0), ZF, Pv, ComplexType(1.0), M);   // M = I - Z Pi
+            int info = nda::lapack::getrf(M, ipiv, lwork);
+            utils::check(info == 0, "gw_line::screened_interaction: getrf of I - Z Pi failed (q={}, node={}, info={})", iq_a,
+                         za + zf + izl, info);
+            XF   = ZF;
+            info = nda::lapack::getrs(M, XF, ipiv);   // XF = (I - Z Pi)^{-1} Z
+            utils::check(info == 0, "gw_line::screened_interaction: getrs failed (q={}, node={}, info={})", iq_a, za + zf + izl,
+                         info);
+            Pv = nda::transpose(XF);
+            if constexpr (MEM == HOST_MEMORY) Pv -= ZT;
+            else nda::tensor::add(ComplexType(-1.0), ZT, ComplexType(1.0), Pv);
+          }
+        }
+        transpose_in_place<MEM>(Dv, nbat, sM);   // W^T -> W
+      }
+      if constexpr (MEM != HOST_MEMORY) {
+        utils::device_sync();
+        device_mem_probe();
+      }
+      Timer.stop("W_dyson");
+
+      Timer.start("W_redistribute");
+      math::nda::redistribute(dD, dTb);
+      for (long p = 0; p < na; ++p) Pi(plan.q_row(p, s), zrng, all, all) = Tb(p, all, all, all);
+      if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+      Timer.stop("W_redistribute");
+    }
+  }
+
+  // ---- (b) ray 2: W(q, -conj z_i) = conj W(-q, z_i)   (ray-1 rows are read only)
+  Timer.start("W_dyson");   // the ray-2 values (counted with the Dyson)
+  auto half = [&](long row, long h) {   // the n1 nodes of ray h (0, 1) of group row `row`, flat
+    return v1_t(std::array<long, 1>{n1 * blk}, Pi.data() + (row * nz + h * n1) * blk);
+  };
+  for (long i = 0; i < g; ++i) conj_copy<MEM>(half(i, 1), half(mrow[i], 0));
+  if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+  Timer.stop("W_dyson");
+
+  // ---- (c) per unit {q, -q}: transposed ray-1 blocks by one exchange, then the fits
+  auto fit_row = [&](long ql, auto const &WT) {
+    auto W2  = nda::reshape(Pi(ql, all, all, all), std::array<long, 2>{nz, blk});
+    auto WT2 = nda::reshape(WT, std::array<long, 2>{nz, blk});
+    auto w2  = nda::reshape(w(w_row(ql), all, all, all), std::array<long, 2>{r, blk});
+    for (long c0 = 0; c0 < blk; c0 += bc) {
+      const auto cr = nda::range(c0, std::min(blk, c0 + bc));
+      auto Yc       = Y(all, nda::range(cr.size()));
+      nda::blas::gemm(ComplexType(1.0), U1H, W2(all, cr), ComplexType(0.0), Yc);
+      nda::blas::gemm(ComplexType(1.0), U2H, WT2(all, cr), ComplexType(1.0), Yc);
+      nda::blas::gemm(ComplexType(1.0), VS, Yc, ComplexType(0.0), w2(all, cr));
+    }
+  };
+  const std::array<long, 4> tgrid = {1, 1, grid.np_Q, grid.np_P};
+  for (long i = 0; i < g; ++i) {
+    const long j = mrow[i];
+    if (j < i) continue;
+    const long nu         = (j == i) ? 1 : 2;
+    const long rows[2]    = {i, j};
+    Timer.start("W_redistribute");
+    auto S = sS.template view<4>({nu, n1, nQ, nP});   // local transposed blocks: the piece (Q_rng, P_rng) of W^T
+    for (long u = 0; u < nu; ++u) transpose_blocks<MEM>(Pi(rows[u], nda::range(n1), all, all), S(u, all, all, all));
+    auto T = sT.template view<4>({nu, n1, nP, nQ});
+    const std::array<long, 4> gsh = {nu, n1, Np, Np};
+    dview_t dS(std::addressof(comm), tgrid, gsh, {0, 0, grid.Q0, grid.P0}, ones, S);
+    dview_t dT(std::addressof(comm), bgrid, gsh, {0, 0, grid.P0, grid.Q0}, ones, T);
+    math::nda::redistribute(dS, dT);   // T(u) = block (P_rng, Q_rng) of W(q_u, z_ray1)^T
+    if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+    Timer.stop("W_redistribute");
+    Timer.start("W_fit");
+    auto WT = sC.template view<3>({nz, nP, nQ});
+    for (long u = 0; u < nu; ++u) {
+      const long pu = (nu == 1) ? 0 : 1 - u;   // the partner -q
+      WT(nda::range(n1), all, all) = T(pu, all, all, all);
+      conj_copy<MEM>(v1_t(std::array<long, 1>{n1 * blk}, WT.data() + n1 * blk),
+                     v1_t(std::array<long, 1>{n1 * blk}, T.data() + u * n1 * blk));
+      fit_row(rows[u], WT);
+    }
+    if constexpr (MEM != HOST_MEMORY) {
+      utils::device_sync();
+      device_mem_probe();
+    }
+    Timer.stop("W_fit");
+  }
+
+  if (W_nodes != nullptr) *W_nodes = std::move(Pi);
+  Pi = arr4_t{};
+}
+
 } // namespace detail
 
 /**
@@ -340,6 +590,16 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
     utils::check(mrow[i] >= 0, "gw_line::screened_interaction: the q group does not contain -q = {} of q = {} (the residues of q "
                                "need W(-q), notes section 3.3: use pair-closed q groups, q_groups_t)",
                  Zb.qminus[qs[i]], qs[i]);
+  }
+  // perf 7.1 (b)/(c): mirror-symmetric nodes -> Dyson on ray 1, ray 2 by conjugation, transposed fit data by exchange
+  // (detail::screened_mirror); env COQUI_GWLINE_W_MIRROR = 0 keeps the path below
+  if (const long n1 = numerics::line_dlr::mirror_half(basis.zeta_nodes); n1 > 0 and detail::env_long("COQUI_GWLINE_W_MIRROR", 1) != 0) {
+    const long np_q = utils::find_proc_grid_max_npools(comm.size(), g, 0.2);
+    if (comm.size() / np_q <= n1) {
+      detail::screened_mirror<MEM>(Pi, Zb, basis, grid, mpi, w, Timer, W_nodes, qs, w_group, mrow, n1);
+      return;
+    }
+    app_log(2, "  gw_line W: {} zeta pools > {} ray-1 nodes: the full-node path is used", comm.size() / np_q, n1);
   }
   dyson_layout_t lay(comm.size(), comm.rank(), g, nz, Np);
   for (auto nm : {"W_redistribute", "W_dyson", "W_fit"}) Timer.add(nm);

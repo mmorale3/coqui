@@ -44,6 +44,7 @@
 #include "configuration.hpp"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
+#include "nda/tensor.hpp"
 #include "utilities/check.hpp"
 #include "utilities/device_pool.h"
 #if defined(ENABLE_CUDA)
@@ -125,6 +126,36 @@ void slab_conv([[maybe_unused]] long E, [[maybe_unused]] long nX, [[maybe_unused
   }
 #endif
   utils::check(false, "gw_line::slab_conv: device build with CUDA required");
+}
+
+/**
+ * Mirror combination of two equally shaped MEM slabs (perf 7.1 (a), polarization.hpp), with the old values on the right:
+ *   add  = true : U <- U + conj(V),  V <- V + conj(U)      (Pi = Pi^> + Pi^< with Pi^<(q, z) = conj Pi^>(-q, -conj z))
+ *   add  = false: U <- conj(V),      V <- conj(U)          (the hole sector alone)
+ * U and V may be the same slab (U = V: in place). Host: one pass; device: through a scratch copy and cuTENSOR adds with
+ * the conjugation op (exact).
+ */
+template <MEMORY_SPACE MEM>
+void mirror_combine(memory::array_view<MEM, ComplexType, 1> U, memory::array_view<MEM, ComplexType, 1> V, bool add,
+                    scratch_t<MEM> &scr) {
+  utils::check(U.size() == V.size(), "gw_line::mirror_combine: size mismatch {} vs {}", U.size(), V.size());
+  const long n = U.size();
+  if constexpr (MEM == HOST_MEMORY) {
+    if (U.data() == V.data()) {
+      for (long i = 0; i < n; ++i) U(i) = add ? U(i) + std::conj(U(i)) : std::conj(U(i));
+      return;
+    }
+    for (long i = 0; i < n; ++i) {
+      const ComplexType u = U(i), v = V(i);
+      U(i) = add ? u + std::conj(v) : std::conj(v);
+      V(i) = add ? v + std::conj(u) : std::conj(u);
+    }
+  } else {
+    auto T = scr.template view<1>({n});
+    T      = U;
+    nda::tensor::add(ComplexType(1.0), nda::conj(V), "a", ComplexType(add ? 1.0 : 0.0), U, "a");
+    if (U.data() != V.data()) nda::tensor::add(ComplexType(1.0), nda::conj(T), "a", ComplexType(add ? 1.0 : 0.0), V, "a");
+  }
 }
 
 /**

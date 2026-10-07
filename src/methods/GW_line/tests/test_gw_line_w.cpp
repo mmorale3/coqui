@@ -237,7 +237,7 @@ void run_v2(std::string const &fixture, long nI_factor) {
 
   // ---- per q (lockstep: thc.Z is collective)
   double a_pex = 0, e_psym = 0, e_wcq = 0, e_pex = 0, s_pc = 0, e_lex = 0, ewb = 0, ea = 0, sa = 0, eb = 0, sb = 0, ec = 0, sc = 0, ed = 0, sd = 0, ecn = 0, scn = 0, res_fit = 0, et = 0, st = 0;
-  double ee = 0, se = 0, e_wsym = 0, e_wold = 0, s_wsym = 0, e_zsym = 0, e_zold = 0, s_z = 0;
+  double ee = 0, se = 0, e_wsym = 0, e_wold = 0, s_wsym = 0, e_zsym = 0, e_zold = 0, s_z = 0, e_mir = 0;
   auto qm = mf->qminus();
   long n_self = 0;
   for (long iq = 0; iq < nq; ++iq) n_self += (qm(iq) == iq) ? 1 : 0;
@@ -284,13 +284,27 @@ void run_v2(std::string const &fixture, long nI_factor) {
     auto Wf = gather_full(comm, grid, Wn(iq, all, all, all));
     auto Wfm = self_q ? Wf : gather_full(comm, grid, Wn(jq, all, all, all));   // W(-q) at the nodes
     cmat Id = nda::eye<ComplexType>(Np);
-    // (a) Dyson by nda::inverse on the full matrices
+    // (a) Dyson by nda::inverse on the full matrices. Mirror-symmetric nodes (perf 7.1 (b)): the code solves the ray-1
+    //     nodes and sets W(q, -conj z_i) = conj W(-q, z_i); the reference does the same (Dyson of -q with Z(-q)); the
+    //     direct Dyson of q at the ray-2 nodes differs by the THC asymmetry of Z (info e_mir)
+    const long n1m = numerics::line_dlr::mirror_half(zeta);
+    auto Pfm       = (n1m > 0 and not self_q) ? gather_full(comm, grid, Pi0(jq, all, all, all)) : Pf;
     nda::array<ComplexType, 3> Wr(nz, Np, Np);
     for (long iz = 0; iz < nz; ++iz) {
       cmat P(Pf(iz, all, all));
       cmat A = Id - Zq * P;
       cmat Ai = nda::inverse(A);
       Wr(iz, all, all) = Ai * Zq - Zq;
+      if (n1m > 0 and iz >= n1m) {
+        cmat const &Zm = Z_all[jq];
+        cmat Pm(Pfm(iz - n1m, all, all));
+        cmat Wm = nda::inverse(cmat(Id - Zm * Pm)) * Zm - Zm;
+        for (long P_ = 0; P_ < Np; ++P_)
+          for (long Q_ = 0; Q_ < Np; ++Q_) {
+            e_mir = std::max(e_mir, std::abs(std::conj(Wm(P_, Q_)) - Wr(iz, P_, Q_)));
+            Wr(iz, P_, Q_) = std::conj(Wm(P_, Q_));
+          }
+      }
     }
     ea = std::max(ea, max_diff3(Wf, Wr));
     sa = std::max(sa, max_abs3(Wr));
@@ -407,7 +421,9 @@ void run_v2(std::string const &fixture, long nI_factor) {
   const double ra = ea / sa, rb = eb / sb, rc = ec / sc, rd = ed / sd, rcn = ecn / scn, rt = et / st, re = ee / se;
   app_log(2, "  [V2] {} ({} ranks, aux grid {}x{}, Dyson pools {}x{}):", fixture, comm.size(), grid.np_P, grid.np_Q, lay.np_q,
           lay.np_z);
-  app_log(2, "    (a) W at the {} nodes vs Dyson (nda::inverse) of the gathered Pi: rel {:.2e} (max|W| {:.3e})", nz, ra, sa);
+  app_log(2, "    (a) W at the {} nodes vs Dyson (nda::inverse) of the gathered Pi: rel {:.2e} (max|W| {:.3e}); mirror nodes (ray 2 = "
+             "conj W(-q) at ray 1, {} per ray) vs the direct Dyson of q there: {:.2e} (THC Z asymmetry)",
+          nz, ra, sa, numerics::line_dlr::mirror_half(zeta), e_mir / sa);
   app_log(2, "    (b) fit vs bosonic_basis_t::fit of the gathered W, as pole sums on nodes/ray points/i nu_n: rel {:.2e} (max|W| {:.3e}); "
              "raw residues differ by {:.1e} (non-unique, info); refit residual at the nodes {:.2e}",
           rb, sb, ewb, res_fit);
@@ -445,7 +461,8 @@ void run_v2(std::string const &fixture, long nI_factor) {
   // the imaginary part of Z); the W relation inherits it
   REQUIRE(e_zsym <= 1e-8 * s_z);
   REQUIRE(e_wsym / s_wsym <= 1e-10 + 10.0 * e_zsym / s_z);
-  REQUIRE(rcn <= 1e-10);
+  REQUIRE(rcn <= 1e-10 + 10.0 * e_zsym / s_z);   // ray-2 nodes from W(-q) with Z(-q): the THC asymmetry of Z (si211 1.7e-9)
+  REQUIRE(e_mir / sa <= 1e-11 + 10.0 * e_zsym / s_z);
   REQUIRE(rt <= 1e-9);
 }
 
