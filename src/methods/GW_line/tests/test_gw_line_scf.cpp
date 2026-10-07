@@ -710,9 +710,9 @@ ptree arr_child(std::vector<double> const &v) {
   }
   return a;
 }
-/// S9b: optics in the driver: after the loop (head of the last iteration), from a restart with nothing to iterate (head group of
-/// the checkpoint), from a checkpoint WITHOUT head groups (recomputed from the final poles, = the head of one more iteration),
-/// the flatter-line pass; the h5 layout
+/// S9b: optics in the driver: after the loop, from a restart with nothing to iterate, from a checkpoint WITHOUT head groups
+/// (recomputed from the final poles, = the head of one more iteration), the flatter-line pass; the h5 layout. perf 7.2: the runs
+/// are not converged, so the SCF-angle line is always recomputed from the final poles (optics.poles = "final")
 void optics_driver_test() {
   lih_t L;
   auto &comm = L.mpi->comm;
@@ -798,7 +798,8 @@ void optics_driver_test() {
           comm.size(), o.eps_inf_h, A.eps_inf.back(), o.fsum_h, o.fsum_m, o.K_h, o.K_m, dAB, dCD / sCD, A.optics_q0[1].eps_inf_h);
   REQUIRE(dAB == 0.0);
   REQUIRE(dCD <= 1e-10 * sCD);
-  REQUIRE(std::abs(o.eps_inf_h - A.eps_inf.back()) <= 1e-6 * A.eps_inf.back());
+  // perf 7.2: A is not converged (2 iterations): its SCF-angle optics come from a pass on the FINAL poles (= the head of iteration 3)
+  REQUIRE(std::abs(o.eps_inf_h - D.eps_inf.back()) <= 1e-6 * D.eps_inf.back());
   REQUIRE(std::abs(A.optics_q0[1].eps_inf_h - D.eps_inf.back()) <= 1e-6 * D.eps_inf.back());
   for (auto const &f : {fa, fc, fd}) remove_file(comm, f + ".gw_line.h5");
   for (auto const &f : {fa, fc, fd}) remove_file(comm, f + ".gw_line.sigma.h5");
@@ -2020,4 +2021,306 @@ TEST_CASE("gw_line_regression_dump", "[.gw_line_regression_dump]") {
     h5::h5_write(g, "scf_mu", R.mu);
   }
   remove_file(mpi.comm, "gw_line_regdump.gw_line.h5");
+}
+
+// ======================================================================================================================
+// perf 7.2: mixing (DIIS), spectra/optics consistency, warm starts, multilevel schedule (lih222, small settings)
+// ======================================================================================================================
+namespace {
+ptree p72_params(std::string const &f, long niter, bool restart = false) {
+  auto pt = scf_params(f, niter, restart, "id", "lehmann");
+  pt.put("lam_b", -1.0);   // auto (S7c)
+  return pt;
+}
+template <typename T, int R> void bcast_test(boost::mpi3::communicator &comm, nda::array<T, R> &A) {
+  std::array<long, R> shp{};
+  if (comm.root()) shp = A.shape();
+  comm.broadcast_n(shp.data(), R, 0);
+  if (not comm.root()) A.resize(shp);
+  if (A.size() > 0) comm.broadcast_n(A.data(), A.size(), 0);
+}
+void p72_table(std::string const &tag, gw_line_result_t const &R) {
+  for (auto const &h : R.history)
+    app_log(1, "  [{}] iter {}: level {} mix {:<6s} m {} resid {:.3e} dSigma {:.3e} residF {:.3e} mu {:.8f} gap {:.6f} eV", tag, h.iter,
+            h.level, h.mix, h.ndiis, h.resid, h.dSigma, h.residF, h.mu, h.gap * 27.211386);
+}
+} // namespace
+
+/// [mixing] linear vs DIIS (4 iterations each): the residual max|Sigma[G] - Sigma_in| of the linear run is dSigma / mixing
+/// (definition); the DIIS run extrapolates from iteration 2 and its residual after 4 iterations is below the linear run's;
+/// restart of a DIIS run: the history is not checkpointed, the first iteration after the restart is a 1-entry DIIS step
+/// (x + beta r), the restored history carries the mixing records.
+TEST_CASE("gw_line_scf_mixing", "[gw_line][scf][mixing]") {
+  lih_t L;
+  auto &comm = L.mpi->comm;
+  const long n = 4;
+  auto pl = p72_params("gw_line_mixL", n);
+  auto Lr = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pl);
+  auto pd = p72_params("gw_line_mixD", n);
+  pd.put("mixing_alg", "diis");
+  auto Dr = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pd);
+  p72_table("linear", Lr);
+  p72_table("diis", Dr);
+  REQUIRE(long(Lr.history.size()) == n);
+  REQUIRE(long(Dr.history.size()) == n);
+  REQUIRE(Lr.history[0].mix == "none");
+  REQUIRE(Dr.history[0].mix == "none");
+  for (long i = 1; i < n; ++i) {
+    REQUIRE(Lr.history[i].mix == "linear");
+    REQUIRE(std::abs(Lr.history[i].dSigma - 0.5 * Lr.history[i].resid) <= 1e-12 * Lr.history[i].resid);
+    REQUIRE(Dr.history[i].mix == "diis");
+    REQUIRE(Dr.history[i].ndiis == std::min(i, 6L));
+    REQUIRE(std::isfinite(Dr.history[i].resid));
+  }
+  // iteration 2 is identical up to the mixing step (same G_1); DIIS with 1 entry and beta 1 = mixing 1
+  REQUIRE(Dr.history[1].resid == Lr.history[1].resid);
+  REQUIRE(Dr.history[n - 1].resid < Lr.history[n - 1].resid);
+  // restart: 2 + restart + 2
+  auto p2 = p72_params("gw_line_mixR", 2);
+  p2.put("mixing_alg", "diis");
+  auto R2 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, p2);
+  auto p4 = p72_params("gw_line_mixR", n, true);
+  p4.put("mixing_alg", "diis");
+  auto R4 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, p4);
+  p72_table("diis 2 + restart + 2", R4);
+  REQUIRE(long(R4.history.size()) == n);
+  REQUIRE(R4.history[1].mix == "diis");
+  REQUIRE(R4.history[1].resid == Dr.history[1].resid);   // restored record
+  REQUIRE(R4.history[2].mix == "diis");
+  REQUIRE(R4.history[2].ndiis == 1);                     // rebuilt history
+  REQUIRE(R4.history[3].ndiis == 2);
+  REQUIRE(R4.history[3].resid < 2.0 * Lr.history[3].resid);
+  app_log(1, "[mixing] ranks {}: residual after {} iterations: linear {:.3e}, diis {:.3e}, diis with a restart after 2 {:.3e}", comm.size(),
+          n, Lr.history[n - 1].resid, Dr.history[n - 1].resid, R4.history[n - 1].resid);
+  for (auto f : {"gw_line_mixL", "gw_line_mixD", "gw_line_mixR"}) remove_file(comm, std::string(f) + ".gw_line.h5");
+}
+
+/// [spectra_F] the spectra are those of the stored G: niter = 1 from the KS start: F_closure = F[D_KS] (iteration 0 F,
+/// bitwise), the QP edges of the spectra = those of the closure of iteration 1 (same upfolded G; before 7.2 the spectra used
+/// F[D_1]); restart with nothing to iterate: F_closure restored, identical spectra.
+TEST_CASE("gw_line_scf_spectra_F", "[gw_line][scf][spectra_F]") {
+  lih_t L;
+  auto &comm = L.mpi->comm;
+  auto pt    = p72_params("gw_line_spF", 1);
+  enable_spectra(pt, 41);
+  auto R = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
+  REQUIRE(R.spectra.has_value());
+  nda::array<ComplexType, 3> F0;
+  if (comm.root()) {
+    h5::file f("gw_line_spF.gw_line.h5", 'r');
+    h5::group g(f);
+    nda::h5_read(g, "scf_line/iter0/F", F0);
+  }
+  bcast_test(comm, F0);
+  const double dF0 = nda::max_element(nda::abs(R.F_closure - F0));
+  const double dF1 = nda::max_element(nda::abs(R.F - R.F_closure));
+  auto const &h    = R.history[0];
+  const double dh = std::abs(R.spectra->e_homo - h.e_homo), dl = std::abs(R.spectra->e_lumo - h.e_lumo);
+  app_log(1, "[spectra_F] ranks {}: F_closure - F[D_KS] {:.1e}, F[D_1] - F_closure {:.3e} Ha; spectra edges vs closure of iteration 1: "
+             "homo {:.2e} lumo {:.2e} Ha (gap {:.6f} vs {:.6f} eV)",
+          comm.size(), dF0, dF1, dh, dl, (R.spectra->e_lumo - R.spectra->e_homo) * 27.211386, h.gap * 27.211386);
+  REQUIRE(dF0 == 0.0);
+  REQUIRE(dF1 > 1e-6);
+  REQUIRE(dh < 1e-6);
+  REQUIRE(dl < 1e-6);
+  auto pr = p72_params("gw_line_spF", 1, true);
+  enable_spectra(pr, 41);
+  auto R2 = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pr);
+  REQUIRE(R2.spectra.has_value());
+  REQUIRE(nda::max_element(nda::abs(R2.F_closure - R.F_closure)) == 0.0);
+  REQUIRE(nda::max_element(nda::abs(R2.spectra->A_diag - R.spectra->A_diag)) == 0.0);
+  remove_file(comm, "gw_line_spF.gw_line.h5");
+}
+
+/// [qp_start] start = "qp_diag": one Pi -> W -> Sigma pass on the KS poles (not an iteration), KS vectors + diagonal QP
+/// energies (iteration 0 poles: unit vectors, mu = QP mid-gap, F = F[D_KS]); start = "qp_file": the energies of a file
+/// (KS + scissor) become the iteration-0 poles exactly.
+TEST_CASE("gw_line_scf_qp_start", "[gw_line][scf][qp_start]") {
+  lih_t L;
+  auto &comm = L.mpi->comm;
+  auto &mf   = *L.mf;
+  const long nk = mf.nkpts(), nb = mf.nbnd(), nocc = long(std::llround(mf.nelec() / 2.0));
+  auto pq    = p72_params("gw_line_qpd", 2);
+  pq.put("start", "qp_diag");
+  auto Q = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, mf, pq);
+  p72_table("qp_diag", Q);
+  REQUIRE(Q.history.size() == 2);
+  REQUIRE(Q.start_time > 0.0);
+  REQUIRE(Q.eps_inf.size() == 2);
+  double ks_gap = 0.0, qp_gap = 0.0, mu0 = 0.0;
+  {
+    double h = -1e300, l = 1e300;
+    for (long k = 0; k < nk; ++k)
+      for (long b = 0; b < nb; ++b) (b < nocc ? h : l) = (b < nocc ? std::max(h, mf.eigval()(0, k, b)) : std::min(l, mf.eigval()(0, k, b)));
+    ks_gap = l - h;
+  }
+  if (comm.root()) {
+    h5::file f("gw_line_qpd.gw_line.h5", 'r');
+    h5::group g(f);
+    auto it0 = g.open_group("scf_line/iter0");
+    double eh = 0, el = 0;
+    h5::h5_read(it0, "e_homo", eh);
+    h5::h5_read(it0, "e_lumo", el);
+    h5::h5_read(it0, "mu", mu0);
+    qp_gap = el - eh;
+    long sd = 0;
+    h5::h5_read(g.open_group("scf_line"), "start_done", sd);
+    REQUIRE(sd == 1);
+    REQUIRE(std::abs(eh + el) < 1e-12);   // mu = QP mid-gap
+  }
+  comm.broadcast_n(&qp_gap, 1, 0);
+  app_log(1, "[qp_start] qp_diag: KS gap {:.4f} eV -> diagonal G0W0 QP gap {:.4f} eV; first iteration gap {:.4f} eV (start pass {:.1f} s)",
+          ks_gap * 27.211386, qp_gap * 27.211386, Q.history[0].gap * 27.211386, Q.start_time);
+  REQUIRE(qp_gap > ks_gap);
+  REQUIRE(Q.history[0].mix == "none");
+  REQUIRE(Q.history[1].mix == "linear");
+  // qp_file: KS + 0.05 Ha scissor on the conduction bands
+  nda::array<double, 2> E(nk, nb);
+  for (long k = 0; k < nk; ++k)
+    for (long b = 0; b < nb; ++b) E(k, b) = mf.eigval()(0, k, b) + (b < nocc ? 0.0 : 0.05);
+  if (comm.root()) {
+    h5::file f("gw_line_qpf_energies.h5", 'w');
+    h5::group g(f);
+    nda::h5_write(g, "qp_energies", E, false);
+  }
+  comm.barrier();
+  auto pf = p72_params("gw_line_qpf", 1);
+  pf.put("start", "qp_file");
+  pf.put("start_file", "gw_line_qpf_energies.h5");
+  auto Fr = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, mf, pf);
+  REQUIRE(Fr.history.size() == 1);
+  if (comm.root()) {
+    h5::file f("gw_line_qpf.gw_line.h5", 'r');
+    h5::group g(f);
+    auto it0 = g.open_group("scf_line/iter0");
+    double mu = 0.0;
+    h5::h5_read(it0, "mu", mu);
+    nda::array<double, 1> ep, eh;
+    nda::array<long, 1> cp, ch;
+    nda::h5_read(it0, "poles/particle_e", ep);
+    nda::h5_read(it0, "poles/hole_e", eh);
+    nda::h5_read(it0, "poles/particle_counts", cp);
+    nda::h5_read(it0, "poles/hole_counts", ch);
+    double d = 0.0;
+    long op = 0, oh = 0;
+    for (long k = 0; k < nk; ++k) {
+      REQUIRE(ch(k) == nocc);
+      REQUIRE(cp(k) == nb - nocc);
+      for (long b = 0; b < nocc; ++b) d = std::max(d, std::abs(eh(oh++) - (E(k, b) - mu)));
+      for (long b = nocc; b < nb; ++b) d = std::max(d, std::abs(ep(op++) - (E(k, b) - mu)));
+    }
+    app_log(1, "[qp_start] qp_file: iteration-0 poles vs file energies - mu: {:.1e}", d);
+    REQUIRE(d == 0.0);
+  }
+  for (auto f : {"gw_line_qpd", "gw_line_qpf"}) remove_file(comm, std::string(f) + ".gw_line.h5");
+  remove_file(comm, "gw_line_qpf_energies.h5");
+}
+
+/// [multilevel] coarse = { niter 1, eps 1e-6, K 6, nodes_per_ray 60, time_eps 1e-6 } then production: levels 1, 0, 0; the
+/// coarse Sigma is dropped at the switch (iteration 2 unmixed), the production iterations equal those of a run started from
+/// the coarse iteration's poles (same Sigma bases and nodes as a cold production run).
+TEST_CASE("gw_line_scf_multilevel", "[gw_line][scf][multilevel]") {
+  lih_t L;
+  auto &comm = L.mpi->comm;
+  auto pm    = p72_params("gw_line_ml", 3);
+  pm.put("coarse.niter", 1);
+  pm.put("coarse.eps", 1e-6);
+  pm.put("coarse.K", 6);
+  pm.put("coarse.nodes_per_ray", 60);
+  pm.put("coarse.time_eps", 1e-6);
+  auto M = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pm);
+  p72_table("multilevel", M);
+  auto C = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, p72_params("gw_line_mlc", 3));
+  p72_table("cold", C);
+  REQUIRE(M.history.size() == 3);
+  REQUIRE(M.history[0].level == 1);
+  REQUIRE(M.history[1].level == 0);
+  REQUIRE(M.history[2].level == 0);
+  REQUIRE(M.history[1].mix == "none");
+  REQUIRE(M.history[2].mix == "linear");
+  REQUIRE(M.Sig_p.extent(1) == C.Sig_p.extent(1));   // production nodes at the end
+  // restart after the coarse iteration (M's checkpoint truncated to iteration 1) = M's production iterations (bitwise)
+  auto pr = pm;
+  pr.put("output", "gw_line_mlr");
+  pr.put("restart", true);
+  if (comm.root()) {
+    std::filesystem::copy_file("gw_line_ml.gw_line.h5", "gw_line_mlr.gw_line.h5", std::filesystem::copy_options::overwrite_existing);
+    h5::file f("gw_line_mlr.gw_line.h5", 'a');
+    h5::group g(f);
+    auto sg = g.open_group("scf_line");
+    h5::h5_write(sg, "final_iter", long(1));
+    sg.unlink("iter2");
+    sg.unlink("iter3");
+  }
+  comm.barrier();
+  auto R = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pr);
+  const double dmu = std::abs(R.mu - M.mu), dpo = maxdiff_poles(R.poles, M.poles);
+  app_log(1, "[multilevel] ranks {}: mu {:.8f} (cold {:.8f}), gap {:.6f} eV (cold {:.6f}); restart after the coarse iteration: |dmu| {:.1e} "
+             "poles {:.1e}; time per iteration coarse {:.1f} s, production {:.1f} s",
+          comm.size(), M.mu, C.mu, M.history[2].gap * 27.211386, C.history[2].gap * 27.211386, dmu, dpo, M.history[0].time,
+          M.history[2].time);
+  REQUIRE(dmu == 0.0);
+  REQUIRE(dpo == 0.0);
+  for (auto f : {"gw_line_ml", "gw_line_mlc", "gw_line_mlr"}) remove_file(comm, std::string(f) + ".gw_line.h5");
+}
+
+/// [optics_initial] optics.poles = "initial" in a niter = 1 run (G0W0 next to RPA@KS): every optics line from the KS poles. SCF
+/// angle: the head of iteration 1 (bitwise the checkpoint's iter1/head); vs a niter = 0 run (final poles = KS, the heads from
+/// passes): SCF-angle heads equal to the kernel accuracy, flatter line (both passes on the KS poles) bitwise.
+TEST_CASE("gw_line_scf_optics_initial", "[gw_line][scf][optics_initial]") {
+  lih_t L;
+  auto &comm = L.mpi->comm;
+  auto par   = [&](std::string const &f, long n, std::string const &poles) {
+    auto pt = p72_params(f, n);
+    pt.put("div_treatment", "gygi");
+    pt.put("eps", 1e-10);
+    pt.put("optics.enable", true);
+    pt.put("optics.wmin", 0.0);
+    pt.put("optics.wmax", 1.0);
+    pt.put("optics.nw", 101);
+    pt.add_child("optics.eta_rel", arr_child({0.05}));
+    pt.put("optics.theta_deg", 10.0);
+    pt.put("optics.poles", poles);
+    return pt;
+  };
+  auto A = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, par("gw_line_oiA", 1, "initial"));
+  auto B = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, par("gw_line_oiB", 0, "final"));
+  REQUIRE(A.optics_q0.size() == 2);
+  REQUIRE(B.optics_q0.size() == 2);
+  double d20 = 0.0, s20 = 0.0, d10 = 0.0, dit = 0.0;
+  if (comm.root()) {
+    h5::file fa("gw_line_oiA.gw_line.h5", 'r'), fb("gw_line_oiB.gw_line.h5", 'r');
+    h5::group ga(fa), gb(fb);
+    nda::array<ComplexType, 2> a20, b20, a10, b10, h1;
+    nda::h5_read(ga, "optics/theta20.0/h_nodes", a20);
+    nda::h5_read(gb, "optics/theta20.0/h_nodes", b20);
+    nda::h5_read(ga, "optics/theta10.0/h_nodes", a10);
+    nda::h5_read(gb, "optics/theta10.0/h_nodes", b10);
+    nda::h5_read(ga, "scf_line/iter1/head/h_nodes", h1);
+    std::string sa, sb;
+    h5::h5_read(ga, "optics/theta20.0/source", sa);
+    h5::h5_read(gb, "optics/theta20.0/source", sb);
+    app_log(1, "  sources: initial run: \"{}\"; niter 0 run: \"{}\"", sa, sb);
+    REQUIRE(sa.find("iteration 1") != std::string::npos);
+    REQUIRE(a20.shape() == b20.shape());
+    REQUIRE(a10.shape() == b10.shape());
+    d20 = nda::max_element(nda::abs(a20 - b20));
+    s20 = nda::max_element(nda::abs(b20));
+    d10 = nda::max_element(nda::abs(a10 - b10));
+    dit = nda::max_element(nda::abs(a20 - h1));
+  }
+  comm.broadcast_n(&d20, 1, 0);
+  comm.broadcast_n(&s20, 1, 0);
+  comm.broadcast_n(&d10, 1, 0);
+  comm.broadcast_n(&dit, 1, 0);
+  app_log(1, "[optics_initial] ranks {}: SCF-angle head (iteration 1) vs the niter = 0 pass {:.1e} (rel), vs iter1/head {:.1e}; 10-deg "
+             "line initial (niter 1) vs niter 0: {:.1e}; eps_inf {:.8f} / {:.8f}",
+          comm.size(), d20 / s20, dit, d10, A.optics_q0[0].eps_inf_h, B.optics_q0[0].eps_inf_h);
+  REQUIRE(dit == 0.0);
+  REQUIRE(d20 <= 1e-9 * s20);
+  REQUIRE(d10 == 0.0);
+  for (auto f : {"gw_line_oiA", "gw_line_oiB"}) {
+    remove_file(comm, std::string(f) + ".gw_line.h5");
+    remove_file(comm, std::string(f) + ".gw_line.sigma.h5");
+  }
 }

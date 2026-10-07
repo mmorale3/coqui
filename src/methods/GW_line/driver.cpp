@@ -69,6 +69,8 @@
 #include "methods/GW_line/head_pass.hpp"
 #include "methods/GW_line/optics.hpp"
 #include "methods/GW_line/k_dist.hpp"
+#include "methods/GW_line/scf_mixing.hpp"
+#include "methods/GW_line/warm_start.hpp"
 #include "methods/GW_line/driver.hpp"
 
 namespace methods::gw_line {
@@ -174,6 +176,47 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   utils::check(head_div_is_gygi(p.head_extrapolation), "gw_line: head_extrapolation must be a gygi variant (got \"{}\")",
                p.head_extrapolation);
   p.optics = optics_params_t::from_ptree(pt);   // S9b
+  p.optics_poles = io::get_value_with_default<std::string>(pt, "optics.poles", p.optics_poles);   // perf 7.2
+  io::tolower(p.optics_poles);
+  utils::check(p.optics_poles == "final" or p.optics_poles == "initial",
+               "gw_line: optics.poles must be \"final\" or \"initial\" (got \"{}\")", p.optics_poles);
+  // perf 7.2: mixing algorithm, warm start, multilevel schedule
+  p.mix.alg    = io::get_value_with_default<std::string>(pt, "mixing_alg", p.mix.alg);
+  io::tolower(p.mix.alg);
+  p.mix.mixing = p.mixing;
+  p.mix.hist   = io::get_value_with_default<long>(pt, "diis_hist", p.mix.hist);
+  p.mix.start  = io::get_value_with_default<long>(pt, "diis_start", p.mix.start);
+  p.mix.beta   = io::get_value_with_default<double>(pt, "diis_beta", p.mix.beta);
+  p.mix.reg    = io::get_value_with_default<double>(pt, "diis_reg", p.mix.reg);
+  p.mix.cmax   = io::get_value_with_default<double>(pt, "diis_cmax", p.mix.cmax);
+  p.mix.grow   = io::get_value_with_default<double>(pt, "diis_grow", p.mix.grow);
+  p.mix.mix_F  = io::get_value_with_default<bool>(pt, "diis_mix_F", p.mix.mix_F);
+  p.mix.wF     = io::get_value_with_default<double>(pt, "diis_wF", p.mix.wF);
+  utils::check(p.mix.alg == "linear" or p.mix.alg == "diis", "gw_line: mixing_alg must be \"linear\" or \"diis\" (got \"{}\")",
+               p.mix.alg);
+  utils::check(p.mix.hist >= 1 and p.mix.beta > 0.0 and p.mix.reg >= 0.0 and p.mix.cmax > 1.0 and p.mix.grow > 1.0,
+               "gw_line: need diis_hist >= 1, diis_beta > 0, diis_reg >= 0, diis_cmax > 1, diis_grow > 1");
+  p.start         = io::get_value_with_default<std::string>(pt, "start", p.start);
+  io::tolower(p.start);
+  p.start_file    = io::get_value_with_default<std::string>(pt, "start_file", p.start_file);
+  p.start_dataset = io::get_value_with_default<std::string>(pt, "start_dataset", p.start_dataset);
+  p.start_eta     = io::get_value_with_default<double>(pt, "start_eta", p.start_eta);
+  utils::check(p.start == "ks" or p.start == "qp_diag" or p.start == "qp_file",
+               "gw_line: start must be \"ks\", \"qp_diag\" or \"qp_file\" (got \"{}\")", p.start);
+  utils::check(p.start != "qp_file" or not p.start_file.empty(), "gw_line: start = \"qp_file\" needs start_file");
+  utils::check(p.start_eta > 0.0, "gw_line: start_eta must be > 0");
+  p.coarse_niter         = io::get_value_with_default<long>(pt, "coarse.niter", p.coarse_niter);
+  p.coarse_eps           = io::get_value_with_default<double>(pt, "coarse.eps", p.coarse_eps);
+  p.coarse_K             = io::get_value_with_default<long>(pt, "coarse.K", p.coarse_K);
+  p.coarse_nodes_per_ray = io::get_value_with_default<long>(pt, "coarse.nodes_per_ray", p.coarse_nodes_per_ray);
+  p.coarse_time_eps      = io::get_value_with_default<double>(pt, "coarse.time_eps", p.coarse_eps);
+  utils::check(p.coarse_niter >= 0 and p.coarse_eps > 0.0 and p.coarse_eps < 1.0 and p.coarse_K >= 1 and
+                   p.coarse_nodes_per_ray > 1 and p.coarse_time_eps > 0.0 and p.coarse_time_eps < 1.0,
+               "gw_line: invalid coarse = {{ niter, eps, K, nodes_per_ray, time_eps }}");
+  utils::check(p.coarse_niter == 0 or p.bases_file.empty(), "gw_line: coarse.niter > 0 is incompatible with bases_file");
+  utils::check(p.coarse_niter == 0 or p.niter >= p.coarse_niter + 2,
+               "gw_line: niter ({}) must be >= coarse.niter + 2 ({}): the run ends with >= 2 production iterations", p.niter,
+               p.coarse_niter + 2);
   utils::check(p.theta_deg > 0.0 and p.theta_deg < 90.0, "gw_line: theta_deg must be in (0, 90)");
   utils::check(p.eps > 0.0 and p.lam > 0.0, "gw_line: eps, lam must be > 0");
   utils::check(p.g_gap >= 0.0 and p.g_gap < p.lam, "gw_line: g_gap must be in [0, lam)");
@@ -244,6 +287,20 @@ void gw_line_params_t::log() const {
   if (not bases_file.empty()) app_log(1, "    DIAGNOSTIC: real-pole bases read from {}", bases_file);
   app_log(1, "    niter = {} (total), mixing = {}, conv_thr = {:.1e}, t_chunk = {}, ray_decades = {}", niter, mixing, conv_thr,
           t_chunk, ray_decades);
+  if (mix.alg == "diis")
+    app_log(1, "    mixing algorithm: DIIS (Anderson/Pulay on Sigma at the nodes{}): history {}, from iteration {} (before: linear "
+               "{}), beta {}, reg {:.1e}, reset if max|c| > {} or |r| > {} x the best",
+            mix.mix_F ? " and F" : "", mix.hist, mix.start, mixing, mix.beta, mix.reg, mix.cmax, mix.grow);
+  else
+    app_log(1, "    mixing algorithm: linear (Sigma at the nodes, F unmixed)");
+  if (start == "ks") app_log(1, "    start: KS poles");
+  else if (start == "qp_diag")
+    app_log(1, "    start: qp_diag (one Pi -> W -> Sigma pass on the KS poles, diagonal QP equation, eta {:.1e} Ha; KS vectors + QP "
+               "energies)", start_eta);
+  else app_log(1, "    start: qp_file (KS vectors + the QP energies of {}{})", start_file, start_dataset.empty() ? "" : ":" + start_dataset);
+  if (coarse_niter > 0)
+    app_log(1, "    multilevel: iterations 1..{} at eps {:.1e}, K {}, {} nodes per ray, time_eps {:.1e}; then production", coarse_niter,
+            coarse_eps, coarse_K, coarse_nodes_per_ray, coarse_time_eps);
   if (time_grid == "id")
     app_log(1, "    time grid: ID (time_eps = {:.1e}, time_pad = {}, time_oversample = {}, time_snap = {}), rebuilt every iteration",
             time_eps, time_pad, time_oversample, time_snap);
@@ -262,8 +319,10 @@ void gw_line_params_t::log() const {
   } else {
     app_log(1, "    spectra: off");
   }
-  if (optics.enable) optics.log();
-  else app_log(1, "    optics: off");
+  if (optics.enable) {
+    optics.log();
+    app_log(1, "    optics G: {} poles", optics_poles);
+  } else app_log(1, "    optics: off");
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -447,6 +506,11 @@ void write_history(h5::group &g, gw_line_iter_t const &r) {
   h5::h5_write(hg, "pruned_w_weight", r.pruned_w_weight);
   h5::h5_write(hg, "pruned_near", r.pruned_near);
   h5::h5_write(hg, "pruned_near_weight", r.pruned_near_weight);
+  h5::h5_write(hg, "resid", r.resid);   // perf 7.2
+  h5::h5_write(hg, "residF", r.residF);
+  h5::h5_write(hg, "mix", r.mix);
+  h5::h5_write(hg, "ndiis", r.ndiis);
+  h5::h5_write(hg, "level", r.level);
 }
 
 gw_line_iter_t read_history(h5::group &g) {
@@ -486,6 +550,13 @@ gw_line_iter_t read_history(h5::group &g) {
     h5::h5_read(hg, "pruned_w_weight", r.pruned_w_weight);
     h5::h5_read(hg, "pruned_near", r.pruned_near);
     h5::h5_read(hg, "pruned_near_weight", r.pruned_near_weight);
+  }
+  if (hg.has_dataset("resid")) {   // absent before perf 7.2
+    h5::h5_read(hg, "resid", r.resid);
+    h5::h5_read(hg, "residF", r.residF);
+    h5::h5_read(hg, "mix", r.mix);
+    h5::h5_read(hg, "ndiis", r.ndiis);
+    h5::h5_read(hg, "level", r.level);
   }
   return r;
 }
@@ -535,6 +606,18 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "div_treatment", p.div_treatment);
   h5::h5_write(ig, "hf_div_treatment", p.hf_div_treatment);
   h5::h5_write(ig, "head_extrapolation", p.head_extrapolation);
+  h5::h5_write(ig, "mixing_alg", p.mix.alg);   // perf 7.2
+  h5::h5_write(ig, "diis_hist", p.mix.hist);
+  h5::h5_write(ig, "diis_start", p.mix.start);
+  h5::h5_write(ig, "diis_beta", p.mix.beta);
+  h5::h5_write(ig, "diis_mix_F", long(p.mix.mix_F ? 1 : 0));
+  h5::h5_write(ig, "start", p.start);
+  h5::h5_write(ig, "start_file", p.start_file);
+  h5::h5_write(ig, "coarse_niter", p.coarse_niter);
+  h5::h5_write(ig, "coarse_eps", p.coarse_eps);
+  h5::h5_write(ig, "coarse_K", p.coarse_K);
+  h5::h5_write(ig, "coarse_nodes_per_ray", p.coarse_nodes_per_ray);
+  h5::h5_write(ig, "coarse_time_eps", p.coarse_time_eps);
   nda::h5_write(ig, "fermionic_nodes", zeta, false);
 }
 
@@ -543,6 +626,7 @@ struct state_t {
   long iter = 0;
   double mu = 0.0, mu_sigma = 0.0, dmu = 0.0, e_homo = 0.0, e_lumo = 0.0;
   nda::array<ComplexType, 3> F;
+  nda::array<ComplexType, 3> F_cl;   ///< perf 7.2: the F of the closure that built `poles` (iteration 0: F)
   pole_data_t poles;
   bool have_sigma = false;
   nda::array<ComplexType, 4> Sig_p, Sig_h;
@@ -649,6 +733,7 @@ void write_state(boost::mpi3::communicator &comm, std::string const &file, state
     h5::h5_write(it, "e_homo", st.e_homo);
     h5::h5_write(it, "e_lumo", st.e_lumo);
     nda::h5_write(it, "F", st.F, false);
+    nda::h5_write(it, "F_closure", st.F_cl, false);   // perf 7.2
     if (st.have_sigma and sigma_all) {
       nda::h5_write(it, "Sigma_p", Sp, false);
       nda::h5_write(it, "Sigma_h", Sh, false);
@@ -663,7 +748,13 @@ void write_state(boost::mpi3::communicator &comm, std::string const &file, state
   comm.barrier();
 }
 
-static constexpr int NHIST = 31;   ///< columns of the broadcast history table
+static constexpr int NHIST = 36;   ///< columns of the broadcast history table
+static const std::vector<std::string> mix_names = {"none", "linear", "diis", "reset"};
+double mix_code(std::string const &m) {
+  auto it = std::find(mix_names.begin(), mix_names.end(), m);
+  return it == mix_names.end() ? 0.0 : double(std::distance(mix_names.begin(), it));
+}
+std::string mix_name(long c) { return (c >= 0 and c < long(mix_names.size())) ? mix_names[c] : std::string("none"); }
 
 /// Root reads scf_line/final_iter (+ the history of iterations 1..final_iter), everything is broadcast.
 state_t read_state(boost::mpi3::communicator &comm, std::string const &file, long nk, long nb,
@@ -691,6 +782,12 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     h5::h5_read(it, "e_homo", st.e_homo);
     h5::h5_read(it, "e_lumo", st.e_lumo);
     nda::h5_read(it, "F", st.F);
+    if (it.has_dataset("F_closure")) nda::h5_read(it, "F_closure", st.F_cl);   // perf 7.2
+    else {
+      app_log(1, "  restart: {} iteration {} has no F_closure (pre-7.2 checkpoint): the spectra use F[D] of the final poles", file,
+              st.iter);
+      st.F_cl = st.F;
+    }
     st.have_sigma = it.has_dataset("Sigma_p");
     if (st.have_sigma) {
       nda::h5_read(it, "Sigma_p", st.Sig_p);
@@ -725,7 +822,7 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
                          r.sigma_gap_h, r.time, r.time_grid == "id" ? 1.0 : 0.0, double(r.nt_pi_p), double(r.nt_pi_h),
                          double(r.nt_sig_p), double(r.nt_sig_h), r.g_repr == "lehmann" ? 1.0 : 0.0, double(r.ng_min),
                          double(r.ng_max), r.g_emin, double(r.pruned_w), r.pruned_w_weight, double(r.pruned_near),
-                         r.pruned_near_weight};
+                         r.pruned_near_weight, r.resid, r.residF, mix_code(r.mix), double(r.ndiis), double(r.level)};
       for (int j = 0; j < NHIST; ++j) hist(i - 1, j) = v[j];
     }
   }
@@ -739,6 +836,7 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
   st.e_lumo     = sc[5];
   st.have_sigma = sc[6] > 0.5;
   bcast_array(comm, st.F);
+  bcast_array(comm, st.F_cl);
   if (st.have_sigma and kd != nullptr) {   // k-distributed: every rank receives the rows of its k only
     st.Sig_p = kd_scatter_full(comm, *kd, st.Sig_p);
     st.Sig_h = kd_scatter_full(comm, *kd, st.Sig_h);
@@ -764,6 +862,8 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     r.ng_min = long(std::llround(hist(i, 24))); r.ng_max = long(std::llround(hist(i, 25))); r.g_emin = hist(i, 26);
     r.pruned_w = long(std::llround(hist(i, 27))); r.pruned_w_weight = hist(i, 28);
     r.pruned_near = long(std::llround(hist(i, 29))); r.pruned_near_weight = hist(i, 30);
+    r.resid = hist(i, 31); r.residF = hist(i, 32); r.mix = mix_name(long(std::llround(hist(i, 33))));
+    r.ndiis = long(std::llround(hist(i, 34))); r.level = long(std::llround(hist(i, 35)));
     history.push_back(r);
   }
   return st;
@@ -1014,7 +1114,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   // fixed grids and bases
   const double theta = prm.theta_deg * std::numbers::pi / 180.0, theta_t = 0.5 * theta;
   auto zeta          = numerics::line_dlr::dense_nodes(theta, prm.node_tmin, prm.node_tmax, prm.nodes_per_ray);
-  const long nz      = zeta.size();
+  long nz            = zeta.size();
+  const auto zeta_prod = zeta;   // perf 7.2: the production nodes (checkpoint input group; zeta may be a coarse level's)
   Timer.start("bases");
   line_basis_t gp(theta, prm.lam, prm.eps, prm.lam, prm.g_gap, -1.0, prm.node_tmax);
   line_basis_t gh(theta, prm.lam, prm.eps, prm.g_gap, prm.lam, -1.0, prm.node_tmax);
@@ -1068,7 +1169,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   aux_grid_t grid(mpi, Np);
   propagator_t<MEM> prop(thc, grid);
   if (restart) {
-    st = read_state(comm, chk, nk, nb, zeta, res.history, kdp);
+    st = read_state(comm, chk, nk, nb, zeta_prod, res.history, kdp);
     app_log(1, "  resumed from {}: {} iterations done, mu {:.6f} Ha", chk, st.iter, st.mu);
   } else {
     st.iter     = 0;
@@ -1081,7 +1182,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     if (comm.root()) {
       h5::file f(chk, 'a');
       h5::group g(f);
-      write_input(g, prm, zeta);
+      write_input(g, prm, zeta_prod);
     }
     comm.barrier();
   }
@@ -1089,11 +1190,12 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   // bosonic basis (rebuilt when its gap changes), Sigma bases (rebuilt when their gaps change)
   std::optional<bosonic_basis_t> bos;
   std::optional<line_basis_t> bp, bh;
+  double lv_eps = prm.eps, lv_time_eps = prm.time_eps;   // perf 7.2: eps / time_eps of the current level
   auto update_bases = [&]() {
     Timer.start("bases");
     const double bgap = prm.bos_gap >= 0.0 ? prm.bos_gap : 0.5 * (st.e_lumo - st.e_homo);
     if (not bos or bos->gap != bgap) {
-      bos.emplace(theta, prm.lam_b, prm.eps, bgap);
+      bos.emplace(theta, prm.lam_b, lv_eps, bgap);
       if (not prm.bases_file.empty()) {
         bos->nu   = read_w("bos_nu");
         bos->rank = bos->nu.size();
@@ -1108,11 +1210,11 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       ghh = 0.8 * (std::abs(st.e_homo) + bos->gap);
     }
     if (not bp or bp->gap[1] != gpp) {
-      bp.emplace(theta, prm.lam, prm.eps, prm.lam, gpp, -1.0, prm.node_tmax);
+      bp.emplace(theta, prm.lam, lv_eps, prm.lam, gpp, -1.0, prm.node_tmax);
       set_line_basis(*bp, "sigma_particle_w");
     }
     if (not bh or bh->gap[0] != ghh) {
-      bh.emplace(theta, prm.lam, prm.eps, ghh, prm.lam, -1.0, prm.node_tmax);
+      bh.emplace(theta, prm.lam, lv_eps, ghh, prm.lam, -1.0, prm.node_tmax);
       set_line_basis(*bh, "sigma_hole_w");
     }
     Timer.stop("bases");
@@ -1123,9 +1225,11 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
 
   dyson_layout_t lay(comm.size(), comm.rank(), nq, bos->zeta_nodes.size(), Np);
   // q groups of the Pi -> W stage (S7e): all q at once unless the Pi group does not fit (device) or COQUI_GWLINE_QGROUP
-  const q_plan_t qplan = choose_q_plan<MEM>(comm, grid, nk, nq, long(bos->zeta_nodes.size()), bos->rank, nb);
-  const q_groups_t qg(nq, qplan.g, qminus_list(mf));   // pair-closed groups (W pairing q <-> -q, screened.hpp)
-  coulomb_blocks_t<MEM> Zb(thc, grid, qg.dyson_q_list(comm.size(), comm.rank(), long(bos->zeta_nodes.size()), Np), Timer);
+  q_plan_t qplan = choose_q_plan<MEM>(comm, grid, nk, nq, long(bos->zeta_nodes.size()), bos->rank, nb);
+  q_groups_t qg(nq, qplan.g, qminus_list(mf));   // pair-closed groups (W pairing q <-> -q, screened.hpp)
+  long zb_nzb = long(bos->zeta_nodes.size());     // perf 7.2: bosonic node count the Dyson slab (Zb) was built for
+  std::vector<long> zb_list = qg.dyson_q_list(comm.size(), comm.rank(), zb_nzb, Np);
+  coulomb_blocks_t<MEM> Zb(thc, grid, zb_list, Timer);
   if (qg.n > 1) app_log(1, "  q groups of the Pi -> W stage: {} groups of <= {} q (Pi group of all q does not fit)", qg.n, qg.max_size());
   if (qplan.w_host)
     app_log(1, "  residues w of all q on the HOST ({:.3f} GB per rank); Sigma streams them in groups of {} q", 16.0 * double(nq) *
@@ -1176,18 +1280,111 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   std::vector<long> k_rows;   // global k of the rows of Sigma on this rank
   for (long l = 0; l < (prm.sigma_kdist ? kd.nloc() : nk); ++l) k_rows.push_back(prm.sigma_kdist ? kd.global(l, kd.rank) : l);
 
+  // perf 7.2 warm starts: KS vectors with QP energies (same density matrix: F[D_KS] unchanged), mu = QP mid-gap
+  auto apply_qp_start = [&](nda::array<double, 2> const &Eabs, std::string const &what) {
+    double h = -1e300, l = 1e300, sh = 0.0;
+    for (long ik = 0; ik < nk; ++ik)
+      for (long n = 0; n < nb; ++n) {
+        if (n < nocc) h = std::max(h, Eabs(ik, n));
+        else l = std::min(l, Eabs(ik, n));
+        sh = std::max(sh, std::abs(Eabs(ik, n) - eig(ik, n)));
+      }
+    utils::check(l > h, "gw_line: start {}: the QP energies have no gap in the KS band order (homo {} lumo {})", what, h, l);
+    const double muq = 0.5 * (h + l);
+    st.mu       = muq;
+    st.mu_sigma = muq;
+    st.dmu      = 0.0;
+    st.e_homo   = h - muq;
+    st.e_lumo   = l - muq;
+    st.poles    = pole_data_t::from_ks(Eabs, muq);
+    app_log(1, "  start {}: KS vectors + QP energies, mu = {:.6f} Ha (QP mid-gap), QP gap {:.4f} eV (KS {:.4f} eV), max|E_QP - e_KS| "
+               "{:.4f} eV; F = F[D_KS] (same density)",
+            what, muq, (l - h) * HA_EV, (lumo - homo) * HA_EV, sh * HA_EV);
+  };
+  auto write_start_done = [&](long done) {   // scf_line/start_done: 0 while the qp_diag start pass is pending
+    if (comm.root()) {
+      utils::h5_quiesce();
+      h5::file f(chk, 'a');
+      h5::group g(f);
+      auto sg = g.has_subgroup("scf_line") ? g.open_group("scf_line") : g.create_group("scf_line");
+      h5::h5_write(sg, "start_done", done);
+    }
+    comm.barrier();
+  };
+  bool qp_pending = false;   // perf 7.2: the qp_diag start pass is still to be done
   if (not restart) {
     Timer.start("phase_F");
     auto D = density_matrix(st.poles);
     hartree_exchange<MEM>(prop, Zb, D, mf, grid, mpi, st.F, Timer);
     if (hf_div) exchange_head_correction(st.F, D, madelung);
     Timer.stop("phase_F");
+    st.F_cl = st.F;
+    if (prm.start == "qp_file") apply_qp_start(read_qp_energies(comm, prm.start_file, prm.start_dataset, nk, nb), "qp_file");
+    qp_pending = (prm.start == "qp_diag" and prm.niter > 0);
     Timer.start("checkpoint");
     write_state(comm, chk, st, nullptr, kdp, sig_all);
+    write_start_done(qp_pending ? 0 : 1);
     Timer.stop("checkpoint");
-    app_log(1, "  start: KS poles, mu0 = {:.6f} Ha (KS mid-gap), KS gap {:.4f} eV, F = V_H + Sigma_x[D_KS]", mu0,
-            (lumo - homo) * HA_EV);
+    if (prm.start != "qp_file")
+      app_log(1, "  start: KS poles, mu0 = {:.6f} Ha (KS mid-gap), KS gap {:.4f} eV, F = V_H + Sigma_x[D_KS]{}", mu0,
+              (lumo - homo) * HA_EV, qp_pending ? "; qp_diag start pass first" : "");
+  } else if (st.iter == 0 and prm.start == "qp_diag" and prm.niter > 0) {   // resumed before the start pass completed?
+    long done = 1;
+    if (comm.root()) {
+      h5::file f(chk, 'r');
+      h5::group g(f);
+      auto sg = g.open_group("scf_line");
+      if (sg.has_dataset("start_done")) h5::h5_read(sg, "start_done", done);
+    }
+    comm.broadcast_n(&done, 1, 0);
+    qp_pending = (done == 0);
   }
+  if (st.F_cl.size() == 0) st.F_cl = st.F;
+
+  // perf 7.2: Coulomb blocks of the Dyson slab follow the bosonic node count (multilevel levels, auto bos_gap)
+  auto ensure_zb = [&]() {
+    const long nzb = long(bos->zeta_nodes.size());
+    if (nzb == zb_nzb) return;
+    qplan    = choose_q_plan<MEM>(comm, grid, nk, nq, nzb, bos->rank, nb);
+    qg       = q_groups_t(nq, qplan.g, qminus_list(mf));
+    auto lst = qg.dyson_q_list(comm.size(), comm.rank(), nzb, Np);
+    long chg = (lst != zb_list) ? 1 : 0;
+    chg      = comm.all_reduce_value(chg, boost::mpi3::max<>{});
+    zb_nzb   = nzb;
+    if (chg) {   // collective (lockstep Z gather)
+      Zb      = coulomb_blocks_t<MEM>(thc, grid, lst, Timer);
+      zb_list = std::move(lst);
+      app_log(1, "  Coulomb blocks rebuilt for {} bosonic nodes (Dyson slab changed)", nzb);
+    }
+  };
+  // perf 7.2 multilevel schedule: level of iteration it (1-based): 1 = coarse for it <= coarse_niter, else 0 = production
+  auto level_of  = [&](long it) -> long { return (it >= 1 and it <= prm.coarse_niter) ? 1 : 0; };
+  long cur_level = 0;
+  auto set_level = [&](long L) {
+    if (L == cur_level) return;
+    cur_level   = L;
+    lv_eps      = L ? prm.coarse_eps : prm.eps;
+    lv_time_eps = L ? prm.coarse_time_eps : prm.time_eps;
+    zeta = numerics::line_dlr::dense_nodes(theta, prm.node_tmin, prm.node_tmax, L ? prm.coarse_nodes_per_ray : prm.nodes_per_ray);
+    nz   = zeta.size();
+    Timer.start("bases");
+    gp = line_basis_t(theta, prm.lam, lv_eps, prm.lam, prm.g_gap, -1.0, prm.node_tmax);
+    gh = line_basis_t(theta, prm.lam, lv_eps, prm.g_gap, prm.lam, -1.0, prm.node_tmax);
+    Timer.stop("bases");
+    bos.reset();
+    bp.reset();
+    bh.reset();
+    cprm.K        = L ? prm.coarse_K : prm.K;
+    cprm.tol_gram = std::max(prm.tol_gram, prm.tol_gram_eps * lv_eps);
+    cprm.phi_prev.clear();
+    update_bases();
+    ensure_zb();
+    app_log(1, "  level {}: eps {:.1e}, K {}, {} fermionic nodes, time_eps {:.1e}; bosonic rank {} ({} nodes), Sigma {}+{}",
+            L ? "coarse" : "production", lv_eps, cprm.K, nz, lv_time_eps, bos->rank, bos->zeta_nodes.size(), bp->rank, bh->rank);
+  };
+  scf_mixer_t mixer(prm.mix);
+  head_out_t hout_first;   // perf 7.2: the head of iteration 1 (computed from the initial poles; optics.poles = "initial")
+  bool have_hout_first = false;
 
   // ---------------------------------------------------------------------------------------------- the loop
   arr4_t Pi, w, Wn;
@@ -1202,7 +1399,18 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     const auto t0 = std::chrono::steady_clock::now();
     const auto ph0 = phase_snapshot(Timer);
     Timer.start("iteration");
+    {   // perf 7.2: the level of this iteration; a Sigma of another level is dropped (no mixing across node grids)
+      const long L = level_of(st.iter + 1);
+      set_level(L);
+      if (st.have_sigma and level_of(st.iter) != L) {
+        st.have_sigma = false;
+        mixer.reset();
+        app_log(1, "  level change: the Sigma of iteration {} (other node grid) is dropped; this iteration takes Sigma[G] unmixed",
+                st.iter);
+      }
+    }
     update_bases();
+    ensure_zb();
     // time nodes of the ray products: GL rays (both kernels) or the four ID grids of the current poles
     Timer.start("time_grid");
     std::optional<time_nodes_t> pi_p, pi_h, sig_p, sig_h;
@@ -1220,7 +1428,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       numerics::line_dlr::time_id_opts_t topt;
       topt.pad        = prm.time_pad;
       topt.oversample = prm.time_oversample;
-      line_time_grids_t tg(st.poles, bos->nu, theta_t, prm.time_eps, topt, bos->zeta_nodes, zeta, comm, prm.time_snap);
+      line_time_grids_t tg(st.poles, bos->nu, theta_t, lv_time_eps, topt, bos->zeta_nodes, zeta, comm, prm.time_snap);
       tg.log(1);
       pi_p.emplace(tg.pi_p);
       pi_h.emplace(tg.pi_h);
@@ -1322,7 +1530,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       head_sigma_correction(st.poles, Thead, bos->nu, hout.h0_res, hout.h0_res_hole, madelung, zeta, k_rows, Sp_new, Sh_new);
       Timer.stop("Sigma_head");
     }
-    if (prm.debug_noise_sigma > 0.0 and st.iter + 1 == prm.debug_noise_iter) {
+    if (prm.debug_noise_sigma > 0.0 and st.iter + 1 == prm.debug_noise_iter and not qp_pending) {
       // diagnostic (noise-floor meter): relative complex Gaussian noise on the new Sigma, seeded per GLOBAL k (rank-count
       // independent), scale max|Sigma^> + Sigma^<| over all k and nodes
       double smax = nda::max_element(nda::abs(Sp_new + Sh_new));
@@ -1337,22 +1545,45 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
               for (long j = 0; j < nb; ++j) (*S)(l, iz, i, j) += prm.debug_noise_sigma * smax * ComplexType(N01(gen), N01(gen));
       }
     }
-    Timer.start("Sigma_mix");
-    double dS = 0.0;
-    if (st.have_sigma) {
-      const double a = prm.mixing, b = 1.0 - prm.mixing;
-      for (long ik = 0; ik < Sp_new.extent(0); ++ik)   // the rows held by this rank (all k, or the owned k)
-        for (long iz = 0; iz < nz; ++iz)
-          for (long i = 0; i < nb; ++i)
-            for (long j = 0; j < nb; ++j) {
-              const ComplexType sp = a * Sp_new(ik, iz, i, j) + b * st.Sig_p(ik, iz, i, j);
-              const ComplexType sh = a * Sh_new(ik, iz, i, j) + b * st.Sig_h(ik, iz, i, j);
-              dS = std::max(dS, std::abs(sp + sh - st.Sig_p(ik, iz, i, j) - st.Sig_h(ik, iz, i, j)));
-              Sp_new(ik, iz, i, j) = sp;
-              Sh_new(ik, iz, i, j) = sh;
-            }
-      if (prm.sigma_kdist) dS = comm.all_reduce_value(dS, boost::mpi3::max<>{});
+    if (qp_pending) {   // perf 7.2 qp_diag start: diagonal QP energies from this Sigma[G_KS], no closure, not an iteration
+      nda::array<ComplexType, 3> Hq(nk, nb, nb);
+      nda::array<double, 2> eks(nk, nb);
+      for (long ik = 0; ik < nk; ++ik) {
+        for (long n = 0; n < nb; ++n) eks(ik, n) = eig(ik, n) - st.mu;
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) Hq(ik, i, j) = H0(ik, i, j) + st.F(ik, i, j) - (i == j ? st.mu : 0.0);
+      }
+      auto qp = qp_diag_energies(comm, eks, Hq, Sp_new, Sh_new, k_rows, prm.sigma_kdist, zeta, *bp, *bh, cprm, prm.start_eta);
+      nda::array<double, 2> Eabs(nk, nb);
+      for (long ik = 0; ik < nk; ++ik)
+        for (long n = 0; n < nb; ++n) Eabs(ik, n) = qp.e(ik, n) + st.mu;
+      app_log(1, "  qp_diag start pass: diagonal QP equation solved for {} (k, band) by Newton, {} linearized; max shift {:.4f} eV",
+              qp.n_newton, qp.n_lin, qp.max_shift * HA_EV);
+      apply_qp_start(Eabs, "qp_diag");
+      qp_pending = false;
+      res.eps_inf.pop_back();   // the head of the KS pass is not an iteration's
+      have_hout = false;
+      Timer.stop("phase_Sigma");
+      Timer.start("checkpoint");
+      write_state(comm, chk, st, nullptr, kdp, sig_all);
+      write_start_done(1);
+      Timer.stop("checkpoint");
+      Timer.stop("iteration");
+      res.start_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      app_log(1, "  qp_diag start pass: {:.1f} s (Pi {:.1f}s W {:.1f}s Sigma {:.1f}s)", res.start_time, tPi, tW,
+              Timer.elapsed("phase_Sigma") - e0);
+      continue;
     }
+    Timer.start("Sigma_mix");
+    // perf 7.2: linear (bitwise the pre-7.2 arithmetic) or DIIS mixing (scf_mixing.hpp); F_next = the F of this closure
+    mix_info_t mi;
+    nda::array<ComplexType, 3> F_next = st.F;
+    const bool mixed = st.have_sigma;
+    if (mixed)
+      mi = mixer.step(comm, st.iter + 1, nk, k_rows, prm.sigma_kdist, st.Sig_p, st.Sig_h, Sp_new, Sh_new, st.F_cl, st.F, F_next);
+    else
+      for (long a = 0; a < st.F.size(); ++a) mi.residF = std::max(mi.residF, std::abs(st.F.data()[a] - st.F_cl.data()[a]));
+    const double dS = mi.dS;
     st.Sig_p      = Sp_new;
     st.Sig_h      = Sh_new;
     st.have_sigma = true;
@@ -1364,7 +1595,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     nda::array<ComplexType, 3> Hrel(nk, nb, nb);
     for (long ik = 0; ik < nk; ++ik)
       for (long i = 0; i < nb; ++i)
-        for (long j = 0; j < nb; ++j) Hrel(ik, i, j) = H0(ik, i, j) + st.F(ik, i, j) - (i == j ? st.mu : 0.0);
+        for (long j = 0; j < nb; ++j) Hrel(ik, i, j) = H0(ik, i, j) + F_next(ik, i, j) - (i == j ? st.mu : 0.0);
+    st.F_cl = F_next;   // perf 7.2: the F of the closure that builds the new poles (spectra, restart)
     cprm.phi_prev.assign(st.phi.begin(), st.phi.end());   // S7f phase continuity (used only if phase_keep > 0)
     auto co = closure(comm, Hrel, st.Sig_p, st.Sig_h, zeta, *bp, *bh, gp, gh, cprm, nelec, Timer, grepr);
     st.phi = nda::array<double, 1>(nk);
@@ -1432,9 +1664,22 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     rec.pruned_w_weight    = co.pruned_w_weight;
     rec.pruned_near        = co.pruned_near;
     rec.pruned_near_weight = co.pruned_near_weight;
+    rec.resid              = mi.resid;   // perf 7.2
+    rec.residF             = mi.residF;
+    rec.mix                = mixed ? mi.kind : std::string("none");
+    rec.ndiis              = mi.m;
+    rec.level              = cur_level;
     rec.time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     res.history.push_back(rec);
     print_line(rec, tPi, tW, tS, tC, tF);
+    app_log(1, "          mixing: {}{}, residual max|Sigma[G] - Sigma_in| {:.3e} (||r|| {:.3e}), max|F[D] - F_in| {:.3e}{}{}", rec.mix,
+            rec.mix == "diis" ? " (" + std::to_string(mi.m) + " entries, max|c| " + std::to_string(mi.cmax).substr(0, 6) + ")" : "",
+            rec.resid, mi.rnorm, rec.residF, cur_level ? ", level coarse" : "",
+            mixer.size() > 0 ? ", DIIS history " + std::to_string(mixer.bytes() / 1048576.0).substr(0, 7) + " MB per rank" : "");
+    if (st.iter == 1) {
+      hout_first      = hout;
+      have_hout_first = true;
+    }
 
     Timer.start("checkpoint");
     write_state(comm, chk, st, &rec, kdp, sig_all, &hout);
@@ -1457,14 +1702,18 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
                 2 * nk, xv / 1073741824.0);
     }
 
-    if (rec.iter > 1 and dS < prm.conv_thr) {
+    // perf 7.2: only after a mixing step (an unmixed iteration has dS = 0); DIIS also needs mixing x residual < conv_thr
+    if (rec.iter > 1 and mixed and dS < prm.conv_thr and (prm.mix.alg == "linear" or prm.mixing * mi.resid < prm.conv_thr)) {
       converged = true;
       app_log(1, "  converged: max|dSigma| = {:.2e} < conv_thr = {:.1e}", dS, prm.conv_thr);
       break;
     }
   }
-  if (not converged and not res.history.empty() and res.history.back().iter > 1 and res.history.back().dSigma < prm.conv_thr)
-    converged = true;
+  if (not converged and not res.history.empty() and res.history.back().iter > 1 and res.history.back().dSigma < prm.conv_thr) {
+    auto const &h = res.history.back();
+    converged     = (h.mix != "none" or (h.resid == 0.0 and h.dSigma > 0.0)) and
+                (h.mix != "diis" and h.mix != "reset" ? true : prm.mixing * h.resid < prm.conv_thr);
+  }
 
   // ---------------------------------------------------------------------------------------------- spectra
   if (prm.do_spectra and st.have_sigma) {
@@ -1472,7 +1721,16 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     nda::array<ComplexType, 3> Hrel(nk, nb, nb);
     for (long ik = 0; ik < nk; ++ik)
       for (long i = 0; i < nb; ++i)
-        for (long j = 0; j < nb; ++j) Hrel(ik, i, j) = H0(ik, i, j) + st.F(ik, i, j) - (i == j ? st.mu : 0.0);
+        for (long j = 0; j < nb; ++j) Hrel(ik, i, j) = H0(ik, i, j) + st.F_cl(ik, i, j) - (i == j ? st.mu : 0.0);
+    // perf 7.2: the G of the stored poles: F of their closure (F_closure), not F[D] of the poles themselves
+    double dFc = 0.0;
+    for (long a = 0; a < st.F.size(); ++a) dFc = std::max(dFc, std::abs(st.F.data()[a] - st.F_cl.data()[a]));
+    app_log(1, "  spectra: G of iteration {} (the stored poles): H0 + F_closure(iteration {}) + Sigma_c(iteration {}){}; max|F[D_{}] - "
+               "F_closure| = {:.3e} Ha (not used)",
+            st.iter, st.iter, st.iter,
+            st.iter == 1 and prm.start == "ks" ? " = G0W0@KS (F[D_KS] + Sigma[G_KS])"
+                                               : (prm.mix.mix_F and not res.history.empty() and res.history.back().mix == "diis" ? " (F_closure = the DIIS-extrapolated F)" : " (F_closure = F[D_" + std::to_string(st.iter - 1) + "])"),
+            st.iter, dFc);
     auto sp = line_spectra(comm, Hrel, st.Sig_p, st.Sig_h, zeta, st.mu - st.mu_sigma, *bp, *bh, cprm, nelec, prm.spectra);
     write_spectra(comm, chk, sp, st.mu);
     Timer.stop("spectra");
@@ -1534,9 +1792,25 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       }
       return hp;
     };
+    // perf 7.2: which G the optics lines use (optics.poles): the final poles or those of iteration 0 (KS / qp start)
+    const bool initial = (prm.optics_poles == "initial");
+    pole_data_t poles0;
+    if (initial) {
+      if (comm.root()) {
+        utils::h5_quiesce();
+        h5::file f(chk, 'r');
+        h5::group g(f);
+        auto it0 = g.open_group("scf_line").open_group("iter0");
+        poles0   = read_poles(it0, nk, nb);
+      }
+      bcast_poles(comm, poles0);
+    }
+    pole_data_t const &opoles = initial ? poles0 : st.poles;
+    const std::string gname   = initial ? "initial poles (iteration 0)" : "final poles (iteration " + std::to_string(st.iter) + ")";
+    app_log(1, "  optics: G = {} (optics.poles = {})", gname, prm.optics_poles);
     auto run_pass = [&](optics_line_t &L, bool flat) {
       Timer.start("optics_pass");
-      auto hpo = head_pass<MEM>(thc, mf, mpi, grid, prop, st.poles, hbasis, pass_params(L.theta_deg, flat));
+      auto hpo = head_pass<MEM>(thc, mf, mpi, grid, prop, opoles, hbasis, pass_params(L.theta_deg, flat));
       Timer.stop("optics_pass");
       L.zeta      = hpo.zeta;
       L.nu        = hpo.nu;
@@ -1545,30 +1819,43 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       L.nt_p      = hpo.nt_p;
       L.nt_h      = hpo.nt_h;
       L.time_grid = hpo.time_grid;
-      app_log(1, "  optics: head pass at {} deg from the final poles: bosonic rank {} ({} nodes), Pi time nodes {} + {} ({}), {} q "
+      app_log(1, "  optics: head pass at {} deg from the {}: bosonic rank {} ({} nodes), Pi time nodes {} + {} ({}), {} q "
                  "group(s), {:.1f} s (Z {:.1f}, Pi {:.1f}, W {:.1f})",
-              L.theta_deg, hpo.rank, hpo.nz, hpo.nt_p, hpo.nt_h, hpo.time_grid, hpo.ngroups, hpo.t_total, hpo.t_Z, hpo.t_Pi, hpo.t_W);
+              L.theta_deg, gname, hpo.rank, hpo.nz, hpo.nt_p, hpo.nt_h, hpo.time_grid, hpo.ngroups, hpo.t_total, hpo.t_Z, hpo.t_Pi, hpo.t_W);
     };
     std::vector<optics_line_t> lines;
     {   // the SCF angle
       auto L = make_line(prm.theta_deg);
       L.time_grid = prm.time_grid;
-      if (have_hout) {
+      // The head of iteration N is Pi[G_{N-1}] (the poles BEFORE its closure). initial: the head of iteration 1 = Pi[G_0].
+      // final: the head of the last iteration if the run converged (G_{N-1} = G_N to the SCF tolerance), else (e.g. G0W0,
+      // niter = 1) one pass from the final poles, so that every optics line uses the same G (perf 7.2; before: always
+      // the last iteration's head, i.e. Pi[G_KS] at the SCF angle next to flatter lines from G_1 in a niter = 1 run)
+      const long ih = initial ? 1 : st.iter;
+      if (not initial and not converged and st.iter >= 1) {
+        L.source = "recomputed from the " + gname + " (run not converged: the last head is Pi[G_" + std::to_string(st.iter - 1) + "])";
+        run_pass(L, false);
+      } else if (initial and have_hout_first) {
+        L.source  = "head of iteration 1 of this run (from the initial poles)";
+        L.zeta    = hout_first.zeta;
+        L.nu      = hout_first.nu;
+        L.h_nodes = hout_first.h_nodes;
+      } else if (not initial and have_hout) {
         L.source  = "head of the last iteration of this run (iteration " + std::to_string(st.iter) + ")";
         L.zeta    = hout_last.zeta;
         L.nu      = hout_last.nu;
         L.h_nodes = hout_last.h_nodes;
-      } else if (read_head_nodes(comm, chk, st.iter, L.h_nodes, L.zeta, L.nu)) {
-        L.source = "checkpoint scf_line/iter" + std::to_string(st.iter) + "/head";
+      } else if (st.iter >= 1 and read_head_nodes(comm, chk, ih, L.h_nodes, L.zeta, L.nu)) {
+        L.source = "checkpoint scf_line/iter" + std::to_string(ih) + "/head";
       } else {
-        L.source = "recomputed from the final poles (checkpoint without a head group)";
+        L.source = "recomputed from the " + gname + " (no head group)";
         run_pass(L, false);
       }
       lines.push_back(std::move(L));
     }
     for (double th : op.theta_deg) {
       auto L   = make_line(th);
-      L.source = "flatter-line pass from the final poles";
+      L.source = "flatter-line pass from the " + gname;
       run_pass(L, true);
       lines.push_back(std::move(L));
     }
@@ -1610,6 +1897,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   res.mu_sigma  = st.mu_sigma;
   res.poles     = std::move(st.poles);
   res.F         = std::move(st.F);
+  res.F_closure = std::move(st.F_cl);
   res.H0        = std::move(H0);
   res.Sig_p     = std::move(st.Sig_p);
   res.Sig_h     = std::move(st.Sig_h);

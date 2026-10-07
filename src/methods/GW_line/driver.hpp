@@ -77,7 +77,27 @@
  *                       bos_nu, bos_zeta_nodes)
  *   niter = 12          TOTAL number of iterations (a restart continues until niter iterations are done)
  *   mixing = 0.5        linear mixing of Sigma^{>/<} at the nodes (F is not mixed, as python)
- *   conv_thr = 1e-5     stop when max|dSigma| at the nodes (after mixing, as python) < conv_thr
+ *   conv_thr = 1e-5     stop when max|dSigma| at the nodes (after mixing, as python) < conv_thr; with mixing_alg = "diis"
+ *                       also mixing x max|Sigma[G] - Sigma_in| < conv_thr. Never in an iteration without a previous Sigma
+ *                       (the first iteration, the first after a qp start or a level change of the multilevel schedule)
+ *   mixing_alg = "linear"   perf 7.2 (scf_mixing.hpp): "linear" (above) | "diis" (Anderson/Pulay on Sigma^{>/<} at the nodes
+ *                       of all k): diis_hist = 6, diis_start = 2 (iterations before it: linear with `mixing`), diis_beta = 1
+ *                       (x = sum c (x_i + beta r_i)), diis_reg = 1e-10, diis_cmax = 10, diis_grow = 10 (resets to a linear
+ *                       step), diis_mix_F = false (F in the vector; the next closure uses the extrapolated F), diis_wF = -1
+ *                       (weight of the F elements; < 0: the number of fermionic nodes). The history is not checkpointed:
+ *                       after a restart it is rebuilt (first step x + beta r). Every iteration logs the residual
+ *                       max|Sigma[G] - Sigma_in| ("resid"; linear: dSigma / mixing) and max|F[D] - F_in|.
+ *   start = "ks"        perf 7.2 initial G: "ks" (below) | "qp_diag": one Pi -> W -> Sigma pass on the KS poles (no SCF closure, not
+ *                       counted as an iteration), diagonal G0W0 QP equation E_n = (H0 + F - mu)_nn + Re Sigma_nn(E_n + i
+ *                       start_eta) per k and band, Sigma_c from the upfolded closure representation of each k (Newton;
+ *                       linearized fallback), then KS vectors with the QP energies (same density, F unchanged), mu = QP
+ *                       mid-gap; the history of the run starts after it | "qp_file": the same with the energies
+ *                       (absolute, Ha, band order, first nbnd bands) read from start_file (dataset start_dataset; default:
+ *                       scf/iter<final_iter>/qp_approx/E_ska of a CoQui mbpt.h5, else "E_ska" / "qp_energies" at the root)
+ *   coarse = { niter = 0, eps = 1e-8, K = 16, nodes_per_ray = 80, time_eps = 1e-8 }   perf 7.2 multilevel schedule: iterations
+ *                       1..niter at these settings (bases, closure, fermionic nodes, time grids), then the production ones;
+ *                       the Sigma of the coarse level is dropped at the switch (the first production iteration takes Sigma[G]
+ *                       unmixed), so the run ends with >= 2 production iterations (niter >= coarse.niter + 2 required)
  *   t_chunk = 0 (auto), ray_decades = 36   time chunk of the ray products; ray length e^{-emin smax sin theta_t} = e^{-decades}
  *   time_grid = "id"    time nodes of the ray products (S7b): "id" = time-node ID (time_grids.hpp; four grids rebuilt every
  *                       iteration from the current poles and bosonic poles, ~100-170 nodes each), "gl" = the generic
@@ -112,6 +132,15 @@
  *                       group, else recomputed from the final poles: head_pass) and, for every theta_deg, from ONE extra
  *                       Pi -> W -> head pass on a flatter bosonic line (own basis, time rays at theta_deg / 2).
  *                       h5 group optics/theta<deg>/{q0 = q -> 0, q0_<variant>, iq<n> = mesh q n} of the checkpoint (layout: optics.hpp write_optics).
+ *                       optics.poles = "final" (default) | "initial" (perf 7.2): the G of every optics line: the final poles
+ *                       (SCF angle: the head of the last iteration) or the initial ones (iteration 0: KS or the qp start;
+ *                       SCF angle: the head of iteration 1, computed from them), e.g. RPA@PBE next to G0W0 with niter = 1.
+ *
+ * Spectra (perf 7.2): A(k, w) of the G whose poles are stored, G_N = [w - (H0 + F_N^cl - mu) - Sigma_N]^{-1} with Sigma_N the
+ * (mixed) Sigma input of the last closure and F_N^cl the F of that closure (scf_line/iter<N>/F_closure; = F[D_{N-1}], the
+ * density of the previous iteration, unless diis_mix_F). Before 7.2 the spectra used F[D_N], inconsistent with G_N by
+ * F[D_N] - F[D_{N-1}] (G0W0, niter = 1: 0.15-0.23 eV peak shifts). niter = 1 from the KS start: the spectra are those of the
+ * G0W0@KS G (F[D_KS] + Sigma[G_KS]) and the poles are its Lehmann poles.
  *
  * Initial guess (as si222c_scgw_line.py): KS poles e_n(k) - mu0 with unit residues in the KS band basis, mu0 = KS
  * mid-gap (python uses CoQui's Matsubara mu; the gap midpoint is used here, no imaginary-axis checkpoint needed), and
@@ -146,6 +175,7 @@
 #include "methods/GW_line/line_state.hpp"
 #include "methods/GW_line/spectra.hpp"
 #include "methods/GW_line/optics.hpp"
+#include "methods/GW_line/scf_mixing.hpp"
 
 namespace methods::gw_line {
 
@@ -180,6 +210,14 @@ struct gw_line_params_t {
   std::string bases_file;                ///< diagnostics/parity: real-pole bases read from this file (gen_lih222_scf_ref.py)
   long niter = 12;
   double mixing = 0.5, conv_thr = 1e-5;
+  mixing_params_t mix;                   ///< perf 7.2: mixing algorithm (scf_mixing.hpp); mix.mixing == mixing
+  std::string start = "ks";              ///< perf 7.2: initial G "ks" | "qp_diag" | "qp_file"
+  std::string start_file, start_dataset; ///< perf 7.2: QP energies for start = "qp_file"
+  double start_eta = 1e-3;               ///< perf 7.2: broadening of the diagonal QP equation (Ha)
+  long coarse_niter = 0;                 ///< perf 7.2: multilevel schedule, iterations 1..coarse_niter at coarse settings
+  double coarse_eps = 1e-8, coarse_time_eps = 1e-8;
+  long coarse_K = 16, coarse_nodes_per_ray = 80;
+  std::string optics_poles = "final";    ///< perf 7.2: G of the optics passes "final" | "initial"
   long t_chunk = 0;   // 0 = automatic (host: 32, COQUI_GWLINE_HOST_TCHUNK; device: from the free memory, capped)
   double ray_decades = 36.0;
   std::string time_grid = "id";          ///< "id" (time-node ID) or "gl" (Gauss-Legendre rays)
@@ -214,6 +252,10 @@ struct gw_line_iter_t {
   double g_emin = 0.0;                   ///< smallest retained |e_m| (sets the ID E_min of the next iteration)
   long pruned_w = 0, pruned_near = 0;    ///< lehmann: poles pruned by weight / near-mu rule (all k)
   double pruned_w_weight = 0.0, pruned_near_weight = 0.0;
+  double resid = 0.0, residF = 0.0;      ///< perf 7.2: max|Sigma[G] - Sigma_in| (total Sigma), max|F[D] - F_in| (0 before 7.2)
+  std::string mix = "none";              ///< perf 7.2: mixing step of this iteration (none | linear | diis | reset)
+  long ndiis = 0;                        ///< perf 7.2: DIIS history entries used
+  long level = 0;                        ///< perf 7.2: 0 = production settings, 1 = coarse (multilevel schedule)
 };
 
 struct gw_line_result_t {
@@ -222,6 +264,8 @@ struct gw_line_result_t {
   double mu = 0.0, mu_sigma = 0.0;       ///< final centre; centre at which Sigma_p/h were sampled
   pole_data_t poles;                     ///< final poles (mu-relative; compressed or factorized Lehmann)
   nda::array<ComplexType, 3> F;          ///< final V_H + Sigma_x
+  nda::array<ComplexType, 3> F_closure;  ///< perf 7.2: the F of the closure that built the final poles (spectra use it)
+  double start_time = 0.0;               ///< perf 7.2: seconds of the qp_diag start pass (0 otherwise)
   nda::array<ComplexType, 3> H0;         ///< one-body Hamiltonian (KS band basis)
   nda::array<ComplexType, 4> Sig_p, Sig_h;   ///< last mixed Sigma at the nodes (empty if no iteration was done); with
                                              ///< sigma_kdist (default) the rows of the k owned by this rank (k mod np)
