@@ -157,13 +157,11 @@ inline nda::array<double, 2> read_qp_energies(boost::mpi3::communicator &comm, s
     used = ds;
     nda::array<double, 3> e3;
     nda::array<double, 2> e2;
-    bool three = true;
-    try {
+    utils::check(g.has_dataset(ds), "gw_line: {} has no dataset {}", file, ds);
+    const int rk = h5::array_interface::get_dataset_info(g, ds).rank();
+    utils::check(rk == 2 or rk == 3, "gw_line: {}:{} has rank {}, expected (nk, nb) or (1, nk, nb)", file, ds, rk);
+    if (rk == 3) {
       nda::h5_read(g, ds, e3);
-    } catch (...) {
-      three = false;
-    }
-    if (three) {
       utils::check(e3.extent(0) == 1 and e3.extent(1) == nk and e3.extent(2) >= nb,
                    "gw_line: {}:{} has shape ({}, {}, {}), expected (1, {}, >= {})", file, ds, e3.extent(0), e3.extent(1),
                    e3.extent(2), nk, nb);
