@@ -176,7 +176,7 @@ void run_s7e(std::string const &fixture) {
     const double dPi = rel(Pi_x, Pi_c);
     // q groups of <= 3 (3, 3, 2 for N_q = 8 on lih222; pair-closed {q, -q} units on lih223): Pi rows and the residues of a
     // grouped Pi -> W stage vs all q at once
-    double dPg = 0.0, dwg = 0.0;
+    double dPg = 0.0, dwg = 0.0, dwraw = 0.0;
     {
       const q_groups_t qg(nq, 3, qminus_list(*mf));
       coulomb_blocks_t<HOST_MEMORY> Zg(thc, grid, qg.dyson_q_list(comm.size(), comm.rank(), zb.size(), Np), T);
@@ -196,7 +196,18 @@ void run_s7e(std::string const &fixture) {
         screened_interaction<HOST_MEMORY>(Pg, Zg, basis, grid, *mpi, wg, T, nullptr, qg.rows(ig), false);
       }
       dPg = comm.all_reduce_value(dPg, mpi3::max<>{}) / comm.all_reduce_value(max_abs3(Pi_c), mpi3::max<>{});
-      dwg = rel(wg, wa);
+      // the residues compared as pole sums at the nodes, both sectors (the raw residues are determined only up to the
+      // near-threshold singular directions of the stacked kernel, ~1e-5 with MKL when the fit's column chunking differs:
+      // info dwraw; perf 7.1)
+      dwraw   = rel(wg, wa);
+      auto qm = mf->qminus();
+      for (long q = 0; q < nq; ++q)
+        for (auto s : {sector_t::particle, sector_t::hole}) {
+          memory::array<HOST_MEMORY, ComplexType, 3> A(zb.size(), grid.nP, grid.nQ), B(zb.size(), grid.nP, grid.nQ);
+          eval_poles<HOST_MEMORY>(wg, basis, q, qm(q), zb, s, s == sector_t::hole, A());
+          eval_poles<HOST_MEMORY>(wa, basis, q, qm(q), zb, s, s == sector_t::hole, B());
+          dwg = std::max(dwg, rel(A, B));
+        }
     }
     screened_interaction<HOST_MEMORY>(Pi_c, Zb, basis, grid, *mpi, w, T);
     auto sigma = [&](char const *xv, char const *right, bool k_local, sector_t s) {
@@ -229,7 +240,8 @@ void run_s7e(std::string const &fixture) {
                                   nda::array<ComplexType, 3>(S0(kd.global(l, kd.rank), nda::ellipsis{}))));
       dloc = std::max(dloc, comm.all_reduce_value(d, mpi3::max<>{}) / m);
     }
-    app_log(1, "[s7e] (b) {}: q groups of 3: Pi rows {:.2e}, residues w {:.2e}", fixture, dPg, dwg);
+    app_log(1, "[s7e] (b) {}: q groups of 3: Pi rows {:.2e}, residues as pole sums at the nodes {:.2e} (raw residues {:.1e}, info)",
+            fixture, dPg, dwg, dwraw);
     REQUIRE(dPg <= 1e-14);
     REQUIRE(dwg <= 1e-12);
     app_log(1, "[s7e] (b) {}: Pi XV vs C(t) {:.2e}; Sigma XV vs C(t) {:.2e}, right- vs left-first contraction {:.2e}, k-distributed "
