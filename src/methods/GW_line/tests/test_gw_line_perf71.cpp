@@ -514,6 +514,18 @@ void run_ab(std::string const &name, long nI_factor) {
     self_energy<HOST_MEMORY>(prop, f.poles, wn, basis, mf, grid, *mpi, fz, ray_p, ray_h, 8, Sp0, T, sector_t::particle);
     self_energy<HOST_MEMORY>(prop, f.poles, wn, basis, mf, grid, *mpi, fz, ray_p, ray_h, 8, Sh0, T, sector_t::hole);
   }
+  // the Sigma^< leg above used the A^ cache of the polarization call (G^ = conj A^ on the conjugated ray); without it:
+  const bool cache_used = (prop.ahat_key >= 0.0 and prop.ahat_key == prop.pole_key);
+  nda::array<ComplexType, 4> Sp1, Sh1;
+  {
+    env_scope_t e1("COQUI_GWLINE_GT_CACHE", "0");
+    self_energy<HOST_MEMORY>(prop, f.poles, wn, basis, mf, grid, *mpi, fz, ray_p, ray_h, 8, Sp1, T, sector_t::both, false, nullptr,
+                             0, &Sh1);
+  }
+  const double e_cache = max_diff3(Sh, Sh1) / max_abs3(Sh1);
+  app_log(2, "[perf71 A/B] {}: Sigma^< with the cached A^ of Pi vs rebuilt G~: {:.2e} (cache valid: {})", name, e_cache, cache_used);
+  REQUIRE(cache_used);
+  REQUIRE(e_cache <= 1e-14);
   const double e_sp = max_diff3(Sp, Sp0) / max_abs3(Sp0), e_sh = max_diff3(Sh, Sh0) / max_abs3(Sh0);
   app_log(2, "\n[perf71 A/B] {} ({} ranks, grid {}x{}, {} nodes = 2 x {} mirror, {} time nodes): Pi new vs old {:.2e}; W at the nodes "
              "{:.2e}, pole sums at 12 points {:.2e} (THC asymmetry of Z {:.1e}); Sigma^> {:.2e}, Sigma^< {:.2e}",

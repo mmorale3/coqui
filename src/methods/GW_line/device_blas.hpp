@@ -47,6 +47,7 @@
 #include "nda/tensor.hpp"
 #include "utilities/check.hpp"
 #include "utilities/device_pool.h"
+#include "utilities/freemem.h"
 #if defined(ENABLE_CUDA)
 #include "methods/GW_line/cuda/gw_line_cuda.cuh"
 #endif
@@ -156,6 +157,15 @@ void mirror_combine(memory::array_view<MEM, ComplexType, 1> U, memory::array_vie
     nda::tensor::add(ComplexType(1.0), nda::conj(V), "a", ComplexType(add ? 1.0 : 0.0), U, "a");
     if (U.data() != V.data()) nda::tensor::add(ComplexType(1.0), nda::conj(T), "a", ComplexType(add ? 1.0 : 0.0), V, "a");
   }
+}
+
+/// perf 7.1: may the A^ cache of propagator_t (bytes per rank) be used? env COQUI_GWLINE_GT_CACHE 0 / 1 / -1 (auto)
+template <MEMORY_SPACE MEM>
+bool gt_cache_enabled(double bytes) {
+  const long mode = env_long("COQUI_GWLINE_GT_CACHE", -1);
+  if (mode >= 0) return mode != 0;
+  if constexpr (MEM == HOST_MEMORY) return bytes <= 1.5 * 1073741824.0;
+  else return bytes <= 0.15 * double(utils::freemem_device_effective()) * 1048576.0;
 }
 
 /**

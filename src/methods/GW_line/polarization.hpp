@@ -168,6 +168,7 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   }
   const long nacc = (qfold or rs) ? g : 1;   // acc chunks held: all q of the group (qfold, real space) or one
 
+  bool filled_now = false;   // perf 7.1: this call refilled the A^ cache of prop
   for (auto const &leg : legs) {
     if (mirror) {   // the particle leg only (it provides both sectors)
       if (leg.ray->sector != sector_t::particle) continue;
@@ -183,6 +184,21 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
     arr4_t acc(nacc, tc, nP, nQ);
     [[maybe_unused]] arr4_t X;   // real space: A^(R)
     const ComplexType alpha(leg.sign * 2.0 / double(nk));
+    // perf 7.1: keep A^(R, t) of the particle leg for the Sigma^< leg (propagator_t::ahat; host <= 1.5 GB per rank)
+    const bool fill_cache = rs and leg.ray->sector == sector_t::particle and
+                            detail::gt_cache_enabled<MEM>(16.0 * double(nk) * double(nt) * double(blk));
+
+    if (fill_cache) {
+      filled_now = true;
+      if (prop.ahat.extent(0) != nk or prop.ahat.extent(1) != nt or prop.ahat.extent(2) != nP or prop.ahat.extent(3) != nQ)
+      {
+        prop.ahat = arr4_t(nk, nt, nP, nQ);
+        app_log(2, "  gw_line::polarization: A^(R, t) cache for the Sigma^< leg: {:.3f} GB per rank (COQUI_GWLINE_GT_CACHE)",
+                16.0 * double(nk) * double(nt) * double(blk) / 1073741824.0);
+      }
+      prop.ahat_key    = -1.0;
+      prop.ahat_filled = 0;
+    }
     if (rs) {
       X = arr4_t(nk, tc, nP, nQ);
       nda::array<ComplexType, 2> gq(g, nk);   // alpha / N e^{-iQ_q R} for the q of the group
@@ -216,6 +232,10 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
         auto X2       = nda::reshape(X, std::array<long, 2>{nk, tc * blk})(all, cr);
         auto C2       = nda::reshape(acc, std::array<long, 2>{g, tc * blk})(all, cr);
         nda::blas::gemm(ComplexType(1.0), FpM, A2, ComplexType(0.0), X2);   // A^(R)
+        if (fill_cache) {
+          for (long R = 0; R < nk; ++R) prop.ahat(R, nda::range(i0, i0 + n), all, all) = X(R, tr, all, all);
+          prop.ahat_filled += n;
+        }
         nda::blas::gemm(ComplexType(1.0), FmM, B2, ComplexType(0.0), A2);   // B^(R), into A
         nda::tensor::elementwise(ComplexType(1.0), X2, ComplexType(1.0), A2, nda::tensor::op::MUL);   // A <- A^ o B^
         nda::blas::gemm(ComplexType(1.0), GmQ, A2, ComplexType(0.0), C2);   // acc(q) = alpha / N sum_R e^{-iQR} (.)
@@ -288,6 +308,12 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
         Timer.stop("Pi_transform");
       }
     }
+  }
+
+  // perf 7.1: the A^ cache is complete for this ray and these poles (only when THIS call filled it)
+  if (filled_now and prop.ahat_filled == prop.ahat.extent(1) and prop.ahat.extent(1) == ray_p.size()) {
+    prop.ahat_t   = nda::array<ComplexType, 1>(ray_p.t);
+    prop.ahat_key = prop.pole_key;
   }
 
   // perf 7.1 (a): Pi(q, z_i) = Pi^>(q, z_i) + conj Pi^>(-q, z_{i +- n1}) (both), or the conjugated mirror alone (hole); the

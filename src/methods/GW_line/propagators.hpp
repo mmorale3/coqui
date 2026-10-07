@@ -92,6 +92,20 @@ struct propagator_t {
   std::vector<char> fac_p, fac_h;                     ///< factorized form per k (particle / hole)
   std::vector<nda::array<ComplexType, 2>> vh_p, vh_h; ///< host V (nb, M) of the factorized sectors
   bool poles_set = false;
+  double pole_key = 0.0;                              ///< fingerprint of the poles of the last set_poles (A^ cache key)
+
+  /**
+   * perf 7.1 (d)+(e): the real-space transform of Pi's hole factor, A^(R, t) = sum_k e^{+ikR} G~^<(k, conj t)^dagger
+   * (gtilde_form_t::adjoint_conj_t) on the particle nodes t, filled by polarization (real-space path) for ALL nodes of its
+   * ray and consumed by the Sigma^< leg on the conjugated ray: there G~^<(k, conj t)^T = conj of the same block, and
+   * sum_k e^{-ikR} conj(.) = conj A^(R, t), so the hole leg skips one G~ build and one transform per (k, t).
+   * Valid while pole_key and the node set (ahat_t) match. Memory N_k N_t block (env COQUI_GWLINE_GT_CACHE: 0 off, 1 on,
+   * -1 / unset: on when <= 1.5 GB per rank on the host, <= 15% of the free memory on the device).
+   */
+  memory::array<MEM, ComplexType, 4> ahat;            ///< (N_k as R, N_t, nP, nQ)
+  nda::array<ComplexType, 1> ahat_t;                  ///< the particle nodes of ahat
+  double ahat_key = -1.0;
+  long ahat_filled = 0;                               ///< nodes filled (valid only when == ahat_t.size())
   // host XV form (S7e): L = Xp V (nP, M), R = Xq V (nQ, M) per k and sector (empty where the C(t) form is used)
   std::vector<nda::array<ComplexType, 2>> L_p, L_h, R_p, R_h;
   long n_xv = 0;                                      ///< (k, sector) pairs using the XV form
@@ -180,6 +194,22 @@ struct propagator_t {
         }
     }
     poles_set = true;
+    {   // fingerprint of the pole data (energies and residues), for the A^ cache
+      double key = double(nk);
+      for (long ik = 0; ik < nk; ++ik) {
+        for (auto const *e : {&e_p[ik], &e_h[ik]})
+          for (long m = 0; m < e->size(); ++m) key += (*e)(m) * double(m + 1 + 7 * ik);
+        auto const &ps = poles(ik, sector_t::particle), &ph = poles(ik, sector_t::hole);
+        for (auto const *pp : {&ps, &ph}) {
+          if (pp->is_factorized())
+            for (auto const &x : pp->v) key += std::abs(x) * 1.000001;
+          else
+            for (auto const &x : pp->coef) key += std::abs(x) * 0.999999;
+        }
+      }
+      if (key != pole_key) ahat_key = -1.0;   // new poles: the cache is stale
+      pole_key = key;
+    }
   }
 
   /// bytes of the host XV factors

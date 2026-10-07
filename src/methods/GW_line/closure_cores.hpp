@@ -44,6 +44,7 @@
 #include <thread>
 #include <vector>
 
+#include <dlfcn.h>
 #include <mpi.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -92,6 +93,15 @@ class closure_cores_t {
     if (n > 1 and sched_setaffinity(0, sizeof(wide), &wide) == 0) {
       widened_ = true;
       ncpu_    = n;
+      // MKL caps its thread count by the cores it found at initialization (the 1-core mask) unless dynamic adjustment
+      // is off: switch it off for the k loop (restored in restore())
+      using get_t = int (*)();
+      using set_t = void (*)(int);
+      if (auto g = reinterpret_cast<get_t>(dlsym(RTLD_DEFAULT, "MKL_Get_Dynamic")))
+        if (auto f = reinterpret_cast<set_t>(dlsym(RTLD_DEFAULT, "MKL_Set_Dynamic"))) {
+          mkl_dyn_ = g();
+          f(0);
+        }
     }
 #else
     (void)rank;
@@ -109,7 +119,12 @@ class closure_cores_t {
   /// the owner's mask back to its own core (idempotent)
   void restore() {
 #if defined(__linux__)
-    if (widened_) sched_setaffinity(0, sizeof(saved_), &saved_);
+    if (widened_) {
+      sched_setaffinity(0, sizeof(saved_), &saved_);
+      if (mkl_dyn_ >= 0)
+        if (auto f = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "MKL_Set_Dynamic"))) f(mkl_dyn_);
+      mkl_dyn_ = -1;
+    }
 #endif
     widened_ = false;
   }
@@ -132,6 +147,7 @@ class closure_cores_t {
   boost::mpi3::communicator *comm_ = nullptr;
   bool active_ = false, helper_ = false, widened_ = false;
   long ncpu_ = 1;
+  int mkl_dyn_ = -1;
 #if defined(__linux__)
   cpu_set_t saved_{};
 #endif

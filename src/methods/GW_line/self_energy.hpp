@@ -249,6 +249,14 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
                                   : detail::auto_t_chunk<MEM>(nt, double(2 * nk + nwq) * nP * nQ * 16.0 +
                                                                       double(nk * nb + nQ) * nb * 16.0);
     auto &Sigma_out = out_of(leg.s);
+    // perf 7.1: the hole leg on the conjugate of the ray whose A^ polarization cached (propagator_t::ahat): G^(R) of the
+    // hole leg = conj A^(R, t), no G~ build and no transform
+    bool use_cache = rs and leg.s == sector_t::hole and prop.ahat_key >= 0.0 and prop.ahat_key == prop.pole_key and
+                     prop.ahat_t.size() == nt and prop.ahat.extent(0) == nk and prop.ahat.extent(2) == nP and
+                     prop.ahat.extent(3) == nQ and detail::env_long("COQUI_GWLINE_GT_CACHE", -1) != 0;
+    if (use_cache)
+      for (long i = 0; i < nt; ++i)
+        if (ray.t(i) != std::conj(prop.ahat_t(i))) { use_cache = false; break; }
     if (rs and ((leg.s == sector_t::hole) != wR_minus)) {   // the hole leg uses w^(-R)
       Timer.start("Sigma_W_time");
       swap_wR_minus();
@@ -282,8 +290,8 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
       nda::tensor::set(ComplexType(0.0), Sig_m);
     }
     if constexpr (MEM != HOST_MEMORY) device_mem_probe();
-    app_log(3, "  gw_line::self_energy: {} sector, {} time nodes in chunks of {}{}", leg.s == sector_t::particle ? "particle" : "hole",
-            nt, tc, rs ? " (real-space convolution, perf 7.1 e)" : "");
+    app_log(3, "  gw_line::self_energy: {} sector, {} time nodes in chunks of {}{}{}", leg.s == sector_t::particle ? "particle" : "hole",
+            nt, tc, rs ? " (real-space convolution, perf 7.1 e)" : "", use_cache ? " (G^ from the cached A^ of Pi)" : "");
     const ComplexType alpha(leg.sign / double(nk));
 
     for (long qs0 = 0; qs0 < nq; qs0 += gsz) {   // q groups (one group = all q unless host-resident residues)
@@ -301,9 +309,10 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
         nda::array<ComplexType, 1> t(ray.t(nda::range(i0, i0 + n)));
         const auto tr = nda::range(n);
 
-        // 1. G~(k, chunk) for all k
+        // 1. G~(k, chunk) for all k (not needed when the hole leg takes G^ from the cached A^)
         Timer.start("Sigma_G_tilde");
-        for (long ik = 0; ik < nk; ++ik) prop.build(ik, t, leg.s, form, G(ik, tr, all, all));
+        if (not use_cache)
+          for (long ik = 0; ik < nk; ++ik) prop.build(ik, t, leg.s, form, G(ik, tr, all, all));
         if constexpr (MEM != HOST_MEMORY) utils::device_sync();
         Timer.stop("Sigma_G_tilde");
 
@@ -333,7 +342,13 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
           auto G2       = nda::reshape(G, std::array<long, 2>{nk, tc * blk})(all, cr);
           auto X2       = nda::reshape(acc, std::array<long, 2>{nk, tc * blk})(all, cr);
           auto W2       = nda::reshape(Wq, std::array<long, 2>{nk, tc * blk})(all, cr);
-          nda::blas::gemm(ComplexType(1.0), FmM, G2, ComplexType(0.0), X2);   // G^(R)
+          if (use_cache) {   // G^(R) = conj A^(R, t)
+            for (long R = 0; R < nk; ++R)
+              detail::conj_copy<MEM>(memory::array_view<MEM, ComplexType, 1>(std::array<long, 1>{n * blk}, acc.data() + R * tc * blk),
+                                     memory::array_view<MEM, ComplexType, 1>(std::array<long, 1>{n * blk},
+                                                                             prop.ahat.data() + (R * nt + i0) * blk));
+          } else
+            nda::blas::gemm(ComplexType(1.0), FmM, G2, ComplexType(0.0), X2);   // G^(R)
           nda::tensor::elementwise(ComplexType(1.0), X2, ComplexType(1.0), W2, nda::tensor::op::MUL);   // W <- G^ o W^
           nda::blas::gemm(ComplexType(1.0), BpM, W2, ComplexType(0.0), G2);   // acc(k) = 1/N sum_R e^{ikR} (.), into G
           std::swap(G, acc);
