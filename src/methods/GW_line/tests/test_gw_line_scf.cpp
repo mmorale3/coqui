@@ -2048,7 +2048,7 @@ void p72_table(std::string const &tag, gw_line_result_t const &R) {
 
 /// [mixing] linear vs DIIS (4 iterations each): the residual max|Sigma[G] - Sigma_in| of the linear run is dSigma / mixing
 /// (definition); the DIIS run extrapolates from iteration 2 and its residual after 4 iterations is below the linear run's;
-/// restart of a DIIS run: the history is not checkpointed, the first iteration after the restart is a 1-entry DIIS step
+/// damp_below: the damped tail; restart of a DIIS run: the history is not checkpointed, the first iteration after the restart is a 1-entry DIIS step
 /// (x + beta r), the restored history carries the mixing records.
 TEST_CASE("gw_line_scf_mixing", "[gw_line][scf][mixing]") {
   lih_t L;
@@ -2075,6 +2075,17 @@ TEST_CASE("gw_line_scf_mixing", "[gw_line][scf][mixing]") {
   // iteration 2 is identical up to the mixing step (same G_1); DIIS with 1 entry and beta 1 = mixing 1
   REQUIRE(Dr.history[1].resid == Lr.history[1].resid);
   REQUIRE(Dr.history[n - 1].resid < Lr.history[n - 1].resid);
+  // damped tail: mixing 1 with damp_below above every residual = linear 0.5 from iteration 2 on (bitwise)
+  auto pt = p72_params("gw_line_mixT", n);
+  pt.put("mixing", 1.0);
+  pt.put("damp_below", 1.0);
+  pt.put("damp_mixing", 0.5);
+  auto Tr = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
+  for (long i = 1; i < n; ++i) {
+    REQUIRE(Tr.history[i].mix == "damped");
+    REQUIRE(Tr.history[i].resid == Lr.history[i].resid);
+    REQUIRE(Tr.history[i].mu == Lr.history[i].mu);
+  }
   // restart: 2 + restart + 2
   auto p2 = p72_params("gw_line_mixR", 2);
   p2.put("mixing_alg", "diis");
@@ -2092,7 +2103,7 @@ TEST_CASE("gw_line_scf_mixing", "[gw_line][scf][mixing]") {
   REQUIRE(R4.history[3].resid < 2.0 * Lr.history[3].resid);
   app_log(1, "[mixing] ranks {}: residual after {} iterations: linear {:.3e}, diis {:.3e}, diis with a restart after 2 {:.3e}", comm.size(),
           n, Lr.history[n - 1].resid, Dr.history[n - 1].resid, R4.history[n - 1].resid);
-  for (auto f : {"gw_line_mixL", "gw_line_mixD", "gw_line_mixR"}) remove_file(comm, std::string(f) + ".gw_line.h5");
+  for (auto f : {"gw_line_mixL", "gw_line_mixD", "gw_line_mixR", "gw_line_mixT"}) remove_file(comm, std::string(f) + ".gw_line.h5");
 }
 
 /// [spectra_F] the spectra are those of the stored G: niter = 1 from the KS start: F_closure = F[D_KS] (iteration 0 F,

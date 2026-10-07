@@ -36,6 +36,12 @@
  *              in the history -> the history is reset to the newest pair and a linear step with `mixing` is taken.
  *              With mix_F the vector includes F (weight wF per element; the next closure uses the extrapolated F).
  *
+ * Damped tail (any algorithm, damp_below > 0): once the residual max|out - in| drops below damp_below, every further step
+ * is linear with damp_mixing (sticky; the DIIS history is dropped; kind "damped"). Undamped steps (mixing 1, DIIS) pass the
+ * closure's discrete-decision noise (Gram cut, phase basins; ~1e-4 in Sigma for Si) straight into the next input, so
+ * the iteration keeps hopping at that level; damped steps let the decisions lock (Si 2x2x2: mixing 1 floors at 1e-4,
+ * mixing 0.5 / 0.7 reach 1e-5).
+ *
  * The history is NOT checkpointed: after a restart it is rebuilt from the restored input (first step x + beta r).
  *
  * Inner products are rank-count independent: per-k partial sums (k-distributed rows: one nonzero contribution per
@@ -66,6 +72,8 @@ struct mixing_params_t {
   double cmax     = 10.0;       ///< reset when max|c_i| exceeds this
   double grow     = 10.0;       ///< reset when |r_new| > grow x min_i |r_i| (divergence guard)
   bool mix_F      = false;      ///< include F in the DIIS vector
+  double damp_below  = 0.0;     ///< > 0: linear steps with damp_mixing once the residual is below this (sticky)
+  double damp_mixing = 0.5;
   double wF       = -1.0;       ///< weight of the F elements in the inner product (< 0: the number of fermionic nodes)
 };
 
@@ -75,7 +83,7 @@ struct mix_info_t {
   double resid = 0.0;   ///< max |out - in| of Sigma^> + Sigma^< (the fixed-point residual; linear: dS / mixing)
   double rnorm = 0.0;   ///< ||r|| (2-norm over everything in the vector)
   double residF = 0.0;  ///< max |F[D] - F_in| (the F residual; reported for every algorithm)
-  std::string kind = "none";   ///< "linear" | "diis" | "reset" | "none"
+  std::string kind = "none";   ///< "linear" | "diis" | "reset" | "damped" | "none"
   long m = 0;           ///< history entries used
   double cmax = 0.0;    ///< max |c_i| of the DIIS step
 };
@@ -93,6 +101,7 @@ public:
   mixing_params_t prm;
   std::deque<entry_t> H;
   std::vector<std::vector<double>> B;   ///< B[i][j] = Re <r_i, r_j>
+  bool damped = false;                  ///< the damped tail is active (damp_below)
 
   scf_mixer_t() = default;
   explicit scf_mixer_t(mixing_params_t p) : prm(std::move(p)) {}
@@ -133,6 +142,16 @@ public:
     info.residF = rF;
     F_next      = F_out;
 
+    if (prm.damp_below > 0.0 and (damped or rmax < prm.damp_below)) {   // damped tail (sticky)
+      if (not damped)
+        app_log(1, "  mixing: residual {:.3e} < damp_below {:.1e}: linear steps with mixing {} from now on", rmax, prm.damp_below,
+                prm.damp_mixing);
+      damped = true;
+      reset();
+      info.kind = "damped";
+      linear_step(comm, distributed, Sp_in, Sh_in, Sp, Sh, info, prm.damp_mixing);
+      return info;
+    }
     if (prm.alg == "linear") {   // the pre-7.2 arithmetic, bitwise
       info.kind = "linear";
       linear_step(comm, distributed, Sp_in, Sh_in, Sp, Sh, info);
@@ -301,8 +320,8 @@ public:
 
 private:
   void linear_step(boost::mpi3::communicator &comm, bool distributed, arr4 const &Sp_in, arr4 const &Sh_in, arr4 &Sp, arr4 &Sh,
-                   mix_info_t &info) const {
-    const double a = prm.mixing, b = 1.0 - prm.mixing;
+                   mix_info_t &info, double mix = -1.0) const {
+    const double a = mix > 0.0 ? mix : prm.mixing, b = 1.0 - a;
     double dS = 0.0;
     for (long a_ = 0; a_ < Sp.size(); ++a_) {
       const ComplexType sp = a * Sp.data()[a_] + b * Sp_in.data()[a_];

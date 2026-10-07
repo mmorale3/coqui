@@ -87,6 +87,9 @@
  *                       (weight of the F elements; < 0: the number of fermionic nodes). The history is not checkpointed:
  *                       after a restart it is rebuilt (first step x + beta r). Every iteration logs the residual
  *                       max|Sigma[G] - Sigma_in| ("resid"; linear: dSigma / mixing) and max|F[D] - F_in|.
+ *   damp_below = 0, damp_mixing = 0.5   perf 7.2 damped tail (any mixing_alg): once resid < damp_below, linear steps with
+ *                       damp_mixing (sticky, also across a restart). Undamped steps keep hopping at the closure's
+ *                       discrete-decision noise (~1e-4 in Sigma for Si); damped steps let the decisions lock.
  *   start = "ks"        perf 7.2 initial G: "ks" (below) | "qp_diag": one Pi -> W -> Sigma pass on the KS poles (no SCF closure, not
  *                       counted as an iteration), diagonal G0W0 QP equation E_n = (H0 + F - mu)_nn + Re Sigma_nn(E_n + i
  *                       start_eta) per k and band, Sigma_c from the upfolded closure representation of each k (Newton;

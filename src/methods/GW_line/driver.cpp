@@ -192,6 +192,10 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.mix.grow   = io::get_value_with_default<double>(pt, "diis_grow", p.mix.grow);
   p.mix.mix_F  = io::get_value_with_default<bool>(pt, "diis_mix_F", p.mix.mix_F);
   p.mix.wF     = io::get_value_with_default<double>(pt, "diis_wF", p.mix.wF);
+  p.mix.damp_below  = io::get_value_with_default<double>(pt, "damp_below", p.mix.damp_below);
+  p.mix.damp_mixing = io::get_value_with_default<double>(pt, "damp_mixing", p.mix.damp_mixing);
+  utils::check(p.mix.damp_below >= 0.0 and p.mix.damp_mixing > 0.0 and p.mix.damp_mixing <= 1.0,
+               "gw_line: need damp_below >= 0 and damp_mixing in (0, 1]");
   utils::check(p.mix.alg == "linear" or p.mix.alg == "diis", "gw_line: mixing_alg must be \"linear\" or \"diis\" (got \"{}\")",
                p.mix.alg);
   utils::check(p.mix.hist >= 1 and p.mix.beta > 0.0 and p.mix.reg >= 0.0 and p.mix.cmax > 1.0 and p.mix.grow > 1.0,
@@ -293,6 +297,8 @@ void gw_line_params_t::log() const {
             mix.mix_F ? " and F" : "", mix.hist, mix.start, mixing, mix.beta, mix.reg, mix.cmax, mix.grow);
   else
     app_log(1, "    mixing algorithm: linear (Sigma at the nodes, F unmixed)");
+  if (mix.damp_below > 0.0)
+    app_log(1, "    damped tail: linear mixing {} once max|Sigma[G] - Sigma_in| < {:.1e}", mix.damp_mixing, mix.damp_below);
   if (start == "ks") app_log(1, "    start: KS poles");
   else if (start == "qp_diag")
     app_log(1, "    start: qp_diag (one Pi -> W -> Sigma pass on the KS poles, diagonal QP equation, eta {:.1e} Ha; KS vectors + QP "
@@ -749,7 +755,7 @@ void write_state(boost::mpi3::communicator &comm, std::string const &file, state
 }
 
 static constexpr int NHIST = 36;   ///< columns of the broadcast history table
-static const std::vector<std::string> mix_names = {"none", "linear", "diis", "reset"};
+static const std::vector<std::string> mix_names = {"none", "linear", "diis", "reset", "damped"};
 double mix_code(std::string const &m) {
   auto it = std::find(mix_names.begin(), mix_names.end(), m);
   return it == mix_names.end() ? 0.0 : double(std::distance(mix_names.begin(), it));
@@ -1383,6 +1389,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
             L ? "coarse" : "production", lv_eps, cprm.K, nz, lv_time_eps, bos->rank, bos->zeta_nodes.size(), bp->rank, bh->rank);
   };
   scf_mixer_t mixer(prm.mix);
+  if (not res.history.empty() and res.history.back().mix == "damped") mixer.damped = true;   // restart in the damped tail
   head_out_t hout_first;   // perf 7.2: the head of iteration 1 (computed from the initial poles; optics.poles = "initial")
   bool have_hout_first = false;
 
@@ -1703,7 +1710,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     }
 
     // perf 7.2: only after a mixing step (an unmixed iteration has dS = 0); DIIS also needs mixing x residual < conv_thr
-    if (rec.iter > 1 and mixed and dS < prm.conv_thr and (prm.mix.alg == "linear" or prm.mixing * mi.resid < prm.conv_thr)) {
+    if (rec.iter > 1 and mixed and dS < prm.conv_thr and
+        (mi.kind == "linear" or mi.kind == "damped" or prm.mixing * mi.resid < prm.conv_thr)) {
       converged = true;
       app_log(1, "  converged: max|dSigma| = {:.2e} < conv_thr = {:.1e}", dS, prm.conv_thr);
       break;
