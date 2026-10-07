@@ -74,6 +74,7 @@
 #include "utilities/Timer.hpp"
 #include "methods/GW_line/line_state.hpp"
 #include "methods/GW_line/blas_scope.hpp"
+#include "methods/GW_line/closure_cores.hpp"
 #include "methods/GW_line/closure_device.hpp"
 
 namespace methods::gw_line {
@@ -433,7 +434,9 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   // processed by the same code whatever the worker (results depend only on the BLAS thread count, as for nw = 1)
   const long nown = rank < nk ? (nk - 1 - rank) / np + 1 : 0;
   const long nw   = std::max(1L, std::min(p.k_workers, nown));
-  const long bt   = (nw == 1) ? p.blas_threads : (p.blas_threads > 0 ? std::max(1L, p.blas_threads / nw) : 1L);
+  closure_cores_t cores(comm, nk);   // perf 7.1 (f): np > N_k -> the owners borrow the idle ranks' cores (closure_cores.hpp)
+  const long bt   = (nw == 1) ? (p.blas_threads > 0 ? p.blas_threads : cores.blas_threads())
+                              : (p.blas_threads > 0 ? std::max(1L, p.blas_threads / nw) : 1L);
   std::string blas_backend;
   if (nw == 1) {
     blas_threads_scope_t blas_scope(bt);
@@ -463,6 +466,7 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     blas_backend = be[0];
   }
   if (p.hooks) device_lapack_release();   // the kernels get the device memory back
+  cores.wait();                           // perf 7.1 (f): masks restored; the helpers waited here without polling
   Timer.stop("closure_upfold");
   {   // S7g: per-step profile of the closure (max over ranks of the per-rank sums over the owned k)
     double pmax[8], umax[4];
