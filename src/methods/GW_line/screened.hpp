@@ -156,9 +156,9 @@ struct coulomb_blocks_t {
   coulomb_blocks_t(methods::thc_reader_t const &thc, aux_grid_t const &grid_, std::vector<long> const &q_list,
                    utils::TimerManager &Timer)
      : grid(grid_) {
-    utils::check(thc.nkpts() == thc.nkpts_ibz() and thc.nqpts() == thc.nqpts_ibz(),
-                 "gw_line::coulomb_blocks_t: requires a mesh without symmetry reduction (nk {} nk_ibz {} nq {} nq_ibz {})",
-                 thc.nkpts(), thc.nkpts_ibz(), thc.nqpts(), thc.nqpts_ibz());
+    // perf 7.3: on a symmetric mesh the reader holds Z(q) of the IBZ q only (the first nq_ibz); the rows -q of IBZ q that are
+    // not IBZ q themselves (ibz_t's virtual rows) get Z(-q) := conj Z(q); all other rows stay zero (never used)
+    const long nqI = thc.nqpts_ibz();
     utils::check(thc.ns() == 1 and thc.npol() == 1, "gw_line::coulomb_blocks_t: spin-restricted collinear only (ns={}, npol={})",
                  thc.ns(), thc.npol());
     utils::check(thc.Np() == grid.Np, "gw_line::coulomb_blocks_t: grid Np {} != thc Np {}", grid.Np, thc.Np());
@@ -175,10 +175,16 @@ struct coulomb_blocks_t {
     Timer.start("Z_gather");
     nda::array<ComplexType, 3> zb(nq, grid.nP, grid.nQ);
     Z_full = nda::array<ComplexType, 3>(nfull, Np, Np);
-    for (long iq = 0; iq < nq; ++iq) {   // LOCKSTEP: identical call sequence on every rank
+    if (nqI < nq) zb() = ComplexType(0.0);
+    for (long iq = 0; iq < nqI; ++iq) {   // LOCKSTEP: identical call sequence on every rank
       auto Zq = thc.Z(int(iq));
       zb(iq, nda::range::all, nda::range::all) = Zq(grid.P_rng(), grid.Q_rng());
       if (q_pos[iq] >= 0) Z_full(q_pos[iq], nda::range::all, nda::range::all) = Zq;
+      const long qm = qminus[iq];
+      if (qm >= nqI) {   // virtual row -q
+        zb(qm, nda::range::all, nda::range::all) = nda::conj(Zq(grid.P_rng(), grid.Q_rng()));
+        if (q_pos[qm] >= 0) Z_full(q_pos[qm], nda::range::all, nda::range::all) = nda::conj(Zq);
+      }
     }
     Z = memory::to_memory_space<MEM>(zb);
     Timer.stop("Z_gather");

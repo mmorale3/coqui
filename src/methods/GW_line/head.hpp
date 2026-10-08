@@ -110,23 +110,37 @@ struct head_basis_t {
   std::vector<long> qminus;
 
   head_basis_t() = default;
+  /// perf 7.3: on a symmetric mesh (nq_ibz < nq) the head vectors of the IBZ q come from the reader, the virtual rows -q of
+  /// ibz_t get conj(cb(q)) (zeta_{-q} = conj zeta_q), every other q has f = 0 (skipped); rows are absolute q indices
   head_basis_t(methods::thc_reader_t const &thc, mf::MF const &mf, aux_grid_t const &grid)
      : nq(mf.nqpts()), Np(thc.Np()), nP(grid.nP), nQ(grid.nQ) {
-    utils::check(thc.nqpts() == thc.nqpts_ibz() and mf.nqpts() == mf.nqpts_ibz(), "gw_line::head_basis_t: nosym mesh required");
-    auto cb = thc.basis_bar_head();
-    utils::check(cb.extent(0) == nq and cb.extent(1) == Np, "gw_line::head_basis_t: basis_bar_head ({}, {}) vs (nq {}, Np {})",
-                 cb.extent(0), cb.extent(1), nq, Np);
-    cbP = nda::array<ComplexType, 2>(cb(nda::range::all, grid.P_rng()));
-    cbQ = nda::array<ComplexType, 2>(cb(nda::range::all, grid.Q_rng()));
-    fac = nda::array<double, 1>(nq);
-    constexpr double fpi = 4.0 * 3.14159265358979323846;   // as eval_eps_inv_q
-    for (long iq = 0; iq < nq; ++iq) {
-      auto qp  = mf.Qpts_ibz(iq);
-      fac(iq)  = (qp(0) * qp(0) + qp(1) * qp(1) + qp(2) * qp(2)) / fpi * mf.volume();
-    }
+    auto cb        = thc.basis_bar_head();
+    const long nqI = mf.nqpts_ibz();
+    utils::check(cb.extent(0) == nqI and cb.extent(1) == Np, "gw_line::head_basis_t: basis_bar_head ({}, {}) vs (nq_ibz {}, Np {})",
+                 cb.extent(0), cb.extent(1), nqI, Np);
     auto qm = mf.qminus();
     qminus.resize(nq);
     for (long iq = 0; iq < nq; ++iq) qminus[iq] = qm(iq);
+    cbP = nda::array<ComplexType, 2>(nq, nP);
+    cbQ = nda::array<ComplexType, 2>(nq, nQ);
+    cbP() = ComplexType(0.0);
+    cbQ() = ComplexType(0.0);
+    fac   = nda::array<double, 1>(nq);
+    fac() = 0.0;
+    constexpr double fpi = 4.0 * 3.14159265358979323846;   // as eval_eps_inv_q
+    auto Q               = mf.Qpts();
+    auto qfac = [&](long iq) { return (Q(iq, 0) * Q(iq, 0) + Q(iq, 1) * Q(iq, 1) + Q(iq, 2) * Q(iq, 2)) / fpi * mf.volume(); };
+    for (long iq = 0; iq < nqI; ++iq) {
+      cbP(iq, nda::range::all) = cb(iq, grid.P_rng());
+      cbQ(iq, nda::range::all) = cb(iq, grid.Q_rng());
+      fac(iq)                  = qfac(iq);
+      const long m = qminus[iq];
+      if (m >= nqI) {
+        cbP(m, nda::range::all) = nda::conj(cb(iq, grid.P_rng()));
+        cbQ(m, nda::range::all) = nda::conj(cb(iq, grid.Q_rng()));
+        fac(m)                  = qfac(m);
+      }
+    }
   }
 };
 
@@ -352,10 +366,12 @@ struct head_extrapolation_t {
   std::vector<std::string> info;   ///< log lines (q indices and orders per axis)
 
   head_extrapolation_t() = default;
-  head_extrapolation_t(mf::MF const &mf, std::string div) : variant(std::move(div)) {
+  /// full_mesh (perf 7.3, symmetric meshes): the weights over ALL q of the mesh (mf.Qpts()); the per-q heads are then the
+  /// IBZ heads unfolded by qp_to_ibz (unfold_heads), the same extrapolation as on the nosym mesh
+  head_extrapolation_t(mf::MF const &mf, std::string div, bool full_mesh = false) : variant(std::move(div)) {
     head_check_variant(variant);
     utils::check(head_div_is_gygi(variant), "gw_line::head_extrapolation_t: a gygi variant is required (got \"{}\")", variant);
-    auto Q        = mf.Qpts_ibz();
+    nda::array<double, 2> Q = full_mesh ? nda::array<double, 2>(mf.Qpts()) : nda::array<double, 2>(mf.Qpts_ibz());
     const long nq = Q.shape(0);
     c             = nda::array<double, 1>(nq);
     c()           = 0.0;
@@ -445,6 +461,15 @@ struct head_extrapolation_t {
     for (auto const &s : info) app_log(lvl, "    {}", s);
   }
 };
+
+/// perf 7.3: per-q heads (nq, n) with valid IBZ rows -> every q of the mesh, h(q) = h(qp_to_ibz(q)) (eps^-1_00 is a scalar
+/// invariant under the point operations and time reversal)
+inline nda::array<ComplexType, 2> unfold_heads(nda::array<ComplexType, 2> const &h, mf::MF const &mf) {
+  auto q2i = mf.qp_to_ibz();
+  nda::array<ComplexType, 2> o(h.shape());
+  for (long q = 0; q < h.extent(0); ++q) o(q, nda::range::all) = h(q2i(q), nda::range::all);
+  return o;
+}
 
 // ------------------------------------------------------------------------------------------------------------------
 // Madelung corrections

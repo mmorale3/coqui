@@ -112,6 +112,7 @@ struct closure_params_t {
   double tol_gram = 1e-10;   ///< relative eigenvalue cutoff of the block-Toeplitz Gram matrix
   long nphi       = 8;       ///< coarse terminal-phase scan (+ golden section)
   double tol_svd  = 1e-12;   ///< relative singular-value cutoff of D+ D-^dagger (python 1e-12)
+  std::vector<double> k_weight;   ///< perf 7.3: weights of the k in the electron count (IBZ star sizes); empty = uniform
   std::string gram_cut = "hard";   ///< "hard" (python) | "gap" | "smooth" (numerics::line_dlr::upfold_opts_t)
   std::string svd_cut  = "hard";   ///< "hard" (python) | "gap"
   double cut_window    = 10.0;     ///< window factor of the gap / smooth cuts
@@ -496,7 +497,7 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
 
   // 2. chemical potential (every rank, same data) and re-centring
   Timer.start("closure_mu");
-  auto cp       = numerics::line_dlr::chemical_potential(out.leh.e, out.leh.v, nelec);
+  auto cp       = numerics::line_dlr::chemical_potential(out.leh.e, out.leh.v, nelec, p.k_weight);
   out.dmu       = cp.mu;
   out.e_homo    = cp.e_homo - cp.mu;
   out.e_lumo    = cp.e_lumo - cp.mu;

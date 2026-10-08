@@ -234,6 +234,7 @@ struct gw_line_params_t {
   std::string output = "./gw_line";
   std::string checkpoint_sigma = "last";   ///< "last" | "all" (S7e)
   bool sigma_kdist = true;                 ///< k-distributed Sigma at the nodes (S7e)
+  bool ibz = true;                         ///< perf 7.3: use the symmetry reduction of a symmetric mean field (ibz.hpp); env COQUI_GWLINE_IBZ
   bool do_spectra = true;
   spectra_params_t spectra;
   std::string div_treatment = "ignore_g0";      ///< S9a: Sigma_c head term ("ignore_g0" | gygi variants, head.hpp)

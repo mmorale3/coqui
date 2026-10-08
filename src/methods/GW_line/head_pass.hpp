@@ -74,6 +74,7 @@ struct head_pass_params_t {
   long t_chunk = 0;                 ///< 0: kernel default
   long qgroup = 0;                  ///< q-group size of the Pi -> W stage; 0: from mem_gb
   double mem_gb = 2.0;              ///< host budget per rank for the Pi group (1.8 x g N_zeta block x 16 B)
+  ibz_t const *ibz = nullptr;       ///< perf 7.3: symmetric mesh: Pi / W on the rows R, heads unfolded to every q
 
   // time-grid resolution on flat rays (S9b, [V6][flat], [.flat_scan]): the ID LS energy grid / candidate s grid and the GL
   // panels per e-fold; < 0: auto = the SCF defaults (120 / 40 per e-fold, GL 3 per e-fold) with the candidate s density
@@ -191,14 +192,16 @@ head_pass_out_t head_pass(methods::thc_reader_t &thc, mf::MF &mf, utils::mpi_con
   out.t_basis = g.t_basis;
   out.t_grid  = g.t_grid;
   const long nq = mf.nqpts(), Np = thc.Np(), nz = out.nz;
+  const bool ibzm = (p.ibz != nullptr and p.ibz->active);
+  const long nrow = ibzm ? p.ibz->nrows() : nq;
   // q groups from the budget: Pi group + ~0.8 of it in the W stage
   long gs = p.qgroup;
   if (gs <= 0) {
     const double per_q = 1.8 * double(nz) * 16.0 * double(grid.max_block_size());
-    gs = std::clamp(long(p.mem_gb * 1073741824.0 / per_q), 1L, nq);
+    gs = std::clamp(long(p.mem_gb * 1073741824.0 / per_q), 1L, nrow);
     gs = comm.all_reduce_value(gs, boost::mpi3::min<>{});
   }
-  const q_groups_t qg(nq, gs, qminus_list(mf));
+  const q_groups_t qg = ibzm ? q_groups_t(p.ibz->rows, gs, p.ibz->qminus) : q_groups_t(nq, gs, qminus_list(mf));
   out.ngroups    = qg.n;
   out.group_size = qg.max_size();
   app_log(2, "  head pass theta {} deg: bosonic rank {} ({} nodes, nu [{:.4f}, {:.3f}] Ha; basis {:.2f} s), Pi time nodes ({}) {} + {} "
@@ -218,7 +221,7 @@ head_pass_out_t head_pass(methods::thc_reader_t &thc, mf::MF &mf, utils::mpi_con
                       numerics::line_dlr::sector_t::both, qg.rows(G));
     out.t_Pi += secs(t0);
     t0 = std::chrono::steady_clock::now();
-    screened_interaction<MEM>(Pi, Zb, bos, grid, mpi, w, Timer, &Wn, qg.rows(G), false);
+    screened_interaction<MEM>(Pi, Zb, bos, grid, mpi, w, Timer, &Wn, qg.rows(G), ibzm);
     out.t_W += secs(t0);
     t0 = std::chrono::steady_clock::now();
     head_nodes_partial<MEM>(Wn, qg.rows(G), hb, Hn);
@@ -229,7 +232,7 @@ head_pass_out_t head_pass(methods::thc_reader_t &thc, mf::MF &mf, utils::mpi_con
   t0 = std::chrono::steady_clock::now();
   head_reduce(comm, {&Hn});
   out.t_head += secs(t0);
-  out.h_nodes = std::move(Hn);
+  out.h_nodes = ibzm ? unfold_heads(Hn, mf) : std::move(Hn);
   out.t_total = secs(t00);
   app_log(2, "  head pass theta {} deg: {:.2f} s (basis {:.2f}, time grid {:.2f}, Z {:.2f}, Pi {:.2f}, W {:.2f}, head {:.2f})",
           p.theta_deg, out.t_total, out.t_basis, out.t_grid, out.t_Z, out.t_Pi, out.t_W, out.t_head);

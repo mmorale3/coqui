@@ -99,8 +99,11 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   using arr4_t = memory::array<MEM, ComplexType, 4>;
   auto all     = nda::range::all;
 
-  utils::check(mf.nkpts() == mf.nkpts_ibz() and mf.nqpts() == mf.nqpts_ibz(),
-               "gw_line::polarization: requires a mesh without symmetry reduction (nkpts {} nkpts_ibz {})", mf.nkpts(),
+  // perf 7.3: a symmetric mesh needs the IBZ unfolding of the propagator (ibz.hpp); Pi is computed for the q list given
+  // (the rows R of ibz_t: IBZ q and their -q), with X of all full-BZ k
+  const bool ibzmode = (mf.nkpts() != mf.nkpts_ibz() or mf.nqpts() != mf.nqpts_ibz());
+  utils::check(not ibzmode or (prop.ibz != nullptr and prop.ibz->active),
+               "gw_line::polarization: a symmetric mesh (nkpts {} nkpts_ibz {}) needs propagator_t::set_ibz", mf.nkpts(),
                mf.nkpts_ibz());
   utils::check(ray_p.sector == sector_t::particle and ray_h.sector == sector_t::hole,
                "gw_line::polarization: ray_p must be a particle ray and ray_h a hole ray");
@@ -168,7 +171,9 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   }
   // acc chunks held: all q of the group (qfold), all N_q (real space: the back transform always has N_q rows, so q groups
   // give bitwise the same Pi rows as one call for all q, whatever the BLAS blocking), or one
-  const long nacc = rs ? nq : (qfold ? g : 1);
+  // perf 7.3 (IBZ): only the g rows of the list (rows ordered as qs)
+  const long nacc = rs ? (ibzmode ? g : nq) : (qfold ? g : 1);
+  auto arow       = [&](long iqr) { return ibzmode ? iqr : qs[iqr]; };   // acc row of group row iqr (real space)
 
   bool filled_now = false;   // perf 7.1: this call refilled the A^ cache of prop
   for (auto const &leg : legs) {
@@ -203,9 +208,11 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
     }
     if (rs) {
       X = arr4_t(nk, tc, nP, nQ);
-      nda::array<ComplexType, 2> gq(nq, nk);   // alpha / N e^{-iQ_q R}, all q (the group's rows are selected after)
-      for (long iq = 0; iq < nq; ++iq)
-        for (long R = 0; R < nk; ++R) gq(iq, R) = alpha / double(nk) * kft.Gm(iq, R);
+      nda::array<ComplexType, 2> gq(nacc, nk);   // alpha / N e^{-iQ_q R}, all q (the group's rows are selected after)
+      for (long ia = 0; ia < nacc; ++ia) {
+        const long iq = ibzmode ? qs[ia] : ia;
+        for (long R = 0; R < nk; ++R) gq(ia, R) = alpha / double(nk) * kft.Gm(iq, R);
+      }
       GmQ = memory::to_memory_space<MEM>(gq);
     }
     if constexpr (MEM != HOST_MEMORY) device_mem_probe();
@@ -232,7 +239,7 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
         auto A2       = nda::reshape(A, std::array<long, 2>{nk, tc * blk})(all, cr);
         auto B2       = nda::reshape(B, std::array<long, 2>{nk, tc * blk})(all, cr);
         auto X2       = nda::reshape(X, std::array<long, 2>{nk, tc * blk})(all, cr);
-        auto C2       = nda::reshape(acc, std::array<long, 2>{nq, tc * blk})(all, cr);
+        auto C2       = nda::reshape(acc, std::array<long, 2>{nacc, tc * blk})(all, cr);
         nda::blas::gemm(ComplexType(1.0), FpM, A2, ComplexType(0.0), X2);   // A^(R)
         if (fill_cache) {
           for (long R = 0; R < nk; ++R) prop.ahat(R, nda::range(i0, i0 + n), all, all) = X(R, tr, all, all);
@@ -246,19 +253,19 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
         Timer.start("Pi_transform");
         if constexpr (MEM == HOST_MEMORY) {
           for (long iqr = 0; iqr < g; ++iqr) {
-            auto acc2 = nda::reshape(acc(qs[iqr], all, all, all), std::array<long, 2>{tc, blk})(tr, all);
+            auto acc2 = nda::reshape(acc(arow(iqr), all, all, all), std::array<long, 2>{tc, blk})(tr, all);
             auto Pi2  = nda::reshape(Pi(iqr, all, all, all), std::array<long, 2>{nz, blk});
             nda::blas::gemm(ComplexType(1.0), F(all, nda::range(i0, i0 + n)), acc2, ComplexType(1.0), Pi2);
           }
         } else {
           bool contiguous = true;   // the group rows are q = qs[0] .. qs[0] + g - 1: one batched gemm
-          for (long iqr = 1; iqr < g; ++iqr) contiguous = contiguous and (qs[iqr] == qs[0] + iqr);
+          for (long iqr = 1; iqr < g; ++iqr) contiguous = contiguous and (arow(iqr) == arow(0) + iqr);
           if (contiguous)
-            detail::gemm_strided_cm('N', 'N', blk, nz, n, ComplexType(1.0), acc.data() + qs[0] * tc * blk, blk, tc * blk,
+            detail::gemm_strided_cm('N', 'N', blk, nz, n, ComplexType(1.0), acc.data() + arow(0) * tc * blk, blk, tc * blk,
                                     F.data() + i0, nt, 0, ComplexType(1.0), Pi.data(), blk, nz * blk, g);
           else
             for (long iqr = 0; iqr < g; ++iqr)
-              detail::gemm_strided_cm('N', 'N', blk, nz, n, ComplexType(1.0), acc.data() + qs[iqr] * tc * blk, blk, tc * blk,
+              detail::gemm_strided_cm('N', 'N', blk, nz, n, ComplexType(1.0), acc.data() + arow(iqr) * tc * blk, blk, tc * blk,
                                       F.data() + i0, nt, 0, ComplexType(1.0), Pi.data() + iqr * nz * blk, blk, nz * blk, 1);
           utils::device_sync();
         }

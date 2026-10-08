@@ -68,6 +68,7 @@
 #include "methods/GW_line/proc_grid.hpp"
 #include "methods/GW_line/line_state.hpp"
 #include "methods/GW_line/device_blas.hpp"
+#include "methods/GW_line/ibz.hpp"
 
 namespace methods::gw_line {
 
@@ -110,6 +111,24 @@ struct propagator_t {
   std::vector<nda::array<ComplexType, 2>> L_p, L_h, R_p, R_h;
   long n_xv = 0;                                      ///< (k, sector) pairs using the XV form
 
+  /**
+   * perf 7.3 (IBZ): with set_ibz, set_poles accepts the poles of the IBZ k (poles.nk == nk_ibz) and unfolds them to every
+   * full-BZ k (ibz.hpp unfold_poles; X(k) of all k as before). Host builds then SHARE C(t) within each star: for a factorized
+   * (Hermitian) sector C_{k'}(tau) = C_{k_I}(tau), or C_{k_I}(tau)^T for a time-reversed k', computed once per (k_I, sector,
+   * tau set) and cached (nk_ibz x 4 slots of [nt, nb, nb]); env COQUI_GWLINE_IBZ_CSHARE = 0 turns the sharing off.
+   */
+  ibz_t const *ibz = nullptr;
+  bool share = false;
+  std::vector<long> shr_src;   ///< (nk) IBZ source of k (a full-BZ index: the IBZ k are the first nk_ibz)
+  std::vector<char> shr_tr;    ///< (nk) time-reversed
+  struct ccache_t {
+    nda::array<ComplexType, 1> t;
+    nda::array<ComplexType, 3> C;
+  };
+  mutable std::vector<ccache_t> ccache;
+  mutable nda::array<ComplexType, 2> s_Cc;   ///< conj(C(t)) of one time (adjoint form at a time-reversed k')
+  void set_ibz(ibz_t const *ibz_) { ibz = ibz_; }
+
   // grow-only MEM scratch of build(): phases (or VP), C(t), and the intermediate (host: Xp C; device: C Xq^dagger for all t)
   mutable detail::scratch_t<MEM> s_ph, s_C, s_T;
   mutable detail::scratch_t<HOST_MEMORY> s_VPh;       ///< host staging of VP (device builds only)
@@ -145,7 +164,26 @@ struct propagator_t {
 
   /// Mirror the pole residues to MEM (matrix form N_k M nb^2, factorized N_k nb M; cheap). Must be called whenever the
   /// poles change.
-  void set_poles(pole_data_t const &poles) {
+  void set_poles(pole_data_t const &poles_in) {
+    const bool unf = (ibz != nullptr and ibz->active and poles_in.nk == ibz->nkI and ibz->nkI < nk);
+    pole_data_t unfolded;
+    if (unf) unfolded = unfold_poles(poles_in, *ibz);
+    pole_data_t const &poles = unf ? unfolded : poles_in;
+    share = unf and (MEM == HOST_MEMORY) and detail::env_long("COQUI_GWLINE_IBZ_CSHARE", 1) != 0;
+    shr_src.assign(nk, -1);
+    shr_tr.assign(nk, 0);
+    std::vector<long> star(nk, 1);
+    if (share) {
+      std::vector<long> cnt(nk, 0);
+      for (long k = 0; k < nk; ++k) {
+        shr_src[k] = ibz->k2i[k];
+        shr_tr[k]  = ibz->ktrev[k];
+        ++cnt[shr_src[k]];
+      }
+      for (long k = 0; k < nk; ++k) star[k] = cnt[shr_src[k]];
+      ccache.assign(4 * ibz->nkI, ccache_t{});
+    } else
+      ccache.clear();
     utils::check(poles.nk == nk and poles.nb == nb, "gw_line::propagator_t::set_poles: pole data ({} k, {} bands) vs X ({} k, {} bands)",
                  poles.nk, poles.nb, nk, nb);
     coef_p.clear(); coef_h.clear(); e_p.clear(); e_h.clear();
@@ -183,7 +221,8 @@ struct propagator_t {
           if (not((part ? fac_p : fac_h)[ik])) continue;
           auto const &V  = (part ? vh_p : vh_h)[ik];
           const double M = double(V.extent(1));
-          const bool xv  = (mode == 1) or (mode < 0 and nP * nQ * M + nP * M < b * b * M + nP * b * b + nP * b * nQ);
+          const double cm = b * b * M / double(star[ik]);   // C(t) per k (shared within the star, perf 7.3)
+          const bool xv  = (mode == 1) or (mode < 0 and nP * nQ * M + nP * M < cm + nP * b * b + nP * b * nQ);
           if (not xv or V.extent(1) == 0) continue;
           nda::array<ComplexType, 2> L(grid.nP, V.extent(1)), R(grid.nQ, V.extent(1));
           nda::blas::gemm(ComplexType(1.0), Xp(ik, all, all), V, ComplexType(0.0), L);
@@ -282,6 +321,12 @@ struct propagator_t {
         return;
       }
     }
+    if constexpr (MEM == HOST_MEMORY) {
+      if (share and ((s == sector_t::particle) ? fac_p[ik] : fac_h[ik])) {
+        build_shared(ik, t, s, form, out);
+        return;
+      }
+    }
     // C(tau) for tau = t (plain, transposed) or conj(t) (adjoint_conj_t): phases on the host, one (batched) gemm in MEM.
     // All MEM intermediates are views of grow-only scratch buffers (no allocation per call once warm).
     const bool conj_time = (form == gtilde_form_t::adjoint_conj_t);
@@ -363,6 +408,60 @@ struct propagator_t {
       detail::gemm_strided_cm('N', 'N', nQ, nP, nb, ComplexType(1.0), T.data(), nQ, nb * nQ, xp, nb, 0, ComplexType(0.0),
                               out.data(), nQ, out.indexmap().strides()[0], nt);
       device_mem_probe();
+    }
+  }
+
+  /// perf 7.3: host build from the C(t) of the IBZ source of k (cached per star), see set_ibz
+  void build_shared(long ik, nda::array<ComplexType, 1> const &t, sector_t s, gtilde_form_t form, view_t<3> out) const {
+    auto all             = nda::range::all;
+    const long nt        = t.size();
+    const long src       = shr_src[ik];
+    const bool tr        = shr_tr[ik] != 0;
+    const bool conj_time = (form == gtilde_form_t::adjoint_conj_t);
+    auto &cc             = ccache[(src * 2 + (s == sector_t::particle ? 0 : 1)) * 2 + (conj_time ? 1 : 0)];
+    bool hit             = (cc.t.size() == nt);
+    for (long i = 0; hit and i < nt; ++i) hit = (cc.t(i) == t(i));
+    if (not hit) {   // C_src(tau) = V diag(e^{-i e tau}) V^dagger for the IBZ source (its own, not conjugated, V)
+      auto const &e  = (s == sector_t::particle) ? e_p[src] : e_h[src];
+      auto const &Vh = (s == sector_t::particle) ? vh_p[src] : vh_h[src];
+      const long M   = e.size();
+      cc.t           = t;
+      cc.C           = nda::array<ComplexType, 3>(nt, nb, nb);
+      nda::array<ComplexType, 2> VP(nb, M);
+      for (long it = 0; it < nt; ++it) {
+        const ComplexType tau = conj_time ? std::conj(t(it)) : t(it);
+        for (long m = 0; m < M; ++m) {
+          const ComplexType ph = std::exp(ComplexType(0.0, -e(m)) * tau);
+          for (long a = 0; a < nb; ++a) VP(a, m) = Vh(a, m) * ph;
+        }
+        nda::blas::gemm(ComplexType(1.0), VP, nda::dagger(Vh), ComplexType(0.0), cc.C(it, all, all));
+      }
+    }
+    auto tmp = s_T.template view<2>({grid.nP, nb});
+    if (s_Cc.extent(0) != nb) s_Cc = nda::array<ComplexType, 2>(nb, nb);
+    for (long it = 0; it < nt; ++it) {
+      auto Ct = cc.C(it, all, all);
+      auto ot = out(it, all, all);
+      switch (form) {
+        case gtilde_form_t::plain:   // X C' X^dagger, C' = C or C^T
+          if (tr) nda::blas::gemm(ComplexType(1.0), Xp(ik, all, all), nda::transpose(Ct), ComplexType(0.0), tmp);
+          else nda::blas::gemm(ComplexType(1.0), Xp(ik, all, all), Ct, ComplexType(0.0), tmp);
+          nda::blas::gemm(ComplexType(1.0), tmp, XqH(ik, all, all), ComplexType(0.0), ot);
+          break;
+        case gtilde_form_t::transposed:   // conj(X) C'^T X^T
+          if (tr) nda::blas::gemm(ComplexType(1.0), Xpc(ik, all, all), Ct, ComplexType(0.0), tmp);
+          else nda::blas::gemm(ComplexType(1.0), Xpc(ik, all, all), nda::transpose(Ct), ComplexType(0.0), tmp);
+          nda::blas::gemm(ComplexType(1.0), tmp, XqT(ik, all, all), ComplexType(0.0), ot);
+          break;
+        case gtilde_form_t::adjoint_conj_t:   // X C'(conj t)^dagger X^dagger, C'^dagger = C^dagger or conj(C)
+          if (tr) {
+            s_Cc = nda::conj(Ct);
+            nda::blas::gemm(ComplexType(1.0), Xp(ik, all, all), s_Cc, ComplexType(0.0), tmp);
+          } else
+            nda::blas::gemm(ComplexType(1.0), Xp(ik, all, all), nda::dagger(Ct), ComplexType(0.0), tmp);
+          nda::blas::gemm(ComplexType(1.0), tmp, XqH(ik, all, all), ComplexType(0.0), ot);
+          break;
+      }
     }
   }
 

@@ -224,18 +224,26 @@ struct q_groups_t {
   std::vector<std::vector<long>> qs;   ///< absolute q of each group (row order of Pi / W of the group)
   q_groups_t() = default;
   /// qminus: -q of every q (mf::MF::qminus, see qminus_list in screened.hpp)
-  q_groups_t(long nq_, long g_, std::vector<long> const &qminus) : nq(nq_), g(std::clamp(g_, 1L, nq_)) {
-    utils::check(long(qminus.size()) == nq, "q_groups_t: qminus has {} entries for {} q", long(qminus.size()), nq);
+  q_groups_t(long nq_, long g_, std::vector<long> const &qminus) : q_groups_t(iota(nq_), g_, qminus) {}
+  static std::vector<long> iota(long n) {
+    std::vector<long> v(n);
+    for (long q = 0; q < n; ++q) v[q] = q;
+    return v;
+  }
+  /// perf 7.3: groups of an explicit row list (closed under -q; the IBZ rows R of ibz_t), in list order
+  q_groups_t(std::vector<long> const &list, long g_, std::vector<long> const &qminus)
+     : nq(long(list.size())), g(std::clamp(g_, 1L, std::max(1L, long(list.size())))) {
+    const long nfull = long(qminus.size());
+    for (long q : list) utils::check(q >= 0 and q < nfull, "q_groups_t: q = {} out of [0, {})", q, nfull);
     if (g >= nq) {
-      qs.emplace_back(nq);
-      for (long q = 0; q < nq; ++q) qs[0][q] = q;
+      qs.push_back(list);
     } else {
-      std::vector<char> placed(nq, 0);
+      std::vector<char> placed(nfull, 0);
       std::vector<long> cur;
-      for (long q = 0; q < nq; ++q) {
+      for (long q : list) {
         if (placed[q]) continue;
         const long qm = qminus[q];
-        utils::check(qm >= 0 and qm < nq and qminus[qm] == q, "q_groups_t: qminus is not an involution at q = {}", q);
+        utils::check(qm >= 0 and qm < nfull and qminus[qm] == q, "q_groups_t: qminus is not an involution at q = {}", q);
         const long u = (qm == q) ? 1 : 2;
         if (not cur.empty() and long(cur.size()) + u > g) {
           qs.push_back(cur);

@@ -118,7 +118,7 @@ inline spectra_out_t line_spectra(boost::mpi3::communicator &comm, nda::array<Co
   detail::exact_allreduce(comm, npol.data(), npol.size());
   for (long ik = 0; ik < nk; ++ik) out.npoles.push_back(long(std::llround(npol(ik))));
   auto leh   = gather_lehmann(comm, nk, nb, e_loc, v_loc);
-  auto cp    = numerics::line_dlr::chemical_potential(leh.e, leh.v, nelec);
+  auto cp    = numerics::line_dlr::chemical_potential(leh.e, leh.v, nelec, p.k_weight);
   out.e_homo = cp.e_homo;
   out.e_lumo = cp.e_lumo;
   out.N      = cp.N;

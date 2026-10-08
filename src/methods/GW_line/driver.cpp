@@ -68,6 +68,9 @@
 #include "methods/GW_line/head.hpp"
 #include "methods/GW_line/head_pass.hpp"
 #include "methods/GW_line/optics.hpp"
+#include "methods/GW_line/ibz.hpp"
+#include "methods/GW_line/self_energy_ibz.hpp"
+#include "methods/GW_line/static_ibz.hpp"
 #include "methods/GW_line/k_dist.hpp"
 #include "methods/GW_line/scf_mixing.hpp"
 #include "methods/GW_line/warm_start.hpp"
@@ -143,6 +146,8 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.time_oversample = io::get_value_with_default<double>(pt, "time_oversample", p.time_oversample);
   p.time_snap       = io::get_value_with_default<double>(pt, "time_snap", p.time_snap);
   p.sigma_kdist     = io::get_value_with_default<bool>(pt, "sigma_kdist", p.sigma_kdist);
+  p.ibz             = io::get_value_with_default<bool>(pt, "ibz", p.ibz);
+  if (char const *e = std::getenv("COQUI_GWLINE_IBZ"); e != nullptr and *e != '\0') p.ibz = std::strtol(e, nullptr, 10) != 0;
   p.checkpoint_sigma = io::get_value_with_default<std::string>(pt, "checkpoint_sigma", p.checkpoint_sigma);
   io::tolower(p.checkpoint_sigma);
   {
@@ -314,6 +319,7 @@ void gw_line_params_t::log() const {
     app_log(1, "    time grid: GL rays (ray_decades = {}, 3 panels/e-fold, 16 nodes/panel)", ray_decades);
   app_log(1, "    restart = {}, checkpoint = {}.gw_line.h5 (Sigma at the nodes: {})", restart, output,
           checkpoint_sigma == "last" ? "last iteration only, in " + output + ".gw_line.sigma.h5" : "every iteration");
+  app_log(1, "    IBZ reduction of a symmetric mean field: {} (ibz; env COQUI_GWLINE_IBZ)", ibz ? "on" : "off");
   app_log(1, "    Sigma at the nodes {} (sigma_kdist = {})", sigma_kdist ? "k-distributed (owner k mod np)" : "replicated on every rank",
           sigma_kdist);
   app_log(1, "    divergence: div_treatment = {} (Sigma_c head term {}), hf_div_treatment = {}; head extrapolation {}", div_treatment,
@@ -369,6 +375,16 @@ void write_system_h5(boost::mpi3::communicator &comm, std::string const &file, m
     nda::h5_write(s, "eigval", eig, false);
     nda::h5_write(s, "qk_to_k2", mf.qk_to_k2(), false);
     nda::h5_write(s, "kpoints", mf.kpts(), false);
+    // perf 7.3: the k of the poles / Sigma / spectra are the first nkpts_ibz of kpoints; every k maps to kp_to_ibz (time-
+    // reversed orbitals where kp_trev: G(k) = conj G(k_ibz))
+    h5::h5_write(s, "nkpts_ibz", long(H0.extent(0)));
+    nda::array<long, 1> k2i(nk), ktr(nk);
+    for (long ik = 0; ik < nk; ++ik) {
+      k2i(ik) = (H0.extent(0) < nk) ? long(mf.kp_to_ibz()(ik)) : ik;
+      ktr(ik) = (H0.extent(0) < nk and mf.kp_trev()(ik)) ? 1 : 0;
+    }
+    nda::h5_write(s, "kp_to_ibz", k2i, false);
+    nda::h5_write(s, "kp_trev", ktr, false);
   }
   comm.barrier();
 }
@@ -1058,13 +1074,17 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   auto &comm   = mpi.comm;
   const std::string chk = prm.output + ".gw_line.h5";
 
-  utils::check(mf.nkpts() == mf.nkpts_ibz() and mf.nqpts() == mf.nqpts_ibz(),
-               "gw_line: requires a k mesh without symmetry reduction (nkpts {} nkpts_ibz {}); use a nosym mean field",
-               mf.nkpts(), mf.nkpts_ibz());
+  // perf 7.3: a symmetric mean field runs on its IBZ (ibz.hpp); the full-BZ path needs a nosym mean field (the THC reader
+  // of a symmetric mean field holds Z(q) for the IBZ q only)
+  const bool sym_mf = (mf.nkpts() != mf.nkpts_ibz() or mf.nqpts() != mf.nqpts_ibz());
+  utils::check(not sym_mf or prm.ibz, "gw_line: symmetric mean field (nkpts {} nkpts_ibz {}) with ibz = false: the full-BZ path needs a "
+                                      "nosym mean field", mf.nkpts(), mf.nkpts_ibz());
+  const ibz_t ibz(mf, thc.nbnd(), sym_mf);
   utils::check(mf.nspin() == 1 and mf.npol() == 1 and thc.ns() == 1 and thc.npol() == 1,
                "gw_line: spin-restricted collinear only (nspin {}, npol {})", mf.nspin(), mf.npol());
   utils::check(thc.nbnd() == mf.nbnd(), "gw_line: THC nbnd {} != MF nbnd {}", thc.nbnd(), mf.nbnd());
-  const long nk = mf.nkpts(), nq = mf.nqpts(), nb = thc.nbnd(), Np = thc.Np();
+  // nk: the k of the poles, Sigma, closure, mixing and checkpoints (the IBZ k on a symmetric mesh); nkF: all k (X, G~)
+  const long nk = ibz.nkI, nkF = mf.nkpts(), nq = mf.nqpts(), nb = thc.nbnd(), Np = thc.Np();
   const double nelec = double(mf.nelec());
   const long nocc    = long(std::llround(nelec / 2.0));
   const k_dist_t kd(nk, comm);                         // owner of Sigma(k) (S7e: k-distributed Sigma)
@@ -1086,9 +1106,10 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   app_log(1, "\n╔══════════════════════════════════════════════════════════╗");
   app_log(1, "║  CoQuí: self-consistent GW on the tilted frequency line  ║");
   app_log(1, "╚══════════════════════════════════════════════════════════╝");
-  app_log(1, "  nkpts = {}, nqpts = {}, nbnd = {}, Np = {}, nelec = {}, ranks = {}, memory space = {}", nk, nq, nb, Np, nelec,
+  app_log(1, "  nkpts = {}, nqpts = {}, nbnd = {}, Np = {}, nelec = {}, ranks = {}, memory space = {}", nkF, nq, nb, Np, nelec,
           comm.size(), MEM == HOST_MEMORY ? "host" : "device");
   prm.log();
+  ibz.log(1);
 
   // one-body Hamiltonian, KS spectrum, initial centre
   Timer.start("H0");
@@ -1143,6 +1164,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   Timer.stop("bases");
   closure_params_t cprm{prm.wp, prm.K, std::max(prm.tol_gram, prm.tol_gram_eps * prm.eps), prm.nphi};
   cprm.tol_svd    = prm.tol_svd;
+  if (ibz.active)   // perf 7.3: star weights of the IBZ k in the electron count (empty = uniform, the nosym path unchanged)
+    for (long k = 0; k < ibz.nkI; ++k) cprm.k_weight.push_back(ibz.kw(k));
   cprm.gram_cut   = prm.closure_cut;
   cprm.svd_cut    = prm.closure_svd_cut;
   cprm.cut_window = prm.closure_cut_window;
@@ -1174,6 +1197,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   if (prm.restart and not restart) app_log(1, "  restart requested but {} does not exist: starting from the KS poles", chk);
   aux_grid_t grid(mpi, Np);
   propagator_t<MEM> prop(thc, grid);
+  prop.set_ibz(&ibz);   // perf 7.3: IBZ poles unfolded to every k (no-op without symmetry)
   if (restart) {
     st = read_state(comm, chk, nk, nb, zeta_prod, res.history, kdp);
     app_log(1, "  resumed from {}: {} iterations done, mu {:.6f} Ha", chk, st.iter, st.mu);
@@ -1229,19 +1253,26 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   app_log(1, "  bases: bosonic rank {} ({} nodes, gap {:.4f}), Sigma {}+{}, G {}+{}, fermionic nodes {}", bos->rank,
           bos->zeta_nodes.size(), bos->gap, bp->rank, bh->rank, gp.rank, gh.rank, nz);
 
-  dyson_layout_t lay(comm.size(), comm.rank(), nq, bos->zeta_nodes.size(), Np);
+  const long nqR = ibz.nrows();   // perf 7.3: Pi / W rows (all q without symmetry)
+  dyson_layout_t lay(comm.size(), comm.rank(), nqR, bos->zeta_nodes.size(), Np);
   // q groups of the Pi -> W stage (S7e): all q at once unless the Pi group does not fit (device) or COQUI_GWLINE_QGROUP
-  q_plan_t qplan = choose_q_plan<MEM>(comm, grid, nk, nq, long(bos->zeta_nodes.size()), bos->rank, nb);
-  q_groups_t qg(nq, qplan.g, qminus_list(mf));   // pair-closed groups (W pairing q <-> -q, screened.hpp)
+  q_plan_t qplan = choose_q_plan<MEM>(comm, grid, nkF, nqR, long(bos->zeta_nodes.size()), bos->rank, nb);
+  utils::check(not(ibz.active and qplan.w_host), "gw_line: host-resident residues (q_plan_t::w_host) are not implemented with the IBZ");
+  q_groups_t qg(ibz.rows, qplan.g, ibz.qminus);   // pair-closed groups of the rows R (W pairing q <-> -q, screened.hpp)
   long zb_nzb = long(bos->zeta_nodes.size());     // perf 7.2: bosonic node count the Dyson slab (Zb) was built for
   std::vector<long> zb_list = qg.dyson_q_list(comm.size(), comm.rank(), zb_nzb, Np);
   coulomb_blocks_t<MEM> Zb(thc, grid, zb_list, Timer);
+  // F = V_H + Sigma_x: the IBZ class sums (static_ibz.hpp) on a symmetric mesh
+  auto static_F = [&](nda::array<ComplexType, 3> const &D, nda::array<ComplexType, 3> &F) {
+    if (ibz.active) hartree_exchange_ibz<MEM>(prop, Zb, D, mf, ibz, grid, comm, F, Timer);
+    else hartree_exchange<MEM>(prop, Zb, D, mf, grid, mpi, F, Timer);
+  };
   if (qg.n > 1) app_log(1, "  q groups of the Pi -> W stage: {} groups of <= {} q (Pi group of all q does not fit)", qg.n, qg.max_size());
   if (qplan.w_host)
     app_log(1, "  residues w of all q on the HOST ({:.3f} GB per rank); Sigma streams them in groups of {} q", 16.0 * double(nq) *
                    bos->rank * grid.max_block_size() / 1073741824.0, qplan.gs_sigma);
   const bool dev_fused   = (MEM != HOST_MEMORY) and detail::fused_hadamard();
-  const double model_dev = grid.log(nk, nq, bos->zeta_nodes.size(), bos->rank,
+  const double model_dev = grid.log(nkF, nqR, bos->zeta_nodes.size(), bos->rank,
                                     (prm.t_chunk > 0 ? prm.t_chunk : (MEM == HOST_MEMORY ? detail::host_t_chunk_default : 64)),
                                     nb, qg.max_size(), dev_fused);
   lay.log();
@@ -1250,7 +1281,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   // Dyson slab
   const double sig_bytes  = 16.0 * double(prm.sigma_kdist ? kd.nloc(0) : nk) * double(nz) * double(nb * nb);
   const double model_host = (MEM == HOST_MEMORY ? model_dev : 0.0) + 4.0 * sig_bytes +
-                            2.0 * 16.0 * double(nk) * double(detail::host_t_chunk_default) * double(nb * nb) +
+                            2.0 * 16.0 * double(nkF) * double(detail::host_t_chunk_default) * double(nb * nb) +
                             16.0 * double(Zb.Z_full.extent(0)) * double(Np) * double(Np);
   app_log(2, "    driver host arrays: Sigma 4 x {:.4f} GB ({}), full Z(q) {} x {:.4f} GB; host model {:.4f} GB above the "
              "baseline RSS {:.4f} GB",
@@ -1261,7 +1292,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   // q -> 0 extrapolation, and the Madelung terms of div_treatment (Sigma_c) / hf_div_treatment (exchange)
   const double madelung = mf.madelung();
   const head_basis_t hbasis(thc, mf, grid);
-  const head_extrapolation_t hextra(mf, prm.head_extrapolation);
+  const head_extrapolation_t hextra(mf, prm.head_extrapolation, ibz.active);   // perf 7.3: full mesh, unfolded heads
   bool sig_div = head_div_is_gygi(prm.div_treatment);
   if (sig_div and nq == 1) {
     app_log(1, "  gw_line: nqpts == 1 while div_treatment = {}: the Sigma_c head term is skipped (ignore_g0), as CoQui does",
@@ -1281,8 +1312,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
             sig_div ? ", max|T - 1| = " + std::to_string(dT) : std::string(""));
     hextra.log(1);
   }
-  std::vector<long> q_all(nq);
-  for (long q = 0; q < nq; ++q) q_all[q] = q;
+  std::vector<long> q_all = ibz.rows;   // the residue rows (all q without symmetry)
   std::vector<long> k_rows;   // global k of the rows of Sigma on this rank
   for (long l = 0; l < (prm.sigma_kdist ? kd.nloc() : nk); ++l) k_rows.push_back(prm.sigma_kdist ? kd.global(l, kd.rank) : l);
 
@@ -1321,7 +1351,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   if (not restart) {
     Timer.start("phase_F");
     auto D = density_matrix(st.poles);
-    hartree_exchange<MEM>(prop, Zb, D, mf, grid, mpi, st.F, Timer);
+    static_F(D, st.F);
     if (hf_div) exchange_head_correction(st.F, D, madelung);
     Timer.stop("phase_F");
     st.F_cl = st.F;
@@ -1351,8 +1381,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   auto ensure_zb = [&]() {
     const long nzb = long(bos->zeta_nodes.size());
     if (nzb == zb_nzb) return;
-    qplan    = choose_q_plan<MEM>(comm, grid, nk, nq, nzb, bos->rank, nb);
-    qg       = q_groups_t(nq, qplan.g, qminus_list(mf));
+    qplan    = choose_q_plan<MEM>(comm, grid, nkF, nqR, nzb, bos->rank, nb);
+    qg       = q_groups_t(ibz.rows, qplan.g, ibz.qminus);
     auto lst = qg.dyson_q_list(comm.size(), comm.rank(), nzb, Np);
     long chg = (lst != zb_list) ? 1 : 0;
     chg      = comm.all_reduce_value(chg, boost::mpi3::max<>{});
@@ -1394,7 +1424,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   bool have_hout_first = false;
 
   // ---------------------------------------------------------------------------------------------- the loop
-  arr4_t Pi, w, Wn;
+  arr4_t Pi, w, Wn, wI;
   memory::array<HOST_MEMORY, ComplexType, 4> w_h;   // host-resident residues (q_plan_t::w_host)
   Timer.add("W_head");
   Timer.add("Sigma_head");
@@ -1470,7 +1500,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
                         qg.rows(G));
       tPi += toc("phase_Pi", e0);
       e0 = tic("phase_W");
-      screened_interaction<MEM>(Pi, Zb, *bos, grid, mpi, w, Timer, &Wn, qg.rows(G), qplan.w_host);
+      screened_interaction<MEM>(Pi, Zb, *bos, grid, mpi, w, Timer, &Wn, qg.rows(G), qplan.w_host or ibz.active);
       Timer.start("W_head");
       head_nodes_partial<MEM>(Wn, qg.rows(G), hbasis, Hn);
       Wn = arr4_t{};
@@ -1483,8 +1513,15 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
         for (long i = 0; i < qg.size(G); ++i)
           w_h(qg.rows(G)[i], nda::range::all, nda::range::all, nda::range::all) = wg(i, nda::range::all, nda::range::all, nda::range::all);
       }
+      if (ibz.active) {   // perf 7.3: this group's rows -> the residues of the rows R (ibz.rows order)
+        if (wI.extent(0) != nqR or wI.extent(1) != bos->rank) wI = arr4_t(nqR, bos->rank, grid.nP, grid.nQ);
+        for (long i = 0; i < qg.size(G); ++i)
+          wI(ibz.rpos[qg.rows(G)[i]], nda::range::all, nda::range::all, nda::range::all) =
+              w(i, nda::range::all, nda::range::all, nda::range::all);
+      }
       tW += toc("phase_W", e0);
     }
+    if (ibz.active) std::swap(w, wI);   // w: rows R in ibz.rows order (head residues, Sigma)
     head_out_t hout;
     {
       e0 = tic("phase_W");
@@ -1494,13 +1531,18 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       hout.h_nodes       = std::move(Hn);
       hout.h_res         = std::move(hres_p);
       hout.h_res_hole    = std::move(hres_h);
+      if (ibz.active) {   // perf 7.3: the IBZ heads to every q of the mesh (hextra weights the full mesh)
+        hout.h_nodes    = unfold_heads(hout.h_nodes, mf);
+        hout.h_res      = unfold_heads(hout.h_res, mf);
+        hout.h_res_hole = unfold_heads(hout.h_res_hole, mf);
+      }
       hout.h0_nodes      = hextra.apply(hout.h_nodes);
       hout.h0_res        = hextra.apply(hout.h_res);
       hout.h0_res_hole   = hextra.apply(hout.h_res_hole);
       hout.zeta          = bos->zeta_nodes;
       hout.nu            = bos->nu;
       hout.q_weights     = hextra.c;
-      hout.qpts          = nda::array<double, 2>(mf.Qpts_ibz());
+      hout.qpts          = ibz.active ? nda::array<double, 2>(mf.Qpts()) : nda::array<double, 2>(mf.Qpts_ibz());
       hout.madelung      = madelung;
       hout.eps_inf       = head_eps_inf(hout.h0_res, hout.h0_res_hole, bos->nu);
       hout.extrapolation = prm.head_extrapolation;
@@ -1529,8 +1571,12 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     if (qplan.w_host) w = arr4_t{};   // only the last group's rows: free them
     auto const *whp = qplan.w_host ? &w_h : nullptr;
     // both sectors in one call (perf 7.1: the real-space residues are transformed once): particle -> Sp_new, hole -> Sh_new
-    self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer, sector_t::both,
-                     prm.sigma_kdist, whp, qplan.gs_sigma, &Sh_new);
+    if (ibz.active)   // perf 7.3: Sigma at the IBZ k from the class sums (self_energy_ibz.hpp)
+      self_energy_ibz<MEM>(prop, st.poles, w, *bos, mf, ibz, grid, comm, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer,
+                           sector_t::both, prm.sigma_kdist, &Sh_new);
+    else
+      self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer, sector_t::both,
+                       prm.sigma_kdist, whp, qplan.gs_sigma, &Sh_new);
     if (sig_div) {   // S9a: the q -> 0 head term of Sigma_c (head.hpp), per sector, on the rows of this rank
       Timer.start("Sigma_head");
       head_sigma_correction(st.poles, Thead, bos->nu, hout.h0_res, hout.h0_res_hole, madelung, zeta, k_rows, Sp_new, Sh_new);
@@ -1629,7 +1675,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     // 4. static part of the new poles
     e0 = tic("phase_F");
     auto D = density_matrix(st.poles);
-    hartree_exchange<MEM>(prop, Zb, D, mf, grid, mpi, st.F, Timer);
+    static_F(D, st.F);
     if (hf_div) exchange_head_correction(st.F, D, madelung);
     const double tF = toc("phase_F", e0);
     {
@@ -1764,14 +1810,17 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       optics_line_t L;
       L.theta_deg = th_deg;
       L.q_weights = hextra.c;
-      L.qpts      = nda::array<double, 2>(mf.Qpts_ibz());
+      L.qpts      = ibz.active ? nda::array<double, 2>(mf.Qpts()) : nda::array<double, 2>(mf.Qpts_ibz());
       L.lattv     = nda::array<double, 2>(mf.lattv());
       L.qminus    = qminus_list(mf);
       L.qfac.resize(nq);
-      for (long q = 0; q < nq; ++q) L.qfac[q] = hbasis.fac(q);
+      for (long q = 0; q < nq; ++q) {   // perf 7.3: f(q) of every q of the mesh (hbasis holds only the rows R)
+        const double q2 = L.qpts(q, 0) * L.qpts(q, 0) + L.qpts(q, 1) * L.qpts(q, 1) + L.qpts(q, 2) * L.qpts(q, 2);
+        L.qfac[q]       = ibz.active ? q2 / (4.0 * std::numbers::pi) * mf.volume() : hbasis.fac(q);
+      }
       for (auto const &v : op.q0_variants) {   // sensitivity of q0 to the extrapolation variant
         if (v == prm.head_extrapolation) continue;
-        head_extrapolation_t hv(mf, v);
+        head_extrapolation_t hv(mf, v, ibz.active);
         L.variant_names.push_back(v);
         L.variant_weights.push_back(hv.c);
       }
@@ -1790,6 +1839,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       hp.ray_decades = prm.ray_decades;
       hp.t_chunk   = prm.t_chunk;
       hp.mem_gb    = op.mem_gb;
+      hp.ibz       = &ibz;
       if (flat) {
         hp.nline = op.nline;
         hp.npole = op.npole;
