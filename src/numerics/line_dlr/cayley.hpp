@@ -395,6 +395,14 @@ struct upfold_opts_t {
   /// 1.7e-13..8.4e-13, retried ones 1.1e-12..2.6e-12 at 1e-12 (Schur's backward error ~ n eps ~ 1e-13); a residual of
   /// 1e-11 moves a pole by <= 1e-11 (d^2 + wp^2) / (2 wp) (1.6e-9 Ha at |d| = 6 Ha), far below the closure's roundoff floor
   double ueig_tol = 1e-11;
+  /**
+   * perf 7.1c: angle beta of the first cut u0 = e^{i beta} of the "cayley" path. 0 (u0 = 1, omega = +-infinity; S7g):
+   * ill-conditioned when the realization has a pole at very large |d| (moment-truncation artefacts, e.g. a Gram
+   * eigenvalue at the cut), which costs a failed attempt + the gap-cut retry. pi (u0 = -1, omega = mu): inside the gap of
+   * an insulating Sigma, never close to an eigenvalue there; the retry rule is unchanged. Changes the eigenvectors at
+   * the roundoff level only.
+   */
+  double ueig_cut = 0.0;
   /// perf 7.1c: held-out error of the golden-section refinement: "eigen" (python: the error of each realization) |
   /// "poly" (heldout_poly_t: ||R U(z)^{K+1} R^dag - C^(K+1)|| as an exact recursion in z = e^{i phi}, no eigensolve)
   std::string scan_err = "eigen";
@@ -713,7 +721,8 @@ inline realization_t realize(upfold_problem_t const &pr, double phi, upfold_opts
   if (o.ueig == "cayley") {
     detail::ueig_stats_t st;
     auto const *hk = (o.hooks and o.hooks->in_ueig) ? o.hooks : nullptr;
-    done           = detail::unitary_eig_cayley(U, u, Z, o.ueig_tol, st, hk);
+    done           = detail::unitary_eig_cayley(U, u, Z, o.ueig_tol, st, hk,
+                                                    o.ueig_cut == 0.0 ? ComplexType(1.0) : std::exp(ComplexType(0.0, o.ueig_cut)));
     res.ueig_nflag = std::max(res.ueig_nflag, st.nflag);
     res.ueig_res   = std::max(res.ueig_res, st.res_max);
     res.t_rr += st.t_rr;

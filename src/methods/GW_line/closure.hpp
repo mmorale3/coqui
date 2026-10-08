@@ -60,6 +60,7 @@
 #include <mutex>
 #include <thread>
 #include <cmath>
+#include <numbers>
 #include <numeric>
 #include <random>
 #include <string>
@@ -152,6 +153,9 @@ struct closure_params_t {
    * the lent cores of an owner relative to a coarse rank).
    */
   std::string scan       = detail::env_string("COQUI_GWLINE_CLOSURE_SCAN", "parallel");
+  /// perf 7.1c: first cut of the Cayley U-eigen path: "mu" (u0 = -1, in the gap of Sigma) | "inf" (u0 = 1, pre-7.1c);
+  /// env COQUI_GWLINE_UEIG_CUT
+  std::string ueig_cut   = detail::env_string("COQUI_GWLINE_UEIG_CUT", "mu");
   long scan_threads_max  = long(detail::env_double("COQUI_GWLINE_SCAN_THREADS", 0.0));
   long scan_owner_weight = long(detail::env_double("COQUI_GWLINE_SCAN_OWNER_WEIGHT", 4.0));
   double scan_budget_mb  = detail::env_double("COQUI_GWLINE_SCAN_MB", 512.0);
@@ -169,6 +173,8 @@ struct closure_params_t {
     o.ueig       = ueig;
     o.hooks      = hooks;
     o.scan_err   = (scan == "serial") ? "eigen" : "poly";
+    utils::check(ueig_cut == "mu" or ueig_cut == "inf", "gw_line::closure: ueig_cut must be \"mu\" or \"inf\" (got \"{}\")", ueig_cut);
+    o.ueig_cut   = (ueig_cut == "mu") ? std::numbers::pi : 0.0;
     if (ik >= 0) {
       if (phase_keep > 0.0 and ik < long(phi_prev.size())) {
         o.phi_prev   = phi_prev[ik];
@@ -636,8 +642,8 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     const double fnp = double(comm.size());
     app_log(2, "          closure realizations (s, min / avg / max over ranks of the owner's sums): eigen realizations {:.2f} / {:.2f} / "
                "{:.2f}, of which Rayleigh-Ritz + gap-cut retries + Schur {:.2f} / {:.2f} / {:.2f}; eigensolve-free golden "
-               "section {:.2f} / {:.2f} / {:.2f}; scan \"{}\", deferred k {}",
-            pmin[8], psum[8] / fnp, pmax[8], pmin[9], psum[9] / fnp, pmax[9], pmin[10], psum[10] / fnp, pmax[10], p.scan,
+               "section {:.2f} / {:.2f} / {:.2f}; scan \"{}\", first Cayley cut \"{}\", deferred k {}",
+            pmin[8], psum[8] / fnp, pmax[8], pmin[9], psum[9] / fnp, pmax[9], pmin[10], psum[10] / fnp, pmax[10], p.scan, p.ueig_cut,
             long(dk.size()));
   }
 
