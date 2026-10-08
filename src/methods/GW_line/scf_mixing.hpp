@@ -64,7 +64,7 @@ namespace methods::gw_line {
 
 struct mixing_params_t {
   std::string alg = "linear";   ///< "linear" | "diis"
-  double mixing   = 0.5;        ///< linear mixing (linear algorithm; DIIS warm-up / reset steps)
+  double mixing   = 1.0;        ///< linear mixing (linear algorithm; DIIS warm-up / reset steps)
   long hist       = 6;          ///< DIIS history length
   long start      = 2;          ///< first iteration (1-based) that extrapolates; earlier iterations: linear with `mixing`
   double beta     = 1.0;        ///< DIIS step: x = sum c (x_i + beta r_i)
@@ -72,7 +72,7 @@ struct mixing_params_t {
   double cmax     = 10.0;       ///< reset when max|c_i| exceeds this
   double grow     = 10.0;       ///< reset when |r_new| > grow x min_i |r_i| (divergence guard)
   bool mix_F      = false;      ///< include F in the DIIS vector
-  double damp_below  = 0.0;     ///< > 0: linear steps with damp_mixing once the residual is below this (sticky)
+  double damp_below  = 3e-4;    ///< > 0: linear steps with damp_mixing once the residual is below this (sticky)
   double damp_mixing = 0.5;
   double wF       = -1.0;       ///< weight of the F elements in the inner product (< 0: the number of fermionic nodes)
 };

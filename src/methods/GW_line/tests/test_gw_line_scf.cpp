@@ -409,6 +409,8 @@ ptree scf_params(std::string const &output, long niter, bool restart, std::strin
   pt.put("nphi", 8);
   pt.put("niter", niter);
   pt.put("mixing", 0.5);
+  pt.put("mixing_alg", "linear");   // perf 7.2: pinned (python parity): linear 0.5 without the damped tail
+  pt.put("damp_below", 0.0);
   pt.put("conv_thr", 1e-14);
   pt.put("t_chunk", 8);
   pt.put("ray_decades", 36.0);

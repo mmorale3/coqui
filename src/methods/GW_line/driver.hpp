@@ -76,8 +76,12 @@
  *                       pivoted-QR pole selection differs between LAPACKs; keys sigma_{particle,hole}_w, g_{particle,hole}_w,
  *                       bos_nu, bos_zeta_nodes)
  *   niter = 12          TOTAL number of iterations (a restart continues until niter iterations are done)
- *   mixing = 0.5        linear mixing of Sigma^{>/<} at the nodes (F is not mixed, as python)
- *   conv_thr = 1e-5     stop when max|dSigma| at the nodes (after mixing, as python) < conv_thr; with mixing_alg = "diis"
+ *   mixing = 1.0        linear mixing of Sigma^{>/<} at the nodes (F is not mixed, as python). perf 7.2: default 1.0 (was 0.5;
+ *                       the map Sigma_in -> Sigma[G] contracts by 0.15-0.25 per step for Si/LiH, so 0.5 made every
+ *                       iteration halve the error: 16-24 iterations), with damp_below = 3e-4 (damped tail, below)
+ *   conv_thr = 3e-5     stop when max|dSigma| at the nodes (after mixing, as python) < conv_thr (perf 7.2: default 3e-5, was
+ *                       1e-5: the closure-noise floor of the residual is 2e-5..1e-4 for Si; in the damped tail dSigma =
+ *                       0.5 resid, so 3e-5 = resid 6e-5, reached at iteration 9 for Si 2x2x2); with mixing_alg = "diis"
  *                       also mixing x max|Sigma[G] - Sigma_in| < conv_thr. Never in an iteration without a previous Sigma
  *                       (the first iteration, the first after a qp start or a level change of the multilevel schedule)
  *   mixing_alg = "linear"   perf 7.2 (scf_mixing.hpp): "linear" (above) | "diis" (Anderson/Pulay on Sigma^{>/<} at the nodes
@@ -87,7 +91,7 @@
  *                       (weight of the F elements; < 0: the number of fermionic nodes). The history is not checkpointed:
  *                       after a restart it is rebuilt (first step x + beta r). Every iteration logs the residual
  *                       max|Sigma[G] - Sigma_in| ("resid"; linear: dSigma / mixing) and max|F[D] - F_in|.
- *   damp_below = 0, damp_mixing = 0.5   perf 7.2 damped tail (any mixing_alg): once resid < damp_below, linear steps with
+ *   damp_below = 3e-4, damp_mixing = 0.5   perf 7.2 damped tail (any mixing_alg): once resid < damp_below, linear steps with
  *                       damp_mixing (sticky, also across a restart). Undamped steps keep hopping at the closure's
  *                       discrete-decision noise (~1e-4 in Sigma for Si); damped steps let the decisions lock.
  *   start = "ks"        perf 7.2 initial G: "ks" (below) | "qp_diag": one Pi -> W -> Sigma pass on the KS poles (no SCF closure, not
@@ -212,7 +216,7 @@ struct gw_line_params_t {
   long debug_noise_iter = 1;             ///< ... in this iteration
   std::string bases_file;                ///< diagnostics/parity: real-pole bases read from this file (gen_lih222_scf_ref.py)
   long niter = 12;
-  double mixing = 0.5, conv_thr = 1e-5;
+  double mixing = 1.0, conv_thr = 3e-5;   ///< perf 7.2: defaults mixing 1.0 (was 0.5) + damped tail, conv_thr 3e-5 (was 1e-5)
   mixing_params_t mix;                   ///< perf 7.2: mixing algorithm (scf_mixing.hpp); mix.mixing == mixing
   std::string start = "ks";              ///< perf 7.2: initial G "ks" | "qp_diag" | "qp_file"
   std::string start_file, start_dataset; ///< perf 7.2: QP energies for start = "qp_file"
