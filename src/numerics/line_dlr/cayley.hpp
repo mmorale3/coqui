@@ -396,9 +396,8 @@ struct upfold_opts_t {
   /// 1e-11 moves a pole by <= 1e-11 (d^2 + wp^2) / (2 wp) (1.6e-9 Ha at |d| = 6 Ha), far below the closure's roundoff floor
   double ueig_tol = 1e-11;
   /// perf 7.1c: held-out error of the golden-section refinement: "eigen" (python: the error of each realization) |
-  /// "mfree" (||R U^{K+1} R^dag - C^(K+1)|| by K+1 products of row blocks of R with U, no eigensolve; same quantity)
+  /// "poly" (heldout_poly_t: ||R U(z)^{K+1} R^dag - C^(K+1)|| as an exact recursion in z = e^{i phi}, no eigensolve)
   std::string scan_err = "eigen";
-  long scan_rows       = 4;   ///< row block of the "mfree" error (fixed: the error does not depend on the distribution)
   lapack_hooks_t const *hooks = nullptr;   ///< external (device) drivers of the Gram eigen, SVD and Cayley path; null: host
 };
 
@@ -438,8 +437,10 @@ struct upfold_result_t {
   double t_coarse = 0.0, t_refine = 0.0, t_final = 0.0;   ///< scan: coarse phases | golden section | final realization
   double t_eig    = 0.0;             ///< all eigen realizations (incl. retries, Rayleigh-Ritz, Schur fallbacks)
   double t_rr     = 0.0;             ///< Rayleigh-Ritz refinements + gap-cut retries + Schur fallbacks (part of t_eig)
-  double t_mfree  = 0.0;             ///< eigensolve-free held-out evaluations
+  double t_poly   = 0.0;             ///< building the eigensolve-free held-out error (heldout_poly_t)
+  double t_bcast  = 0.0;             ///< distributed scan: broadcast of the problem
   long n_eig = 0, n_mfree = 0;       ///< eigen realizations | eigensolve-free held-out evaluations
+  long scan_ranks = 0, scan_threads = 0;   ///< distributed scan: ranks of the batch, BLAS threads of the owner
 };
 
 namespace detail {
@@ -465,7 +466,7 @@ inline long cut_boundary(std::vector<double> const &x, double t, std::string con
 /**
  * perf 7.1c: the realization problem of upfold_block after the SVD: U(phi) = A1 + e^{i phi} A0 (A1 = P1 Q1^dag,
  * A0 = P0 Q0^dag, A0 unused if n_free = 0), couplings W = R Z (R = B X[:, :r]^dag, n x Nr) and the held-out moment
- * Cheld = C^(K+1). upfold_prepare builds it, realize / heldout_rows evaluate it, upfold_finish turns the chosen
+ * Cheld = C^(K+1). upfold_prepare builds it, realize / heldout_poly evaluate it, upfold_finish turns the chosen
  * realization into poles. upfold_block chains them (serial); GW_line/closure_scan.hpp distributes the terminal-phase scan
  * of the same problem over MPI ranks.
  */
@@ -473,6 +474,9 @@ struct upfold_problem_t {
   long n = 0, Nr = 0, K = 0, n_free = 0;
   double wp = 0.0, nheld = 0.0;   ///< nheld = ||C^(K+1)||_F
   cmatrix_F A1, A0, R, Cheld;
+  cmatrix_F P0, Q0h;              ///< the free block: A0 = P0 Q0h (Nr x n_free, n_free x Nr)
+  bool need_ref = false;          ///< upfold_prepare(defer_ref): the reference SVD of Mref is still to be done
+  cmatrix_F Mref;                 ///< D+ D-^dag for the deferred reference SVD
 };
 
 /// One realization U(phi) = Z diag(u) Z^dag: held-out error ||W diag(u^{K+1}) W^dag - C^(K+1)|| / (1 + ||C^(K+1)||), u, W = R Z.
@@ -483,6 +487,28 @@ struct realization_t {
 };
 
 namespace detail {
+/// numerical rank r1 of the singular values sv (descending) with the cut of o; sets the diagnostics svd_near / svd_margin
+inline long svd_rank(nda::array<double, 1> const &sv, upfold_opts_t const &o, upfold_result_t &res) {
+  const long Nr = sv.size();
+  const double tol_svd = o.tol_svd;
+  std::vector<double> xs(Nr);
+  for (long i = 0; i < Nr; ++i) xs[i] = (sv(0) > 0.0) ? sv(i) / sv(0) : 0.0;
+  res.svd_near   = 0;
+  res.svd_margin = std::numeric_limits<double>::infinity();
+  for (long i = 0; i < Nr; ++i) {
+    if (xs[i] > 0.1 * tol_svd and xs[i] < 10.0 * tol_svd) ++res.svd_near;
+    if (xs[i] > 0.0) res.svd_margin = std::min(res.svd_margin, std::abs(std::log10(xs[i] / tol_svd)));
+  }
+  long r = cut_boundary(xs, tol_svd, o.svd_cut == "smooth" ? "hard" : o.svd_cut, o.cut_window);
+  if (o.svd_cut == "hard") {   // python: count of sv > tol_svd s0 (identical to the boundary for a descending sequence)
+    r = 0;
+    for (long i = 0; i < Nr; ++i)
+      if (sv(i) > tol_svd * sv(0)) ++r;
+  }
+  if (o.force_r1 >= 0) r = std::min(o.force_r1, Nr);
+  return r;
+}
+
 inline double seconds_since(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -496,6 +522,19 @@ inline cmatrix_F form_u(upfold_problem_t const &pr, double phi) {
     for (long i = 0; i < Nr; ++i) U(i, j) = pr.A1(i, j) + (pr.n_free > 0 ? eph * pr.A0(i, j) : ComplexType(0.0));
   return U;
 }
+/// A1 = P1 Q1^dag, A0 = P0 Q0^dag (+ P0, Q0h) of the SVD P diag(s) Qh with rank r1; sets r1 / n_free
+inline void set_free_block(upfold_problem_t &pr, cmatrix_F const &P, cmatrix_F const &Qh, long r1, upfold_result_t &res) {
+  using nda::range;
+  const long Nr = pr.Nr;
+  res.r1     = r1;
+  res.n_free = Nr - r1;
+  pr.n_free  = Nr - r1;
+  cmatrix_F P1 = P(range::all, range(0, r1)), Q1h = Qh(range(0, r1), range::all);
+  pr.P0  = P(range::all, range(r1, Nr));
+  pr.Q0h = Qh(range(r1, Nr), range::all);
+  pr.A1  = mm(P1, Q1h);                                             // P1 Q1^dag
+  pr.A0  = mm(pr.P0, pr.Q0h);                                       // P0 Q0^dag
+}
 } // namespace detail
 
 /**
@@ -503,10 +542,10 @@ inline cmatrix_F form_u(upfold_problem_t const &pr, double phi) {
  * profile (t_c0, t_gram, t_svd, t_svd_ref) of res and returns the realization problem.
  */
 inline upfold_problem_t upfold_prepare(nda::array<ComplexType, 3> const &C, long K, double wp, upfold_opts_t const &o,
-                                       upfold_result_t &res) {
+                                       upfold_result_t &res, bool defer_ref = false) {
   using nda::range;
   const long n = C.extent(1);
-  const double tol_c0 = o.tol_c0, tol_gram = o.tol_gram, tol_svd = o.tol_svd;
+  const double tol_c0 = o.tol_c0, tol_gram = o.tol_gram;
   const long nphi = o.nphi;
   utils::check(C.extent(0) >= K + 2, "cayley::upfold_block: need moments 0..K+1 (K = {}), got {}", K, C.extent(0));
   utils::check(K >= 1 and nphi >= 1, "cayley::upfold_block: invalid K = {} or nphi = {}", K, nphi);
@@ -515,9 +554,8 @@ inline upfold_problem_t upfold_prepare(nda::array<ComplexType, 3> const &C, long
                "\"gesdd\" (got \"{}\")", o.svd_driver);
   utils::check(o.ueig == "schur" or o.ueig == "cayley", "cayley::upfold_block: ueig must be \"schur\" or \"cayley\" (got \"{}\")",
                o.ueig);
-  utils::check(o.scan_err == "eigen" or o.scan_err == "mfree", "cayley::upfold_block: scan_err must be \"eigen\" or \"mfree\" "
+  utils::check(o.scan_err == "eigen" or o.scan_err == "poly", "cayley::upfold_block: scan_err must be \"eigen\" or \"poly\" "
                "(got \"{}\")", o.scan_err);
-  utils::check(o.scan_rows >= 1, "cayley::upfold_block: scan_rows must be >= 1");
   using clock_t_ = std::chrono::steady_clock;
   auto tlap      = clock_t_::now();
   auto lap       = [&tlap]() {
@@ -612,49 +650,50 @@ inline upfold_problem_t upfold_prepare(nda::array<ComplexType, 3> const &C, long
     if (o.svd_driver == "gesdd") detail::svd_dc(M, sv, P, Qh);
     else nda::lapack::gesvd(M, sv, P, Qh);
   }
-  auto svd_rank = [&]() {
-    std::vector<double> xs(Nr);
-    for (long i = 0; i < Nr; ++i) xs[i] = (sv(0) > 0.0) ? sv(i) / sv(0) : 0.0;
-    res.svd_near   = 0;
-    res.svd_margin = std::numeric_limits<double>::infinity();
-    for (long i = 0; i < Nr; ++i) {
-      if (xs[i] > 0.1 * tol_svd and xs[i] < 10.0 * tol_svd) ++res.svd_near;
-      if (xs[i] > 0.0) res.svd_margin = std::min(res.svd_margin, std::abs(std::log10(xs[i] / tol_svd)));
-    }
-    long r = detail::cut_boundary(xs, tol_svd, o.svd_cut == "smooth" ? "hard" : o.svd_cut, o.cut_window);
-    if (o.svd_cut == "hard") {   // python: count of sv > tol_svd s0 (identical to the boundary for a descending sequence)
-      r = 0;
-      for (long i = 0; i < Nr; ++i)
-        if (sv(i) > tol_svd * sv(0)) ++r;
-    }
-    if (o.force_r1 >= 0) r = std::min(o.force_r1, Nr);
-    return r;
-  };
-  long r1 = svd_rank();
-  if (fast and r1 < Nr) {
-    const auto tref = clock_t_::now();
-    nda::lapack::gesvd(Mref, sv, P, Qh);
-    r1               = svd_rank();
-    res.svd_reference = true;
-    res.t_svd_ref     = detail::seconds_since(tref);
-  }
-  res.r1     = r1;
-  res.n_free = Nr - r1;
+  long r1 = detail::svd_rank(sv, o, res);
   upfold_problem_t pr;
-  pr.n = n; pr.Nr = Nr; pr.K = K; pr.n_free = Nr - r1; pr.wp = wp;
-  cmatrix_F P1 = P(range::all, range(0, r1)), Q1h = Qh(range(0, r1), range::all);
-  cmatrix_F P0 = P(range::all, range(r1, Nr)), Q0h = Qh(range(r1, Nr), range::all);
-  pr.A1 = detail::mm(P1, Q1h);                                      // P1 Q1^dag
-  pr.A0 = detail::mm(P0, Q0h);                                      // P0 Q0^dag
+  pr.n = n; pr.Nr = Nr; pr.K = K; pr.wp = wp;
   cmatrix_F X0 = X(range::all, range(0, r));
   pr.R = detail::mm(B, X0, 'N', 'C');                               // n x Nr
-
+  if (fast and r1 < Nr and defer_ref) {   // perf 7.1c: the reference SVD later (upfold_prepare_ref, borrowed cores)
+    pr.need_ref = true;
+    pr.Mref     = std::move(Mref);
+    res.r1      = r1;
+    res.n_free  = Nr - r1;
+    pr.n_free   = Nr - r1;
+  } else {
+    if (fast and r1 < Nr) {
+      const auto tref = clock_t_::now();
+      nda::lapack::gesvd(Mref, sv, P, Qh);
+      r1                = detail::svd_rank(sv, o, res);
+      res.svd_reference = true;
+      res.t_svd_ref     = detail::seconds_since(tref);
+    }
+    detail::set_free_block(pr, P, Qh, r1, res);
+  }
   pr.Cheld = cmatrix_F(n, n);
   for (long i = 0; i < n; ++i)
     for (long j = 0; j < n; ++j) pr.Cheld(i, j) = C(K + 1, i, j);
   pr.nheld  = detail::frob(pr.Cheld);
   res.t_svd = lap();
   return pr;
+}
+
+/// perf 7.1c: the reference SVD deferred by upfold_prepare(defer_ref = true) (zgesvd of Mref; may change r1 / n_free)
+inline void upfold_prepare_ref(upfold_problem_t &pr, upfold_opts_t const &o, upfold_result_t &res) {
+  if (not pr.need_ref) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  const long Nr = pr.Nr;
+  cmatrix_F P(Nr, Nr), Qh(Nr, Nr);
+  nda::array<double, 1> sv(Nr);
+  nda::lapack::gesvd(pr.Mref, sv, P, Qh);
+  const long r1     = detail::svd_rank(sv, o, res);
+  res.svd_reference = true;
+  detail::set_free_block(pr, P, Qh, r1, res);
+  pr.need_ref = false;
+  pr.Mref     = cmatrix_F();
+  res.t_svd_ref = detail::seconds_since(t0);
+  res.t_svd += res.t_svd_ref;
 }
 
 /**
@@ -719,40 +758,82 @@ inline realization_t realize(upfold_problem_t const &pr, double phi, upfold_opts
 }
 
 /**
- * perf 7.1c: eigensolve-free held-out error, rows [r0, r1) of R: sum_{i in [r0, r1), j} |(R U^{K+1} R^dag - C^(K+1))_ij|^2
- * with U = U(phi) given (detail::form_u). For a unitary U = Z diag(u) Z^dag, R U^{K+1} R^dag = W diag(u^{K+1}) W^dag
- * (W = R Z): the held-out error of realize() without the eigen-decomposition (K+1 products of an (r1 - r0) x Nr block
- * with U; identical in exact arithmetic, roundoff-level different).
+ * perf 7.1c: the held-out error of the terminal-phase scan without eigen-decompositions. For the unitary
+ * U(z) = A1 + z P0 Q0^dag (z = e^{i phi}) with U = Z diag(u) Z^dag, W diag(u^{K+1}) W^dag = R U^{K+1} R^dag (W = R Z), so
+ * the error of realize() is ||R U(z)^{K+1} R^dag - C^(K+1)|| / (1 + ||C^(K+1)||) exactly. Unrolling v_m = R U^m
+ * (v_{m+1} = v_m A1 + z (v_m P0) Q0^dag):
+ *   R U^{K+1} R^dag = G + z sum_{l=0..K} W_l Y_{K-l},   W_m = v_m P0 = X_m + z sum_{l<m} W_l C_{m-1-l},
+ *   G = R A1^{K+1} R^dag, X_m = R A1^m P0 (n x f), C_m = Q0^dag A1^m P0 (f x f), Y_m = Q0^dag A1^m R^dag (f x n).
+ * The z-independent parts cost K+1 products of the n x Nr block R with A1 plus two chains of f columns / rows (built once
+ * per k); an evaluation is then O(K^2 n f^2 + K n^2 f) -- the 32 golden-section errors become free. The recursion is the
+ * unitary evolution v_m -> v_m U written in another order (no expansion in powers of z): roundoff ~ K eps, as realize().
  */
-inline double heldout_rows(upfold_problem_t const &pr, cmatrix_F const &U, long r0, long r1) {
-  using nda::range;
-  const long nb = r1 - r0, Nr = pr.Nr, n = pr.n;
-  if (nb <= 0) return 0.0;
-  cmatrix_F Y = pr.R(range(r0, r1), range::all), Y2(nb, Nr);
-  for (long p = 0; p < pr.K + 1; ++p) {
-    nda::blas::gemm(ComplexType(1.0), Y, U, ComplexType(0.0), Y2);
-    std::swap(Y, Y2);
+struct heldout_poly_t {
+  long K1 = 0, n = 0, f = 0;
+  cmatrix_F D;                      ///< G - C^(K+1)
+  std::vector<cmatrix_F> X, C, Y;   ///< X_m (m = 0..K), C_m (m = 0..K-1), Y_m (m = 0..K)
+  double scale = 1.0;               ///< 1 + ||C^(K+1)||
+
+  double operator()(double phi) const {
+    const ComplexType z = std::exp(ComplexType(0.0, phi)), one(1.0), zero(0.0);
+    std::vector<cmatrix_F> W(K1);
+    cmatrix_F acc(n, f);
+    for (long m = 0; m < K1; ++m) {
+      acc() = zero;
+      for (long l = 0; l < m; ++l) nda::blas::gemm(one, W[l], C[m - 1 - l], one, acc);
+      W[m] = X[m];
+      for (long j = 0; j < f; ++j)
+        for (long i = 0; i < n; ++i) W[m](i, j) += z * acc(i, j);
+    }
+    cmatrix_F E(n, n);
+    E() = zero;
+    for (long l = 0; l < K1; ++l) nda::blas::gemm(one, W[l], Y[K1 - 1 - l], one, E);
+    double s2 = 0.0;
+    for (long j = 0; j < n; ++j)
+      for (long i = 0; i < n; ++i) s2 += std::norm(D(i, j) + z * E(i, j));
+    return std::sqrt(s2) / scale;
   }
-  auto E = detail::mm(Y, pr.R, 'N', 'C');   // nb x n
-  double s = 0.0;
-  for (long j = 0; j < n; ++j)
-    for (long i = 0; i < nb; ++i) s += std::norm(E(i, j) - pr.Cheld(r0 + i, j));
-  return s;
-}
+};
 
-/// number of row blocks of the eigensolve-free held-out error (fixed by the problem, not by the distribution)
-inline long heldout_blocks(upfold_problem_t const &pr, long rows) { return (pr.n + rows - 1) / rows; }
-
-/// the eigensolve-free held-out error at phi: blocks of `rows` rows of R, summed in block order (as the distributed scan)
-inline double heldout_mfree(upfold_problem_t const &pr, double phi, long rows, upfold_result_t &res) {
-  const auto t0 = std::chrono::steady_clock::now();
-  auto U        = detail::form_u(pr, phi);
-  const long nb = heldout_blocks(pr, rows);
-  double s      = 0.0;
-  for (long b = 0; b < nb; ++b) s += heldout_rows(pr, U, b * rows, std::min(pr.n, (b + 1) * rows));
-  ++res.n_mfree;
-  res.t_mfree += detail::seconds_since(t0);
-  return std::sqrt(s) / (1.0 + pr.nheld);
+/// build heldout_poly_t of a problem with a free block (n_free > 0)
+inline heldout_poly_t heldout_poly(upfold_problem_t const &pr) {
+  const long n = pr.n, Nr = pr.Nr, f = pr.n_free, K1 = pr.K + 1;
+  const ComplexType one(1.0), zero(0.0);
+  utils::check(f > 0 and pr.P0.extent(1) == f and pr.Q0h.extent(0) == f, "cayley::heldout_poly: no free block");
+  heldout_poly_t hp;
+  hp.K1 = K1; hp.n = n; hp.f = f; hp.scale = 1.0 + pr.nheld;
+  hp.X.resize(K1); hp.C.resize(K1 > 1 ? K1 - 1 : 0); hp.Y.resize(K1);
+  {   // G = R A1^{K+1} R^dag
+    cmatrix_F V(pr.R), V2(n, Nr);
+    for (long p = 0; p < K1; ++p) {
+      nda::blas::gemm(one, V, pr.A1, zero, V2);
+      std::swap(V, V2);
+    }
+    hp.D = detail::mm(V, pr.R, 'N', 'C');
+    hp.D -= pr.Cheld;
+  }
+  {   // S_m = A1^m P0: X_m = R S_m, C_m = Q0^dag S_m
+    cmatrix_F S(pr.P0), S2(Nr, f);
+    for (long m = 0; m < K1; ++m) {
+      hp.X[m] = detail::mm(pr.R, S);
+      if (m + 1 < K1) {
+        hp.C[m] = detail::mm(pr.Q0h, S);
+        nda::blas::gemm(one, pr.A1, S, zero, S2);
+        std::swap(S, S2);
+      }
+    }
+  }
+  {   // T_m = Q0^dag A1^m: Y_m = T_m R^dag
+    cmatrix_F T(pr.Q0h), T2(f, Nr);
+    for (long m = 0; m < K1; ++m) {
+      hp.Y[m] = detail::mm(T, pr.R, 'N', 'C');
+      if (m + 1 < K1) {
+        nda::blas::gemm(one, T, pr.A1, zero, T2);
+        std::swap(T, T2);
+      }
+    }
+  }
+  return hp;
 }
 
 /// the coarse phases of the terminal-phase scan (np.linspace(0, 2 pi, nphi, endpoint=False))
@@ -836,6 +917,16 @@ struct golden_t {
   double result() const { return 0.5 * (a + b); }
 };
 
+/// the golden-section refinement of g with the error function f (python order of evaluations)
+template <typename F> inline void golden_refine(golden_t &g, F &&f) {
+  g.fc = f(g.c);
+  g.fd = f(g.d);
+  for (int it = 0; it < golden_t::nsteps; ++it) {
+    const double x = g.propose();
+    g.accept(f(x));
+  }
+}
+
 /// step 3 of upfold_block: poles (mu-relative) of the chosen realization, sorted ascending
 inline void upfold_finish(upfold_problem_t const &pr, realization_t const &best, double phi, upfold_result_t &res) {
   const long Nr = pr.Nr, n = pr.n;
@@ -872,7 +963,7 @@ inline bool needs_phase_scan(upfold_problem_t const &pr, upfold_opts_t const &o)
  *   d = wp cot(arg(u)/2). As in python, reject_unity only screens the coarse-scan phases (the refined phase is not re-screened).
  * Python's default nphi is 72 (kept here for parity); the cost is one Schur form of an r_gram x r_gram matrix per phase.
  * upfold_opts_t selects the S7f alternatives (gap / smooth cuts, phase continuity); its defaults are the python algorithm.
- * perf 7.1c: o.scan_err = "mfree" evaluates the golden-section errors without eigen-decompositions (heldout_mfree).
+ * perf 7.1c: o.scan_err = "poly" evaluates the golden-section errors without eigen-decompositions (heldout_poly_t).
  */
 inline void upfold_complete(upfold_problem_t const &pr, upfold_opts_t const &o, upfold_result_t &res) {
   const auto t0 = std::chrono::steady_clock::now();
@@ -894,13 +985,17 @@ inline void upfold_complete(upfold_problem_t const &pr, upfold_opts_t const &o, 
     golden_t g(coarse_decide(errs, umin, o, res), nphi);
     res.t_coarse = detail::seconds_since(t0);
     const auto t1 = std::chrono::steady_clock::now();
-    auto f = [&](double p) { return (o.scan_err == "mfree") ? heldout_mfree(pr, p, o.scan_rows, res) : realize(pr, p, o, res).err; };
-    g.fc = f(g.c);
-    g.fd = f(g.d);
-    for (int it = 0; it < golden_t::nsteps; ++it) {
-      const double x = g.propose();
-      g.accept(f(x));
+    heldout_poly_t hp;
+    if (o.scan_err == "poly") {
+      hp         = heldout_poly(pr);
+      res.t_poly = detail::seconds_since(t1);
     }
+    auto f = [&](double p) {
+      if (o.scan_err != "poly") return realize(pr, p, o, res).err;
+      ++res.n_mfree;
+      return hp(p);
+    };
+    golden_refine(g, f);
     phi_best      = g.result();
     res.t_refine  = detail::seconds_since(t1);
     const auto t2 = std::chrono::steady_clock::now();

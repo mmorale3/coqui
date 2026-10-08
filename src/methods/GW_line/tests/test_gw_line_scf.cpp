@@ -416,41 +416,55 @@ TEST_CASE("gw_line_closure_scan", "[gw_line][scf][closure][scan]") {
     }
     std::vector<long> dk(nk);
     std::iota(dk.begin(), dk.end(), 0L);
+    auto dsigma = [](ldlr::upfold_result_t const &a, ldlr::upfold_result_t const &b) {   // max |dSigma| / max |Sigma|
+      std::mt19937 gz(5);
+      std::uniform_real_distribution<double> ux(-1.0, 1.0), uy(0.005, 0.1);
+      double dS = 0.0, sm = 0.0;
+      for (int q = 0; q < 20; ++q) {
+        const ComplexType z(ux(gz), uy(gz));
+        auto S0 = ldlr::sigma_from_poles(a.d, a.W, z), S1 = ldlr::sigma_from_poles(b.d, b.W, z);
+        dS      = std::max(dS, nda::max_element(nda::abs(S1 - S0)));
+        sm      = std::max(sm, nda::max_element(nda::abs(S0)));
+      }
+      return dS / sm;
+    };
     for (double budget : {1e12, 1.0}) {   // all k in one batch | one k per batch
       std::vector<ldlr::upfold_problem_t> prs(nk);
       std::vector<ldlr::upfold_result_t> res(nk);
-      std::vector<ldlr::upfold_problem_t const *> probs(nk, nullptr);
+      std::vector<ldlr::upfold_problem_t *> probs(nk, nullptr);
+      std::vector<ldlr::upfold_result_t *> ups(nk, nullptr);
       for (long k = rank; k < nk; k += np) {
-        prs[k]   = ldlr::upfold_prepare(C[k], K, wp, p.upfold_opts(k), res[k]);
+        prs[k]   = ldlr::upfold_prepare(C[k], K, wp, p.upfold_opts(k), res[k], true);   // reference SVD deferred
+        REQUIRE(prs[k].need_ref);
         probs[k] = &prs[k];
+        ups[k]   = &res[k];
       }
       std::vector<long> done(nk, 0);
-      distributed_phase_scan(comm, dk, probs, [&](long k) { return p.upfold_opts(k); }, 0, 0, budget,
-                             [&](long k, phase_scan_t const &s) {
-                               REQUIRE(k % np == rank);
-                               res[k].phi_index = s.phi_index;
-                               ldlr::upfold_final(prs[k], s.phi, p.upfold_opts(k), res[k]);
-                               done[k] = 1;
-                             });
-      double dmax = 0.0, dphi = 0.0, dphi_eig = 0.0, dpol_eig = 0.0;
-      long nbad = 0;
+      distributed_phase_scan(comm, dk, probs, ups, [&](long k) { return p.upfold_opts(k); }, 0, 0, 4, budget, [&](long k) {
+        REQUIRE(k % np == rank);
+        done[k] = 1;
+      });
+      double v[6] = {0, 0, 0, 0, 0, 0}, vm[6];   // max|d, W|, |dphi|, dSigma, vs eigen: |dphi|, dSigma; failures
       for (long k = rank; k < nk; k += np) {
-        nbad += (done[k] == 1 ? 0 : 1) + (res[k].phi_index == ref[k].phi_index ? 0 : 1);
-        dmax     = std::max(dmax, max_pole_diff(res[k], ref[k]));
-        dphi     = std::max(dphi, std::abs(res[k].phi - ref[k].phi));
-        dphi_eig = std::max(dphi_eig, std::abs(res[k].phi - ref_eig[k].phi));
-        dpol_eig = std::max(dpol_eig, max_pole_diff(res[k], ref_eig[k]));
+        v[5] += (done[k] == 1 ? 0 : 1) + (res[k].phi_index == ref[k].phi_index ? 0 : 1) + (res[k].r1 == ref[k].r1 ? 0 : 1);
+        v[0] = std::max(v[0], max_pole_diff(res[k], ref[k]));
+        v[1] = std::max(v[1], std::abs(res[k].phi - ref[k].phi));
+        v[2] = std::max(v[2], dsigma(res[k], ref[k]));
+        v[3] = std::max(v[3], std::abs(res[k].phi - ref_eig[k].phi));
+        v[4] = std::max(v[4], dsigma(res[k], ref_eig[k]));
       }
-      double v[4] = {dmax, dphi, dphi_eig, double(nbad)}, vm[4];
-      comm.all_reduce_n(v, 4, vm, boost::mpi3::max<>{});
-      app_log(1, "[closure scan] ranks {} budget {:.0e}: distributed vs serial (mfree) max|d, W| {:.1e} |dphi| {:.1e} | vs the "
-                 "eigen scan |dphi| {:.1e} | n_free {} {} {}",
-              np, budget, vm[0], vm[1], vm[2], ref[0].n_free, ref[1].n_free, ref[2].n_free);
-      CHECK(vm[3] == 0.0);
-      CHECK(vm[0] == 0.0);   // bitwise: same arithmetic, same BLAS threads (no borrowed cores on the Mac / in -c8 jobs)
-      CHECK(vm[1] == 0.0);
+      comm.all_reduce_n(v, 6, vm, boost::mpi3::max<>{});
+      app_log(1, "[closure scan] ranks {} budget {:.0e}: distributed vs serial (poly) max|d, W| {:.1e} |dphi| {:.1e} dSigma {:.1e} "
+                 "({}) | vs the eigen scan |dphi| {:.1e} dSigma {:.1e} | n_free {} {} {}",
+              np, budget, vm[0], vm[1], vm[2], vm[0] == 0.0 ? "bitwise" : "roundoff", vm[3], vm[4], ref[0].n_free, ref[1].n_free,
+              ref[2].n_free);
+      CHECK(vm[5] == 0.0);
+      // bitwise for equal BLAS threads and code paths (the Mac); MKL may take alignment-dependent kernels: the golden
+      // section then ends one bracket step apart (4 pi / nphi 0.618^30 ~ 8.5e-7 rad)
+      CHECK(vm[1] <= 1e-5);
       CHECK(vm[2] <= 1e-5);
-      (void)dpol_eig;
+      CHECK(vm[3] <= 1e-5);
+      CHECK(vm[4] <= 1e-5);
     }
   }
 
@@ -487,8 +501,9 @@ TEST_CASE("gw_line_closure_scan", "[gw_line][scf][closure][scan]") {
     line_basis_t bp(theta, lam, eps, lam, 0.02, -1.0, 60.0), bh(theta, lam, eps, 0.02, lam, -1.0, 60.0);
     line_basis_t gp(theta, lam, eps, lam, 0.0, -1.0, 60.0), gh(theta, lam, eps, 0.0, lam, -1.0, 60.0);
     closure_params_t pp;   // wp 0.11, K 24, tol_gram 1e-10, nphi 8
-    pp.K    = 12;
+    pp.K    = 3;   // (K + 1) nb Gram directions > K nb: a free block
     pp.ueig = "cayley";
+    pp.svd_driver = "gesdd";
     pp.scan = "parallel";
     auto ps = pp;
     ps.scan = "serial";
@@ -504,7 +519,7 @@ TEST_CASE("gw_line_closure_scan", "[gw_line][scf][closure][scan]") {
       auto ck = closure_k(nda::array<ComplexType, 2>(H(ik, nda::range::all, nda::range::all)), sp, pp, ik);
       REQUIRE(ck.e.size() == op.leh.e[ik].size());
       for (long m = 0; m < ck.e.size(); ++m) dser = std::max(dser, std::abs(ck.e(m) - op.dmu - op.leh.e[ik](m)));
-      CHECK(op.diag[ik].phi == ck.diag.phi);
+      CHECK(std::abs(op.diag[ik].phi - ck.diag.phi) <= 1e-5);
     }
     double dG = 0.0, gm = 0.0;
     for (long iw = 0; iw < 40; ++iw) {
@@ -523,11 +538,11 @@ TEST_CASE("gw_line_closure_scan", "[gw_line][scf][closure][scan]") {
         gm = std::max(gm, nda::max_element(nda::abs(G2)));
       }
     }
-    app_log(1, "[closure scan] closure() ranks {}: k with a free block {} of {} | parallel vs per-k serial (mfree) max|de| {:.1e} | "
+    app_log(1, "[closure scan] closure() ranks {}: k with a free block {} of {} | parallel vs per-k serial (poly) max|de| {:.1e} | "
                "parallel vs serial (eigen) dmu {:.1e} Ha, gap {:.1e} Ha, max|dG|/max|G| {:.1e}",
             np, nfree, nk, dser, std::abs(op.dmu - os.dmu), std::abs((op.e_lumo - op.e_homo) - (os.e_lumo - os.e_homo)), dG / gm);
     CHECK(nfree > 0);
-    CHECK(dser == 0.0);
+    CHECK(dser <= 1e-6);   // bitwise on the Mac; MKL code-path roundoff -> one golden bracket step
     CHECK(std::abs(op.dmu - os.dmu) <= 1e-6);
     CHECK(dG / gm <= 1e-5);
   }

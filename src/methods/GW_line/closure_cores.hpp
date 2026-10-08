@@ -97,12 +97,13 @@ class closure_cores_t {
 #endif
   }
   /**
-   * perf 7.1c: the ranks with `busy` set borrow the cores of the other ranks of their host: the idle ranks of a host are
-   * dealt round-robin (in rank order) to its busy ranks, at most max_threads cores per busy rank (its own included;
-   * <= 0: no cap). Same conditions as above (Linux, every rank bound to one core, COQUI_GWLINE_CLOSURE_BORROW != 0).
-   * Collective over comm; every rank must call wait() afterwards.
+   * perf 7.1c: the ranks with weight > 0 ("busy") borrow the cores of the other ranks of their host: the idle ranks of a
+   * host are dealt round-robin to its busy ranks, a busy rank of weight w taking w cards per round (in rank order), at
+   * most max_threads cores per busy rank (its own included; <= 0: no cap). Same conditions as above (Linux, every rank
+   * bound to one core, COQUI_GWLINE_CLOSURE_BORROW != 0). Collective over comm; every rank must call wait() afterwards.
    */
-  closure_cores_t(boost::mpi3::communicator &comm, bool busy, long max_threads) : comm_(&comm) {
+  closure_cores_t(boost::mpi3::communicator &comm, long weight, long max_threads) : comm_(&comm) {
+    const bool busy = weight > 0;
     char const *v = std::getenv("COQUI_GWLINE_CLOSURE_BORROW");
     const bool enable = (v == nullptr or *v == '\0' or std::strtol(v, nullptr, 10) != 0);
     const long np = comm.size(), rank = comm.rank();
@@ -116,7 +117,7 @@ class closure_cores_t {
         if (CPU_ISSET(c, &mask)) mycpu = c;
     char host[256] = {0};
     gethostname(host, sizeof(host) - 1);
-    std::array<long, 3> me = {long(std::hash<std::string>{}(std::string(host)) & 0x7fffffffffffL), mycpu, busy ? 1L : 0L};
+    std::array<long, 3> me = {long(std::hash<std::string>{}(std::string(host)) & 0x7fffffffffffL), mycpu, std::max(0L, weight)};
     std::vector<long> all(3 * np);
     comm.all_gather_n(me.data(), 3, all.data(), 3);
     for (long r = 0; r < np; ++r)
@@ -129,11 +130,17 @@ class closure_cores_t {
       helper_ = not hb.empty();
       return;
     }
-    const long ib = long(std::find(hb.begin(), hb.end(), rank) - hb.begin()), nb = long(hb.size());
+    std::vector<long> cards;   // busy ranks of the host, rank r appearing weight(r) times, round by round
+    long wmax = 0;
+    for (long b : hb) wmax = std::max(wmax, all[3 * b + 2]);
+    for (long rd = 0; rd < wmax; ++rd)
+      for (long b : hb)
+        if (all[3 * b + 2] > rd) cards.push_back(b);
     saved_         = mask;
     cpu_set_t wide = mask;
     long n         = 1;
-    for (long i = ib; i < long(hi.size()); i += nb) {
+    for (long i = 0; i < long(hi.size()); ++i) {
+      if (cards[i % long(cards.size())] != rank) continue;
       if (max_threads > 0 and n >= max_threads) break;
       CPU_SET(int(all[3 * hi[i] + 1]), &wide);
       ++n;
@@ -143,6 +150,7 @@ class closure_cores_t {
     (void)busy;
     (void)max_threads;
     (void)rank;
+    (void)weight;
 #endif
   }
   ~closure_cores_t() { restore(); }
@@ -159,6 +167,7 @@ class closure_cores_t {
 #if defined(__linux__)
     if (widened_) {
       sched_setaffinity(0, sizeof(saved_), &saved_);
+      repin_pool(&saved_, ncpu_);
       if (mkl_dyn_ >= 0)
         if (auto f = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "MKL_Set_Dynamic"))) f(mkl_dyn_);
       mkl_dyn_ = -1;
@@ -184,10 +193,23 @@ class closure_cores_t {
  private:
 #if defined(__linux__)
   /// the calling thread's mask -> wide (n cores); saved_ must hold the original mask
+  /**
+   * perf 7.1c: the GNU OpenMP pool threads that MKL reuses keep the affinity mask they were created with (a previous
+   * lending, possibly of cores now lent to another rank): run one parallel region of n threads (GOMP_parallel, resolved
+   * at run time; libmkl_gnu_thread) in which every pool thread takes the mask m.
+   */
+  static void repin_one(void *m) { sched_setaffinity(0, sizeof(cpu_set_t), static_cast<cpu_set_t *>(m)); }
+  static void repin_pool(cpu_set_t *m, long n) {
+    using gomp_parallel_t = void (*)(void (*)(void *), void *, unsigned, unsigned);
+    if (n > 1)
+      if (auto g = reinterpret_cast<gomp_parallel_t>(dlsym(RTLD_DEFAULT, "GOMP_parallel"))) g(repin_one, m, unsigned(n), 0u);
+  }
   void widen(cpu_set_t const &wide, long n) {
     if (n > 1 and sched_setaffinity(0, sizeof(wide), &wide) == 0) {
       widened_ = true;
       ncpu_    = n;
+      wide_    = wide;
+      repin_pool(&wide_, n);
       // MKL caps its thread count by the cores it found at initialization (the 1-core mask) unless dynamic adjustment
       // is off: switch it off for the k loop (restored in restore())
       using get_t = int (*)();
@@ -205,7 +227,7 @@ class closure_cores_t {
   long ncpu_ = 1;
   int mkl_dyn_ = -1;
 #if defined(__linux__)
-  cpu_set_t saved_{};
+  cpu_set_t saved_{}, wide_{};
 #endif
 };
 

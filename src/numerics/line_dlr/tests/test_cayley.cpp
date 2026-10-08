@@ -456,9 +456,10 @@ TEST_CASE("cayley_ueig_ab", "[numerics][cayley]") {
   CHECK(d_rev <= 1e-6);
 }
 
-// perf 7.1c: the eigensolve-free held-out error ||R U^{K+1} R^dag - C^(K+1)|| equals the realization's error (exact in
-// exact arithmetic) at any phase; the golden section on it ("mfree") vs the python scan ("eigen") on models with a free block
-TEST_CASE("cayley_scan_mfree", "[numerics][cayley][scan]") {
+// perf 7.1c: the eigensolve-free held-out error (heldout_poly_t: ||R U(z)^{K+1} R^dag - C^(K+1)|| by the recursion in z)
+// equals the realization's error (exact in exact arithmetic) at any phase; the golden section on it ("poly") vs the python
+// scan ("eigen") on models with a free block
+TEST_CASE("cayley_scan_poly", "[numerics][cayley][scan]") {
   const long n = 8, K = 12;
   const double wp = 0.11;
   for (long P : {120L, 160L, 240L}) {
@@ -482,17 +483,18 @@ TEST_CASE("cayley_scan_mfree", "[numerics][cayley][scan]") {
       auto pr = ldlr::upfold_prepare(C, K, wp, o, r0);
       REQUIRE(pr.n_free > 0);
       double dmax = 0.0, emin = 1e300;
+      auto hp = ldlr::heldout_poly(pr);
       for (long ip = 0; ip < 24; ++ip) {
         const double phi = 2.0 * std::numbers::pi * (ip + 0.37) / 24.0;
         ldlr::upfold_result_t rr;
         const double e_eig = ldlr::realize(pr, phi, o, rr).err;
-        const double e_mf  = ldlr::heldout_mfree(pr, phi, o.scan_rows, rr);
+        const double e_mf  = hp(phi);
         dmax = std::max(dmax, std::abs(e_eig - e_mf));
         emin = std::min(emin, e_eig);
       }
       auto oe = o, om = o;
       oe.scan_err = "eigen";
-      om.scan_err = "mfree";
+      om.scan_err = "poly";
       auto ue = ldlr::upfold_block(C, K, wp, oe), um = ldlr::upfold_block(C, K, wp, om);
       double dS = 0.0, sm = 0.0;
       std::mt19937 gz(5);
@@ -502,9 +504,9 @@ TEST_CASE("cayley_scan_mfree", "[numerics][cayley][scan]") {
         dS      = std::max(dS, closure_bench::max_abs2(nda::array<dcomplex, 2>(S1 - S0)));
         sm      = std::max(sm, closure_bench::max_abs2(S0));
       }
-      std::cout << std::scientific << std::setprecision(3) << "[scan_mfree] P " << P << " " << ueig << " Nr " << pr.Nr
-                << " n_free " << pr.n_free << " | max |err_eig - err_mfree| over 24 phases " << dmax << " (min err " << emin
-                << ") | phi eigen " << std::setprecision(12) << ue.phi << " mfree " << um.phi << std::setprecision(3)
+      std::cout << std::scientific << std::setprecision(3) << "[scan_poly] P " << P << " " << ueig << " Nr " << pr.Nr
+                << " n_free " << pr.n_free << " | max |err_eig - err_poly| over 24 phases " << dmax << " (min err " << emin
+                << ") | phi eigen " << std::setprecision(12) << ue.phi << " poly " << um.phi << std::setprecision(3)
                 << " |dphi| " << std::abs(ue.phi - um.phi) << " held-out " << ue.residual << " / " << um.residual
                 << " dSigma " << dS / sm << " | realizations " << ue.n_eig << " / " << um.n_eig << " + " << um.n_mfree
                 << " eigensolve-free" << std::endl;
