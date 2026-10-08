@@ -72,7 +72,7 @@ struct bosonic_basis_t {
   double node_factor = 0.0;                    ///< nz / rank of the symmetric selection (0: python nodes)
 
   /// default nz / r of the symmetric node selection (perf 7.1 scan, notes section 5)
-  static constexpr double default_node_factor = 1.25;   // perf 7.1 scan: 1.1-1.5 as accurate as 2 r vs Casida
+  static constexpr double default_node_factor = 1.5;   // perf 7.1 scan: 1.1-1.5 as accurate as 2 r vs Casida; 1.5 for margin
   /// env COQUI_GWLINE_BOS_NODES (a number; <= 0 selects the python nodes), else default_node_factor
   static double env_node_factor() {
     char const *v = std::getenv("COQUI_GWLINE_BOS_NODES");

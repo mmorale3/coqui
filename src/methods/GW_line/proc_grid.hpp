@@ -287,7 +287,7 @@ inline double aux_grid_t::log(long nk, long nq, long nzeta, long r_b, long t_chu
   // q of the group; Sigma holds G~, acc, W^(R) of all R per chunk and the transformed residues w^(R) (N_q r_b blocks)
   char const *rsv     = std::getenv("COQUI_GWLINE_RSPACE");
   const bool rs       = (rsv == nullptr or *rsv == '\0' or std::strtol(rsv, nullptr, 10) != 0) and nk == nq;
-  const double nacc   = (device_fused or rs) ? double(rs ? g : nq) : 1.0;
+  const double nacc   = (device_fused or rs) ? double(nq) : 1.0;
   const double pi_t   = ((rs ? 3.0 : 2.0) * nk + nacc) * t_chunk * blk;
   const double sg_t   = (2.0 * nk + (rs ? double(nq) : nacc)) * t_chunk * blk + double(nk) * t_chunk * nb * nb * 16.0 +
                       (rs ? w : 0.0);
