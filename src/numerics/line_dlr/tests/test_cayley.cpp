@@ -456,4 +456,68 @@ TEST_CASE("cayley_ueig_ab", "[numerics][cayley]") {
   CHECK(d_rev <= 1e-6);
 }
 
+// perf 7.1c: the eigensolve-free held-out error ||R U^{K+1} R^dag - C^(K+1)|| equals the realization's error (exact in
+// exact arithmetic) at any phase; the golden section on it ("mfree") vs the python scan ("eigen") on models with a free block
+TEST_CASE("cayley_scan_mfree", "[numerics][cayley][scan]") {
+  const long n = 8, K = 12;
+  const double wp = 0.11;
+  for (long P : {120L, 160L, 240L}) {
+    std::mt19937 gen(777 + P);
+    nda::array<double, 1> w(P);
+    nda::array<dcomplex, 3> g(P, n, n);
+    for (long l = 0; l < P; ++l) {
+      const double a = 0.02 * std::pow(6.0 / 0.02, closure_bench::unif(gen, 0.0, 1.0));
+      w(l)           = (l % 2 ? a : -a);
+      std::vector<dcomplex> v(n);
+      for (auto &x : v) x = dcomplex(closure_bench::unif(gen, -1.0, 1.0), closure_bench::unif(gen, -1.0, 1.0)) / std::sqrt(double(P));
+      for (long i = 0; i < n; ++i)
+        for (long j = 0; j < n; ++j) g(l, i, j) = v[i] * std::conj(v[j]);
+    }
+    auto C = ldlr::moments_from_poles(w, g, wp, K + 1);
+    for (std::string ueig : {"schur", "cayley"}) {
+      ldlr::upfold_opts_t o;
+      o.tol_gram = 1e-10;
+      o.ueig     = ueig;
+      ldlr::upfold_result_t r0;
+      auto pr = ldlr::upfold_prepare(C, K, wp, o, r0);
+      REQUIRE(pr.n_free > 0);
+      double dmax = 0.0, emin = 1e300;
+      for (long ip = 0; ip < 24; ++ip) {
+        const double phi = 2.0 * std::numbers::pi * (ip + 0.37) / 24.0;
+        ldlr::upfold_result_t rr;
+        const double e_eig = ldlr::realize(pr, phi, o, rr).err;
+        const double e_mf  = ldlr::heldout_mfree(pr, phi, o.scan_rows, rr);
+        dmax = std::max(dmax, std::abs(e_eig - e_mf));
+        emin = std::min(emin, e_eig);
+      }
+      auto oe = o, om = o;
+      oe.scan_err = "eigen";
+      om.scan_err = "mfree";
+      auto ue = ldlr::upfold_block(C, K, wp, oe), um = ldlr::upfold_block(C, K, wp, om);
+      double dS = 0.0, sm = 0.0;
+      std::mt19937 gz(5);
+      for (int q = 0; q < 20; ++q) {
+        const dcomplex z(closure_bench::unif(gz, -1.0, 1.0), closure_bench::unif(gz, 0.005, 0.1));
+        auto S0 = ldlr::sigma_from_poles(ue.d, ue.W, z), S1 = ldlr::sigma_from_poles(um.d, um.W, z);
+        dS      = std::max(dS, closure_bench::max_abs2(nda::array<dcomplex, 2>(S1 - S0)));
+        sm      = std::max(sm, closure_bench::max_abs2(S0));
+      }
+      std::cout << std::scientific << std::setprecision(3) << "[scan_mfree] P " << P << " " << ueig << " Nr " << pr.Nr
+                << " n_free " << pr.n_free << " | max |err_eig - err_mfree| over 24 phases " << dmax << " (min err " << emin
+                << ") | phi eigen " << std::setprecision(12) << ue.phi << " mfree " << um.phi << std::setprecision(3)
+                << " |dphi| " << std::abs(ue.phi - um.phi) << " held-out " << ue.residual << " / " << um.residual
+                << " dSigma " << dS / sm << " | realizations " << ue.n_eig << " / " << um.n_eig << " + " << um.n_mfree
+                << " eigensolve-free" << std::endl;
+      CHECK(dmax <= 1e-12);
+      CHECK(ue.phi_index == um.phi_index);
+      CHECK(ue.d.size() == um.d.size());
+      CHECK(std::abs(ue.phi - um.phi) <= 1e-5);
+      CHECK(std::abs(ue.residual - um.residual) <= 1e-10 * (1.0 + ue.residual));
+      CHECK(dS / sm <= 1e-5);
+      CHECK(um.n_eig == o.nphi + 1);
+      CHECK(um.n_mfree == 2 + ldlr::golden_t::nsteps);
+    }
+  }
+}
+
 } // namespace bdft_tests

@@ -54,7 +54,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <cmath>
@@ -76,6 +78,7 @@
 #include "methods/GW_line/blas_scope.hpp"
 #include "methods/GW_line/closure_cores.hpp"
 #include "methods/GW_line/closure_device.hpp"
+#include "methods/GW_line/closure_scan.hpp"
 
 namespace methods::gw_line {
 
@@ -105,6 +108,17 @@ inline sigma_poles_t fit_sigma_sectors(line_basis_t const &bp, line_basis_t cons
   return out;
 }
 
+namespace detail {
+inline std::string env_string(char const *nm, std::string const &d) {
+  char const *e = std::getenv(nm);
+  return (e and *e) ? std::string(e) : d;
+}
+inline double env_double(char const *nm, double d) {
+  char const *e = std::getenv(nm);
+  return (e and *e) ? std::strtod(e, nullptr) : d;
+}
+} // namespace detail
+
 /// Parameters of the moment closure (notes section 6; plan section 5; S7f: cut modes, phase continuity, diagnostics).
 struct closure_params_t {
   double wp       = 0.11;    ///< Cayley scale (Ha)
@@ -128,6 +142,17 @@ struct closure_params_t {
   std::string svd_driver = "gesvd";   ///< numerics::line_dlr::upfold_opts_t::svd_driver
   std::string ueig       = "schur";   ///< numerics::line_dlr::upfold_opts_t::ueig
   numerics::line_dlr::lapack_hooks_t const *hooks = nullptr;   ///< external (device) eigensolvers; null: host LAPACK
+  /**
+   * perf 7.1c: the terminal-phase scan of the k with a free block (n_free > 0). "parallel": the golden section on the
+   * eigensolve-free held-out error, distributed over ranks with the coarse realizations (closure_scan.hpp); serial callers
+   * (closure_k) run the same arithmetic on one rank. "serial": the pre-7.1c scan (the owner realizes all 41 phases).
+   * Env COQUI_GWLINE_CLOSURE_SCAN overrides the default; COQUI_GWLINE_SCAN_MB (problem broadcast budget per rank, MB),
+   * COQUI_GWLINE_SCAN_THREADS (cap of the borrowed cores per scan rank, 0 = none).
+   */
+  std::string scan       = detail::env_string("COQUI_GWLINE_CLOSURE_SCAN", "parallel");
+  long scan_rows         = 4;   ///< row block of the eigensolve-free held-out error (part of the result's roundoff: fixed)
+  long scan_threads_max  = long(detail::env_double("COQUI_GWLINE_SCAN_THREADS", 0.0));
+  double scan_budget_mb  = detail::env_double("COQUI_GWLINE_SCAN_MB", 512.0);
 
   numerics::line_dlr::upfold_opts_t upfold_opts(long ik) const {
     numerics::line_dlr::upfold_opts_t o;
@@ -141,6 +166,8 @@ struct closure_params_t {
     o.svd_driver = svd_driver;
     o.ueig       = ueig;
     o.hooks      = hooks;
+    o.scan_err   = (scan == "serial") ? "eigen" : "mfree";
+    o.scan_rows  = scan_rows;
     if (ik >= 0) {
       if (phase_keep > 0.0 and ik < long(phi_prev.size())) {
         o.phi_prev   = phi_prev[ik];
@@ -193,6 +220,28 @@ struct g_repr_params_t {
   double wsmall    = 0.0;            ///< (iii) weight threshold
 };
 
+/// perf 7.1c: profile of the closure of one k (wall seconds on its owner, counts), gathered for the per-k log
+struct closure_kprof_t {
+  double t_fit = 0.0, t_mom = 0.0, t_gram = 0.0, t_svd = 0.0, t_svd_ref = 0.0, t_bcast = 0.0, t_coarse = 0.0,
+         t_refine = 0.0, t_final = 0.0, t_eig = 0.0, t_rr = 0.0, t_leh = 0.0;
+  long n_free = 0, n_eig = 0, n_mfree = 0, retry = 0, nflag = 0, fallback = 0, scan_ranks = 0, scan_threads = 0;
+  static constexpr long nfields = 20;
+  double total() const { return t_fit + t_mom + t_gram + t_svd + t_bcast + t_coarse + t_refine + t_final + t_leh; }
+  void pack(double *x) const {
+    double v[nfields] = {t_fit, t_mom, t_gram, t_svd, t_svd_ref, t_bcast, t_coarse, t_refine, t_final, t_eig, t_rr, t_leh,
+                         double(n_free), double(n_eig), double(n_mfree), double(retry), double(nflag), double(fallback),
+                         double(scan_ranks), double(scan_threads)};
+    std::copy_n(v, nfields, x);
+  }
+  void unpack(double const *x) {
+    t_fit = x[0]; t_mom = x[1]; t_gram = x[2]; t_svd = x[3]; t_svd_ref = x[4]; t_bcast = x[5]; t_coarse = x[6];
+    t_refine = x[7]; t_final = x[8]; t_eig = x[9]; t_rr = x[10]; t_leh = x[11];
+    n_free = std::llround(x[12]); n_eig = std::llround(x[13]); n_mfree = std::llround(x[14]); retry = std::llround(x[15]);
+    nflag = std::llround(x[16]); fallback = std::llround(x[17]); scan_ranks = std::llround(x[18]);
+    scan_threads = std::llround(x[19]);
+  }
+};
+
 /// Result of the closure of one k: the Lehmann G (mu-relative to the closure centre) and the upfolded Sigma_c poles.
 struct closure_k_t {
   nda::array<double, 1> e;         ///< [M] Lehmann energies, ascending
@@ -205,12 +254,18 @@ struct closure_k_t {
   double t_mom = 0.0, t_c0 = 0.0, t_gram = 0.0, t_svd = 0.0, t_ueig = 0.0, t_leh = 0.0;
   long ueig_fallback = 0, ueig_nflag = 0, ueig_reason = 0, ueig_retry = 0;
   double ueig_res    = 0.0;
+  closure_kprof_t prof{};          ///< perf 7.1c
 };
 
-/// python lehmann_from_sigma: moments of the total measure -> upfold_block -> eig of Htilde. ik: k index (per-k options,
-/// noise seed; -1 = none).
-inline closure_k_t closure_k(nda::array<ComplexType, 2> const &Hrel, sigma_poles_t const &sp, closure_params_t const &p,
-                             long ik = -1) {
+/// perf 7.1c: the first half of closure_k (moments, upfold_prepare): the realization problem and the decisions so far
+struct closure_k_work_t {
+  numerics::line_dlr::upfold_problem_t pr;
+  numerics::line_dlr::upfold_result_t up;
+  numerics::line_dlr::upfold_opts_t o;
+  double t_mom = 0.0;
+};
+
+inline closure_k_work_t closure_k_begin(sigma_poles_t const &sp, closure_params_t const &p, long ik = -1) {
   using namespace numerics::line_dlr;
   using clk = std::chrono::steady_clock;
   const auto t0 = clk::now();
@@ -223,14 +278,24 @@ inline closure_k_t closure_k(nda::array<ComplexType, 2> const &Hrel, sigma_poles
     std::normal_distribution<double> N01;
     for (auto &x : C) x += p.moment_noise * c0 * ComplexType(N01(gen), N01(gen));
   }
-  const auto t1 = clk::now();
-  auto up = upfold_block(C, p.K, p.wp, p.upfold_opts(ik));
+  closure_k_work_t w;
+  w.t_mom = std::chrono::duration<double>(clk::now() - t0).count();
+  w.o     = p.upfold_opts(ik);
+  w.pr    = upfold_prepare(C, p.K, p.wp, w.o, w.up);
+  return w;
+}
+
+/// the second half of closure_k: the finished upfolding (w.up) -> eig of Htilde
+inline closure_k_t closure_k_end(nda::array<ComplexType, 2> const &Hrel, closure_k_work_t &&w, closure_params_t const &p) {
+  using namespace numerics::line_dlr;
+  using clk = std::chrono::steady_clock;
+  auto &up      = w.up;
   const auto t2 = clk::now();
-  auto L  = lehmann(Hrel, up.d, up.W, p.hooks);
+  auto L        = lehmann(Hrel, up.d, up.W, p.hooks);
   const auto t3 = clk::now();
-  auto dg = upfold_diag_t::from(up);
+  auto dg       = upfold_diag_t::from(up);
   closure_k_t out{std::move(L.e), std::move(L.v), std::move(up.d), std::move(up.W), up.residual, dg};
-  out.t_mom         = std::chrono::duration<double>(t1 - t0).count();
+  out.t_mom         = w.t_mom;
   out.t_c0          = up.t_c0;
   out.t_gram        = up.t_gram;
   out.t_svd         = up.t_svd;
@@ -241,7 +306,22 @@ inline closure_k_t closure_k(nda::array<ComplexType, 2> const &Hrel, sigma_poles
   out.ueig_reason   = up.ueig_reason;
   out.ueig_retry    = up.ueig_retry;
   out.ueig_res      = up.ueig_res;
+  auto &pf          = out.prof;
+  pf.t_mom = w.t_mom; pf.t_gram = up.t_c0 + up.t_gram; pf.t_svd = up.t_svd; pf.t_svd_ref = up.t_svd_ref;
+  pf.t_coarse = up.t_coarse; pf.t_refine = up.t_refine; pf.t_final = up.t_final; pf.t_eig = up.t_eig; pf.t_rr = up.t_rr;
+  pf.t_leh = out.t_leh; pf.n_free = up.n_free; pf.n_eig = up.n_eig; pf.n_mfree = up.n_mfree; pf.retry = up.ueig_retry;
+  pf.nflag = up.ueig_nflag; pf.fallback = up.ueig_fallback;
+  if (up.n_free == 0) pf.t_final = up.t_ueig;   // the single realization
   return out;
+}
+
+/// python lehmann_from_sigma: moments of the total measure -> upfold_block -> eig of Htilde. ik: k index (per-k options,
+/// noise seed; -1 = none). The terminal-phase scan, if any, runs serially here (p.scan selects its held-out error).
+inline closure_k_t closure_k(nda::array<ComplexType, 2> const &Hrel, sigma_poles_t const &sp, closure_params_t const &p,
+                             long ik = -1) {
+  auto w = closure_k_begin(sp, p, ik);
+  numerics::line_dlr::upfold_complete(w.pr, w.o, w.up);
+  return closure_k_end(Hrel, std::move(w), p);
 }
 
 /**
@@ -371,6 +451,7 @@ struct closure_out_t {
   std::vector<long> npoles;       ///< upfolded poles per k
   std::vector<double> heldout;    ///< held-out moment error per k
   std::vector<upfold_diag_t> diag;   ///< upfolding decisions per k (S7f; phi = the terminal phase for phase continuity)
+  std::vector<closure_kprof_t> kprof;   ///< perf 7.1c: profile per k (owner wall seconds)
 };
 
 /**
@@ -393,30 +474,41 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   utils::check((Sig_p.extent(0) == nk or Sig_p.extent(0) == nloc) and Sig_p.extent(1) == nz and Sig_p.extent(2) == nb and
                    Sig_h.shape() == Sig_p.shape(),
                "gw_line::closure: Sigma shape mismatch");
-  for (auto nm : {"closure_upfold", "closure_gather", "closure_mu", "closure_compress"}) Timer.add(nm);
+  for (auto nm : {"closure_upfold", "closure_kloop", "closure_wait", "closure_scan", "closure_gather", "closure_mu",
+                  "closure_compress"})
+    Timer.add(nm);
   closure_out_t out;
 
-  // 1. per owned k: sector fits -> moments -> upfold -> Lehmann (S7g: BLAS threads of the rank, p.blas_threads)
+  // 1. per owned k: sector fits -> moments -> upfold -> Lehmann (S7g: BLAS threads of the rank, p.blas_threads).
+  //    perf 7.1c: a k with a free block (n_free > 0) stops after upfold_prepare ("deferred"); its terminal-phase scan runs
+  //    distributed over the ranks after every owner is done (step 1b), then its owner finishes it.
   Timer.start("closure_upfold");
+  Timer.start("closure_kloop");
   using clk = std::chrono::steady_clock;
-  double prof[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // fit, moments, C0, Gram, SVD, U eigen, Lehmann, U-eigen fallbacks
+  constexpr long NPROF = 11;
+  double prof[NPROF] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};   // fit, moments, C0, Gram, SVD, U eigen, Lehmann, U-eigen fallbacks,
+                                                             // eigen realizations, RR + retries, eigensolve-free errors
   std::array<double, 4> ustat{0.0, 0.0, 0.0, 0.0};   // max RR-refined columns, max residual, max reason, retries (sum)
   std::mutex ustat_mx;
   std::vector<nda::array<double, 1>> e_loc(nk);
   std::vector<nda::array<ComplexType, 2>> v_loc(nk);
-  const long ni = 2 + upfold_diag_t::nfields;
-  nda::array<double, 2> info(nk, ni);   // (npoles, heldout, diag)
+  const long nd = upfold_diag_t::nfields, nkp = closure_kprof_t::nfields;
+  const long ni = 2 + nd + nkp;
+  nda::array<double, 2> info(nk, ni);   // (npoles, heldout, diag, kprof)
   info() = 0.0;
-  auto do_k = [&](long ik, double *pr) {   // writes only the slots of ik
-    const long ks = sig_loc ? ik / np : ik;
-    const auto tf0 = clk::now();
-    nda::array<ComplexType, 3> Sp(Sig_p(ks, all, all, all)), Sh(Sig_h(ks, all, all, all));
-    auto sp = fit_sigma_sectors(bp, bh, zeta, Sp, Sh);
-    pr[0] += std::chrono::duration<double>(clk::now() - tf0).count();
-    nda::array<ComplexType, 2> H(Hrel(ik, all, all));
-    auto ck   = closure_k(H, sp, p, ik);
+  struct pending_t {
+    closure_k_work_t w;
+    double t_fit = 0.0;
+  };
+  std::vector<std::unique_ptr<pending_t>> pend(nk);
+  const bool par_scan = (p.scan == "parallel");
+  utils::check(par_scan or p.scan == "serial", "gw_line::closure: scan must be \"parallel\" or \"serial\" (got \"{}\")", p.scan);
+  auto store_k = [&](long ik, closure_k_t &ck, double t_fit, double *pr) {   // writes only the slots of ik
+    ck.prof.t_fit = t_fit;
+    pr[0] += t_fit;
     pr[1] += ck.t_mom; pr[2] += ck.t_c0; pr[3] += ck.t_gram; pr[4] += ck.t_svd; pr[5] += ck.t_ueig;
     pr[6] += ck.t_leh; pr[7] += double(ck.ueig_fallback);
+    pr[8] += ck.prof.t_eig; pr[9] += ck.prof.t_rr; pr[10] += ck.prof.t_refine;
     {
       std::lock_guard<std::mutex> lk(ustat_mx);
       ustat[0] = std::max(ustat[0], double(ck.ueig_nflag));
@@ -429,6 +521,23 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     info(ik, 0) = double(ck.d.size());
     info(ik, 1) = ck.heldout;
     ck.diag.pack(&info(ik, 2));
+    ck.prof.pack(&info(ik, 2 + nd));
+  };
+  auto do_k = [&](long ik, double *pr) {   // writes only the slots of ik
+    const long ks = sig_loc ? ik / np : ik;
+    const auto tf0 = clk::now();
+    nda::array<ComplexType, 3> Sp(Sig_p(ks, all, all, all)), Sh(Sig_h(ks, all, all, all));
+    auto sp = fit_sigma_sectors(bp, bh, zeta, Sp, Sh);
+    const double t_fit = std::chrono::duration<double>(clk::now() - tf0).count();
+    auto w = closure_k_begin(sp, p, ik);
+    if (par_scan and numerics::line_dlr::needs_phase_scan(w.pr, w.o)) {
+      pend[ik] = std::make_unique<pending_t>(pending_t{std::move(w), t_fit});
+      return;
+    }
+    numerics::line_dlr::upfold_complete(w.pr, w.o, w.up);
+    nda::array<ComplexType, 2> H(Hrel(ik, all, all));
+    auto ck = closure_k_end(H, std::move(w), p);
+    store_k(ik, ck, t_fit, pr);
   };
   // S7g: the owned k on nw concurrent host threads (k_workers), each with blas_threads / nw BLAS threads; every k is
   // processed by the same code whatever the worker (results depend only on the BLAS thread count, as for nw = 1)
@@ -444,7 +553,7 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     for (long ik = rank; ik < nk; ik += np) do_k(ik, prof);
   } else {
     std::atomic<long> next{0};
-    std::vector<std::array<double, 8>> pw(nw);
+    std::vector<std::array<double, NPROF>> pw(nw);
     std::vector<std::exception_ptr> err(nw);
     std::vector<std::string> be(nw);
     auto worker = [&](long w) {
@@ -462,18 +571,74 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     for (auto &e : err)
       if (e) std::rethrow_exception(e);
     for (auto const &x : pw)
-      for (int i = 0; i < 8; ++i) prof[i] += x[i];
+      for (long i = 0; i < NPROF; ++i) prof[i] += x[i];
     blas_backend = be[0];
   }
-  if (p.hooks) device_lapack_release();   // the kernels get the device memory back
+  Timer.stop("closure_kloop");
+  Timer.start("closure_wait");
   cores.wait();                           // perf 7.1 (f): masks restored; the helpers waited here without polling
+  Timer.stop("closure_wait");
+
+  // 1b. perf 7.1c: the terminal-phase scans of the deferred k, distributed (closure_scan.hpp); their owners finish them
+  Timer.start("closure_scan");
+  std::vector<long> dk;
+  {
+    std::vector<double> fl(nk, 0.0);
+    for (long ik = rank; ik < nk; ik += np) fl[ik] = pend[ik] ? 1.0 : 0.0;
+    detail::exact_allreduce(comm, fl.data(), nk);
+    for (long ik = 0; ik < nk; ++ik)
+      if (fl[ik] > 0.5) dk.push_back(ik);
+  }
+  if (not dk.empty()) {
+    std::vector<numerics::line_dlr::upfold_problem_t const *> probs(dk.size(), nullptr);
+    for (size_t j = 0; j < dk.size(); ++j)
+      if (pend[dk[j]]) probs[j] = &pend[dk[j]]->w.pr;
+    auto finish = [&](long j, phase_scan_t const &s) {
+      const long ik = dk[j];
+      auto &pe      = *pend[ik];
+      auto &up      = pe.w.up;
+      up.phi_index  = s.phi_index;
+      up.n_rejected = s.n_rejected;
+      up.phi_kept   = s.phi_kept;
+      up.phi_tie    = s.phi_tie;
+      up.n_realize += s.n_eig;
+      up.n_eig += s.n_eig;
+      up.n_mfree += s.n_mfree;
+      up.ueig_nflag = std::max(up.ueig_nflag, s.ueig_nflag);
+      up.ueig_retry += s.ueig_retry;
+      up.ueig_fallback += s.ueig_fallback;
+      up.ueig_res = std::max(up.ueig_res, s.ueig_res);
+      if (s.ueig_reason > 0) up.ueig_reason = int(s.ueig_reason);
+      up.t_eig += s.t_eig;
+      up.t_rr += s.t_rr;
+      up.t_coarse = s.t_coarse;
+      up.t_refine = s.t_refine;
+      numerics::line_dlr::upfold_final(pe.w.pr, s.phi, pe.w.o, up);
+      up.t_ueig = s.t_bcast + s.t_coarse + s.t_refine + up.t_final;
+      nda::array<ComplexType, 2> H(Hrel(ik, all, all));
+      auto ck              = closure_k_end(H, std::move(pe.w), p);
+      ck.prof.t_bcast      = s.t_bcast;
+      ck.prof.scan_ranks   = s.ranks;
+      ck.prof.scan_threads = s.threads;
+      store_k(ik, ck, pe.t_fit, prof);
+      pend[ik].reset();
+    };
+    distributed_phase_scan(comm, dk, probs, [&](long k) { return p.upfold_opts(k); }, p.blas_threads, p.scan_threads_max,
+                           p.scan_budget_mb * 1024.0 * 1024.0, finish, &Timer);
+  }
+  Timer.stop("closure_scan");
+  if (p.hooks) device_lapack_release();   // the kernels get the device memory back
   Timer.stop("closure_upfold");
   {   // S7g: per-step profile of the closure (max over ranks of the per-rank sums over the owned k)
-    double pmax[8], umax[4];
-    std::copy_n(prof, 8, pmax);
+    double pmax[NPROF], pmin[NPROF], psum[NPROF], umax[4];
+    std::copy_n(prof, NPROF, pmax);
+    std::copy_n(prof, NPROF, pmin);
+    std::copy_n(prof, NPROF, psum);
     std::copy_n(ustat.data(), 4, umax);
     if (comm.size() > 1) {
-      comm.all_reduce_n(prof, 8, pmax, boost::mpi3::max<>{});
+      comm.all_reduce_n(prof, NPROF, pmax, boost::mpi3::max<>{});
+      comm.all_reduce_n(prof, NPROF, pmin, boost::mpi3::min<>{});
+      comm.all_reduce_n(prof, NPROF, psum, std::plus<>{});
       comm.all_reduce_n(ustat.data(), 4, umax, boost::mpi3::max<>{});
     }
     app_log(2, "          closure profile (s, max over ranks of the sums over the rank's k): fit {:.2f} moments {:.2f} C0 {:.2f} Gram {:.2f} SVD {:.2f} U-eigen "
@@ -481,6 +646,12 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
                "columns {}, residual {:.1e}, reason {}, gap-cut retries {}), device fallbacks (rank 0, cumulative) {}; k workers {}",
             pmax[0], pmax[1], pmax[2], pmax[3], pmax[4], pmax[5], pmax[6], bt > 0 ? bt : 0, blas_backend, p.svd_driver, p.ueig,
             p.hooks ? " + GPU" : "", long(pmax[7]), long(umax[0]), umax[1], long(umax[2]), long(umax[3]), device_lapack_failures(), nw);
+    const double fnp = double(comm.size());
+    app_log(2, "          closure realizations (s, min / avg / max over ranks of the owner's sums): eigen realizations {:.2f} / {:.2f} / "
+               "{:.2f}, of which Rayleigh-Ritz + gap-cut retries + Schur {:.2f} / {:.2f} / {:.2f}; eigensolve-free golden "
+               "section {:.2f} / {:.2f} / {:.2f}; scan \"{}\", deferred k {}",
+            pmin[8], psum[8] / fnp, pmax[8], pmin[9], psum[9] / fnp, pmax[9], pmin[10], psum[10] / fnp, pmax[10], p.scan,
+            long(dk.size()));
   }
 
   Timer.start("closure_gather");
@@ -491,8 +662,33 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     out.heldout.push_back(info(ik, 1));
     out.diag.emplace_back();
     out.diag.back().unpack(&info(ik, 2));
+    out.kprof.emplace_back();
+    out.kprof.back().unpack(&info(ik, 2 + upfold_diag_t::nfields));
   }
   Timer.stop("closure_gather");
+  {   // perf 7.1c: per-k profile -- the k with a terminal-phase scan, retries or fallbacks, and the slowest k
+    double tmin = 1e300, tmax = 0.0, tsum = 0.0;
+    long kslow = 0;
+    for (long ik = 0; ik < nk; ++ik) {
+      const double t = out.kprof[ik].total();
+      tmin = std::min(tmin, t);
+      tsum += t;
+      if (t > tmax) { tmax = t; kslow = ik; }
+    }
+    app_log(2, "          closure per k (s, owner wall): min {:.2f} avg {:.2f} max {:.2f} (k {})", tmin, tsum / double(nk), tmax, kslow);
+    for (long ik = 0; ik < nk; ++ik) {
+      auto const &f = out.kprof[ik];
+      if (not(f.n_free > 0 or f.retry > 0 or f.fallback > 0 or ik == kslow)) continue;
+      auto const &d = out.diag[ik];
+      app_log(2, "          closure k {} (rank {}): Nr {} r1 {} n_free {} | fit {:.2f} mom {:.2f} C0+Gram {:.2f} SVD {:.2f} (ref "
+                 "{:.2f}) | scan bcast {:.2f} coarse {:.2f} refine {:.2f} final {:.2f} | eigen realizations {} ({:.2f} s, RR + "
+                 "retries {:.2f} s, retries {}, max RR columns {}, Schur fallbacks {}), eigensolve-free errors {} | Lehmann "
+                 "{:.2f} | total {:.2f} | scan ranks {} BLAS threads {} | phi {:.9f} basin {} tie {:.3f} rejected {}",
+              ik, ik % np, d.r_gram, d.r1, f.n_free, f.t_fit, f.t_mom, f.t_gram, f.t_svd, f.t_svd_ref, f.t_bcast, f.t_coarse,
+              f.t_refine, f.t_final, f.n_eig, f.t_eig, f.t_rr, f.retry, f.nflag, f.fallback, f.n_mfree, f.t_leh, f.total(),
+              f.scan_ranks, f.scan_threads, d.phi, d.phi_index, d.phi_tie, d.n_rejected);
+    }
+  }
 
   // 2. chemical potential (every rank, same data) and re-centring
   Timer.start("closure_mu");

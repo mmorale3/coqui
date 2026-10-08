@@ -36,6 +36,7 @@
  * the ranks already float). Env COQUI_GWLINE_CLOSURE_BORROW = 0 disables it.
  */
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -90,20 +91,57 @@ class closure_cores_t {
         CPU_SET(int(all[2 * h + 1]), &wide);
         ++n;
       }
-    if (n > 1 and sched_setaffinity(0, sizeof(wide), &wide) == 0) {
-      widened_ = true;
-      ncpu_    = n;
-      // MKL caps its thread count by the cores it found at initialization (the 1-core mask) unless dynamic adjustment
-      // is off: switch it off for the k loop (restored in restore())
-      using get_t = int (*)();
-      using set_t = void (*)(int);
-      if (auto g = reinterpret_cast<get_t>(dlsym(RTLD_DEFAULT, "MKL_Get_Dynamic")))
-        if (auto f = reinterpret_cast<set_t>(dlsym(RTLD_DEFAULT, "MKL_Set_Dynamic"))) {
-          mkl_dyn_ = g();
-          f(0);
-        }
-    }
+    widen(wide, n);
 #else
+    (void)rank;
+#endif
+  }
+  /**
+   * perf 7.1c: the ranks with `busy` set borrow the cores of the other ranks of their host: the idle ranks of a host are
+   * dealt round-robin (in rank order) to its busy ranks, at most max_threads cores per busy rank (its own included;
+   * <= 0: no cap). Same conditions as above (Linux, every rank bound to one core, COQUI_GWLINE_CLOSURE_BORROW != 0).
+   * Collective over comm; every rank must call wait() afterwards.
+   */
+  closure_cores_t(boost::mpi3::communicator &comm, bool busy, long max_threads) : comm_(&comm) {
+    char const *v = std::getenv("COQUI_GWLINE_CLOSURE_BORROW");
+    const bool enable = (v == nullptr or *v == '\0' or std::strtol(v, nullptr, 10) != 0);
+    const long np = comm.size(), rank = comm.rank();
+    if (not enable or np < 2) return;
+#if defined(__linux__)
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    long mycpu = -1;
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0 and CPU_COUNT(&mask) == 1)
+      for (int c = 0; c < CPU_SETSIZE; ++c)
+        if (CPU_ISSET(c, &mask)) mycpu = c;
+    char host[256] = {0};
+    gethostname(host, sizeof(host) - 1);
+    std::array<long, 3> me = {long(std::hash<std::string>{}(std::string(host)) & 0x7fffffffffffL), mycpu, busy ? 1L : 0L};
+    std::vector<long> all(3 * np);
+    comm.all_gather_n(me.data(), 3, all.data(), 3);
+    for (long r = 0; r < np; ++r)
+      if (all[3 * r + 1] < 0) return;   // some rank is not bound to one core: nothing to lend (collectively)
+    active_ = true;
+    std::vector<long> hb, hi;   // busy / idle ranks of my host, rank order
+    for (long r = 0; r < np; ++r)
+      if (all[3 * r] == me[0]) (all[3 * r + 2] ? hb : hi).push_back(r);
+    if (not busy or hb.empty()) {
+      helper_ = not hb.empty();
+      return;
+    }
+    const long ib = long(std::find(hb.begin(), hb.end(), rank) - hb.begin()), nb = long(hb.size());
+    saved_         = mask;
+    cpu_set_t wide = mask;
+    long n         = 1;
+    for (long i = ib; i < long(hi.size()); i += nb) {
+      if (max_threads > 0 and n >= max_threads) break;
+      CPU_SET(int(all[3 * hi[i] + 1]), &wide);
+      ++n;
+    }
+    widen(wide, n);
+#else
+    (void)busy;
+    (void)max_threads;
     (void)rank;
 #endif
   }
@@ -144,6 +182,24 @@ class closure_cores_t {
   }
 
  private:
+#if defined(__linux__)
+  /// the calling thread's mask -> wide (n cores); saved_ must hold the original mask
+  void widen(cpu_set_t const &wide, long n) {
+    if (n > 1 and sched_setaffinity(0, sizeof(wide), &wide) == 0) {
+      widened_ = true;
+      ncpu_    = n;
+      // MKL caps its thread count by the cores it found at initialization (the 1-core mask) unless dynamic adjustment
+      // is off: switch it off for the k loop (restored in restore())
+      using get_t = int (*)();
+      using set_t = void (*)(int);
+      if (auto g = reinterpret_cast<get_t>(dlsym(RTLD_DEFAULT, "MKL_Get_Dynamic")))
+        if (auto f = reinterpret_cast<set_t>(dlsym(RTLD_DEFAULT, "MKL_Set_Dynamic"))) {
+          mkl_dyn_ = g();
+          f(0);
+        }
+    }
+  }
+#endif
   boost::mpi3::communicator *comm_ = nullptr;
   bool active_ = false, helper_ = false, widened_ = false;
   long ncpu_ = 1;
