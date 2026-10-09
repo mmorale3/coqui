@@ -69,8 +69,11 @@ class closure_cores_t {
    *            may belong to another owner's block). Every BLAS thread of an owner runs on its own core of one socket.
    *   "interleave" (perf 7.1 (f)): owner r keeps its core and takes the cores of the ranks r + N_k, r + 2 N_k, ... (on
    *            rome 1 node: 64 owners / helpers on socket 0, the rest on socket 1 -> chains across both sockets).
+   * kcost (optional, size nk, identical on every rank; "block" only): expected cost of every k (e.g. Nr^3 of the previous
+   * closure): the owners are assigned to the sockets greedily by cost (largest first, to the socket with the least cost per
+   * core so far, at most its share of owners) and every socket's cores are split in proportion to its owners' costs (>= 1).
    */
-  closure_cores_t(boost::mpi3::communicator &comm, long nk) : comm_(&comm) {
+  closure_cores_t(boost::mpi3::communicator &comm, long nk, std::vector<double> const *kcost = nullptr) : comm_(&comm) {
     char const *v = std::getenv("COQUI_GWLINE_CLOSURE_BORROW");
     const bool enable = (v == nullptr or *v == '\0' or std::strtol(v, nullptr, 10) != 0);
     const long np = comm.size(), rank = comm.rank();
@@ -126,14 +129,61 @@ class closure_cores_t {
           }
       }
       const long me = long(std::find(own.begin(), own.end(), rank) - own.begin());
-      long base = 0;
-      for (long s = 0; s < ns; ++s) {
-        if (me < base + nos[s]) {
-          const long j = me - base, c = long(sc[s].size());
-          for (long i = j * c / nos[s]; i < (j + 1) * c / nos[s]; ++i) cores.push_back(int(sc[s][i]));
-          break;
+      const bool weighted = kcost != nullptr and long(kcost->size()) == nk;
+      if (not weighted) {
+        long base = 0;
+        for (long s = 0; s < ns; ++s) {
+          if (me < base + nos[s]) {
+            const long j = me - base, c = long(sc[s].size());
+            for (long i = j * c / nos[s]; i < (j + 1) * c / nos[s]; ++i) cores.push_back(int(sc[s][i]));
+            break;
+          }
+          base += nos[s];
         }
-        base += nos[s];
+      } else {
+        // owners -> sockets: largest cost first, to the socket with the least cost per core (count cap nos[s])
+        std::vector<double> cst(no);
+        for (long i = 0; i < no; ++i) cst[i] = std::max(1e-300, (*kcost)[own[i]]);
+        std::vector<long> ord(no);
+        for (long i = 0; i < no; ++i) ord[i] = i;
+        std::stable_sort(ord.begin(), ord.end(), [&](long x, long y) { return cst[x] > cst[y]; });
+        std::vector<long> sk(no, 0), cnt(ns, 0);
+        std::vector<double> load(ns, 0.0);
+        for (long i : ord) {
+          long best = -1;
+          for (long s2 = 0; s2 < ns; ++s2) {
+            if (cnt[s2] >= nos[s2]) continue;
+            const double x = (load[s2] + cst[i]) / double(sc[s2].size());
+            if (best < 0 or x < (load[best] + cst[i]) / double(sc[best].size())) best = s2;
+          }
+          sk[i] = best;
+          ++cnt[best];
+          load[best] += cst[i];
+        }
+        // per socket: its owners in owner order, cores in proportion to the costs (largest remainder, >= 1 each)
+        const long s0 = sk[me];
+        std::vector<long> mem;
+        for (long i = 0; i < no; ++i)
+          if (sk[i] == s0) mem.push_back(i);
+        const long c = long(sc[s0].size()), nm = long(mem.size());
+        std::vector<long> nc(nm, 1);
+        long given = nm;
+        std::vector<std::pair<double, long>> rem;
+        for (long j = 0; j < nm; ++j) {
+          const double e = double(c - nm) * cst[mem[j]] / load[s0];
+          const long f   = long(std::floor(e));
+          nc[j] += f;
+          given += f;
+          rem.push_back({e - double(f), j});
+        }
+        std::stable_sort(rem.begin(), rem.end(), [](auto const &x, auto const &y) { return x.first > y.first; });
+        for (long t = 0; given < c and t < nm; ++t, ++given) ++nc[rem[t].second];
+        long off = 0;
+        for (long j = 0; j < nm; ++j) {
+          if (mem[j] == me)
+            for (long i = off; i < off + nc[j]; ++i) cores.push_back(int(sc[s0][i]));
+          off += nc[j];
+        }
       }
     }
     widen(cores, mycpu);

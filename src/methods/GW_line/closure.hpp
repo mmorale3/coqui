@@ -566,7 +566,11 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   // processed by the same code whatever the worker (results depend only on the BLAS thread count, as for nw = 1)
   const long nown = rank < nk ? (nk - 1 - rank) / np + 1 : 0;
   const long nw   = std::max(1L, std::min(p.k_workers, nown));
-  closure_cores_t cores(comm, nk);   // perf 7.1 (f): np > N_k -> the owners borrow the idle ranks' cores (closure_cores.hpp)
+  // perf 7.5a: cost-weighted core blocks from the previous closure of the same k set (Nr^3; COQUI_GWLINE_CLOSURE_WEIGHTS,
+  // default 1): the owners' chains differ by up to (1300 / 1160)^3 = 1.4 on si444
+  static std::vector<double> kcost_prev;
+  const bool use_w = detail::env_double("COQUI_GWLINE_CLOSURE_WEIGHTS", 1.0) > 0.0 and long(kcost_prev.size()) == nk;
+  closure_cores_t cores(comm, nk, use_w ? &kcost_prev : nullptr);   // perf 7.1 (f) / 7.5a: the owners borrow the idle ranks' cores
   const long bt   = (nw == 1) ? (p.blas_threads > 0 ? p.blas_threads : cores.blas_threads())
                               : (p.blas_threads > 0 ? std::max(1L, p.blas_threads / nw) : 1L);
   if (cores.blas_threads() > 0)
@@ -681,6 +685,10 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     out.kprof.back().unpack(&info(ik, 2 + upfold_diag_t::nfields));
   }
   Timer.stop("closure_gather");
+  {   // perf 7.5a: the cost of every k for the core blocks of the next closure (identical on every rank)
+    kcost_prev.assign(nk, 0.0);
+    for (long ik = 0; ik < nk; ++ik) kcost_prev[ik] = std::pow(double(std::max(1L, out.diag[ik].r_gram)), 3.0);
+  }
   {   // perf 7.1c: per-k profile -- the k with a terminal-phase scan, retries or fallbacks, and the slowest k
     double tmin = 1e300, tmax = 0.0, tsum = 0.0;
     long kslow = 0;
@@ -707,8 +715,8 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     }
     if (detail::env_double("COQUI_GWLINE_CLOSURE_KTABLE", 0.0) > 0.0) {   // perf 7.5a: every k (benchmarks)
       app_log(2, "          closure k table: k rank Nr | fit mom Gram SVD Ueig(final) Lehmann total | cores [first-last] sockets "
-                 "CPUs(start/end) | place \"{}\" pin \"{}\"",
-              closure_cores_t::place_mode(), closure_cores_t::pin_mode());
+                 "CPUs(start/end) | place \"{}\" pin \"{}\" cost-weighted {}",
+              closure_cores_t::place_mode(), closure_cores_t::pin_mode(), use_w);
       for (long ik = 0; ik < nk; ++ik) {
         auto const &f = out.kprof[ik];
         app_log(2, "            k {:3d} r {:4d} Nr {:5d} | {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} | {:3d} [{}-{}] {:#x} {}/{}",

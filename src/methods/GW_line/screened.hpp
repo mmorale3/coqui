@@ -85,7 +85,14 @@
 #include <string>
 #include <vector>
 
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
 #include <mpi.h>
+#include <sys/mman.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
 
 #include "configuration.hpp"
 #include "IO/app_loggers.h"
@@ -646,6 +653,180 @@ struct w_nodes_t {
   w_nodes_t &operator=(w_nodes_t const &) = delete;
 };
 
+/**
+ * perf 7.5b: the node-shared buffer of screened_mirror_node. Backend (env COQUI_GWLINE_W_SHM):
+ *   "posix" (default): shm_open in /dev/shm (tmpfs) by the node's local rank 0, mapped by every rank of the node; kept
+ *           between calls (env COQUI_GWLINE_W_KEEP, default 1) and reused while large enough, so that the page faults of the
+ *           first touch are paid once per run (freed at exit);
+ *   "mpi"  : MPI_Win_allocate_shared per call (OpenMPI 4.1 puts the backing file in its session directory, on rusty the
+ *           NVMe /tmp: 16.8 s of page faults + write-back for the 21 GB of si444 IBZ, measured in job 7203962).
+ * acquire() is collective over comm (all ranks of all nodes): false on every rank if any node fails (no space in /dev/shm,
+ * shm_open / mmap errors); the caller then falls back.
+ */
+class node_shm_t {
+ public:
+  ComplexType *data = nullptr;
+  bool kept = false;   ///< the buffer of a previous call was reused
+  std::string backend;
+  node_shm_t()                              = default;
+  node_shm_t(node_shm_t const &)            = delete;
+  node_shm_t &operator=(node_shm_t const &) = delete;
+  ~node_shm_t() { release(); }
+
+  bool acquire(MPI_Comm comm, MPI_Comm node, size_t bytes) {
+    backend = env_string_w("COQUI_GWLINE_W_SHM", "posix");
+    bytes   = std::max<size_t>(bytes, 4096);
+    int lrank = 0, gnp = 0, grank = 0;
+    MPI_Comm_rank(node, &lrank);
+    MPI_Comm_size(comm, &gnp);
+    MPI_Comm_rank(comm, &grank);
+    int ok = 1;
+    if (backend == "mpi") {
+      ComplexType *base  = nullptr;
+      const MPI_Aint wb  = (lrank == 0) ? MPI_Aint(bytes) : MPI_Aint(0);
+      if (MPI_Win_allocate_shared(wb, int(sizeof(ComplexType)), MPI_INFO_NULL, node, &base, &win_) != MPI_SUCCESS) ok = 0;
+      if (ok) {
+        MPI_Aint sz = 0;
+        int du      = 0;
+        MPI_Win_shared_query(win_, 0, &sz, &du, &data);
+        MPI_Win_lock_all(MPI_MODE_NOCHECK, win_);
+      }
+      MPI_Allreduce(MPI_IN_PLACE, &ok, 1, MPI_INT, MPI_MIN, comm);
+      return ok != 0;
+    }
+    // posix: reuse the kept mapping when it belongs to the same node group and is large enough (collective decision)
+    auto &c   = cache();
+    int leader = grank;
+    MPI_Bcast(&leader, 1, MPI_INT, 0, node);
+    int nl = 0;
+    MPI_Comm_size(node, &nl);
+    int reuse = (c.p != nullptr and c.bytes >= bytes and c.leader == leader and c.nl == nl and c.gnp == gnp) ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &reuse, 1, MPI_INT, MPI_MIN, comm);
+    if (reuse) {
+      data = static_cast<ComplexType *>(c.p);
+      kept = true;
+      own_ = false;
+      return true;
+    }
+    drop_cache();   // every rank (the decision is collective)
+    char name[128] = {0};
+    if (lrank == 0) {
+      static long counter = 0;
+      std::snprintf(name, sizeof(name), "/coqui_gwline_w_%d_%ld", int(getpid()), counter++);
+      struct statvfs sv;
+      if (statvfs("/dev/shm", &sv) == 0 and double(sv.f_bavail) * double(sv.f_bsize) < 1.05 * double(bytes)) ok = 0;
+      int fd = ok ? shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600) : -1;
+      if (fd < 0) ok = 0;
+      if (ok and ftruncate(fd, off_t(bytes)) != 0) ok = 0;
+      if (fd >= 0) close(fd);
+      if (not ok and fd >= 0) shm_unlink(name);
+    }
+    MPI_Bcast(&ok, 1, MPI_INT, 0, node);
+    MPI_Bcast(name, int(sizeof(name)), MPI_CHAR, 0, node);
+    void *p = nullptr;
+    if (ok) {
+      int fd = shm_open(name, O_RDWR, 0600);
+      if (fd >= 0) {
+        p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        if (p == MAP_FAILED) p = nullptr;
+      }
+      if (p == nullptr) ok = 0;
+    }
+    MPI_Barrier(node);
+    if (lrank == 0 and name[0] != '\0') shm_unlink(name);   // the memory lives until the last munmap
+    MPI_Allreduce(MPI_IN_PLACE, &ok, 1, MPI_INT, MPI_MIN, comm);
+    if (not ok) {
+      if (p != nullptr) munmap(p, bytes);
+      return false;
+    }
+    data = static_cast<ComplexType *>(p);
+    // keep only a buffer that is small against the node's available memory (it then also sits through the Sigma stage, which
+    // the q plan did not budget): bytes <= COQUI_GWLINE_W_KEEP_FRAC (default 0.1) x MemAvailable, the same on every node
+    int keep = env_long("COQUI_GWLINE_W_KEEP", 1) != 0 ? 1 : 0;
+    if (keep and lrank == 0) {
+      double avail = -1.0;
+      if (FILE *fp = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), fp))
+          if (std::strncmp(line, "MemAvailable:", 13) == 0) avail = 1024.0 * std::strtod(line + 13, nullptr);
+        std::fclose(fp);
+      }
+      const char *fv   = std::getenv("COQUI_GWLINE_W_KEEP_FRAC");
+      const double frac = (fv != nullptr and *fv != '\0') ? std::strtod(fv, nullptr) : 0.1;
+      if (avail > 0.0 and double(bytes) > frac * avail) keep = 0;
+    }
+    MPI_Bcast(&keep, 1, MPI_INT, 0, node);
+    MPI_Allreduce(MPI_IN_PLACE, &keep, 1, MPI_INT, MPI_MIN, comm);
+    if (keep) {
+      c.p      = p;   // (no temporary cache_t: its destructor unmaps)
+      c.bytes  = bytes;
+      c.leader = leader;
+      c.nl     = nl;
+      c.gnp    = gnp;
+      own_     = false;
+    } else {
+      own_   = true;
+      bytes_ = bytes;
+    }
+    return true;
+  }
+  /// collective over the node (barrier) for the mpi backend; posix: unmaps a non-kept buffer
+  void release() {
+    if (win_ != MPI_WIN_NULL) {
+      int fin = 0;
+      MPI_Finalized(&fin);
+      if (not fin) {
+        MPI_Win_unlock_all(win_);
+        MPI_Win_free(&win_);
+      }
+      win_ = MPI_WIN_NULL;
+    }
+    if (own_ and data != nullptr) munmap(static_cast<void *>(data), bytes_);
+    own_ = false;
+    data = nullptr;
+  }
+  /// fences + node barrier (the copies of the other ranks are visible after it)
+  void sync(MPI_Comm node) const {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (win_ != MPI_WIN_NULL) MPI_Win_sync(win_);
+    MPI_Barrier(node);
+    if (win_ != MPI_WIN_NULL) MPI_Win_sync(win_);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+  }
+  static double kept_bytes() { return double(cache().bytes); }
+
+ private:
+  struct cache_t {
+    void *p      = nullptr;
+    size_t bytes = 0;
+    int leader = -1, nl = 0, gnp = 0;
+    cache_t() = default;
+    cache_t(cache_t const &) = delete;
+    cache_t &operator=(cache_t const &) = delete;
+    ~cache_t() {
+      if (p != nullptr) munmap(p, bytes);
+    }
+  };
+  static cache_t &cache() {
+    static cache_t c;
+    return c;
+  }
+  static void drop_cache() {
+    auto &c = cache();
+    if (c.p != nullptr) munmap(c.p, c.bytes);
+    c.p     = nullptr;
+    c.bytes = 0;
+  }
+  static std::string env_string_w(char const *nm, char const *def) {
+    char const *v = std::getenv(nm);
+    return (v == nullptr or *v == '\0') ? std::string(def) : std::string(v);
+  }
+  MPI_Win win_ = MPI_WIN_NULL;
+  bool own_    = false;
+  size_t bytes_ = 0;
+};
+
 /// [first, last) of chunk i of [b, e) in n chunks (itertools::chunk_range)
 inline std::array<long, 2> w_chunk(long b, long e, long n, long i) {
   auto [x0, x1] = itertools::chunk_range(b, e, n, i);
@@ -658,14 +839,14 @@ inline std::array<long, 2> w_chunk(long b, long e, long n, long i) {
  *   matrices    : the M = g n1 ray-1 Dyson problems m = i n1 + z (group row i, node z), node a solves the contiguous chunk
  *                 [Ma0, Ma1) of m (chunk_range over the NN nodes), its rank l the chunk [m0, m1) of it (over the L ranks):
  *                 balanced to one matrix (the q-pool layout leaves pools idle when np_q does not divide g);
- *   forward     : every rank writes its block (P_rng, Q_rng) of the matrices of its node straight into the node window
- *                 (MPI_Win_allocate_shared, C layout Np x Np per matrix); blocks of the matrices of other nodes go to the
+ *   forward     : every rank writes its block (P_rng, Q_rng) of the matrices of its node straight into the node buffer
+ *                 (node_shm_t: /dev/shm, kept between calls; C layout Np x Np per matrix); blocks of the matrices of other nodes go to the
  *                 rank with the same local index there (pairwise MPI_Sendrecv rounds over the cross communicator), which
  *                 writes them at the sender's (P, Q) coordinates;
- *   Dyson       : in place in the window, per matrix the operations of screened_mirror (gemm I - Z Pi, getrf, getrs with
+ *   Dyson       : in place in the buffer, per matrix the operations of screened_mirror (gemm I - Z Pi, getrf, getrs with
  *                 Z, W = X - Z: the same values as its transpose / subtract / transpose sequence);
  *   backward    : every rank reads its block of W(m) (-> Pi rows) and, for the pair fit, the transposed block
- *                 W(m)[Q_rng, P_rng]^T (= its block of W(m)^T) from the window; for the matrices of other nodes the
+ *                 W(m)[Q_rng, P_rng]^T (= its block of W(m)^T) from the buffer; for the matrices of other nodes the
  *                 counterpart there packs both and sends them back (pairwise rounds);
  *   ray 2, fit  : as screened_mirror (conj of the mirror row; w = VS (U1H W + U2H W^T) per row, the same fit_row).
  * All moves are exact copies: W at the nodes and the residues equal those of the redistribute path up to the BLAS
@@ -736,10 +917,19 @@ inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi,
             : bad == 4 ? "transient above the budget" : "the ranks of a node are not consecutive");
     return false;
   }
-  app_log(2, "  gw_line W (perf 7.5b node path): {} ray-1 matrices on {} node(s) x {} ranks, <= {} per rank, node window "
-             "{:.2f} GB, transient <= {:.3f} GB per rank (redistribute path {:.3f} GB)",
-          M, NN, L, (M + comm.size() - 1) / comm.size(), 16.0 * double(Ma1 - Ma0) * double(N2) / 1073741824.0,
-          peak_max / 1073741824.0, old_transient / 1073741824.0);
+  // node-shared buffer of the node's matrices (C layout, Np x Np each)
+  auto tw = clk::now();
+  node_shm_t shm;
+  if (not shm.acquire(comm.get(), nd.node, size_t(Ma1 - Ma0) * size_t(N2) * sizeof(ComplexType))) {
+    app_log(2, "  gw_line W (perf 7.5b node path) not used (node-shared buffer \"{}\" not available): the redistribute path follows",
+            shm.backend);
+    return false;
+  }
+  const double t_alloc = secs(tw);
+  app_log(2, "  gw_line W (perf 7.5b node path): {} ray-1 matrices on {} node(s) x {} ranks, <= {} per rank, node buffer "
+             "{:.2f} GB ({}{}), transient <= {:.3f} GB per rank (redistribute path {:.3f} GB)",
+          M, NN, L, (M + comm.size() - 1) / comm.size(), 16.0 * double(Ma1 - Ma0) * double(N2) / 1073741824.0, shm.backend,
+          shm.kept ? ", kept from the previous call" : "", peak_max / 1073741824.0, old_transient / 1073741824.0);
 
   for (auto nm : {"W_redistribute", "W_dyson", "W_fit", "W_wait"}) Timer.add(nm);
   const long w_rows = w_group ? g : Zb.nq;
@@ -751,20 +941,9 @@ inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi,
   double t_fwd = 0.0, t_fx = 0.0, t_dys = 0.0, t_bwd = 0.0, t_bx = 0.0, t_fit = 0.0, t_wait = 0.0;
   double by_intra = 0.0, by_inter = 0.0;
 
-  // node window
   Timer.start("W_redistribute");
-  auto tw = clk::now();
-  MPI_Win win = MPI_WIN_NULL;
-  ComplexType *base = nullptr;
-  const MPI_Aint wbytes = (l == 0) ? MPI_Aint(Ma1 - Ma0) * MPI_Aint(N2) * MPI_Aint(sizeof(ComplexType)) : MPI_Aint(0);
-  MPI_Win_allocate_shared(wbytes, int(sizeof(ComplexType)), MPI_INFO_NULL, nd.node, &base, &win);
-  ComplexType *W0 = nullptr;
-  {
-    MPI_Aint sz = 0;
-    int du      = 0;
-    MPI_Win_shared_query(win, 0, &sz, &du, &W0);
-  }
-  MPI_Win_lock_all(MPI_MODE_NOCHECK, win);
+  tw = clk::now();
+  ComplexType *W0 = shm.data;
   auto mat = [&](long m) { return W0 + (m - Ma0) * N2; };
   auto put = [&](ComplexType *Wm, long P0, long nP_, long Q0, long nQ_, ComplexType const *src) {
     for (long p = 0; p < nP_; ++p) std::copy_n(src + p * nQ_, nQ_, Wm + (P0 + p) * Np + Q0);
@@ -784,11 +963,9 @@ inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi,
   };
   auto pi_blk = [&](long m) { return Pi.data() + ((m / n1) * nz + (m % n1)) * blk; };
   auto sync_node = [&]() {
-    MPI_Win_sync(win);
     const auto t0 = clk::now();
-    MPI_Barrier(nd.node);
+    shm.sync(nd.node);
     t_wait += secs(t0);
-    MPI_Win_sync(win);
   };
   const MPI_Datatype ct = MPI_CXX_DOUBLE_COMPLEX;
   // one round of the cross-node exchange: ns matrices of es elements to `to` (pack(j, dst)), nr matrices of er elements from
@@ -953,24 +1130,19 @@ inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi,
   Timer.stop("W_fit");
 
   Timer.start("W_wait");
-  MPI_Win_unlock_all(win);
-  {
-    const auto t0 = clk::now();
-    MPI_Barrier(nd.node);
-    t_wait += secs(t0);
-  }
-  MPI_Win_free(&win);
+  sync_node();   // nobody reads the buffer any more (it may be kept for the next call)
+  shm.release();
   Timer.stop("W_wait");
 
   {   // profile (max over ranks)
-    double x[9] = {t_fwd, t_fx, t_dys, t_bwd, t_bx, t_fit, t_wait, by_intra, by_inter};
-    comm.all_reduce_in_place_n(x, 9, boost::mpi3::max<>{});
+    double x[10] = {t_fwd, t_fx, t_dys, t_bwd, t_bx, t_fit, t_wait, by_intra, by_inter, t_alloc};
+    comm.all_reduce_in_place_n(x, 10, boost::mpi3::max<>{});
     double tot = secs(t_all);
     tot        = comm.all_reduce_value(tot, boost::mpi3::max<>{});
-    app_log(2, "  gw_line W node path (s, max over ranks): forward {:.3f} (inter-node {:.3f}) | Dyson {:.3f} | backward {:.3f} "
-               "(inter-node {:.3f}) | fit {:.3f} | node barriers {:.3f} | total {:.3f}; per rank {:.3f} GB intra-node copies, "
-               "{:.3f} GB sent to other nodes in {} pairwise rounds",
-            x[0], x[1], x[2], x[3], x[4], x[5], x[6], tot, x[7] / 1073741824.0, x[8] / 1073741824.0, 2 * (NN - 1));
+    app_log(2, "  gw_line W node path (s, max over ranks): buffer {:.3f} | forward {:.3f} (inter-node {:.3f}) | Dyson {:.3f} | "
+               "backward {:.3f} (inter-node {:.3f}) | fit {:.3f} | node barriers {:.3f} | total {:.3f}; per rank {:.3f} GB "
+               "intra-node copies, {:.3f} GB sent to other nodes in {} pairwise rounds",
+            x[9], x[0], x[1], x[2], x[3], x[4], x[5], x[6], tot, x[7] / 1073741824.0, x[8] / 1073741824.0, 2 * (NN - 1));
   }
   if (W_nodes != nullptr) *W_nodes = std::move(Pi);
   Pi = Arr4_t{};
