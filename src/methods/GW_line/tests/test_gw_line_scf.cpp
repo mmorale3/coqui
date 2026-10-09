@@ -95,6 +95,8 @@
 #include "methods/GW_line/time_grids.hpp"
 #include "methods/GW_line/static_part.hpp"
 #include "methods/GW_line/head.hpp"
+#include "methods/GW_line/closure_device.hpp"
+#include "methods/GW_line/q_plan.hpp"
 
 namespace {
 
@@ -546,6 +548,132 @@ TEST_CASE("gw_line_closure_scan", "[gw_line][scf][closure][scan]") {
     CHECK(std::abs(op.dmu - os.dmu) <= 1e-6);
     CHECK(dG / gm <= 1e-5);
   }
+}
+
+// ======================================================================================================================
+// perf 7.4b: the distributed scan with the cuSOLVER closure drivers (device builds; a no-op on host builds)
+// ======================================================================================================================
+TEST_CASE("gw_line_closure_scan_device", "[gw_line][scf][closure][scan][device]") {
+  auto const *h0 = methods::gw_line::device_lapack_hooks(0);
+  if (not h0) return;   // host build: nothing to compare
+  auto &mpi  = utils::make_unit_test_mpi_context();
+  auto &comm = mpi->comm;
+  const long np = comm.size();
+  // the toy of gw_line_closure_scan (2): 3 k, nb 3, K 3 -> a free block at every k (deferred to the distributed scan)
+  const long nk = 3, nb = 3, npk = 160;
+  const double theta = 20.0 * std::numbers::pi / 180.0, lam = 6.0, eps = 1e-10, nelec = 4.0;
+  std::mt19937 gen(31337);
+  std::uniform_real_distribution<double> U(-1.0, 1.0);
+  nda::array<ComplexType, 3> H(nk, nb, nb);
+  auto zeta     = numerics::line_dlr::dense_nodes(theta, 1e-3, 60.0, 120);
+  const long nz = zeta.size();
+  nda::array<ComplexType, 4> Sp(nk, nz, nb, nb), Sh(nk, nz, nb, nb);
+  Sp() = ComplexType(0.0);
+  Sh() = ComplexType(0.0);
+  for (long ik = 0; ik < nk; ++ik) {
+    const double e0[3] = {-0.5 + 0.03 * ik, -0.3 - 0.02 * ik, 0.5 + 0.04 * ik};
+    for (long i = 0; i < nb; ++i)
+      for (long j = 0; j <= i; ++j) {
+        ComplexType x = (i == j) ? ComplexType(e0[i] + 0.02 * U(gen), 0.0) : 0.02 * ComplexType(U(gen), U(gen));
+        H(ik, i, j) = x;
+        H(ik, j, i) = std::conj(x);
+      }
+    for (long l = 0; l < npk; ++l) {
+      const double E = (l % 2 == 0 ? 1.0 : -1.0) * (0.6 + 3.4 * 0.5 * (1.0 + U(gen)));
+      std::vector<ComplexType> b(nb);
+      for (auto &x : b) x = 0.15 * std::sqrt(8.0 / double(npk)) * ComplexType(U(gen), U(gen));
+      auto &S = (E > 0.0) ? Sp : Sh;
+      for (long iz = 0; iz < nz; ++iz)
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) S(ik, iz, i, j) += b[i] * std::conj(b[j]) / (zeta(iz) - E);
+    }
+  }
+  line_basis_t bp(theta, lam, eps, lam, 0.02, -1.0, 60.0), bh(theta, lam, eps, 0.02, lam, -1.0, 60.0);
+  line_basis_t gp(theta, lam, eps, lam, 0.0, -1.0, 60.0), gh(theta, lam, eps, 0.0, lam, -1.0, 60.0);
+  // the device drivers at every size (production: min_dim 256; the toy's Gram / SVD are ~16 x 16)
+  for (int var : {0, 1}) {
+    numerics::line_dlr::lapack_hooks_t hk = *methods::gw_line::device_lapack_hooks(var);
+    hk.min_dim = 0;
+    closure_params_t pp;
+    pp.K          = 3;
+    pp.ueig       = "cayley";
+    pp.svd_driver = "gesdd";
+    pp.scan       = "parallel";
+    auto pd       = pp;
+    pd.hooks      = &hk;
+    utils::TimerManager T1, T2;
+    const long f0 = methods::gw_line::device_lapack_failures();
+    auto oh       = closure(comm, H, Sp, Sh, zeta, bp, bh, gp, gh, pp, nelec, T1);
+    auto od       = closure(comm, H, Sp, Sh, zeta, bp, bh, gp, gh, pd, nelec, T2);
+    const long nfail = methods::gw_line::device_lapack_failures() - f0;
+    long nfree_h = 0, nfree_d = 0;
+    for (long ik = 0; ik < nk; ++ik) {
+      nfree_h += (oh.kprof[ik].n_free > 0);
+      nfree_d += (od.kprof[ik].n_free > 0);
+    }
+    double dG = 0.0, gm = 0.0;
+    for (long iw = 0; iw < 40; ++iw) {
+      const ComplexType z(0.0, 1e-2 * std::pow(10.0, 3.0 * iw / 39.0));
+      for (long ik = 0; ik < nk; ++ik) {
+        nda::matrix<ComplexType> G1(nb, nb), G2(nb, nb);
+        G1() = ComplexType(0.0);
+        G2() = ComplexType(0.0);
+        for (long m = 0; m < od.leh.e[ik].size(); ++m)
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) G1(i, j) += od.leh.v[ik](i, m) * std::conj(od.leh.v[ik](j, m)) / (z - od.leh.e[ik](m));
+        for (long m = 0; m < oh.leh.e[ik].size(); ++m)
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) G2(i, j) += oh.leh.v[ik](i, m) * std::conj(oh.leh.v[ik](j, m)) / (z - oh.leh.e[ik](m));
+        dG = std::max(dG, nda::max_element(nda::abs(G1 - G2)));
+        gm = std::max(gm, nda::max_element(nda::abs(G2)));
+      }
+    }
+    double dphi = 0.0;
+    for (long ik = 0; ik < nk; ++ik) dphi = std::max(dphi, std::abs(od.diag[ik].phi - oh.diag[ik].phi));
+    const double dmu = std::abs(od.dmu - oh.dmu), dgap = std::abs((od.e_lumo - od.e_homo) - (oh.e_lumo - oh.e_homo));
+    app_log(1, "[closure scan][device] ranks {} svd variant {}: k with a free block host {} device {} of {}; device vs host: dmu {:.1e} Ha, "
+               "gap {:.1e} Ha, max|dG|/max|G| {:.1e}, max|dphi| {:.1e}; device fallbacks to the host {}",
+            np, var, nfree_h, nfree_d, nk, dmu, dgap, dG / gm, dphi, nfail);
+    CHECK(nfree_h > 0);
+    CHECK(nfree_d == nfree_h);
+    CHECK(nfail == 0);
+    // the closure amplifies the driver roundoff ~1e5 x (S7g) and the golden section may end one bracket step apart (7.1c)
+    CHECK(dmu <= 1e-6);
+    CHECK(dgap <= 1e-6);
+    CHECK(dG / gm <= 1e-5);
+  }
+}
+
+// ======================================================================================================================
+// perf 7.4b: automatic q groups from the plan 6.7 memory model (q_plan.hpp)
+// ======================================================================================================================
+TEST_CASE("gw_line_qplan_select", "[gw_line][scf][qplan]") {
+  using namespace methods::gw_line;
+  // 12 rows, q <-> -q pairs (0, 1) (2, 3) ... and two self-inverse rows (10, 11)
+  std::vector<long> rows(12), qm(12);
+  std::iota(rows.begin(), rows.end(), 0L);
+  for (long q = 0; q < 10; ++q) qm[q] = (q % 2 == 0) ? q + 1 : q - 1;
+  qm[10] = 10;
+  qm[11] = 11;
+  auto c = q_group_candidates(rows, qm);
+  REQUIRE(c.front() == 12);
+  for (size_t i = 1; i < c.size(); ++i) REQUIRE(c[i] < c[i - 1]);
+  for (long g : c) {   // every candidate is realised as a pair-closed grouping of max size g
+    q_groups_t qg(rows, g, qm);
+    REQUIRE(qg.max_size() == g);
+  }
+  // model: 1 + g units; budget 6.5 units -> largest g with 1 + g <= 6.5
+  auto [g, idx] = largest_fitting(c, [](long g) { return 1.0 + double(g) <= 6.5; });
+  long expect   = 0;
+  for (long x : c)
+    if (1.0 + double(x) <= 6.5) { expect = x; break; }
+  REQUIRE(g == expect);
+  REQUIRE(idx > 0);
+  auto [g0, i0] = largest_fitting(c, [](long) { return false; });
+  REQUIRE(i0 == -1);
+  REQUIRE(g0 == c.back());
+  app_log(1, "[qplan] candidates (12 rows, 5 pairs + 2 self-inverse): {} ... {} ({} sizes); budget 6.5 units -> g = {}", c.front(),
+          c.back(), c.size(), g);
 }
 
 // ======================================================================================================================
@@ -2525,5 +2653,48 @@ TEST_CASE("gw_line_scf_optics_initial", "[gw_line][scf][optics_initial]") {
   for (auto f : {"gw_line_oiA", "gw_line_oiB"}) {
     remove_file(comm, std::string(f) + ".gw_line.h5");
     remove_file(comm, std::string(f) + ".gw_line.sigma.h5");
+  }
+}
+
+// perf 7.4b: the driver's automatic q plan: a forced host budget between the models of the smallest groups and of all q
+// must split the Pi -> W stage into groups and give results bitwise equal to all q at once
+TEST_CASE("gw_line_qplan_driver", "[gw_line][scf][qplan]") {
+  for (std::string fx : {"qe_lih222", "qe_lih223"}) {
+    lih_t L(fx);
+    auto &comm = L.mpi->comm;
+    auto A     = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params("gw_line_qpA", 2, false, "id", "lehmann"));
+    const long nq = L.mf->nqpts();
+    REQUIRE(A.q_ngroups >= 1);
+    REQUIRE(A.q_model_host_all > A.q_model_host_min);
+    // the budget half-way between the smallest groups and all q (bytes -> GB)
+    const double bud = 0.5 * (A.q_model_host_all + A.q_model_host_min);
+    auto pb          = scf_params("gw_line_qpB", 2, false, "id", "lehmann");
+    pb.put("mem_budget_gb", bud / 1073741824.0);
+    auto B = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pb);
+    double dmu = 0.0, dgap = 0.0;
+    for (long i = 0; i < 2; ++i) {
+      dmu  = std::max(dmu, std::abs(A.history[i].mu - B.history[i].mu));
+      dgap = std::max(dgap, std::abs(A.history[i].gap - B.history[i].gap));
+    }
+    const double mS = comm.all_reduce_value(double(nda::max_element(nda::abs(A.Sig_p))), mpi3::max<>{});
+    const double dS = comm.all_reduce_value(double(std::max(nda::max_element(nda::abs(B.Sig_p - A.Sig_p)),
+                                                            nda::max_element(nda::abs(B.Sig_h - A.Sig_h)))),
+                                            mpi3::max<>{}) / mS;
+    app_log(1, "[qplan] {} ({} ranks, {} q): all q: {} group(s), model {:.4f} MB (smallest groups {:.4f} MB, budget {}); forced budget "
+               "{:.4f} MB -> {} groups of <= {} q, model {:.4f} MB; vs all q: |dmu| {:.1e} |dgap| {:.1e} Sigma {:.1e}",
+            fx, comm.size(), nq, A.q_ngroups, A.q_model_host_all / 1048576.0, A.q_model_host_min / 1048576.0,
+            A.q_budget_host > 0.0 ? fmt::format("{:.1f} MB", A.q_budget_host / 1048576.0) : std::string("unconstrained"),
+            bud / 1048576.0, B.q_ngroups, B.q_group_size, B.q_model_host / 1048576.0, dmu, dgap, dS);
+    REQUIRE(B.q_ngroups > 1);
+    REQUIRE(B.q_group_size < nq);
+    REQUIRE(B.q_model_host <= bud);
+    // bitwise on the Mac (the Pi rows and W of each q do not depend on the grouping); the [s7e] q-group gate (1e-12) allows
+    // for MKL's alignment-dependent kernels on the regrouped Dyson slabs
+    app_log(1, "[qplan] {}: {}", fx, (dmu == 0.0 and dgap == 0.0 and dS == 0.0) ? "BITWISE" : "not bitwise (within the gate)");
+    REQUIRE(dmu <= 1e-12);
+    REQUIRE(dgap <= 1e-12);
+    REQUIRE(dS <= 1e-12);
+    remove_file(comm, "gw_line_qpA.gw_line.h5");
+    remove_file(comm, "gw_line_qpB.gw_line.h5");
   }
 }

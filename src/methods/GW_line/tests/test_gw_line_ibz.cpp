@@ -45,6 +45,8 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
+#include <numbers>
 #include <random>
 #include <set>
 #include <string>
@@ -506,3 +508,112 @@ TEST_CASE("gw_line_ibz_phys", "[.ibz_phys]") {
               A.history[0].gap, B.history[0].gap, A.history[0].gap - B.history[0].gap);
     }
 }
+
+#if defined(ENABLE_DEVICE)
+/**
+ * perf 7.4b [ibz][device]: the IBZ kernels HOST vs DEVICE on identical inputs (symmetric fixtures, random non-diagonal IBZ
+ * poles): Pi on the rows R (C(t) shared per star on both), W at the nodes from the SAME Pi, Sigma at the IBZ k (class sums)
+ * from the SAME residues, F = V_H + Sigma_x (static_ibz); device C(t) sharing vs per-k device builds; then the driver
+ * (2 iterations) on the device vs the host.
+ */
+TEST_CASE("gw_line_ibz_device", "[ibz][device][gw_line]") {
+  auto &mpi = *utils::make_unit_test_mpi_context();
+  for (std::string name : {"qe_lih222_sym", "qe_lih223_sym", "qe_lih223_inv"}) {
+    auto f = make_fix(name);
+    ibz_t ibz(*f.mf, f.nb);
+    auto &mf   = *f.mf;
+    auto poles = random_poles(f, 0.01, 5);
+    double gap = 1e300;
+    for (long k = 0; k < f.nkI; ++k)
+      for (long n = 0; n < f.nb; ++n) gap = std::min(gap, std::abs(f.eigI(k, n) - f.mu));
+    const double deg = std::numbers::pi / 180.0, theta = 20.0 * deg, theta_t = 10.0 * deg;
+    numerics::line_dlr::bosonic_basis_t basis(theta, 4.0, 1e-10, gap);
+    const double smax = 30.0 / (poles.emin() * std::sin(theta_t));
+    numerics::line_dlr::time_ray_t ray_p(theta_t, smax, 1e-5, 1.5, 12, sector_t::particle),
+        ray_h(theta_t, smax, 1e-5, 1.5, 12, sector_t::hole);
+    auto fz = numerics::line_dlr::dense_nodes(theta, 1e-3, 60.0, 30);
+    aux_grid_t grid(mpi, f.Np);
+    utils::TimerManager T;
+    env_scope_t x("COQUI_GWLINE_GT_XV", "0");   // host: the C(t) form (shared per star), as the device
+    propagator_t<HOST_MEMORY> ph(*f.thc, grid);
+    propagator_t<DEVICE_MEMORY> pd(*f.thc, grid);
+    ph.set_ibz(&ibz);
+    pd.set_ibz(&ibz);
+    // Pi (host t_chunk 8, device automatic)
+    memory::array<HOST_MEMORY, ComplexType, 4> Pi_h;
+    memory::array<DEVICE_MEMORY, ComplexType, 4> Pi_d;
+    polarization<HOST_MEMORY>(ph, poles, mf, grid, basis.zeta_nodes, ray_p, ray_h, 8, Pi_h, T, sector_t::both, ibz.rows);
+    polarization<DEVICE_MEMORY>(pd, poles, mf, grid, basis.zeta_nodes, ray_p, ray_h, 0, Pi_d, T, sector_t::both, ibz.rows);
+    const double ePi = mdiff(Pi_h, nda::array<ComplexType, 4>(memory::to_memory_space<HOST_MEMORY>(Pi_d))) / mabs(Pi_h);
+    double ePi_ns = 0.0;
+    {   // device: C(t) shared per star vs per-k builds of the unfolded poles
+      env_scope_t e("COQUI_GWLINE_IBZ_CSHARE", "0");
+      propagator_t<DEVICE_MEMORY> pn(*f.thc, grid);
+      pn.set_ibz(&ibz);
+      memory::array<DEVICE_MEMORY, ComplexType, 4> Pi_n;
+      polarization<DEVICE_MEMORY>(pn, poles, mf, grid, basis.zeta_nodes, ray_p, ray_h, 0, Pi_n, T, sector_t::both, ibz.rows);
+      ePi_ns = mdiff(nda::array<ComplexType, 4>(memory::to_memory_space<HOST_MEMORY>(Pi_n)),
+                     nda::array<ComplexType, 4>(memory::to_memory_space<HOST_MEMORY>(Pi_d))) / mabs(Pi_h);
+    }
+    // W at the nodes from the same Pi (host Pi copied to the device)
+    q_groups_t qg(ibz.rows, ibz.nrows(), ibz.qminus);
+    auto zl = qg.dyson_q_list(mpi.comm.size(), mpi.comm.rank(), basis.zeta_nodes.size(), f.Np);
+    coulomb_blocks_t<HOST_MEMORY> Zh(*f.thc, grid, zl, T);
+    coulomb_blocks_t<DEVICE_MEMORY> Zd(*f.thc, grid, zl, T);
+    memory::array<HOST_MEMORY, ComplexType, 4> w_h, Wn_h, Pc_h(Pi_h);
+    memory::array<DEVICE_MEMORY, ComplexType, 4> w_d, Wn_d, Pc_d = memory::to_memory_space<DEVICE_MEMORY>(Pi_h);
+    screened_interaction<HOST_MEMORY>(Pc_h, Zh, basis, grid, mpi, w_h, T, &Wn_h, ibz.rows, true);
+    screened_interaction<DEVICE_MEMORY>(Pc_d, Zd, basis, grid, mpi, w_d, T, &Wn_d, ibz.rows, true);
+    const double eW = mdiff(Wn_h, nda::array<ComplexType, 4>(memory::to_memory_space<HOST_MEMORY>(Wn_d))) / mabs(Wn_h);
+    // Sigma at the IBZ k from the SAME residues (host w copied to the device)
+    nda::array<ComplexType, 4> Sp_h, Sh_h, Sp_d, Sh_d, Sp_n, Sh_n;
+    memory::array<DEVICE_MEMORY, ComplexType, 4> wd = memory::to_memory_space<DEVICE_MEMORY>(w_h);
+    self_energy_ibz<HOST_MEMORY>(ph, poles, w_h, basis, mf, ibz, grid, mpi.comm, fz, ray_p, ray_h, 8, Sp_h, T, sector_t::both, false,
+                                 &Sh_h);
+    self_energy_ibz<DEVICE_MEMORY>(pd, poles, wd, basis, mf, ibz, grid, mpi.comm, fz, ray_p, ray_h, 0, Sp_d, T, sector_t::both,
+                                   false, &Sh_d);
+    {
+      env_scope_t e("COQUI_GWLINE_IBZ_CSHARE", "0");
+      propagator_t<DEVICE_MEMORY> pn(*f.thc, grid);
+      pn.set_ibz(&ibz);
+      self_energy_ibz<DEVICE_MEMORY>(pn, poles, wd, basis, mf, ibz, grid, mpi.comm, fz, ray_p, ray_h, 0, Sp_n, T, sector_t::both,
+                                     false, &Sh_n);
+    }
+    const double eS    = std::max(mdiff(Sp_h, Sp_d) / mabs(Sp_h), mdiff(Sh_h, Sh_d) / mabs(Sh_h));
+    const double eS_ns = std::max(mdiff(Sp_n, Sp_d) / mabs(Sp_h), mdiff(Sh_n, Sh_d) / mabs(Sh_h));
+    // F = V_H + Sigma_x of a perturbed density at the IBZ k
+    auto D = density_matrix(poles);
+    nda::array<ComplexType, 3> F_h, F_d;
+    hartree_exchange_ibz<HOST_MEMORY>(ph, Zh, D, mf, ibz, grid, mpi.comm, F_h, T);
+    hartree_exchange_ibz<DEVICE_MEMORY>(pd, Zd, D, mf, ibz, grid, mpi.comm, F_d, T);
+    const double eF = mdiff(F_h, F_d) / mabs(F_h);
+    app_log(1, "  [ibz][device] {} ({} ranks, {} IBZ k of {}, {} rows): device vs host: Pi {:.1e}, W(nodes) {:.1e}, Sigma {:.1e}, F {:.1e}; "
+               "device C(t) shared vs per k: Pi {:.1e}, Sigma {:.1e}",
+            name, mpi.comm.size(), f.nkI, f.nk, ibz.nrows(), ePi, eW, eS, eF, ePi_ns, eS_ns);
+    REQUIRE(ePi <= 1e-13);
+    REQUIRE(eW <= 1e-12);
+    REQUIRE(eS <= 1e-12);
+    REQUIRE(eF <= 1e-13);
+    REQUIRE(ePi_ns <= 1e-13);
+    REQUIRE(eS_ns <= 1e-12);
+  }
+  {   // the driver on the device vs the host (lih223_sym, 2 iterations; the closure amplifies roundoff ~1e5 x from it 2 on)
+    auto fs = make_fix("qe_lih223_sym");
+    auto A  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*fs.thc, *fs.mf, ibz_scf_params("ibz_dev_h", 2));
+    auto B  = methods::gw_line::gw_line_scf<DEVICE_MEMORY>(*fs.thc, *fs.mf, ibz_scf_params("ibz_dev_d", 2));
+    REQUIRE(A.history.size() == 2);
+    REQUIRE(B.history.size() == 2);
+    for (long i = 0; i < 2; ++i)
+      app_log(1, "  [ibz][device][scf] lih223_sym it {}: mu host {:.12f} device {:.12f} (d {:.1e}), gap {:.10f} / {:.10f} (d {:.1e}) Ha",
+              i + 1, A.history[i].mu, B.history[i].mu, std::abs(A.history[i].mu - B.history[i].mu), A.history[i].gap,
+              B.history[i].gap, std::abs(A.history[i].gap - B.history[i].gap));
+    REQUIRE(std::abs(A.history[0].mu - B.history[0].mu) <= 1e-9);
+    REQUIRE(std::abs(A.history[0].gap - B.history[0].gap) <= 1e-9);
+    REQUIRE(std::abs(A.history[1].mu - B.history[1].mu) <= 1e-6);
+    REQUIRE(std::abs(A.history[1].gap - B.history[1].gap) <= 1e-6);
+    if (mpi.comm.root())
+      for (auto s : {"ibz_dev_h", "ibz_dev_d"})
+        for (auto e : {".gw_line.h5", ".gw_line.sigma.h5"}) std::filesystem::remove(std::string(s) + e);
+  }
+}
+#endif
