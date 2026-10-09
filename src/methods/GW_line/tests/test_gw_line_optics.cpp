@@ -264,7 +264,9 @@ void run_flat(std::string const &fixture, std::vector<double> const &thetas, std
               qsel.size(), tPi, tW, hpo.t_total, hpo.t_grid, hpo.t_Z, hpo.t_Pi, hpo.t_W);
       if (tg == "id" or th >= 20.0) {   // the GL rays need the flat-scaled panels (head_pass auto); gated: ID everywhere, GL at 20
         REQUIRE(ep / sp <= 1e-9);
-        REQUIRE(ew / sw <= 1e-9);
+        // W on the mirrored nodes (perf 7.1) equals the direct Dyson solve up to the THC asymmetry of Z(q) vs conj Z(-q):
+        // 1e-12 on lih, ~1e-9 on qe_si211 (1.04e-9 measured on the 10 deg line, 2 ranks); gate at twice that floor.
+        REQUIRE(ew / sw <= 2e-9);
         REQUIRE(eh / sh <= 1e-9);
       }
       REQUIRE(ehp / sh <= 1e-12);
