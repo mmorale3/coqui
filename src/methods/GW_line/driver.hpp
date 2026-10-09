@@ -119,6 +119,10 @@
  *                       iteration's in iter<N>/Sigma_{p,h} (the pre-S7e layout; 2 N_k N_zeta nb^2 x 16 B per iteration)
  *   sigma_kdist = true  Sigma at the nodes k-distributed over the ranks (S7e, k_dist.hpp: owner(k) = k mod np, the closure's
  *                       ownership; reduce-scatter in the self-energy); false = replicated on every rank (pre-S7e)
+ *   mem_budget_gb = 0, dev_mem_budget_gb = 0, mem_frac = 0.8, q_group_size = 0   perf 7.4b (q_plan.hpp): q groups of the
+ *                       Pi -> W stage chosen automatically as the largest group whose plan-6.7 model fits mem_frac of the free
+ *                       host memory per rank (MemAvailable / cgroup, at the plan) and of the free device memory; the budgets
+ *                       in GB per rank override the measurement; q_group_size > 0 (or env COQUI_GWLINE_QGROUP) fixes the size
  *   output / outdir + prefix   checkpoint stem (MBPT_drivers resolve_mbpt_output_stem; the driver reads "output")
  *   div_treatment = "ignore_g0"   q -> 0 divergence of Sigma_c (S9a, head.hpp): "ignore_g0" (Z(Gamma) without its G = 0 term,
  *                       no head term) or a gygi variant of CoQui ("gygi" = axis-folded polynomial extrapolation of the head
@@ -235,6 +239,10 @@ struct gw_line_params_t {
   std::string checkpoint_sigma = "last";   ///< "last" | "all" (S7e)
   bool sigma_kdist = true;                 ///< k-distributed Sigma at the nodes (S7e)
   bool ibz = true;                         ///< perf 7.3: use the symmetry reduction of a symmetric mean field (ibz.hpp); env COQUI_GWLINE_IBZ
+  double mem_budget_gb = 0.0;              ///< perf 7.4b: host memory per rank for the GW_line arrays (GB; 0 = mem_frac of the free memory)
+  double dev_mem_budget_gb = 0.0;          ///< perf 7.4b: device memory per rank (GB; 0 = mem_frac of the free device memory)
+  double mem_frac = 0.8;                   ///< perf 7.4b: fraction of the available memory the q plan may fill
+  long q_group_size = 0;                   ///< perf 7.4b: > 0 fixes the largest q-group size (0 = automatic, q_plan.hpp)
   bool do_spectra = true;
   spectra_params_t spectra;
   std::string div_treatment = "ignore_g0";      ///< S9a: Sigma_c head term ("ignore_g0" | gygi variants, head.hpp)
@@ -283,6 +291,8 @@ struct gw_line_result_t {
   nda::array<ComplexType, 1> head_hp0, head_hh0;   ///< S9a: extrapolated head residues of the last iteration of this run
   std::vector<double> optics_theta;                ///< S9b: angles of the optics lines (SCF angle first)
   std::vector<optics_q_t> optics_q0;               ///< S9b: q -> 0 optics per line (same order)
+  long q_group_size = 0, q_ngroups = 0;           ///< perf 7.4b: the q plan of the Pi -> W stage (last one made)
+  double q_budget_host = -1.0, q_model_host = 0.0, q_model_host_all = 0.0, q_model_host_min = 0.0;   ///< bytes per rank
 };
 
 /// Non-interacting one-body Hamiltonian (no xc) in the KS band basis, (nk, nb, nb), hermitized; collective.

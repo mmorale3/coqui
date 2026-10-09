@@ -98,6 +98,13 @@ struct aux_grid_t {
    * t_chunk: the chunk of the kernels (device automatic: the kernels pick it at call time from the free memory).
    */
   double log(long nk, long nq, long nzeta, long r_b, long t_chunk, long nb, long g = -1, bool device_fused = false) const;
+  /// perf 7.4b: the plan section 6.7 model of log() without logging (bytes per rank; see mem_model_t)
+  struct mem_model_t {
+    double z = 0, w = 0, pig = 0, xsl = 0, res = 0, pi_t = 0, w_t = 0, sg_t = 0, peak = 0, nacc = 0;
+    double peak_stage = 0;   ///< max over the stages (Pi: res + pi_t, W: res + w_t, Sigma: res - pig + sg_t)
+    long nsub_q = 0, n_zsub = 0;
+  };
+  mem_model_t model(long nk, long nq, long nzeta, long r_b, long t_chunk, long nb, long g = -1, bool device_fused = false) const;
 };
 
 /**
@@ -284,30 +291,47 @@ inline long dyson_nbat_max() {
   return (v != nullptr and *v != '\0') ? std::max(1L, std::strtol(v, nullptr, 10)) : 256L;
 }
 
-inline double aux_grid_t::log(long nk, long nq, long nzeta, long r_b, long t_chunk, long nb, long g, bool device_fused) const {
+inline aux_grid_t::mem_model_t aux_grid_t::model(long nk, long nq, long nzeta, long r_b, long t_chunk, long nb, long g,
+                                                 bool device_fused) const {
   if (g < 0) g = nq;
-  const double GB  = 1024.0 * 1024.0 * 1024.0;
+  mem_model_t m;
   const long mb    = max_block_size();
   const double blk = double(mb) * 16.0;
-  const double xsl = double(nk) * double(2 * ((Np + np_P - 1) / np_P + (Np + np_Q - 1) / np_Q)) * double(nb) * 16.0;
-  const double z = nq * blk, w = double(nq) * r_b * blk, pig = double(g) * nzeta * blk;
+  m.xsl = double(nk) * double(2 * ((Np + np_P - 1) / np_P + (Np + np_Q - 1) / np_Q)) * double(nb) * 16.0;
+  m.z = nq * blk;
+  m.w = double(nq) * r_b * blk;
+  m.pig = double(g) * nzeta * blk;
   // perf 7.1 (e): real-space convolutions (default, env COQUI_GWLINE_RSPACE): Pi holds A, B, A^(R) of all k and acc of all
   // q of the group; Sigma holds G~, acc, W^(R) of all R per chunk and the transformed residues w^(R) (N_q r_b blocks)
   char const *rsv     = std::getenv("COQUI_GWLINE_RSPACE");
   const bool rs       = (rsv == nullptr or *rsv == '\0' or std::strtol(rsv, nullptr, 10) != 0) and nk == nq;
-  const double nacc   = (device_fused or rs) ? double(nq) : 1.0;
-  const double pi_t   = ((rs ? 3.0 : 2.0) * nk + nacc) * t_chunk * blk;
-  const double sg_t   = (2.0 * nk + (rs ? double(nq) : nacc)) * t_chunk * blk + double(nk) * t_chunk * nb * nb * 16.0 +
-                      (rs ? w : 0.0);
+  m.nacc              = (device_fused or rs) ? double(nq) : 1.0;
+  m.pi_t              = ((rs ? 3.0 : 2.0) * nk + m.nacc) * t_chunk * blk;
+  m.sg_t              = (2.0 * nk + (rs ? double(nq) : m.nacc)) * t_chunk * blk + double(nk) * t_chunk * nb * nb * 16.0 +
+                        (rs ? m.w : 0.0);
   dyson_layout_t lay(np, rank, g, nzeta, Np);
   w_plan_t plan(lay, mb);
   const long nbat     = device_fused ? std::min((plan.nzs + lay.np_z - 1) / lay.np_z, dyson_nbat_max()) : 1L;
+  const double GB     = 1024.0 * 1024.0 * 1024.0;
   const double stg    = std::min(2.0 * GB, 2.0 * 16.0 * double(lay.np_q) * plan.nzs * mb);
   // fit buffer (screened_interaction): k x bc with bc = clamp(S / (64 k), min(blk, 4096), blk); in units of blk (k <= N_zeta)
   const double kfit   = std::min(double(nzeta), std::max(double(g) * nzeta / 64.0, double(nzeta) * std::min(mb, 4096L) / double(mb)));
-  const double w_t    = plan.transient_bytes(kfit, nbat, np > 1 ? stg : 0.0);
-  const double res    = z + w + pig + xsl;
-  const double peak   = res + std::max({pi_t, w_t, sg_t});
+  m.w_t               = plan.transient_bytes(kfit, nbat, np > 1 ? stg : 0.0);
+  m.res               = m.z + m.w + m.pig + m.xsl;
+  m.peak              = m.res + std::max({m.pi_t, m.w_t, m.sg_t});
+  m.peak_stage        = std::max({m.res + m.pi_t, m.res + m.w_t, m.res - m.pig + m.sg_t});
+  m.nsub_q            = plan.nsub_q;
+  m.n_zsub            = plan.n_zsub();
+  return m;
+}
+
+inline double aux_grid_t::log(long nk, long nq, long nzeta, long r_b, long t_chunk, long nb, long g, bool device_fused) const {
+  if (g < 0) g = nq;
+  const double GB  = 1024.0 * 1024.0 * 1024.0;
+  const double blk = double(max_block_size()) * 16.0;
+  const auto m     = model(nk, nq, nzeta, r_b, t_chunk, nb, g, device_fused);
+  const double z = m.z, w = m.w, pig = m.pig, xsl = m.xsl, pi_t = m.pi_t, w_t = m.w_t, sg_t = m.sg_t, res = m.res, peak = m.peak;
+  const double nacc = m.nacc;
   // per stage (the Pi group is consumed by the W stage: not held during Sigma)
   app_log(2, "  gw_line aux grid: {} ranks -> (P,Q) = ({} x {}), Np = {}, block <= {} x {} ({:.3f} MB)", np, np_P, np_Q, Np,
           (Np + np_P - 1) / np_P, (Np + np_Q - 1) / np_Q, blk / 1024.0 / 1024.0);
@@ -316,7 +340,7 @@ inline double aux_grid_t::log(long nk, long nq, long nzeta, long r_b, long t_chu
   app_log(2, "      resident : Z {:.4f}  w {:.4f}  Pi-group {:.4f}  X slices {:.4f}  -> {:.4f}", z / GB, w / GB, pig / GB,
           xsl / GB, res / GB);
   app_log(2, "      transient: Pi stage {:.4f} (A, B {} + acc {} chunks)  W stage {:.4f} ({} x {} sub-steps)  Sigma stage {:.4f}",
-          pi_t / GB, 2 * nk, long(nacc), w_t / GB, plan.nsub_q, plan.n_zsub(), sg_t / GB);
+          pi_t / GB, 2 * nk, long(nacc), w_t / GB, m.nsub_q, m.n_zsub, sg_t / GB);
   app_log(2, "      predicted high-water: {:.4f}  (Pi stage {:.4f}, W stage {:.4f}, Sigma stage {:.4f})", peak / GB,
           (res + pi_t) / GB, (res + w_t) / GB, (res - pig + sg_t) / GB);
   return peak;

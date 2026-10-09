@@ -71,6 +71,7 @@
 #include "methods/GW_line/ibz.hpp"
 #include "methods/GW_line/self_energy_ibz.hpp"
 #include "methods/GW_line/static_ibz.hpp"
+#include "methods/GW_line/q_plan.hpp"
 #include "methods/GW_line/k_dist.hpp"
 #include "methods/GW_line/scf_mixing.hpp"
 #include "methods/GW_line/warm_start.hpp"
@@ -147,6 +148,11 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.time_snap       = io::get_value_with_default<double>(pt, "time_snap", p.time_snap);
   p.sigma_kdist     = io::get_value_with_default<bool>(pt, "sigma_kdist", p.sigma_kdist);
   p.ibz             = io::get_value_with_default<bool>(pt, "ibz", p.ibz);
+  p.mem_budget_gb     = io::get_value_with_default<double>(pt, "mem_budget_gb", p.mem_budget_gb);
+  p.dev_mem_budget_gb = io::get_value_with_default<double>(pt, "dev_mem_budget_gb", p.dev_mem_budget_gb);
+  p.mem_frac          = io::get_value_with_default<double>(pt, "mem_frac", p.mem_frac);
+  p.q_group_size      = io::get_value_with_default<long>(pt, "q_group_size", p.q_group_size);
+  utils::check(p.mem_frac > 0.0 and p.mem_frac <= 1.0, "gw_line: mem_frac = {} must be in (0, 1]", p.mem_frac);
   if (char const *e = std::getenv("COQUI_GWLINE_IBZ"); e != nullptr and *e != '\0') p.ibz = std::strtol(e, nullptr, 10) != 0;
   p.checkpoint_sigma = io::get_value_with_default<std::string>(pt, "checkpoint_sigma", p.checkpoint_sigma);
   io::tolower(p.checkpoint_sigma);
@@ -924,54 +930,7 @@ void pole_counts(pole_data_t const &pd, long &nmin, long &nmax, double &emin) {
 }
 
 
-/**
- * Memory plan of the q loops (S7e):
- *   g        : q-group size of the Pi -> W stage (polarization + screened_interaction per group of g consecutive q);
- *   w_host   : residues w of all q kept on the HOST (device runs whose w does not fit), Sigma then streams them per group;
- *   gs_sigma : q-group size of the Sigma stage with host-resident residues (residues of gs_sigma q copied to the device
- *              per group and sector; G~ rebuilt per group).
- * Env overrides: COQUI_GWLINE_QGROUP, COQUI_GWLINE_W_HOST (0/1), COQUI_GWLINE_SIGMA_QGROUP. Host default: g = N_q,
- * resident w (the Pi group of all q is 2.5 GB per rank for Si 4x4x4 nb 60 at 64 ranks and shrinks with the ranks).
- * Device: w resident if it takes <= 35% of the free device memory (min over ranks); g = the largest group whose Pi group
- * plus ~0.8 of it (W-stage sub-step buffers) fits in 80% of the free memory left by the Z blocks, the resident w, the
- * device Sigma accumulator (N_k N_zeta_f nb^2, N_zeta_f <= 2 nz) and the Pi-stage factors at t_chunk 16; gs_sigma: the
- * residues of gs_sigma q in <= 25% of the free memory.
- */
-struct q_plan_t {
-  long g = 0, gs_sigma = 0;
-  bool w_host = false;
-};
-
-template <MEMORY_SPACE MEM>
-q_plan_t choose_q_plan(boost::mpi3::communicator &comm, aux_grid_t const &grid, long nk, long nq, long nz, long r_b, long nb) {
-  q_plan_t qp;
-  const double GB  = 1073741824.0;
-  const double blk = 16.0 * double(grid.max_block_size());
-  const double w   = double(nq) * r_b * blk;
-  qp.g             = nq;
-  qp.w_host        = false;
-  qp.gs_sigma      = nq;
-  if constexpr (MEM != HOST_MEMORY) {
-    double freeb   = double(utils::freemem_device_effective()) * 1048576.0;
-    freeb          = comm.all_reduce_value(freeb, boost::mpi3::min<>{});
-    qp.w_host      = (w > 0.35 * freeb);
-    const double fixed = double(nq) * blk + (qp.w_host ? 0.0 : w) + 16.0 * double(nk) * 2.0 * nz * nb * nb + 2.0 * nk * 16.0 * blk;
-    const double per_q = 1.8 * double(nz) * blk;
-    qp.g               = std::clamp(long((0.8 * freeb - fixed) / per_q), 1L, nq);
-    qp.gs_sigma        = std::clamp(long(0.25 * freeb / (double(r_b) * blk)), 1L, nq);
-    utils::check(0.8 * freeb - fixed > per_q, "gw_line: device memory: Z blocks + residues ({:.2f} GB, {}) + Sigma accumulator + "
-                                              "one q of the Pi group ({:.2f} GB) exceed 80% of the free device memory ({:.2f} GB); "
-                                              "use more GPUs",
-                 w / GB, qp.w_host ? "on the host" : "resident", per_q / GB, freeb / GB);
-    app_log(2, "  q plan (device): free {:.2f} GB (min over ranks), residues {:.2f} GB {}, fixed {:.2f} GB, Pi group per q {:.3f} GB",
-            freeb / GB, w / GB, qp.w_host ? "on the HOST" : "resident", fixed / GB, per_q / GB);
-  }
-  if (long v = detail::env_long("COQUI_GWLINE_QGROUP", 0); v > 0) qp.g = std::min(v, nq);
-  if (long v = detail::env_long("COQUI_GWLINE_W_HOST", -1); v >= 0) qp.w_host = (v != 0);
-  if (long v = detail::env_long("COQUI_GWLINE_SIGMA_QGROUP", 0); v > 0) qp.gs_sigma = std::min(v, nq);
-  if (not qp.w_host) qp.gs_sigma = nq;
-  return qp;
-}
+// perf 7.4b: q_plan_t / choose_q_plan moved to q_plan.hpp (automatic q groups from the 6.7 memory model)
 
 // ------------------------------------------------------------------------------------------------------------------
 // S7e instrumentation: per-iteration phase timers (min / avg / max over ranks) and host / device high-water memory
@@ -1256,8 +1215,59 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
 
   const long nqR = ibz.nrows();   // perf 7.3: Pi / W rows (all q without symmetry)
   dyson_layout_t lay(comm.size(), comm.rank(), nqR, bos->zeta_nodes.size(), Np);
-  // q groups of the Pi -> W stage (S7e): all q at once unless the Pi group does not fit (device) or COQUI_GWLINE_QGROUP
-  q_plan_t qplan = choose_q_plan<MEM>(comm, grid, nkF, nqR, long(bos->zeta_nodes.size()), bos->rank, nb);
+  // q groups of the Pi -> W stage (S7e; perf 7.4b: automatic from the 6.7 model and the host / device budgets, q_plan.hpp)
+  const bool dev_fused   = (MEM != HOST_MEMORY) and detail::fused_hadamard();
+  const long tc_model    = (prm.t_chunk > 0 ? prm.t_chunk : (MEM == HOST_MEMORY ? detail::host_t_chunk_default : 64));
+  const double sig_bytes = 16.0 * double(prm.sigma_kdist ? kd.nloc(0) : nk) * double(nz) * double(nb * nb);
+  // host model (S7e): the kernel arrays (= the 6.7 model on the host path) + the Sigma arrays of the driver (Sig_p, Sig_h,
+  // Sp_new, Sh_new: 4 N_k N_zeta_f nb^2) + the per-chunk Sigma reduce buffers (2 N_k t_chunk nb^2) + the full Z(q) of the
+  // Dyson slab of the grouping (max over the ranks: the plan is collective)
+  // the kernels' stage-wise peak of the 6.7 model (aux_grid_t::model) + what it does not contain (perf 7.4b, measured on
+  // si444 IBZ: VmHWM 2.77 GB vs model 1.48 GB): the A^ cache of Pi's real-space transform (propagators.hpp, N_k x N_t
+  // blocks when enabled; N_t estimated by the bosonic node count) and, on the IBZ, the class-sum arrays of self_energy_ibz
+  // (G~, G^ of all k, W(t) of the rows R, the back-transformed class sums: (2 N_k + |R| + n_cls nk_ibz) t_chunk blocks)
+  auto kernels_model = [&](long g, long nzb_) {
+    q_groups_t qgg(ibz.rows, g, ibz.qminus);
+    const auto mm    = grid.model(nkF, nqR, nzb_, bos->rank, tc_model, nb, qgg.max_size(), dev_fused);
+    const double b16 = 16.0 * double(grid.max_block_size());
+    double stage     = mm.peak_stage;
+    if (ibz.active) {
+      const double sg = (2.0 * nkF + nqR + double(ibz.nclasses()) * nk) * double(tc_model) * b16;
+      stage           = std::max({mm.res + mm.pi_t, mm.res + mm.w_t, mm.res - mm.pig + sg});
+    }
+    const double ahat = double(nkF) * double(nzb_) * b16;
+    if (detail::gt_cache_enabled<MEM>(ahat)) stage += ahat;
+    return stage;
+  };
+  // host model (S7e): the kernel arrays (host path) + the Sigma arrays of the driver (Sig_p, Sig_h, Sp_new, Sh_new:
+  // 4 N_k N_zeta_f nb^2) + the per-chunk Sigma reduce buffers (2 N_k t_chunk nb^2) + the full Z(q) of the Dyson slab of
+  // the grouping (max over the ranks: the plan is collective)
+  auto qmodel_host = [&](long g, long nzb_) {
+    q_groups_t qgg(ibz.rows, g, ibz.qminus);
+    const double zf = 16.0 * double(qgg.dyson_q_list(comm.size(), comm.rank(), nzb_, Np).size()) * double(Np) * double(Np);
+    double m = (MEM == HOST_MEMORY ? kernels_model(g, nzb_) : 0.0) + 4.0 * sig_bytes +
+               2.0 * 16.0 * double(nkF) * double(detail::host_t_chunk_default) * double(nb * nb) + zf;
+    return comm.all_reduce_value(m, boost::mpi3::max<>{});
+  };
+  auto qmodel_dev = [&](long g, long nzb_) {
+    double m = kernels_model(g, nzb_);
+    return comm.all_reduce_value(m, boost::mpi3::max<>{});
+  };
+  auto make_qplan = [&](long nzb_) {
+    return choose_q_plan<MEM>(comm, mpi.node_comm, grid, ibz.rows, ibz.qminus, nkF, nzb_, bos->rank, nb, q_budget_params_t{prm.mem_budget_gb, prm.dev_mem_budget_gb, prm.mem_frac, prm.q_group_size},
+                              [&](long g) { return qmodel_host(g, nzb_); }, [&](long g) { return qmodel_dev(g, nzb_); },
+                              not ibz.active);
+  };
+  q_plan_t qplan = make_qplan(long(bos->zeta_nodes.size()));
+  auto record_qplan = [&]() {
+    res.q_group_size     = qplan.g;
+    res.q_ngroups        = qplan.ngroups;
+    res.q_budget_host    = qplan.budget_host;
+    res.q_model_host     = qplan.model_host;
+    res.q_model_host_all = qplan.model_host_all;
+    res.q_model_host_min = qplan.model_host_min;
+  };
+  record_qplan();
   utils::check(not(ibz.active and qplan.w_host), "gw_line: host-resident residues (q_plan_t::w_host) are not implemented with the IBZ");
   q_groups_t qg(ibz.rows, qplan.g, ibz.qminus);   // pair-closed groups of the rows R (W pairing q <-> -q, screened.hpp)
   long zb_nzb = long(bos->zeta_nodes.size());     // perf 7.2: bosonic node count the Dyson slab (Zb) was built for
@@ -1272,15 +1282,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   if (qplan.w_host)
     app_log(1, "  residues w of all q on the HOST ({:.3f} GB per rank); Sigma streams them in groups of {} q", 16.0 * double(nq) *
                    bos->rank * grid.max_block_size() / 1073741824.0, qplan.gs_sigma);
-  const bool dev_fused   = (MEM != HOST_MEMORY) and detail::fused_hadamard();
-  const double model_dev = grid.log(nkF, nqR, bos->zeta_nodes.size(), bos->rank,
-                                    (prm.t_chunk > 0 ? prm.t_chunk : (MEM == HOST_MEMORY ? detail::host_t_chunk_default : 64)),
-                                    nb, qg.max_size(), dev_fused);
+  const double model_dev = grid.log(nkF, nqR, bos->zeta_nodes.size(), bos->rank, tc_model, nb, qg.max_size(), dev_fused);
   lay.log();
-  // host model (S7e): the kernel arrays (= model_dev on the host path) + the Sigma arrays of the driver (Sig_p, Sig_h,
-  // Sp_new, Sh_new: 4 N_k N_zeta_f nb^2) + the per-chunk Sigma reduce buffers (2 N_k t_chunk nb^2) + the full Z(q) of the
-  // Dyson slab
-  const double sig_bytes  = 16.0 * double(prm.sigma_kdist ? kd.nloc(0) : nk) * double(nz) * double(nb * nb);
   const double model_host = (MEM == HOST_MEMORY ? model_dev : 0.0) + 4.0 * sig_bytes +
                             2.0 * 16.0 * double(nkF) * double(detail::host_t_chunk_default) * double(nb * nb) +
                             16.0 * double(Zb.Z_full.extent(0)) * double(Np) * double(Np);
@@ -1382,7 +1385,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   auto ensure_zb = [&]() {
     const long nzb = long(bos->zeta_nodes.size());
     if (nzb == zb_nzb) return;
-    qplan    = choose_q_plan<MEM>(comm, grid, nkF, nqR, nzb, bos->rank, nb);
+    qplan    = make_qplan(nzb);
+    record_qplan();
     qg       = q_groups_t(ibz.rows, qplan.g, ibz.qminus);
     auto lst = qg.dyson_q_list(comm.size(), comm.rank(), nzb, Np);
     long chg = (lst != zb_list) ? 1 : 0;
