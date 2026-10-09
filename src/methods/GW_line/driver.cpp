@@ -982,9 +982,11 @@ void mem_trace(boost::mpi3::communicator &comm, ncomm_t &node_comm, std::string 
 
 /// the phases of one iteration, in print order (indented names are sub-timers of the preceding phase)
 static const std::vector<std::string> phase_names = {
-    "time_grid",     "bases",          "phase_Pi",        "G_tilde",         "Pi_hadamard",    "Pi_transform",
+    "time_grid",     "bases",          "phase_Pi",        "G_tilde",         "Pi_hadamard",    "Pi_ft_fwd",
+    "Pi_ft_prod",    "Pi_ft_back",     "Pi_transform",
     "phase_W",       "W_redistribute", "W_dyson",         "W_fit",           "phase_Sigma",    "Sigma_G_tilde",
-    "Sigma_W_time",  "Sigma_hadamard", "Sigma_contract",  "Sigma_allreduce", "Sigma_transform", "Sigma_mix",
+    "Sigma_W_time",  "Sig_ft_wR",      "Sigma_hadamard",  "Sig_ft_G",        "Sig_ft_W",       "Sig_ft_prod",
+    "Sig_ft_back",   "Sigma_contract", "Sigma_allreduce", "Sigma_transform", "Sigma_mix",
     "phase_closure", "closure_upfold", "closure_kloop",   "closure_wait",    "closure_scan",   "closure_gather",
     "closure_mu",    "closure_compress", "phase_F",
     "checkpoint",    "iteration"};
