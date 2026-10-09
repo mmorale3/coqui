@@ -955,6 +955,31 @@ double host_rss_bytes() {
   return 0.0;
 }
 
+/// perf 7.4b: env COQUI_GWLINE_MEMTRACE = 1: VmRSS / VmHWM per rank (max, min over the ranks; the rank of the max) and the
+/// smallest MemAvailable over the nodes at a point of the iteration (collective; diagnostics of the memory model)
+template <typename ncomm_t>
+void mem_trace(boost::mpi3::communicator &comm, ncomm_t &node_comm, std::string const &tag) {
+  static const bool on = [] {
+    char const *v = std::getenv("COQUI_GWLINE_MEMTRACE");
+    return v != nullptr and *v != '\0' and std::strtol(v, nullptr, 10) != 0;
+  }();
+  if (not on) return;
+  const double GB = 1073741824.0;
+  double rss = host_rss_bytes(), hwm = host_hwm_bytes(), av = 1e300;
+  if (node_comm.rank() == 0) {
+    std::ifstream f("/proc/meminfo");
+    std::string line;
+    while (std::getline(f, line))
+      if (line.rfind("MemAvailable:", 0) == 0) av = 1024.0 * std::strtod(line.c_str() + 13, nullptr);
+  }
+  double v[4] = {rss, hwm, -rss, -av}, mx[4];
+  comm.all_reduce_n(v, 4, mx, boost::mpi3::max<>{});
+  double who = (rss == mx[0]) ? double(comm.rank()) : -1.0, wmax = 0.0;
+  comm.all_reduce_n(&who, 1, &wmax, boost::mpi3::max<>{});
+  app_log(1, "  [memtrace] {:<14s} VmRSS max {:.3f} GB (rank {}) min {:.3f} GB; VmHWM max {:.3f} GB; MemAvailable min over nodes {:.1f} GB",
+          tag, mx[0] / GB, long(wmax), -mx[2] / GB, mx[1] / GB, -mx[3] / GB);
+}
+
 /// the phases of one iteration, in print order (indented names are sub-timers of the preceding phase)
 static const std::vector<std::string> phase_names = {
     "time_grid",     "bases",          "phase_Pi",        "G_tilde",         "Pi_hadamard",    "Pi_transform",
@@ -1269,7 +1294,9 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     return choose_q_plan<MEM>(comm, mpi.node_comm, grid, ibz.rows, ibz.qminus, nkF, nzb_, bos->rank, nb, q_budget_params_t{prm.mem_budget_gb, prm.dev_mem_budget_gb, prm.mem_frac, prm.q_group_size},
                               [&](long g, bool ip) { return qmodel_host(g, nzb_, ip); },
                               [&](long g, bool ip) { return qmodel_dev(g, nzb_, ip); }, not ibz.active,
-                              not ibz.active);   // in place: the full-BZ Sigma's real-space path only
+                              not ibz.active,   // in place: the full-BZ Sigma's real-space path only
+                              // the root alone: the checkpoint's gather of Sigma (write_state: two sectors, owner + k order)
+                              (prm.sigma_kdist and comm.size() > 1) ? 3.0 * 16.0 * double(nk) * double(nz) * double(nb * nb) : 0.0);
   };
   q_plan_t qplan = make_qplan(long(bos->zeta_nodes.size()));
   auto record_qplan = [&]() {
@@ -1518,8 +1545,10 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       polarization<MEM>(prop, st.poles, mf, grid, bos->zeta_nodes, *pi_p, *pi_h, prm.t_chunk, Pi, Timer, sector_t::both,
                         qg.rows(G));
       tPi += toc("phase_Pi", e0);
+      mem_trace(comm, mpi.node_comm, "Pi group " + std::to_string(G));
       e0 = tic("phase_W");
       screened_interaction<MEM>(Pi, Zb, *bos, grid, mpi, w, Timer, &Wn, qg.rows(G), qplan.w_host or ibz.active);
+      mem_trace(comm, mpi.node_comm, "W group " + std::to_string(G));
       Timer.start("W_head");
       head_nodes_partial<MEM>(Wn, qg.rows(G), hbasis, Hn);
       Wn = arr4_t{};
@@ -1596,6 +1625,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     else
       self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer, sector_t::both,
                        prm.sigma_kdist, whp, qplan.gs_sigma, &Sh_new, qplan.wR_inplace ? &w : nullptr);   // 7.4b: w consumed
+    mem_trace(comm, mpi.node_comm, "Sigma");
     if (sig_div) {   // S9a: the q -> 0 head term of Sigma_c (head.hpp), per sector, on the rows of this rank
       Timer.start("Sigma_head");
       head_sigma_correction(st.poles, Thead, bos->nu, hout.h0_res, hout.h0_res_hole, madelung, zeta, k_rows, Sp_new, Sh_new);
@@ -1684,6 +1714,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
               gn, gm, sn, sm, tie, kept);
     }
     const double tC = toc("phase_closure", e0);
+    mem_trace(comm, mpi.node_comm, "closure");
     st.mu_sigma = st.mu;
     st.mu += co.dmu;
     st.dmu    = co.dmu;
@@ -1697,6 +1728,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     static_F(D, st.F);
     if (hf_div) exchange_head_correction(st.F, D, madelung);
     const double tF = toc("phase_F", e0);
+    mem_trace(comm, mpi.node_comm, "F");
     {
       const double np_tot = double(st.poles.total_poles()), MB = 1024.0 * 1024.0;
       app_log(2, "          pole residues ({}): {:.0f} poles, {:.3f} MB host + the same mirrored by the propagator (matrix form "
@@ -1754,6 +1786,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
 
     Timer.start("checkpoint");
     write_state(comm, chk, st, &rec, kdp, sig_all, &hout);
+    mem_trace(comm, mpi.node_comm, "checkpoint");
     Timer.stop("checkpoint");
     Timer.stop("iteration");
     if (comm.root() and std::filesystem::exists(chk)) {

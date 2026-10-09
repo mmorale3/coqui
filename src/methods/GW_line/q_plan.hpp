@@ -27,7 +27,8 @@
  * of memory with all q at once).
  *
  * Budgets (bytes per rank, ABOVE what the process already holds when the plan is made: MF, THC, X, node-shared arrays):
- *   host   : frac x (available memory of the node) / (ranks on the node), min over the nodes. The available memory is
+ *   host   : frac x (available memory of the node) / (ranks on the node), min over the nodes (the root's node minus what
+ *            the root alone holds: the checkpoint's gather of Sigma, 3 N_k N_zeta nb^2 x 16 B). The available memory is
  *            MemAvailable of /proc/meminfo, capped by the job's cgroup (memory.max - memory.current, cgroup v2, or
  *            memory.limit_in_bytes - memory.usage_in_bytes, v1) when that is readable; measured by one rank per node at
  *            the moment of the plan (after the THC is loaded). Unknown (no /proc, e.g. macOS): no host constraint.
@@ -137,14 +138,16 @@ inline double node_available_bytes() {
 
 } // namespace detail
 
-/// host budget per rank (bytes; < 0 unconstrained): frac x available / ranks on the node, min over the nodes. Collective.
+/// host budget per rank (bytes; < 0 unconstrained): frac x available / ranks on the node, min over the nodes; the node of
+/// the world root also carries root_extra (bytes held by the root alone, e.g. the checkpoint's gather of Sigma). Collective.
 template <typename comm_t, typename ncomm_t>
-double host_budget_per_rank(comm_t &comm, ncomm_t &node_comm, double frac, double override_gb) {
+double host_budget_per_rank(comm_t &comm, ncomm_t &node_comm, double frac, double override_gb, double root_extra = 0.0) {
   if (override_gb > 0.0) return override_gb * 1073741824.0;
   double a = -1.0;
   if (node_comm.rank() == 0) a = detail::node_available_bytes();
   node_comm.broadcast_n(&a, 1, 0);
-  double b = (a > 0.0) ? frac * a / double(node_comm.size()) : 1e300;
+  const int has_root = node_comm.all_reduce_value(int(comm.rank() == 0), boost::mpi3::max<>{});
+  double b = (a > 0.0) ? (frac * a - (has_root ? root_extra : 0.0)) / double(node_comm.size()) : 1e300;
   b        = comm.all_reduce_value(b, boost::mpi3::min<>{});
   return b >= 1e299 ? -1.0 : b;
 }
@@ -195,7 +198,7 @@ template <MEMORY_SPACE MEM, typename comm_t, typename ncomm_t>
 q_plan_t choose_q_plan(comm_t &comm, ncomm_t &node_comm, [[maybe_unused]] aux_grid_t const &grid, std::vector<long> const &rows,
                        std::vector<long> const &qminus, long nk, long nz, long r_b, long nb, q_budget_params_t const &bp,
                        std::function<double(long, bool)> const &model_host, std::function<double(long, bool)> const &model_dev,
-                       bool w_host_ok = true, bool inplace_ok = false) {
+                       bool w_host_ok = true, bool inplace_ok = false, double root_extra = 0.0) {
   q_plan_t qp;
   const double GB  = 1073741824.0;
   const long nq    = long(rows.size());
@@ -203,7 +206,7 @@ q_plan_t choose_q_plan(comm_t &comm, ncomm_t &node_comm, [[maybe_unused]] aux_gr
   const double w   = double(nq) * r_b * blk;
   qp.g             = nq;
   qp.gs_sigma      = nq;
-  qp.budget_host   = host_budget_per_rank(comm, node_comm, bp.mem_frac, bp.mem_budget_gb);
+  qp.budget_host   = host_budget_per_rank(comm, node_comm, bp.mem_frac, bp.mem_budget_gb, root_extra);
   qp.budget_dev    = device_budget_per_rank<MEM>(comm, bp.mem_frac, bp.dev_mem_budget_gb);
   long g_dev_rule  = nq;
   if constexpr (MEM != HOST_MEMORY) {   // the pre-7.4b device rule (S7e), kept as an upper bound
