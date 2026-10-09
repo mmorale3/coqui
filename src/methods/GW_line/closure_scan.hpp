@@ -27,7 +27,7 @@
  * eigensolve of the Nr x Nr unitary U each; Si 4x4x4, Nr 1302: 41 x ~3 s) while every other rank waited. Here, after
  * every owner has prepared its k up to the fast SVD (upfold_prepare with defer_ref), the k with a free block ("deferred")
  * are finished together:
- *   - scan ranks of k: its owner and the nphi ranks (owner + 1 + ip) mod np. Three phases, each with the cores of the
+ *   - scan ranks of k: its owner and the nphi ranks (owner + (1 + ip) stride) mod np, stride = np / (batch (nphi + 1)). Three phases, each with the cores of the
  *     ranks idle in that phase lent to the busy ranks of their host (closure_cores_t; the lenders sleep):
  *   - (A) the owner redoes the SVD with the reference driver (upfold_prepare_ref, the pre-7.1c arithmetic);
  *   - (B) the owner broadcasts the problem (A1, A0, R, C^(K+1)) to the scan ranks;
@@ -113,16 +113,20 @@ void distributed_phase_scan(boost::mpi3::communicator &comm, std::vector<long> c
       ob[j]   = opts(dk[j0 + j]);
       nphi[j] = ob[j].nphi;
     }
-    // coarse task ip of k -> rank (owner + 1 + ip) mod np
-    auto task_rank = [&](long j, long ip) { return (owner(j0 + j) + 1 + ip) % np; };
+    // coarse task ip of k -> rank (owner + (1 + ip) stride) mod np: spread over the ranks (memory bandwidth of all sockets /
+    // nodes; the lent cores are the nearest idle ones)
+    long nphi_max = 1;
+    for (long j = 0; j < B; ++j) nphi_max = std::max(nphi_max, nphi[j]);
+    const long stride = std::max(1L, np / (B * (nphi_max + 1)));
+    auto task_rank    = [&](long j, long ip) { return (owner(j0 + j) + (1 + ip) * stride) % np; };
     bool own_any = false, own_ref = false, in_S = false;
     for (long j = 0; j < B; ++j) {
-      const long t = (rank - owner(j0 + j) + np) % np;
-      if (t == 0) {
+      if (owner(j0 + j) == rank) {
         own_any = true;
         own_ref = own_ref or prob[j0 + j]->need_ref;
+        in_S    = true;
       }
-      in_S = in_S or (t <= nphi[j]);
+      for (long ip = 0; ip < nphi[j]; ++ip) in_S = in_S or (task_rank(j, ip) == rank);
     }
     MPI_Comm sc = MPI_COMM_NULL;
     MPI_Comm_split(comm.get(), in_S ? 0 : MPI_UNDEFINED, int(rank), &sc);
