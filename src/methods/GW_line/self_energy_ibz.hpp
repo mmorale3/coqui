@@ -154,7 +154,7 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
     long ncmax            = 1;
     for (auto const &cl : ibz.cls) ncmax = std::max(ncmax, long(cl.q_eff.size()));
     const long tc = (t_chunk > 0) ? std::min(t_chunk, nt)
-                                  : detail::auto_t_chunk<MEM>(nt, double(3 * nk + nR + ncmax + nkI) * blk * 16.0);
+                                  : detail::auto_t_chunk<MEM>(nt, double(3 * nk + nR + ncmax + ncl * nkI) * blk * 16.0);
     auto &Sigma_out = out_of(leg.s);
     bool use_cache  = leg.s == sector_t::hole and prop.ahat_key >= 0.0 and prop.ahat_key == prop.pole_key and
                      prop.ahat_t.size() == nt and prop.ahat.extent(0) == nk and prop.ahat.extent(2) == nP and
@@ -183,8 +183,15 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
       }
     const auto form              = leg.transposed ? gtilde_form_t::transposed : gtilde_form_t::plain;
     nda::array<ComplexType, 2> F = ray.transform_matrix(zeta);   // (nz, nt), host
-    arr4_t G(nk, tc, nP, nQ), Gh(nk, tc, nP, nQ), Wt(nR, tc, nP, nQ), Wg(ncmax, tc, nP, nQ), Wc(nk, tc, nP, nQ),
-        acc(nkI, tc, nP, nQ);
+    arr4_t G(nk, tc, nP, nQ), Gh(nk, tc, nP, nQ), Wt(nR, tc, nP, nQ);
+    memory::array<MEM, ComplexType, 5> accC(ncl, nkI, tc, nP, nQ);   // the back-transformed class sums of the chunk
+    [[maybe_unused]] arr4_t Wg, Wc;                                   // device: whole-chunk class buffers
+    if constexpr (MEM != HOST_MEMORY) {
+      Wg = arr4_t(ncmax, tc, nP, nQ);
+      Wc = arr4_t(nk, tc, nP, nQ);
+    }
+    const long cb = std::max(16L, detail::env_long("COQUI_GWLINE_IBZ_CB", 512));   // host column block
+    detail::scratch_t<HOST_MEMORY> s_gb, s_wc;
     arr2_t Em(tc, r), u1(nP, nb), t1(nb, nQ);
     arr4_t part_m(nkI, tc, nb, nb);
     nda::array<ComplexType, 4> part, partT;
@@ -240,29 +247,59 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
       if constexpr (MEM != HOST_MEMORY) utils::device_sync();
       Timer.stop("Sigma_W_time");
 
-      for (long c = 0; c < ncl; ++c) {
-        auto const &cl = ibz.cls[c];
-        const long nc  = cl.q_eff.size();
-        // 3. W_c^(R) = sum_j e^{-iQ_j R} W(q_eff_j); product with G^(R); back to the nk_ibz rows ks
-        Timer.start("Sigma_hadamard");
-        for (long j = 0; j < nc; ++j) Wg(j, tr, all, all) = Wt(ibz.rpos[cl.q_eff[j]], tr, all, all);
-        auto Wg2 = nda::reshape(Wg, std::array<long, 2>{ncmax, tc * blk})(nda::range(nc), cr);
-        auto Wc2 = nda::reshape(Wc, std::array<long, 2>{nk, tc * blk})(all, cr);
-        auto A2  = nda::reshape(acc, std::array<long, 2>{nkI, tc * blk})(all, cr);
-        nda::blas::gemm(ComplexType(1.0), Hc[c], Wg2, ComplexType(0.0), Wc2);
-        nda::tensor::elementwise(ComplexType(1.0), Gh2, ComplexType(1.0), Wc2, nda::tensor::op::MUL);
-        nda::blas::gemm(ComplexType(1.0), Bc[c], Wc2, ComplexType(0.0), A2);
-        if constexpr (MEM != HOST_MEMORY) utils::device_sync();
-        Timer.stop("Sigma_hadamard");
+      // 3. per class: W_c^(R) = sum_j e^{-iQ_j R} W(q_eff_j), product with G^(R), back to the nk_ibz rows ks -> accC(c)
+      //    host: blocked over the (t, P, Q) columns so that the G^ / W_c / product stripes of all classes stay in cache
+      //    (the unblocked form makes ~6 passes over N x (t block) arrays per class: memory-bound); env COQUI_GWLINE_IBZ_CB
+      Timer.start("Sigma_hadamard");
+      const long ncols = n * blk;
+      if constexpr (MEM == HOST_MEMORY) {
+        auto Gfull = nda::reshape(Gh, std::array<long, 2>{nk, tc * blk});
+        auto Wfull = nda::reshape(Wt, std::array<long, 2>{nR, tc * blk});
+        for (long c0 = 0; c0 < ncols; c0 += cb) {
+          const long w  = std::min(cb, ncols - c0);
+          const auto br = nda::range(c0, c0 + w);
+          auto Gs       = Gfull(all, br);
+          for (long c = 0; c < ncl; ++c) {
+            auto const &cl = ibz.cls[c];
+            const long nc  = cl.q_eff.size();
+            auto gb        = s_gb.template view<2>({nc, w});
+            for (long j = 0; j < nc; ++j) gb(j, all) = Wfull(ibz.rpos[cl.q_eff[j]], br);
+            auto wc = s_wc.template view<2>({nk, w});
+            nda::blas::gemm(ComplexType(1.0), Hc[c], gb, ComplexType(0.0), wc);
+            for (long R = 0; R < nk; ++R) {
+              ComplexType *wp = &wc(R, 0);
+              ComplexType const *gp = &Gs(R, 0);
+              for (long i = 0; i < w; ++i) wp[i] *= gp[i];
+            }
+            auto A2 = nda::reshape(accC(c, all, all, all, all), std::array<long, 2>{nkI, tc * blk})(all, br);
+            nda::blas::gemm(ComplexType(1.0), Bc[c], wc, ComplexType(0.0), A2);
+          }
+        }
+      } else {
+        for (long c = 0; c < ncl; ++c) {
+          auto const &cl = ibz.cls[c];
+          const long nc  = cl.q_eff.size();
+          for (long j = 0; j < nc; ++j) Wg(j, tr, all, all) = Wt(ibz.rpos[cl.q_eff[j]], tr, all, all);
+          auto Wg2 = nda::reshape(Wg, std::array<long, 2>{ncmax, tc * blk})(nda::range(nc), cr);
+          auto Wc2 = nda::reshape(Wc, std::array<long, 2>{nk, tc * blk})(all, cr);
+          auto A2  = nda::reshape(accC(c, all, all, all, all), std::array<long, 2>{nkI, tc * blk})(all, cr);
+          nda::blas::gemm(ComplexType(1.0), Hc[c], Wg2, ComplexType(0.0), Wc2);
+          nda::tensor::elementwise(ComplexType(1.0), Gh2, ComplexType(1.0), Wc2, nda::tensor::op::MUL);
+          nda::blas::gemm(ComplexType(1.0), Bc[c], Wc2, ComplexType(0.0), A2);
+        }
+        utils::device_sync();
+      }
+      Timer.stop("Sigma_hadamard");
 
-        // 4. contraction with the XD slices of (class, k), accumulated over the classes
-        Timer.start("Sigma_contract");
+      // 4. contraction with the XD slices of (class, k), accumulated over the classes
+      Timer.start("Sigma_contract");
+      for (long c = 0; c < ncl; ++c) {
         const ComplexType beta = (c == 0) ? ComplexType(0.0) : ComplexType(1.0);
         for (long k = 0; k < nkI; ++k) {
           auto const &L  = Lc[c * nkI + k];
           auto const &Rr = Rc[c * nkI + k];
           for (long it = 0; it < n; ++it) {
-            auto a = acc(k, it, all, all);
+            auto a = accC(c, k, it, all, all);
             auto o = part_m(k, it, all, all);
             if (right_first) {
               nda::blas::gemm(ComplexType(1.0), a, Rr, ComplexType(0.0), u1);
@@ -273,9 +310,9 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
             }
           }
         }
-        if constexpr (MEM != HOST_MEMORY) utils::device_sync();
-        Timer.stop("Sigma_contract");
       }
+      if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+      Timer.stop("Sigma_contract");
 
       // 5. reduction over the grid and transform to the line nodes (as self_energy, nk_ibz rows)
       Timer.start("Sigma_allreduce");

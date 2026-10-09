@@ -33,7 +33,8 @@
  *                poles: Pi rows and Sigma (<= 1e-13); (C) [.ibz_phys] sym vs nosym fixture of the same system: eigenvalues
  *                of Sigma(k, zeta) at the IBZ k (report: the THC / mean-field difference of the two fixtures).
  *  [ibz][scf]    the driver on lih222_sym / lih223_sym (IBZ) vs lih222 / lih223 (nosym, full BZ), 3 iterations: mu, QP gap per
- *                iteration, KS gaps of the two fixtures (the tolerance is the mean-field / THC difference of the fixtures).
+ *                iteration (gated at 1e-4 Ha on iterations 1-2: the THC difference of the two fixtures, 1e-5 at Np 128; iteration 3
+ *                reported only: closure basin noise); gygi on lih223 (eps_inf, iteration 1).
  */
 
 #undef NDEBUG
@@ -382,16 +383,18 @@ TEST_CASE("gw_line_ibz_scf", "[ibz][scf][gw_line]") {
     auto B = methods::gw_line::gw_line_scf<HOST_MEMORY>(*fn.thc, *fn.mf, ibz_scf_params("ibz_scf_" + nosym, niter));
     REQUIRE(long(A.history.size()) == niter);
     REQUIRE(long(B.history.size()) == niter);
+    // gated: iterations 1-2; iteration 3 reported only (the K = 8 closure flips basins on 1e-10 Sigma changes, S7f: the
+    // nosym reference itself moves by 2.3e-4 Ha in mu between the Mac and rusty at iteration 3)
     double dmu = 0.0, dgap = 0.0;
     for (long i = 0; i < niter; ++i) {
-      dmu  = std::max(dmu, std::abs(A.history[i].mu - B.history[i].mu));
-      dgap = std::max(dgap, std::abs(A.history[i].gap - B.history[i].gap));
+      if (i < 2) dmu = std::max(dmu, std::abs(A.history[i].mu - B.history[i].mu));
+      if (i < 2) dgap = std::max(dgap, std::abs(A.history[i].gap - B.history[i].gap));
       app_log(1, "  [ibz][scf] {} vs {} it {}: mu {:.10f} / {:.10f}, gap {:.8f} / {:.8f} Ha", sym, nosym, i + 1, A.history[i].mu,
               B.history[i].mu, A.history[i].gap, B.history[i].gap);
     }
     // the fixtures themselves: KS mid-gap and KS gap
-    app_log(1, "  [ibz][scf] {} vs {} ({} ranks): KS mu {:.10f} / {:.10f}; max |dmu| {:.2e} Ha, max |dgap| {:.2e} Ha over {} iterations",
-            sym, nosym, mpi.comm.size(), fs.mu, fn.mu, dmu, dgap, niter);
+    app_log(1, "  [ibz][scf] {} vs {} ({} ranks): KS mu {:.10f} / {:.10f}; max |dmu| {:.2e} Ha, max |dgap| {:.2e} Ha (iterations 1-2)",
+            sym, nosym, mpi.comm.size(), fs.mu, fn.mu, dmu, dgap);
     REQUIRE(dmu <= 1e-4);
     REQUIRE(dgap <= 1e-4);
   }
