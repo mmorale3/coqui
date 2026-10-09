@@ -76,11 +76,16 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <climits>
+#include <complex>
 #include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
 #include <vector>
+
+#include <mpi.h>
 
 #include "configuration.hpp"
 #include "IO/app_loggers.h"
@@ -416,6 +421,38 @@ void screened_mirror(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks_t<ME
     if (batched) ipiv_b = memory::array<MEM, int, 2>(nbat, Np);
   }
 
+  // perf 7.5b profile of this path (env COQUI_GWLINE_W_PROFILE = 1): a barrier before every redistribute (timer W_wait:
+  // the imbalance of the preceding step, otherwise hidden in W_redistribute) and the message pattern of the calls
+  const bool wprof = env_long("COQUI_GWLINE_W_PROFILE", 0) != 0;
+  long n_calls = 0;
+  double t_wait = 0.0, t_red = 0.0;
+  auto pbar = [&]() {
+    if (not wprof) return;
+    Timer.add("W_wait");
+    Timer.start("W_wait");
+    const auto t0 = std::chrono::steady_clock::now();
+    comm.barrier();
+    t_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    Timer.stop("W_wait");
+  };
+  auto redist = [&](auto &A, auto &B) {
+    const auto t0 = std::chrono::steady_clock::now();
+    math::nda::redistribute(A, B);
+    t_red += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    ++n_calls;
+  };
+  if (wprof) {
+    // forward call of a sub-step: every rank sends its blocks of the n_act x nzs matrices; the receivers are the ranks of the
+    // active q pools with a non-empty zeta chunk (one message each of nzl blocks)
+    const long nzs = plan.nzs, nzl = (nzs + lay.np_z - 1) / lay.np_z;
+    app_log(2, "  gw_line W profile (redistribute path): grid {} x {}, block {} x {} ({:.1f} KB), Dyson pools (q, zeta) = ({} x {}), "
+               "{} q sub-steps x {} zeta sub-slabs of {} nodes; forward / backward call: <= {} messages per rank of <= {} blocks "
+               "({:.1f} KB), {:.1f} MB per rank; transposed exchange: {} calls (one per {{q, -q}}) of {} x {} blocks to <= {} partners",
+            grid.np_P, grid.np_Q, nP, nQ, 16.0 * nP * nQ / 1024.0, lay.np_q, lay.np_z, plan.nsub_q, plan.n_zsub(), nzs,
+            lay.np_q * std::min(lay.np_z, nzs), nzl, 16.0 * nzl * nP * nQ / 1024.0, 16.0 * lay.np_q * nzs * nP * nQ / 1048576.0,
+            g, 2, n1, std::max(grid.np_P, grid.np_Q) / std::min(grid.np_P, grid.np_Q) + 1);
+  }
+
   // ---- (b) Dyson on the ray-1 nodes
   const std::array<long, 4> bgrid = {1, 1, grid.np_P, grid.np_Q}, ones = {1, 1, 1, 1};
   for (long s = 0; s < plan.nsub_q; ++s) {
@@ -441,7 +478,10 @@ void screened_mirror(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks_t<ME
       dview_t dTb(std::addressof(comm), bgrid, gsh, {0, 0, grid.P0, grid.Q0}, ones, Tb);
       auto D4 = sD.template view<4>({act ? 1L : 0L, nzl, Np, Np});
       dview_t dD(std::addressof(comm), lay.pgrid(), gsh, {act ? lay.ip_q : na, zf, 0, 0}, ones, D4);
-      math::nda::redistribute(dTb, dD);
+      Timer.stop("W_redistribute");
+      pbar();
+      Timer.start("W_redistribute");
+      redist(dTb, dD);
       if constexpr (MEM != HOST_MEMORY) {
         utils::device_sync();
         device_mem_probe();
@@ -484,8 +524,9 @@ void screened_mirror(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks_t<ME
       }
       Timer.stop("W_dyson");
 
+      pbar();
       Timer.start("W_redistribute");
-      math::nda::redistribute(dD, dTb);
+      redist(dD, dTb);
       for (long p = 0; p < na; ++p) Pi(plan.q_row(p, s), zrng, all, all) = Tb(p, all, all, all);
       if constexpr (MEM != HOST_MEMORY) utils::device_sync();
       Timer.stop("W_redistribute");
@@ -520,6 +561,7 @@ void screened_mirror(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks_t<ME
     if (j < i) continue;
     const long nu         = (j == i) ? 1 : 2;
     const long rows[2]    = {i, j};
+    pbar();
     Timer.start("W_redistribute");
     auto S = sS.template view<4>({nu, n1, nQ, nP});   // local transposed blocks: the piece (Q_rng, P_rng) of W^T
     for (long u = 0; u < nu; ++u) transpose_blocks<MEM>(Pi(rows[u], nda::range(n1), all, all), S(u, all, all, all));
@@ -527,7 +569,7 @@ void screened_mirror(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks_t<ME
     const std::array<long, 4> gsh = {nu, n1, Np, Np};
     dview_t dS(std::addressof(comm), tgrid, gsh, {0, 0, grid.Q0, grid.P0}, ones, S);
     dview_t dT(std::addressof(comm), bgrid, gsh, {0, 0, grid.P0, grid.Q0}, ones, T);
-    math::nda::redistribute(dS, dT);   // T(u) = block (P_rng, Q_rng) of W(q_u, z_ray1)^T
+    redist(dS, dT);   // T(u) = block (P_rng, Q_rng) of W(q_u, z_ray1)^T
     if constexpr (MEM != HOST_MEMORY) utils::device_sync();
     Timer.stop("W_redistribute");
     Timer.start("W_fit");
@@ -546,8 +588,399 @@ void screened_mirror(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks_t<ME
     Timer.stop("W_fit");
   }
 
+  if (wprof) {
+    double x[2] = {t_wait, t_red};
+    double xm[2] = {0, 0};
+    comm.all_reduce_n(x, 2, xm, boost::mpi3::max<>{});
+    double xa[2] = {0, 0};
+    comm.all_reduce_n(x, 2, xa, std::plus<>{});
+    app_log(2, "  gw_line W profile (redistribute path): {} redistribute calls, inside the calls avg {:.3f} / max {:.3f} s, "
+               "waiting at the barriers before them avg {:.3f} / max {:.3f} s",
+            n_calls, xa[1] / comm.size(), xm[1], xa[0] / comm.size(), xm[0]);
+  }
   if (W_nodes != nullptr) *W_nodes = std::move(Pi);
   Pi = arr4_t{};
+}
+
+/**
+ * perf 7.5b: node and cross-node communicators of the node-shared W stage. node: the ranks of one shared-memory node
+ * (MPI_COMM_TYPE_SHARED; env COQUI_GWLINE_W_NODE_SIZE > 0 splits it further into virtual nodes of that many ranks, for
+ * tests of the cross-node exchange on one machine); cross: the ranks with the same local index l on every node, ordered
+ * by the nodes' leader rank (cross rank = node index a). ok: every node has the same number of ranks.
+ */
+struct w_nodes_t {
+  MPI_Comm node = MPI_COMM_NULL, cross = MPI_COMM_NULL;
+  int L = 1, l = 0, NN = 1, a = 0;
+  bool ok = false;
+  explicit w_nodes_t(MPI_Comm comm) {
+    int rank = 0, np = 1;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &np);
+    MPI_Comm shm = MPI_COMM_NULL;
+    MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &shm);
+    const long vs = env_long("COQUI_GWLINE_W_NODE_SIZE", 0);
+    if (vs > 0) {
+      int sr = 0;
+      MPI_Comm_rank(shm, &sr);
+      MPI_Comm_split(shm, int(sr / vs), sr, &node);
+      MPI_Comm_free(&shm);
+    } else {
+      node = shm;
+    }
+    MPI_Comm_size(node, &L);
+    MPI_Comm_rank(node, &l);
+    int lr[2] = {L, -L};
+    MPI_Allreduce(MPI_IN_PLACE, lr, 2, MPI_INT, MPI_MIN, comm);
+    int leader = rank;
+    MPI_Bcast(&leader, 1, MPI_INT, 0, node);
+    MPI_Comm_split(comm, l, leader, &cross);
+    MPI_Comm_size(cross, &NN);
+    MPI_Comm_rank(cross, &a);
+    ok = (lr[0] == -lr[1]) and long(NN) * long(L) == long(np);
+  }
+  ~w_nodes_t() {
+    if (cross != MPI_COMM_NULL) MPI_Comm_free(&cross);
+    if (node != MPI_COMM_NULL) MPI_Comm_free(&node);
+  }
+  w_nodes_t(w_nodes_t const &)            = delete;
+  w_nodes_t &operator=(w_nodes_t const &) = delete;
+};
+
+/// [first, last) of chunk i of [b, e) in n chunks (itertools::chunk_range)
+inline std::array<long, 2> w_chunk(long b, long e, long n, long i) {
+  auto [x0, x1] = itertools::chunk_range(b, e, n, i);
+  return {long(x0), long(x1)};
+}
+
+/**
+ * perf 7.5b: the mirror W stage (screened_mirror, same arithmetic) with the (P, Q)-block -> whole-matrix transposition
+ * through NODE-SHARED memory instead of three all-to-all redistributes. Host only.
+ *   matrices    : the M = g n1 ray-1 Dyson problems m = i n1 + z (group row i, node z), node a solves the contiguous chunk
+ *                 [Ma0, Ma1) of m (chunk_range over the NN nodes), its rank l the chunk [m0, m1) of it (over the L ranks):
+ *                 balanced to one matrix (the q-pool layout leaves pools idle when np_q does not divide g);
+ *   forward     : every rank writes its block (P_rng, Q_rng) of the matrices of its node straight into the node window
+ *                 (MPI_Win_allocate_shared, C layout Np x Np per matrix); blocks of the matrices of other nodes go to the
+ *                 rank with the same local index there (pairwise MPI_Sendrecv rounds over the cross communicator), which
+ *                 writes them at the sender's (P, Q) coordinates;
+ *   Dyson       : in place in the window, per matrix the operations of screened_mirror (gemm I - Z Pi, getrf, getrs with
+ *                 Z, W = X - Z: the same values as its transpose / subtract / transpose sequence);
+ *   backward    : every rank reads its block of W(m) (-> Pi rows) and, for the pair fit, the transposed block
+ *                 W(m)[Q_rng, P_rng]^T (= its block of W(m)^T) from the window; for the matrices of other nodes the
+ *                 counterpart there packs both and sends them back (pairwise rounds);
+ *   ray 2, fit  : as screened_mirror (conj of the mirror row; w = VS (U1H W + U2H W^T) per row, the same fit_row).
+ * All moves are exact copies: W at the nodes and the residues equal those of the redistribute path up to the BLAS
+ * arithmetic of the Dyson on another buffer ([gw_line][w] gates). Returns false (collectively, before any work) when the
+ * layout does not apply: unequal ranks per node, a missing full Z(q) of a rank's rows (the Coulomb blocks keep the
+ * union of both layouts' rows, q_groups_t::dyson_q_list), MPI counts beyond int, or a transient above the budget
+ * (max(1.25 x the redistribute path's transient, 64 MB)).
+ */
+inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi, coulomb_blocks_t<HOST_MEMORY> const &Zb,
+                                 bosonic_basis_t const &basis, aux_grid_t const &grid, boost::mpi3::communicator &comm,
+                                 memory::array<HOST_MEMORY, ComplexType, 4> &w, utils::TimerManager &Timer,
+                                 memory::array<HOST_MEMORY, ComplexType, 4> *W_nodes, std::vector<long> const &qs, bool w_group,
+                                 std::vector<long> const &mrow, long n1, double old_transient) {
+  using Arr4_t  = memory::array<HOST_MEMORY, ComplexType, 4>;
+  using clk     = std::chrono::steady_clock;
+  auto secs     = [](clk::time_point t0) { return std::chrono::duration<double>(clk::now() - t0).count(); };
+  auto all      = nda::range::all;
+  const long g = Pi.extent(0), nz = Pi.extent(1), Np = grid.Np, nP = grid.nP, nQ = grid.nQ;
+  const long blk = nP * nQ, N2 = Np * Np, M = g * n1;
+  const long r   = basis.rank;
+  const auto t_all = clk::now();
+
+  w_nodes_t nd(comm.get());
+  const long NN = nd.NN, L = nd.L, a = nd.a, l = nd.l;
+  (void)L;
+  // geometry of the counterparts (b, l), b = 0..NN-1
+  std::vector<long> geo(4 * NN);
+  {
+    long me[4] = {grid.P0, grid.nP, grid.Q0, grid.nQ};
+    MPI_Allgather(me, 4, MPI_LONG, geo.data(), 4, MPI_LONG, nd.cross);
+  }
+  // this rank's matrices: chunk of [0, M) over the global ranks (q_groups_t::dyson_q_list keeps their full Z(q)); the node's
+  // matrices: the union over its ranks, contiguous when the node's ranks are consecutive (else: the redistribute path)
+  const auto [m0, m1] = w_chunk(0, M, comm.size(), comm.rank());
+  long mr[3] = {m0, -m1, m1 - m0};
+  MPI_Allreduce(MPI_IN_PLACE, mr, 2, MPI_LONG, MPI_MIN, nd.node);
+  MPI_Allreduce(MPI_IN_PLACE, mr + 2, 1, MPI_LONG, MPI_SUM, nd.node);
+  const long Ma0 = mr[0], Ma1 = -mr[1];
+  std::vector<long> nr(2 * NN);
+  {
+    long me2[2] = {Ma0, Ma1};
+    MPI_Allgather(me2, 2, MPI_LONG, nr.data(), 2, MPI_LONG, nd.cross);
+  }
+  auto nrange = [&](long b) { return std::array<long, 2>{nr[2 * b], nr[2 * b + 1]}; };
+  // feasibility (collective)
+  long bad = nd.ok ? 0 : 1;
+  if (not bad and mr[2] != Ma1 - Ma0) bad = 5;
+  for (long m = m0; m < m1 and not bad; ++m)
+    if (not Zb.has_full(qs[m / n1])) bad = 2;
+  double peak = 16.0 * double(Ma1 - Ma0) * double(N2) / double(L) + 16.0 * double(nz) * double(blk);
+  // cross-node messages: chunks of <= xcap elements per side (COQUI_GWLINE_W_XCHUNK_MB, default 16)
+  long bmax = 0;
+  for (long b = 0; b < NN; ++b) bmax = std::max(bmax, geo[4 * b + 1] * geo[4 * b + 3]);
+  long mbmax = 0;
+  for (long b = 0; b < NN; ++b) mbmax = std::max(mbmax, nrange(b)[1] - nrange(b)[0]);
+  const long xcap = std::max(2 * bmax, std::min(2 * mbmax * bmax, long(double(env_long("COQUI_GWLINE_W_XCHUNK_MB", 16)) * 1048576.0 / 16.0)));
+  if (NN > 1) {
+    peak += 16.0 * double(M - (Ma1 - Ma0)) * double(blk) + 2.0 * 16.0 * double(xcap);
+    if (xcap > long(INT_MAX)) bad = 3;
+  }
+  const double budget = std::max(1.25 * old_transient, 64.0 * 1048576.0);
+  if (not bad and peak > budget) bad = 4;
+  bad = comm.all_reduce_value(bad, boost::mpi3::max<>{});
+  const double peak_max = comm.all_reduce_value(peak, boost::mpi3::max<>{});
+  if (bad) {
+    app_log(2, "  gw_line W (perf 7.5b node path) not used ({}): the redistribute path follows",
+            bad == 1 ? "unequal ranks per node" : bad == 2 ? "full Z(q) of a row not kept" : bad == 3 ? "MPI count beyond int"
+            : bad == 4 ? "transient above the budget" : "the ranks of a node are not consecutive");
+    return false;
+  }
+  app_log(2, "  gw_line W (perf 7.5b node path): {} ray-1 matrices on {} node(s) x {} ranks, <= {} per rank, node window "
+             "{:.2f} GB, transient <= {:.3f} GB per rank (redistribute path {:.3f} GB)",
+          M, NN, L, (M + comm.size() - 1) / comm.size(), 16.0 * double(Ma1 - Ma0) * double(N2) / 1073741824.0,
+          peak_max / 1073741824.0, old_transient / 1073741824.0);
+
+  for (auto nm : {"W_redistribute", "W_dyson", "W_fit", "W_wait"}) Timer.add(nm);
+  const long w_rows = w_group ? g : Zb.nq;
+  if (w.extent(0) != w_rows or w.extent(1) != r or w.extent(2) != nP or w.extent(3) != nQ) {
+    w = Arr4_t(w_rows, r, nP, nQ);
+    w() = ComplexType(0.0);
+  }
+  bosonic_fit_t fit(basis, basis.zeta_nodes);
+  double t_fwd = 0.0, t_fx = 0.0, t_dys = 0.0, t_bwd = 0.0, t_bx = 0.0, t_fit = 0.0, t_wait = 0.0;
+  double by_intra = 0.0, by_inter = 0.0;
+
+  // node window
+  Timer.start("W_redistribute");
+  auto tw = clk::now();
+  MPI_Win win = MPI_WIN_NULL;
+  ComplexType *base = nullptr;
+  const MPI_Aint wbytes = (l == 0) ? MPI_Aint(Ma1 - Ma0) * MPI_Aint(N2) * MPI_Aint(sizeof(ComplexType)) : MPI_Aint(0);
+  MPI_Win_allocate_shared(wbytes, int(sizeof(ComplexType)), MPI_INFO_NULL, nd.node, &base, &win);
+  ComplexType *W0 = nullptr;
+  {
+    MPI_Aint sz = 0;
+    int du      = 0;
+    MPI_Win_shared_query(win, 0, &sz, &du, &W0);
+  }
+  MPI_Win_lock_all(MPI_MODE_NOCHECK, win);
+  auto mat = [&](long m) { return W0 + (m - Ma0) * N2; };
+  auto put = [&](ComplexType *Wm, long P0, long nP_, long Q0, long nQ_, ComplexType const *src) {
+    for (long p = 0; p < nP_; ++p) std::copy_n(src + p * nQ_, nQ_, Wm + (P0 + p) * Np + Q0);
+  };
+  auto get = [&](ComplexType const *Wm, long P0, long nP_, long Q0, long nQ_, ComplexType *dst) {
+    for (long p = 0; p < nP_; ++p) std::copy_n(Wm + (P0 + p) * Np + Q0, nQ_, dst + p * nQ_);
+  };
+  // transposed block: dst(p, q) = Wm(Q0 + q, P0 + p), (nP_ x nQ_), tiled
+  auto get_t = [&](ComplexType const *Wm, long P0, long nP_, long Q0, long nQ_, ComplexType *dst) {
+    constexpr long TB = 32;
+    for (long q0 = 0; q0 < nQ_; q0 += TB)
+      for (long p0 = 0; p0 < nP_; p0 += TB)
+        for (long q = q0; q < std::min(nQ_, q0 + TB); ++q) {
+          ComplexType const *s = Wm + (Q0 + q) * Np + P0;
+          for (long p = p0; p < std::min(nP_, p0 + TB); ++p) dst[p * nQ_ + q] = s[p];
+        }
+  };
+  auto pi_blk = [&](long m) { return Pi.data() + ((m / n1) * nz + (m % n1)) * blk; };
+  auto sync_node = [&]() {
+    MPI_Win_sync(win);
+    const auto t0 = clk::now();
+    MPI_Barrier(nd.node);
+    t_wait += secs(t0);
+    MPI_Win_sync(win);
+  };
+  const MPI_Datatype ct = MPI_CXX_DOUBLE_COMPLEX;
+  // one round of the cross-node exchange: ns matrices of es elements to `to` (pack(j, dst)), nr matrices of er elements from
+  // `from` (unpack(j, src)), in chunks of <= xcap elements (one tag per direction; the chunks of a pair are matched in order,
+  // both partners derive the same chunking)
+  std::vector<ComplexType> xs, xr;
+  auto xround = [&](long to, long ns, long es, auto &&pack, long from, long nr, long er, auto &&unpack, int tag0) {
+    const long cs = std::max(1L, xcap / std::max(1L, es)), cr = std::max(1L, xcap / std::max(1L, er));
+    const long ks = (ns + cs - 1) / cs, kr = (nr + cr - 1) / cr;
+    xs.resize(size_t(std::min(ns, cs) * es));
+    xr.resize(size_t(std::min(nr, cr) * er));
+    for (long c = 0; c < std::max(ks, kr); ++c) {
+      MPI_Request rq[2] = {MPI_REQUEST_NULL, MPI_REQUEST_NULL};
+      const long j0r = c * cr, j1r = std::min(nr, j0r + cr);
+      if (c < kr) MPI_Irecv(xr.data(), int((j1r - j0r) * er), ct, int(from), tag0, nd.cross, &rq[0]);
+      if (c < ks) {
+        const long j0 = c * cs, j1 = std::min(ns, j0 + cs);
+        for (long j = j0; j < j1; ++j) pack(j, xs.data() + (j - j0) * es);
+        MPI_Isend(xs.data(), int((j1 - j0) * es), ct, int(to), tag0, nd.cross, &rq[1]);
+        by_inter += 16.0 * double((j1 - j0) * es);
+      }
+      MPI_Waitall(2, rq, MPI_STATUSES_IGNORE);
+      if (c < kr)
+        for (long j = j0r; j < j1r; ++j) unpack(j, xr.data() + (j - j0r) * er);
+    }
+  };
+
+  // ---- forward: own blocks of the node's matrices into the window
+  for (long m = Ma0; m < Ma1; ++m) put(mat(m), grid.P0, nP, grid.Q0, nQ, pi_blk(m));
+  by_intra += 16.0 * double(Ma1 - Ma0) * double(blk);
+  // blocks of the other nodes' matrices: pairwise rounds with the counterparts
+  if (NN > 1) {
+    const auto tx = clk::now();
+    for (long s = 1; s < NN; ++s) {
+      const long to = (a + s) % NN, from = (a - s + NN) % NN;
+      const auto [t0, t1] = nrange(to);
+      const long fb       = geo[4 * from + 1] * geo[4 * from + 3];
+      xround(
+          to, t1 - t0, blk, [&](long j, ComplexType *d) { std::copy_n(pi_blk(t0 + j), blk, d); }, from, Ma1 - Ma0, fb,
+          [&](long j, ComplexType const *x) { put(mat(Ma0 + j), geo[4 * from], geo[4 * from + 1], geo[4 * from + 2], geo[4 * from + 3], x); },
+          751);
+    }
+    t_fx = secs(tx);
+  }
+  sync_node();
+  t_fwd = secs(tw);
+  Timer.stop("W_redistribute");
+
+  // ---- Dyson on this rank's matrices, in place (screened_mirror's arithmetic)
+  Timer.start("W_dyson");
+  const auto td = clk::now();
+  {
+    nda::matrix<ComplexType> Id(Np, Np), Mm(Np, Np);
+    Id() = ComplexType(0.0);
+    for (long P = 0; P < Np; ++P) Id(P, P) = ComplexType(1.0);
+    nda::matrix<ComplexType, nda::F_layout> ZF(Np, Np), XF(Np, Np);
+    nda::array<int, 1> ipiv(Np);
+    nda::array<ComplexType, 1> lwork;
+    long izf = -1;
+    for (long m = m0; m < m1; ++m) {
+      const long i = m / n1, z = m % n1;
+      if (i != izf) {
+        nda::matrix<ComplexType, nda::F_layout> zf_h(Zb.full(qs[i]));
+        ZF  = zf_h;
+        izf = i;
+      }
+      nda::array_view<ComplexType, 2> Pv(std::array<long, 2>{Np, Np}, mat(m));
+      Mm = Id;
+      nda::blas::gemm(ComplexType(-1.0), ZF, Pv, ComplexType(1.0), Mm);   // M = I - Z Pi
+      int info = nda::lapack::getrf(Mm, ipiv, lwork);
+      utils::check(info == 0, "gw_line::screened_interaction: getrf of I - Z Pi failed (q={}, node={}, info={})", qs[i], z, info);
+      XF   = ZF;
+      info = nda::lapack::getrs(Mm, XF, ipiv);   // XF = (I - Z Pi)^{-1} Z
+      utils::check(info == 0, "gw_line::screened_interaction: getrs failed (q={}, node={}, info={})", qs[i], z, info);
+      for (long P = 0; P < Np; ++P)
+        for (long Q = 0; Q < Np; ++Q) Pv(P, Q) = XF(P, Q) - ZF(P, Q);   // W = X - Z
+    }
+  }
+  t_dys = secs(td);
+  Timer.stop("W_dyson");
+  Timer.start("W_wait");
+  sync_node();
+  Timer.stop("W_wait");
+
+  // ---- backward: W blocks -> Pi rows (ray 1), transposed blocks for the fit (own node: read later from the window)
+  Timer.start("W_redistribute");
+  const auto tb = clk::now();
+  for (long m = Ma0; m < Ma1; ++m) get(mat(m), grid.P0, nP, grid.Q0, nQ, pi_blk(m));
+  by_intra += 16.0 * double(Ma1 - Ma0) * double(blk);
+  std::vector<ComplexType> tr;            // transposed blocks of the other nodes' matrices, m order (m outside [Ma0, Ma1))
+  std::vector<long> tr_off(NN > 1 ? M : 0, -1);
+  if (NN > 1) {
+    const auto tx = clk::now();
+    tr.resize(size_t((M - (Ma1 - Ma0)) * blk));
+    long off = 0;
+    for (long s = 1; s < NN; ++s) {
+      const long to = (a + s) % NN, from = (a - s + NN) % NN;
+      const long P0t = geo[4 * to], nPt = geo[4 * to + 1], Q0t = geo[4 * to + 2], nQt = geo[4 * to + 3], bt = nPt * nQt;
+      const auto [f0, f1] = nrange(from);
+      xround(
+          to, Ma1 - Ma0, 2 * bt,
+          [&](long j, ComplexType *d) {
+            get(mat(Ma0 + j), P0t, nPt, Q0t, nQt, d);
+            get_t(mat(Ma0 + j), P0t, nPt, Q0t, nQt, d + bt);
+          },
+          from, f1 - f0, 2 * blk,
+          [&](long j, ComplexType const *x) {
+            std::copy_n(x, blk, pi_blk(f0 + j));
+            std::copy_n(x + blk, blk, tr.data() + off);
+            tr_off[f0 + j] = off;
+            off += blk;
+          },
+          752);
+    }
+    t_bx = secs(tx);
+  }
+  t_bwd = secs(tb);
+  Timer.stop("W_redistribute");
+
+  // ---- ray 2: W(q, -conj z_i) = conj W(-q, z_i)
+  Timer.start("W_dyson");
+  for (long i = 0; i < g; ++i) {
+    ComplexType *dst = Pi.data() + (i * nz + n1) * blk;
+    ComplexType const *src = Pi.data() + (mrow[i] * nz) * blk;
+    for (long x = 0; x < n1 * blk; ++x) dst[x] = std::conj(src[x]);
+  }
+  Timer.stop("W_dyson");
+
+  // ---- fits: w(q) = VS (U1H W(q) + U2H W(-q)^T)
+  Timer.start("W_fit");
+  const auto tf = clk::now();
+  {
+    const long k  = fit.k;
+    const long bc = std::clamp(long(double(g) * nz * blk / (64.0 * double(std::max(k, 1L)))), std::min(blk, 4096L), blk);
+    nda::matrix<ComplexType> U1H = fit.U1H, U2H = fit.U2H, VS = fit.VS, Y(k, bc);
+    nda::array<ComplexType, 3> WT(nz, nP, nQ);
+    std::vector<ComplexType> tmp(blk);
+    auto T_of = [&](long m, ComplexType *dst) {   // block of W(m)^T: W(m)[Q_rng, P_rng]^T
+      if (m >= Ma0 and m < Ma1) get_t(mat(m), grid.P0, nP, grid.Q0, nQ, dst);
+      else std::copy_n(tr.data() + tr_off[m], blk, dst);
+    };
+    for (long i = 0; i < g; ++i) {
+      for (long z = 0; z < n1; ++z) {
+        T_of(mrow[i] * n1 + z, WT.data() + z * blk);   // ray 1: W(-q, z_i)^T
+        T_of(i * n1 + z, tmp.data());                  // ray 2: conj W(q, z_i)^T
+        ComplexType *d2 = WT.data() + (n1 + z) * blk;
+        for (long x = 0; x < blk; ++x) d2[x] = std::conj(tmp[x]);
+      }
+      auto W2  = nda::reshape(Pi(i, all, all, all), std::array<long, 2>{nz, blk});
+      auto WT2 = nda::reshape(WT, std::array<long, 2>{nz, blk});
+      auto w2  = nda::reshape(w(w_group ? i : qs[i], all, all, all), std::array<long, 2>{r, blk});
+      for (long c0 = 0; c0 < blk; c0 += bc) {
+        const auto cr = nda::range(c0, std::min(blk, c0 + bc));
+        auto Yc       = Y(all, nda::range(cr.size()));
+        nda::blas::gemm(ComplexType(1.0), U1H, W2(all, cr), ComplexType(0.0), Yc);
+        nda::blas::gemm(ComplexType(1.0), U2H, WT2(all, cr), ComplexType(1.0), Yc);
+        nda::blas::gemm(ComplexType(1.0), VS, Yc, ComplexType(0.0), w2(all, cr));
+      }
+    }
+  }
+  t_fit = secs(tf);
+  Timer.stop("W_fit");
+
+  Timer.start("W_wait");
+  MPI_Win_unlock_all(win);
+  {
+    const auto t0 = clk::now();
+    MPI_Barrier(nd.node);
+    t_wait += secs(t0);
+  }
+  MPI_Win_free(&win);
+  Timer.stop("W_wait");
+
+  {   // profile (max over ranks)
+    double x[9] = {t_fwd, t_fx, t_dys, t_bwd, t_bx, t_fit, t_wait, by_intra, by_inter};
+    comm.all_reduce_in_place_n(x, 9, boost::mpi3::max<>{});
+    double tot = secs(t_all);
+    tot        = comm.all_reduce_value(tot, boost::mpi3::max<>{});
+    app_log(2, "  gw_line W node path (s, max over ranks): forward {:.3f} (inter-node {:.3f}) | Dyson {:.3f} | backward {:.3f} "
+               "(inter-node {:.3f}) | fit {:.3f} | node barriers {:.3f} | total {:.3f}; per rank {:.3f} GB intra-node copies, "
+               "{:.3f} GB sent to other nodes in {} pairwise rounds",
+            x[0], x[1], x[2], x[3], x[4], x[5], x[6], tot, x[7] / 1073741824.0, x[8] / 1073741824.0, 2 * (NN - 1));
+  }
+  if (W_nodes != nullptr) *W_nodes = std::move(Pi);
+  Pi = Arr4_t{};
+  return true;
+}
+
+/// perf 7.5b: env COQUI_GWLINE_W_REDIST: "node" (default, screened_mirror_node on the host) | "old" (redistribute path)
+inline std::string w_redist_mode() {
+  char const *v = std::getenv("COQUI_GWLINE_W_REDIST");
+  return (v == nullptr or *v == '\0') ? std::string("node") : std::string(v);
 }
 
 } // namespace detail
@@ -600,6 +1033,22 @@ void screened_interaction(memory::array<MEM, ComplexType, 4> &Pi, coulomb_blocks
   // perf 7.1 (b)/(c): mirror-symmetric nodes -> Dyson on ray 1, ray 2 by conjugation, transposed fit data by exchange
   // (detail::screened_mirror); env COQUI_GWLINE_W_MIRROR = 0 keeps the path below
   if (const long n1 = numerics::line_dlr::mirror_half(basis.zeta_nodes); n1 > 0 and detail::env_long("COQUI_GWLINE_W_MIRROR", 1) != 0) {
+    if constexpr (MEM == HOST_MEMORY) {
+      if (detail::w_redist_mode() != "old") {
+        // the budget: the W-stage transient the q plan reserved for the redistribute path (aux_grid_t::model)
+        double old_t = 16.0 * double(g) * double(nz) * double(grid.max_block_size());
+        if (dyson_layout_t::valid(comm.size(), g, nz)) {
+          const long mb = grid.max_block_size();
+          dyson_layout_t lay0(comm.size(), comm.rank(), g, nz, Np);
+          w_plan_t plan0(lay0, mb);
+          const double kfit = std::min(double(nz), std::max(double(g) * nz / 64.0, double(nz) * std::min(mb, 4096L) / double(mb)));
+          const double stg  = std::min(2.0 * 1073741824.0, 2.0 * 16.0 * double(lay0.np_q) * plan0.nzs * mb);
+          old_t = std::max(old_t, plan0.transient_bytes(kfit, 1, comm.size() > 1 ? stg : 0.0));
+        }
+        old_t = comm.all_reduce_value(old_t, boost::mpi3::min<>{});
+        if (detail::screened_mirror_node(Pi, Zb, basis, grid, comm, w, Timer, W_nodes, qs, w_group, mrow, n1, old_t)) return;
+      }
+    }
     const long np_q = utils::find_proc_grid_max_npools(comm.size(), g, 0.2);
     if (comm.size() / np_q <= n1) {
       detail::screened_mirror<MEM>(Pi, Zb, basis, grid, mpi, w, Timer, W_nodes, qs, w_group, mrow, n1);

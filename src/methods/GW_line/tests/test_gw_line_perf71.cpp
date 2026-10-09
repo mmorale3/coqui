@@ -538,6 +538,99 @@ void run_ab(std::string const &name, long nI_factor) {
   REQUIRE(e_sh <= 1e-12);
 }
 
+/**
+ * [gw_line][w] perf 7.5b: the node-shared W stage (screened_mirror_node, COQUI_GWLINE_W_REDIST = node, the default on the
+ * host) vs the redistribute path (= old), same Pi and Coulomb blocks: W at the nodes, the residues and their pole sums at
+ * 12 ray points, <= 1e-13 relative (exact copies; only the BLAS arithmetic of the Dyson on another buffer may differ).
+ * Variants: (i) all q in one group, (ii) virtual nodes of one rank (COQUI_GWLINE_W_NODE_SIZE = 1: the cross-node
+ * exchange; with 2 ranks two "nodes"), (iii) pair-closed q groups of <= 2 q (rows of the group only).
+ */
+void run_wnode(std::string const &name, long nI_factor) {
+  auto &mpi  = utils::make_unit_test_mpi_context();
+  auto &comm = mpi->comm;
+  auto f     = make_fixture(name, nI_factor);
+  auto &mf   = *f.mf;
+  auto &thc  = *f.thc;
+  const long nq = f.nq, Np = f.Np;
+  const double deg = std::numbers::pi / 180.0, theta = 20.0 * deg, theta_t = 10.0 * deg;
+  double emin_occ = 1e300, emax_vir = -1e300;
+  for (long ik = 0; ik < f.nk; ++ik)
+    for (long n = 0; n < f.nb; ++n) {
+      if (f.e_rel(ik, n) < 0) emin_occ = std::min(emin_occ, f.e_rel(ik, n));
+      else emax_vir = std::max(emax_vir, f.e_rel(ik, n));
+    }
+  numerics::line_dlr::bosonic_basis_t basis(theta, std::max(4.0, 1.2 * (emax_vir - emin_occ)), 1e-10, 0.5 * f.ks_gap);
+  const long nz = basis.zeta_nodes.size();
+  REQUIRE(numerics::line_dlr::mirror_half(basis.zeta_nodes) > 0);
+  const double smax = 30.0 / (f.poles.emin() * std::sin(theta_t));
+  time_ray_t ray_p(theta_t, smax, 1e-5, 1.5, 12, sector_t::particle), ray_h(theta_t, smax, 1e-5, 1.5, 12, sector_t::hole);
+  aux_grid_t grid(*mpi, Np);
+  propagator_t<HOST_MEMORY> prop(thc, grid);
+  auto rel = [&](auto const &a, auto const &b) {
+    const double d = comm.all_reduce_value(max_diff3(a, b), mpi3::max<>{});
+    const double m = comm.all_reduce_value(max_abs3(b), mpi3::max<>{});
+    return d / m;
+  };
+  utils::TimerManager T;
+  memory::array<HOST_MEMORY, ComplexType, 4> Pn;
+  polarization<HOST_MEMORY>(prop, f.poles, mf, grid, basis.zeta_nodes, ray_p, ray_h, 8, Pn, T);
+  std::vector<long> qm(nq);
+  for (long q = 0; q < nq; ++q) qm[q] = mf.qminus()(q);
+  auto z12 = twelve_points(theta);
+  auto poles12 = [&](memory::array<HOST_MEMORY, ComplexType, 4> const &wa, memory::array<HOST_MEMORY, ComplexType, 4> const &wb,
+                     std::vector<long> const &rows) {
+    double e = 0.0;
+    for (long q : rows)
+      for (auto s : {sector_t::particle, sector_t::hole}) {
+        memory::array<HOST_MEMORY, ComplexType, 3> A(12, grid.nP, grid.nQ), B(12, grid.nP, grid.nQ);
+        eval_poles<HOST_MEMORY>(wa, basis, q, qm[q], z12, s, s == sector_t::hole, A());
+        eval_poles<HOST_MEMORY>(wb, basis, q, qm[q], z12, s, s == sector_t::hole, B());
+        e = std::max(e, rel(A, B));
+      }
+    return e;
+  };
+  for (long gsize : {nq, 2L}) {
+    q_groups_t qg(nq, gsize, qm);
+    coulomb_blocks_t<HOST_MEMORY> Zb(thc, grid, qg.dyson_q_list(comm.size(), comm.rank(), nz, Np), T);
+    for (long G = 0; G < qg.n; ++G) {
+      auto const &qs = qg.rows(G);
+      const long g   = qs.size();
+      memory::array<HOST_MEMORY, ComplexType, 4> P0(g, nz, grid.nP, grid.nQ);
+      for (long i = 0; i < g; ++i) P0(i, nda::range::all, nda::range::all, nda::range::all) = Pn(qs[i], nda::range::all, nda::range::all, nda::range::all);
+      memory::array<HOST_MEMORY, ComplexType, 4> Pc = P0, wo, wn, wv, Wo, Wn, Wv;
+      {
+        env_scope_t e1("COQUI_GWLINE_W_REDIST", "old");
+        screened_interaction<HOST_MEMORY>(Pc, Zb, basis, grid, *mpi, wo, T, &Wo, qs, false);
+      }
+      Pc = P0;
+      {
+        env_scope_t e1("COQUI_GWLINE_W_REDIST", "node");
+        screened_interaction<HOST_MEMORY>(Pc, Zb, basis, grid, *mpi, wn, T, &Wn, qs, false);
+      }
+      Pc = P0;
+      {
+        env_scope_t e1("COQUI_GWLINE_W_REDIST", "node"), e2("COQUI_GWLINE_W_NODE_SIZE", "1");
+        screened_interaction<HOST_MEMORY>(Pc, Zb, basis, grid, *mpi, wv, T, &Wv, qs, false);
+      }
+      const double e_wn = rel(Wn, Wo), e_wv = rel(Wv, Wo), e_rn = rel(wn, wo), e_rv = rel(wv, wo);
+      const double e_pn = poles12(wn, wo, qs), e_pv = poles12(wv, wo, qs);
+      app_log(2, "[w 7.5b] {} ({} ranks, grid {}x{}, group {} of {}: {} q, {} nodes): node path vs redistribute: W at the nodes "
+                 "{:.2e} / virtual nodes {:.2e}; residues {:.2e} / {:.2e}; pole sums at 12 points {:.2e} / {:.2e}",
+              name, comm.size(), grid.np_P, grid.np_Q, G, qg.n, g, nz, e_wn, e_wv, e_rn, e_rv, e_pn, e_pv);
+      REQUIRE(e_wn <= 1e-13);
+      REQUIRE(e_wv <= 1e-13);
+      REQUIRE(e_rn <= 1e-13);
+      REQUIRE(e_rv <= 1e-13);
+      REQUIRE(e_pn <= 1e-13);
+      REQUIRE(e_pv <= 1e-13);
+    }
+  }
+}
+
+TEST_CASE("gw_line_w75_lih222", "[gw_line][w]") { run_wnode("qe_lih222", 8); }
+TEST_CASE("gw_line_w75_si211", "[gw_line][w]") { run_wnode("qe_si211", 8); }
+TEST_CASE("gw_line_w75_lih223", "[gw_line][w]") { run_wnode("qe_lih223", 8); }
+
 } // namespace
 
 TEST_CASE("gw_line_perf71_ab_lih222", "[gw_line][perf71]") { run_ab("qe_lih222", 8); }

@@ -281,11 +281,22 @@ struct q_groups_t {
     for (auto const &v : qs) m = std::max(m, long(v.size()));
     return m;
   }
+  /// perf 7.5b: + the rows of the node-shared W stage (screened_mirror_node: the ray-1 matrices m = i n1 + z, n1 = nz / 2,
+  /// chunked over the ranks), so that both W paths find their full Z(q)
   std::vector<long> dyson_q_list(long np, long rank, long nz, long Np) const {
     std::vector<long> v;
     for (long G = 0; G < n; ++G) {
-      dyson_layout_t lay(np, rank, size(G), nz, Np);
-      for (long q = lay.q_first; q < lay.q_first + lay.nq_loc; ++q) v.push_back(qs[G][q]);
+      if (dyson_layout_t::valid(np, size(G), nz)) {
+        dyson_layout_t lay(np, rank, size(G), nz, Np);
+        for (long q = lay.q_first; q < lay.q_first + lay.nq_loc; ++q) v.push_back(qs[G][q]);
+      }
+      if (nz % 2 == 0 and nz > 0) {
+        const long n1 = nz / 2, M = size(G) * n1;
+        auto [m0, m1] = itertools::chunk_range(0, M, np, rank);
+        if (m1 > m0)
+          for (long i = m0 / n1; i <= (m1 - 1) / n1; ++i)
+            if (std::find(v.begin(), v.end(), qs[G][i]) == v.end()) v.push_back(qs[G][i]);
+      }
     }
     return v;
   }
