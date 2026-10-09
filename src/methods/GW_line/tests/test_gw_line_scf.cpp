@@ -466,7 +466,9 @@ TEST_CASE("gw_line_closure_scan", "[gw_line][scf][closure][scan]") {
       CHECK(vm[1] <= 1e-5);
       CHECK(vm[2] <= 1e-5);
       CHECK(vm[3] <= 1e-5);
-      CHECK(vm[4] <= 1e-5);
+      // vs the eigen scan: one golden bracket step of phase moves Sigma by up to ~2e-5 (perf 7.4b: 2.1e-5 at 2 ranks on an
+      // icelake node, job 7203091; 3.7e-6..7.5e-6 on genoa / the Mac)
+      CHECK(vm[4] <= 5e-5);
     }
   }
 
