@@ -48,6 +48,8 @@ void transform_k2g(bool trev, nda::stack_array<double, 3, 3> const& Rinv,
   int* err_d;
   int err = 0;
   cuda::cuda_check(cudaMalloc((void**)&err_d, sizeof(int)), "cudaMalloc");
+  // the kernel only ever sets the flag; it must start at 0 (uninitialized device memory gave random aborts)
+  cuda::cuda_check(cudaMemset(err_d, 0, sizeof(int)), "cudaMemset");
   cuda::synchronize();
   auto k2g_d = to_cuda_std_mdspan(k2g);
   auto kernel = utils::detail::transform_k2g<decltype(k2g_d)>{(trev?-1.0:1.0),
