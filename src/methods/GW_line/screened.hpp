@@ -657,9 +657,9 @@ struct w_nodes_t {
  * perf 7.5b: the node-shared buffer of screened_mirror_node: the matrices of the node, every rank's chunk [m0, m1) in its OWN
  * segment, every segment mapped by every rank of the node (seg(r) = base of local rank r's segment). Backend (env
  * COQUI_GWLINE_W_SHM):
- *   "posix" (default): one shm_open object per rank in /dev/shm (tmpfs), pre-faulted by its owner (the first-touch page faults
- *           of ONE shared object serialize on its inode: 14.7 s for 21 GB on a rome node, job 7204203; per-rank objects fault
- *           in parallel and land on the owner's NUMA domain); kept between calls (env COQUI_GWLINE_W_KEEP, default 1) while
+ *   "posix" (default): one shm_open object per rank in /dev/shm (tmpfs) (the first-touch page faults of ONE shared object
+ *           serialize on its inode: 14.7 s for 21 GB on a rome node, job 7204203; per-rank objects fault in parallel, 1.7 s);
+ *           kept between calls (env COQUI_GWLINE_W_KEEP, default 1) while
  *           every segment is large enough and the node total is <= COQUI_GWLINE_W_KEEP_FRAC (0.1) x MemAvailable;
  *   "mpi"  : MPI_Win_allocate_shared per call (OpenMPI 4.1 backs it with ONE file in its session directory, on rusty the
  *           NVMe /tmp: 16.8 s / 50 s for the 21 / 65 GB of si444 IBZ / full BZ, jobs 7203962 / 7203963).
@@ -761,9 +761,11 @@ class node_shm_t {
         if (p[r] != nullptr) munmap(p[r], size_t(sizes[r]));
       return false;
     }
-    // pre-fault my segment (env COQUI_GWLINE_W_PREFAULT = owner (default): the owner's NUMA domain, the per-rank objects
-    // fault in parallel | none: the forward pass faults the pages, on the writers' domains)
-    if (env_string_w("COQUI_GWLINE_W_PREFAULT", "owner") == "owner") {
+    // pre-fault (env COQUI_GWLINE_W_PREFAULT): none (default): the first forward pass faults the pages, on the writers' NUMA
+    // domains (the per-rank objects fault in parallel), so the copies of the later calls stay local: si444 IBZ rome 1 node
+    // W_redistribute 1.93 / 0.47 / 0.46 s (iterations 1-3) | owner: the owner pre-faults its segment (its NUMA domain):
+    // 1.36 / 1.14 / 1.14 s (job 7204530)
+    if (env_string_w("COQUI_GWLINE_W_PREFAULT", "none") == "owner") {
       const auto t0 = std::chrono::steady_clock::now();
       std::memset(p[lrank], 0, size_t(sizes[lrank]));
       t_prefault = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -960,7 +962,7 @@ inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi,
   app_log(2, "  gw_line W (perf 7.5b node path): {} ray-1 matrices on {} node(s) x {} ranks, <= {} per rank, node buffer "
              "{:.2f} GB ({}{}), transient <= {:.3f} GB per rank (redistribute path {:.3f} GB)",
           M, NN, L, (M + comm.size() - 1) / comm.size(), 16.0 * double(Ma1 - Ma0) * double(N2) / 1073741824.0, shm.backend,
-          shm.kept ? ", kept from the previous call" : (shm.backend == "mpi" ? ", per call" : ", new: pre-faulted by the owners"),
+          shm.kept ? ", kept from the previous call" : (shm.backend == "mpi" ? ", per call" : ", new"),
           peak_max / 1073741824.0,
           old_transient / 1073741824.0);
 
