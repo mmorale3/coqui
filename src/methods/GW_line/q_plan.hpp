@@ -55,6 +55,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <string>
@@ -310,10 +311,10 @@ q_plan_t choose_q_plan(comm_t &comm, ncomm_t &node_comm, [[maybe_unused]] aux_gr
   if (long v = detail::env_long("COQUI_GWLINE_SIGMA_QGROUP", 0); v > 0) qp.gs_sigma = std::min(v, nq);
   if (not qp.w_host) qp.gs_sigma = nq;
   app_log(1, "  q plan: {} q groups of <= {} of {} rows ({}{}); model per rank: host {:.3f} GB (all q {:.3f}, least-memory grouping {:.3f}) budget {}{}",
-          qp.ngroups, qp.g, nq, qp.reason, qp.level > 0 ? fmt::format("; relief level {}", qp.level) : std::string(""), qp.model_host / GB, qp.model_host_all / GB, qp.model_host_min / GB,
-          qp.budget_host > 0.0 ? fmt::format("{:.3f} GB", qp.budget_host / GB) : std::string("unconstrained"),
+          qp.ngroups, qp.g, nq, qp.reason, qp.level > 0 ? std::format("; relief level {}", qp.level) : std::string(""), qp.model_host / GB, qp.model_host_all / GB, qp.model_host_min / GB,
+          qp.budget_host > 0.0 ? std::format("{:.3f} GB", qp.budget_host / GB) : std::string("unconstrained"),
           MEM == HOST_MEMORY ? std::string("")
-                             : fmt::format("; device {:.3f} GB (all q {:.3f}) budget {:.3f} GB", qp.model_dev / GB,
+                             : std::format("; device {:.3f} GB (all q {:.3f}) budget {:.3f} GB", qp.model_dev / GB,
                                            qp.model_dev_all / GB, qp.budget_dev / GB));
   return qp;
 }

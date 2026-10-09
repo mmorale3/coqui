@@ -61,6 +61,7 @@
 #include <complex>
 #include <numeric>
 #include <random>
+#include <format>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -2725,7 +2726,7 @@ TEST_CASE("gw_line_qplan_driver", "[gw_line][scf][qplan]") {
     app_log(1, "[qplan] {} ({} ranks, {} q): all q: {} group(s), model {:.4f} MB (smallest groups {:.4f} MB, budget {}); forced budget "
                "{:.4f} MB -> {} groups of <= {} q, model {:.4f} MB; vs all q: |dmu| {:.1e} |dgap| {:.1e} Sigma {:.1e}",
             fx, comm.size(), nq, A.q_ngroups, A.q_model_host_all / 1048576.0, A.q_model_host_min / 1048576.0,
-            A.q_budget_host > 0.0 ? fmt::format("{:.1f} MB", A.q_budget_host / 1048576.0) : std::string("unconstrained"),
+            A.q_budget_host > 0.0 ? std::format("{:.1f} MB", A.q_budget_host / 1048576.0) : std::string("unconstrained"),
             bud / 1048576.0, B.q_ngroups, B.q_group_size, B.q_model_host / 1048576.0, dmu, dgap, dS);
     REQUIRE(B.q_ngroups > 1);
     REQUIRE(B.q_group_size < nq);
