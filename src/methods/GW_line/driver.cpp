@@ -1226,13 +1226,16 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   // si444 IBZ: VmHWM 2.77 GB vs model 1.48 GB): the A^ cache of Pi's real-space transform (propagators.hpp, N_k x N_t
   // blocks when enabled; N_t estimated by the bosonic node count) and, on the IBZ, the class-sum arrays of self_energy_ibz
   // (G~, G^ of all k, W(t) of the rows R, the back-transformed class sums: (2 N_k + |R| + n_cls nk_ibz) t_chunk blocks)
+  // device: the kernels size their chunk from the free memory at the call (40%, >= 8): the plan needs only the minimum chunk
+  const long tc_plan = (MEM == HOST_MEMORY) ? tc_model : (prm.t_chunk > 0 ? prm.t_chunk : 8L);
   auto kernels_model = [&](long g, long nzb_) {
     q_groups_t qgg(ibz.rows, g, ibz.qminus);
-    const auto mm    = grid.model(nkF, nqR, nzb_, bos->rank, tc_model, nb, qgg.max_size(), dev_fused);
+    const auto mm    = grid.model(nkF, nqR, nzb_, bos->rank, tc_plan, nb, qgg.max_size(), dev_fused);
     const double b16 = 16.0 * double(grid.max_block_size());
     double stage     = mm.peak_stage;
     if (ibz.active) {
-      const double sg = (2.0 * nkF + nqR + double(ibz.nclasses()) * nk) * double(tc_model) * b16;
+      const double sg = (2.0 * nkF + nqR + double(ibz.nclasses()) * nk + (MEM == HOST_MEMORY ? 0.0 : double(nkF + nqR))) *
+                        double(tc_plan) * b16;
       stage           = std::max({mm.res + mm.pi_t, mm.res + mm.w_t, mm.res - mm.pig + sg});
     }
     const double ahat = double(nkF) * double(nzb_) * b16;
