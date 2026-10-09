@@ -48,8 +48,8 @@
  * batched Z2Z plans directly on the chunk arrays (istride = row stride, idist = 1, batch = columns, in column blocks).
  *
  * Mode (kft_mode): env COQUI_GWLINE_KFT = "gemm" (the perf 7.1 dense gemms), "fft", or unset / "auto": FFT when the map is
- * valid, the build has the FFT library and N >= COQUI_GWLINE_KFT_NMIN (default kft_nmin_default, the measured
- * crossover, see the progress entry perf 7.5c).
+ * valid, the build has the FFT library and N >= COQUI_GWLINE_KFT_NMIN (defaults kft_nmin_default (host, measured) and
+ * kft_nmin_default_device (modelled), see below and the progress entry perf 7.5c).
  */
 
 #include <algorithm>
@@ -80,8 +80,15 @@
 
 namespace methods::gw_line {
 
-/// measured crossover (perf 7.5c): the FFT path is the default for meshes with at least this many k points
-inline constexpr long kft_nmin_default = 8;
+/**
+ * Crossover of the automatic mode (perf 7.5c). Host, measured ([.kft_bench], every core of a node busy): the blocked FFT
+ * pipeline is 7.8x (rome) / 7.7x (genoa) faster than the gemms at 4^3, 13x at 6^3, 21-24x at 8^3, and the in-run Pi / Sigma
+ * convolutions 2.7x (4^3) - 5.3x (6^3): FFT for every mesh. Device, modelled (not yet measured on a GPU): the dense zgemm
+ * at ~15 TF/s vs a memory-bound cuFFT pass (2 N 16 bytes per column at ~1.5 TB/s) gives only ~1.5x at 4^3 and the strided
+ * cuFFT layout may lose that: gemm below N = 100, FFT from 5^3 up (COQUI_GWLINE_KFT_NMIN overrides both).
+ */
+inline constexpr long kft_nmin_default        = 8;
+inline constexpr long kft_nmin_default_device = 100;
 
 /// mesh positions of k and Q_q (see the file header); built from kmesh_ft_t and verified against its gemm matrices
 struct kmesh_map_t {
@@ -184,7 +191,8 @@ kft_mode_t kft_mode(kmesh_map_t const &map) {
   }
   if (s == "fft") return kft_mode_t::fft;
   char const *nm = std::getenv("COQUI_GWLINE_KFT_NMIN");
-  const long nmin = (nm != nullptr and *nm != '\0') ? std::strtol(nm, nullptr, 10) : kft_nmin_default;
+  const long nmin = (nm != nullptr and *nm != '\0') ? std::strtol(nm, nullptr, 10)
+                                                    : (MEM == HOST_MEMORY ? kft_nmin_default : kft_nmin_default_device);
   return map.N >= nmin ? kft_mode_t::fft : kft_mode_t::gemm;
 }
 
