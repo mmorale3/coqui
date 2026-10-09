@@ -39,6 +39,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <string>
@@ -58,40 +60,83 @@ namespace methods::gw_line {
 
 class closure_cores_t {
  public:
-  /// collective over comm; nk: number of k of the closure (owner of k = k mod np)
+  /**
+   * The k loop of the closure (collective over comm; nk: number of k, owner of k = k mod np). np > N_k: the ranks >= N_k
+   * lend their cores to the owners of their host. Placement (env COQUI_GWLINE_CLOSURE_PLACE):
+   *   "block" (perf 7.5a, default): the cores of the host are split per socket (physical_package_id) into contiguous blocks,
+   *            the owners of the host are spread over the sockets in proportion to their cores, one block per owner (owner
+   *            i of the host -> block i, blocks in core order); the owner's master thread moves to its block (its own core
+   *            may belong to another owner's block). Every BLAS thread of an owner runs on its own core of one socket.
+   *   "interleave" (perf 7.1 (f)): owner r keeps its core and takes the cores of the ranks r + N_k, r + 2 N_k, ... (on
+   *            rome 1 node: 64 owners / helpers on socket 0, the rest on socket 1 -> chains across both sockets).
+   */
   closure_cores_t(boost::mpi3::communicator &comm, long nk) : comm_(&comm) {
     char const *v = std::getenv("COQUI_GWLINE_CLOSURE_BORROW");
     const bool enable = (v == nullptr or *v == '\0' or std::strtol(v, nullptr, 10) != 0);
     const long np = comm.size(), rank = comm.rank();
     if (not enable or np <= nk or nk < 1) return;
 #if defined(__linux__)
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
+    std::vector<long> all;
     long mycpu = -1;
-    if (sched_getaffinity(0, sizeof(mask), &mask) == 0 and CPU_COUNT(&mask) == 1)
-      for (int c = 0; c < CPU_SETSIZE; ++c)
-        if (CPU_ISSET(c, &mask)) mycpu = c;
-    char host[256] = {0};
-    gethostname(host, sizeof(host) - 1);
-    std::array<long, 2> me = {long(std::hash<std::string>{}(std::string(host)) & 0x7fffffffffffL), mycpu};
-    std::vector<long> all(2 * np);
-    comm.all_gather_n(me.data(), 2, all.data(), 2);
-    for (long r = 0; r < np; ++r)
-      if (all[2 * r + 1] < 0) return;   // some rank is not bound to one core: nothing to lend (collectively)
+    if (not gather(comm, 0, all, mycpu)) return;
     active_ = true;
+    const long host = all[NF * rank];
+    std::vector<long> own, hr;   // owners / all ranks of my host, rank order
+    for (long r = 0; r < np; ++r)
+      if (all[NF * r] == host) {
+        hr.push_back(r);
+        if (r < nk) own.push_back(r);
+      }
     if (rank >= nk) {
-      helper_ = (all[2 * (rank % nk)] == me[0]);
+      helper_ = not own.empty();
       return;
     }
-    saved_   = mask;
-    cpu_set_t wide = mask;
-    long n   = 1;
-    for (long h = rank + nk; h < np; h += nk)
-      if (all[2 * h] == me[0]) {
-        CPU_SET(int(all[2 * h + 1]), &wide);
-        ++n;
+    std::vector<int> cores;
+    if (place_mode() == "interleave") {
+      cores.push_back(int(mycpu));
+      for (long h = rank + nk; h < np; h += nk)
+        if (all[NF * h] == host) cores.push_back(int(all[NF * h + 1]));
+    } else {
+      // sockets of the host, their cores in increasing order
+      std::vector<long> sock;
+      for (long r : hr)
+        if (std::find(sock.begin(), sock.end(), all[NF * r + 2]) == sock.end()) sock.push_back(all[NF * r + 2]);
+      std::sort(sock.begin(), sock.end());
+      const long ns = long(sock.size()), no = long(own.size());
+      std::vector<std::vector<long>> sc(ns);
+      for (long r : hr) sc[std::find(sock.begin(), sock.end(), all[NF * r + 2]) - sock.begin()].push_back(all[NF * r + 1]);
+      for (auto &x : sc) std::sort(x.begin(), x.end());
+      // owners per socket in proportion to the cores (largest remainder), at least as many cores as owners per socket
+      std::vector<long> nos(ns, 0);
+      {
+        long ncores = 0, given = 0;
+        for (auto &x : sc) ncores += long(x.size());
+        std::vector<std::pair<double, long>> rem;
+        for (long s = 0; s < ns; ++s) {
+          const double e = double(no) * double(sc[s].size()) / double(ncores);
+          nos[s] = std::min(long(sc[s].size()), long(std::floor(e)));
+          given += nos[s];
+          rem.push_back({e - double(nos[s]), s});
+        }
+        std::stable_sort(rem.begin(), rem.end(), [](auto const &a, auto const &b) { return a.first > b.first; });
+        for (long i = 0; given < no; i = (i + 1) % ns)
+          if (nos[rem[i].second] < long(sc[rem[i].second].size())) {
+            ++nos[rem[i].second];
+            ++given;
+          }
       }
-    widen(wide, n);
+      const long me = long(std::find(own.begin(), own.end(), rank) - own.begin());
+      long base = 0;
+      for (long s = 0; s < ns; ++s) {
+        if (me < base + nos[s]) {
+          const long j = me - base, c = long(sc[s].size());
+          for (long i = j * c / nos[s]; i < (j + 1) * c / nos[s]; ++i) cores.push_back(int(sc[s][i]));
+          break;
+        }
+        base += nos[s];
+      }
+    }
+    widen(cores, mycpu);
 #else
     (void)rank;
 #endif
@@ -110,53 +155,42 @@ class closure_cores_t {
     const long np = comm.size(), rank = comm.rank();
     if (not enable or np < 2) return;
 #if defined(__linux__)
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
+    std::vector<long> all;
     long mycpu = -1;
-    if (sched_getaffinity(0, sizeof(mask), &mask) == 0 and CPU_COUNT(&mask) == 1)
-      for (int c = 0; c < CPU_SETSIZE; ++c)
-        if (CPU_ISSET(c, &mask)) mycpu = c;
-    char host[256] = {0};
-    gethostname(host, sizeof(host) - 1);
-    std::array<long, 3> me = {long(std::hash<std::string>{}(std::string(host)) & 0x7fffffffffffL), mycpu, std::max(0L, weight)};
-    std::vector<long> all(3 * np);
-    comm.all_gather_n(me.data(), 3, all.data(), 3);
-    for (long r = 0; r < np; ++r)
-      if (all[3 * r + 1] < 0) return;   // some rank is not bound to one core: nothing to lend (collectively)
+    if (not gather(comm, std::max(0L, weight), all, mycpu)) return;
     active_ = true;
+    const long host = all[NF * rank];
     std::vector<long> hb, hi;   // busy / idle ranks of my host, rank order
     for (long r = 0; r < np; ++r)
-      if (all[3 * r] == me[0]) (all[3 * r + 2] ? hb : hi).push_back(r);
+      if (all[NF * r] == host) (all[NF * r + 3] ? hb : hi).push_back(r);
     if (not busy or hb.empty()) {
       helper_ = not hb.empty();
       return;
     }
     std::vector<char> taken(hi.size(), 0);
     std::vector<long> got(hb.size(), 1);   // cores per busy rank (own included)
-    saved_         = mask;
-    cpu_set_t wide = mask;
+    std::vector<int> cores{int(mycpu)};
     for (bool more = true; more;) {
       more = false;
       for (size_t ib = 0; ib < hb.size(); ++ib) {
-        const long b = hb[ib], cb = all[3 * b + 1];
-        for (long w = 0; w < all[3 * b + 2]; ++w) {
+        const long b = hb[ib], cb = all[NF * b + 1];
+        for (long w = 0; w < all[NF * b + 3]; ++w) {
           if (max_threads > 0 and got[ib] >= max_threads) break;
           long best = -1;
           for (size_t i = 0; i < hi.size(); ++i) {
             if (taken[i]) continue;
-            const long d = std::abs(all[3 * hi[i] + 1] - cb);
-            if (best < 0 or d < std::abs(all[3 * hi[best] + 1] - cb)) best = long(i);
+            const long d = std::abs(all[NF * hi[i] + 1] - cb);
+            if (best < 0 or d < std::abs(all[NF * hi[best] + 1] - cb)) best = long(i);
           }
           if (best < 0) break;
           taken[best] = 1;
           ++got[ib];
           more = true;
-          if (b == rank) CPU_SET(int(all[3 * hi[best] + 1]), &wide);
+          if (b == rank) cores.push_back(int(all[NF * hi[best] + 1]));
         }
       }
     }
-    const long ib = long(std::find(hb.begin(), hb.end(), rank) - hb.begin());
-    widen(wide, got[ib]);
+    widen(cores, mycpu);
 #else
     (void)busy;
     (void)max_threads;
@@ -172,13 +206,26 @@ class closure_cores_t {
   long blas_threads() const { return widened_ ? ncpu_ : 0; }
   long cores() const { return ncpu_; }
   bool active() const { return active_; }
+  /// perf 7.5a diagnostics of the widened owner: first / last core of its set, sockets spanned (bit mask of package ids),
+  /// distinct CPUs the BLAS team ran on right after the pinning (sched_getcpu of every team thread)
+  long core_first() const { return core_lo_; }
+  long core_last() const { return core_hi_; }
+  long socket_mask() const { return sock_mask_; }
+  long cpus_seen() const { return seen_; }
+  /// distinct CPUs of the team now (one parallel region of blas_threads() threads; 0 if not widened)
+  long probe_cpus() const {
+#if defined(__linux__)
+    if (widened_) return team_cpus(ncpu_);
+#endif
+    return 0;
+  }
 
   /// the owner's mask back to its own core (idempotent)
   void restore() {
 #if defined(__linux__)
     if (widened_) {
       sched_setaffinity(0, sizeof(saved_), &saved_);
-      repin_pool(&saved_, ncpu_);
+      if (pin_mode() != "none") repin_pool_mask(&saved_, ncpu_);
       if (mkl_dyn_ >= 0)
         if (auto f = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "MKL_Set_Dynamic"))) f(mkl_dyn_);
       mkl_dyn_ = -1;
@@ -201,44 +248,152 @@ class closure_cores_t {
     }
   }
 
+  /// env COQUI_GWLINE_CLOSURE_PLACE: "block" (default) | "interleave"
+  static std::string place_mode() {
+    char const *v = std::getenv("COQUI_GWLINE_CLOSURE_PLACE");
+    return (v == nullptr or *v == '\0') ? std::string("block") : std::string(v);
+  }
+  /**
+   * env COQUI_GWLINE_CLOSURE_PIN: how the BLAS team (the GNU OpenMP pool MKL reuses) is placed on the owner's cores:
+   *   "core" (perf 7.5a, default): thread t of the team bound to core t of the set (the master to the first);
+   *   "mask" (perf 7.1c): every team thread gets the whole set (re-pinned from the previous lending's mask); after the
+   *          restore() of the previous closure all of them sit on the owner's single core and stay there (the scheduler
+   *          does not move a running thread whose CPU is still allowed): the regression of the merge (measured);
+   *   "none" (perf 7.1 (f)): only the master's mask is widened; pool threads keep the mask they were created with.
+   */
+  static std::string pin_mode() {
+    char const *v = std::getenv("COQUI_GWLINE_CLOSURE_PIN");
+    return (v == nullptr or *v == '\0') ? std::string("core") : std::string(v);
+  }
+
  private:
+  static constexpr long NF = 4;   // host, core, socket, weight
 #if defined(__linux__)
-  /// the calling thread's mask -> wide (n cores); saved_ must hold the original mask
+  /// all ranks: (host hash, bound core, socket of the core, weight); false (collectively) if some rank floats
+  bool gather(boost::mpi3::communicator &comm, long weight, std::vector<long> &all, long &mycpu) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    mycpu = -1;
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0 and CPU_COUNT(&mask) == 1)
+      for (int c = 0; c < CPU_SETSIZE; ++c)
+        if (CPU_ISSET(c, &mask)) mycpu = c;
+    saved_ = mask;
+    char host[256] = {0};
+    gethostname(host, sizeof(host) - 1);
+    std::array<long, NF> me = {long(std::hash<std::string>{}(std::string(host)) & 0x7fffffffffffL), mycpu, socket_of(mycpu),
+                               weight};
+    const long np = comm.size();
+    all.assign(NF * np, 0);
+    comm.all_gather_n(me.data(), NF, all.data(), NF);
+    for (long r = 0; r < np; ++r)
+      if (all[NF * r + 1] < 0) return false;   // some rank is not bound to one core: nothing to lend (collectively)
+    return true;
+  }
+  static long socket_of(long cpu) {
+    if (cpu < 0) return 0;
+    std::string f = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/physical_package_id";
+    long s = 0;
+    if (FILE *fp = std::fopen(f.c_str(), "r")) {
+      if (std::fscanf(fp, "%ld", &s) != 1) s = 0;
+      std::fclose(fp);
+    }
+    return s;
+  }
+  using gomp_parallel_t = void (*)(void (*)(void *), void *, unsigned, unsigned);
+  static gomp_parallel_t gomp_parallel() { return reinterpret_cast<gomp_parallel_t>(dlsym(RTLD_DEFAULT, "GOMP_parallel")); }
+  static int thread_num() {
+    using f_t = int (*)();
+    static f_t f = reinterpret_cast<f_t>(dlsym(RTLD_DEFAULT, "omp_get_thread_num"));
+    return f ? f() : 0;
+  }
   /**
    * perf 7.1c: the GNU OpenMP pool threads that MKL reuses keep the affinity mask they were created with (a previous
    * lending, possibly of cores now lent to another rank): run one parallel region of n threads (GOMP_parallel, resolved
    * at run time; libmkl_gnu_thread) in which every pool thread takes the mask m.
    */
   static void repin_one(void *m) { sched_setaffinity(0, sizeof(cpu_set_t), static_cast<cpu_set_t *>(m)); }
-  static void repin_pool(cpu_set_t *m, long n) {
-    using gomp_parallel_t = void (*)(void (*)(void *), void *, unsigned, unsigned);
+  static void repin_pool_mask(cpu_set_t *m, long n) {
     if (n > 1)
-      if (auto g = reinterpret_cast<gomp_parallel_t>(dlsym(RTLD_DEFAULT, "GOMP_parallel"))) g(repin_one, m, unsigned(n), 0u);
+      if (auto g = gomp_parallel()) g(repin_one, m, unsigned(n), 0u);
   }
-  void widen(cpu_set_t const &wide, long n) {
-    if (n > 1 and sched_setaffinity(0, sizeof(wide), &wide) == 0) {
-      widened_ = true;
-      ncpu_    = n;
-      wide_    = wide;
-      repin_pool(&wide_, n);
-      // MKL caps its thread count by the cores it found at initialization (the 1-core mask) unless dynamic adjustment
-      // is off: switch it off for the k loop (restored in restore())
-      using get_t = int (*)();
-      using set_t = void (*)(int);
-      if (auto g = reinterpret_cast<get_t>(dlsym(RTLD_DEFAULT, "MKL_Get_Dynamic")))
-        if (auto f = reinterpret_cast<set_t>(dlsym(RTLD_DEFAULT, "MKL_Set_Dynamic"))) {
-          mkl_dyn_ = g();
-          f(0);
+  /// perf 7.5a: thread t of an n-thread region -> core c[t] (one core each)
+  struct pin_ctx_t {
+    std::vector<int> const *c;
+  };
+  static void pin_one(void *x) {
+    auto const &c = *static_cast<pin_ctx_t *>(x)->c;
+    const int t   = thread_num();
+    if (t < 0 or t >= int(c.size())) return;
+    cpu_set_t m;
+    CPU_ZERO(&m);
+    CPU_SET(c[t], &m);
+    sched_setaffinity(0, sizeof(m), &m);
+  }
+  struct seen_ctx_t {
+    std::vector<int> *cpu;
+  };
+  static void see_one(void *x) {
+    auto &v     = *static_cast<seen_ctx_t *>(x)->cpu;
+    const int t = thread_num();
+    if (t >= 0 and t < int(v.size())) v[t] = sched_getcpu();
+  }
+  static long team_cpus(long n) {
+    std::vector<int> v(std::max(1L, n), -1);
+    seen_ctx_t ctx{&v};
+    if (auto g = gomp_parallel(); g and n > 1) g(see_one, &ctx, unsigned(n), 0u);
+    else v[0] = sched_getcpu();
+    std::sort(v.begin(), v.end());
+    return long(std::unique(v.begin(), v.end()) - v.begin()) - (v[0] < 0 ? 1 : 0);
+  }
+  /// the owner's thread team on the cores c (c[0] = the master's core): pinning per pin_mode()
+  void widen(std::vector<int> cores, long mycpu) {
+    const long n = long(cores.size());
+    if (n <= 1 and (n == 0 or cores[0] == mycpu)) return;
+    const std::string pm = pin_mode();
+    cpu_set_t wide;
+    CPU_ZERO(&wide);
+    for (int c : cores) CPU_SET(c, &wide);
+    if (pm == "core") {
+      cpu_set_t m0;
+      CPU_ZERO(&m0);
+      CPU_SET(cores[0], &m0);
+      if (sched_setaffinity(0, sizeof(m0), &m0) != 0) return;
+      if (n > 1) {
+        if (auto g = gomp_parallel()) {
+          pin_ctx_t ctx{&cores};
+          g(pin_one, &ctx, unsigned(n), 0u);
+        } else if (sched_setaffinity(0, sizeof(wide), &wide) != 0) {
+          return;
         }
+      }
+    } else {
+      if (sched_setaffinity(0, sizeof(wide), &wide) != 0) return;
+      if (pm == "mask") repin_pool_mask(&wide, n);
     }
+    widened_ = true;
+    ncpu_    = n;
+    core_lo_ = *std::min_element(cores.begin(), cores.end());
+    core_hi_ = *std::max_element(cores.begin(), cores.end());
+    sock_mask_ = 0;
+    for (int c : cores) sock_mask_ |= (1L << std::min(62L, socket_of(c)));
+    // MKL caps its thread count by the cores it found at initialization (the 1-core mask) unless dynamic adjustment
+    // is off: switch it off for the k loop (restored in restore())
+    using get_t = int (*)();
+    using set_t = void (*)(int);
+    if (auto gd = reinterpret_cast<get_t>(dlsym(RTLD_DEFAULT, "MKL_Get_Dynamic")))
+      if (auto f = reinterpret_cast<set_t>(dlsym(RTLD_DEFAULT, "MKL_Set_Dynamic"))) {
+        mkl_dyn_ = gd();
+        f(0);
+      }
+    seen_ = team_cpus(n);
   }
 #endif
   boost::mpi3::communicator *comm_ = nullptr;
   bool active_ = false, helper_ = false, widened_ = false;
-  long ncpu_ = 1;
+  long ncpu_ = 1, core_lo_ = -1, core_hi_ = -1, sock_mask_ = 0, seen_ = 0;
   int mkl_dyn_ = -1;
 #if defined(__linux__)
-  cpu_set_t saved_{}, wide_{};
+  cpu_set_t saved_{};
 #endif
 };
 

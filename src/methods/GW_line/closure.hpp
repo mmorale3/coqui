@@ -235,13 +235,17 @@ struct closure_kprof_t {
   double t_fit = 0.0, t_mom = 0.0, t_gram = 0.0, t_svd = 0.0, t_svd_ref = 0.0, t_bcast = 0.0, t_coarse = 0.0,
          t_refine = 0.0, t_final = 0.0, t_eig = 0.0, t_rr = 0.0, t_leh = 0.0, t_poly = 0.0;
   long n_free = 0, n_eig = 0, n_mfree = 0, retry = 0, nflag = 0, fallback = 0, scan_ranks = 0, scan_threads = 0;
-  static constexpr long nfields = 21;
+  /// perf 7.5a: the owner's cores in the k loop (closure_cores_t): count, first / last core, sockets (bit mask), distinct
+  /// CPUs of the BLAS team after the pinning and at the end of the owner's k loop
+  long cores = 1, core_first = -1, core_last = -1, sock_mask = 0, cpus_start = 0, cpus_end = 0;
+  static constexpr long nfields = 27;
   /// owner wall of the k (t_svd includes the reference SVD; the eigensolve-free build overlaps the coarse scan)
   double total() const { return t_fit + t_mom + t_gram + t_svd + t_bcast + t_coarse + t_refine + t_final + t_leh; }
   void pack(double *x) const {
     double v[nfields] = {t_fit, t_mom, t_gram, t_svd, t_svd_ref, t_bcast, t_coarse, t_refine, t_final, t_eig, t_rr, t_leh,
                          double(n_free), double(n_eig), double(n_mfree), double(retry), double(nflag), double(fallback),
-                         double(scan_ranks), double(scan_threads), t_poly};
+                         double(scan_ranks), double(scan_threads), t_poly, double(cores), double(core_first),
+                         double(core_last), double(sock_mask), double(cpus_start), double(cpus_end)};
     std::copy_n(v, nfields, x);
   }
   void unpack(double const *x) {
@@ -250,6 +254,8 @@ struct closure_kprof_t {
     n_free = std::llround(x[12]); n_eig = std::llround(x[13]); n_mfree = std::llround(x[14]); retry = std::llround(x[15]);
     nflag = std::llround(x[16]); fallback = std::llround(x[17]); scan_ranks = std::llround(x[18]);
     scan_threads = std::llround(x[19]); t_poly = x[20];
+    cores = std::llround(x[21]); core_first = std::llround(x[22]); core_last = std::llround(x[23]);
+    sock_mask = std::llround(x[24]); cpus_start = std::llround(x[25]); cpus_end = std::llround(x[26]);
   }
 };
 
@@ -516,8 +522,11 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   std::vector<std::unique_ptr<pending_t>> pend(nk);
   const bool par_scan = (p.scan == "parallel");
   utils::check(par_scan or p.scan == "serial", "gw_line::closure: scan must be \"parallel\" or \"serial\" (got \"{}\")", p.scan);
+  std::array<long, 5> kcores{1, -1, -1, 0, 0};   // perf 7.5a: this owner's cores in the k loop (closure_cores_t)
   auto store_k = [&](long ik, closure_k_t &ck, double t_fit, double *pr) {   // writes only the slots of ik
     ck.prof.t_fit = t_fit;
+    ck.prof.cores = kcores[0]; ck.prof.core_first = kcores[1]; ck.prof.core_last = kcores[2];
+    ck.prof.sock_mask = kcores[3]; ck.prof.cpus_start = kcores[4];
     pr[0] += t_fit;
     pr[1] += ck.t_mom; pr[2] += ck.t_c0; pr[3] += ck.t_gram; pr[4] += ck.t_svd; pr[5] += ck.t_ueig;
     pr[6] += ck.t_leh; pr[7] += double(ck.ueig_fallback);
@@ -560,6 +569,8 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   closure_cores_t cores(comm, nk);   // perf 7.1 (f): np > N_k -> the owners borrow the idle ranks' cores (closure_cores.hpp)
   const long bt   = (nw == 1) ? (p.blas_threads > 0 ? p.blas_threads : cores.blas_threads())
                               : (p.blas_threads > 0 ? std::max(1L, p.blas_threads / nw) : 1L);
+  if (cores.blas_threads() > 0)
+    kcores = {cores.cores(), cores.core_first(), cores.core_last(), cores.socket_mask(), cores.cpus_seen()};
   std::string blas_backend;
   if (nw == 1) {
     blas_threads_scope_t blas_scope(bt);
@@ -587,6 +598,11 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     for (auto const &x : pw)
       for (long i = 0; i < NPROF; ++i) prof[i] += x[i];
     blas_backend = be[0];
+  }
+  {   // perf 7.5a: distinct CPUs of the team at the end of the owner's k loop (written into the owned k's profile slots)
+    const long ce = cores.probe_cpus();
+    for (long ik = rank; ik < nk; ik += np)
+      if (not pend[ik]) info(ik, 2 + nd + 26) = double(ce);
   }
   Timer.stop("closure_kloop");
   Timer.start("closure_wait");
@@ -682,10 +698,23 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
       app_log(2, "          closure k {} (rank {}): Nr {} r1 {} n_free {} | fit {:.2f} mom {:.2f} C0+Gram {:.2f} SVD {:.2f} (ref "
                  "{:.2f}) | scan bcast {:.2f} coarse {:.2f} refine {:.2f} final {:.2f} | eigen realizations {} ({:.2f} s, RR + "
                  "retries {:.2f} s, retries {}, max RR columns {}, Schur fallbacks {}), eigensolve-free errors {} (build {:.2f} s) | "
-                 "Lehmann {:.2f} | total {:.2f} | scan ranks {} BLAS threads coarse {} owner {} | phi {:.9f} basin {} tie {:.3f} rejected {}",
+                 "Lehmann {:.2f} | total {:.2f} | scan ranks {} BLAS threads coarse {} owner {} | phi {:.9f} basin {} tie {:.3f} rejected {}"
+                 " | cores {} [{}-{}] sockets {:#x} CPUs used {} / {}",
               ik, ik % np, d.r_gram, d.r1, f.n_free, f.t_fit, f.t_mom, f.t_gram, f.t_svd, f.t_svd_ref, f.t_bcast, f.t_coarse,
               f.t_refine, f.t_final, f.n_eig, f.t_eig, f.t_rr, f.retry, f.nflag, f.fallback, f.n_mfree, f.t_poly, f.t_leh, f.total(),
-              f.scan_ranks, f.scan_threads / 1000, f.scan_threads % 1000, d.phi, d.phi_index, d.phi_tie, d.n_rejected);
+              f.scan_ranks, f.scan_threads / 1000, f.scan_threads % 1000, d.phi, d.phi_index, d.phi_tie, d.n_rejected, f.cores,
+              f.core_first, f.core_last, f.sock_mask, f.cpus_start, f.cpus_end);
+    }
+    if (detail::env_double("COQUI_GWLINE_CLOSURE_KTABLE", 0.0) > 0.0) {   // perf 7.5a: every k (benchmarks)
+      app_log(2, "          closure k table: k rank Nr | fit mom Gram SVD Ueig(final) Lehmann total | cores [first-last] sockets "
+                 "CPUs(start/end) | place \"{}\" pin \"{}\"",
+              closure_cores_t::place_mode(), closure_cores_t::pin_mode());
+      for (long ik = 0; ik < nk; ++ik) {
+        auto const &f = out.kprof[ik];
+        app_log(2, "            k {:3d} r {:4d} Nr {:5d} | {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} | {:3d} [{}-{}] {:#x} {}/{}",
+                ik, ik % np, out.diag[ik].r_gram, f.t_fit, f.t_mom, f.t_gram, f.t_svd, f.t_final, f.t_leh, f.total(), f.cores,
+                f.core_first, f.core_last, f.sock_mask, f.cpus_start, f.cpus_end);
+      }
     }
   }
 
