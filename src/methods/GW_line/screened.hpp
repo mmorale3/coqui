@@ -1172,8 +1172,11 @@ inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi,
   t_fit = secs(tf);
   Timer.stop("W_fit");
 
+  // no barrier at the end (posix): every rank unmaps only its own mappings, a kept buffer is written again only after the
+  // next call's collective acquire(), so the ranks that finish their fits early go on to the Sigma stage's local work
+  // (the mpi backend's MPI_Win_free synchronizes by itself)
   Timer.start("W_wait");
-  sync_node();   // nobody reads the buffer any more (it may be kept for the next call)
+  if (shm.backend == "mpi") sync_node();
   shm.release();
   Timer.stop("W_wait");
 
