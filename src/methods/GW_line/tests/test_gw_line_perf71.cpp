@@ -37,6 +37,8 @@
 
 #include "catch2/catch.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <numbers>
@@ -64,6 +66,7 @@
 #include "methods/GW_line/propagators.hpp"
 #include "methods/GW_line/polarization.hpp"
 #include "methods/GW_line/kmesh_ft.hpp"
+#include "methods/GW_line/kmesh_fft.hpp"
 #include "methods/GW_line/screened.hpp"
 #include "methods/GW_line/self_energy.hpp"
 #include "numerics/line_dlr/bosonic_basis.hpp"
@@ -631,6 +634,191 @@ TEST_CASE("gw_line_w75_lih222", "[gw_line][w]") { run_wnode("qe_lih222", 8); }
 TEST_CASE("gw_line_w75_si211", "[gw_line][w]") { run_wnode("qe_si211", 8); }
 TEST_CASE("gw_line_w75_lih223", "[gw_line][w]") { run_wnode("qe_lih223", 8); }
 
+/**
+ * [gw_line][kft] perf 7.5c: the k-mesh transforms as 3-D FFTs (kmesh_fft.hpp) vs the dense Fourier gemms of perf 7.1, same
+ * inputs (KS poles, GL rays, mirror nodes, process grid of the test):
+ *   map    the FFT phases vs kmesh_ft_t's Fp / conj Hm (checked at construction, <= 1e-12) and the five transforms of
+ *          kmesh_ft.hpp on random blocks through the host engine (placement, sign, scale) vs the gemms     <= 1e-14
+ *   Pi     (mirror, real space) fft vs gemm                                                                  <= 1e-13
+ *   Sigma  both legs in one call, same residues w: with the A^ cache of each mode's Pi, with rebuilt G~ (GT_CACHE = 0)
+ *          and with the residues transformed in place (w_consume)                                            <= 1e-13 (si211 2e-13)
+ * Device builds: the same on the device (cuFFT) vs the host gemm path.
+ */
+void run_kft(std::string const &name, long nI_factor) {
+  auto &mpi  = utils::make_unit_test_mpi_context();
+  auto &comm = mpi->comm;
+  auto f     = make_fixture(name, nI_factor);
+  auto &mf   = *f.mf;
+  auto &thc  = *f.thc;
+  const long nq = f.nq, Np = f.Np;
+  // map and the raw transforms
+  const kmesh_ft_t kft(mf);
+  const kmesh_map_t km(kft, mf);
+  REQUIRE(kft.ok);
+  REQUIRE(km.ok);
+  double e_tr = 0.0;
+  {
+    const long N = km.N, nc = 37;
+    std::mt19937_64 gen(11);
+    std::normal_distribution<double> N01;
+    nda::array<ComplexType, 2> X(N, nc), Y(N, nc), Z(N, nc);
+    for (long i = 0; i < N; ++i)
+      for (long c = 0; c < nc; ++c) X(i, c) = ComplexType(N01(gen), N01(gen));
+    kmesh_fft_host_t eng(km, 1, 16);   // width 16: blocks 16, 16, 5
+    eng.prepare(nc, {{0, +1}, {0, -1}});
+    auto via_fft = [&](std::vector<long> const &place, int sign, std::vector<long> const &take) {   // rows take[i] of FFT[X at place]
+      nda::array<ComplexType, 2> O(long(take.size()), nc);
+      for (long c0 = 0; c0 < nc; c0 += eng.cb) {
+        const long w = std::min(eng.cb, nc - c0);
+        detail::block_place(eng.buf(0), w, X.data() + c0, nc, N, place.data());
+        eng.fft(0, w, sign);
+        detail::block_out(O.data() + c0, nc, long(take.size()), w, eng.buf(0), take, 0, ComplexType(1.0));
+      }
+      return O;
+    };
+    std::vector<long> idR(N);
+    for (long r = 0; r < N; ++r) idR[r] = r;
+    auto chk = [&](nda::array<ComplexType, 2> const &a, nda::array<ComplexType, 2> const &b) {
+      double d = 0.0, m = 0.0;
+      for (long i = 0; i < a.size(); ++i) {
+        d = std::max(d, std::abs(a.data()[i] - b.data()[i]));
+        m = std::max(m, std::abs(b.data()[i]));
+      }
+      e_tr = std::max(e_tr, d / m);
+    };
+    nda::array<ComplexType, 2> G1 = nda::matmul(kft.Fp, X);   // sum_k e^{ikR} X(k)
+    chk(via_fft(km.kpos, +1, idR), G1);
+    nda::array<ComplexType, 2> G2 = nda::matmul(kft.Fm, X);   // sum_k e^{-ikR} X(k)
+    chk(via_fft(km.kpos, -1, idR), G2);
+    nda::array<ComplexType, 2> G3 = nda::matmul(kft.Hm, X);   // sum_q e^{-iQR} X(q)
+    chk(via_fft(km.qpos, -1, idR), G3);
+    nda::array<ComplexType, 2> G4 = nda::matmul(kft.Gm, X);   // (q) sum_R e^{-iQR} X(R)
+    chk(via_fft(idR, -1, km.qpos), G4);
+    nda::array<ComplexType, 2> G5 = nda::matmul(kft.Bp, X);   // (k) sum_R e^{ikR} X(R)
+    chk(via_fft(idR, +1, km.kpos), G5);
+  }
+  const double deg = std::numbers::pi / 180.0, theta = 20.0 * deg, theta_t = 10.0 * deg;
+  double emin_occ = 1e300, emax_vir = -1e300;
+  for (long ik = 0; ik < f.nk; ++ik)
+    for (long n = 0; n < f.nb; ++n) {
+      if (f.e_rel(ik, n) < 0) emin_occ = std::min(emin_occ, f.e_rel(ik, n));
+      else emax_vir = std::max(emax_vir, f.e_rel(ik, n));
+    }
+  numerics::line_dlr::bosonic_basis_t basis(theta, std::max(4.0, 1.2 * (emax_vir - emin_occ)), 1e-10, 0.5 * f.ks_gap);
+  const double smax = 30.0 / (f.poles.emin() * std::sin(theta_t));
+  time_ray_t ray_p(theta_t, smax, 1e-5, 1.5, 12, sector_t::particle), ray_h(theta_t, smax, 1e-5, 1.5, 12, sector_t::hole);
+  aux_grid_t grid(*mpi, Np);
+  propagator_t<HOST_MEMORY> prop(thc, grid);
+  auto rel = [&](auto const &a, auto const &b) {
+    const double d = comm.all_reduce_value(max_diff3(a, b), mpi3::max<>{});
+    const double m = comm.all_reduce_value(max_abs3(b), mpi3::max<>{});
+    return d / m;
+  };
+  utils::TimerManager T;
+  auto fz = numerics::line_dlr::dense_nodes(theta, 1e-3, 60.0, 30);
+  struct res_t {
+    memory::array<HOST_MEMORY, ComplexType, 4> Pi;
+    nda::array<ComplexType, 4> Sp, Sh, Sp1, Sh1, Sp2, Sh2;
+  };
+  memory::array<HOST_MEMORY, ComplexType, 4> wn;
+  auto pass = [&](char const *mode, bool make_w) {
+    env_scope_t e("COQUI_GWLINE_KFT", mode);
+    res_t o;
+    polarization<HOST_MEMORY>(prop, f.poles, mf, grid, basis.zeta_nodes, ray_p, ray_h, 8, o.Pi, T);
+    if (make_w) {
+      dyson_layout_t lay(*mpi, nq, basis.zeta_nodes.size(), Np);
+      coulomb_blocks_t<HOST_MEMORY> Zb(thc, grid, lay.q_rng(), T);
+      memory::array<HOST_MEMORY, ComplexType, 4> Pc = o.Pi;
+      screened_interaction<HOST_MEMORY>(Pc, Zb, basis, grid, *mpi, wn, T);
+    }
+    self_energy<HOST_MEMORY>(prop, f.poles, wn, basis, mf, grid, *mpi, fz, ray_p, ray_h, 8, o.Sp, T, sector_t::both, false, nullptr,
+                             0, &o.Sh);
+    REQUIRE((prop.ahat_key >= 0.0 and prop.ahat_key == prop.pole_key));   // the hole leg used this mode's A^ cache
+    {
+      env_scope_t e1("COQUI_GWLINE_GT_CACHE", "0");
+      self_energy<HOST_MEMORY>(prop, f.poles, wn, basis, mf, grid, *mpi, fz, ray_p, ray_h, 8, o.Sp1, T, sector_t::both, false,
+                               nullptr, 0, &o.Sh1);
+    }
+    {   // residues transformed in place (the q plan's relief level 1)
+      memory::array<HOST_MEMORY, ComplexType, 4> wc = wn;
+      self_energy<HOST_MEMORY>(prop, f.poles, wc, basis, mf, grid, *mpi, fz, ray_p, ray_h, 8, o.Sp2, T, sector_t::both, false,
+                               nullptr, 0, &o.Sh2, &wc);
+    }
+    return o;
+  };
+  auto g  = pass("gemm", true);
+  auto ff = pass("fft", false);
+  const double e_pi = rel(ff.Pi, g.Pi);
+  const double e_s  = std::max(rel(ff.Sp, g.Sp), rel(ff.Sh, g.Sh));
+  const double e_s1 = std::max(rel(ff.Sp1, g.Sp1), rel(ff.Sh1, g.Sh1));
+  const double e_s2 = std::max(rel(ff.Sp2, g.Sp2), rel(ff.Sh2, g.Sh2));
+  const double e_gg = std::max(rel(g.Sp2, g.Sp), rel(g.Sh1, g.Sh));   // gemm self-consistency (in place / no cache)
+  app_log(1, "  [kft] {} ({} ranks, mesh {}x{}x{}, k order {}, q order {}): phases k {:.1e} Q {:.1e}, transforms {:.2e}; fft vs gemm: "
+             "Pi {:.2e}, Sigma {:.2e} (rebuilt G~ {:.2e}, w^(R) in place {:.2e}; gemm variants among themselves {:.2e})",
+          name, comm.size(), km.n[0], km.n[1], km.n[2], km.kid ? "mesh" : "permuted", km.qid ? "mesh" : "permuted", km.err_k, km.err_q,
+          e_tr, e_pi, e_s, e_s1, e_s2, e_gg);
+  REQUIRE(e_tr <= 1e-14);
+  REQUIRE(e_pi <= 1e-13);
+  const double gs = (name == "qe_si211") ? 1e-12 : 1e-13;   // si211: residue cancellations (perf 7.1: 2e-13 - 1e-12)
+  REQUIRE(e_s <= gs);
+  REQUIRE(e_s1 <= gs);
+  REQUIRE(e_s2 <= gs);
+#if defined(ENABLE_DEVICE)
+  {   // device (cuFFT) vs the host gemm results on the same residues
+    env_scope_t e("COQUI_GWLINE_KFT", "fft");
+    propagator_t<DEVICE_MEMORY> pd(thc, grid);
+    memory::array<DEVICE_MEMORY, ComplexType, 4> Pd;
+    polarization<DEVICE_MEMORY>(pd, f.poles, mf, grid, basis.zeta_nodes, ray_p, ray_h, 8, Pd, T);
+    nda::array<ComplexType, 4> Pdh = memory::to_memory_space<HOST_MEMORY>(Pd);
+    memory::array<DEVICE_MEMORY, ComplexType, 4> wd = memory::to_memory_space<DEVICE_MEMORY>(wn);
+    nda::array<ComplexType, 4> Sp, Sh, Sp2, Sh2;
+    self_energy<DEVICE_MEMORY>(pd, f.poles, wd, basis, mf, grid, *mpi, fz, ray_p, ray_h, 8, Sp, T, sector_t::both, false, nullptr, 0,
+                               &Sh);
+    self_energy<DEVICE_MEMORY>(pd, f.poles, wd, basis, mf, grid, *mpi, fz, ray_p, ray_h, 8, Sp2, T, sector_t::both, false, nullptr, 0,
+                               &Sh2, &wd);
+    const double dpi = rel(Pdh, g.Pi), ds = std::max(rel(Sp, g.Sp), rel(Sh, g.Sh)), ds2 = std::max(rel(Sp2, g.Sp), rel(Sh2, g.Sh));
+    app_log(1, "  [kft][device] {}: device fft vs host gemm: Pi {:.2e}, Sigma {:.2e}, w^(R) in place {:.2e}", name, dpi, ds, ds2);
+    REQUIRE(dpi <= 1e-13);
+    REQUIRE(ds <= gs);
+    REQUIRE(ds2 <= gs);
+  }
+#endif
+}
+
+/// a kmesh_map_t of an n1 x n2 x n3 mesh with random k and q orders (the fixtures are all mesh-ordered) and its gemm matrices
+struct synth_mesh_t {
+  kmesh_map_t m;
+  nda::array<ComplexType, 2> Fp, Hm;   // (R, k) e^{+ikR}, (R, q) e^{-iQR}
+  synth_mesh_t(long n1, long n2, long n3, bool permute, unsigned seed) {
+    m.n  = {n1, n2, n3};
+    m.N  = n1 * n2 * n3;
+    m.ok = true;
+    m.kpos.resize(m.N);
+    m.qpos.resize(m.N);
+    for (long i = 0; i < m.N; ++i) m.kpos[i] = m.qpos[i] = i;
+    std::mt19937_64 gen(seed);
+    if (permute) {
+      std::shuffle(m.kpos.begin(), m.kpos.end(), gen);
+      std::shuffle(m.qpos.begin(), m.qpos.end(), gen);
+    }
+    m.kid = not permute;
+    m.qid = not permute;
+    Fp = nda::array<ComplexType, 2>(m.N, m.N);
+    Hm = nda::array<ComplexType, 2>(m.N, m.N);
+    auto ph = [&](long pos, long r) {
+      const long a[3] = {r / (n2 * n3), (r / n3) % n2, r % n3}, j[3] = {pos / (n2 * n3), (pos / n3) % n2, pos % n3};
+      double x = double((j[0] * a[0]) % n1) / n1 + double((j[1] * a[1]) % n2) / n2 + double((j[2] * a[2]) % n3) / n3;
+      x -= std::floor(x);
+      return std::exp(ComplexType(0.0, 2.0 * std::numbers::pi * x));
+    };
+    for (long r = 0; r < m.N; ++r)
+      for (long k = 0; k < m.N; ++k) {
+        Fp(r, k) = ph(m.kpos[k], r);
+        Hm(r, k) = std::conj(ph(m.qpos[k], r));
+      }
+  }
+};
+
 } // namespace
 
 TEST_CASE("gw_line_perf71_ab_lih222", "[gw_line][perf71]") { run_ab("qe_lih222", 8); }
@@ -644,3 +832,116 @@ TEST_CASE("gw_line_perf71_nodes_lih223", "[.perf71_nodes]") { run_nodes("qe_lih2
 TEST_CASE("gw_line_perf71_rel_lih222", "[.perf71_rel]") { run_relations("qe_lih222", 8); }
 TEST_CASE("gw_line_perf71_rel_si211", "[.perf71_rel]") { run_relations("qe_si211", 8); }
 TEST_CASE("gw_line_perf71_rel_lih223", "[.perf71_rel]") { run_relations("qe_lih223", 8); }
+
+/// [gw_line][kft] the host engine and the row helpers on meshes with permuted k / q orders (incl. odd and mixed sizes)
+TEST_CASE("gw_line_kft_engine", "[gw_line][kft]") {
+  double e = 0.0;
+  for (auto [n1, n2, n3] : std::vector<std::tuple<long, long, long>>{{3, 4, 5}, {4, 4, 4}, {2, 3, 1}, {6, 6, 6}}) {
+    synth_mesh_t sm(n1, n2, n3, true, 3);
+    auto const &m = sm.m;
+    const long N = m.N, nc = 41;
+    std::mt19937_64 gen(5);
+    std::normal_distribution<double> N01;
+    nda::array<ComplexType, 2> X(N, nc);
+    for (long i = 0; i < N; ++i)
+      for (long c = 0; c < nc; ++c) X(i, c) = ComplexType(N01(gen), N01(gen));
+    kmesh_fft_host_t eng(m, 1, 16);
+    eng.prepare(nc, {{0, +1}, {0, -1}});
+    std::vector<long> id(N);
+    for (long r = 0; r < N; ++r) id[r] = r;
+    auto via = [&](std::vector<long> const &place, int sign, std::vector<long> const &take) {
+      nda::array<ComplexType, 2> O(N, nc);
+      for (long c0 = 0; c0 < nc; c0 += eng.cb) {
+        const long w = std::min(eng.cb, nc - c0);
+        detail::block_place(eng.buf(0), w, X.data() + c0, nc, N, place.data());
+        eng.fft(0, w, sign);
+        detail::block_out(O.data() + c0, nc, N, w, eng.buf(0), take, 0, ComplexType(1.0));
+      }
+      return O;
+    };
+    auto rel = [](auto const &a, auto const &b) {
+      double d = 0.0, mx = 0.0;
+      for (long i = 0; i < a.size(); ++i) {
+        d  = std::max(d, std::abs(a.data()[i] - b.data()[i]));
+        mx = std::max(mx, std::abs(b.data()[i]));
+      }
+      return d / mx;
+    };
+    nda::array<ComplexType, 2> Fm = nda::conj(sm.Fp), Bp = nda::transpose(sm.Fp), Gm = nda::transpose(sm.Hm);
+    e = std::max(e, rel(via(m.kpos, +1, id), nda::matmul(sm.Fp, X)));
+    e = std::max(e, rel(via(m.kpos, -1, id), nda::matmul(Fm, X)));
+    e = std::max(e, rel(via(m.qpos, -1, id), nda::matmul(sm.Hm, X)));
+    e = std::max(e, rel(via(id, -1, m.qpos), nda::matmul(Gm, X)));
+    e = std::max(e, rel(via(id, +1, m.kpos), nda::matmul(Bp, X)));
+    // permute_rows (the device in-place residue placement) on the host
+    nda::array<ComplexType, 2> Y = X, Z(N, nc);
+    detail::permute_rows<HOST_MEMORY>(Y.data(), N, nc, m.qpos);
+    for (long r = 0; r < N; ++r) Z(m.qpos[r], nda::range::all) = X(r, nda::range::all);
+    e = std::max(e, rel(Y, Z));
+  }
+  app_log(1, "  [kft] engine on permuted meshes (3x4x5, 4x4x4, 2x3x1, 6x6x6): max rel {:.2e}", e);
+  REQUIRE(e <= 1e-14);
+}
+
+/**
+ * [.kft_bench] (hidden) per-column cost of the Pi-type convolution (two forward transforms, product, back transform to nrows
+ * rows) with the dense gemms vs the blocked FFT engine, on meshes 4^3, 5^3, 6^3, 8^3; ncols columns (env
+ * COQUI_GWLINE_BENCH_NCOLS, default 32 x 4300 = one si444 chunk on 128 ranks), nrows = N / 3 (IBZ rows). Run it on every core
+ * of a node at once (mpirun -np <cores>) to include the memory-bandwidth contention of the production runs; rank 0 prints
+ * the max over ranks.
+ */
+TEST_CASE("gw_line_kft_bench", "[.kft_bench]") {
+  auto &mpi  = utils::make_unit_test_mpi_context();
+  auto &comm = mpi->comm;
+  const long ncols0 = detail::env_long("COQUI_GWLINE_BENCH_NCOLS", 32 * 4300);
+  for (long n : {4L, 5L, 6L, 8L}) {
+    synth_mesh_t sm(n, n, n, false, 1);
+    auto const &m = sm.m;
+    const long N = m.N, nr = std::max(1L, N / 3);
+    const long ncols = std::max(1024L, ncols0 * 64 / N);   // same memory per array for every mesh
+    nda::array<ComplexType, 2> A(N, ncols), B(N, ncols), X(N, ncols), C(nr, ncols);
+    for (long i = 0; i < A.size(); ++i) {
+      A.data()[i] = ComplexType(1e-3 * (i % 7), 1.0);
+      B.data()[i] = ComplexType(1.0, 1e-3 * (i % 5));
+    }
+    nda::array<ComplexType, 2> Fm = nda::conj(sm.Fp), Gq(nr, N);
+    std::vector<long> rows(nr);
+    for (long i = 0; i < nr; ++i) {
+      rows[i] = (7 * i) % N;
+      for (long R = 0; R < N; ++R) Gq(i, R) = sm.Hm(R, rows[i]);
+    }
+    comm.barrier();
+    auto t0 = std::chrono::steady_clock::now();
+    nda::blas::gemm(ComplexType(1.0), sm.Fp, A, ComplexType(0.0), X);
+    nda::blas::gemm(ComplexType(1.0), Fm, B, ComplexType(0.0), A);
+    for (long i = 0; i < A.size(); ++i) A.data()[i] *= X.data()[i];
+    nda::blas::gemm(ComplexType(1.0), Gq, A, ComplexType(0.0), C);
+    const double tg = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    comm.barrier();
+    for (long i = 0; i < A.size(); ++i) A.data()[i] = ComplexType(1e-3 * (i % 7), 1.0);
+    kmesh_fft_host_t eng(m, 2);
+    eng.prepare(ncols, {{0, +1}, {1, -1}, {0, -1}});
+    std::vector<long> qrow(nr);
+    for (long i = 0; i < nr; ++i) qrow[i] = m.qpos[rows[i]];
+    comm.barrier();
+    t0 = std::chrono::steady_clock::now();
+    for (long c0 = 0; c0 < ncols; c0 += eng.cb) {
+      const long w = std::min(eng.cb, ncols - c0);
+      detail::block_in(eng.buf(0), N, w, A.data() + c0, ncols);
+      eng.fft(0, w, +1);
+      detail::block_in(eng.buf(1), N, w, B.data() + c0, ncols);
+      eng.fft(1, w, -1);
+      detail::block_mul(eng.buf(0), N, w, eng.buf(1), w);
+      eng.fft(0, w, -1);
+      detail::block_out(C.data() + c0, ncols, nr, w, eng.buf(0), qrow, 0, ComplexType(1.0));
+    }
+    const double tf = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double mg = comm.all_reduce_value(tg, mpi3::max<>{}), mf = comm.all_reduce_value(tf, mpi3::max<>{});
+    app_log(1, "  [kft bench] mesh {}^3 (N {}), {} columns, {} ranks, cb {}: gemm {:.3f} s ({:.1f} ns/col), fft {:.3f} s ({:.1f} ns/col): x{:.2f}",
+            n, N, ncols, comm.size(), eng.cb, mg, 1e9 * mg / ncols, mf, 1e9 * mf / ncols, mg / mf);
+  }
+}
+
+TEST_CASE("gw_line_kft_lih222", "[gw_line][kft]") { run_kft("qe_lih222", 8); }
+TEST_CASE("gw_line_kft_si211", "[gw_line][kft]") { run_kft("qe_si211", 8); }
+TEST_CASE("gw_line_kft_lih223", "[gw_line][kft]") { run_kft("qe_lih223", 8); }

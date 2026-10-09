@@ -66,6 +66,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <memory>
 #include <vector>
 
 #include "configuration.hpp"
@@ -83,6 +85,7 @@
 #include "methods/GW_line/propagators.hpp"
 #include "methods/GW_line/device_blas.hpp"
 #include "methods/GW_line/kmesh_ft.hpp"
+#include "methods/GW_line/kmesh_fft.hpp"
 
 namespace methods::gw_line {
 
@@ -116,7 +119,7 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   utils::check(g > 0, "gw_line::polarization: empty q group");
   for (long q : qs) utils::check(q >= 0 and q < nq, "gw_line::polarization: q = {} out of [0, {})", q, nq);
 
-  for (auto nm : {"G_tilde", "Pi_hadamard", "Pi_transform"}) Timer.add(nm);
+  for (auto nm : {"G_tilde", "Pi_hadamard", "Pi_transform", "Pi_ft_fwd", "Pi_ft_prod", "Pi_ft_back"}) Timer.add(nm);
   prop.set_poles(poles);
 
   if (Pi.extent(0) != g or Pi.extent(1) != nz or Pi.extent(2) != nP or Pi.extent(3) != nQ) Pi = arr4_t(g, nz, nP, nQ);
@@ -150,11 +153,21 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
   //   A^(R) = sum_k e^{+ikR} A(k), B^(R) = sum_k e^{-ikR} B(k), acc(q) = alpha / N sum_R e^{-iQ_q R} A^(R) o B^(R)
   const kmesh_ft_t kft(mf);
   const bool rs = detail::env_long("COQUI_GWLINE_RSPACE", 1) != 0 and kft.ok;
+  // perf 7.5c: the three transforms as 3-D FFTs of the mesh (kmesh_fft.hpp; env COQUI_GWLINE_KFT = gemm / fft / auto)
+  const kmesh_map_t kmap(kft, mf);
+  const bool use_fft = rs and kft_mode<MEM>(kmap) == kft_mode_t::fft;
   [[maybe_unused]] memory::array<MEM, ComplexType, 2> FpM, FmM, GmQ;
-  if (rs) {
+  if (rs and not use_fft) {
     FpM = memory::to_memory_space<MEM>(kft.Fp);
     FmM = memory::to_memory_space<MEM>(kft.Fm);
   }
+  // FFT: the factors of k are built into the mesh rows kpos(k); the back transform row of q is qpos(q)
+  auto krow = [&](long ik) { return use_fft ? kmap.kpos[ik] : ik; };
+  std::unique_ptr<kmesh_fft_host_t> eng;
+  if constexpr (MEM == HOST_MEMORY)
+    if (use_fft) eng = std::make_unique<kmesh_fft_host_t>(kmap, 2);
+  std::vector<long> qrow(g);   // FFT: mesh row of the group's q
+  for (long i = 0; i < g; ++i) qrow[i] = use_fft ? kmap.qpos[qs[i]] : 0;
 
   // ---- S7d Hadamard setup (device fused kernel; see the file header)
   [[maybe_unused]] const bool fused = (MEM != HOST_MEMORY) and detail::fused_hadamard() and not rs;
@@ -206,7 +219,9 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
       prop.ahat_key    = -1.0;
       prop.ahat_filled = 0;
     }
-    if (rs) {
+    if (rs and use_fft) {
+      if constexpr (MEM != HOST_MEMORY) X = arr4_t(nk, tc, nP, nQ);
+    } else if (rs) {
       X = arr4_t(nk, tc, nP, nQ);
       nda::array<ComplexType, 2> gq(nacc, nk);   // alpha / N e^{-iQ_q R}, all q (the group's rows are selected after)
       for (long ia = 0; ia < nacc; ++ia) {
@@ -217,7 +232,7 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
     }
     if constexpr (MEM != HOST_MEMORY) device_mem_probe();
     app_log(3, "  gw_line::polarization: {} sector, {} time nodes in chunks of {}{}", leg.ray->sector == sector_t::particle ? "particle" : "hole", nt, tc,
-            rs ? " (real-space convolution, perf 7.1 e)"
+            rs ? (use_fft ? " (real-space convolution, FFT of the mesh, perf 7.5c)" : " (real-space convolution, perf 7.1 e)")
                : (fused ? (qfold ? " (fused Hadamard, all q per launch)" : " (fused Hadamard, one q per launch)") : ""));
 
     for (long i0 = 0; i0 < nt; i0 += tc) {
@@ -227,11 +242,79 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
 
       Timer.start("G_tilde");
       for (long ik = 0; ik < nk; ++ik) {
-        prop.build(ik, t, leg.s_k, gtilde_form_t::adjoint_conj_t, A(ik, tr, all, all));
-        prop.build(ik, t, leg.s_kmq, gtilde_form_t::transposed, B(ik, tr, all, all));
+        prop.build(ik, t, leg.s_k, gtilde_form_t::adjoint_conj_t, A(krow(ik), tr, all, all));
+        prop.build(ik, t, leg.s_kmq, gtilde_form_t::transposed, B(krow(ik), tr, all, all));
       }
       if constexpr (MEM != HOST_MEMORY) utils::device_sync();
       Timer.stop("G_tilde");
+
+      if (use_fft) {   // perf 7.5c: the same convolution with FFTs of the mesh (kmesh_fft.hpp)
+        Timer.start("Pi_hadamard");
+        const long ld = tc * blk, ncols = n * blk;
+        const ComplexType sc = alpha / double(nk);
+        if constexpr (MEM == HOST_MEMORY) {
+          // per cache block of columns: A^ (+), [cache], B^ (-), product, back (-), the group's rows -> acc (alpha / N)
+          eng->prepare(ncols, {{0, +1}, {1, -1}, {0, -1}});
+          ComplexType *a = eng->buf(0), *b = eng->buf(1);
+          for (long c0 = 0; c0 < ncols; c0 += eng->cb) {
+            const long w = std::min(eng->cb, ncols - c0);
+            Timer.start("Pi_ft_fwd");
+            detail::block_in(a, nk, w, A.data() + c0, ld);
+            eng->fft(0, w, +1);
+            if (fill_cache)
+              for (long R = 0; R < nk; ++R)
+                std::memcpy(prop.ahat.data() + (R * nt + i0) * blk + c0, a + R * w, sizeof(ComplexType) * size_t(w));
+            detail::block_in(b, nk, w, B.data() + c0, ld);
+            eng->fft(1, w, -1);
+            Timer.stop("Pi_ft_fwd");
+            Timer.start("Pi_ft_prod");
+            detail::block_mul(a, nk, w, b, w);
+            Timer.stop("Pi_ft_prod");
+            Timer.start("Pi_ft_back");
+            eng->fft(0, w, -1);
+            for (long iqr = 0; iqr < g; ++iqr)
+              detail::block_out(acc.data() + arow(iqr) * ld + c0, ld, 1, w, a, qrow, iqr, sc);
+            Timer.stop("Pi_ft_back");
+          }
+          if (fill_cache) prop.ahat_filled += n;
+        } else {
+          Timer.start("Pi_ft_fwd");
+          detail::fft_mesh_device(kmap.n, A.data(), X.data(), ncols, ld, +1);   // A^(R) into X
+          if (fill_cache) {
+            for (long R = 0; R < nk; ++R) prop.ahat(R, nda::range(i0, i0 + n), all, all) = X(R, tr, all, all);
+            prop.ahat_filled += n;
+          }
+          detail::fft_mesh_device(kmap.n, B.data(), A.data(), ncols, ld, -1);   // B^(R) into A
+          utils::device_sync();
+          Timer.stop("Pi_ft_fwd");
+          Timer.start("Pi_ft_prod");
+          auto A2 = nda::reshape(A, std::array<long, 2>{nk, tc * blk})(all, nda::range(ncols));
+          auto X2 = nda::reshape(X, std::array<long, 2>{nk, tc * blk})(all, nda::range(ncols));
+          nda::tensor::elementwise(ComplexType(1.0), X2, ComplexType(1.0), A2, nda::tensor::op::MUL);   // A <- A^ o B^
+          utils::device_sync();
+          Timer.stop("Pi_ft_prod");
+          Timer.start("Pi_ft_back");
+          detail::fft_mesh_device(kmap.n, A.data(), A.data(), ncols, ld, -1);   // rows qpos(q): N / alpha acc(q)
+          utils::device_sync();
+          Timer.stop("Pi_ft_back");
+        }
+        Timer.stop("Pi_hadamard");
+        Timer.start("Pi_transform");
+        if constexpr (MEM == HOST_MEMORY) {
+          for (long iqr = 0; iqr < g; ++iqr) {
+            auto acc2 = nda::reshape(acc(arow(iqr), all, all, all), std::array<long, 2>{tc, blk})(tr, all);
+            auto Pi2  = nda::reshape(Pi(iqr, all, all, all), std::array<long, 2>{nz, blk});
+            nda::blas::gemm(ComplexType(1.0), F(all, nda::range(i0, i0 + n)), acc2, ComplexType(1.0), Pi2);
+          }
+        } else {
+          for (long iqr = 0; iqr < g; ++iqr)   // Pi(q) += (alpha / N) F[:, chunk] . FFT row qpos(q)
+            detail::gemm_strided_cm('N', 'N', blk, nz, n, sc, A.data() + qrow[iqr] * ld, blk, ld, F.data() + i0, nt, 0,
+                                    ComplexType(1.0), Pi.data() + iqr * nz * blk, blk, nz * blk, 1);
+          utils::device_sync();
+        }
+        Timer.stop("Pi_transform");
+        continue;
+      }
 
       if (rs) {   // perf 7.1 (e): three gemm passes over the k mesh and one elementwise product per R (alpha folded in)
         Timer.start("Pi_hadamard");
@@ -240,15 +323,23 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
         auto B2       = nda::reshape(B, std::array<long, 2>{nk, tc * blk})(all, cr);
         auto X2       = nda::reshape(X, std::array<long, 2>{nk, tc * blk})(all, cr);
         auto C2       = nda::reshape(acc, std::array<long, 2>{nacc, tc * blk})(all, cr);
+        Timer.start("Pi_ft_fwd");
         nda::blas::gemm(ComplexType(1.0), FpM, A2, ComplexType(0.0), X2);   // A^(R)
         if (fill_cache) {
           for (long R = 0; R < nk; ++R) prop.ahat(R, nda::range(i0, i0 + n), all, all) = X(R, tr, all, all);
           prop.ahat_filled += n;
         }
         nda::blas::gemm(ComplexType(1.0), FmM, B2, ComplexType(0.0), A2);   // B^(R), into A
+        if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+        Timer.stop("Pi_ft_fwd");
+        Timer.start("Pi_ft_prod");
         nda::tensor::elementwise(ComplexType(1.0), X2, ComplexType(1.0), A2, nda::tensor::op::MUL);   // A <- A^ o B^
+        if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+        Timer.stop("Pi_ft_prod");
+        Timer.start("Pi_ft_back");
         nda::blas::gemm(ComplexType(1.0), GmQ, A2, ComplexType(0.0), C2);   // acc(q) = alpha / N sum_R e^{-iQR} (.)
         if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+        Timer.stop("Pi_ft_back");
         Timer.stop("Pi_hadamard");
         Timer.start("Pi_transform");
         if constexpr (MEM == HOST_MEMORY) {

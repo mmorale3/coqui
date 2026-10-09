@@ -45,6 +45,10 @@
  */
 
 #include <array>
+#include <chrono>
+#include <cstring>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "configuration.hpp"
@@ -63,6 +67,7 @@
 #include "methods/GW_line/device_blas.hpp"
 #include "methods/GW_line/k_dist.hpp"
 #include "methods/GW_line/kmesh_ft.hpp"
+#include "methods/GW_line/kmesh_fft.hpp"
 #include "methods/GW_line/ibz.hpp"
 
 namespace methods::gw_line {
@@ -90,8 +95,12 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
   const kmesh_ft_t kft(mf);
   utils::check(kft.ok, "gw_line::self_energy_ibz: the k mesh has no valid Fourier matrices (kmesh_ft_t)");
 
-  for (auto nm : {"Sigma_G_tilde", "Sigma_W_time", "Sigma_hadamard", "Sigma_contract", "Sigma_allreduce", "Sigma_transform"})
+  for (auto nm : {"Sigma_G_tilde", "Sigma_W_time", "Sigma_hadamard", "Sigma_contract", "Sigma_allreduce", "Sigma_transform",
+                  "Sig_ft_G", "Sig_ft_W", "Sig_ft_prod", "Sig_ft_back"})
     Timer.add(nm);
+  // perf 7.5c instrumentation: COQUI_GWLINE_FTPROF = 1 logs the class sums' time per class (level 1, once per call)
+  const bool ftprof = detail::env_long("COQUI_GWLINE_FTPROF", 0) != 0;
+  std::vector<double> t_cls(ibz.nclasses(), 0.0);
   prop.set_poles(poles);   // IBZ poles unfolded by the propagator (set_ibz)
 
   const k_dist_t kd(nkI, comm);
@@ -104,10 +113,34 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
   }
   auto out_of = [&](sector_t s) -> nda::array<ComplexType, 4> & { return (s == sector_t::hole and Sigma_h) ? *Sigma_h : Sigma; };
 
+  // perf 7.5c: the class sums with FFTs of the mesh (kmesh_fft.hpp): G^ = FFT-[G built into the rows kpos],
+  // W_c^ = FFT-[W(q_eff) placed at qpos(q_eff)], A_c(ks) = 1/N FFT+[G^ o W_c^](kpos(ks)); host: fused per cache block
+  // (one G^ per block shared by the classes); device: whole-chunk cuFFT, 1/N in the contraction
+  const kmesh_map_t kmap(kft, mf);
+  const bool use_fft = kft_mode<MEM>(kmap) == kft_mode_t::fft;
+  auto krow          = [&](long ik) { return use_fft ? kmap.kpos[ik] : ik; };
+  std::unique_ptr<kmesh_fft_host_t> eng;
+  if constexpr (MEM == HOST_MEMORY)
+    if (use_fft) eng = std::make_unique<kmesh_fft_host_t>(kmap, 2);
+  std::vector<std::vector<long>> wpos(ncl), kspos(ncl);   // FFT: mesh rows of the class's q_eff and of its ks
+  std::vector<std::vector<char>> wdup(ncl);               // a q_eff row already placed in this class (accumulate)
+  if (use_fft)
+    for (long c = 0; c < ncl; ++c) {
+      auto const &cl = ibz.cls[c];
+      std::vector<char> seen(nk, 0);
+      for (long q : cl.q_eff) {
+        wpos[c].push_back(kmap.qpos[q]);
+        wdup[c].push_back(seen[kmap.qpos[q]]);
+        seen[kmap.qpos[q]] = 1;
+      }
+      for (long k : cl.ks) kspos[c].push_back(kmap.kpos[k]);
+    }
+
   // ---- fixed per call: Fourier matrices, XD slices of every (class, IBZ k) on the host
-  memory::array<MEM, ComplexType, 2> FmM = memory::to_memory_space<MEM>(kft.Fm);
+  memory::array<MEM, ComplexType, 2> FmM;
+  if (not use_fft) FmM = memory::to_memory_space<MEM>(kft.Fm);
   std::vector<arr2_t> Hc(ncl), Bc(ncl);   // (N, n_c) e^{-iQ_{q_eff} R}; (nk_ibz, N) e^{+i ks R} / N
-  for (long c = 0; c < ncl; ++c) {
+  for (long c = 0; c < ncl and not use_fft; ++c) {
     auto const &cl = ibz.cls[c];
     const long nc  = cl.q_eff.size();
     nda::array<ComplexType, 2> h(nk, nc), b(nkI, nk);
@@ -183,7 +216,8 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
       }
     const auto form              = leg.transposed ? gtilde_form_t::transposed : gtilde_form_t::plain;
     nda::array<ComplexType, 2> F = ray.transform_matrix(zeta);   // (nz, nt), host
-    arr4_t G(nk, tc, nP, nQ), Gh(nk, tc, nP, nQ), Wt(nR, tc, nP, nQ);
+    // (host FFT: G^ lives in the cache blocks, no Gh array)
+    arr4_t G(nk, tc, nP, nQ), Gh((use_fft and MEM == HOST_MEMORY) ? 0 : nk, tc, nP, nQ), Wt(nR, tc, nP, nQ);
     memory::array<MEM, ComplexType, 5> accC(ncl, nkI, tc, nP, nQ);   // the back-transformed class sums of the chunk
     [[maybe_unused]] arr4_t Wg, Wc;                                   // device: whole-chunk class buffers
     if constexpr (MEM != HOST_MEMORY) {
@@ -203,8 +237,9 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
       part = nda::array<ComplexType, 4>(nkI, tc, nb, nb);
       if (leg.transposed) partT = nda::array<ComplexType, 4>(nkI, tc, nb, nb);
     }
-    app_log(3, "  gw_line::self_energy_ibz: {} sector, {} time nodes in chunks of {}, {} classes, {} rows{}",
-            leg.s == sector_t::particle ? "particle" : "hole", nt, tc, ncl, nR, use_cache ? " (G^ from the cached A^ of Pi)" : "");
+    app_log(3, "  gw_line::self_energy_ibz: {} sector, {} time nodes in chunks of {}, {} classes, {} rows{}{}",
+            leg.s == sector_t::particle ? "particle" : "hole", nt, tc, ncl, nR, use_cache ? " (G^ from the cached A^ of Pi)" : "",
+            use_fft ? " (FFT of the mesh, perf 7.5c)" : "");
     const ComplexType alpha(leg.sign / double(nk));
 
     for (long i0 = 0; i0 < nt; i0 += tc) {
@@ -216,10 +251,101 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
       // 1. G~ of all full-BZ k and G^(R)
       Timer.start("Sigma_G_tilde");
       if (not use_cache)
-        for (long ik = 0; ik < nk; ++ik) prop.build(ik, t, leg.s, form, G(ik, tr, all, all));
+        for (long ik = 0; ik < nk; ++ik) prop.build(ik, t, leg.s, form, G(krow(ik), tr, all, all));
       if constexpr (MEM != HOST_MEMORY) utils::device_sync();
       Timer.stop("Sigma_G_tilde");
+      const long ld = tc * blk, ncols = n * blk;
+      if (use_fft) {   // perf 7.5c: W(r, chunk) first, then the class sums with FFTs
+        Timer.start("Sigma_W_time");
+        {
+          nda::array<ComplexType, 2> Eh = basis.time_exponentials(t, leg.s);
+          auto Ev = Em(tr, all);
+          Ev      = Eh;
+          for (long i = 0; i < nR; ++i) {
+            auto w2 = nda::reshape(w(wrow[i], all, all, all), std::array<long, 2>{r, blk});
+            auto W2 = nda::reshape(Wt(i, all, all, all), std::array<long, 2>{tc, blk})(tr, all);
+            nda::blas::gemm(ComplexType(1.0), Ev, w2, ComplexType(0.0), W2);
+          }
+        }
+        if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+        Timer.stop("Sigma_W_time");
+        Timer.start("Sigma_hadamard");
+        const ComplexType sN(1.0 / double(nk));
+        if constexpr (MEM == HOST_MEMORY) {
+          eng->prepare(ncols, {{0, -1}, {1, -1}, {1, +1}});
+          ComplexType *g0 = eng->buf(0), *b = eng->buf(1);
+          for (long c0 = 0; c0 < ncols; c0 += eng->cb) {
+            const long wd = std::min(eng->cb, ncols - c0);
+            Timer.start("Sig_ft_G");
+            if (use_cache) detail::block_in_conj(g0, nk, wd, prop.ahat.data() + i0 * blk + c0, nt * blk);
+            else {
+              detail::block_in(g0, nk, wd, G.data() + c0, ld);
+              eng->fft(0, wd, -1);
+            }
+            Timer.stop("Sig_ft_G");
+            for (long c = 0; c < ncl; ++c) {
+              auto const &cl = ibz.cls[c];
+              const long nc  = cl.q_eff.size();
+              const auto tcl = ftprof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+              Timer.start("Sig_ft_W");
+              std::memset(static_cast<void *>(b), 0, sizeof(ComplexType) * size_t(nk * wd));
+              for (long j = 0; j < nc; ++j)
+                detail::block_place(b, wd, Wt.data() + ibz.rpos[cl.q_eff[j]] * ld + c0, ld, 1, &wpos[c][j], wdup[c][j] != 0);
+              eng->fft(1, wd, -1);
+              Timer.stop("Sig_ft_W");
+              Timer.start("Sig_ft_prod");
+              detail::block_mul(b, nk, wd, g0, wd);
+              Timer.stop("Sig_ft_prod");
+              Timer.start("Sig_ft_back");
+              eng->fft(1, wd, +1);
+              detail::block_out(accC.data() + c * nkI * ld + c0, ld, nkI, wd, b, kspos[c], 0, sN);
+              Timer.stop("Sig_ft_back");
+              if (ftprof) t_cls[c] += std::chrono::duration<double>(std::chrono::steady_clock::now() - tcl).count();
+            }
+          }
+        } else {
+          auto Gh2 = nda::reshape(Gh, std::array<long, 2>{nk, tc * blk})(all, cr);
+          auto Wc2 = nda::reshape(Wc, std::array<long, 2>{nk, tc * blk})(all, cr);
+          Timer.start("Sig_ft_G");
+          if (use_cache) {
+            for (long R = 0; R < nk; ++R)
+              detail::conj_copy<MEM>(memory::array_view<MEM, ComplexType, 1>(std::array<long, 1>{n * blk}, Gh.data() + R * ld),
+                                     memory::array_view<MEM, ComplexType, 1>(std::array<long, 1>{n * blk},
+                                                                             prop.ahat.data() + (R * nt + i0) * blk));
+          } else
+            detail::fft_mesh_device(kmap.n, G.data(), Gh.data(), ncols, ld, -1);
+          utils::device_sync();
+          Timer.stop("Sig_ft_G");
+          for (long c = 0; c < ncl; ++c) {
+            auto const &cl = ibz.cls[c];
+            const long nc  = cl.q_eff.size();
+            const auto tcl = ftprof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            Timer.start("Sig_ft_W");
+            nda::tensor::set(ComplexType(0.0), Wc);
+            for (long j = 0; j < nc; ++j) {
+              auto dst = Wc(wpos[c][j], tr, all, all);
+              if (wdup[c][j]) nda::tensor::add(ComplexType(1.0), Wt(ibz.rpos[cl.q_eff[j]], tr, all, all), "abc", ComplexType(1.0), dst, "abc");
+              else dst = Wt(ibz.rpos[cl.q_eff[j]], tr, all, all);
+            }
+            detail::fft_mesh_device(kmap.n, Wc.data(), Wc.data(), ncols, ld, -1);
+            utils::device_sync();
+            Timer.stop("Sig_ft_W");
+            Timer.start("Sig_ft_prod");
+            nda::tensor::elementwise(ComplexType(1.0), Gh2, ComplexType(1.0), Wc2, nda::tensor::op::MUL);
+            utils::device_sync();
+            Timer.stop("Sig_ft_prod");
+            Timer.start("Sig_ft_back");
+            detail::fft_mesh_device(kmap.n, Wc.data(), Wc.data(), ncols, ld, +1);   // N A_c at the rows kpos(ks)
+            for (long k = 0; k < nkI; ++k) accC(c, k, tr, all, all) = Wc(kspos[c][k], tr, all, all);
+            utils::device_sync();
+            Timer.stop("Sig_ft_back");
+            if (ftprof) t_cls[c] += std::chrono::duration<double>(std::chrono::steady_clock::now() - tcl).count();
+          }
+        }
+        Timer.stop("Sigma_hadamard");
+      } else {
       Timer.start("Sigma_hadamard");
+      Timer.start("Sig_ft_G");
       auto G2  = nda::reshape(G, std::array<long, 2>{nk, tc * blk})(all, cr);
       auto Gh2 = nda::reshape(Gh, std::array<long, 2>{nk, tc * blk})(all, cr);
       if (use_cache) {
@@ -230,6 +356,7 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
       } else
         nda::blas::gemm(ComplexType(1.0), FmM, G2, ComplexType(0.0), Gh2);
       if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+      Timer.stop("Sig_ft_G");
       Timer.stop("Sigma_hadamard");
 
       // 2. W(r, chunk) of the rows R from the residues (the leg's residue row)
@@ -251,7 +378,6 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
       //    host: blocked over the (t, P, Q) columns so that the G^ / W_c / product stripes of all classes stay in cache
       //    (the unblocked form makes ~6 passes over N x (t block) arrays per class: memory-bound); env COQUI_GWLINE_IBZ_CB
       Timer.start("Sigma_hadamard");
-      const long ncols = n * blk;
       if constexpr (MEM == HOST_MEMORY) {
         auto Gfull = nda::reshape(Gh, std::array<long, 2>{nk, tc * blk});
         auto Wfull = nda::reshape(Wt, std::array<long, 2>{nR, tc * blk});
@@ -262,37 +388,59 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
           for (long c = 0; c < ncl; ++c) {
             auto const &cl = ibz.cls[c];
             const long nc  = cl.q_eff.size();
+            const auto tcl = ftprof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            Timer.start("Sig_ft_W");
             auto gb        = s_gb.template view<2>({nc, w});
             for (long j = 0; j < nc; ++j) gb(j, all) = Wfull(ibz.rpos[cl.q_eff[j]], br);
             auto wc = s_wc.template view<2>({nk, w});
             nda::blas::gemm(ComplexType(1.0), Hc[c], gb, ComplexType(0.0), wc);
+            Timer.stop("Sig_ft_W");
+            Timer.start("Sig_ft_prod");
             for (long R = 0; R < nk; ++R) {
               ComplexType *wp = &wc(R, 0);
               ComplexType const *gp = &Gs(R, 0);
               for (long i = 0; i < w; ++i) wp[i] *= gp[i];
             }
+            Timer.stop("Sig_ft_prod");
+            Timer.start("Sig_ft_back");
             auto A2 = nda::reshape(accC(c, all, all, all, all), std::array<long, 2>{nkI, tc * blk})(all, br);
             nda::blas::gemm(ComplexType(1.0), Bc[c], wc, ComplexType(0.0), A2);
+            Timer.stop("Sig_ft_back");
+            if (ftprof) t_cls[c] += std::chrono::duration<double>(std::chrono::steady_clock::now() - tcl).count();
           }
         }
       } else {
         for (long c = 0; c < ncl; ++c) {
           auto const &cl = ibz.cls[c];
           const long nc  = cl.q_eff.size();
+          const auto tcl = ftprof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+          Timer.start("Sig_ft_W");
           for (long j = 0; j < nc; ++j) Wg(j, tr, all, all) = Wt(ibz.rpos[cl.q_eff[j]], tr, all, all);
           auto Wg2 = nda::reshape(Wg, std::array<long, 2>{ncmax, tc * blk})(nda::range(nc), cr);
           auto Wc2 = nda::reshape(Wc, std::array<long, 2>{nk, tc * blk})(all, cr);
           auto A2  = nda::reshape(accC(c, all, all, all, all), std::array<long, 2>{nkI, tc * blk})(all, cr);
           nda::blas::gemm(ComplexType(1.0), Hc[c], Wg2, ComplexType(0.0), Wc2);
+          utils::device_sync();
+          Timer.stop("Sig_ft_W");
+          Timer.start("Sig_ft_prod");
           nda::tensor::elementwise(ComplexType(1.0), Gh2, ComplexType(1.0), Wc2, nda::tensor::op::MUL);
+          utils::device_sync();
+          Timer.stop("Sig_ft_prod");
+          Timer.start("Sig_ft_back");
           nda::blas::gemm(ComplexType(1.0), Bc[c], Wc2, ComplexType(0.0), A2);
+          utils::device_sync();
+          Timer.stop("Sig_ft_back");
+          if (ftprof) t_cls[c] += std::chrono::duration<double>(std::chrono::steady_clock::now() - tcl).count();
         }
         utils::device_sync();
       }
       Timer.stop("Sigma_hadamard");
+      }   // gemm path
 
       // 4. contraction with the XD slices of (class, k), accumulated over the classes
       Timer.start("Sigma_contract");
+      // perf 7.5c device FFT: accC = N x the class sums (1/N here)
+      const ComplexType cs = (use_fft and MEM != HOST_MEMORY) ? ComplexType(1.0 / double(nk)) : ComplexType(1.0);
       for (long c = 0; c < ncl; ++c) {
         const ComplexType beta = (c == 0) ? ComplexType(0.0) : ComplexType(1.0);
         for (long k = 0; k < nkI; ++k) {
@@ -302,10 +450,10 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
             auto a = accC(c, k, it, all, all);
             auto o = part_m(k, it, all, all);
             if (right_first) {
-              nda::blas::gemm(ComplexType(1.0), a, Rr, ComplexType(0.0), u1);
+              nda::blas::gemm(cs, a, Rr, ComplexType(0.0), u1);
               nda::blas::gemm(ComplexType(1.0), L, u1, beta, o);
             } else {
-              nda::blas::gemm(ComplexType(1.0), L, a, ComplexType(0.0), t1);
+              nda::blas::gemm(cs, L, a, ComplexType(0.0), t1);
               nda::blas::gemm(ComplexType(1.0), t1, Rr, beta, o);
             }
           }
@@ -354,6 +502,11 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
       }
       Timer.stop("Sigma_transform");
     }
+  }
+  if (ftprof) {
+    std::string line;
+    for (long c = 0; c < ncl; ++c) line += std::to_string(ibz.cls[c].q_eff.size()) + ":" + std::to_string(t_cls[c]).substr(0, 6) + " ";
+    app_log(1, "  self_energy_ibz (COQUI_GWLINE_FTPROF): class sums per class (n_c:s, rank 0, both legs): {}", line);
   }
 }
 

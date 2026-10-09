@@ -82,6 +82,8 @@
  */
 
 #include <array>
+#include <cstring>
+#include <memory>
 
 #include "configuration.hpp"
 #include "nda/nda.hpp"
@@ -101,6 +103,7 @@
 #include "methods/GW_line/device_blas.hpp"
 #include "methods/GW_line/k_dist.hpp"
 #include "methods/GW_line/kmesh_ft.hpp"
+#include "methods/GW_line/kmesh_fft.hpp"
 
 namespace methods::gw_line {
 
@@ -146,7 +149,8 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
   // the q whose interaction the residue row iq enters: q for the particle leg, -q for the hole leg (see the header)
   auto q_of_row = [&](sector_t s, long iq) -> long { return s == sector_t::hole ? long(qm(iq)) : iq; };
 
-  for (auto nm : {"Sigma_G_tilde", "Sigma_W_time", "Sigma_hadamard", "Sigma_contract", "Sigma_allreduce", "Sigma_transform"})
+  for (auto nm : {"Sigma_G_tilde", "Sigma_W_time", "Sigma_hadamard", "Sigma_contract", "Sigma_allreduce", "Sigma_transform",
+                  "Sig_ft_wR", "Sig_ft_G", "Sig_ft_prod", "Sig_ft_back"})
     Timer.add(nm);
   prop.set_poles(poles);
 
@@ -208,17 +212,58 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
   // sum_j w^_j(R) e^{-i nu_j t}, the hole leg sum_q e^{+iQR} (.) = w^(-R) (rows swapped in place before the hole leg);
   // G^(R) = sum_k e^{-ikR} G(k), acc(k) = 1/N sum_R e^{+ikR} G^(R) o W^(R)  (kmesh_ft.hpp)
   [[maybe_unused]] memory::array<MEM, ComplexType, 2> FmM, BpM;
+  // perf 7.5c: the transforms as 3-D FFTs of the mesh (kmesh_fft.hpp): w^(R) = FFT-[w placed at qpos], G^ = FFT-[G built
+  // into the rows kpos], acc(k) = 1/N FFT+[G^ o W^](kpos(k)) (host: fused per cache block; device: rows kpos of the output,
+  // 1/N in the contraction)
+  const kmesh_map_t kmap(kft, mf);
+  const bool use_fft = rs and kft_mode<MEM>(kmap) == kft_mode_t::fft;
+  auto krow          = [&](long ik) { return use_fft ? kmap.kpos[ik] : ik; };
+  std::unique_ptr<kmesh_fft_host_t> eng;
+  if constexpr (MEM == HOST_MEMORY)
+    if (use_fft) eng = std::make_unique<kmesh_fft_host_t>(kmap, 1);
   // perf 7.4b: w_consume == &w (the driver's q plan when memory is short): w^(R) overwrites w in column blocks (scratch
   // nk x cb; the caller's residues are consumed), so the Sigma stage holds N_q r_b blocks less
   arr4_t wR_own;
   ComplexType *wRp = nullptr;
   bool wR_minus = false;
-  if (rs) {
+  if (rs and use_fft) {
+    Timer.start("Sigma_W_time");
+    Timer.start("Sig_ft_wR");
+    const long len = r * blk;
+    if (w_consume != nullptr)
+      utils::check(w_consume->data() == w.data() and nk == nq, "gw_line::self_energy: w_consume must alias w (and N_k == N_q)");
+    else
+      wR_own = arr4_t(nk, r, nP, nQ);
+    ComplexType *dst = (w_consume != nullptr) ? w_consume->data() : wR_own.data();
+    if constexpr (MEM == HOST_MEMORY) {   // per cache block: the q rows placed at qpos, FFT-, written as rows R (in place OK)
+      eng->prepare(len, {{0, -1}});
+      ComplexType *b = eng->buf(0);
+      for (long c0 = 0; c0 < len; c0 += eng->cb) {
+        const long wd = std::min(eng->cb, len - c0);
+        detail::block_place(b, wd, w.data() + c0, len, nq, kmap.qpos.data());
+        eng->fft(0, wd, -1);
+        for (long R = 0; R < nk; ++R) std::memcpy(dst + R * len + c0, b + R * wd, sizeof(ComplexType) * size_t(wd));
+      }
+    } else {
+      if (w_consume != nullptr) {
+        if (not kmap.qid) detail::permute_rows<MEM>(dst, nq, len, kmap.qpos);
+      } else if (not kmap.qid) {
+        for (long q = 0; q < nq; ++q) wR_own(kmap.qpos[q], all, all, all) = w(q, all, all, all);
+      }
+      ComplexType const *src = (w_consume == nullptr and kmap.qid) ? w.data() : dst;
+      detail::fft_mesh_device(kmap.n, src, dst, len, len, -1);
+      utils::device_sync();
+    }
+    wRp = dst;
+    Timer.stop("Sig_ft_wR");
+    Timer.stop("Sigma_W_time");
+  } else if (rs) {
     FmM = memory::to_memory_space<MEM>(kft.Fm);
     nda::array<ComplexType, 2> bp = kft.Bp;
     bp *= ComplexType(1.0 / double(nk));
     BpM = memory::to_memory_space<MEM>(bp);
     Timer.start("Sigma_W_time");
+    Timer.start("Sig_ft_wR");
     memory::array<MEM, ComplexType, 2> HmM = memory::to_memory_space<MEM>(kft.Hm);
     if (w_consume != nullptr) {
       utils::check(w_consume->data() == w.data() and nk == nq, "gw_line::self_energy: w_consume must alias w (and N_k == N_q)");
@@ -241,6 +286,7 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
       wRp = wR_own.data();
     }
     if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+    Timer.stop("Sig_ft_wR");
     Timer.stop("Sigma_W_time");
   }
   // real space: w^(R) (N, r, nP, nQ), rows -R after the swap
@@ -312,7 +358,8 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
     }
     if constexpr (MEM != HOST_MEMORY) device_mem_probe();
     app_log(3, "  gw_line::self_energy: {} sector, {} time nodes in chunks of {}{}{}", leg.s == sector_t::particle ? "particle" : "hole",
-            nt, tc, rs ? " (real-space convolution, perf 7.1 e)" : "", use_cache ? " (G^ from the cached A^ of Pi)" : "");
+            nt, tc, rs ? (use_fft ? " (real-space convolution, FFT of the mesh, perf 7.5c)" : " (real-space convolution, perf 7.1 e)") : "",
+            use_cache ? " (G^ from the cached A^ of Pi)" : "");
     const ComplexType alpha(leg.sign / double(nk));
 
     for (long qs0 = 0; qs0 < nq; qs0 += gsz) {   // q groups (one group = all q unless host-resident residues)
@@ -333,7 +380,7 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
         // 1. G~(k, chunk) for all k (not needed when the hole leg takes G^ from the cached A^)
         Timer.start("Sigma_G_tilde");
         if (not use_cache)
-          for (long ik = 0; ik < nk; ++ik) prop.build(ik, t, leg.s, form, G(ik, tr, all, all));
+          for (long ik = 0; ik < nk; ++ik) prop.build(ik, t, leg.s, form, G((rs ? krow(ik) : ik), tr, all, all));
         if constexpr (MEM != HOST_MEMORY) utils::device_sync();
         Timer.stop("Sigma_G_tilde");
 
@@ -363,6 +410,53 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
           auto G2       = nda::reshape(G, std::array<long, 2>{nk, tc * blk})(all, cr);
           auto X2       = nda::reshape(acc, std::array<long, 2>{nk, tc * blk})(all, cr);
           auto W2       = nda::reshape(Wq, std::array<long, 2>{nk, tc * blk})(all, cr);
+          if (use_fft) {   // perf 7.5c
+            const long ld = tc * blk, ncols = n * blk;
+            if constexpr (MEM == HOST_MEMORY) {
+              // per cache block: G^ (-) [or conj A^], o W^(R), back (+), rows kpos(k) -> acc(k) / N (k order)
+              eng->prepare(ncols, {{0, -1}, {0, +1}});
+              ComplexType *b = eng->buf(0);
+              for (long c0 = 0; c0 < ncols; c0 += eng->cb) {
+                const long wd = std::min(eng->cb, ncols - c0);
+                Timer.start("Sig_ft_G");
+                if (use_cache) detail::block_in_conj(b, nk, wd, prop.ahat.data() + i0 * blk + c0, nt * blk);
+                else {
+                  detail::block_in(b, nk, wd, G.data() + c0, ld);
+                  eng->fft(0, wd, -1);
+                }
+                Timer.stop("Sig_ft_G");
+                Timer.start("Sig_ft_prod");
+                detail::block_mul(b, nk, wd, Wq.data() + c0, ld);
+                Timer.stop("Sig_ft_prod");
+                Timer.start("Sig_ft_back");
+                eng->fft(0, wd, +1);
+                detail::block_out(acc.data() + c0, ld, nk, wd, b, kmap.kpos, 0, ComplexType(1.0 / double(nk)));
+                Timer.stop("Sig_ft_back");
+              }
+            } else {
+              Timer.start("Sig_ft_G");
+              if (use_cache) {   // G^(R) = conj A^(R, t)
+                for (long R = 0; R < nk; ++R)
+                  detail::conj_copy<MEM>(memory::array_view<MEM, ComplexType, 1>(std::array<long, 1>{n * blk}, acc.data() + R * ld),
+                                         memory::array_view<MEM, ComplexType, 1>(std::array<long, 1>{n * blk},
+                                                                                 prop.ahat.data() + (R * nt + i0) * blk));
+              } else
+                detail::fft_mesh_device(kmap.n, G.data(), acc.data(), ncols, ld, -1);   // G^(R) into acc
+              utils::device_sync();
+              Timer.stop("Sig_ft_G");
+              Timer.start("Sig_ft_prod");
+              nda::tensor::elementwise(ComplexType(1.0), X2, ComplexType(1.0), W2, nda::tensor::op::MUL);   // W <- G^ o W^
+              utils::device_sync();
+              Timer.stop("Sig_ft_prod");
+              Timer.start("Sig_ft_back");
+              detail::fft_mesh_device(kmap.n, Wq.data(), G.data(), ncols, ld, +1);   // N acc(k) at the rows kpos(k), into G
+              utils::device_sync();
+              Timer.stop("Sig_ft_back");
+              std::swap(G, acc);
+            }
+            Timer.stop("Sigma_hadamard");
+          } else {
+          Timer.start("Sig_ft_G");
           if (use_cache) {   // G^(R) = conj A^(R, t)
             for (long R = 0; R < nk; ++R)
               detail::conj_copy<MEM>(memory::array_view<MEM, ComplexType, 1>(std::array<long, 1>{n * blk}, acc.data() + R * tc * blk),
@@ -370,11 +464,20 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
                                                                              prop.ahat.data() + (R * nt + i0) * blk));
           } else
             nda::blas::gemm(ComplexType(1.0), FmM, G2, ComplexType(0.0), X2);   // G^(R)
+          if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+          Timer.stop("Sig_ft_G");
+          Timer.start("Sig_ft_prod");
           nda::tensor::elementwise(ComplexType(1.0), X2, ComplexType(1.0), W2, nda::tensor::op::MUL);   // W <- G^ o W^
+          if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+          Timer.stop("Sig_ft_prod");
+          Timer.start("Sig_ft_back");
           nda::blas::gemm(ComplexType(1.0), BpM, W2, ComplexType(0.0), G2);   // acc(k) = 1/N sum_R e^{ikR} (.), into G
+          if constexpr (MEM != HOST_MEMORY) utils::device_sync();
+          Timer.stop("Sig_ft_back");
           std::swap(G, acc);
           if constexpr (MEM != HOST_MEMORY) utils::device_sync();
           Timer.stop("Sigma_hadamard");
+          }
         } else if (kouter) {   // device, fused: W(q, chunk) for all q (one gemm), then acc(k) for all k in one launch
           Timer.start("Sigma_W_time");
           // column-major: W(q)^T (blk x n) = w(q)^T (blk x r) . E^T (r x n), batched over q
@@ -446,17 +549,19 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
             //   o(t)  = t1(t) R, R = Xq = XqT^T (plain) or conj(Xq) = XqH^T (transposed) -> o(t)^T = R^T t1(t)^T
             ComplexType const *xl = (leg.transposed ? prop.Xp : prop.Xpc).data() + ik * nP * nb;
             ComplexType const *xr = (leg.transposed ? prop.XqH : prop.XqT).data() + ik * nb * nQ;
-            auto a = acc(ik, tr, all, all);
+            // perf 7.5c device FFT: acc(k) is N x the FFT row kpos(k)
+            const ComplexType cs  = use_fft ? ComplexType(1.0 / double(nk)) : ComplexType(1.0);
+            auto a = acc(use_fft ? krow(ik) : ik, tr, all, all);
             auto o = part_m(ik, tr, all, all);
             if (right_first) {
               //   u(t) = a(t) R  ->  u(t)^T (nb x nP) = R^T a(t)^T: R_cm = xr (nQ x nb, ld nQ) with op 'T', a_cm (nQ x nP)
               //   o(t) = L u(t)  ->  o(t)^T = u(t)^T L^T: L_cm = xl (nb x nP, ld nb) with op 'T'
-              detail::gemm_strided_cm('T', 'N', nb, nP, nQ, ComplexType(1.0), xr, nQ, 0, a.data(), nQ, nP * nQ, ComplexType(0.0),
+              detail::gemm_strided_cm('T', 'N', nb, nP, nQ, cs, xr, nQ, 0, a.data(), nQ, nP * nQ, ComplexType(0.0),
                                       t1b.data(), nb, nb * nP, n);
               detail::gemm_strided_cm('N', 'T', nb, nb, nP, ComplexType(1.0), t1b.data(), nb, nb * nP, xl, nb, 0, ComplexType(0.0),
                                       o.data(), nb, nb * nb, n);
             } else {
-              detail::gemm_strided_cm('N', 'T', nQ, nb, nP, ComplexType(1.0), a.data(), nQ, nP * nQ, xl, nb, 0, ComplexType(0.0),
+              detail::gemm_strided_cm('N', 'T', nQ, nb, nP, cs, a.data(), nQ, nP * nQ, xl, nb, 0, ComplexType(0.0),
                                       t1b.data(), nQ, nb * nQ, n);
               detail::gemm_strided_cm('T', 'N', nb, nb, nQ, ComplexType(1.0), xr, nQ, 0, t1b.data(), nQ, nb * nQ, ComplexType(0.0),
                                       o.data(), nb, nb * nb, n);

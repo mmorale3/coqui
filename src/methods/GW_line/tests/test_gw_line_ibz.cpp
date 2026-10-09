@@ -70,6 +70,7 @@
 #include "methods/GW_line/static_part.hpp"
 #include "methods/GW_line/static_ibz.hpp"
 #include "methods/GW_line/ibz.hpp"
+#include "methods/GW_line/kmesh_fft.hpp"
 #include "methods/GW_line/driver.hpp"
 #include "methods/GW_line/polarization.hpp"
 #include "methods/GW_line/self_energy.hpp"
@@ -470,6 +471,114 @@ TEST_CASE("gw_line_ibz_scf", "[ibz][scf][gw_line]") {
     }
     REQUIRE(std::abs(A.history[0].mu - B.history[0].mu) <= 1e-4);
     REQUIRE(std::abs(A.history[0].gap - B.history[0].gap) <= 1e-4);
+  }
+}
+
+/**
+ * [ibz][kft] perf 7.5c: the IBZ kernels with the k-mesh transforms as FFTs (kmesh_fft.hpp) vs the dense gemms, on the symmetric
+ * fixtures with random non-diagonal poles: Pi rows (<= 1e-13); Sigma at the IBZ k from the SAME residues (class sums: placed
+ * W(q_eff), G^ shared per block, rows kpos(ks); A^ cache and rebuilt G~) <= 1e-13; the driver on lih223_sym (2 iterations,
+ * gemm vs fft): mu / gap per iteration (gate 1e-10 Ha). Device builds: the device FFT path vs the host gemm path.
+ */
+TEST_CASE("gw_line_ibz_kft", "[ibz][kft][gw_line]") {
+  auto &mpi = *utils::make_unit_test_mpi_context();
+  for (std::string name : {"qe_lih222_sym", "qe_lih223_sym", "qe_lih223_inv"}) {
+    auto f = make_fix(name);
+    ibz_t ibz(*f.mf, f.nb);
+    auto poles = random_poles(f, 0.01, 7);
+    double gap = 1e300;
+    for (long k = 0; k < f.nkI; ++k)
+      for (long n = 0; n < f.nb; ++n) gap = std::min(gap, std::abs(f.eigI(k, n) - f.mu));
+    auto &mf = *f.mf;
+    const kmesh_ft_t kft(mf);
+    const kmesh_map_t km(kft, mf);
+    REQUIRE(km.ok);
+    const double deg = std::numbers::pi / 180.0, theta = 20.0 * deg, theta_t = 10.0 * deg;
+    numerics::line_dlr::bosonic_basis_t basis(theta, 4.0, 1e-10, gap);
+    const double smax = 30.0 / (poles.emin() * std::sin(theta_t));
+    numerics::line_dlr::time_ray_t ray_p(theta_t, smax, 1e-5, 1.5, 12, sector_t::particle),
+        ray_h(theta_t, smax, 1e-5, 1.5, 12, sector_t::hole);
+    aux_grid_t grid(mpi, f.Np);
+    utils::TimerManager T;
+    propagator_t<HOST_MEMORY> prop(*f.thc, grid);
+    prop.set_ibz(&ibz);
+    auto fz = numerics::line_dlr::dense_nodes(theta, 1e-3, 60.0, 30);
+    memory::array<HOST_MEMORY, ComplexType, 4> w;
+    struct o_t {
+      memory::array<HOST_MEMORY, ComplexType, 4> Pi;
+      nda::array<ComplexType, 4> Sp, Sh, Sp1, Sh1;
+    };
+    auto pass = [&](char const *mode, bool make_w) {
+      env_scope_t e("COQUI_GWLINE_KFT", mode);
+      o_t o;
+      polarization<HOST_MEMORY>(prop, poles, mf, grid, basis.zeta_nodes, ray_p, ray_h, 8, o.Pi, T, sector_t::both, ibz.rows);
+      if (make_w) {
+        q_groups_t qg(ibz.rows, ibz.nrows(), ibz.qminus);
+        coulomb_blocks_t<HOST_MEMORY> Zb(*f.thc, grid, qg.dyson_q_list(mpi.comm.size(), mpi.comm.rank(), basis.zeta_nodes.size(), f.Np), T);
+        auto Pc = o.Pi;
+        screened_interaction<HOST_MEMORY>(Pc, Zb, basis, grid, mpi, w, T, nullptr, ibz.rows, true);
+      }
+      self_energy_ibz<HOST_MEMORY>(prop, poles, w, basis, mf, ibz, grid, mpi.comm, fz, ray_p, ray_h, 8, o.Sp, T, sector_t::both, false,
+                                   &o.Sh);
+      env_scope_t e1("COQUI_GWLINE_GT_CACHE", "0");
+      self_energy_ibz<HOST_MEMORY>(prop, poles, w, basis, mf, ibz, grid, mpi.comm, fz, ray_p, ray_h, 8, o.Sp1, T, sector_t::both,
+                                   false, &o.Sh1);
+      return o;
+    };
+    auto rel = [&](auto const &a, auto const &b) {
+      const double d = mpi.comm.all_reduce_value(mdiff(a, b), boost::mpi3::max<>{});
+      const double m = mpi.comm.all_reduce_value(mabs(b), boost::mpi3::max<>{});
+      return d / std::max(1e-300, m);
+    };
+    auto g  = pass("gemm", true);
+    auto ff = pass("fft", false);
+    const double ep = rel(ff.Pi, g.Pi), es = std::max(rel(ff.Sp, g.Sp), rel(ff.Sh, g.Sh)),
+                 es1 = std::max(rel(ff.Sp1, g.Sp1), rel(ff.Sh1, g.Sh1));
+    app_log(1, "  [ibz][kft] {} ({} ranks, {} of {} k, {} rows, {} classes, k order {}, q order {}): fft vs gemm: Pi {:.2e}, Sigma {:.2e} "
+               "(rebuilt G~ {:.2e})",
+            name, mpi.comm.size(), f.nkI, f.nk, ibz.nrows(), ibz.nclasses(), km.kid ? "mesh" : "permuted", km.qid ? "mesh" : "permuted",
+            ep, es, es1);
+    REQUIRE(ep <= 1e-13);
+    REQUIRE(es <= 1e-13);
+    REQUIRE(es1 <= 1e-13);
+#if defined(ENABLE_DEVICE)
+    {
+      env_scope_t e("COQUI_GWLINE_KFT", "fft");
+      propagator_t<DEVICE_MEMORY> pd(*f.thc, grid);
+      pd.set_ibz(&ibz);
+      memory::array<DEVICE_MEMORY, ComplexType, 4> Pd;
+      polarization<DEVICE_MEMORY>(pd, poles, mf, grid, basis.zeta_nodes, ray_p, ray_h, 8, Pd, T, sector_t::both, ibz.rows);
+      nda::array<ComplexType, 4> Pdh = memory::to_memory_space<HOST_MEMORY>(Pd);
+      memory::array<DEVICE_MEMORY, ComplexType, 4> wd = memory::to_memory_space<DEVICE_MEMORY>(w);
+      nda::array<ComplexType, 4> Sp, Sh;
+      self_energy_ibz<DEVICE_MEMORY>(pd, poles, wd, basis, mf, ibz, grid, mpi.comm, fz, ray_p, ray_h, 8, Sp, T, sector_t::both, false,
+                                     &Sh);
+      const double dp = rel(Pdh, g.Pi), ds = std::max(rel(Sp, g.Sp), rel(Sh, g.Sh));
+      app_log(1, "  [ibz][kft][device] {}: device fft vs host gemm: Pi {:.2e}, Sigma {:.2e}", name, dp, ds);
+      REQUIRE(dp <= 1e-13);
+      REQUIRE(ds <= 1e-13);
+    }
+#endif
+  }
+  {   // the driver, gemm vs fft (lih223_sym: q != -q rows, point group + TR)
+    auto fs           = make_fix("qe_lih223_sym");
+    const long niter  = 2;
+    auto run = [&](char const *mode, std::string const &out) {
+      env_scope_t e("COQUI_GWLINE_KFT", mode);
+      return methods::gw_line::gw_line_scf<HOST_MEMORY>(*fs.thc, *fs.mf, ibz_scf_params(out, niter));
+    };
+    auto A = run("gemm", "ibz_kft_gemm");
+    auto B = run("fft", "ibz_kft_fft");
+    double dmu = 0.0, dgap = 0.0;
+    for (long i = 0; i < niter; ++i) {
+      dmu  = std::max(dmu, std::abs(A.history[i].mu - B.history[i].mu));
+      dgap = std::max(dgap, std::abs(A.history[i].gap - B.history[i].gap));
+      app_log(1, "  [ibz][kft][scf] lih223_sym it {}: gemm mu {:.14f} gap {:.14f}; fft mu {:.14f} gap {:.14f} Ha (dmu {:.1e}, dgap {:.1e})",
+              i + 1, A.history[i].mu, A.history[i].gap, B.history[i].mu, B.history[i].gap, A.history[i].mu - B.history[i].mu,
+              A.history[i].gap - B.history[i].gap);
+    }
+    REQUIRE(dmu <= 1e-10);
+    REQUIRE(dgap <= 1e-10);
   }
 }
 
