@@ -97,10 +97,11 @@ class closure_cores_t {
 #endif
   }
   /**
-   * perf 7.1c: the ranks with weight > 0 ("busy") borrow the cores of the other ranks of their host: the idle ranks of a
-   * host are dealt round-robin to its busy ranks, a busy rank of weight w taking w cards per round (in rank order), at
-   * most max_threads cores per busy rank (its own included; <= 0: no cap). Same conditions as above (Linux, every rank
-   * bound to one core, COQUI_GWLINE_CLOSURE_BORROW != 0). Collective over comm; every rank must call wait() afterwards.
+   * perf 7.1c: the ranks with weight > 0 ("busy") borrow the cores of the other ranks of their host. Local lending: in
+   * rounds, every busy rank (rank order) takes `weight` of the free idle cores nearest to its own core (by core index:
+   * same CCX / socket first; spreading the threads over both sockets made the eigensolvers slower than 2 local threads),
+   * at most max_threads cores per busy rank (its own included; <= 0: no cap). Same conditions as above (Linux, every
+   * rank bound to one core, COQUI_GWLINE_CLOSURE_BORROW != 0). Collective over comm; every rank must call wait() afterwards.
    */
   closure_cores_t(boost::mpi3::communicator &comm, long weight, long max_threads) : comm_(&comm) {
     const bool busy = weight > 0;
@@ -130,22 +131,32 @@ class closure_cores_t {
       helper_ = not hb.empty();
       return;
     }
-    std::vector<long> cards;   // busy ranks of the host, rank r appearing weight(r) times, round by round
-    long wmax = 0;
-    for (long b : hb) wmax = std::max(wmax, all[3 * b + 2]);
-    for (long rd = 0; rd < wmax; ++rd)
-      for (long b : hb)
-        if (all[3 * b + 2] > rd) cards.push_back(b);
+    std::vector<char> taken(hi.size(), 0);
+    std::vector<long> got(hb.size(), 1);   // cores per busy rank (own included)
     saved_         = mask;
     cpu_set_t wide = mask;
-    long n         = 1;
-    for (long i = 0; i < long(hi.size()); ++i) {
-      if (cards[i % long(cards.size())] != rank) continue;
-      if (max_threads > 0 and n >= max_threads) break;
-      CPU_SET(int(all[3 * hi[i] + 1]), &wide);
-      ++n;
+    for (bool more = true; more;) {
+      more = false;
+      for (size_t ib = 0; ib < hb.size(); ++ib) {
+        const long b = hb[ib], cb = all[3 * b + 1];
+        for (long w = 0; w < all[3 * b + 2]; ++w) {
+          if (max_threads > 0 and got[ib] >= max_threads) break;
+          long best = -1;
+          for (size_t i = 0; i < hi.size(); ++i) {
+            if (taken[i]) continue;
+            const long d = std::abs(all[3 * hi[i] + 1] - cb);
+            if (best < 0 or d < std::abs(all[3 * hi[best] + 1] - cb)) best = long(i);
+          }
+          if (best < 0) break;
+          taken[best] = 1;
+          ++got[ib];
+          more = true;
+          if (b == rank) CPU_SET(int(all[3 * hi[best] + 1]), &wide);
+        }
+      }
     }
-    widen(wide, n);
+    const long ib = long(std::find(hb.begin(), hb.end(), rank) - hb.begin());
+    widen(wide, got[ib]);
 #else
     (void)busy;
     (void)max_threads;

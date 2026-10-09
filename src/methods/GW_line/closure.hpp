@@ -149,7 +149,7 @@ struct closure_params_t {
    * SVD and the final realization with borrowed cores (closure_scan.hpp); serial callers (closure_k) run the same
    * arithmetic on one rank. "serial": the pre-7.1c scan (the owner realizes all 41 phases).
    * Env COQUI_GWLINE_CLOSURE_SCAN overrides the default; COQUI_GWLINE_SCAN_MB (problem broadcast budget per rank, MB),
-   * COQUI_GWLINE_SCAN_THREADS (cap of the borrowed cores per busy rank, 0 = none).
+   * COQUI_GWLINE_SCAN_THREADS (cores per busy rank incl. its own, default 16; 0 = no cap).
    */
   std::string scan       = detail::env_string("COQUI_GWLINE_CLOSURE_SCAN", "parallel");
   /// perf 7.1c: first cut of the Cayley U-eigen path: "inf" (u0 = 1, S7g) | "mu" (u0 = -1, in the gap of Sigma; measured on
@@ -158,7 +158,7 @@ struct closure_params_t {
   /// perf 7.1c: residual acceptance factor of the Cayley path over ueig_tol (upfold_opts_t::ueig_accept; S7g: 1);
   /// env COQUI_GWLINE_UEIG_ACCEPT
   double ueig_accept     = detail::env_double("COQUI_GWLINE_UEIG_ACCEPT", 10.0);
-  long scan_threads_max  = long(detail::env_double("COQUI_GWLINE_SCAN_THREADS", 0.0));
+  long scan_threads_max  = long(detail::env_double("COQUI_GWLINE_SCAN_THREADS", 16.0));
   double scan_budget_mb  = detail::env_double("COQUI_GWLINE_SCAN_MB", 512.0);
 
   numerics::line_dlr::upfold_opts_t upfold_opts(long ik) const {
