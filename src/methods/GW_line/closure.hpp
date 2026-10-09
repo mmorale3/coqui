@@ -567,9 +567,9 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   const long nown = rank < nk ? (nk - 1 - rank) / np + 1 : 0;
   const long nw   = std::max(1L, std::min(p.k_workers, nown));
   // perf 7.5a: cost-weighted core blocks from the previous closure of the same k set (Nr^3; COQUI_GWLINE_CLOSURE_WEIGHTS,
-  // default 1): the owners' chains differ by up to (1300 / 1160)^3 = 1.4 on si444
+  // default 0: on si444 the per-k walls do not follow Nr^3, measured no gain, job 7204203)
   static std::vector<double> kcost_prev;
-  const bool use_w = detail::env_double("COQUI_GWLINE_CLOSURE_WEIGHTS", 1.0) > 0.0 and long(kcost_prev.size()) == nk;
+  const bool use_w = detail::env_double("COQUI_GWLINE_CLOSURE_WEIGHTS", 0.0) > 0.0 and long(kcost_prev.size()) == nk;
   closure_cores_t cores(comm, nk, use_w ? &kcost_prev : nullptr);   // perf 7.1 (f) / 7.5a: the owners borrow the idle ranks' cores
   const long bt   = (nw == 1) ? (p.blas_threads > 0 ? p.blas_threads : cores.blas_threads())
                               : (p.blas_threads > 0 ? std::max(1L, p.blas_threads / nw) : 1L);

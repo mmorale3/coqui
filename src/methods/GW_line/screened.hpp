@@ -654,95 +654,122 @@ struct w_nodes_t {
 };
 
 /**
- * perf 7.5b: the node-shared buffer of screened_mirror_node. Backend (env COQUI_GWLINE_W_SHM):
- *   "posix" (default): shm_open in /dev/shm (tmpfs) by the node's local rank 0, mapped by every rank of the node; kept
- *           between calls (env COQUI_GWLINE_W_KEEP, default 1) and reused while large enough, so that the page faults of the
- *           first touch are paid once per run (freed at exit);
- *   "mpi"  : MPI_Win_allocate_shared per call (OpenMPI 4.1 puts the backing file in its session directory, on rusty the
- *           NVMe /tmp: 16.8 s of page faults + write-back for the 21 GB of si444 IBZ, measured in job 7203962).
- * acquire() is collective over comm (all ranks of all nodes): false on every rank if any node fails (no space in /dev/shm,
+ * perf 7.5b: the node-shared buffer of screened_mirror_node: the matrices of the node, every rank's chunk [m0, m1) in its OWN
+ * segment, every segment mapped by every rank of the node (seg(r) = base of local rank r's segment). Backend (env
+ * COQUI_GWLINE_W_SHM):
+ *   "posix" (default): one shm_open object per rank in /dev/shm (tmpfs), pre-faulted by its owner (the first-touch page faults
+ *           of ONE shared object serialize on its inode: 14.7 s for 21 GB on a rome node, job 7204203; per-rank objects fault
+ *           in parallel and land on the owner's NUMA domain); kept between calls (env COQUI_GWLINE_W_KEEP, default 1) while
+ *           every segment is large enough and the node total is <= COQUI_GWLINE_W_KEEP_FRAC (0.1) x MemAvailable;
+ *   "mpi"  : MPI_Win_allocate_shared per call (OpenMPI 4.1 backs it with ONE file in its session directory, on rusty the
+ *           NVMe /tmp: 16.8 s / 50 s for the 21 / 65 GB of si444 IBZ / full BZ, jobs 7203962 / 7203963).
+ * acquire() is collective over comm (all ranks of all nodes): false on every rank if any rank fails (no space in /dev/shm,
  * shm_open / mmap errors); the caller then falls back.
  */
 class node_shm_t {
  public:
-  ComplexType *data = nullptr;
-  bool kept = false;   ///< the buffer of a previous call was reused
+  bool kept = false;   ///< the segments of a previous call were reused
   std::string backend;
+  double t_prefault = 0.0;
   node_shm_t()                              = default;
   node_shm_t(node_shm_t const &)            = delete;
   node_shm_t &operator=(node_shm_t const &) = delete;
   ~node_shm_t() { release(); }
 
-  bool acquire(MPI_Comm comm, MPI_Comm node, size_t bytes) {
+  ComplexType *seg(long r) const { return segs_[r]; }
+
+  bool acquire(MPI_Comm comm, MPI_Comm node, size_t my_bytes) {
     backend = env_string_w("COQUI_GWLINE_W_SHM", "posix");
-    bytes   = std::max<size_t>(bytes, 4096);
-    int lrank = 0, gnp = 0, grank = 0;
+    my_bytes = std::max<size_t>(my_bytes, 4096);
+    int lrank = 0, nl = 0, gnp = 0, grank = 0;
     MPI_Comm_rank(node, &lrank);
+    MPI_Comm_size(node, &nl);
     MPI_Comm_size(comm, &gnp);
     MPI_Comm_rank(comm, &grank);
+    std::vector<unsigned long long> sizes(nl);
+    {
+      unsigned long long b = my_bytes;
+      MPI_Allgather(&b, 1, MPI_UNSIGNED_LONG_LONG, sizes.data(), 1, MPI_UNSIGNED_LONG_LONG, node);
+    }
+    double total = 0.0;
+    for (auto x : sizes) total += double(x);
     int ok = 1;
+    segs_.assign(nl, nullptr);
     if (backend == "mpi") {
-      ComplexType *base  = nullptr;
-      const MPI_Aint wb  = (lrank == 0) ? MPI_Aint(bytes) : MPI_Aint(0);
-      if (MPI_Win_allocate_shared(wb, int(sizeof(ComplexType)), MPI_INFO_NULL, node, &base, &win_) != MPI_SUCCESS) ok = 0;
+      ComplexType *base = nullptr;
+      if (MPI_Win_allocate_shared(MPI_Aint(my_bytes), int(sizeof(ComplexType)), MPI_INFO_NULL, node, &base, &win_) != MPI_SUCCESS)
+        ok = 0;
       if (ok) {
-        MPI_Aint sz = 0;
-        int du      = 0;
-        MPI_Win_shared_query(win_, 0, &sz, &du, &data);
+        for (int r = 0; r < nl; ++r) {
+          MPI_Aint sz = 0;
+          int du      = 0;
+          MPI_Win_shared_query(win_, r, &sz, &du, &segs_[r]);
+        }
         MPI_Win_lock_all(MPI_MODE_NOCHECK, win_);
       }
       MPI_Allreduce(MPI_IN_PLACE, &ok, 1, MPI_INT, MPI_MIN, comm);
       return ok != 0;
     }
-    // posix: reuse the kept mapping when it belongs to the same node group and is large enough (collective decision)
-    auto &c   = cache();
+    // posix: reuse the kept mappings when they belong to the same node group and every segment is large enough
+    auto &c    = cache();
     int leader = grank;
     MPI_Bcast(&leader, 1, MPI_INT, 0, node);
-    int nl = 0;
-    MPI_Comm_size(node, &nl);
-    int reuse = (c.p != nullptr and c.bytes >= bytes and c.leader == leader and c.nl == nl and c.gnp == gnp) ? 1 : 0;
+    int reuse = (c.leader == leader and c.nl == nl and c.gnp == gnp and long(c.p.size()) == nl) ? 1 : 0;
+    for (int r = 0; reuse and r < nl; ++r)
+      if (c.cap[r] < sizes[r]) reuse = 0;
     MPI_Allreduce(MPI_IN_PLACE, &reuse, 1, MPI_INT, MPI_MIN, comm);
     if (reuse) {
-      data = static_cast<ComplexType *>(c.p);
+      for (int r = 0; r < nl; ++r) segs_[r] = static_cast<ComplexType *>(c.p[r]);
       kept = true;
-      own_ = false;
       return true;
     }
     drop_cache();   // every rank (the decision is collective)
-    char name[128] = {0};
     if (lrank == 0) {
-      static long counter = 0;
-      std::snprintf(name, sizeof(name), "/coqui_gwline_w_%d_%ld", int(getpid()), counter++);
       struct statvfs sv;
-      if (statvfs("/dev/shm", &sv) == 0 and double(sv.f_bavail) * double(sv.f_bsize) < 1.05 * double(bytes)) ok = 0;
-      int fd = ok ? shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600) : -1;
-      if (fd < 0) ok = 0;
-      if (ok and ftruncate(fd, off_t(bytes)) != 0) ok = 0;
-      if (fd >= 0) close(fd);
-      if (not ok and fd >= 0) shm_unlink(name);
+      if (statvfs("/dev/shm", &sv) == 0 and double(sv.f_bavail) * double(sv.f_bsize) < 1.05 * total) ok = 0;
     }
     MPI_Bcast(&ok, 1, MPI_INT, 0, node);
-    MPI_Bcast(name, int(sizeof(name)), MPI_CHAR, 0, node);
-    void *p = nullptr;
+    // my segment
+    static long counter = 0;
+    char name[64] = {0};
+    std::snprintf(name, sizeof(name), "/cqgw_%d_%ld", int(getpid()), counter++);
     if (ok) {
-      int fd = shm_open(name, O_RDWR, 0600);
-      if (fd >= 0) {
-        p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        close(fd);
-        if (p == MAP_FAILED) p = nullptr;
-      }
-      if (p == nullptr) ok = 0;
+      int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+      if (fd < 0) ok = 0;
+      if (ok and ftruncate(fd, off_t(my_bytes)) != 0) ok = 0;
+      if (fd >= 0) close(fd);
     }
+    MPI_Allreduce(MPI_IN_PLACE, &ok, 1, MPI_INT, MPI_MIN, node);
+    std::vector<char> names(size_t(nl) * 64);
+    MPI_Allgather(name, 64, MPI_CHAR, names.data(), 64, MPI_CHAR, node);
+    std::vector<void *> p(nl, nullptr);
+    if (ok)
+      for (int r = 0; r < nl; ++r) {
+        int fd = shm_open(names.data() + size_t(r) * 64, O_RDWR, 0600);
+        if (fd >= 0) {
+          void *x = mmap(nullptr, size_t(sizes[r]), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+          close(fd);
+          if (x != MAP_FAILED) p[r] = x;
+        }
+        if (p[r] == nullptr) ok = 0;
+      }
     MPI_Barrier(node);
-    if (lrank == 0 and name[0] != '\0') shm_unlink(name);   // the memory lives until the last munmap
+    shm_unlink(name);   // the memory lives until the last munmap
     MPI_Allreduce(MPI_IN_PLACE, &ok, 1, MPI_INT, MPI_MIN, comm);
     if (not ok) {
-      if (p != nullptr) munmap(p, bytes);
+      for (int r = 0; r < nl; ++r)
+        if (p[r] != nullptr) munmap(p[r], size_t(sizes[r]));
       return false;
     }
-    data = static_cast<ComplexType *>(p);
-    // keep only a buffer that is small against the node's available memory (it then also sits through the Sigma stage, which
-    // the q plan did not budget): bytes <= COQUI_GWLINE_W_KEEP_FRAC (default 0.1) x MemAvailable, the same on every node
+    // pre-fault my segment (owner's NUMA domain; the per-rank objects fault in parallel)
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      std::memset(p[lrank], 0, size_t(sizes[lrank]));
+      t_prefault = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    for (int r = 0; r < nl; ++r) segs_[r] = static_cast<ComplexType *>(p[r]);
+    // keep only when small against the node's available memory (it then also sits through the Sigma stage, which the q
+    // plan did not budget): the same decision on every node
     int keep = env_long("COQUI_GWLINE_W_KEEP", 1) != 0 ? 1 : 0;
     if (keep and lrank == 0) {
       double avail = -1.0;
@@ -752,26 +779,25 @@ class node_shm_t {
           if (std::strncmp(line, "MemAvailable:", 13) == 0) avail = 1024.0 * std::strtod(line + 13, nullptr);
         std::fclose(fp);
       }
-      const char *fv   = std::getenv("COQUI_GWLINE_W_KEEP_FRAC");
+      const char *fv    = std::getenv("COQUI_GWLINE_W_KEEP_FRAC");
       const double frac = (fv != nullptr and *fv != '\0') ? std::strtod(fv, nullptr) : 0.1;
-      if (avail > 0.0 and double(bytes) > frac * avail) keep = 0;
+      if (avail > 0.0 and total > frac * (avail + total)) keep = 0;
     }
     MPI_Bcast(&keep, 1, MPI_INT, 0, node);
     MPI_Allreduce(MPI_IN_PLACE, &keep, 1, MPI_INT, MPI_MIN, comm);
     if (keep) {
-      c.p      = p;   // (no temporary cache_t: its destructor unmaps)
-      c.bytes  = bytes;
+      c.p      = p;
+      c.cap.assign(sizes.begin(), sizes.end());
       c.leader = leader;
       c.nl     = nl;
       c.gnp    = gnp;
-      own_     = false;
     } else {
-      own_   = true;
-      bytes_ = bytes;
+      own_.assign(p.begin(), p.end());
+      own_sz_.assign(sizes.begin(), sizes.end());
     }
     return true;
   }
-  /// collective over the node (barrier) for the mpi backend; posix: unmaps a non-kept buffer
+  /// mpi backend: frees the window (collective over the node); posix: unmaps non-kept segments
   void release() {
     if (win_ != MPI_WIN_NULL) {
       int fin = 0;
@@ -782,9 +808,11 @@ class node_shm_t {
       }
       win_ = MPI_WIN_NULL;
     }
-    if (own_ and data != nullptr) munmap(static_cast<void *>(data), bytes_);
-    own_ = false;
-    data = nullptr;
+    for (size_t r = 0; r < own_.size(); ++r)
+      if (own_[r] != nullptr) munmap(own_[r], size_t(own_sz_[r]));
+    own_.clear();
+    own_sz_.clear();
+    segs_.clear();
   }
   /// fences + node barrier (the copies of the other ranks are visible after it)
   void sync(MPI_Comm node) const {
@@ -794,37 +822,37 @@ class node_shm_t {
     if (win_ != MPI_WIN_NULL) MPI_Win_sync(win_);
     std::atomic_thread_fence(std::memory_order_seq_cst);
   }
-  static double kept_bytes() { return double(cache().bytes); }
 
  private:
   struct cache_t {
-    void *p      = nullptr;
-    size_t bytes = 0;
+    std::vector<void *> p;
+    std::vector<unsigned long long> cap;
     int leader = -1, nl = 0, gnp = 0;
-    cache_t() = default;
-    cache_t(cache_t const &) = delete;
+    cache_t()                           = default;
+    cache_t(cache_t const &)            = delete;
     cache_t &operator=(cache_t const &) = delete;
-    ~cache_t() {
-      if (p != nullptr) munmap(p, bytes);
+    ~cache_t() { clear(); }
+    void clear() {
+      for (size_t r = 0; r < p.size(); ++r)
+        if (p[r] != nullptr) munmap(p[r], size_t(cap[r]));
+      p.clear();
+      cap.clear();
+      leader = -1;
     }
   };
   static cache_t &cache() {
     static cache_t c;
     return c;
   }
-  static void drop_cache() {
-    auto &c = cache();
-    if (c.p != nullptr) munmap(c.p, c.bytes);
-    c.p     = nullptr;
-    c.bytes = 0;
-  }
+  static void drop_cache() { cache().clear(); }
   static std::string env_string_w(char const *nm, char const *def) {
     char const *v = std::getenv(nm);
     return (v == nullptr or *v == '\0') ? std::string(def) : std::string(v);
   }
   MPI_Win win_ = MPI_WIN_NULL;
-  bool own_    = false;
-  size_t bytes_ = 0;
+  std::vector<ComplexType *> segs_;
+  std::vector<void *> own_;
+  std::vector<unsigned long long> own_sz_;
 };
 
 /// [first, last) of chunk i of [b, e) in n chunks (itertools::chunk_range)
@@ -871,7 +899,6 @@ inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi,
 
   w_nodes_t nd(comm.get());
   const long NN = nd.NN, L = nd.L, a = nd.a, l = nd.l;
-  (void)L;
   // geometry of the counterparts (b, l), b = 0..NN-1
   std::vector<long> geo(4 * NN);
   {
@@ -920,7 +947,10 @@ inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi,
   // node-shared buffer of the node's matrices (C layout, Np x Np each)
   auto tw = clk::now();
   node_shm_t shm;
-  if (not shm.acquire(comm.get(), nd.node, size_t(Ma1 - Ma0) * size_t(N2) * sizeof(ComplexType))) {
+  Timer.start("W_redistribute");   // (the page faults of a new buffer are part of the transposition's cost)
+  const bool got = shm.acquire(comm.get(), nd.node, size_t(m1 - m0) * size_t(N2) * sizeof(ComplexType));
+  Timer.stop("W_redistribute");
+  if (not got) {
     app_log(2, "  gw_line W (perf 7.5b node path) not used (node-shared buffer \"{}\" not available): the redistribute path follows",
             shm.backend);
     return false;
@@ -929,7 +959,9 @@ inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi,
   app_log(2, "  gw_line W (perf 7.5b node path): {} ray-1 matrices on {} node(s) x {} ranks, <= {} per rank, node buffer "
              "{:.2f} GB ({}{}), transient <= {:.3f} GB per rank (redistribute path {:.3f} GB)",
           M, NN, L, (M + comm.size() - 1) / comm.size(), 16.0 * double(Ma1 - Ma0) * double(N2) / 1073741824.0, shm.backend,
-          shm.kept ? ", kept from the previous call" : "", peak_max / 1073741824.0, old_transient / 1073741824.0);
+          shm.kept ? ", kept from the previous call" : (shm.backend == "mpi" ? ", per call" : ", new: pre-faulted by the owners"),
+          peak_max / 1073741824.0,
+          old_transient / 1073741824.0);
 
   for (auto nm : {"W_redistribute", "W_dyson", "W_fit", "W_wait"}) Timer.add(nm);
   const long w_rows = w_group ? g : Zb.nq;
@@ -943,8 +975,16 @@ inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi,
 
   Timer.start("W_redistribute");
   tw = clk::now();
-  ComplexType *W0 = shm.data;
-  auto mat = [&](long m) { return W0 + (m - Ma0) * N2; };
+  // matrix m of the node -> its owner's segment (owner = the node rank whose chunk holds m)
+  std::vector<ComplexType *> mptr(size_t(std::max(0L, Ma1 - Ma0)), nullptr);
+  {
+    std::vector<long> c0(2 * L);
+    long me2[2] = {m0, m1};
+    MPI_Allgather(me2, 2, MPI_LONG, c0.data(), 2, MPI_LONG, nd.node);
+    for (long r = 0; r < L; ++r)
+      for (long m = c0[2 * r]; m < c0[2 * r + 1]; ++m) mptr[m - Ma0] = shm.seg(r) + (m - c0[2 * r]) * N2;
+  }
+  auto mat = [&](long m) { return mptr[m - Ma0]; };
   auto put = [&](ComplexType *Wm, long P0, long nP_, long Q0, long nQ_, ComplexType const *src) {
     for (long p = 0; p < nP_; ++p) std::copy_n(src + p * nQ_, nQ_, Wm + (P0 + p) * Np + Q0);
   };
@@ -1136,6 +1176,7 @@ inline bool screened_mirror_node(memory::array<HOST_MEMORY, ComplexType, 4> &Pi,
 
   {   // profile (max over ranks)
     double x[10] = {t_fwd, t_fx, t_dys, t_bwd, t_bx, t_fit, t_wait, by_intra, by_inter, t_alloc};
+    (void)l;
     comm.all_reduce_in_place_n(x, 10, boost::mpi3::max<>{});
     double tot = secs(t_all);
     tot        = comm.all_reduce_value(tot, boost::mpi3::max<>{});
