@@ -1001,7 +1001,8 @@ static const std::vector<std::string> phase_names = {
     "time_grid",     "bases",          "phase_Pi",        "G_tilde",         "Pi_hadamard",    "Pi_transform",
     "phase_W",       "W_redistribute", "W_dyson",         "W_fit",           "phase_Sigma",    "Sigma_G_tilde",
     "Sigma_W_time",  "Sigma_hadamard", "Sigma_contract",  "Sigma_allreduce", "Sigma_transform", "Sigma_mix",
-    "phase_closure", "closure_upfold", "closure_gather",  "closure_mu",      "closure_compress", "phase_F",
+    "phase_closure", "closure_upfold", "closure_kloop",   "closure_wait",    "closure_scan",   "closure_gather",
+    "closure_mu",    "closure_compress", "phase_F",
     "checkpoint",    "iteration"};
 
 std::vector<double> phase_snapshot(utils::TimerManager &T) {

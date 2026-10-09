@@ -59,6 +59,7 @@
 #include <cmath>
 #include <functional>
 #include <complex>
+#include <numeric>
 #include <random>
 #include <string>
 #include <tuple>
@@ -356,6 +357,195 @@ void closure_toy(long npk) {
 TEST_CASE("gw_line_closure_toy", "[gw_line][scf][closure]") {
   SECTION("exact 8-pole Sigma") { closure_toy(8); }
   SECTION("120-pole Sigma") { closure_toy(120); }
+}
+
+// ======================================================================================================================
+// perf 7.1c: the distributed terminal-phase scan (closure_scan.hpp) vs the serial one
+// ======================================================================================================================
+namespace {
+/// moments of a random real-pole measure (n orbitals, P rank-1 poles in +-[0.02, 6] Ha): P > (K+1) n gives a free block
+nda::array<ComplexType, 3> scan_model_moments(long n, long P, long K, double wp, unsigned seed) {
+  std::mt19937 gen(seed);
+  std::uniform_real_distribution<double> U01(0.0, 1.0), U(-1.0, 1.0);
+  nda::array<double, 1> w(P);
+  nda::array<ComplexType, 3> g(P, n, n);
+  for (long l = 0; l < P; ++l) {
+    const double a = 0.02 * std::pow(6.0 / 0.02, U01(gen));
+    w(l)           = (l % 2 ? a : -a);
+    std::vector<ComplexType> v(n);
+    for (auto &x : v) x = ComplexType(U(gen), U(gen)) / std::sqrt(double(P));
+    for (long i = 0; i < n; ++i)
+      for (long j = 0; j < n; ++j) g(l, i, j) = v[i] * std::conj(v[j]);
+  }
+  return numerics::line_dlr::moments_from_poles(w, g, wp, K + 1);
+}
+
+/// max |a - b| over two pole sets of the same size (bitwise checks: 0)
+double max_pole_diff(numerics::line_dlr::upfold_result_t const &a, numerics::line_dlr::upfold_result_t const &b) {
+  if (a.d.size() != b.d.size()) return 1e300;
+  double x = 0.0;
+  for (long l = 0; l < a.d.size(); ++l) x = std::max(x, std::abs(a.d(l) - b.d(l)));
+  for (long i = 0; i < a.W.extent(0); ++i)
+    for (long l = 0; l < a.W.extent(1); ++l) x = std::max(x, std::abs(a.W(i, l) - b.W(i, l)));
+  return x;
+}
+} // namespace
+
+TEST_CASE("gw_line_closure_scan", "[gw_line][scf][closure][scan]") {
+  namespace ldlr = numerics::line_dlr;
+  auto &mpi  = utils::make_unit_test_mpi_context();
+  auto &comm = mpi->comm;
+  const long np = comm.size(), rank = comm.rank();
+
+  // (1) distributed_phase_scan on nk problems with a free block vs the serial upfold_block with the same held-out error
+  //     ("mfree": bitwise for equal BLAS threads) and vs the python scan ("eigen": roundoff-level phase difference)
+  {
+    const long nk = 3, n = 8, K = 12;
+    const double wp = 0.11;
+    closure_params_t p;
+    p.K = K; p.wp = wp; p.tol_gram = 1e-10; p.ueig = "cayley"; p.svd_driver = "gesdd"; p.scan = "parallel";
+    std::vector<nda::array<ComplexType, 3>> C(nk);
+    std::vector<ldlr::upfold_result_t> ref(nk), ref_eig(nk);
+    for (long k = 0; k < nk; ++k) {
+      C[k]        = scan_model_moments(n, 150 + 30 * k, K, wp, 4242 + unsigned(k));
+      auto o      = p.upfold_opts(k);
+      ref[k]      = ldlr::upfold_block(C[k], K, wp, o);
+      o.scan_err  = "eigen";
+      ref_eig[k]  = ldlr::upfold_block(C[k], K, wp, o);
+      REQUIRE(ref[k].n_free > 0);
+    }
+    std::vector<long> dk(nk);
+    std::iota(dk.begin(), dk.end(), 0L);
+    auto dsigma = [](ldlr::upfold_result_t const &a, ldlr::upfold_result_t const &b) {   // max |dSigma| / max |Sigma|
+      std::mt19937 gz(5);
+      std::uniform_real_distribution<double> ux(-1.0, 1.0), uy(0.005, 0.1);
+      double dS = 0.0, sm = 0.0;
+      for (int q = 0; q < 20; ++q) {
+        const ComplexType z(ux(gz), uy(gz));
+        auto S0 = ldlr::sigma_from_poles(a.d, a.W, z), S1 = ldlr::sigma_from_poles(b.d, b.W, z);
+        dS      = std::max(dS, nda::max_element(nda::abs(S1 - S0)));
+        sm      = std::max(sm, nda::max_element(nda::abs(S0)));
+      }
+      return dS / sm;
+    };
+    for (double budget : {1e12, 1.0}) {   // all k in one batch | one k per batch
+      std::vector<ldlr::upfold_problem_t> prs(nk);
+      std::vector<ldlr::upfold_result_t> res(nk);
+      std::vector<ldlr::upfold_problem_t *> probs(nk, nullptr);
+      std::vector<ldlr::upfold_result_t *> ups(nk, nullptr);
+      for (long k = rank; k < nk; k += np) {
+        prs[k]   = ldlr::upfold_prepare(C[k], K, wp, p.upfold_opts(k), res[k], true);   // reference SVD deferred
+        REQUIRE(prs[k].need_ref);
+        probs[k] = &prs[k];
+        ups[k]   = &res[k];
+      }
+      std::vector<long> done(nk, 0);
+      distributed_phase_scan(comm, dk, probs, ups, [&](long k) { return p.upfold_opts(k); }, 0, 0, budget, [&](long k) {
+        REQUIRE(k % np == rank);
+        done[k] = 1;
+      });
+      double v[6] = {0, 0, 0, 0, 0, 0}, vm[6];   // max|d, W|, |dphi|, dSigma, vs eigen: |dphi|, dSigma; failures
+      for (long k = rank; k < nk; k += np) {
+        v[5] += (done[k] == 1 ? 0 : 1) + (res[k].phi_index == ref[k].phi_index ? 0 : 1) + (res[k].r1 == ref[k].r1 ? 0 : 1);
+        v[0] = std::max(v[0], max_pole_diff(res[k], ref[k]));
+        v[1] = std::max(v[1], std::abs(res[k].phi - ref[k].phi));
+        v[2] = std::max(v[2], dsigma(res[k], ref[k]));
+        v[3] = std::max(v[3], std::abs(res[k].phi - ref_eig[k].phi));
+        v[4] = std::max(v[4], dsigma(res[k], ref_eig[k]));
+      }
+      comm.all_reduce_n(v, 6, vm, boost::mpi3::max<>{});
+      app_log(1, "[closure scan] ranks {} budget {:.0e}: distributed vs serial (poly) max|d, W| {:.1e} |dphi| {:.1e} dSigma {:.1e} "
+                 "({}) | vs the eigen scan |dphi| {:.1e} dSigma {:.1e} | n_free {} {} {}",
+              np, budget, vm[0], vm[1], vm[2], vm[0] == 0.0 ? "bitwise" : "roundoff", vm[3], vm[4], ref[0].n_free, ref[1].n_free,
+              ref[2].n_free);
+      CHECK(vm[5] == 0.0);
+      // bitwise for equal BLAS threads and code paths (the Mac); MKL may take alignment-dependent kernels: the golden
+      // section then ends one bracket step apart (4 pi / nphi 0.618^30 ~ 8.5e-7 rad)
+      CHECK(vm[1] <= 1e-5);
+      CHECK(vm[2] <= 1e-5);
+      CHECK(vm[3] <= 1e-5);
+      CHECK(vm[4] <= 1e-5);
+    }
+  }
+
+  // (2) closure(): scan "parallel" vs every k closed serially (closure_k, mfree; bitwise) and vs scan "serial" (eigen)
+  {
+    const long nk = 3, nb = 3, npk = 160;
+    const double theta = 20.0 * std::numbers::pi / 180.0, lam = 6.0, eps = 1e-10, nelec = 4.0;
+    std::mt19937 gen(31337);
+    std::uniform_real_distribution<double> U(-1.0, 1.0);
+    nda::array<ComplexType, 3> H(nk, nb, nb);
+    auto zeta     = numerics::line_dlr::dense_nodes(theta, 1e-3, 60.0, 120);
+    const long nz = zeta.size();
+    nda::array<ComplexType, 4> Sp(nk, nz, nb, nb), Sh(nk, nz, nb, nb);
+    Sp() = ComplexType(0.0);
+    Sh() = ComplexType(0.0);
+    for (long ik = 0; ik < nk; ++ik) {
+      const double e0[3] = {-0.5 + 0.03 * ik, -0.3 - 0.02 * ik, 0.5 + 0.04 * ik};
+      for (long i = 0; i < nb; ++i)
+        for (long j = 0; j <= i; ++j) {
+          ComplexType x = (i == j) ? ComplexType(e0[i] + 0.02 * U(gen), 0.0) : 0.02 * ComplexType(U(gen), U(gen));
+          H(ik, i, j) = x;
+          H(ik, j, i) = std::conj(x);
+        }
+      for (long l = 0; l < npk; ++l) {
+        const double E = (l % 2 == 0 ? 1.0 : -1.0) * (0.6 + 3.4 * 0.5 * (1.0 + U(gen)));
+        std::vector<ComplexType> b(nb);
+        for (auto &x : b) x = 0.15 * std::sqrt(8.0 / double(npk)) * ComplexType(U(gen), U(gen));
+        auto &S = (E > 0.0) ? Sp : Sh;
+        for (long iz = 0; iz < nz; ++iz)
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) S(ik, iz, i, j) += b[i] * std::conj(b[j]) / (zeta(iz) - E);
+      }
+    }
+    line_basis_t bp(theta, lam, eps, lam, 0.02, -1.0, 60.0), bh(theta, lam, eps, 0.02, lam, -1.0, 60.0);
+    line_basis_t gp(theta, lam, eps, lam, 0.0, -1.0, 60.0), gh(theta, lam, eps, 0.0, lam, -1.0, 60.0);
+    closure_params_t pp;   // wp 0.11, K 24, tol_gram 1e-10, nphi 8
+    pp.K    = 3;   // (K + 1) nb Gram directions > K nb: a free block
+    pp.ueig = "cayley";
+    pp.svd_driver = "gesdd";
+    pp.scan = "parallel";
+    auto ps = pp;
+    ps.scan = "serial";
+    utils::TimerManager T1, T2;
+    auto op = closure(comm, H, Sp, Sh, zeta, bp, bh, gp, gh, pp, nelec, T1);
+    auto os = closure(comm, H, Sp, Sh, zeta, bp, bh, gp, gh, ps, nelec, T2);
+    long nfree = 0;
+    double dser = 0.0;
+    for (long ik = 0; ik < nk; ++ik) {
+      nfree += (op.kprof[ik].n_free > 0);
+      auto sp = fit_sigma_sectors(bp, bh, zeta, nda::array<ComplexType, 3>(Sp(ik, nda::ellipsis{})),
+                                  nda::array<ComplexType, 3>(Sh(ik, nda::ellipsis{})));
+      auto ck = closure_k(nda::array<ComplexType, 2>(H(ik, nda::range::all, nda::range::all)), sp, pp, ik);
+      REQUIRE(ck.e.size() == op.leh.e[ik].size());
+      for (long m = 0; m < ck.e.size(); ++m) dser = std::max(dser, std::abs(ck.e(m) - op.dmu - op.leh.e[ik](m)));
+      CHECK(std::abs(op.diag[ik].phi - ck.diag.phi) <= 1e-5);
+    }
+    double dG = 0.0, gm = 0.0;
+    for (long iw = 0; iw < 40; ++iw) {
+      const ComplexType z(0.0, 1e-2 * std::pow(10.0, 3.0 * iw / 39.0));
+      for (long ik = 0; ik < nk; ++ik) {
+        nda::matrix<ComplexType> G1(nb, nb), G2(nb, nb);
+        G1() = ComplexType(0.0);
+        G2() = ComplexType(0.0);
+        for (long m = 0; m < op.leh.e[ik].size(); ++m)
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) G1(i, j) += op.leh.v[ik](i, m) * std::conj(op.leh.v[ik](j, m)) / (z + op.dmu - op.leh.e[ik](m) - op.dmu);
+        for (long m = 0; m < os.leh.e[ik].size(); ++m)
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) G2(i, j) += os.leh.v[ik](i, m) * std::conj(os.leh.v[ik](j, m)) / (z + os.dmu - os.leh.e[ik](m) - os.dmu);
+        dG = std::max(dG, nda::max_element(nda::abs(G1 - G2)));
+        gm = std::max(gm, nda::max_element(nda::abs(G2)));
+      }
+    }
+    app_log(1, "[closure scan] closure() ranks {}: k with a free block {} of {} | parallel vs per-k serial (poly) max|de| {:.1e} | "
+               "parallel vs serial (eigen) dmu {:.1e} Ha, gap {:.1e} Ha, max|dG|/max|G| {:.1e}",
+            np, nfree, nk, dser, std::abs(op.dmu - os.dmu), std::abs((op.e_lumo - op.e_homo) - (os.e_lumo - os.e_homo)), dG / gm);
+    CHECK(nfree > 0);
+    CHECK(dser <= 1e-6);   // bitwise on the Mac; MKL code-path roundoff -> one golden bracket step
+    CHECK(std::abs(op.dmu - os.dmu) <= 1e-6);
+    CHECK(dG / gm <= 1e-5);
+  }
 }
 
 // ======================================================================================================================
