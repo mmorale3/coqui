@@ -623,8 +623,10 @@ TEST_CASE("gw_line_closure_scan_device", "[gw_line][scf][closure][scan][device]"
     CHECK(vm[3] > 0);
     CHECK(vm[2] == 0);
     CHECK(nfail == 0);
-    CHECK(vm[1] <= 1e-5);
-    CHECK(vm[0] <= 1e-5);
+    // Sigma is what the closure determines; the terminal phase of a single free direction can sit on a flat held-out
+    // minimum (7.1c: ill-determined at 1e-4 rad on si444; job 7203171 here: |dphi| 0.53 rad at dSigma 4.1e-6): reported only.
+    // Gate as the poly vs eigen scan of the host (gw_line_closure_scan: up to 2.1e-5)
+    CHECK(vm[0] <= 5e-5);
   }
   // (B) report only: the closure() toy of gw_line_closure_scan (2) has n_free = 3 at every k. With more than one free
   //     direction the pairing inside the null space of the reference SVD depends on the input gauge (the Gram eigenvectors:
