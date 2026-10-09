@@ -123,15 +123,18 @@ struct propagator_t {
   std::vector<char> shr_tr;    ///< (nk) time-reversed
   struct ccache_t {
     nda::array<ComplexType, 1> t;
-    nda::array<ComplexType, 3> C;
+    nda::array<ComplexType, 3> C;   ///< host builds
+    arr_t<3> Cm;                     ///< device builds (perf 7.4b): the cached C_src(tau) in MEM
   };
   mutable std::vector<ccache_t> ccache;
+  mutable double ccache_bytes = 0.0;   ///< device: MEM bytes held by the cache (budget: see build_shared)
   mutable nda::array<ComplexType, 2> s_Cc;   ///< conj(C(t)) of one time (adjoint form at a time-reversed k')
   void set_ibz(ibz_t const *ibz_) { ibz = ibz_; }
 
   // grow-only MEM scratch of build(): phases (or VP), C(t), and the intermediate (host: Xp C; device: C Xq^dagger for all t)
   mutable detail::scratch_t<MEM> s_ph, s_C, s_T;
   mutable detail::scratch_t<HOST_MEMORY> s_VPh;       ///< host staging of VP (device builds only)
+  mutable detail::scratch_t<MEM> s_Cm;                ///< device: conj(C_src) of a time-reversed k' (adjoint form)
 
   /// X slices of all k for the block of `grid`, from the collinear THC collocation matrices thc.X(0, 0, ik).
   propagator_t(methods::thc_reader_t const &thc, aux_grid_t const &grid_) : grid(grid_) {
@@ -169,7 +172,7 @@ struct propagator_t {
     pole_data_t unfolded;
     if (unf) unfolded = unfold_poles(poles_in, *ibz);
     pole_data_t const &poles = unf ? unfolded : poles_in;
-    share = unf and (MEM == HOST_MEMORY) and detail::env_long("COQUI_GWLINE_IBZ_CSHARE", 1) != 0;
+    share = unf and detail::env_long("COQUI_GWLINE_IBZ_CSHARE", 1) != 0;   // perf 7.4b: host and device
     shr_src.assign(nk, -1);
     shr_tr.assign(nk, 0);
     std::vector<long> star(nk, 1);
@@ -184,6 +187,7 @@ struct propagator_t {
       ccache.assign(4 * ibz->nkI, ccache_t{});
     } else
       ccache.clear();
+    ccache_bytes = 0.0;
     utils::check(poles.nk == nk and poles.nb == nb, "gw_line::propagator_t::set_poles: pole data ({} k, {} bands) vs X ({} k, {} bands)",
                  poles.nk, poles.nb, nk, nb);
     coef_p.clear(); coef_h.clear(); e_p.clear(); e_h.clear();
@@ -321,11 +325,9 @@ struct propagator_t {
         return;
       }
     }
-    if constexpr (MEM == HOST_MEMORY) {
-      if (share and ((s == sector_t::particle) ? fac_p[ik] : fac_h[ik])) {
-        build_shared(ik, t, s, form, out);
-        return;
-      }
+    if (share and ((s == sector_t::particle) ? fac_p[ik] : fac_h[ik])) {
+      build_shared(ik, t, s, form, out);
+      return;
     }
     // C(tau) for tau = t (plain, transposed) or conj(t) (adjoint_conj_t): phases on the host, one (batched) gemm in MEM.
     // All MEM intermediates are views of grow-only scratch buffers (no allocation per call once warm).
@@ -411,8 +413,102 @@ struct propagator_t {
     }
   }
 
-  /// perf 7.3: host build from the C(t) of the IBZ source of k (cached per star), see set_ibz
+  /// perf 7.3: build from the C(t) of the IBZ source of k (cached per star), see set_ibz. Host (7.3) and device (7.4b).
   void build_shared(long ik, nda::array<ComplexType, 1> const &t, sector_t s, gtilde_form_t form, view_t<3> out) const {
+    if constexpr (MEM == HOST_MEMORY) build_shared_host(ik, t, s, form, out);
+    else build_shared_device(ik, t, s, form, out);
+  }
+
+  /**
+   * Device form of build_shared (perf 7.4b). C_src(tau) = V diag(e^{-i e tau}) V^dagger of the IBZ source is built with the
+   * same strided-batched gemm as build() (so the source k itself is bitwise the unshared device build) and cached in MEM
+   * per (source, sector, tau set); budget env COQUI_GWLINE_IBZ_CSHARE_MB (default: 5% of the free device memory at the
+   * first fill; beyond it the slot is rebuilt per call into scratch). A time-reversed k' uses C' = C_src^T through the
+   * op flag of the first gemm; its adjoint form needs C'^dagger = conj(C_src) (no BLAS op): one conjugated copy.
+   * Column-major mapping (see build()): out(t)^T = [Xq'^T op(C(t) buffer)] Xp'^T with
+   *   plain: op N (C' = C) / T (C' = C^T);  transposed: T / N;  adjoint_conj_t: C / N on the conj(C) copy.
+   */
+  void build_shared_device(long ik, nda::array<ComplexType, 1> const &t, sector_t s, gtilde_form_t form, view_t<3> out) const
+    requires(MEM != HOST_MEMORY)
+  {
+    const long nt        = t.size();
+    const long src       = shr_src[ik];
+    const bool tr        = shr_tr[ik] != 0;
+    const bool part      = (s == sector_t::particle);
+    const bool conj_time = (form == gtilde_form_t::adjoint_conj_t);
+    auto &cc             = ccache[(src * 2 + (part ? 0 : 1)) * 2 + (conj_time ? 1 : 0)];
+    bool hit             = (cc.t.size() == nt and cc.Cm.extent(0) == nt);
+    for (long i = 0; hit and i < nt; ++i) hit = (cc.t(i) == t(i));
+    ComplexType *Cp = nullptr;
+    if (hit) Cp = cc.Cm.data();
+    else {
+      auto const &e  = part ? e_p[src] : e_h[src];
+      auto const &Vh = part ? vh_p[src] : vh_h[src];
+      auto const &Vm = part ? coef_p[src] : coef_h[src];
+      const long M   = e.size();
+      const double need = 16.0 * double(nt) * double(nb * nb);
+      if (cc.Cm.extent(0) == nt) Cp = cc.Cm.data();
+      else {
+        const double budget = [] {
+          const long mb = detail::env_long("COQUI_GWLINE_IBZ_CSHARE_MB", -1);
+          return mb >= 0 ? double(mb) * 1048576.0 : 0.05 * double(utils::freemem_device_effective()) * 1048576.0;
+        }();
+        ccache_bytes -= 16.0 * double(cc.Cm.size());
+        cc.Cm = arr_t<3>{};
+        cc.t  = nda::array<ComplexType, 1>{};
+        if (ccache_bytes + need <= budget) {
+          cc.Cm = arr_t<3>(nt, nb, nb);
+          ccache_bytes += need;
+          Cp = cc.Cm.data();
+        } else
+          Cp = s_C.template view<3>({nt, nb, nb}).data();
+      }
+      auto VPh = s_VPh.template view<3>({nt, nb, M});
+      for (long it = 0; it < nt; ++it) {
+        const ComplexType tau = conj_time ? std::conj(t(it)) : t(it);
+        for (long m = 0; m < M; ++m) {
+          const ComplexType ph = std::exp(ComplexType(0.0, -e(m)) * tau);
+          for (long a = 0; a < nb; ++a) VPh(it, a, m) = Vh(a, m) * ph;
+        }
+      }
+      auto VP = s_ph.template view<3>({nt, nb, M});
+      VP      = VPh;
+      detail::gemm_strided_cm('C', 'N', nb, nb, M, ComplexType(1.0), Vm.data(), M, 0, VP.data(), M, nb * M, ComplexType(0.0), Cp,
+                              nb, nb * nb, nt);
+      if (Cp == cc.Cm.data() and cc.Cm.extent(0) == nt) cc.t = t;
+    }
+    char opC = 'N';
+    switch (form) {
+      case gtilde_form_t::plain: opC = tr ? 'T' : 'N'; break;
+      case gtilde_form_t::transposed: opC = tr ? 'N' : 'T'; break;
+      case gtilde_form_t::adjoint_conj_t: opC = tr ? 'N' : 'C'; break;
+    }
+    if (form == gtilde_form_t::adjoint_conj_t and tr) {   // conj(C_src) into scratch (exact)
+      auto Cc = s_Cm.template view<1>({nt * nb * nb});
+      memory::array_view<MEM, ComplexType, 1> Cv(std::array<long, 1>{nt * nb * nb}, Cp);
+      nda::tensor::set(ComplexType(0.0), Cc);
+      nda::tensor::add(ComplexType(1.0), nda::conj(Cv), "a", ComplexType(0.0), Cc, "a");
+      Cp = Cc.data();
+    }
+    const long nP = grid.nP, nQ = grid.nQ;
+    utils::check(out.indexmap().strides()[1] == nQ and out.indexmap().strides()[2] == 1,
+                 "gw_line::propagator_t::build_shared: out blocks must be contiguous");
+    auto T          = s_T.template view<3>({nt, nb, nQ});
+    auto const &Xq_ = (form == gtilde_form_t::transposed) ? XqT : XqH;
+    auto const &Xp_ = (form == gtilde_form_t::transposed) ? Xpc : Xp;
+    ComplexType const *xq = Xq_.data() + ik * nb * nQ;
+    ComplexType const *xp = Xp_.data() + ik * nP * nb;
+    detail::gemm_strided_cm('N', opC, nQ, nb, nb, ComplexType(1.0), xq, nQ, 0, Cp, nb, nb * nb, ComplexType(0.0), T.data(), nQ,
+                            nb * nQ, nt);
+    detail::gemm_strided_cm('N', 'N', nQ, nP, nb, ComplexType(1.0), T.data(), nQ, nb * nQ, xp, nb, 0, ComplexType(0.0), out.data(),
+                            nQ, out.indexmap().strides()[0], nt);
+    device_mem_probe();
+  }
+
+  /// perf 7.3: host build from the C(t) of the IBZ source of k (cached per star)
+  void build_shared_host(long ik, nda::array<ComplexType, 1> const &t, sector_t s, gtilde_form_t form, view_t<3> out) const
+    requires(MEM == HOST_MEMORY)
+  {
     auto all             = nda::range::all;
     const long nt        = t.size();
     const long src       = shr_src[ik];
