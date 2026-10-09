@@ -113,7 +113,7 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
                  numerics::line_dlr::time_nodes_t const &ray_h, long t_chunk, nda::array<ComplexType, 4> &Sigma,
                  utils::TimerManager &Timer, sector_t sectors = sector_t::both, bool k_local = false,
                  memory::array<HOST_MEMORY, ComplexType, 4> const *w_host = nullptr, long sig_qgroup = 0,
-                 nda::array<ComplexType, 4> *Sigma_h = nullptr) {
+                 nda::array<ComplexType, 4> *Sigma_h = nullptr, memory::array<MEM, ComplexType, 4> *w_consume = nullptr) {
   using time_ray_t = numerics::line_dlr::time_nodes_t;   // GL ray or ID nodes (S7b)
   using arr4_t = memory::array<MEM, ComplexType, 4>;
   using arr3_t = memory::array<MEM, ComplexType, 3>;
@@ -178,7 +178,7 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
   bool rs = detail::env_long("COQUI_GWLINE_RSPACE", 1) != 0 and kft.ok and w_host == nullptr;
   if constexpr (MEM != HOST_MEMORY) {   // the transformed residues w^(R) need N_q r_b blocks of device memory besides w
     if (rs) {
-      const double need = 16.0 * double(nq) * r * nP * nQ * 1.15 + 16.0 * 4.0 * nk * 8.0 * nP * nQ;
+      const double need = (w_consume ? 0.0 : 16.0 * double(nq) * r * nP * nQ * 1.15) + 16.0 * 4.0 * nk * 8.0 * nP * nQ;
       double freeb      = double(utils::freemem_device_effective()) * 1048576.0;
       freeb             = comm.all_reduce_value(freeb, boost::mpi3::min<>{});
       if (need > 0.8 * freeb) {
@@ -208,7 +208,10 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
   // sum_j w^_j(R) e^{-i nu_j t}, the hole leg sum_q e^{+iQR} (.) = w^(-R) (rows swapped in place before the hole leg);
   // G^(R) = sum_k e^{-ikR} G(k), acc(k) = 1/N sum_R e^{+ikR} G^(R) o W^(R)  (kmesh_ft.hpp)
   [[maybe_unused]] memory::array<MEM, ComplexType, 2> FmM, BpM;
-  arr4_t wR;   // real space: w^(R) (N, r, nP, nQ), rows -R after the swap
+  // perf 7.4b: w_consume == &w (the driver's q plan when memory is short): w^(R) overwrites w in column blocks (scratch
+  // nk x cb; the caller's residues are consumed), so the Sigma stage holds N_q r_b blocks less
+  arr4_t wR_own;
+  ComplexType *wRp = nullptr;
   bool wR_minus = false;
   if (rs) {
     FmM = memory::to_memory_space<MEM>(kft.Fm);
@@ -216,14 +219,32 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
     bp *= ComplexType(1.0 / double(nk));
     BpM = memory::to_memory_space<MEM>(bp);
     Timer.start("Sigma_W_time");
-    wR = arr4_t(nk, r, nP, nQ);
     memory::array<MEM, ComplexType, 2> HmM = memory::to_memory_space<MEM>(kft.Hm);
-    auto w2  = nda::reshape(w, std::array<long, 2>{nq, r * blk});
-    auto wR2 = nda::reshape(wR, std::array<long, 2>{nk, r * blk});
-    nda::blas::gemm(ComplexType(1.0), HmM, w2, ComplexType(0.0), wR2);
+    if (w_consume != nullptr) {
+      utils::check(w_consume->data() == w.data() and nk == nq, "gw_line::self_energy: w_consume must alias w (and N_k == N_q)");
+      auto W2        = nda::reshape(*w_consume, std::array<long, 2>{nq, r * blk});
+      const long cbw = std::min(r * blk, std::max(64L, detail::env_long("COQUI_GWLINE_WR_CB", 1L << 22) / std::max(1L, nk)));
+      memory::array<MEM, ComplexType, 2> tmp(nk, cbw);
+      for (long c0 = 0; c0 < r * blk; c0 += cbw) {
+        const long wdt = std::min(cbw, r * blk - c0);
+        auto tv        = tmp(all, nda::range(wdt));
+        nda::blas::gemm(ComplexType(1.0), HmM, W2(all, nda::range(c0, c0 + wdt)), ComplexType(0.0), tv);
+        W2(all, nda::range(c0, c0 + wdt)) = tv;
+      }
+      wRp = w_consume->data();
+      app_log(3, "  gw_line::self_energy: residues transformed to real space in place (column blocks of {})", cbw);
+    } else {
+      wR_own   = arr4_t(nk, r, nP, nQ);
+      auto w2  = nda::reshape(w, std::array<long, 2>{nq, r * blk});
+      auto wR2 = nda::reshape(wR_own, std::array<long, 2>{nk, r * blk});
+      nda::blas::gemm(ComplexType(1.0), HmM, w2, ComplexType(0.0), wR2);
+      wRp = wR_own.data();
+    }
     if constexpr (MEM != HOST_MEMORY) utils::device_sync();
     Timer.stop("Sigma_W_time");
   }
+  // real space: w^(R) (N, r, nP, nQ), rows -R after the swap
+  memory::array_view<MEM, ComplexType, 4> wR(std::array<long, 4>{rs ? nk : 0, r, nP, nQ}, wRp);
   auto swap_wR_minus = [&]() {   // w^(R) <-> w^(-R): rows R and -R exchanged (an involution)
     arr4_t tmp(1, r, nP, nQ);
     for (long R = 0; R < nk; ++R) {
@@ -545,10 +566,11 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
                  numerics::line_dlr::time_nodes_t const &ray_p, numerics::line_dlr::time_nodes_t const &ray_h, long t_chunk,
                  nda::array<ComplexType, 4> &Sigma, utils::TimerManager &Timer, sector_t sectors = sector_t::both,
                  bool k_local = false, memory::array<HOST_MEMORY, ComplexType, 4> const *w_host = nullptr,
-                 long sig_qgroup = 0, nda::array<ComplexType, 4> *Sigma_h = nullptr) {
+                 long sig_qgroup = 0, nda::array<ComplexType, 4> *Sigma_h = nullptr,
+                 memory::array<MEM, ComplexType, 4> *w_consume = nullptr) {
   utils::check(grid.np == mpi.comm.size() and grid.rank == mpi.comm.rank(), "gw_line::self_energy: grid/communicator mismatch");
   self_energy<MEM>(prop, poles, w, basis, mf, grid, mpi.comm, zeta, ray_p, ray_h, t_chunk, Sigma, Timer, sectors, k_local,
-                   w_host, sig_qgroup, Sigma_h);
+                   w_host, sig_qgroup, Sigma_h, w_consume);
 }
 
 #define GW_LINE_SIGMA_EXTERN(MEM)                                                                                        \
@@ -559,7 +581,7 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
                                         numerics::line_dlr::time_nodes_t const &, long, nda::array<ComplexType, 4> &,     \
                                         utils::TimerManager &, sector_t, bool,                                    \
                                         memory::array<HOST_MEMORY, ComplexType, 4> const *, long,                 \
-                                        nda::array<ComplexType, 4> *);
+                                        nda::array<ComplexType, 4> *, memory::array<MEM, ComplexType, 4> *);
 
 GW_LINE_SIGMA_EXTERN(HOST_MEMORY)
 #if defined(ENABLE_DEVICE)

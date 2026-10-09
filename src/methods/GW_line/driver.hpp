@@ -292,6 +292,7 @@ struct gw_line_result_t {
   std::vector<double> optics_theta;                ///< S9b: angles of the optics lines (SCF angle first)
   std::vector<optics_q_t> optics_q0;               ///< S9b: q -> 0 optics per line (same order)
   long q_group_size = 0, q_ngroups = 0;           ///< perf 7.4b: the q plan of the Pi -> W stage (last one made)
+  bool q_wR_inplace = false;                      ///< perf 7.4b: Sigma's real-space residues overwrote w
   double q_budget_host = -1.0, q_model_host = 0.0, q_model_host_all = 0.0, q_model_host_min = 0.0;   ///< bytes per rank
 };
 

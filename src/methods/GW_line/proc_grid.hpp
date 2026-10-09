@@ -104,7 +104,8 @@ struct aux_grid_t {
     double peak_stage = 0;   ///< max over the stages (Pi: res + pi_t, W: res + w_t, Sigma: res - pig + sg_t)
     long nsub_q = 0, n_zsub = 0;
   };
-  mem_model_t model(long nk, long nq, long nzeta, long r_b, long t_chunk, long nb, long g = -1, bool device_fused = false) const;
+  mem_model_t model(long nk, long nq, long nzeta, long r_b, long t_chunk, long nb, long g = -1, bool device_fused = false,
+                    bool wR_inplace = false) const;
 };
 
 /**
@@ -135,6 +136,12 @@ struct dyson_layout_t {
     auto [z0, z1] = itertools::chunk_range(0, nz, np_z, ip_z);
     q_first = q0; nq_loc = q1 - q0;
     z_first = z0; nz_loc = z1 - z0;
+  }
+  /// perf 7.4b: whether the layout exists (the constructor's checks), for the q plan's candidate groupings
+  static bool valid(long np_, long g_, long nz_) {
+    if (np_ <= 0 or g_ <= 0 or nz_ <= 0) return false;
+    const long pq = utils::find_proc_grid_max_npools(np_, g_, 0.2);
+    return pq > 0 and np_ % pq == 0 and pq <= g_ and np_ / pq <= nz_;
   }
   template <typename comm_t>
   dyson_layout_t(utils::mpi_context_t<comm_t> const &mpi, long g_, long nz_, long Np_)
@@ -292,7 +299,7 @@ inline long dyson_nbat_max() {
 }
 
 inline aux_grid_t::mem_model_t aux_grid_t::model(long nk, long nq, long nzeta, long r_b, long t_chunk, long nb, long g,
-                                                 bool device_fused) const {
+                                                 bool device_fused, bool wR_inplace) const {
   if (g < 0) g = nq;
   mem_model_t m;
   const long mb    = max_block_size();
@@ -308,7 +315,7 @@ inline aux_grid_t::mem_model_t aux_grid_t::model(long nk, long nq, long nzeta, l
   m.nacc              = (device_fused or rs) ? double(nq) : 1.0;
   m.pi_t              = ((rs ? 3.0 : 2.0) * nk + m.nacc) * t_chunk * blk;
   m.sg_t              = (2.0 * nk + (rs ? double(nq) : m.nacc)) * t_chunk * blk + double(nk) * t_chunk * nb * nb * 16.0 +
-                        (rs ? m.w : 0.0);
+                        ((rs and not wR_inplace) ? m.w : 0.0);   // perf 7.4b: w^(R) in place of w (self_energy w_consume)
   dyson_layout_t lay(np, rank, g, nzeta, Np);
   w_plan_t plan(lay, mb);
   const long nbat     = device_fused ? std::min((plan.nzs + lay.np_z - 1) / lay.np_z, dyson_nbat_max()) : 1L;

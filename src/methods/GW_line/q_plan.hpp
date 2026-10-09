@@ -68,12 +68,13 @@ namespace methods::gw_line {
 struct q_plan_t {
   long g = 0, gs_sigma = 0;
   bool w_host = false;
+  bool wR_inplace = false;             ///< Sigma's real-space residues overwrite w (self_energy w_consume) to fit
   long ngroups = 1;                    ///< number of q groups of the Pi -> W stage
   double budget_host = -1.0;           ///< bytes per rank (< 0: unconstrained)
   double budget_dev = -1.0;
   double model_host = 0.0, model_dev = 0.0;   ///< model of the chosen g
   double model_host_all = 0.0, model_dev_all = 0.0;   ///< model of g = N_q (all q at once)
-  double model_host_min = 0.0, model_dev_min = 0.0;   ///< model of the smallest groups
+  double model_host_min = 0.0, model_dev_min = 0.0;   ///< model of the least-memory grouping
   std::string reason = "all q";
 };
 
@@ -191,10 +192,10 @@ inline std::vector<long> q_group_candidates(std::vector<long> const &rows, std::
  * (bytes per rank; model_dev unused on the host). Collective (budgets).
  */
 template <MEMORY_SPACE MEM, typename comm_t, typename ncomm_t>
-q_plan_t choose_q_plan(comm_t &comm, ncomm_t &node_comm, aux_grid_t const &grid, std::vector<long> const &rows,
+q_plan_t choose_q_plan(comm_t &comm, ncomm_t &node_comm, [[maybe_unused]] aux_grid_t const &grid, std::vector<long> const &rows,
                        std::vector<long> const &qminus, long nk, long nz, long r_b, long nb, q_budget_params_t const &bp,
-                       std::function<double(long)> const &model_host, std::function<double(long)> const &model_dev,
-                       bool w_host_ok = true) {
+                       std::function<double(long, bool)> const &model_host, std::function<double(long, bool)> const &model_dev,
+                       bool w_host_ok = true, bool inplace_ok = false) {
   q_plan_t qp;
   const double GB  = 1073741824.0;
   const long nq    = long(rows.size());
@@ -227,50 +228,80 @@ q_plan_t choose_q_plan(comm_t &comm, ncomm_t &node_comm, aux_grid_t const &grid,
   if constexpr (MEM == HOST_MEMORY) qp.w_host = qp.w_host and detail::env_long("COQUI_GWLINE_W_HOST", -1) == 1;
 
   const auto cands = q_group_candidates(rows, qminus);
-  auto fits_host   = [&](long g) { return qp.budget_host < 0.0 or model_host(g) <= qp.budget_host; };
-  auto fits_dev    = [&](long g) {
-    if constexpr (MEM == HOST_MEMORY) return true;
-    else return g <= g_dev_rule and (qp.budget_dev < 0.0 or model_dev(g) <= qp.budget_dev);
+  // the models of every candidate (collective: the model functions reduce over the ranks; 1e300 = infeasible grouping).
+  // Memory is NOT monotonic in g: small groups shrink the Pi group and the W sub-steps but every rank then holds the full
+  // Z(q) of its q in every group's Dyson slab.
+  const long nc = long(cands.size());
+  std::vector<double> mh(nc), md(nc, 0.0);
+  auto eval = [&](bool inplace) {
+    for (long i = 0; i < nc; ++i) {
+      mh[i] = model_host(cands[i], inplace);
+      if constexpr (MEM != HOST_MEMORY) md[i] = model_dev(cands[i], inplace);
+    }
   };
-  qp.model_host_all = model_host(nq);
-  qp.model_host_min = model_host(cands.back());
-  if constexpr (MEM != HOST_MEMORY) {
-    qp.model_dev_all = model_dev(nq);
-    qp.model_dev_min = model_dev(cands.back());
+  const long ip_env = detail::env_long("COQUI_GWLINE_WR_INPLACE", -1);   // 1 force, 0 never, -1 when needed
+  qp.wR_inplace     = inplace_ok and ip_env == 1;
+  eval(qp.wR_inplace);
+  auto fits = [&](long i) {
+    const bool h = (mh[i] < 1e299) and (qp.budget_host < 0.0 or mh[i] <= qp.budget_host);
+    if constexpr (MEM == HOST_MEMORY) return h;
+    else return h and md[i] < 1e299 and cands[i] <= g_dev_rule and (qp.budget_dev < 0.0 or md[i] <= qp.budget_dev);
+  };
+  // perf 7.4b: no grouping fits with Sigma's real-space residues beside w -> retry with them in place of w
+  if (inplace_ok and not qp.wR_inplace and ip_env != 0) {
+    bool any = false;
+    for (long i = 0; i < nc and not any; ++i) any = fits(i);
+    if (not any) {
+      qp.wR_inplace = true;
+      eval(true);
+    }
   }
+  // the candidate of least memory (host; device runs: device first)
+  long imin = 0;
+  for (long i = 1; i < nc; ++i) {
+    const bool better = (MEM == HOST_MEMORY) ? mh[i] < mh[imin] : (md[i] < md[imin] or (md[i] == md[imin] and mh[i] < mh[imin]));
+    if (better) imin = i;
+  }
+  qp.model_host_all = mh[0];
+  qp.model_host_min = mh[imin];
+  qp.model_dev_all  = md[0];
+  qp.model_dev_min  = md[imin];
   long fixed_g = (bp.q_group_size > 0) ? bp.q_group_size : 0;
   if (long v = detail::env_long("COQUI_GWLINE_QGROUP", 0); v > 0) fixed_g = v;
+  long ichosen = -1;
   if (fixed_g > 0) {
     qp.g      = std::min(fixed_g, nq);
     qp.reason = "fixed (q_group_size / COQUI_GWLINE_QGROUP)";
   } else {
-    auto [g, idx] = largest_fitting(cands, [&](long g) { return fits_host(g) and fits_dev(g); });
-    qp.g          = g;
-    if (idx == 0) qp.reason = "all q fit";
-    else if (idx > 0) qp.reason = "memory model";
+    for (long i = 0; i < nc and ichosen < 0; ++i)
+      if (fits(i)) ichosen = i;
+    if (ichosen == 0) qp.reason = "all q fit";
+    else if (ichosen > 0) qp.reason = "memory model";
+    if (ichosen >= 0) qp.g = cands[ichosen];
     else {
-      qp.reason = "memory model: even the smallest groups exceed the budget";
-      // blocks shrink ~ 1/np: ranks needed for the smallest groups (an estimate printed for the user)
+      ichosen   = imin;
+      qp.g      = cands[imin];
+      qp.reason = "memory model: no grouping fits the budget, least-memory grouping";
       const double over_h = (qp.budget_host > 0.0) ? qp.model_host_min / qp.budget_host : 0.0;
       const double over_d = (qp.budget_dev > 0.0) ? qp.model_dev_min / qp.budget_dev : 0.0;
       const double over   = std::max(over_h, over_d);
-      app_log(1, "  WARNING gw_line q plan: the smallest q groups ({} rows) need {:.2f} GB host / {:.2f} GB device per rank, budget "
-                 "{:.2f} / {:.2f} GB (x{:.2f}): run on ~{:.0f}x the ranks (or nodes / GPUs)",
-              g, qp.model_host_min / GB, qp.model_dev_min / GB, qp.budget_host / GB, qp.budget_dev / GB, over, std::ceil(over));
+      app_log(1, "  WARNING gw_line q plan: the least-memory grouping (<= {} rows) needs {:.2f} GB host / {:.2f} GB device per rank, "
+                 "budget {:.2f} / {:.2f} GB (x{:.2f}): run on ~{:.0f}x the ranks (or nodes / GPUs)",
+              qp.g, qp.model_host_min / GB, qp.model_dev_min / GB, qp.budget_host / GB, qp.budget_dev / GB, over, std::ceil(over));
       // abort only when the model exceeds the WHOLE available memory (the budget is mem_frac of it)
       if (bp.mem_budget_gb <= 0.0 and qp.budget_host > 0.0)
         utils::check(qp.model_host_min <= qp.budget_host / bp.mem_frac,
-                     "gw_line: the memory model of the smallest q groups ({:.2f} GB per rank) exceeds the available host memory "
-                     "({:.2f} GB per rank): use more nodes", qp.model_host_min / GB, qp.budget_host / bp.mem_frac / GB);
+                     "gw_line: the memory model of the least-memory q grouping ({:.2f} GB per rank) exceeds the available host "
+                     "memory ({:.2f} GB per rank): use more nodes", qp.model_host_min / GB, qp.budget_host / bp.mem_frac / GB);
     }
   }
   qp.ngroups    = q_groups_t(rows, qp.g, qminus).n;
-  qp.model_host = model_host(qp.g);
-  if constexpr (MEM != HOST_MEMORY) qp.model_dev = model_dev(qp.g);
+  qp.model_host = (ichosen >= 0) ? mh[ichosen] : model_host(qp.g, qp.wR_inplace);
+  if constexpr (MEM != HOST_MEMORY) qp.model_dev = (ichosen >= 0) ? md[ichosen] : model_dev(qp.g, qp.wR_inplace);
   if (long v = detail::env_long("COQUI_GWLINE_SIGMA_QGROUP", 0); v > 0) qp.gs_sigma = std::min(v, nq);
   if (not qp.w_host) qp.gs_sigma = nq;
-  app_log(1, "  q plan: {} q groups of <= {} of {} rows ({}); model per rank: host {:.3f} GB (all q {:.3f}, smallest {:.3f}) budget {}{}",
-          qp.ngroups, qp.g, nq, qp.reason, qp.model_host / GB, qp.model_host_all / GB, qp.model_host_min / GB,
+  app_log(1, "  q plan: {} q groups of <= {} of {} rows ({}{}); model per rank: host {:.3f} GB (all q {:.3f}, least-memory grouping {:.3f}) budget {}{}",
+          qp.ngroups, qp.g, nq, qp.reason, qp.wR_inplace ? "; Sigma's real-space residues in place of w" : "", qp.model_host / GB, qp.model_host_all / GB, qp.model_host_min / GB,
           qp.budget_host > 0.0 ? fmt::format("{:.3f} GB", qp.budget_host / GB) : std::string("unconstrained"),
           MEM == HOST_MEMORY ? std::string("")
                              : fmt::format("; device {:.3f} GB (all q {:.3f}) budget {:.3f} GB", qp.model_dev / GB,

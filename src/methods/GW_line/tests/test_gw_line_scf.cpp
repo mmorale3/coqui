@@ -2694,7 +2694,29 @@ TEST_CASE("gw_line_qplan_driver", "[gw_line][scf][qplan]") {
     REQUIRE(dmu <= 1e-12);
     REQUIRE(dgap <= 1e-12);
     REQUIRE(dS <= 1e-12);
+    // Sigma's real-space residues in place of w (forced; the plan enables it only when nothing fits otherwise)
+    setenv("COQUI_GWLINE_WR_INPLACE", "1", 1);
+    auto C = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scf_params("gw_line_qpC", 2, false, "id", "lehmann"));
+    unsetenv("COQUI_GWLINE_WR_INPLACE");
+    double dmu_c = 0.0, dgap_c = 0.0;
+    for (long i = 0; i < 2; ++i) {
+      dmu_c  = std::max(dmu_c, std::abs(A.history[i].mu - C.history[i].mu));
+      dgap_c = std::max(dgap_c, std::abs(A.history[i].gap - C.history[i].gap));
+    }
+    const double dS_c = comm.all_reduce_value(double(std::max(nda::max_element(nda::abs(C.Sig_p - A.Sig_p)),
+                                                              nda::max_element(nda::abs(C.Sig_h - A.Sig_h)))),
+                                              mpi3::max<>{}) / mS;
+    app_log(1, "[qplan] {}: w^(R) in place of w (model {:.4f} MB vs {:.4f} MB): vs all q: |dmu| {:.1e} |dgap| {:.1e} Sigma {:.1e}", fx,
+            C.q_model_host / 1048576.0, A.q_model_host / 1048576.0, dmu_c, dgap_c, dS_c);
+    REQUIRE(C.q_wR_inplace);
+    REQUIRE(not A.q_wR_inplace);
+    REQUIRE(C.q_model_host <= A.q_model_host);
+    // the column-blocked transform may change BLAS blocking (roundoff), amplified by one closure at iteration 2
+    REQUIRE(dmu_c <= 1e-9);
+    REQUIRE(dgap_c <= 1e-9);
+    REQUIRE(dS_c <= 1e-9);
     remove_file(comm, "gw_line_qpA.gw_line.h5");
     remove_file(comm, "gw_line_qpB.gw_line.h5");
+    remove_file(comm, "gw_line_qpC.gw_line.h5");
   }
 }
