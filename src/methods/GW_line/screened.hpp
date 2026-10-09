@@ -761,8 +761,9 @@ class node_shm_t {
         if (p[r] != nullptr) munmap(p[r], size_t(sizes[r]));
       return false;
     }
-    // pre-fault my segment (owner's NUMA domain; the per-rank objects fault in parallel)
-    {
+    // pre-fault my segment (env COQUI_GWLINE_W_PREFAULT = owner (default): the owner's NUMA domain, the per-rank objects
+    // fault in parallel | none: the forward pass faults the pages, on the writers' domains)
+    if (env_string_w("COQUI_GWLINE_W_PREFAULT", "owner") == "owner") {
       const auto t0 = std::chrono::steady_clock::now();
       std::memset(p[lrank], 0, size_t(sizes[lrank]));
       t_prefault = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
