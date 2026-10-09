@@ -1242,7 +1242,21 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   dyson_layout_t lay(comm.size(), comm.rank(), nqR, bos->zeta_nodes.size(), Np);
   // q groups of the Pi -> W stage (S7e; perf 7.4b: automatic from the 6.7 model and the host / device budgets, q_plan.hpp)
   const bool dev_fused   = (MEM != HOST_MEMORY) and detail::fused_hadamard();
-  const long tc_model    = (prm.t_chunk > 0 ? prm.t_chunk : (MEM == HOST_MEMORY ? detail::host_t_chunk_default : 64));
+  const long tc_host0    = (prm.t_chunk > 0 ? prm.t_chunk : detail::env_long("COQUI_GWLINE_HOST_TCHUNK", detail::host_t_chunk_default));
+  const long tc_model    = (MEM == HOST_MEMORY ? tc_host0 : (prm.t_chunk > 0 ? prm.t_chunk : 64));
+  // perf 7.4b relief levels of the q plan (q_plan.hpp), tried in order when no q grouping fits the budget:
+  //   full BZ: 0 none, 1 Sigma's real-space residues in place of w, 2 + host t_chunk / 2, 3 + host t_chunk / 4 (>= 8);
+  //   IBZ    : 0 none, 1 host t_chunk / 2, 2 host t_chunk / 4. The device chooses its chunk itself (no t_chunk levels);
+  //   an explicit t_chunk disables the t_chunk levels.
+  const bool ip_ok      = not ibz.active and detail::env_long("COQUI_GWLINE_WR_INPLACE", -1) != 0;
+  const long ntc_levels = (MEM == HOST_MEMORY and prm.t_chunk <= 0) ? 2 : 0;
+  const long nlevels    = 1 + (ip_ok ? 1 : 0) + ntc_levels;
+  auto level_inplace    = [&](long L) { return ip_ok and (L >= 1 or detail::env_long("COQUI_GWLINE_WR_INPLACE", -1) == 1); };
+  auto level_tc         = [&](long L) {   // the host kernels' t_chunk at level L (0: the default)
+    const long halvings = std::max(0L, L - (ip_ok ? 1 : 0));
+    if (MEM != HOST_MEMORY or prm.t_chunk > 0 or halvings == 0) return prm.t_chunk;
+    return std::max(8L, tc_host0 >> halvings);
+  };
   const double sig_bytes = 16.0 * double(prm.sigma_kdist ? kd.nloc(0) : nk) * double(nz) * double(nb * nb);
   // host model (S7e): the kernel arrays (= the 6.7 model on the host path) + the Sigma arrays of the driver (Sig_p, Sig_h,
   // Sp_new, Sh_new: 4 N_k N_zeta_f nb^2) + the per-chunk Sigma reduce buffers (2 N_k t_chunk nb^2) + the full Z(q) of the
@@ -1252,7 +1266,11 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   // blocks when enabled; N_t estimated by the bosonic node count) and, on the IBZ, the class-sum arrays of self_energy_ibz
   // (G~, G^ of all k, W(t) of the rows R, the back-transformed class sums: (2 N_k + |R| + n_cls nk_ibz) t_chunk blocks)
   // device: the kernels size their chunk from the free memory at the call (40%, >= 8): the plan needs only the minimum chunk
-  const long tc_plan = (MEM == HOST_MEMORY) ? tc_model : (prm.t_chunk > 0 ? prm.t_chunk : 8L);
+  auto tc_plan_of = [&](long L) -> long {
+    if (MEM != HOST_MEMORY) return prm.t_chunk > 0 ? prm.t_chunk : 8L;
+    const long t = level_tc(L);
+    return t > 0 ? t : tc_model;
+  };
   // a grouping is feasible when the Dyson layout of every group exists (np <= q pools x zeta pools; dyson_layout_t)
   auto feasible = [&](long g, long nzb_) {
     q_groups_t qgg(ibz.rows, g, ibz.qminus);
@@ -1260,9 +1278,10 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       if (not dyson_layout_t::valid(comm.size(), qgg.size(G), nzb_)) return false;
     return true;
   };
-  auto kernels_model = [&](long g, long nzb_, bool inplace) {
+  auto kernels_model = [&](long g, long nzb_, long L) {
     q_groups_t qgg(ibz.rows, g, ibz.qminus);
-    const auto mm    = grid.model(nkF, nqR, nzb_, bos->rank, tc_plan, nb, qgg.max_size(), dev_fused, inplace);
+    const long tc_plan = tc_plan_of(L);
+    const auto mm    = grid.model(nkF, nqR, nzb_, bos->rank, tc_plan, nb, qgg.max_size(), dev_fused, level_inplace(L));
     const double b16 = 16.0 * double(grid.max_block_size());
     double stage     = mm.peak_stage;
     if (ibz.active) {
@@ -1277,26 +1296,35 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   // host model (S7e): the kernel arrays (host path) + the Sigma arrays of the driver (Sig_p, Sig_h, Sp_new, Sh_new:
   // 4 N_k N_zeta_f nb^2) + the per-chunk Sigma reduce buffers (2 N_k t_chunk nb^2) + the full Z(q) of the Dyson slab of
   // the grouping (max over the ranks: the plan is collective)
-  auto qmodel_host = [&](long g, long nzb_, bool inplace) {
+  // the Sigma reduce of a chunk: the send buffer + MPI_Reduce_scatter's temporaries (~2 more of the same size; the 8x8x8 node
+  // ran out of memory entering Sigma with 3.2 GB per rank free against the 2.8 GB of the arrays alone): 3 N_k t_chunk nb^2
+  auto qmodel_host = [&](long g, long nzb_, long L) {
     if (not feasible(g, nzb_)) return 1e300;   // same on every rank (no collective skipped unevenly)
     q_groups_t qgg(ibz.rows, g, ibz.qminus);
     const double zf = 16.0 * double(qgg.dyson_q_list(comm.size(), comm.rank(), nzb_, Np).size()) * double(Np) * double(Np);
-    double m = (MEM == HOST_MEMORY ? kernels_model(g, nzb_, inplace) : 0.0) + 4.0 * sig_bytes +
-               2.0 * 16.0 * double(nkF) * double(detail::host_t_chunk_default) * double(nb * nb) + zf;
+    const long tcr  = (MEM == HOST_MEMORY) ? tc_plan_of(L) : detail::host_t_chunk_default;
+    double m = (MEM == HOST_MEMORY ? kernels_model(g, nzb_, L) : 0.0) + 4.0 * sig_bytes +
+               3.0 * 16.0 * double(nkF) * double(tcr) * double(nb * nb) + zf;
     return comm.all_reduce_value(m, boost::mpi3::max<>{});
   };
-  auto qmodel_dev = [&](long g, long nzb_, bool inplace) {
+  auto qmodel_dev = [&](long g, long nzb_, long L) {
     if (not feasible(g, nzb_)) return 1e300;
-    double m = kernels_model(g, nzb_, inplace);
+    double m = kernels_model(g, nzb_, L);
     return comm.all_reduce_value(m, boost::mpi3::max<>{});
   };
   auto make_qplan = [&](long nzb_) {
-    return choose_q_plan<MEM>(comm, mpi.node_comm, grid, ibz.rows, ibz.qminus, nkF, nzb_, bos->rank, nb, q_budget_params_t{prm.mem_budget_gb, prm.dev_mem_budget_gb, prm.mem_frac, prm.q_group_size},
-                              [&](long g, bool ip) { return qmodel_host(g, nzb_, ip); },
-                              [&](long g, bool ip) { return qmodel_dev(g, nzb_, ip); }, not ibz.active,
-                              not ibz.active,   // in place: the full-BZ Sigma's real-space path only
-                              // the root alone: the checkpoint's gather of Sigma (write_state: two sectors, owner + k order)
-                              (prm.sigma_kdist and comm.size() > 1) ? 3.0 * 16.0 * double(nk) * double(nz) * double(nb * nb) : 0.0);
+    auto qp = choose_q_plan<MEM>(comm, mpi.node_comm, grid, ibz.rows, ibz.qminus, nkF, nzb_, bos->rank, nb,
+                                 q_budget_params_t{prm.mem_budget_gb, prm.dev_mem_budget_gb, prm.mem_frac, prm.q_group_size},
+                                 [&](long g, long L) { return qmodel_host(g, nzb_, L); },
+                                 [&](long g, long L) { return qmodel_dev(g, nzb_, L); }, not ibz.active, nlevels,
+                                 // the root alone: the checkpoint's gather of Sigma (write_state: two sectors, owner + k order)
+                                 (prm.sigma_kdist and comm.size() > 1) ? 3.0 * 16.0 * double(nk) * double(nz) * double(nb * nb) : 0.0);
+    qp.wR_inplace = level_inplace(qp.level);
+    qp.t_chunk    = level_tc(qp.level);
+    if (qp.level > 0 or qp.wR_inplace)
+      app_log(1, "  q plan relief: Sigma's real-space residues {}, kernel t_chunk {}", qp.wR_inplace ? "in place of w" : "beside w",
+              qp.t_chunk > 0 ? std::to_string(qp.t_chunk) : std::string("default"));
+    return qp;
   };
   q_plan_t qplan = make_qplan(long(bos->zeta_nodes.size()));
   auto record_qplan = [&]() {
@@ -1542,7 +1570,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     hres_h() = ComplexType(0.0);
     for (long G = 0; G < qg.n; ++G) {   // one group (all q) unless the Pi group does not fit
       e0 = tic("phase_Pi");
-      polarization<MEM>(prop, st.poles, mf, grid, bos->zeta_nodes, *pi_p, *pi_h, prm.t_chunk, Pi, Timer, sector_t::both,
+      polarization<MEM>(prop, st.poles, mf, grid, bos->zeta_nodes, *pi_p, *pi_h, qplan.t_chunk, Pi, Timer, sector_t::both,
                         qg.rows(G));
       tPi += toc("phase_Pi", e0);
       mem_trace(comm, mpi.node_comm, "Pi group " + std::to_string(G));
@@ -1620,10 +1648,10 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     auto const *whp = qplan.w_host ? &w_h : nullptr;
     // both sectors in one call (perf 7.1: the real-space residues are transformed once): particle -> Sp_new, hole -> Sh_new
     if (ibz.active)   // perf 7.3: Sigma at the IBZ k from the class sums (self_energy_ibz.hpp)
-      self_energy_ibz<MEM>(prop, st.poles, w, *bos, mf, ibz, grid, comm, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer,
+      self_energy_ibz<MEM>(prop, st.poles, w, *bos, mf, ibz, grid, comm, zeta, *sig_p, *sig_h, qplan.t_chunk, Sp_new, Timer,
                            sector_t::both, prm.sigma_kdist, &Sh_new);
     else
-      self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, prm.t_chunk, Sp_new, Timer, sector_t::both,
+      self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, qplan.t_chunk, Sp_new, Timer, sector_t::both,
                        prm.sigma_kdist, whp, qplan.gs_sigma, &Sh_new, qplan.wR_inplace ? &w : nullptr);   // 7.4b: w consumed
     mem_trace(comm, mpi.node_comm, "Sigma");
     if (sig_div) {   // S9a: the q -> 0 head term of Sigma_c (head.hpp), per sector, on the rows of this rank
