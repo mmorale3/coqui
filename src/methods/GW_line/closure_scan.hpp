@@ -27,13 +27,13 @@
  * eigensolve of the Nr x Nr unitary U each; Si 4x4x4, Nr 1302: 41 x ~3 s) while every other rank waited. Here, after
  * every owner has prepared its k up to the fast SVD (upfold_prepare with defer_ref), the k with a free block ("deferred")
  * are finished together:
- *   - scan ranks of k: its owner and the nphi ranks (owner + 1 + ip) mod np; every other rank lends its core to the scan
- *     ranks of its host (closure_cores_t, owners weighted x owner_weight) and sleeps;
- *   - the owner redoes the SVD with the reference driver (upfold_prepare_ref, the pre-7.1c arithmetic) and broadcasts the
- *     problem (A1, A0, R, C^(K+1));
+ *   - scan ranks of k: its owner and the nphi ranks (owner + 1 + ip) mod np. Three phases, each with the cores of the
+ *     ranks idle in that phase lent to the busy ranks of their host (closure_cores_t; the lenders sleep):
+ *   - (A) the owner redoes the SVD with the reference driver (upfold_prepare_ref, the pre-7.1c arithmetic);
+ *   - (B) the owner broadcasts the problem (A1, A0, R, C^(K+1)) to the scan ranks;
  *   - coarse scan: the nphi eigen realizations on the nphi coarse ranks (cayley::realize, the same as the serial scan;
  *     one exact all_reduce), while the owner builds the eigensolve-free held-out error (cayley::heldout_poly_t);
- *   - the owner: the same decision (cayley::coarse_decide), the 30-step golden section on the eigensolve-free error
+ *   - (C) the owner: the same decision (cayley::coarse_decide), the 30-step golden section on the eigensolve-free error
  *     (exact in exact arithmetic; microseconds per phase), the final realization, then finish(j) (Lehmann).
  * The deferred k are processed in batches whose broadcast problems fit in budget_bytes per rank. Each coarse realization
  * is the same code on the same data as in the serial scan: the result depends on the BLAS thread counts / MKL code paths
@@ -72,15 +72,14 @@ inline void bcast_matrix(numerics::line_dlr::cmatrix_F const &A, int root, MPI_C
  * Collective over comm. dk: the deferred k in increasing order (identical on every rank), owner(k) = k mod np;
  * prob[j], res[j]: the problem / upfold result of dk[j] on its owner (ignored elsewhere; on return res[j] is the finished
  * upfolding); opts(k): the upfold options of k (identical on every rank); threads: BLAS threads of a scan rank without
- * borrowed cores (<= 0: untouched); max_threads: cap of borrowed cores per scan rank (<= 0: none); owner_weight: share of
- * the lent cores of an owner relative to a coarse rank. On the owner of dk[j], finish(j) is called after the upfolding,
- * still with the borrowed cores. The waits at the end of the batches are accumulated in the timer "closure_wait" of T.
+ * borrowed cores (<= 0: untouched); max_threads: cap of borrowed cores per busy rank (<= 0: none). On the owner of
+ * dk[j], finish(j) is called after the upfolding, still with the borrowed cores. The waits at the end of the batches are accumulated in the timer "closure_wait" of T.
  */
 template <typename Opts, typename Finish>
 void distributed_phase_scan(boost::mpi3::communicator &comm, std::vector<long> const &dk,
                             std::vector<numerics::line_dlr::upfold_problem_t *> const &prob,
                             std::vector<numerics::line_dlr::upfold_result_t *> const &res, Opts &&opts, long threads,
-                            long max_threads, long owner_weight, double budget_bytes, Finish &&finish,
+                            long max_threads, double budget_bytes, Finish &&finish,
                             utils::TimerManager *T = nullptr) {
   namespace ldlr = numerics::line_dlr;
   using clk      = std::chrono::steady_clock;
@@ -116,142 +115,166 @@ void distributed_phase_scan(boost::mpi3::communicator &comm, std::vector<long> c
     }
     // coarse task ip of k -> rank (owner + 1 + ip) mod np
     auto task_rank = [&](long j, long ip) { return (owner(j0 + j) + 1 + ip) % np; };
-    long weight = 0;
+    bool own_any = false, own_ref = false, in_S = false;
     for (long j = 0; j < B; ++j) {
       const long t = (rank - owner(j0 + j) + np) % np;
-      if (t == 0) weight = std::max(weight, std::max(1L, owner_weight));
-      else if (t <= nphi[j]) weight = std::max(weight, 1L);
+      if (t == 0) {
+        own_any = true;
+        own_ref = own_ref or prob[j0 + j]->need_ref;
+      }
+      in_S = in_S or (t <= nphi[j]);
     }
-    const bool in_S = weight > 0;
-    MPI_Comm sc     = MPI_COMM_NULL;
+    MPI_Comm sc = MPI_COMM_NULL;
     MPI_Comm_split(comm.get(), in_S ? 0 : MPI_UNDEFINED, int(rank), &sc);
-    closure_cores_t cores(comm, weight, max_threads);   // the idle ranks lend their cores to the scan ranks of their host
-    if (in_S) {
-      const long bt = cores.blas_threads() > 0 ? cores.blas_threads() : threads;
-      blas_threads_scope_t bscope(bt);
-      int ns = 0;
-      MPI_Comm_size(sc, &ns);
-      std::vector<int> world(ns);
-      const int me = int(rank);
-      MPI_Allgather(&me, 1, MPI_INT, world.data(), 1, MPI_INT, sc);
-      auto sc_rank = [&](long r) { return int(std::find(world.begin(), world.end(), int(r)) - world.begin()); };
-      // 1. owners: the reference SVD; then the problems owner -> scan ranks of the batch
-      for (long j = 0; j < B; ++j)
-        if (owner(j0 + j) == rank) ldlr::upfold_prepare_ref(*prob[j0 + j], ob[j], *res[j0 + j]);
-      std::vector<double> tb(B, 0.0);
-      std::vector<ldlr::upfold_problem_t> loc(B);
-      std::vector<ldlr::upfold_problem_t const *> P(B);
-      for (long j = 0; j < B; ++j) {
-        const auto t0  = clk::now();
-        const bool own = (owner(j0 + j) == rank);
-        const int root = sc_rank(owner(j0 + j));
-        double hdr[6]  = {0, 0, 0, 0, 0, 0};
-        if (own) {
-          auto const &q = *prob[j0 + j];
-          hdr[0] = double(q.n); hdr[1] = double(q.Nr); hdr[2] = double(q.K); hdr[3] = double(q.n_free);
-          hdr[4] = q.wp; hdr[5] = q.nheld;
-        }
-        MPI_Bcast(hdr, 6, MPI_DOUBLE, root, sc);
-        const bool scan = std::llround(hdr[3]) > 0;   // the reference SVD may have closed the free block
-        if (own) {
-          P[j] = prob[j0 + j];
-          if (scan)
-            for (auto const *A : {&P[j]->A1, &P[j]->A0, &P[j]->R, &P[j]->Cheld}) detail::bcast_matrix(*A, root, sc);
-        } else {
-          auto &q  = loc[j];
-          q.n      = std::llround(hdr[0]);
-          q.Nr     = std::llround(hdr[1]);
-          q.K      = std::llround(hdr[2]);
-          q.n_free = std::llround(hdr[3]);
-          q.wp     = hdr[4];
-          q.nheld  = hdr[5];
-          if (scan) {
-            q.A1    = ldlr::cmatrix_F(q.Nr, q.Nr);
-            q.A0    = ldlr::cmatrix_F(q.Nr, q.Nr);
-            q.R     = ldlr::cmatrix_F(q.n, q.Nr);
-            q.Cheld = ldlr::cmatrix_F(q.n, q.n);
-            for (auto *A : {&q.A1, &q.A0, &q.R, &q.Cheld}) detail::bcast_matrix(*A, root, sc);
-          }
-          P[j] = &q;
-        }
-        tb[j] = secs(t0);
+    auto wait = [&](closure_cores_t &c) {
+      if (T) T->start("closure_wait");
+      c.wait();
+      if (T) T->stop("closure_wait");
+    };
+    auto bthreads = [&](closure_cores_t const &c) { return c.blas_threads() > 0 ? c.blas_threads() : threads; };
+    // phase A: the owners redo the SVD with the reference driver, with the cores of every other rank of their host
+    {
+      closure_cores_t cores(comm, own_ref ? 1L : 0L, max_threads);
+      if (own_ref) {
+        blas_threads_scope_t bscope(bthreads(cores));
+        for (long j = 0; j < B; ++j)
+          if (owner(j0 + j) == rank) ldlr::upfold_prepare_ref(*prob[j0 + j], ob[j], *res[j0 + j]);
       }
-
-      // 2. coarse scan on the coarse ranks; meanwhile the owners build the eigensolve-free held-out error
-      const auto tc = clk::now();
-      constexpr long NF = 9;   // err, umin, nflag, retry, fallback, residual, reason, t_eig, t_rr
-      std::vector<long> coff(B + 1, 0);
-      for (long j = 0; j < B; ++j) coff[j + 1] = coff[j] + nphi[j] * NF;
-      std::vector<double> cv(coff[B], 0.0);
-      std::vector<ldlr::heldout_poly_t> hp(B);
-      std::vector<double> tpoly(B, 0.0);
-      for (long j = 0; j < B; ++j)
-        if (owner(j0 + j) == rank and P[j]->n_free > 0 and ob[j].scan_err == "poly") {
-          const auto t0 = clk::now();
-          hp[j]         = ldlr::heldout_poly(*P[j]);
-          tpoly[j]      = secs(t0);
-        }
-      for (long j = 0; j < B; ++j) {
-        if (P[j]->n_free == 0) continue;
-        for (long ip = 0; ip < nphi[j]; ++ip) {
-          if (task_rank(j, ip) != rank) continue;
-          ldlr::upfold_result_t rt;
-          auto rz   = ldlr::realize(*P[j], ldlr::coarse_phase(ip, nphi[j]), ob[j], rt);
-          double *x = cv.data() + coff[j] + ip * NF;
-          x[0] = rz.err; x[1] = ldlr::unity_distance(rz.u); x[2] = double(rt.ueig_nflag); x[3] = double(rt.ueig_retry);
-          x[4] = double(rt.ueig_fallback); x[5] = rt.ueig_res; x[6] = double(rt.ueig_reason); x[7] = rt.t_eig; x[8] = rt.t_rr;
-        }
-      }
-      MPI_Allreduce(MPI_IN_PLACE, cv.data(), int(cv.size()), MPI_DOUBLE, MPI_SUM, sc);   // one contributor per slot
-      const double t_coarse = secs(tc);
-      MPI_Comm_free(&sc);
-
-      // 3. owners: decision, golden section, final realization, finish
-      for (long j = 0; j < B; ++j) {
-        if (owner(j0 + j) != rank) continue;
-        auto &pr = *prob[j0 + j];
-        auto &up = *res[j0 + j];
-        up.t_bcast      = tb[j];
-        up.scan_ranks   = ns;
-        up.scan_threads = bt;
-        if (pr.n_free == 0) {
-          ldlr::upfold_complete(pr, ob[j], up);
-        } else {
-          std::vector<double> errs(nphi[j]), umin(nphi[j]);
-          for (long ip = 0; ip < nphi[j]; ++ip) {
-            double const *x = cv.data() + coff[j] + ip * NF;
-            errs[ip]        = x[0];
-            umin[ip]        = x[1];
-            up.ueig_nflag   = std::max(up.ueig_nflag, long(std::llround(x[2])));
-            up.ueig_retry += std::llround(x[3]);
-            up.ueig_fallback += std::llround(x[4]);
-            up.ueig_res = std::max(up.ueig_res, x[5]);
-            if (x[6] > 0.5) up.ueig_reason = int(std::llround(x[6]));
-            up.t_eig += x[7];
-            up.t_rr += x[8];
-          }
-          up.n_eig += nphi[j];
-          up.n_realize += nphi[j];
-          ldlr::golden_t g(ldlr::coarse_decide(errs, umin, ob[j], up), nphi[j]);
-          up.t_coarse   = t_coarse;
-          up.t_poly     = tpoly[j];
-          const auto tr = clk::now();
-          auto f        = [&](double p) {
-            if (ob[j].scan_err != "poly") return ldlr::realize(pr, p, ob[j], up).err;
-            ++up.n_mfree;
-            return hp[j](p);
-          };
-          ldlr::golden_refine(g, f);
-          up.t_refine = secs(tr);
-          ldlr::upfold_final(pr, g.result(), ob[j], up);
-          up.t_ueig = tb[j] + up.t_coarse + up.t_refine + up.t_final;
-        }
-        finish(j0 + j);
-      }
+      wait(cores);
     }
-    if (T) T->start("closure_wait");
-    cores.wait();
-    if (T) T->stop("closure_wait");
+    // phase B: problems owner -> scan ranks; coarse scan on the coarse ranks, eigensolve-free error built by the owners
+    int ns = 0;
+    std::vector<double> tb(B, 0.0), tpoly(B, 0.0), cv;
+    std::vector<ldlr::upfold_problem_t> loc(B);
+    std::vector<ldlr::upfold_problem_t const *> P(B);
+    std::vector<ldlr::heldout_poly_t> hp(B);
+    constexpr long NF = 9;   // err, umin, nflag, retry, fallback, residual, reason, t_eig, t_rr
+    std::vector<long> coff(B + 1, 0);
+    for (long j = 0; j < B; ++j) coff[j + 1] = coff[j] + nphi[j] * NF;
+    double t_coarse = 0.0;
+    long bt_coarse  = 0;
+    {
+      closure_cores_t cores(comm, in_S ? 1L : 0L, max_threads);
+      if (in_S) {
+        bt_coarse = bthreads(cores);
+        blas_threads_scope_t bscope(bt_coarse);
+        MPI_Comm_size(sc, &ns);
+        std::vector<int> world(ns);
+        const int me = int(rank);
+        MPI_Allgather(&me, 1, MPI_INT, world.data(), 1, MPI_INT, sc);
+        auto sc_rank = [&](long r) { return int(std::find(world.begin(), world.end(), int(r)) - world.begin()); };
+        for (long j = 0; j < B; ++j) {
+          const auto t0  = clk::now();
+          const bool own = (owner(j0 + j) == rank);
+          const int root = sc_rank(owner(j0 + j));
+          double hdr[6]  = {0, 0, 0, 0, 0, 0};
+          if (own) {
+            auto const &q = *prob[j0 + j];
+            hdr[0] = double(q.n); hdr[1] = double(q.Nr); hdr[2] = double(q.K); hdr[3] = double(q.n_free);
+            hdr[4] = q.wp; hdr[5] = q.nheld;
+          }
+          MPI_Bcast(hdr, 6, MPI_DOUBLE, root, sc);
+          const bool scan = std::llround(hdr[3]) > 0;   // the reference SVD may have closed the free block
+          if (own) {
+            P[j] = prob[j0 + j];
+            if (scan)
+              for (auto const *A : {&P[j]->A1, &P[j]->A0, &P[j]->R, &P[j]->Cheld}) detail::bcast_matrix(*A, root, sc);
+          } else {
+            auto &q  = loc[j];
+            q.n      = std::llround(hdr[0]);
+            q.Nr     = std::llround(hdr[1]);
+            q.K      = std::llround(hdr[2]);
+            q.n_free = std::llround(hdr[3]);
+            q.wp     = hdr[4];
+            q.nheld  = hdr[5];
+            if (scan) {
+              q.A1    = ldlr::cmatrix_F(q.Nr, q.Nr);
+              q.A0    = ldlr::cmatrix_F(q.Nr, q.Nr);
+              q.R     = ldlr::cmatrix_F(q.n, q.Nr);
+              q.Cheld = ldlr::cmatrix_F(q.n, q.n);
+              for (auto *A : {&q.A1, &q.A0, &q.R, &q.Cheld}) detail::bcast_matrix(*A, root, sc);
+            }
+            P[j] = &q;
+          }
+          tb[j] = secs(t0);
+        }
+        const auto tc = clk::now();
+        cv.assign(coff[B], 0.0);
+        for (long j = 0; j < B; ++j)
+          if (owner(j0 + j) == rank and P[j]->n_free > 0 and ob[j].scan_err == "poly") {
+            const auto t0 = clk::now();
+            hp[j]         = ldlr::heldout_poly(*P[j]);
+            tpoly[j]      = secs(t0);
+          }
+        for (long j = 0; j < B; ++j) {
+          if (P[j]->n_free == 0) continue;
+          for (long ip = 0; ip < nphi[j]; ++ip) {
+            if (task_rank(j, ip) != rank) continue;
+            ldlr::upfold_result_t rt;
+            auto rz   = ldlr::realize(*P[j], ldlr::coarse_phase(ip, nphi[j]), ob[j], rt);
+            double *x = cv.data() + coff[j] + ip * NF;
+            x[0] = rz.err; x[1] = ldlr::unity_distance(rz.u); x[2] = double(rt.ueig_nflag); x[3] = double(rt.ueig_retry);
+            x[4] = double(rt.ueig_fallback); x[5] = rt.ueig_res; x[6] = double(rt.ueig_reason); x[7] = rt.t_eig; x[8] = rt.t_rr;
+          }
+        }
+        MPI_Allreduce(MPI_IN_PLACE, cv.data(), int(cv.size()), MPI_DOUBLE, MPI_SUM, sc);   // one contributor per slot
+        t_coarse = secs(tc);
+        for (long j = 0; j < B; ++j)   // the non-owners' copies are no longer needed
+          if (owner(j0 + j) != rank) loc[j] = ldlr::upfold_problem_t{};
+        MPI_Comm_free(&sc);
+      }
+      wait(cores);
+    }
+    // phase C: the owners decide, refine, realize the final phase and finish, with the cores of their host
+    {
+      closure_cores_t cores(comm, own_any ? 1L : 0L, max_threads);
+      if (own_any) {
+        const long bt = bthreads(cores);
+        blas_threads_scope_t bscope(bt);
+        for (long j = 0; j < B; ++j) {
+          if (owner(j0 + j) != rank) continue;
+          auto &pr = *prob[j0 + j];
+          auto &up = *res[j0 + j];
+          up.t_bcast      = tb[j];
+          up.scan_ranks   = ns;
+          up.scan_threads = bt_coarse * 1000 + bt;   // coarse-rank / owner BLAS threads (log: x / 1000, x % 1000)
+          if (pr.n_free == 0) {
+            ldlr::upfold_complete(pr, ob[j], up);
+          } else {
+            std::vector<double> errs(nphi[j]), umin(nphi[j]);
+            for (long ip = 0; ip < nphi[j]; ++ip) {
+              double const *x = cv.data() + coff[j] + ip * NF;
+              errs[ip]        = x[0];
+              umin[ip]        = x[1];
+              up.ueig_nflag   = std::max(up.ueig_nflag, long(std::llround(x[2])));
+              up.ueig_retry += std::llround(x[3]);
+              up.ueig_fallback += std::llround(x[4]);
+              up.ueig_res = std::max(up.ueig_res, x[5]);
+              if (x[6] > 0.5) up.ueig_reason = int(std::llround(x[6]));
+              up.t_eig += x[7];
+              up.t_rr += x[8];
+            }
+            up.n_eig += nphi[j];
+            up.n_realize += nphi[j];
+            ldlr::golden_t g(ldlr::coarse_decide(errs, umin, ob[j], up), nphi[j]);
+            up.t_coarse   = t_coarse;
+            up.t_poly     = tpoly[j];
+            const auto tr = clk::now();
+            auto f        = [&](double p) {
+              if (ob[j].scan_err != "poly") return ldlr::realize(pr, p, ob[j], up).err;
+              ++up.n_mfree;
+              return hp[j](p);
+            };
+            ldlr::golden_refine(g, f);
+            up.t_refine = secs(tr);
+            ldlr::upfold_final(pr, g.result(), ob[j], up);
+            up.t_ueig = tb[j] + up.t_coarse + up.t_refine + up.t_final;
+          }
+          finish(j0 + j);
+        }
+      }
+      wait(cores);
+    }
     j0 = j1;
   }
 }

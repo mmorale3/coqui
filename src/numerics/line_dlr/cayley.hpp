@@ -267,7 +267,8 @@ struct ueig_stats_t {
  * the caller then uses the Schur form.
  */
 inline bool unitary_eig_cayley(cmatrix_F const &U, nda::array<ComplexType, 1> &u, cmatrix_F &Z, double tol,
-                               ueig_stats_t &st, lapack_hooks_t const *h = nullptr, ComplexType u0 = ComplexType(1.0)) {
+                               ueig_stats_t &st, lapack_hooks_t const *h = nullptr, ComplexType u0 = ComplexType(1.0),
+                               double accept = 1.0) {
   const int n = int(U.extent(0));
   st = ueig_stats_t{};
   u.resize(n);
@@ -341,7 +342,7 @@ inline bool unitary_eig_cayley(cmatrix_F const &U, nda::array<ComplexType, 1> &u
     st.t_rr = std::chrono::duration<double>(std::chrono::steady_clock::now() - trr).count();
   }
   st.res_max = *std::max_element(res.begin(), res.end());
-  if (st.res_max > tol) { st.fallback = true; st.reason = 3; return false; }
+  if (st.res_max > tol * accept) { st.fallback = true; st.reason = 3; return false; }
   return true;
 }
 
@@ -403,6 +404,12 @@ struct upfold_opts_t {
    * the roundoff level only.
    */
   double ueig_cut = 0.0;
+  /**
+   * perf 7.1c: the "cayley" path accepts the eigenvectors when the residual after Rayleigh-Ritz is <= ueig_accept x
+   * ueig_tol (columns above ueig_tol are still refined); above it: the gap-cut retry. 1 = S7g. si444 (perf 7.1c): the
+   * retries (1-2 k per iteration, +3.3-4.0 s each) had post-RR residuals 2.1e-11..2.9e-11 at ueig_tol 1e-11.
+   */
+  double ueig_accept = 1.0;
   /// perf 7.1c: held-out error of the golden-section refinement: "eigen" (python: the error of each realization) |
   /// "poly" (heldout_poly_t: ||R U(z)^{K+1} R^dag - C^(K+1)|| as an exact recursion in z = e^{i phi}, no eigensolve)
   std::string scan_err = "eigen";
@@ -722,7 +729,8 @@ inline realization_t realize(upfold_problem_t const &pr, double phi, upfold_opts
     detail::ueig_stats_t st;
     auto const *hk = (o.hooks and o.hooks->in_ueig) ? o.hooks : nullptr;
     done           = detail::unitary_eig_cayley(U, u, Z, o.ueig_tol, st, hk,
-                                                    o.ueig_cut == 0.0 ? ComplexType(1.0) : std::exp(ComplexType(0.0, o.ueig_cut)));
+                                                    o.ueig_cut == 0.0 ? ComplexType(1.0) : std::exp(ComplexType(0.0, o.ueig_cut)),
+                                                    o.ueig_accept);
     res.ueig_nflag = std::max(res.ueig_nflag, st.nflag);
     res.ueig_res   = std::max(res.ueig_res, st.res_max);
     res.t_rr += st.t_rr;
@@ -740,7 +748,7 @@ inline realization_t realize(upfold_problem_t const &pr, double phi, upfold_opts
         }
       ++res.ueig_retry;
       detail::ueig_stats_t st2;
-      done           = detail::unitary_eig_cayley(U, u, Z, o.ueig_tol, st2, hk, std::exp(ComplexType(0.0, beta)));
+      done           = detail::unitary_eig_cayley(U, u, Z, o.ueig_tol, st2, hk, std::exp(ComplexType(0.0, beta)), o.ueig_accept);
       res.ueig_nflag = std::max(res.ueig_nflag, st2.nflag);
       res.ueig_res   = std::max(res.ueig_res, st2.res_max);
       if (not done) res.ueig_reason = 10 + st2.reason;

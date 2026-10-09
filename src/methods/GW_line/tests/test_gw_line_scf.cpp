@@ -440,7 +440,7 @@ TEST_CASE("gw_line_closure_scan", "[gw_line][scf][closure][scan]") {
         ups[k]   = &res[k];
       }
       std::vector<long> done(nk, 0);
-      distributed_phase_scan(comm, dk, probs, ups, [&](long k) { return p.upfold_opts(k); }, 0, 0, 4, budget, [&](long k) {
+      distributed_phase_scan(comm, dk, probs, ups, [&](long k) { return p.upfold_opts(k); }, 0, 0, budget, [&](long k) {
         REQUIRE(k % np == rank);
         done[k] = 1;
       });

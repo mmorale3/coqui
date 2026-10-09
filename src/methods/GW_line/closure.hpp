@@ -149,15 +149,16 @@ struct closure_params_t {
    * SVD and the final realization with borrowed cores (closure_scan.hpp); serial callers (closure_k) run the same
    * arithmetic on one rank. "serial": the pre-7.1c scan (the owner realizes all 41 phases).
    * Env COQUI_GWLINE_CLOSURE_SCAN overrides the default; COQUI_GWLINE_SCAN_MB (problem broadcast budget per rank, MB),
-   * COQUI_GWLINE_SCAN_THREADS (cap of the borrowed cores per scan rank, 0 = none), COQUI_GWLINE_SCAN_OWNER_WEIGHT (share of
-   * the lent cores of an owner relative to a coarse rank).
+   * COQUI_GWLINE_SCAN_THREADS (cap of the borrowed cores per busy rank, 0 = none).
    */
   std::string scan       = detail::env_string("COQUI_GWLINE_CLOSURE_SCAN", "parallel");
-  /// perf 7.1c: first cut of the Cayley U-eigen path: "mu" (u0 = -1, in the gap of Sigma) | "inf" (u0 = 1, pre-7.1c);
-  /// env COQUI_GWLINE_UEIG_CUT
-  std::string ueig_cut   = detail::env_string("COQUI_GWLINE_UEIG_CUT", "mu");
+  /// perf 7.1c: first cut of the Cayley U-eigen path: "inf" (u0 = 1, S7g) | "mu" (u0 = -1, in the gap of Sigma; measured on
+  /// si444: does not avoid the retries, kept as an option); env COQUI_GWLINE_UEIG_CUT
+  std::string ueig_cut   = detail::env_string("COQUI_GWLINE_UEIG_CUT", "inf");
+  /// perf 7.1c: residual acceptance factor of the Cayley path over ueig_tol (upfold_opts_t::ueig_accept; S7g: 1);
+  /// env COQUI_GWLINE_UEIG_ACCEPT
+  double ueig_accept     = detail::env_double("COQUI_GWLINE_UEIG_ACCEPT", 10.0);
   long scan_threads_max  = long(detail::env_double("COQUI_GWLINE_SCAN_THREADS", 0.0));
-  long scan_owner_weight = long(detail::env_double("COQUI_GWLINE_SCAN_OWNER_WEIGHT", 4.0));
   double scan_budget_mb  = detail::env_double("COQUI_GWLINE_SCAN_MB", 512.0);
 
   numerics::line_dlr::upfold_opts_t upfold_opts(long ik) const {
@@ -175,6 +176,7 @@ struct closure_params_t {
     o.scan_err   = (scan == "serial") ? "eigen" : "poly";
     utils::check(ueig_cut == "mu" or ueig_cut == "inf", "gw_line::closure: ueig_cut must be \"mu\" or \"inf\" (got \"{}\")", ueig_cut);
     o.ueig_cut   = (ueig_cut == "mu") ? std::numbers::pi : 0.0;
+    o.ueig_accept = ueig_accept;
     if (ik >= 0) {
       if (phase_keep > 0.0 and ik < long(phi_prev.size())) {
         o.phi_prev   = phi_prev[ik];
@@ -616,8 +618,11 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
       store_k(ik, ck, pe.t_fit, prof);
       pend[ik].reset();
     };
+    std::string ks;
+    for (long k : dk) ks += (ks.empty() ? "" : " ") + std::to_string(k);
+    app_log(1, "          closure: terminal-phase scan (n_free > 0) of k {} distributed over the ranks", ks);
     distributed_phase_scan(comm, dk, probs, ups, [&](long k) { return p.upfold_opts(k); }, p.blas_threads, p.scan_threads_max,
-                           p.scan_owner_weight, p.scan_budget_mb * 1024.0 * 1024.0, finish, &Timer);
+                           p.scan_budget_mb * 1024.0 * 1024.0, finish, &Timer);
   }
   Timer.stop("closure_scan");
   if (p.hooks) device_lapack_release();   // the kernels get the device memory back
@@ -642,8 +647,8 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     const double fnp = double(comm.size());
     app_log(2, "          closure realizations (s, min / avg / max over ranks of the owner's sums): eigen realizations {:.2f} / {:.2f} / "
                "{:.2f}, of which Rayleigh-Ritz + gap-cut retries + Schur {:.2f} / {:.2f} / {:.2f}; eigensolve-free golden "
-               "section {:.2f} / {:.2f} / {:.2f}; scan \"{}\", first Cayley cut \"{}\", deferred k {}",
-            pmin[8], psum[8] / fnp, pmax[8], pmin[9], psum[9] / fnp, pmax[9], pmin[10], psum[10] / fnp, pmax[10], p.scan, p.ueig_cut,
+               "section {:.2f} / {:.2f} / {:.2f}; scan \"{}\", first Cayley cut \"{}\", residual acceptance x{}, deferred k {}",
+            pmin[8], psum[8] / fnp, pmax[8], pmin[9], psum[9] / fnp, pmax[9], pmin[10], psum[10] / fnp, pmax[10], p.scan, p.ueig_cut, p.ueig_accept,
             long(dk.size()));
   }
 
@@ -676,10 +681,10 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
       app_log(2, "          closure k {} (rank {}): Nr {} r1 {} n_free {} | fit {:.2f} mom {:.2f} C0+Gram {:.2f} SVD {:.2f} (ref "
                  "{:.2f}) | scan bcast {:.2f} coarse {:.2f} refine {:.2f} final {:.2f} | eigen realizations {} ({:.2f} s, RR + "
                  "retries {:.2f} s, retries {}, max RR columns {}, Schur fallbacks {}), eigensolve-free errors {} (build {:.2f} s) | "
-                 "Lehmann {:.2f} | total {:.2f} | scan ranks {} BLAS threads {} | phi {:.9f} basin {} tie {:.3f} rejected {}",
+                 "Lehmann {:.2f} | total {:.2f} | scan ranks {} BLAS threads coarse {} owner {} | phi {:.9f} basin {} tie {:.3f} rejected {}",
               ik, ik % np, d.r_gram, d.r1, f.n_free, f.t_fit, f.t_mom, f.t_gram, f.t_svd, f.t_svd_ref, f.t_bcast, f.t_coarse,
               f.t_refine, f.t_final, f.n_eig, f.t_eig, f.t_rr, f.retry, f.nflag, f.fallback, f.n_mfree, f.t_poly, f.t_leh, f.total(),
-              f.scan_ranks, f.scan_threads, d.phi, d.phi_index, d.phi_tie, d.n_rejected);
+              f.scan_ranks, f.scan_threads / 1000, f.scan_threads % 1000, d.phi, d.phi_index, d.phi_tie, d.n_rejected);
     }
   }
 
