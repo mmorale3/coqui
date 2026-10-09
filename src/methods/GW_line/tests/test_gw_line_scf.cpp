@@ -556,93 +556,131 @@ TEST_CASE("gw_line_closure_scan", "[gw_line][scf][closure][scan]") {
 // perf 7.4b: the distributed scan with the cuSOLVER closure drivers (device builds; a no-op on host builds)
 // ======================================================================================================================
 TEST_CASE("gw_line_closure_scan_device", "[gw_line][scf][closure][scan][device]") {
+  namespace ldlr = numerics::line_dlr;
   auto const *h0 = methods::gw_line::device_lapack_hooks(0);
   if (not h0) return;   // host build: nothing to compare
   auto &mpi  = utils::make_unit_test_mpi_context();
   auto &comm = mpi->comm;
-  const long np = comm.size();
-  // the toy of gw_line_closure_scan (2): 3 k, nb 3, K 3 -> a free block at every k (deferred to the distributed scan)
-  const long nk = 3, nb = 3, npk = 160;
-  const double theta = 20.0 * std::numbers::pi / 180.0, lam = 6.0, eps = 1e-10, nelec = 4.0;
-  std::mt19937 gen(31337);
-  std::uniform_real_distribution<double> U(-1.0, 1.0);
-  nda::array<ComplexType, 3> H(nk, nb, nb);
-  auto zeta     = numerics::line_dlr::dense_nodes(theta, 1e-3, 60.0, 120);
-  const long nz = zeta.size();
-  nda::array<ComplexType, 4> Sp(nk, nz, nb, nb), Sh(nk, nz, nb, nb);
-  Sp() = ComplexType(0.0);
-  Sh() = ComplexType(0.0);
-  for (long ik = 0; ik < nk; ++ik) {
-    const double e0[3] = {-0.5 + 0.03 * ik, -0.3 - 0.02 * ik, 0.5 + 0.04 * ik};
-    for (long i = 0; i < nb; ++i)
-      for (long j = 0; j <= i; ++j) {
-        ComplexType x = (i == j) ? ComplexType(e0[i] + 0.02 * U(gen), 0.0) : 0.02 * ComplexType(U(gen), U(gen));
-        H(ik, i, j) = x;
-        H(ik, j, i) = std::conj(x);
-      }
-    for (long l = 0; l < npk; ++l) {
-      const double E = (l % 2 == 0 ? 1.0 : -1.0) * (0.6 + 3.4 * 0.5 * (1.0 + U(gen)));
-      std::vector<ComplexType> b(nb);
-      for (auto &x : b) x = 0.15 * std::sqrt(8.0 / double(npk)) * ComplexType(U(gen), U(gen));
-      auto &S = (E > 0.0) ? Sp : Sh;
-      for (long iz = 0; iz < nz; ++iz)
-        for (long i = 0; i < nb; ++i)
-          for (long j = 0; j < nb; ++j) S(ik, iz, i, j) += b[i] * std::conj(b[j]) / (zeta(iz) - E);
+  const long np = comm.size(), rank = comm.rank();
+  auto dsigma = [](ldlr::upfold_result_t const &a, ldlr::upfold_result_t const &b) {   // max |dSigma| / max |Sigma|
+    std::mt19937 gz(5);
+    std::uniform_real_distribution<double> ux(-1.0, 1.0), uy(0.005, 0.1);
+    double dS = 0.0, sm = 0.0;
+    for (int q = 0; q < 20; ++q) {
+      const ComplexType z(ux(gz), uy(gz));
+      auto S0 = ldlr::sigma_from_poles(a.d, a.W, z), S1 = ldlr::sigma_from_poles(b.d, b.W, z);
+      dS      = std::max(dS, nda::max_element(nda::abs(S1 - S0)));
+      sm      = std::max(sm, nda::max_element(nda::abs(S0)));
+    }
+    return dS / sm;
+  };
+  // (A) gated: models with ONE free direction per k (the production case, si444 iteration 2: n_free = 1). The terminal-phase
+  //     scan is then unique up to the phase it scans, so the device Gram eigenvectors (another gauge of X) must give the host
+  //     closure. Deferred reference SVD + distributed scan with the cuSOLVER drivers (min_dim 0) vs the host serial upfold.
+  const long nk = 3, n = 8, K = 12;
+  const double wp = 0.11;
+  closure_params_t p;
+  p.K = K; p.wp = wp; p.tol_gram = 1e-10; p.ueig = "cayley"; p.svd_driver = "gesdd"; p.scan = "parallel";
+  std::vector<nda::array<ComplexType, 3>> C(nk);
+  std::vector<ldlr::upfold_result_t> ref(nk);
+  for (long k = 0; k < nk; ++k) {   // the smallest pole count past K n with n_free = 1 (deterministic, same on every rank)
+    for (long P = K * n + 1; P <= K * n + 16; ++P) {
+      C[k]   = scan_model_moments(n, P, K, wp, 9100 + unsigned(k));
+      ref[k] = ldlr::upfold_block(C[k], K, wp, p.upfold_opts(k));
+      if (ref[k].n_free == 1) break;
     }
   }
-  line_basis_t bp(theta, lam, eps, lam, 0.02, -1.0, 60.0), bh(theta, lam, eps, 0.02, lam, -1.0, 60.0);
-  line_basis_t gp(theta, lam, eps, lam, 0.0, -1.0, 60.0), gh(theta, lam, eps, 0.0, lam, -1.0, 60.0);
-  // the device drivers at every size (production: min_dim 256; the toy's Gram / SVD are ~16 x 16)
   for (int var : {0, 1}) {
     numerics::line_dlr::lapack_hooks_t hk = *methods::gw_line::device_lapack_hooks(var);
     hk.min_dim = 0;
+    closure_params_t pd = p;
+    pd.hooks            = &hk;
+    const long f0       = methods::gw_line::device_lapack_failures();
+    std::vector<ldlr::upfold_problem_t> prs(nk);
+    std::vector<ldlr::upfold_result_t> res(nk);
+    std::vector<ldlr::upfold_problem_t *> probs(nk, nullptr);
+    std::vector<ldlr::upfold_result_t *> ups(nk, nullptr);
+    std::vector<long> dk;
+    for (long k = 0; k < nk; ++k) dk.push_back(k);
+    for (long k = rank; k < nk; k += np) {
+      prs[k]   = ldlr::upfold_prepare(C[k], K, wp, pd.upfold_opts(k), res[k], true);
+      probs[k] = &prs[k];
+      ups[k]   = &res[k];
+    }
+    distributed_phase_scan(comm, dk, probs, ups, [&](long k) { return pd.upfold_opts(k); }, 0, 0, 1e12, [&](long) {});
+    double v[4] = {0, 0, 0, 0}, vm[4];   // dSigma, |dphi|, n_free mismatches, k with n_free == 1
+    for (long k = rank; k < nk; k += np) {
+      v[0] = std::max(v[0], dsigma(res[k], ref[k]));
+      v[1] = std::max(v[1], std::abs(res[k].phi - ref[k].phi));
+      v[2] += (res[k].n_free == ref[k].n_free) ? 0 : 1;
+      v[3] += (ref[k].n_free == 1) ? 1 : 0;
+    }
+    comm.all_reduce_n(v, 4, vm, boost::mpi3::max<>{});
+    const long nfail = methods::gw_line::device_lapack_failures() - f0;
+    app_log(1, "[closure scan][device] n_free = 1 models (ranks {}, svd variant {}): device (deferred reference SVD, distributed scan) vs "
+               "host serial: dSigma {:.1e}, |dphi| {:.1e}, n_free mismatches {}, device fallbacks {}",
+            np, var, vm[0], vm[1], long(vm[2]), nfail);
+    CHECK(vm[3] > 0);
+    CHECK(vm[2] == 0);
+    CHECK(nfail == 0);
+    CHECK(vm[1] <= 1e-5);
+    CHECK(vm[0] <= 1e-5);
+  }
+  // (B) report only: the closure() toy of gw_line_closure_scan (2) has n_free = 3 at every k. With more than one free
+  //     direction the pairing inside the null space of the reference SVD depends on the input gauge (the Gram eigenvectors:
+  //     cuSOLVER vs MKL), i.e. the closure is not unique there: device and host may end in different terminal-phase basins.
+  {
+    const long nk2 = 3, nb = 3, npk = 160;
+    const double theta = 20.0 * std::numbers::pi / 180.0, lam = 6.0, eps = 1e-10, nelec = 4.0;
+    std::mt19937 gen(31337);
+    std::uniform_real_distribution<double> U(-1.0, 1.0);
+    nda::array<ComplexType, 3> H(nk2, nb, nb);
+    auto zeta     = numerics::line_dlr::dense_nodes(theta, 1e-3, 60.0, 120);
+    const long nz = zeta.size();
+    nda::array<ComplexType, 4> Sp(nk2, nz, nb, nb), Sh(nk2, nz, nb, nb);
+    Sp() = ComplexType(0.0);
+    Sh() = ComplexType(0.0);
+    for (long ik = 0; ik < nk2; ++ik) {
+      const double e0[3] = {-0.5 + 0.03 * ik, -0.3 - 0.02 * ik, 0.5 + 0.04 * ik};
+      for (long i = 0; i < nb; ++i)
+        for (long j = 0; j <= i; ++j) {
+          ComplexType x = (i == j) ? ComplexType(e0[i] + 0.02 * U(gen), 0.0) : 0.02 * ComplexType(U(gen), U(gen));
+          H(ik, i, j) = x;
+          H(ik, j, i) = std::conj(x);
+        }
+      for (long l = 0; l < npk; ++l) {
+        const double E = (l % 2 == 0 ? 1.0 : -1.0) * (0.6 + 3.4 * 0.5 * (1.0 + U(gen)));
+        std::vector<ComplexType> bv(nb);
+        for (auto &x : bv) x = 0.15 * std::sqrt(8.0 / double(npk)) * ComplexType(U(gen), U(gen));
+        auto &S = (E > 0.0) ? Sp : Sh;
+        for (long iz = 0; iz < nz; ++iz)
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) S(ik, iz, i, j) += bv[i] * std::conj(bv[j]) / (zeta(iz) - E);
+      }
+    }
+    line_basis_t bp(theta, lam, eps, lam, 0.02, -1.0, 60.0), bh(theta, lam, eps, 0.02, lam, -1.0, 60.0);
+    line_basis_t gp(theta, lam, eps, lam, 0.0, -1.0, 60.0), gh(theta, lam, eps, 0.0, lam, -1.0, 60.0);
+    numerics::line_dlr::lapack_hooks_t hk = *h0;
+    hk.min_dim = 0;
     closure_params_t pp;
-    pp.K          = 3;
-    pp.ueig       = "cayley";
-    pp.svd_driver = "gesdd";
-    pp.scan       = "parallel";
-    auto pd       = pp;
-    pd.hooks      = &hk;
+    pp.K = 3; pp.ueig = "cayley"; pp.svd_driver = "gesdd"; pp.scan = "parallel";
+    auto pd  = pp;
+    pd.hooks = &hk;
     utils::TimerManager T1, T2;
     const long f0 = methods::gw_line::device_lapack_failures();
     auto oh       = closure(comm, H, Sp, Sh, zeta, bp, bh, gp, gh, pp, nelec, T1);
     auto od       = closure(comm, H, Sp, Sh, zeta, bp, bh, gp, gh, pd, nelec, T2);
     const long nfail = methods::gw_line::device_lapack_failures() - f0;
-    long nfree_h = 0, nfree_d = 0;
-    for (long ik = 0; ik < nk; ++ik) {
-      nfree_h += (oh.kprof[ik].n_free > 0);
-      nfree_d += (od.kprof[ik].n_free > 0);
-    }
-    double dG = 0.0, gm = 0.0;
-    for (long iw = 0; iw < 40; ++iw) {
-      const ComplexType z(0.0, 1e-2 * std::pow(10.0, 3.0 * iw / 39.0));
-      for (long ik = 0; ik < nk; ++ik) {
-        nda::matrix<ComplexType> G1(nb, nb), G2(nb, nb);
-        G1() = ComplexType(0.0);
-        G2() = ComplexType(0.0);
-        for (long m = 0; m < od.leh.e[ik].size(); ++m)
-          for (long i = 0; i < nb; ++i)
-            for (long j = 0; j < nb; ++j) G1(i, j) += od.leh.v[ik](i, m) * std::conj(od.leh.v[ik](j, m)) / (z - od.leh.e[ik](m));
-        for (long m = 0; m < oh.leh.e[ik].size(); ++m)
-          for (long i = 0; i < nb; ++i)
-            for (long j = 0; j < nb; ++j) G2(i, j) += oh.leh.v[ik](i, m) * std::conj(oh.leh.v[ik](j, m)) / (z - oh.leh.e[ik](m));
-        dG = std::max(dG, nda::max_element(nda::abs(G1 - G2)));
-        gm = std::max(gm, nda::max_element(nda::abs(G2)));
-      }
-    }
     double dphi = 0.0;
-    for (long ik = 0; ik < nk; ++ik) dphi = std::max(dphi, std::abs(od.diag[ik].phi - oh.diag[ik].phi));
-    const double dmu = std::abs(od.dmu - oh.dmu), dgap = std::abs((od.e_lumo - od.e_homo) - (oh.e_lumo - oh.e_homo));
-    app_log(1, "[closure scan][device] ranks {} svd variant {}: k with a free block host {} device {} of {}; device vs host: dmu {:.1e} Ha, "
-               "gap {:.1e} Ha, max|dG|/max|G| {:.1e}, max|dphi| {:.1e}; device fallbacks to the host {}",
-            np, var, nfree_h, nfree_d, nk, dmu, dgap, dG / gm, dphi, nfail);
-    CHECK(nfree_h > 0);
-    CHECK(nfree_d == nfree_h);
+    long nf = 0;
+    for (long ik = 0; ik < nk2; ++ik) {
+      dphi = std::max(dphi, std::abs(od.diag[ik].phi - oh.diag[ik].phi));
+      nf   = std::max(nf, long(oh.kprof[ik].n_free));
+    }
+    app_log(1, "[closure scan][device] closure() toy with n_free {} (report only, not unique): device vs host dmu {:.1e} Ha, gap {:.1e} Ha, "
+               "max|dphi| {:.1e}; device fallbacks {}",
+            nf, std::abs(od.dmu - oh.dmu), std::abs((od.e_lumo - od.e_homo) - (oh.e_lumo - oh.e_homo)), dphi, nfail);
     CHECK(nfail == 0);
-    // the closure amplifies the driver roundoff ~1e5 x (S7g) and the golden section may end one bracket step apart (7.1c)
-    CHECK(dmu <= 1e-6);
-    CHECK(dgap <= 1e-6);
-    CHECK(dG / gm <= 1e-5);
   }
 }
 

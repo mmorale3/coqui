@@ -596,11 +596,12 @@ TEST_CASE("gw_line_ibz_device", "[ibz][device][gw_line]") {
     REQUIRE(eF <= 1e-13);
     REQUIRE(ePi_ns <= 1e-13);
     REQUIRE(eS_ns <= 1e-12);
-  }
-  {   // the driver on the device vs the host (lih223_sym, 2 iterations; the closure amplifies roundoff ~1e5 x from it 2 on)
-    auto fs = make_fix("qe_lih223_sym");
-    auto A  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*fs.thc, *fs.mf, ibz_scf_params("ibz_dev_h", 2));
-    auto B  = methods::gw_line::gw_line_scf<DEVICE_MEMORY>(*fs.thc, *fs.mf, ibz_scf_params("ibz_dev_d", 2));
+    if (name != "qe_lih223_sym") continue;
+    // the driver on the device vs the host (lih223_sym, 2 iterations; the closure amplifies roundoff ~1e5 x from it 2 on).
+    // Same fixture object (a further symmetric MF construction in a CUDA build can hit the uninitialized error flag of
+    // kernels::device::transform_k2g, numerics/device_kernels/cuda/symmetry_tools.cu: job 7203025)
+    auto A = methods::gw_line::gw_line_scf<HOST_MEMORY>(*f.thc, *f.mf, ibz_scf_params("ibz_dev_h", 2));
+    auto B = methods::gw_line::gw_line_scf<DEVICE_MEMORY>(*f.thc, *f.mf, ibz_scf_params("ibz_dev_d", 2));
     REQUIRE(A.history.size() == 2);
     REQUIRE(B.history.size() == 2);
     for (long i = 0; i < 2; ++i)
@@ -612,8 +613,8 @@ TEST_CASE("gw_line_ibz_device", "[ibz][device][gw_line]") {
     REQUIRE(std::abs(A.history[1].mu - B.history[1].mu) <= 1e-6);
     REQUIRE(std::abs(A.history[1].gap - B.history[1].gap) <= 1e-6);
     if (mpi.comm.root())
-      for (auto s : {"ibz_dev_h", "ibz_dev_d"})
-        for (auto e : {".gw_line.h5", ".gw_line.sigma.h5"}) std::filesystem::remove(std::string(s) + e);
+      for (auto st : {"ibz_dev_h", "ibz_dev_d"})
+        for (auto e : {".gw_line.h5", ".gw_line.sigma.h5"}) std::filesystem::remove(std::string(st) + e);
   }
 }
 #endif
