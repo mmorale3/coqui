@@ -205,7 +205,8 @@ void polarization(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF cons
     [[maybe_unused]] arr4_t X;   // real space: A^(R)
     const ComplexType alpha(leg.sign * 2.0 / double(nk));
     // perf 7.1: keep A^(R, t) of the particle leg for the Sigma^< leg (propagator_t::ahat; host <= 1.5 GB per rank)
-    const bool fill_cache = rs and leg.ray->sector == sector_t::particle and
+    // (S8b: not on the tau leg, theta_t = pi / 2: its nodes are not the Sigma nodes)
+    const bool fill_cache = rs and leg.ray->sector == sector_t::particle and leg.ray->theta_t < 1.5 and
                             detail::gt_cache_enabled<MEM>(16.0 * double(nk) * double(nt) * double(blk));
 
     if (fill_cache) {

@@ -101,7 +101,7 @@ Hartree. "auto" defaults are computed at run time as described.
 | key | type | default | meaning | when to change |
 |---|---|---|---|---|
 | `interaction` | string | (required) | name of the THC `[interaction]` block (read by `main.cpp`) | always set |
-| `theta_deg` | double | `20.0` | line angle (deg), in (0, 90); time rays at theta / 2 | convergence studies only (15-25 deg measured) |
+| `theta_deg` | double | `20.0` | line angle (deg), in (0, 90); time rays at theta_t_frac x theta | convergence studies only (15-25 deg measured) |
 | `eps` | double | `1e-10` | tolerance of every real-pole basis (fermionic, bosonic) and default of `time_eps` | 1e-8 for quick tests (10x worse moments) |
 | `lam` | double | `6.0` | fermionic pole range (Ha) of the Sigma / G bases | if QP poles beyond 6 Ha matter (logged as dropped weight) |
 | `lam_b` | double | auto: 2 `g_emax` (lehmann) / 2 `lam` (compressed) when <= 0 | bosonic pole range (Ha); must cover Pi's spectrum (sum of particle and hole pole energies) | leave auto; a narrower range made the W residues 1e5x ill-conditioned |
@@ -240,6 +240,32 @@ Hartree. "auto" defaults are computed at run time as described.
 | `checkpoint_sigma` | string | `"last"` | Sigma at the nodes: `"last"` = only the last iteration's, in `<output>.gw_line.sigma.h5` (rewritten every iteration); `"all"` = every iteration's in `iter<N>/Sigma_{p,h}` | `"all"` for analysis of small systems |
 | `outdir`, `prefix` | string | "./", required | checkpoint stem `<outdir>/<prefix>` (the executable requires `prefix` unless `output` is given) | per run |
 | `output` | string | outdir + "/" + prefix | explicit checkpoint stem (wins over outdir / prefix); a direct C++ call without any of them uses "./gw_line" | scripted runs |
+
+**Finite temperature (S8b; notes sec:finiteT; an iteration is thermal iff a pole lies within E_T = ln(1/thermal_tol)/beta of mu)**
+
+| key | type | default | meaning | when to change |
+|---|---|---|---|---|
+| `theta_t_frac` | double | `0.5` | ray angle theta_t = theta_t_frac theta (T = 0 too) | flatter rays lower the finite-T node floor (rho = sin(theta - theta_t)/sin(theta_t)) |
+| `beta` | double | `0.0` | inverse temperature (1/Ha); 0 = T = 0. Thermal iterations need `g_repr = "lehmann"`, `start = "ks"`, no `coarse`, no optics | set for finite T |
+| `thermal_tol` | double | `1e-8` | thermal tolerance tau_T: window E_T = ln(1/tau_T)/beta; far poles keep weight 1 (error <= tau_T) | 1e-10..1e-12 for tight comparisons |
+| `thermal_floor` | double | `30.0` | c_zeta: bosonic line nodes with rho beta abs(zeta) < c_zeta are excluded; wedge band bottom | keep |
+| `thermal_floor_f` | double | = `thermal_floor` | c_f: fermionic node floor of the thermal closure fit (c_zeta + ln(1/tau_T) = the strict option) | keep |
+| `wp_floor` | double | `15.0` | omega_p := max(`wp`, wp_floor zeta_T), zeta_T = c_zeta/(rho beta), in thermal iterations | keep (E3 study) |
+| `mu_rule` | string | `"auto"` | `"auto"` (gap midpoint iff abs(dN) <= mu_dn_max and abs(dN) > mu_th_factor n_th, else N(mu) = N_el) / `"gap"` / `"number"` | metals: auto gives "number" |
+| `mu_dn_max` | double | `0.1` | rule auto: largest thermal count mismatch at the gap midpoint read as a closure weight error | keep |
+| `mu_th_factor` | double | `10.0` | rule auto: abs(dN) must exceed this times the thermal carriers n_th(mu_g) | keep |
+| `band_heights` | long | `8` | heights of the wedge band of the bosonic data set D | keep |
+| `band_x` | long | `21` | points per band height (odd: symmetric under z -> -conj z) | keep |
+| `band_top` | double | `4.0` | band top / x extent = band_top zeta_T sin(theta) | keep |
+| `mats_factor` | double | `4.0` | Matsubara points i nu_n of D, n = 1..ceil(mats_factor zeta_T beta / 2 pi) | keep |
+| `bos_eps_T` | double | `1e-12` | tolerance of the D-selected bosonic basis (pivoted QR on D) | keep |
+| `bos_line_eps` | double | `1e-10` | eps of the gapless bosonic line basis whose unmasked nodes enter D | keep |
+| `cut_odd` | double | `1e-13` | relative SVD cutoff of the odd sector of the split pair fit | keep |
+| `cut_even` | double | `1e-10` | relative SVD cutoff of the even sector | keep |
+| `tau_grid` | string | `"gl"` | tau-leg nodes on [0, beta/2]: `"gl"` (composite GL, ~200-250) / `"id"` (finite-interval ID, ~30-40) | `"id"` for cost |
+| `tau_eps` | double | `1e-12` | tolerance of the tau ID | keep |
+| `spectra.occupation` | bool | `false` | also write f(w - mu) on the spectra grid (spectra/fermi_w; f A = the occupied spectrum) | finite-T plots |
+| `thermal_bases_file` | string | `""` | parity: D (D_zeta_re/_im, D_kind), nu_b and the two-sided Sigma basis (sigma_basis_w) read from this h5 (the python finite-T SCF reference) | parity tests |
 
 **Diagnostics**
 
@@ -542,8 +568,10 @@ consistency check only, not a reference).
 
 ## 10. Limitations and status
 
-- T = 0 and gapped systems only (even electron count, KS gap); finite temperature (notes sec:finiteT, plan S8b) and metals
-  (notes sec:metals, plan S8c) are designed, not implemented. The time-ray angle is fixed at theta / 2.
+- Gapped systems (even electron count, KS gap); finite temperature is implemented (S8b, `beta`; notes sec:finiteT): thermal
+  sector lists, guarded rays, the bosonic data set D with the tau leg, the split pair fit, Bose-weighted W(t), the total-Sigma
+  closure and the mu rule; the near-mu resolution of thermal spectra is ~60/(rho beta) Ha (notes sec:fT_res). Metals (notes
+  sec:metals, plan S8c) are designed, not implemented. The time-ray angle is theta_t_frac x theta (default 1/2).
 - Spin-restricted collinear; THC interactions only.
 - Optics: RPA polarization of the self-consistent G (no vertex corrections, no excitons; absorption onset = direct QP gap);
   q -> 0 from the extrapolation of the finite-q heads (variant dependent; the q0_<variant> groups quantify it).

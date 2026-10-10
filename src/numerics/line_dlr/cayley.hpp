@@ -1219,6 +1219,94 @@ inline chemical_potential_t chemical_potential(std::vector<nda::array<double, 1>
   return chemical_potential_t{best.mid, best.eh, best.el, best.el - best.eh, best.N};
 }
 
+
+// ------------------------------------------------------------------------------------------------------------------
+// Finite temperature (S8b, notes section 11.6; python line/closure.py electron_count_T, thermal_carriers,
+// chemical_potential_T). Energies relative to the same reference as e (mu-relative: a shift).
+// ------------------------------------------------------------------------------------------------------------------
+
+/// f(e) = 1 / (e^{beta e} + 1), overflow-free (python fermi: 0.5 (1 - tanh(beta e / 2)))
+inline double fermi(double e, double beta) { return 0.5 * (1.0 - std::tanh(0.5 * beta * e)); }
+
+namespace detail {
+inline std::vector<double> norm_k_weights(long nk, std::vector<double> const &k_weight) {
+  std::vector<double> w(nk, 1.0 / double(nk));
+  if (not k_weight.empty()) {
+    utils::check(long(k_weight.size()) == nk, "cayley: k_weight size mismatch");
+    const double s = std::accumulate(k_weight.begin(), k_weight.end(), 0.0);
+    for (long k = 0; k < nk; ++k) w[k] = k_weight[k] / s;
+  }
+  return w;
+}
+} // namespace detail
+
+/// N(mu) = 2 sum_k w_k sum_m f(e_m - mu) |v_m|^2 + dropped (Eq. fT_mu)
+inline double electron_count_T(std::vector<nda::array<double, 1>> const &e_k, std::vector<nda::array<ComplexType, 2>> const &v_k,
+                               double beta, double mu = 0.0, std::vector<double> const &k_weight = {}, double dropped = 0.0) {
+  const long nk = long(e_k.size());
+  auto wk       = detail::norm_k_weights(nk, k_weight);
+  double N      = dropped;
+  for (long k = 0; k < nk; ++k) {
+    double acc = 0.0;
+    for (long m = 0; m < e_k[k].size(); ++m) {
+      double w = 0.0;
+      for (long i = 0; i < v_k[k].extent(0); ++i) w += std::norm(v_k[k](i, m));
+      acc += fermi(e_k[k](m) - mu, beta) * w;
+    }
+    N += 2.0 * wk[k] * acc;
+  }
+  return N;
+}
+
+/// n_th(mu) of Eq. fT_nth: 2 sum_k w_k [sum_{e > mu} f |v|^2 + sum_{e < mu} (1 - f) |v|^2]
+inline double thermal_carriers(std::vector<nda::array<double, 1>> const &e_k, std::vector<nda::array<ComplexType, 2>> const &v_k,
+                               double beta, double mu = 0.0, std::vector<double> const &k_weight = {}) {
+  const long nk = long(e_k.size());
+  auto wk       = detail::norm_k_weights(nk, k_weight);
+  double n      = 0.0;
+  for (long k = 0; k < nk; ++k) {
+    double acc = 0.0;
+    for (long m = 0; m < e_k[k].size(); ++m) {
+      double w = 0.0;
+      for (long i = 0; i < v_k[k].extent(0); ++i) w += std::norm(v_k[k](i, m));
+      const double f = fermi(e_k[k](m) - mu, beta);
+      acc += (e_k[k](m) > mu ? f : 1.0 - f) * w;
+    }
+    n += 2.0 * wk[k] * acc;
+  }
+  return n;
+}
+
+/// N(mu) = N_el by bisection to the root in mu (python chemical_potential_T; poles with |e| >= 1e5 are not bracketing
+/// candidates). Returns {mu, N(mu)}.
+inline std::pair<double, double> chemical_potential_T(std::vector<nda::array<double, 1>> const &e_k,
+                                                      std::vector<nda::array<ComplexType, 2>> const &v_k, double nelec, double beta,
+                                                      std::vector<double> const &k_weight = {}, double dropped = 0.0,
+                                                      long maxit = 200) {
+  double emin = 1e300, emax = -1e300;
+  for (auto const &e : e_k)
+    for (long m = 0; m < e.size(); ++m)
+      if (std::abs(e(m)) < 1e5) {
+        emin = std::min(emin, e(m));
+        emax = std::max(emax, e(m));
+      }
+  utils::check(emin <= emax, "cayley::chemical_potential_T: no poles");
+  double lo = emin - 50.0 / beta - 1.0, hi = emax + 50.0 / beta + 1.0;
+  double Nlo = electron_count_T(e_k, v_k, beta, lo, k_weight, dropped) - nelec;
+  double mid = lo, Nm = Nlo;
+  for (long it = 0; it < maxit; ++it) {
+    mid = 0.5 * (lo + hi);
+    Nm  = electron_count_T(e_k, v_k, beta, mid, k_weight, dropped) - nelec;
+    if (Nm == 0.0 or hi - lo < 4e-16 * std::max(1.0, std::abs(mid))) break;
+    if ((Nm < 0) == (Nlo < 0)) {
+      lo  = mid;
+      Nlo = Nm;
+    } else
+      hi = mid;
+  }
+  return {mid, Nm + nelec};
+}
+
 } // namespace numerics::line_dlr
 
 #endif

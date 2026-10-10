@@ -80,6 +80,7 @@
 #include "methods/GW_line/closure_cores.hpp"
 #include "methods/GW_line/closure_device.hpp"
 #include "methods/GW_line/closure_scan.hpp"
+#include "methods/GW_line/thermal_mu.hpp"
 
 namespace methods::gw_line {
 
@@ -107,6 +108,44 @@ inline sigma_poles_t fit_sigma_sectors(line_basis_t const &bp, line_basis_t cons
     out.g(rh + l, nda::ellipsis{}) = gp(l, nda::ellipsis{});
   }
   return out;
+}
+
+/**
+ * S8b finite temperature of the closure (notes section 11.6): `active` = a thermal iteration (the TOTAL Sigma_c = I^> + I^< at
+ * the nodes rho beta |zeta| >= c_f (mask) fitted on the two-sided gapless fermionic basis bt; moments over all its poles);
+ * the chemical potential by tp.mu_rule (thermal_mu.hpp; an empty window at the gap midpoint = the T = 0 rule, bitwise);
+ * near-mu pruning (iii) off and Fermi-weighted electron counts unless the rule fell back to "gap(T=0)".
+ */
+struct closure_thermal_t {
+  bool active = false;
+  line_basis_t const *bt = nullptr;
+  std::vector<char> mask;            ///< (nz) 1 = node kept in the total fit
+  thermal_params_t tp;
+};
+
+/// S8b: the total Sigma_c at the masked nodes fitted on the two-sided basis bt (python fit_sigma_total)
+inline sigma_poles_t fit_sigma_total(line_basis_t const &bt, nda::array<ComplexType, 1> const &zeta, std::vector<char> const &mask,
+                                     nda::array<ComplexType, 3> const &Sig_p, nda::array<ComplexType, 3> const &Sig_h) {
+  const long nz = zeta.size(), nb = Sig_p.extent(1);
+  long nm = 0;
+  for (long i = 0; i < nz; ++i) nm += mask[i] ? 1 : 0;
+  nda::array<ComplexType, 1> zm(nm);
+  nda::array<ComplexType, 3> S(nm, nb, nb);
+  for (long i = 0, j = 0; i < nz; ++i)
+    if (mask[i]) {
+      zm(j) = zeta(i);
+      S(j, nda::range::all, nda::range::all) = Sig_p(i, nda::range::all, nda::range::all) + Sig_h(i, nda::range::all, nda::range::all);
+      ++j;
+    }
+  return sigma_poles_t{nda::array<double, 1>(bt.w), bt.fit(zm, S)};
+}
+
+/// S8b: the Sigma fit of the closure / spectra: sectors (T = 0) or the thermal total fit
+inline sigma_poles_t fit_sigma_closure(line_basis_t const &bp, line_basis_t const &bh, nda::array<ComplexType, 1> const &zeta,
+                                       nda::array<ComplexType, 3> const &Sp, nda::array<ComplexType, 3> const &Sh,
+                                       closure_thermal_t const *th) {
+  if (th != nullptr and th->active) return fit_sigma_total(*th->bt, zeta, th->mask, Sp, Sh);
+  return fit_sigma_sectors(bp, bh, zeta, Sp, Sh);
 }
 
 namespace detail {
@@ -471,6 +510,10 @@ struct closure_out_t {
   std::vector<double> heldout;    ///< held-out moment error per k
   std::vector<upfold_diag_t> diag;   ///< upfolding decisions per k (S7f; phi = the terminal phase for phase continuity)
   std::vector<closure_kprof_t> kprof;   ///< perf 7.1c: profile per k (owner wall seconds)
+  // S8b (closure_thermal_t given)
+  std::string mu_rule = "gap";    ///< rule used ("gap" T = 0 / "gap" / "number" / "gap(T=0)")
+  double dN = 0.0, n_th = 0.0;    ///< N_T(mu_g) - N_el and the thermal carriers at the gap midpoint
+  bool window_next = false;       ///< a pole of the new G within E_T of the new mu (the next iteration is thermal)
 };
 
 /**
@@ -484,7 +527,7 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
                              nda::array<ComplexType, 4> const &Sig_p, nda::array<ComplexType, 4> const &Sig_h,
                              nda::array<ComplexType, 1> const &zeta, line_basis_t const &bp, line_basis_t const &bh,
                              line_basis_t const &gp, line_basis_t const &gh, closure_params_t const &p, double nelec,
-                             utils::TimerManager &Timer, g_repr_params_t const &gr = {}) {
+                             utils::TimerManager &Timer, g_repr_params_t const &gr = {}, closure_thermal_t const *th = nullptr) {
   auto all       = nda::range::all;
   const long nk  = Hrel.extent(0), nb = Hrel.extent(1), nz = zeta.size();
   const long np  = comm.size(), rank = comm.rank();
@@ -549,7 +592,7 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     const long ks = sig_loc ? ik / np : ik;
     const auto tf0 = clk::now();
     nda::array<ComplexType, 3> Sp(Sig_p(ks, all, all, all)), Sh(Sig_h(ks, all, all, all));
-    auto sp = fit_sigma_sectors(bp, bh, zeta, Sp, Sh);
+    auto sp = fit_sigma_closure(bp, bh, zeta, Sp, Sh, th);
     const double t_fit = std::chrono::duration<double>(clk::now() - tf0).count();
     auto w = closure_k_begin(sp, p, ik, par_scan);
     if (par_scan and numerics::line_dlr::needs_phase_scan(w.pr, w.o)) {
@@ -728,7 +771,23 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
 
   // 2. chemical potential (every rank, same data) and re-centring
   Timer.start("closure_mu");
-  auto cp       = numerics::line_dlr::chemical_potential(out.leh.e, out.leh.v, nelec, p.k_weight);
+  // S8b: the thermal rule (thermal_mu.hpp); "gap(T=0)" (empty window at the gap midpoint) = the T = 0 code below, bitwise
+  bool thermal_mu = false;
+  numerics::line_dlr::chemical_potential_t cp;
+  if (th != nullptr) {
+    auto r          = mu_rule_apply(out.leh.e, out.leh.v, nelec, p.k_weight, th->tp);
+    out.mu_rule     = r.rule;
+    out.dN          = r.dN;
+    out.n_th        = r.n_th;
+    out.window_next = r.window;
+    cp              = r.gap;
+    if (r.rule != "gap(T=0)") {
+      thermal_mu = true;
+      cp.mu      = r.mu;
+      cp.N       = r.N;
+    }
+  } else
+    cp = numerics::line_dlr::chemical_potential(out.leh.e, out.leh.v, nelec, p.k_weight);
   out.dmu       = cp.mu;
   out.e_homo    = cp.e_homo - cp.mu;
   out.e_lumo    = cp.e_lumo - cp.mu;
@@ -736,10 +795,12 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   out.nel_lehmann = 0.0;
   for (long ik = 0; ik < nk; ++ik) {
     out.leh.e[ik] -= cp.mu;
+    if (thermal_mu) continue;
     for (long m = 0; m < out.leh.e[ik].size(); ++m)
       if (out.leh.e[ik](m) < 0.0)
         for (long i = 0; i < nb; ++i) out.nel_lehmann += 2.0 / double(nk) * std::norm(out.leh.v[ik](i, m));
   }
+  if (thermal_mu) out.nel_lehmann = cp.N;   // N_T(mu) of the Lehmann G (k-weighted, Eq. fT_mu)
   Timer.stop("closure_mu");
 
   // 3a. Lehmann representation: pruning only (every rank, same data, k in order -> rank-count independent)
@@ -747,7 +808,14 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     Timer.start("closure_compress");
     out.repr            = "lehmann";
     const double emax   = (gr.emax < 0.0) ? gp.lam : gr.emax;
-    const double e_near = (gr.emin_frac > 0.0) ? gr.emin_frac * 0.5 * (out.e_lumo - out.e_homo) : 0.0;
+    // S8b: near-mu pruning (iii) off in thermal mode (its purpose, a finite ray length, is served by the beta guard)
+    const double e_near = (gr.emin_frac > 0.0 and not thermal_mu) ? gr.emin_frac * 0.5 * (out.e_lumo - out.e_homo) : 0.0;
+    std::vector<double> kw_n = p.k_weight;   // S8b: normalized k weights of the thermal count
+    if (thermal_mu) {
+      if (kw_n.empty()) kw_n.assign(nk, 1.0);
+      const double ws = std::accumulate(kw_n.begin(), kw_n.end(), 0.0);
+      for (auto &x : kw_n) x /= ws;
+    }
     std::vector<nda::array<double, 1>> ek(nk);
     std::vector<nda::array<ComplexType, 2>> vk(nk);
     out.dropped = out.dropped_sum = 0.0;
@@ -771,7 +839,8 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
           out.pruned_near_weight += w;
         } else {
           keep.push_back(m);
-          if (e(m) < 0.0) out.nel_compressed += 2.0 / double(nk) * w;
+          if (thermal_mu) out.nel_compressed += 2.0 * kw_n[ik] * numerics::line_dlr::fermi(e(m), th->tp.beta) * w;
+          else if (e(m) < 0.0) out.nel_compressed += 2.0 / double(nk) * w;
         }
       }
       ek[ik] = nda::array<double, 1>(long(keep.size()));
@@ -788,6 +857,7 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     return out;
   }
   utils::check(gr.repr == "compressed", "gw_line::closure: g_repr must be \"lehmann\" or \"compressed\" (got \"{}\")", gr.repr);
+  utils::check(not thermal_mu, "gw_line::closure: finite temperature needs g_repr = \"lehmann\"");
 
   // 3b. per owned k: compression; gather (fixed pole counts: the basis ranks)
   Timer.start("closure_compress");

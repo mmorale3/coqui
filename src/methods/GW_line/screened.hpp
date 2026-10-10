@@ -229,6 +229,10 @@ struct bosonic_fit_t {
   nda::array<ComplexType, 2> U1H, U2H, VS;
 
   bosonic_fit_t(bosonic_basis_t const &basis, nda::array<ComplexType, 1> const &zeta) : nz(zeta.size()), r(basis.rank) {
+    if (basis.split_fit) {
+      split(basis, zeta);
+      return;
+    }
     auto [Km, Kp] = basis.kernels(zeta);
     const long m = 2 * nz, n = 2 * r, dm = std::min(m, n);
     nda::matrix<ComplexType, nda::F_layout> A(m, n), U(m, m), VT(n, n);
@@ -256,6 +260,68 @@ struct bosonic_fit_t {
     for (long j = 0; j < r; ++j)
       for (long i = 0; i < k; ++i) VS(j, i) = std::conj(VT(i, j)) / sv(i);
   }
+
+  /**
+   * S8b: the decoupled odd / even pair fit of Eq. fT_splitfit in the same factored form (python fit_split): with
+   * s_j = w_j(q) + w_j(-q)^T (odd kernel K^- - K^+, cutoff cut_odd) and d_j = w_j(q) - w_j(-q)^T (even kernel K^- + K^+, cutoff
+   * cut_even), each a column-scaled SVD least squares A_s = U S V^dagger (columns divided by their norms cn):
+   *   U1H = [U_o^dagger; U_e^dagger], U2H = [U_o^dagger; -U_e^dagger]   ->  Y = U1H W + U2H W^T = [U_o^dag (W + W^T); U_e^dag (W - W^T)],
+   *   VS(j, :) = 1/2 [V_o S_o^{-1} / cn_o, V_e S_e^{-1} / cn_e](j, :)   ->  w(q) = VS Y = (s + d) / 2.
+   * The Bose rows of a with_bose basis (rows rank_fit() + b, source pole j_b): w_{j_b}(-q)^T = (s - d)/2 = the same row with
+   * the even columns negated (U1H W^T + U2H W = [Y_o; -Y_e]): one solve gives both residue sets.
+   */
+  void split(bosonic_basis_t const &basis, nda::array<ComplexType, 1> const &zeta) {
+    const long rf = basis.rank_fit();
+    nda::array<ComplexType, 2> Uh[2], VSs[2];
+    long ks[2] = {0, 0};
+    for (int sec = 0; sec < 2; ++sec) {
+      nda::matrix<ComplexType, nda::F_layout> A(nz, rf), U(nz, nz), VT(rf, rf);
+      std::vector<double> cn(rf, 0.0);
+      for (long j = 0; j < rf; ++j) {
+        for (long i = 0; i < nz; ++i) {
+          const ComplexType km = 1.0 / (zeta(i) - basis.nu(j)), kp = 1.0 / (zeta(i) + basis.nu(j));
+          A(i, j) = sec == 0 ? km - kp : km + kp;
+          cn[j] += std::norm(A(i, j));
+        }
+        cn[j] = std::sqrt(cn[j]);
+        for (long i = 0; i < nz; ++i) A(i, j) /= cn[j];
+      }
+      const long dm = std::min(nz, rf);
+      nda::array<double, 1> sv(dm);
+      nda::lapack::gesvd(A, sv, U, VT);
+      const double cut = sec == 0 ? basis.cut_odd : basis.cut_even;
+      long kk = 0;
+      for (long i = 0; i < dm; ++i)
+        if (sv(i) > cut * sv(0)) ++kk;
+      ks[sec] = kk;
+      Uh[sec] = nda::array<ComplexType, 2>(kk, nz);
+      VSs[sec] = nda::array<ComplexType, 2>(rf, kk);
+      for (long i = 0; i < kk; ++i)
+        for (long z = 0; z < nz; ++z) Uh[sec](i, z) = std::conj(U(z, i));
+      for (long j = 0; j < rf; ++j)
+        for (long i = 0; i < kk; ++i) VSs[sec](j, i) = 0.5 * std::conj(VT(i, j)) / sv(i) / cn[j];
+    }
+    k   = ks[0] + ks[1];
+    U1H = nda::array<ComplexType, 2>(k, nz);
+    U2H = nda::array<ComplexType, 2>(k, nz);
+    VS  = nda::array<ComplexType, 2>(r, k);
+    for (long i = 0; i < ks[0]; ++i)
+      for (long z = 0; z < nz; ++z) U1H(i, z) = U2H(i, z) = Uh[0](i, z);
+    for (long i = 0; i < ks[1]; ++i)
+      for (long z = 0; z < nz; ++z) {
+        U1H(ks[0] + i, z) = Uh[1](i, z);
+        U2H(ks[0] + i, z) = -Uh[1](i, z);
+      }
+    for (long j = 0; j < r; ++j) {
+      const bool extra = j >= rf;
+      const long src   = extra ? basis.bose_src[j - rf] : j;
+      for (long i = 0; i < ks[0]; ++i) VS(j, i) = VSs[0](src, i);
+      for (long i = 0; i < ks[1]; ++i) VS(j, ks[0] + i) = extra ? -VSs[1](src, i) : VSs[1](src, i);
+    }
+    k_odd  = ks[0];
+    k_even = ks[1];
+  }
+  long k_odd = 0, k_even = 0;   ///< S8b split fit: kept singular values per sector
 };
 
 namespace detail {

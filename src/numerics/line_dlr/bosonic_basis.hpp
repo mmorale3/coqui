@@ -46,6 +46,21 @@
  * (block modified Gram-Schmidt, twice); when the pair system's rank is exhausted a fresh pass continues on the remaining
  * candidates (oversampling). node_factor <= 0: the python node selection above (asymmetric; [parity] / bases files).
  * mirror_half(zeta) detects the symmetric layout of any node set (0 if not symmetric).
+ *
+ * Finite temperature (S8b, notes section 11.5 sec:fT_W):
+ *  - from_data(theta, D, lam, eps_b): the basis selected ON the bosonic data set D (unmasked line nodes, wedge band, i nu_n,
+ *    nu_0 = 0): candidate poles on the log grid [numin, lam] (numin = 1e-4 lam), column-pivoted QR of the column-normalized
+ *    stacked odd kernel [K^-; -K^+] evaluated at D, tolerance eps_b; zeta_nodes = zeta_dense = D (any layout; a layout
+ *    [z_1..z_n1, -conj z_1..-conj z_n1] with z_i in the closed upper-right quadrant keeps the mirror paths, mirror_half).
+ *    split_fit: the pair fit of screened.hpp is the decoupled odd / even fit of Eq. fT_splitfit (bosonic_fit_t), cutoffs
+ *    cut_odd / cut_even relative to the largest singular value of the column-scaled kernels (fit_split below = the host form).
+ *  - with_bose(beta, E_T): the Sigma basis of Eq. fT_W: the rows j < rank_fit() are the fitted poles with W(t) weights
+ *    tw_j = 1 + n_j, the n_bose rows after them are copies of the window poles (nu_j <= E_T, n_j > 0) whose residue rows hold
+ *    w_j(-q)^T (bosonic_fit_t computes them from the same data, screened.hpp) with weights n_j and the opposite exponential:
+ *      particle: tw_j e^{-i nu_j t} (fitted rows), n_j e^{+i nu_j t} (extra rows);
+ *      hole:    -tw_j e^{+i nu_j t},              -n_j e^{-i nu_j t},
+ *    so W^>_T(q, t) = sum_rows E^>(t)_j w_j(q) and W^<_T(q, t)^T = sum_rows E^<(t)_j w_j(-q) with the unchanged kernels.
+ *    tw empty (T = 0): time_exponentials is the T = 0 formula (bitwise).
  */
 
 #include <algorithm>
@@ -70,6 +85,17 @@ struct bosonic_basis_t {
 
   long n_mirror = 0;                           ///< n1 > 0: zeta_nodes is mirror-symmetric in the layout above, else 0
   double node_factor = 0.0;                    ///< nz / rank of the symmetric selection (0: python nodes)
+
+  // S8b finite temperature (file header)
+  bool split_fit  = false;                     ///< decoupled odd / even pair fit (Eq. fT_splitfit)
+  double cut_odd  = 1e-13, cut_even = 1e-10;   ///< relative SVD cutoffs of the split fit
+  long n_bose     = 0;                         ///< extra residue rows (window poles, w_j(-q)^T) after the rank_fit() fitted rows
+  std::vector<long> bose_src;                  ///< (n_bose) fitted row j of every extra row
+  nda::array<double, 1> tw;                    ///< (rank) W(t) weights (1 + n_j fitted, n_j extra); empty: T = 0
+  double beta = 0.0, E_T = 0.0;                ///< of with_bose (diagnostics)
+  long rank_fit() const { return rank - n_bose; }
+
+  bosonic_basis_t() = default;
 
   /// default nz / r of the symmetric node selection (perf 7.1 scan, notes section 5)
   static constexpr double default_node_factor = 1.5;   // perf 7.1 scan: 1.1-1.5 as accurate as 2 r vs Casida; 1.5 for margin
@@ -126,6 +152,144 @@ struct bosonic_basis_t {
   }
 
   long size() const { return rank; }
+  static long mirror_half_(nda::array<ComplexType, 1> const &zeta);
+
+  /// S8b: the basis selected on the data set D (file header; python BosonicLineBasis.from_data)
+  static bosonic_basis_t from_data(double theta_, nda::array<ComplexType, 1> const &zdata, double lam_, double eps_ = 1e-12,
+                                   long npole = 800, double numin = -1.0, double cut_odd_ = 1e-13, double cut_even_ = 1e-10) {
+    utils::check(lam_ > 0.0 and eps_ > 0.0 and npole > 1 and zdata.size() > 0, "bosonic_basis_t::from_data: invalid parameters");
+    bosonic_basis_t b;
+    b.theta = theta_; b.lam = lam_; b.eps = eps_; b.gap = 0.0;
+    b.split_fit = true; b.cut_odd = cut_odd_; b.cut_even = cut_even_;
+    if (numin <= 0.0) numin = 1e-4 * lam_;
+    const long nd = zdata.size();
+    auto nuc      = detail::logspace(numin, lam_, npole);
+    nda::matrix<ComplexType, nda::F_layout> Kn(2 * nd, npole);
+    for (long j = 0; j < npole; ++j) {
+      double nrm = 0.0;
+      for (long i = 0; i < nd; ++i) {
+        Kn(i, j)      = 1.0 / (zdata(i) - nuc(j));
+        Kn(nd + i, j) = -1.0 / (zdata(i) + nuc(j));
+        nrm += std::norm(Kn(i, j)) + std::norm(Kn(nd + i, j));
+      }
+      nrm = std::sqrt(nrm);
+      for (long i = 0; i < 2 * nd; ++i) Kn(i, j) /= nrm;
+    }
+    auto q = detail::pivoted_qr(Kn);
+    b.rank = detail::qr_rank(q, eps_);
+    std::vector<double> ns(b.rank);
+    for (long l = 0; l < b.rank; ++l) ns[l] = nuc(q.piv[l]);
+    std::sort(ns.begin(), ns.end());
+    b.nu = nda::array<double, 1>(b.rank);
+    for (long l = 0; l < b.rank; ++l) b.nu(l) = ns[l];
+    b.zeta_nodes = zdata;
+    b.zeta_dense = zdata;
+    b.n_mirror   = mirror_half_(zdata);
+    return b;
+  }
+
+  /// S8b: the same fitted poles nu (e.g. injected) on the data set D (no selection)
+  static bosonic_basis_t with_poles(double theta_, nda::array<ComplexType, 1> const &zdata, double lam_, nda::array<double, 1> const &nu_,
+                                    double eps_ = 1e-12, double cut_odd_ = 1e-13, double cut_even_ = 1e-10) {
+    bosonic_basis_t b;
+    b.theta = theta_; b.lam = lam_; b.eps = eps_; b.gap = 0.0;
+    b.split_fit = true; b.cut_odd = cut_odd_; b.cut_even = cut_even_;
+    b.nu = nu_;
+    b.rank = nu_.size();
+    b.zeta_nodes = zdata;
+    b.zeta_dense = zdata;
+    b.n_mirror   = mirror_half_(zdata);
+    return b;
+  }
+
+  /// S8b: the Sigma basis of Eq. fT_W (file header): n_j = 1 / (e^{beta nu_j} - 1) for nu_j <= E_T (0 beyond)
+  bosonic_basis_t with_bose(double beta_, double E_T_) const {
+    utils::check(n_bose == 0, "bosonic_basis_t::with_bose: already augmented");
+    bosonic_basis_t b = *this;
+    b.beta = beta_;
+    b.E_T  = E_T_;
+    const long r = rank;
+    std::vector<double> n(r, 0.0);
+    for (long j = 0; j < r; ++j) {
+      const double x = beta_ * nu(j);
+      if (nu(j) <= E_T_ and x <= 700.0) n[j] = 1.0 / std::expm1(x);
+      if (n[j] > 0.0) b.bose_src.push_back(j);
+    }
+    b.n_bose = long(b.bose_src.size());
+    b.rank   = r + b.n_bose;
+    b.nu     = nda::array<double, 1>(b.rank);
+    b.tw     = nda::array<double, 1>(b.rank);
+    for (long j = 0; j < r; ++j) {
+      b.nu(j) = nu(j);
+      b.tw(j) = 1.0 + n[j];
+    }
+    for (long i = 0; i < b.n_bose; ++i) {
+      b.nu(r + i) = nu(b.bose_src[i]);
+      b.tw(r + i) = n[b.bose_src[i]];
+    }
+    return b;
+  }
+
+  /// the fitted poles only (rows < rank_fit())
+  nda::array<double, 1> nu_fit() const { return nda::array<double, 1>(nu(nda::range(rank_fit()))); }
+
+  /**
+   * S8b host form of the decoupled pair fit (Eq. fT_splitfit; python BosonicLineBasis.fit_split): returns {w(q), w(-q)}
+   * (rank_fit, N, N) from W(q), W(-q) at zeta (W(-q) = W(q) for a self-inverse q).
+   */
+  std::pair<nda::array<ComplexType, 3>, nda::array<ComplexType, 3>> fit_split(nda::array<ComplexType, 1> const &zeta,
+                                                                              nda::array<ComplexType, 3> const &W,
+                                                                              nda::array<ComplexType, 3> const &Wm) const {
+    const long nz = W.extent(0), N = W.extent(1), r = rank_fit();
+    nda::array<ComplexType, 2> s_(r, N * N), d_(r, N * N);
+    for (int sec = 0; sec < 2; ++sec) {
+      nda::matrix<ComplexType, nda::F_layout> A(nz, r);
+      std::vector<double> cn(r, 0.0);
+      for (long j = 0; j < r; ++j) {
+        for (long i = 0; i < nz; ++i) {
+          const ComplexType km = 1.0 / (zeta(i) - nu(j)), kp = 1.0 / (zeta(i) + nu(j));
+          A(i, j) = sec == 0 ? km - kp : km + kp;
+          cn[j] += std::norm(A(i, j));
+        }
+        cn[j] = std::sqrt(cn[j]);
+        for (long i = 0; i < nz; ++i) A(i, j) /= cn[j];
+      }
+      const long dm = std::min(nz, r);
+      nda::matrix<ComplexType, nda::F_layout> U(nz, nz), VT(r, r);
+      nda::array<double, 1> sv(dm);
+      nda::lapack::gesvd(A, sv, U, VT);
+      const double cut = sec == 0 ? cut_odd : cut_even;
+      long k = 0;
+      for (long i = 0; i < dm; ++i)
+        if (sv(i) > cut * sv(0)) ++k;
+      nda::array<ComplexType, 2> Y(k, N * N);
+      Y() = 0.0;
+      for (long i = 0; i < k; ++i)
+        for (long z = 0; z < nz; ++z) {
+          const ComplexType u = std::conj(U(z, i));
+          for (long P = 0; P < N; ++P)
+            for (long Q = 0; Q < N; ++Q) {
+              const ComplexType dz = sec == 0 ? W(z, P, Q) + Wm(z, Q, P) : W(z, P, Q) - Wm(z, Q, P);
+              Y(i, P * N + Q) += u * dz;
+            }
+        }
+      auto &X = sec == 0 ? s_ : d_;
+      X()     = 0.0;
+      for (long j = 0; j < r; ++j)
+        for (long i = 0; i < k; ++i) {
+          const ComplexType c = std::conj(VT(i, j)) / sv(i) / cn[j];
+          for (long c0 = 0; c0 < N * N; ++c0) X(j, c0) += c * Y(i, c0);
+        }
+    }
+    nda::array<ComplexType, 3> w(r, N, N), wm(r, N, N);
+    for (long j = 0; j < r; ++j)
+      for (long P = 0; P < N; ++P)
+        for (long Q = 0; Q < N; ++Q) {
+          w(j, P, Q)  = 0.5 * (s_(j, P * N + Q) + d_(j, P * N + Q));
+          wm(j, Q, P) = 0.5 * (s_(j, P * N + Q) - d_(j, P * N + Q));
+        }
+    return {std::move(w), std::move(wm)};
+  }
 
   /**
    * n1 = ceil(node_factor r / 2) ray-1 nodes by the greedy group selection of the file header (zeta_dense(0:nline) is ray 1,
@@ -345,6 +509,15 @@ struct bosonic_basis_t {
     const long nt = t.size();
     nda::array<ComplexType, 2> E(nt, rank);
     const ComplexType I(0.0, 1.0);
+    if (tw.size() == rank) {   // S8b Eq. fT_W (file header)
+      const long rf = rank_fit();
+      for (long i = 0; i < nt; ++i)
+        for (long j = 0; j < rank; ++j) {
+          const double sg = (j < rf) ? 1.0 : -1.0;   // extra rows: the opposite exponential
+          E(i, j) = (sector == sector_t::particle) ? tw(j) * std::exp(-I * sg * nu(j) * t(i)) : -tw(j) * std::exp(I * sg * nu(j) * t(i));
+        }
+      return E;
+    }
     for (long i = 0; i < nt; ++i)
       for (long j = 0; j < rank; ++j)
         E(i, j) = (sector == sector_t::particle) ? std::exp(-I * nu(j) * t(i)) : -std::exp(I * nu(j) * t(i));
@@ -361,11 +534,14 @@ inline long mirror_half(nda::array<ComplexType, 1> const &zeta) {
   if (nz < 2 or nz % 2 != 0) return 0;
   const long n1 = nz / 2;
   for (long i = 0; i < n1; ++i) {
-    if (not(zeta(i).real() > 0.0 and zeta(i).imag() > 0.0)) return 0;
+    // S8b: the CLOSED quadrant (Matsubara points i nu_n and nu_0 = 0 of the finite-T data set are their own mirrors)
+    if (not(zeta(i).real() >= 0.0 and zeta(i).imag() >= 0.0)) return 0;
     if (std::abs(zeta(n1 + i) + std::conj(zeta(i))) > 1e-14 * std::abs(zeta(i))) return 0;
   }
   return n1;
 }
+
+inline long bosonic_basis_t::mirror_half_(nda::array<ComplexType, 1> const &zeta) { return mirror_half(zeta); }
 
 } // namespace numerics::line_dlr
 

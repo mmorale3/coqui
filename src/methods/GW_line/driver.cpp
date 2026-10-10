@@ -75,6 +75,7 @@
 #include "methods/GW_line/k_dist.hpp"
 #include "methods/GW_line/scf_mixing.hpp"
 #include "methods/GW_line/warm_start.hpp"
+#include "methods/GW_line/thermal.hpp"
 #include "methods/GW_line/driver.hpp"
 
 namespace methods::gw_line {
@@ -186,6 +187,39 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   head_check_variant(p.head_extrapolation);
   utils::check(head_div_is_gygi(p.head_extrapolation), "gw_line: head_extrapolation must be a gygi variant (got \"{}\")",
                p.head_extrapolation);
+  // S8b finite temperature
+  p.theta_t_frac    = io::get_value_with_default<double>(pt, "theta_t_frac", p.theta_t_frac);
+  p.beta            = io::get_value_with_default<double>(pt, "beta", p.beta);
+  p.thermal_tol     = io::get_value_with_default<double>(pt, "thermal_tol", p.thermal_tol);
+  p.thermal_floor   = io::get_value_with_default<double>(pt, "thermal_floor", p.thermal_floor);
+  p.thermal_floor_f = io::get_value_with_default<double>(pt, "thermal_floor_f", p.thermal_floor);
+  p.wp_floor        = io::get_value_with_default<double>(pt, "wp_floor", p.wp_floor);
+  p.mu_rule         = io::get_value_with_default<std::string>(pt, "mu_rule", p.mu_rule);
+  io::tolower(p.mu_rule);
+  p.mu_dn_max       = io::get_value_with_default<double>(pt, "mu_dn_max", p.mu_dn_max);
+  p.mu_th_factor    = io::get_value_with_default<double>(pt, "mu_th_factor", p.mu_th_factor);
+  p.band_heights    = io::get_value_with_default<long>(pt, "band_heights", p.band_heights);
+  p.band_x          = io::get_value_with_default<long>(pt, "band_x", p.band_x);
+  p.band_top        = io::get_value_with_default<double>(pt, "band_top", p.band_top);
+  p.mats_factor     = io::get_value_with_default<double>(pt, "mats_factor", p.mats_factor);
+  p.bos_eps_T       = io::get_value_with_default<double>(pt, "bos_eps_T", p.bos_eps_T);
+  p.bos_line_eps    = io::get_value_with_default<double>(pt, "bos_line_eps", p.bos_line_eps);
+  p.cut_odd         = io::get_value_with_default<double>(pt, "cut_odd", p.cut_odd);
+  p.cut_even        = io::get_value_with_default<double>(pt, "cut_even", p.cut_even);
+  p.tau_grid        = io::get_value_with_default<std::string>(pt, "tau_grid", p.tau_grid);
+  io::tolower(p.tau_grid);
+  p.tau_eps         = io::get_value_with_default<double>(pt, "tau_eps", p.tau_eps);
+  p.spectra_occupation = io::get_value_with_default<bool>(pt, "spectra.occupation", p.spectra_occupation);
+  p.thermal_bases_file = io::get_value_with_default<std::string>(pt, "thermal_bases_file", p.thermal_bases_file);
+  utils::check(p.theta_t_frac > 0.0 and p.theta_t_frac < 1.0, "gw_line: theta_t_frac must be in (0, 1)");
+  utils::check(p.beta >= 0.0, "gw_line: beta must be >= 0");
+  utils::check(p.thermal_tol > 0.0 and p.thermal_tol < 1.0 and p.thermal_floor > 0.0 and p.thermal_floor_f > 0.0 and p.wp_floor >= 0.0,
+               "gw_line: invalid thermal_tol / thermal_floor / thermal_floor_f / wp_floor");
+  utils::check(p.mu_rule == "auto" or p.mu_rule == "gap" or p.mu_rule == "number",
+               "gw_line: mu_rule must be \"auto\", \"gap\" or \"number\" (got \"{}\")", p.mu_rule);
+  utils::check(p.band_heights >= 2 and p.band_x >= 3 and p.mats_factor > 0.0 and p.bos_eps_T > 0.0 and p.cut_odd > 0.0 and p.cut_even > 0.0,
+               "gw_line: invalid finite-T W-step parameters");
+  utils::check(p.tau_grid == "gl" or p.tau_grid == "id", "gw_line: tau_grid must be \"gl\" or \"id\" (got \"{}\")", p.tau_grid);
   p.optics = optics_params_t::from_ptree(pt);   // S9b
   p.optics_poles = io::get_value_with_default<std::string>(pt, "optics.poles", p.optics_poles);   // perf 7.2
   io::tolower(p.optics_poles);
@@ -271,6 +305,12 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
                "gw_line: checkpoint_sigma must be \"last\" or \"all\" (got \"{}\")", p.checkpoint_sigma);
   utils::check(p.time_eps > 0.0 and p.time_eps < 1.0 and p.time_pad >= 1.0 and p.time_oversample >= 1.0 and p.time_snap >= 0.0,
                "gw_line: need 0 < time_eps < 1, time_pad >= 1, time_oversample >= 1");
+  if (p.beta > 0.0) {   // S8b: what thermal iterations need
+    utils::check(p.g_repr == "lehmann", "gw_line: beta > 0 needs g_repr = \"lehmann\" (per-pole thermal weights)");
+    utils::check(p.start == "ks", "gw_line: beta > 0 supports start = \"ks\" only");
+    utils::check(p.coarse_niter == 0, "gw_line: beta > 0 does not support the multilevel schedule (coarse.niter)");
+    utils::check(not p.optics.enable, "gw_line: beta > 0 does not support the optics passes");
+  }
   return p;
 }
 
@@ -337,6 +377,14 @@ void gw_line_params_t::log() const {
   } else {
     app_log(1, "    spectra: off");
   }
+  app_log(1, "    theta_t = {} theta", theta_t_frac);
+  if (beta > 0.0)
+    app_log(1, "    finite temperature: beta = {} (T = {:.1f} K), thermal_tol = {:.1e} (E_T = {:.5f} Ha), c_zeta = {}, c_f = {}, wp_floor = {}, "
+               "mu_rule = {} (mu_dn_max {}, mu_th_factor {}), band {} x {}, mats_factor {}, eps_b {:.1e} (line basis {:.1e}), split "
+               "cuts {:.0e} / {:.0e}, tau grid {} (tau_eps {:.0e}){}",
+            beta, 315775.02 / beta, thermal_tol, std::log(1.0 / thermal_tol) / beta, thermal_floor, thermal_floor_f, wp_floor, mu_rule,
+            mu_dn_max, mu_th_factor, band_heights, band_x, mats_factor, bos_eps_T, bos_line_eps, cut_odd, cut_even, tau_grid, tau_eps,
+            thermal_bases_file.empty() ? "" : "; DIAGNOSTIC: D / nu_b / Sigma basis from " + thermal_bases_file);
   if (optics.enable) {
     optics.log();
     app_log(1, "    optics G: {} poles", optics_poles);
@@ -539,6 +587,18 @@ void write_history(h5::group &g, gw_line_iter_t const &r) {
   h5::h5_write(hg, "mix", r.mix);
   h5::h5_write(hg, "ndiis", r.ndiis);
   h5::h5_write(hg, "level", r.level);
+  if (not r.mu_rule.empty()) {   // S8b
+    auto tg = hg.create_group("thermal");
+    h5::h5_write(tg, "thermal", r.thermal);
+    h5::h5_write(tg, "mu_rule", r.mu_rule);
+    h5::h5_write(tg, "dN", r.dN);
+    h5::h5_write(tg, "n_th", r.n_th);
+    h5::h5_write(tg, "wp_used", r.wp_used);
+    h5::h5_write(tg, "nD", r.nD);
+    h5::h5_write(tg, "rank_b", r.rank_b);
+    h5::h5_write(tg, "ntau", r.ntau);
+    h5::h5_write(tg, "nwin", r.nwin);
+  }
 }
 
 gw_line_iter_t read_history(h5::group &g) {
@@ -585,6 +645,14 @@ gw_line_iter_t read_history(h5::group &g) {
     h5::h5_read(hg, "mix", r.mix);
     h5::h5_read(hg, "ndiis", r.ndiis);
     h5::h5_read(hg, "level", r.level);
+  }
+  if (hg.has_subgroup("thermal")) {   // S8b
+    auto tg = hg.open_group("thermal");
+    h5::h5_read(tg, "thermal", r.thermal);
+    h5::h5_read(tg, "mu_rule", r.mu_rule);
+    h5::h5_read(tg, "dN", r.dN);
+    h5::h5_read(tg, "n_th", r.n_th);
+    h5::h5_read(tg, "wp_used", r.wp_used);
   }
   return r;
 }
@@ -646,6 +714,24 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "coarse_K", p.coarse_K);
   h5::h5_write(ig, "coarse_nodes_per_ray", p.coarse_nodes_per_ray);
   h5::h5_write(ig, "coarse_time_eps", p.coarse_time_eps);
+  h5::h5_write(ig, "theta_t_frac", p.theta_t_frac);   // S8b
+  h5::h5_write(ig, "beta", p.beta);
+  h5::h5_write(ig, "thermal_tol", p.thermal_tol);
+  h5::h5_write(ig, "thermal_floor", p.thermal_floor);
+  h5::h5_write(ig, "thermal_floor_f", p.thermal_floor_f);
+  h5::h5_write(ig, "wp_floor", p.wp_floor);
+  h5::h5_write(ig, "mu_rule", p.mu_rule);
+  h5::h5_write(ig, "mu_dn_max", p.mu_dn_max);
+  h5::h5_write(ig, "mu_th_factor", p.mu_th_factor);
+  h5::h5_write(ig, "tau_grid", p.tau_grid);
+  if (p.beta > 0.0) {   // S8b: the derived scales (E_T window, zeta_T bosonic floor, S_T guard)
+    const double th = p.theta_deg * std::numbers::pi / 180.0, tt = p.theta_t_frac * th;
+    const double rho = std::sin(th - tt) / std::sin(tt);
+    h5::h5_write(ig, "E_T", std::log(1.0 / p.thermal_tol) / p.beta);
+    h5::h5_write(ig, "zeta_T", p.thermal_floor / (rho * p.beta));
+    h5::h5_write(ig, "zeta_T_f", p.thermal_floor_f / (rho * p.beta));
+    h5::h5_write(ig, "S_T", p.beta / std::sin(tt));
+  }
   nda::h5_write(ig, "fermionic_nodes", zeta, false);
 }
 
@@ -776,7 +862,7 @@ void write_state(boost::mpi3::communicator &comm, std::string const &file, state
   comm.barrier();
 }
 
-static constexpr int NHIST = 36;   ///< columns of the broadcast history table
+static constexpr int NHIST = 38;   ///< columns of the broadcast history table
 static const std::vector<std::string> mix_names = {"none", "linear", "diis", "reset", "damped"};
 double mix_code(std::string const &m) {
   auto it = std::find(mix_names.begin(), mix_names.end(), m);
@@ -850,7 +936,8 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
                          r.sigma_gap_h, r.time, r.time_grid == "id" ? 1.0 : 0.0, double(r.nt_pi_p), double(r.nt_pi_h),
                          double(r.nt_sig_p), double(r.nt_sig_h), r.g_repr == "lehmann" ? 1.0 : 0.0, double(r.ng_min),
                          double(r.ng_max), r.g_emin, double(r.pruned_w), r.pruned_w_weight, double(r.pruned_near),
-                         r.pruned_near_weight, r.resid, r.residF, mix_code(r.mix), double(r.ndiis), double(r.level)};
+                         r.pruned_near_weight, r.resid, r.residF, mix_code(r.mix), double(r.ndiis), double(r.level),
+                         double(r.thermal), r.wp_used};
       for (int j = 0; j < NHIST; ++j) hist(i - 1, j) = v[j];
     }
   }
@@ -892,6 +979,7 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     r.pruned_near = long(std::llround(hist(i, 29))); r.pruned_near_weight = hist(i, 30);
     r.resid = hist(i, 31); r.residF = hist(i, 32); r.mix = mix_name(long(std::llround(hist(i, 33))));
     r.ndiis = long(std::llround(hist(i, 34))); r.level = long(std::llround(hist(i, 35)));
+    r.thermal = long(std::llround(hist(i, 36))); r.wp_used = hist(i, 37);   // S8b
     history.push_back(r);
   }
   return st;
@@ -1126,7 +1214,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   const double mu0 = 0.5 * (homo + lumo);
 
   // fixed grids and bases
-  const double theta = prm.theta_deg * std::numbers::pi / 180.0, theta_t = 0.5 * theta;
+  const double theta = prm.theta_deg * std::numbers::pi / 180.0, theta_t = prm.theta_t_frac * theta;   // S8b: theta_t_frac
   auto zeta          = numerics::line_dlr::dense_nodes(theta, prm.node_tmin, prm.node_tmax, prm.nodes_per_ray);
   long nz            = zeta.size();
   const auto zeta_prod = zeta;   // perf 7.2: the production nodes (checkpoint input group; zeta may be a coarse level's)
@@ -1177,6 +1265,38 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
           cprm.hooks ? "GPU (cuSOLVER, host fallback)" : "host");
   g_repr_params_t grepr{prm.g_repr, prm.g_emax, prm.g_wtol, prm.g_emin_frac, prm.g_wsmall};
 
+  // S8b finite temperature (thermal.hpp): an iteration is thermal iff a pole of its G lies within E_T of mu; then the
+  // kernels run on the thermal sector lists, the W step on the data set D with the D-selected (Bose-augmented) basis, the
+  // closure fits the total Sigma on the two-sided gapless basis and mu follows mu_rule. Otherwise the T = 0 code (bitwise).
+  thermal_params_t tpar;
+  tpar.beta = prm.beta; tpar.thermal_tol = prm.thermal_tol; tpar.c_zeta = prm.thermal_floor; tpar.c_f = prm.thermal_floor_f;
+  tpar.theta = theta; tpar.theta_t = theta_t; tpar.wp_floor = prm.wp_floor; tpar.mu_rule = prm.mu_rule;
+  tpar.mu_dn_max = prm.mu_dn_max; tpar.mu_th_factor = prm.mu_th_factor; tpar.band_heights = prm.band_heights;
+  tpar.band_x = prm.band_x; tpar.band_top = prm.band_top; tpar.mats_factor = prm.mats_factor; tpar.eps_b = prm.bos_eps_T;
+  tpar.lam_b = prm.lam_b; tpar.bos_eps_T = prm.bos_line_eps; tpar.cut_odd = prm.cut_odd; tpar.cut_even = prm.cut_even;
+  tpar.tau_grid = prm.tau_grid; tpar.tau_eps = prm.tau_eps;
+  const double E_T = tpar.on() ? tpar.E_T() : 0.0;
+  // S8b: Lehmann (e, v) per k of factorized poles (both sectors, ascending) and the density matrix of a state
+  auto lehmann_lists = [&](pole_data_t const &p) {
+    std::vector<nda::array<double, 1>> e(p.nk);
+    std::vector<nda::array<ComplexType, 2>> v(p.nk);
+    for (long k = 0; k < p.nk; ++k) {
+      const long M = p.hole[k].size() + p.part[k].size();
+      e[k] = nda::array<double, 1>(M);
+      v[k] = nda::array<ComplexType, 2>(p.nb, M);
+      long j = 0;
+      for (auto const *ps : {&p.hole[k], &p.part[k]})
+        for (long m = 0; m < ps->size(); ++m, ++j) {
+          e[k](j) = ps->e(m);
+          v[k](nda::range::all, j) = ps->v(nda::range::all, m);
+        }
+    }
+    return std::make_pair(std::move(e), std::move(v));
+  };
+  auto density_of = [&](pole_data_t const &p) {
+    if (tpar.on() and window_active(p, E_T)) return density_matrix(thermal_lists(p, prm.beta, E_T));
+    return density_matrix(p);
+  };
   // state: restart or KS start
   state_t st;
   gw_line_result_t res;
@@ -1195,6 +1315,20 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     st.e_homo   = homo - mu0;
     st.e_lumo   = lumo - mu0;
     st.poles    = pole_data_t::from_ks(eig, mu0);
+    if (tpar.on()) {   // S8b: mu_0 of the KS poles by mu_rule at the run's beta (an empty window keeps the midpoint)
+      auto [le, lv] = lehmann_lists(st.poles);
+      auto r        = mu_rule_apply(le, lv, nelec, cprm.k_weight, tpar);
+      if (r.rule != "gap(T=0)") {
+        st.mu       = mu0 + r.mu;
+        st.mu_sigma = st.mu;
+        st.e_homo   = homo - st.mu;
+        st.e_lumo   = lumo - st.mu;
+        st.poles    = pole_data_t::from_ks(eig, st.mu);
+      }
+      app_log(1, "  finite T start: KS mu_0 = {:.12f} Ha (rule {}; gap midpoint {:.12f}, dN {:.2e}, n_th {:.2e}, N(mu_0) {:.12f}), "
+                 "window poles {}",
+              st.mu, r.rule, mu0, r.dN, r.n_th, r.N, [&] { long c = 0; for (long x : window_counts(st.poles, E_T)) c += x; return c; }());
+    }
     write_system_h5(comm, chk, mf, Np, H0, mu0, true);
     if (comm.root()) {
       h5::file f(chk, 'a');
@@ -1240,6 +1374,63 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   app_log(1, "  bases: bosonic rank {} ({} nodes, gap {:.4f}), Sigma {}+{}, G {}+{}, fermionic nodes {}", bos->rank,
           bos->zeta_nodes.size(), bos->gap, bp->rank, bh->rank, gp.rank, gh.rank, nz);
 
+  std::optional<bosonic_basis_t> bosT;   // the D-selected bosonic basis with the Bose rows (fixed for the run)
+  std::optional<line_basis_t> bt;        // the two-sided gapless Sigma basis of the thermal closure
+  bos_data_t Dset;
+  closure_thermal_t cth;
+  bosonic_basis_t const *bcur = &*bos;   // the bosonic basis of the current iteration
+  auto ensure_thermal = [&]() {
+    if (bosT) return;
+    Timer.start("bases");
+    nda::array<double, 1> nub, sbw;
+    if (not prm.thermal_bases_file.empty()) {   // parity: the python reference's D, nu_b, Sigma basis
+      h5::file f(prm.thermal_bases_file, 'r');
+      h5::group g(f);
+      nda::array<double, 1> zr, zi;
+      nda::array<signed char, 1> kd;
+      nda::h5_read(g, "D_zeta_re", zr);
+      nda::h5_read(g, "D_zeta_im", zi);
+      nda::h5_read(g, "D_kind", kd);
+      nda::h5_read(g, "nu_b", nub);
+      nda::h5_read(g, "sigma_basis_w", sbw);
+      Dset.z = nda::array<ComplexType, 1>(zr.size());
+      Dset.kind.assign(zr.size(), 0);
+      for (long i = 0; i < zr.size(); ++i) {
+        Dset.z(i)    = ComplexType(zr(i), zi(i));
+        Dset.kind[i] = kd(i);
+      }
+      Dset.n_line = Dset.count(0);
+      Dset.n_band = Dset.count(1);
+      Dset.n_mats = Dset.count(2);
+      bosT.emplace(bosonic_basis_t::with_poles(theta, Dset.z, prm.lam_b, nub, prm.bos_eps_T, prm.cut_odd, prm.cut_even)
+                       .with_bose(prm.beta, E_T));
+    } else {
+      bosonic_basis_t bl(theta, prm.lam_b, prm.bos_line_eps, 0.0);
+      Dset = make_bos_data(bl.zeta_nodes, tpar);
+      bosT.emplace(bosonic_basis_t::from_data(theta, Dset.z, prm.lam_b, prm.bos_eps_T, 800, -1.0, prm.cut_odd, prm.cut_even)
+                       .with_bose(prm.beta, E_T));
+    }
+    bt.emplace(theta, prm.lam, lv_eps, 0.0, 0.0, -1.0, prm.node_tmax);
+    if (sbw.size() > 0) {
+      bt->w    = sbw;
+      bt->rank = sbw.size();
+    }
+    cth.bt   = &*bt;
+    cth.tp   = tpar;
+    cth.mask.assign(zeta.size(), 0);
+    long nkeep = 0;
+    for (long i = 0; i < zeta.size(); ++i) {
+      cth.mask[i] = (tpar.rho() * tpar.beta * std::abs(zeta(i)) >= tpar.c_f) ? 1 : 0;
+      nkeep += cth.mask[i];
+    }
+    Timer.stop("bases");
+    app_log(1, "  finite T: E_T = {:.5f} Ha, zeta_T = {:.5f} Ha (rho {:.3f}), S_T = {:.2f}; data set D: {} points (line {}, band {}, "
+               "Matsubara {}, nu_0 x{}{}), D-selected bosonic basis rank {} + {} Bose rows (nu_j <= E_T), two-sided Sigma basis {} "
+               "poles, fermionic nodes kept {} / {} (c_f = {})",
+            E_T, tpar.zeta_T(), tpar.rho(), tpar.S_T(), Dset.z.size(), Dset.n_line, Dset.n_band, Dset.n_mats, Dset.count(3),
+            Dset.mirror ? ", mirror layout" : "", bosT->rank_fit(), bosT->n_bose, bt->rank, nkeep, zeta.size(), tpar.c_f);
+  };
+
   const long nqR = ibz.nrows();   // perf 7.3: Pi / W rows (all q without symmetry)
   dyson_layout_t lay(comm.size(), comm.rank(), nqR, bos->zeta_nodes.size(), Np);
   // q groups of the Pi -> W stage (S7e; perf 7.4b: automatic from the 6.7 model and the host / device budgets, q_plan.hpp)
@@ -1283,7 +1474,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   auto kernels_model = [&](long g, long nzb_, long L) {
     q_groups_t qgg(ibz.rows, g, ibz.qminus);
     const long tc_plan = tc_plan_of(L);
-    const auto mm    = grid.model(nkF, nqR, nzb_, bos->rank, tc_plan, nb, qgg.max_size(), dev_fused, level_inplace(L));
+    const auto mm    = grid.model(nkF, nqR, nzb_, bcur->rank, tc_plan, nb, qgg.max_size(), dev_fused, level_inplace(L));
     const double b16 = 16.0 * double(grid.max_block_size());
     double stage     = mm.peak_stage;
     if (ibz.active) {
@@ -1315,7 +1506,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     return comm.all_reduce_value(m, boost::mpi3::max<>{});
   };
   auto make_qplan = [&](long nzb_) {
-    auto qp = choose_q_plan<MEM>(comm, mpi.node_comm, grid, ibz.rows, ibz.qminus, nkF, nzb_, bos->rank, nb,
+    auto qp = choose_q_plan<MEM>(comm, mpi.node_comm, grid, ibz.rows, ibz.qminus, nkF, nzb_, bcur->rank, nb,
                                  q_budget_params_t{prm.mem_budget_gb, prm.dev_mem_budget_gb, prm.mem_frac, prm.q_group_size},
                                  [&](long g, long L) { return qmodel_host(g, nzb_, L); },
                                  [&](long g, long L) { return qmodel_dev(g, nzb_, L); }, not ibz.active, nlevels,
@@ -1425,7 +1616,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   bool qp_pending = false;   // perf 7.2: the qp_diag start pass is still to be done
   if (not restart) {
     Timer.start("phase_F");
-    auto D = density_matrix(st.poles);
+    auto D = density_of(st.poles);   // S8b: the thermal hole list's density in thermal mode
     static_F(D, st.F);
     if (hf_div) exchange_head_correction(st.F, D, madelung);
     Timer.stop("phase_F");
@@ -1454,7 +1645,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
 
   // perf 7.2: Coulomb blocks of the Dyson slab follow the bosonic node count (multilevel levels, auto bos_gap)
   auto ensure_zb = [&]() {
-    const long nzb = long(bos->zeta_nodes.size());
+    const long nzb = long(bcur->zeta_nodes.size());
     if (nzb == zb_nzb) return;
     qplan    = make_qplan(nzb);
     record_qplan();
@@ -1523,11 +1714,55 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       }
     }
     update_bases();
+    // S8b: thermal iteration iff a pole lies within E_T of mu (window); its kernels see the thermal sector lists
+    const bool thermal = tpar.on() and window_active(st.poles, E_T);
+    if (thermal) ensure_thermal();
+    bcur = thermal ? &*bosT : &*bos;
+    bosonic_basis_t const &BB = *bcur;
+    pole_data_t kp_store;
+    if (thermal) kp_store = thermal_lists(st.poles, prm.beta, E_T);
+    pole_data_t const &kp = thermal ? kp_store : st.poles;
+    long nwin = 0;
+    if (tpar.on())
+      for (long c : window_counts(st.poles, E_T)) nwin += c;
     ensure_zb();
     // time nodes of the ray products: GL rays (both kernels) or the four ID grids of the current poles
     Timer.start("time_grid");
     std::optional<time_nodes_t> pi_p, pi_h, sig_p, sig_h;
-    if (prm.time_grid == "gl") {
+    tau_nodes_t taun;
+    if (thermal) {   // S8b: rays guarded at S_T (GL) or the finite-interval ID; the tau leg's nodes
+      double pmax = -1e300, hmin = 1e300, emax_all = 0.0;
+      for (long ik = 0; ik < kp.nk; ++ik) {
+        for (long m = 0; m < kp.part[ik].size(); ++m) pmax = std::max(pmax, kp.part[ik].e(m));
+        for (long m = 0; m < kp.hole[ik].size(); ++m) hmin = std::min(hmin, kp.hole[ik].e(m));
+        for (auto const *ps : {&st.poles.part[ik], &st.poles.hole[ik]})
+          for (long m = 0; m < ps->size(); ++m) emax_all = std::max(emax_all, std::abs(ps->e(m)));
+      }
+      const double numax = nda::max_element(BB.nu);
+      if (prm.time_grid == "gl") {
+        auto ray_p = time_ray_t::guarded(theta_t, prm.beta, E_T, 1e-5, 3.0, 16, sector_t::particle);
+        auto ray_h = time_ray_t::guarded(theta_t, prm.beta, E_T, 1e-5, 3.0, 16, sector_t::hole);
+        app_log(2, "  rays (finite T, guarded at S_T = {:.2f}): {} + {} time nodes", tpar.S_T(), ray_p.size(), ray_h.size());
+        pi_p.emplace(ray_p);
+        pi_h.emplace(ray_h);
+        sig_p.emplace(ray_p);
+        sig_h.emplace(ray_h);
+      } else {
+        numerics::line_dlr::time_id_opts_t topt;
+        topt.pad        = prm.time_pad;
+        topt.oversample = prm.time_oversample;
+        const double Emax = std::max({pmax - hmin, pmax + numax, -hmin + numax});
+        auto tg = line_time_grids_t::thermal(theta_t, 2.0 * E_T, Emax, tpar.S_T(), lv_time_eps, topt, BB.zeta_nodes, zeta, comm);
+        tg.log(1);
+        pi_p.emplace(tg.pi_p);
+        pi_h.emplace(tg.pi_h);
+        sig_p.emplace(tg.sig_p);
+        sig_h.emplace(tg.sig_h);
+      }
+      taun = make_tau_nodes(tpar, emax_all, 2.0 * emax_all);
+      app_log(2, "  tau leg: {} nodes on [0, beta / 2] ({}{})", taun.size(), taun.kind,
+              taun.kind == "id" ? ", rank " + std::to_string(taun.rank) : std::string(""));
+    } else if (prm.time_grid == "gl") {
       const double emin = st.poles.emin();
       auto ray_p = time_ray_t::for_spectrum(theta_t, emin, prm.ray_decades, 1e-5, 3.0, 16, sector_t::particle);
       auto ray_h = time_ray_t::for_spectrum(theta_t, emin, prm.ray_decades, 1e-5, 3.0, 16, sector_t::hole);
@@ -1541,7 +1776,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       numerics::line_dlr::time_id_opts_t topt;
       topt.pad        = prm.time_pad;
       topt.oversample = prm.time_oversample;
-      line_time_grids_t tg(st.poles, bos->nu, theta_t, lv_time_eps, topt, bos->zeta_nodes, zeta, comm, prm.time_snap);
+      line_time_grids_t tg(st.poles, BB.nu, theta_t, lv_time_eps, topt, BB.zeta_nodes, zeta, comm, prm.time_snap);
       tg.log(1);
       pi_p.emplace(tg.pi_p);
       pi_h.emplace(tg.pi_h);
@@ -1565,19 +1800,30 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     // 1. Pi at the bosonic nodes, W residues; S9a: the heads h(q, zeta_i) from W at the nodes (the Pi buffer, moved out by
     //    screened_interaction and freed right after) and the scalar head residues from w
     double tPi = 0.0, tW = 0.0, e0 = 0.0;
-    const long nzb = bos->zeta_nodes.size();
-    nda::array<ComplexType, 2> Hn(nq, nzb), hres_p(nq, bos->rank), hres_h(nq, bos->rank);
+    const long nzb = BB.zeta_nodes.size();
+    nda::array<ComplexType, 2> Hn(nq, nzb), hres_p(nq, BB.rank), hres_h(nq, BB.rank);
     Hn()     = ComplexType(0.0);
     hres_p() = ComplexType(0.0);
     hres_h() = ComplexType(0.0);
     for (long G = 0; G < qg.n; ++G) {   // one group (all q) unless the Pi group does not fit
       e0 = tic("phase_Pi");
-      polarization<MEM>(prop, st.poles, mf, grid, bos->zeta_nodes, *pi_p, *pi_h, qplan.t_chunk, Pi, Timer, sector_t::both,
+      arr4_t Pi_tau;
+      if (thermal) {   // S8b tau leg first (the ray call below refills the propagator's A^ cache): dynamic Pi(q, 0)
+        nda::array<ComplexType, 1> z0(1);
+        z0(0) = ComplexType(0.0);
+        pi_tau_leg<MEM>(prop, st.poles, mf, ibz, grid, tpar, taun, z0, qplan.t_chunk, Pi_tau, Timer, qg.rows(G));
+      }
+      polarization<MEM>(prop, kp, mf, grid, BB.zeta_nodes, *pi_p, *pi_h, qplan.t_chunk, Pi, Timer, sector_t::both,
                         qg.rows(G));
+      if (thermal)   // the nu_0 points of D (z = 0, outside the wedge) from the tau leg
+        for (long i = 0; i < nzb; ++i)
+          if (BB.zeta_nodes(i) == ComplexType(0.0))
+            for (long r = 0; r < Pi.extent(0); ++r)
+              Pi(r, i, nda::range::all, nda::range::all) = Pi_tau(r, 0, nda::range::all, nda::range::all);
       tPi += toc("phase_Pi", e0);
       mem_trace(comm, mpi.node_comm, "Pi group " + std::to_string(G));
       e0 = tic("phase_W");
-      screened_interaction<MEM>(Pi, Zb, *bos, grid, mpi, w, Timer, &Wn, qg.rows(G), qplan.w_host or ibz.active);
+      screened_interaction<MEM>(Pi, Zb, BB, grid, mpi, w, Timer, &Wn, qg.rows(G), qplan.w_host or ibz.active);
       mem_trace(comm, mpi.node_comm, "W group " + std::to_string(G));
       Timer.start("W_head");
       head_nodes_partial<MEM>(Wn, qg.rows(G), hbasis, Hn);
@@ -1585,14 +1831,14 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       if (qplan.w_host) head_residues_partial<MEM>(w, qg.rows(G), hbasis, hres_p, hres_h);
       Timer.stop("W_head");
       if (qplan.w_host) {   // this group's rows -> the host-resident residues of all q
-        if (w_h.extent(0) != nq or w_h.extent(1) != bos->rank)
-          w_h = memory::array<HOST_MEMORY, ComplexType, 4>(nq, bos->rank, grid.nP, grid.nQ);
+        if (w_h.extent(0) != nq or w_h.extent(1) != BB.rank)
+          w_h = memory::array<HOST_MEMORY, ComplexType, 4>(nq, BB.rank, grid.nP, grid.nQ);
         auto wg = memory::to_memory_space<HOST_MEMORY>(w);
         for (long i = 0; i < qg.size(G); ++i)
           w_h(qg.rows(G)[i], nda::range::all, nda::range::all, nda::range::all) = wg(i, nda::range::all, nda::range::all, nda::range::all);
       }
       if (ibz.active) {   // perf 7.3: this group's rows -> the residues of the rows R (ibz.rows order)
-        if (wI.extent(0) != nqR or wI.extent(1) != bos->rank) wI = arr4_t(nqR, bos->rank, grid.nP, grid.nQ);
+        if (wI.extent(0) != nqR or wI.extent(1) != BB.rank) wI = arr4_t(nqR, BB.rank, grid.nP, grid.nQ);
         for (long i = 0; i < qg.size(G); ++i)
           wI(ibz.rpos[qg.rows(G)[i]], nda::range::all, nda::range::all, nda::range::all) =
               w(i, nda::range::all, nda::range::all, nda::range::all);
@@ -1606,6 +1852,11 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       Timer.start("W_head");
       if (not qplan.w_host) head_residues_partial<MEM>(w, q_all, hbasis, hres_p, hres_h);
       head_reduce(comm, {&Hn, &hres_p, &hres_h});
+      if (thermal) {   // S8b: the head residues of the fitted poles only (the Bose rows are w(-q)^T copies)
+        const auto rf = nda::range(BB.rank_fit());
+        hres_p = nda::array<ComplexType, 2>(hres_p(nda::range::all, rf));
+        hres_h = nda::array<ComplexType, 2>(hres_h(nda::range::all, rf));
+      }
       hout.h_nodes       = std::move(Hn);
       hout.h_res         = std::move(hres_p);
       hout.h_res_hole    = std::move(hres_h);
@@ -1617,18 +1868,18 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       hout.h0_nodes      = hextra.apply(hout.h_nodes);
       hout.h0_res        = hextra.apply(hout.h_res);
       hout.h0_res_hole   = hextra.apply(hout.h_res_hole);
-      hout.zeta          = bos->zeta_nodes;
-      hout.nu            = bos->nu;
+      hout.zeta          = BB.zeta_nodes;
+      hout.nu            = thermal ? BB.nu_fit() : bos->nu;
       hout.q_weights     = hextra.c;
       hout.qpts          = ibz.active ? nda::array<double, 2>(mf.Qpts()) : nda::array<double, 2>(mf.Qpts_ibz());
       hout.madelung      = madelung;
-      hout.eps_inf       = head_eps_inf(hout.h0_res, hout.h0_res_hole, bos->nu);
+      hout.eps_inf       = head_eps_inf(hout.h0_res, hout.h0_res_hole, hout.nu);
       hout.extrapolation = prm.head_extrapolation;
       hout.div_treatment = sig_div ? prm.div_treatment : std::string("ignore_g0");
       hout.hf_div_treatment = prm.hf_div_treatment;
       Timer.stop("W_head");
       tW += toc("phase_W", e0);
-      const auto h0r = head_eval(hout.h0_res, hout.h0_res_hole, bos->nu, bos->zeta_nodes);
+      const auto h0r = head_eval(hout.h0_res, hout.h0_res_hole, hout.nu, hout.zeta);
       double dh = 0.0, sh = 0.0;
       for (long i = 0; i < nzb; ++i) {
         dh = std::max(dh, std::abs(h0r(i) - hout.h0_nodes(i)));
@@ -1650,15 +1901,19 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     auto const *whp = qplan.w_host ? &w_h : nullptr;
     // both sectors in one call (perf 7.1: the real-space residues are transformed once): particle -> Sp_new, hole -> Sh_new
     if (ibz.active)   // perf 7.3: Sigma at the IBZ k from the class sums (self_energy_ibz.hpp)
-      self_energy_ibz<MEM>(prop, st.poles, w, *bos, mf, ibz, grid, comm, zeta, *sig_p, *sig_h, qplan.t_chunk, Sp_new, Timer,
+      self_energy_ibz<MEM>(prop, kp, w, BB, mf, ibz, grid, comm, zeta, *sig_p, *sig_h, qplan.t_chunk, Sp_new, Timer,
                            sector_t::both, prm.sigma_kdist, &Sh_new);
     else
-      self_energy<MEM>(prop, st.poles, w, *bos, mf, grid, mpi, zeta, *sig_p, *sig_h, qplan.t_chunk, Sp_new, Timer, sector_t::both,
+      self_energy<MEM>(prop, kp, w, BB, mf, grid, mpi, zeta, *sig_p, *sig_h, qplan.t_chunk, Sp_new, Timer, sector_t::both,
                        prm.sigma_kdist, whp, qplan.gs_sigma, &Sh_new, qplan.wR_inplace ? &w : nullptr);   // 7.4b: w consumed
     mem_trace(comm, mpi.node_comm, "Sigma");
     if (sig_div) {   // S9a: the q -> 0 head term of Sigma_c (head.hpp), per sector, on the rows of this rank
       Timer.start("Sigma_head");
-      head_sigma_correction(st.poles, Thead, bos->nu, hout.h0_res, hout.h0_res_hole, madelung, zeta, k_rows, Sp_new, Sh_new);
+      if (thermal)   // S8b: weights (1 - f + n), (f + n) over all poles
+        head_sigma_thermal(kp, st.poles, Thead, hout.nu, hout.h0_res, hout.h0_res_hole, madelung, prm.beta, E_T, zeta, k_rows, Sp_new,
+                           Sh_new);
+      else
+        head_sigma_correction(st.poles, Thead, bos->nu, hout.h0_res, hout.h0_res_hole, madelung, zeta, k_rows, Sp_new, Sh_new);
       Timer.stop("Sigma_head");
     }
     if (prm.debug_noise_sigma > 0.0 and st.iter + 1 == prm.debug_noise_iter and not qp_pending) {
@@ -1729,7 +1984,19 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
         for (long j = 0; j < nb; ++j) Hrel(ik, i, j) = H0(ik, i, j) + F_next(ik, i, j) - (i == j ? st.mu : 0.0);
     st.F_cl = F_next;   // perf 7.2: the F of the closure that builds the new poles (spectra, restart)
     cprm.phi_prev.assign(st.phi.begin(), st.phi.end());   // S7f phase continuity (used only if phase_keep > 0)
-    auto co = closure(comm, Hrel, st.Sig_p, st.Sig_h, zeta, *bp, *bh, gp, gh, cprm, nelec, Timer, grepr);
+    // S8b: thermal closure (total fit, omega_p floor, mu rule) or, with beta > 0 and an empty window, the T = 0 fits with the
+    // rule (which keeps the gap midpoint while the window stays empty: bitwise the T = 0 path)
+    closure_params_t cprm_it = cprm;
+    double wp_used = cprm.wp;
+    if (thermal) {
+      wp_used    = std::max(cprm.wp, prm.wp_floor * tpar.zeta_T());
+      cprm_it.wp = wp_used;
+      cth.active = true;
+    } else
+      cth.active = false;
+    if (tpar.on() and not thermal) cth.tp = tpar;
+    auto co = closure(comm, Hrel, st.Sig_p, st.Sig_h, zeta, *bp, *bh, gp, gh, thermal ? cprm_it : cprm, nelec, Timer, grepr,
+                      tpar.on() ? &cth : nullptr);
     st.phi = nda::array<double, 1>(nk);
     for (long ik = 0; ik < nk; ++ik) st.phi(ik) = co.diag[ik].phi;
     {   // S7f: how close the hard decisions of the upfolding are to flipping (closure noise floor)
@@ -1754,7 +2021,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
 
     // 4. static part of the new poles
     e0 = tic("phase_F");
-    auto D = density_matrix(st.poles);
+    auto D = density_of(st.poles);   // S8b: the thermal hole list's density when the new G has a window
     static_F(D, st.F);
     if (hf_div) exchange_head_correction(st.F, D, madelung);
     const double tF = toc("phase_F", e0);
@@ -1802,6 +2069,21 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     rec.mix                = mixed ? mi.kind : std::string("none");
     rec.ndiis              = mi.m;
     rec.level              = cur_level;
+    if (tpar.on()) {   // S8b
+      rec.thermal = thermal ? 1 : 0;
+      rec.mu_rule = co.mu_rule;
+      rec.dN      = co.dN;
+      rec.n_th    = co.n_th;
+      rec.wp_used = wp_used;
+      rec.nD      = BB.zeta_nodes.size();
+      rec.rank_b  = BB.rank_fit();
+      rec.ntau    = taun.size();
+      rec.nwin    = nwin;
+      app_log(1, "          finite T: {} iteration (window poles {}), mu rule {} (dN = N_T(mu_g) - N_el {:+.3e}, n_th {:.3e}), N(mu) {:.12f}, "
+                 "omega_p {:.4f}, |D| {}, rank_b {}, tau nodes {}; next window {}",
+              thermal ? "thermal" : "T = 0", nwin, co.mu_rule, co.dN, co.n_th, co.N_mu, wp_used, rec.nD, rec.rank_b, rec.ntau,
+              co.window_next ? "non-empty" : "empty");
+    }
     rec.time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     res.history.push_back(rec);
     print_line(rec, tPi, tW, tS, tC, tF);
@@ -1866,8 +2148,27 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
             st.iter == 1 and prm.start == "ks" ? " = G0W0@KS (F[D_KS] + Sigma[G_KS])"
                                                : (prm.mix.mix_F and not res.history.empty() and res.history.back().mix == "diis" ? " (F_closure = the DIIS-extrapolated F)" : " (F_closure = F[D_" + std::to_string(st.iter - 1) + "])"),
             st.iter, dFc);
-    auto sp = line_spectra(comm, Hrel, st.Sig_p, st.Sig_h, zeta, st.mu - st.mu_sigma, *bp, *bh, cprm, nelec, prm.spectra);
+    // S8b: a thermal last iteration -> the total fit of its closure (two-sided basis, mask, omega_p floor)
+    const bool th_last = tpar.on() and not res.history.empty() and res.history.back().thermal == 1;
+    closure_params_t cprm_sp = cprm;
+    if (th_last) {
+      ensure_thermal();
+      cth.active = true;
+      cprm_sp.wp = res.history.back().wp_used;
+    }
+    auto sp = line_spectra(comm, Hrel, st.Sig_p, st.Sig_h, zeta, st.mu - st.mu_sigma, *bp, *bh, th_last ? cprm_sp : cprm, nelec,
+                           prm.spectra, th_last ? &cth : nullptr);
     write_spectra(comm, chk, sp, st.mu);
+    if (prm.spectra_occupation and prm.beta > 0.0 and comm.root()) {   // S8b: f(w - mu) on the spectra grid
+      utils::h5_quiesce();
+      h5::file f(chk, 'a');
+      h5::group g(f);
+      auto sg = g.open_group("spectra");
+      nda::array<double, 1> fw(sp.omega.size());
+      for (long i = 0; i < fw.size(); ++i) fw(i) = numerics::line_dlr::fermi(sp.omega(i), prm.beta);
+      nda::h5_write(sg, "fermi_w", fw, false);
+    }
+    comm.barrier();
     Timer.stop("spectra");
     app_log(1, "  spectra: A(k, w) for {} eta x {} k x {} w written to {}:/spectra ({:.1f} s)", sp.eta.size(), nk, sp.omega.size(),
             chk, Timer.elapsed("spectra"));

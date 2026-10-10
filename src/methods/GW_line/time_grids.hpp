@@ -118,8 +118,11 @@ inline void bcast_time_id(boost::mpi3::communicator &comm, numerics::line_dlr::t
   g.ls_rank = n[1];
   g.n_cand  = n[2];
   g.sector  = n[3] == 0 ? numerics::line_dlr::sector_t::particle : numerics::line_dlr::sector_t::hole;
-  std::array<double, 6> x = {g.theta_t, g.Emin, g.Emax, g.eps, g.phase.real(), g.phase.imag()};
-  comm.broadcast_n(x.data(), 6, root);
+  std::array<double, 9> x = {g.theta_t, g.Emin, g.Emax, g.eps, g.phase.real(), g.phase.imag(), g.finite ? 1.0 : 0.0, g.S, g.Eneg};
+  comm.broadcast_n(x.data(), 9, root);
+  g.finite  = x[6] != 0.0;
+  g.S       = x[7];
+  g.Eneg    = x[8];
   g.theta_t = x[0];
   g.Emin    = x[1];
   g.Emax    = x[2];
@@ -254,10 +257,53 @@ struct line_time_grids_t {
     }
   }
 
+  /**
+   * S8b: the grids of a THERMAL iteration (notes section 11.4): ONE finite-interval particle ID grid (time_id_t::finite_interval)
+   * on E in [-Eneg, Emax], s in [0, S] (S = S_T) for Pi^> and Sigma^>, its conjugate for the hole legs (the shared layout of
+   * perf 7.1 (d)); built on rank 0 and broadcast. Diagnostics: LS residual and max|F| over the target points.
+   */
+  static line_time_grids_t thermal(double theta_t, double Eneg, double Emax, double S, double eps,
+                                   numerics::line_dlr::time_id_opts_t const &opts, nda::array<ComplexType, 1> const &zeta_b,
+                                   nda::array<ComplexType, 1> const &zeta_f, boost::mpi3::communicator &comm) {
+    using numerics::line_dlr::time_id_t;
+    line_time_grids_t T;
+    T.shared = true;
+    T.thermal_grid = true;
+    std::array<double, 3> diag{};
+    if (comm.rank() == 0) {
+      const auto t0 = std::chrono::steady_clock::now();
+      T.pi_p        = time_id_t::finite_interval(theta_t, numerics::line_dlr::sector_t::particle, Eneg, Emax, S, eps, opts);
+      double r1 = 0.0, r2 = 0.0, fmax = 0.0;
+      auto F1 = T.pi_p.transform_matrix(zeta_b, &r1);
+      auto F2 = T.pi_p.transform_matrix(zeta_f, &r2);
+      for (auto const &v : F1) fmax = std::max(fmax, std::abs(v));
+      for (auto const &v : F2) fmax = std::max(fmax, std::abs(v));
+      diag = {std::max(r1, r2), fmax, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()};
+    } else
+      T.pi_p.opts = opts;
+    detail::bcast_time_id(comm, T.pi_p, 0);
+    if (comm.size() > 1) comm.broadcast_n(diag.data(), 3, 0);
+    T.pi_h  = detail::conjugate_grid(T.pi_p);
+    T.sig_p = T.pi_p;
+    T.sig_h = T.pi_h;
+    char const *nms[4] = {"Pi^>", "Pi^<", "Sigma^>", "Sigma^<"};
+    for (int i = 0; i < 4; ++i)
+      T.info[i] = time_grid_info_t{std::string(nms[i]) + "*T", -Eneg, Emax, T.pi_p.rank, T.pi_p.size(), diag[0], diag[1], i == 0 ? diag[2] : 0.0};
+    return T;
+  }
+  bool thermal_grid = false;   ///< S8b: finite-interval grid (thermal())
+
   void log(int level = 2) const {
     app_log(level, "  time grids (ID, eps {:.1e}, pad {}, oversample {}): poles e^> [{:.4f}, {:.4f}], |e^<| [{:.4f}, {:.4f}], "
                    "nu [{:.4f}, {:.4f}] Ha",
             pi_p.eps, pi_p.opts.pad, pi_p.opts.oversample, pr.p_min, pr.p_max, pr.h_min, pr.h_max, nu_min, nu_max);
+    if (thermal_grid) {
+      auto const &g = info[0];
+      app_log(level, "  time grids (finite-interval ID, S8b, eps {:.1e}, pad {}): s in [0, {:.2f}], E in [{:.4f}, {:.4f}] Ha (hole grid = "
+                     "conjugate): rank {:4d}, nodes {:4d}, candidates {}, nE {}, LS residual {:.1e}, max|F| {:7.1f}, {:.2f} s",
+              pi_p.eps, pi_p.opts.pad, pi_p.S, g.Emin, g.Emax, g.rank, g.size, pi_p.n_cand, pi_p.nE(), g.ls_residual, g.maxF, g.time);
+      return;
+    }
     if (shared) {
       auto const &g = info[0];
       app_log(level, "    shared (Pi^>, Sigma^>; hole grid = conjugate: Pi^<, Sigma^<) |E| in [{:.4f}, {:.4f}] Ha: rank {:4d}, nodes "

@@ -124,6 +124,18 @@
  *                       host memory per rank (MemAvailable / cgroup, at the plan) and of the free device memory; the budgets
  *                       in GB per rank override the measurement; q_group_size > 0 (or env COQUI_GWLINE_QGROUP) fixes the size
  *   ibz = true          perf 7.3: IBZ reduction (ibz.hpp) when the mean field is symmetric; false = full BZ (env COQUI_GWLINE_IBZ)
+ *   theta_t_frac = 0.5  S8b: the ray angle theta_t = theta_t_frac theta (was fixed at 1/2)
+ *   beta = 0            S8b finite temperature (notes section 11; thermal.hpp): 0 = T = 0. beta > 0: thermal_tol = 1e-8 (tau_T,
+ *                       window E_T = ln(1/tau_T)/beta), thermal_floor = 30 (c_zeta: bosonic node floor rho beta |zeta| >= c_zeta,
+ *                       band bottom), thermal_floor_f = thermal_floor (c_f: fermionic node floor of the closure fit), wp_floor = 15
+ *                       (omega_p := max(wp, wp_floor zeta_T)), mu_rule = "auto" ("auto" | "gap" | "number"; mu_dn_max = 0.1,
+ *                       mu_th_factor = 10, notes Eq. fT_nth), band_heights = 8, band_x = 21, band_top = 4, mats_factor = 4 (data set
+ *                       D), bos_eps_T = 1e-12 (D-selected basis), bos_line_eps = 1e-10 (the line basis of D's line nodes),
+ *                       cut_odd = 1e-13, cut_even = 1e-10 (split fit), tau_grid = "gl" | "id", tau_eps = 1e-12 (tau leg),
+ *                       spectra.occupation = false, thermal_bases_file (parity: D, nu_b, the Sigma basis injected).
+ *                       An iteration is THERMAL iff a pole lies within E_T of mu; otherwise it is the T = 0 code (bitwise).
+ *                       Thermal iterations need g_repr = "lehmann"; sigma_gap / bos_gap are not used there (two-sided gapless
+ *                       Sigma basis, D-selected bosonic basis); start = "ks"; no multilevel, no optics.
  *   output / outdir + prefix   checkpoint stem (MBPT_drivers resolve_mbpt_output_stem; the driver reads "output")
  *   div_treatment = "ignore_g0"   q -> 0 divergence of Sigma_c (S9a, head.hpp): "ignore_g0" (Z(Gamma) without its G = 0 term,
  *                       no head term) or a gygi variant of CoQui ("gygi" = axis-folded polynomial extrapolation of the head
@@ -252,6 +264,22 @@ struct gw_line_params_t {
   std::string hf_div_treatment = "ignore_g0";   ///< S9a: exchange Madelung term ("ignore_g0" | "gygi")
   std::string head_extrapolation = "gygi";      ///< S9a: q -> 0 variant of the head data when div_treatment = "ignore_g0"
   optics_params_t optics;                       ///< S9b: real-axis optics after the loop (optics.hpp)
+  // S8b finite temperature (notes section 11; thermal.hpp, thermal_mu.hpp)
+  double theta_t_frac = 0.5;                    ///< theta_t = theta_t_frac theta (also at T = 0)
+  double beta = 0.0;                            ///< 0: T = 0
+  double thermal_tol = 1e-8, thermal_floor = 30.0, thermal_floor_f = -1.0;   ///< tau_T, c_zeta, c_f (< 0: c_zeta)
+  double wp_floor = 15.0;                       ///< omega_p >= wp_floor zeta_T in thermal iterations
+  std::string mu_rule = "auto";                 ///< "auto" | "gap" | "number"
+  double mu_dn_max = 0.1, mu_th_factor = 10.0;  ///< rule "auto" (Eq. fT_nth)
+  long band_heights = 8, band_x = 21;           ///< wedge band of the bosonic data set D
+  double mats_factor = 4.0, band_top = 4.0;     ///< N_M = ceil(mats_factor zeta_T beta / 2 pi); band top
+  double bos_eps_T = 1e-12;                     ///< eps_b of the D-selected bosonic basis
+  double bos_line_eps = 1e-10;                  ///< eps of the gapless bosonic line basis whose unmasked nodes enter D
+  double cut_odd = 1e-13, cut_even = 1e-10;     ///< split pair fit cutoffs
+  std::string tau_grid = "gl";                  ///< tau leg nodes "gl" | "id"
+  double tau_eps = 1e-12;                       ///< tau ID tolerance
+  bool spectra_occupation = false;              ///< spectra.occupation: also f(w - mu) A(k, w)
+  std::string thermal_bases_file;               ///< parity: D (D_zeta_re/_im), nu_b, sigma_basis_w injected (python reference)
 
   static gw_line_params_t from_ptree(ptree const &pt);
   void log() const;
@@ -275,6 +303,11 @@ struct gw_line_iter_t {
   std::string mix = "none";              ///< perf 7.2: mixing step of this iteration (none | linear | diis | reset)
   long ndiis = 0;                        ///< perf 7.2: DIIS history entries used
   long level = 0;                        ///< perf 7.2: 0 = production settings, 1 = coarse (multilevel schedule)
+  // S8b (written in iter<N>/thermal/, not in the broadcast history table)
+  long thermal = 0;                      ///< 1: thermal iteration (window non-empty at its start)
+  std::string mu_rule = "";              ///< rule the closure used
+  double dN = 0.0, n_th = 0.0, wp_used = 0.0;
+  long nD = 0, rank_b = 0, ntau = 0, nwin = 0;
 };
 
 struct gw_line_result_t {

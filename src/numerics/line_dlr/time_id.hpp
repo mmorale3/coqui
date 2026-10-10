@@ -55,6 +55,20 @@
  * Recommended production setting: eps = 1e-10, oversample = 1.0, pad = 1.25 (r_t ~ 145 for Pi [0.04, 6] and
  * Sigma [0.06, 10], per-pole error <= 4e-10, mixtures ~1e-11; GL ray: 976-992 nodes).
  *
+ * Finite interval (S8b, notes section 11.4, Eqs. fT_gram, fT_TS; time_id_t::finite): the products of the finite-T guarded rays
+ * are sums of e^{-i E t} with E in [-E_neg, E_max] (E < 0: anti-sector pairs, bounded on [0, S] by KMS) on s in [0, S]
+ * (S = S_T = beta / sin(theta_t); also the tau leg at theta_t = pi / 2, S = beta / 2). Same three steps with
+ *  1. fine energy grid: uniform on [-E_neg pad, E_u] with spacing h = 1 / (nU_per_S S) (the family varies on the scale 1/S
+ *     in E), log-spaced on [E_u, E_max pad] (nE_per_efold), E_u = max(E_neg pad, h nE_per_efold); candidate s = {0} U the
+ *     log grid [smin_fac / (E_max pad), S] U a uniform grid of spacing pi / (4 E_neg max(cos, sin) theta_t) (four points
+ *     per period of the slowest surviving oscillation near s = S), trapezoid weights in s;
+ *  2. rows normalized with the finite-interval Gram diagonal G_S(E, E) = (1 - e^{-2 a S}) / (2 a), a = E sin(theta_t)
+ *     (finite for every E; S at a = 0); the eps-rank and the pivots as before;
+ *  3. LS targets the truncated transform T_S(zeta, E) = (1 - e^{i (zeta - E) t_S}) / (zeta - E), t_S = S e^{-+ i theta_t}
+ *     (Eq. fT_TS; not 1 / (zeta - E)), row weights w = G_S(E, E)^{-1/2}; exact (to eps) at any target point of the
+ *     exactness wedge (notes Eq. fT_wedge).
+ * The hole grid is the conjugate of the particle grid as at T = 0 (time_grids.hpp detail::conjugate_grid).
+ *
  * Interface: same consumer members as time_ray_t (t, s, size(), sector, theta_t, phase, transform_matrix(zeta)).
  * `time_nodes_t` below is a type-erased view constructible from either, so a kernel signature
  * `time_ray_t const &` -> `time_nodes_t const &` accepts both without further changes.
@@ -85,6 +99,7 @@ struct time_id_opts_t {
   double smax_fac     = 1.5;    ///< largest candidate s = smax_fac ln(1/eps) / (Emin sin theta_t)
   double rcond        = 1e-14;  ///< LS: singular values below rcond * S_0 are dropped
   long rank_force     = -1;     ///< > 0: take exactly this many pivots (diagnostic / accuracy-vs-nodes studies)
+  double nU_per_S     = 2.0;    ///< S8b finite interval: uniform E spacing h = 1 / (nU_per_S S)
   double pad          = 1.0;    ///< safety margin: the ID is built for [Emin/pad, Emax*pad] (the LS is unconstrained
                                 ///< outside its range: E = 0.8 Emin or 1.2 Emax cost 1e-3..1e-1 at pad = 1)
 };
@@ -100,6 +115,8 @@ struct time_id_t {
   nda::array<double, 1> s;                     ///< (r_t) selected real ray coordinates, ascending
   nda::array<ComplexType, 1> t;                ///< (r_t) complex times s * phase
   nda::array<double, 1> rdiag;                 ///< |R_ll| / |R_00| of the selection QR (first min(nE, n_cand))
+  bool finite = false;                         ///< S8b: finite interval [0, S] (time_id_t::finite), LS targets T_S
+  double S = 0.0, Eneg = 0.0;                  ///< S8b: interval length (in s) and the negative energy range (before pad)
 
   // LS factorization (fine grid and the factored pseudo-inverse)
   nda::array<double, 1> E;                     ///< (nE) signed fine energies
@@ -188,6 +205,132 @@ struct time_id_t {
       for (long j = 0; j < r; ++j) Vs(l, j) = std::conj(VT(l, j)) / sv(l);
   }
 
+  /**
+   * S8b finite-interval ID (file header): particle-side energies E in [-Eneg, Emax] (hole: the negatives), s in [0, S_].
+   * Eneg > 0, Emax > 0. theta_t in (0, pi/2] (pi/2: the tau leg).
+   */
+  static time_id_t finite_interval(double theta_t_, sector_t sector_, double Eneg_, double Emax_, double S_, double eps_,
+                                   time_id_opts_t const &o = {}) {
+    time_id_t g;
+    g.theta_t = theta_t_; g.sector = sector_; g.Emin = 0.0; g.Emax = Emax_; g.eps = eps_; g.opts = o;
+    g.finite = true; g.S = S_; g.Eneg = Eneg_;
+    utils::check(sector_ != sector_t::both, "time_id_t: sector must be particle or hole");
+    utils::check(Eneg_ > 0.0 and Emax_ > 0.0 and S_ > 0.0, "time_id_t::finite_interval: need Eneg, Emax, S > 0 (got {} {} {})", Eneg_,
+                 Emax_, S_);
+    utils::check(eps_ > 0.0 and eps_ < 1.0, "time_id_t: eps = {} out of (0, 1)", eps_);
+    utils::check(theta_t_ > 0.0 and theta_t_ <= std::numbers::pi / 2 + 1e-15, "time_id_t: theta_t = {} out of (0, pi/2]", theta_t_);
+    const double sgn = (sector_ == sector_t::particle) ? 1.0 : -1.0;
+    const double st = std::sin(theta_t_), ct = std::max(0.0, std::cos(theta_t_));
+    g.phase         = std::exp(ComplexType(0.0, -sgn * theta_t_));
+    const double elo = -Eneg_ * o.pad, ehi = Emax_ * o.pad;
+    // 1. fine signed energies (particle side)
+    std::vector<double> ev;
+    const double h  = 1.0 / (o.nU_per_S * S_);
+    const double Eu = std::min(ehi, std::max(-elo, h * o.nE_per_efold));
+    {
+      const long nu = std::max(2L, long(std::ceil((Eu - elo) / h)) + 1);
+      auto lu       = detail::linspace(elo, Eu, nu);
+      for (long i = 0; i < nu; ++i) ev.push_back(lu(i));
+      if (ehi > Eu * (1.0 + 1e-12)) {
+        const long nl = std::max(2L, long(std::ceil(o.nE_per_efold * std::log(ehi / Eu))) + 1);
+        auto ll       = detail::logspace(Eu, ehi, nl);
+        for (long i = 1; i < nl; ++i) ev.push_back(ll(i));
+      }
+    }
+    const long nE = long(ev.size());
+    g.E = nda::array<double, 1>(nE);
+    g.w = nda::array<double, 1>(nE);
+    for (long k = 0; k < nE; ++k) {
+      g.E(k) = sgn * ev[k];
+      g.w(k) = 1.0 / std::sqrt(gram_diag(ev[k] * st, S_));
+    }
+    // candidate s: {0} U log [smin_fac / ehi, S] U uniform, sorted, unique; trapezoid weights
+    std::vector<double> sc{0.0};
+    {
+      const double smin = o.smin_fac / ehi;
+      if (S_ > smin) {
+        const long nsl = std::max(long(o.ns_per_efold * std::log(S_ / smin)), 2L);
+        auto sl        = detail::logspace(smin, S_, nsl);
+        for (long m = 0; m < nsl; ++m) sc.push_back(sl(m));
+      }
+      const double du = std::numbers::pi / (4.0 * Eneg_ * std::max(ct, st));
+      const long nu   = std::max(2L, long(std::ceil(S_ / du)) + 1);
+      auto su         = detail::linspace(0.0, S_, nu);
+      for (long m = 1; m < nu; ++m) sc.push_back(su(m));
+      std::sort(sc.begin(), sc.end());
+      std::vector<double> u{sc[0]};
+      for (size_t m = 1; m < sc.size(); ++m)
+        if (sc[m] > u.back() * (1.0 + 1e-13) + 1e-300) u.push_back(sc[m]);
+      sc.swap(u);
+    }
+    g.n_cand = long(sc.size());
+    std::vector<double> wsc(g.n_cand);
+    for (long m = 0; m < g.n_cand; ++m) {
+      const double a = (m > 0) ? sc[m - 1] : sc[m], b = (m + 1 < g.n_cand) ? sc[m + 1] : sc[m];
+      wsc[m] = 0.5 * (b - a);
+    }
+    // 2. selection
+    nda::matrix<ComplexType, nda::F_layout> M(nE, g.n_cand);
+    for (long m = 0; m < g.n_cand; ++m) {
+      const ComplexType mt = ComplexType(0.0, -1.0) * sc[m] * g.phase;
+      const double cw      = std::sqrt(wsc[m]);
+      for (long k = 0; k < nE; ++k) M(k, m) = g.w(k) * cw * std::exp(g.E(k) * mt);
+    }
+    auto qr = detail::pivoted_qr(M);
+    g.rank  = detail::qr_rank(qr, eps_);
+    g.rdiag = nda::array<double, 1>(long(qr.rdiag.size()));
+    for (long l = 0; l < g.rdiag.size(); ++l) g.rdiag(l) = qr.rdiag[l] / qr.rdiag[0];
+    long r = (o.rank_force > 0) ? o.rank_force : long(std::ceil(o.oversample * double(g.rank) - 1e-9));
+    r      = std::min(r, std::min(g.n_cand, nE));
+    std::vector<long> J(qr.piv.begin(), qr.piv.begin() + r);
+    std::sort(J.begin(), J.end());
+    g.s = nda::array<double, 1>(r);
+    g.t = nda::array<ComplexType, 1>(r);
+    for (long j = 0; j < r; ++j) {
+      g.s(j) = sc[J[j]];
+      g.t(j) = g.s(j) * g.phase;
+    }
+    g.factor_ls();
+    return g;
+  }
+
+  /// G_S(E, E) = (1 - e^{-2 a S}) / (2 a) (S at a = 0): the squared L2(ds) norm of e^{-i E t(s)} on [0, S], a = E sin(theta_t)
+  static double gram_diag(double a, double S_) {
+    const double x = 2.0 * a * S_;
+    return (std::abs(x) < 1e-8) ? S_ * (1.0 - 0.5 * x) : -std::expm1(-x) / (2.0 * a);
+  }
+
+  /// T_S(zeta, E) = -i t_S (e^x - 1) / x, x = i (zeta - E) t_S (Eq. fT_TS; stable at zeta -> E)
+  ComplexType target_finite(ComplexType zeta, double Ek) const {
+    const ComplexType tS = S * phase, x = ComplexType(0.0, 1.0) * (zeta - Ek) * tS;
+    ComplexType r;
+    if (std::abs(x) < 1e-3) r = 1.0 + x * (0.5 + x * (1.0 / 6.0 + x * (1.0 / 24.0 + x / 120.0)));
+    else r = (std::exp(x) - 1.0) / x;
+    return ComplexType(0.0, -1.0) * tS * r;
+  }
+
+  /// LS factorization diag(w) A = U S V^dagger on the current nodes (finite_interval; the T = 0 constructor has its own)
+  void factor_ls() {
+    const long ne = E.size(), r = s.size();
+    nda::matrix<ComplexType, nda::F_layout> A(ne, r), U(ne, ne), VT(r, r);
+    for (long j = 0; j < r; ++j) {
+      const ComplexType mt = ComplexType(0.0, -1.0) * t(j);
+      for (long k = 0; k < ne; ++k) A(k, j) = w(k) * std::exp(E(k) * mt);
+    }
+    const long kmax = std::min(ne, r);
+    sv              = nda::array<double, 1>(kmax);
+    nda::lapack::gesvd(A, sv, U, VT);
+    ls_rank = 0;
+    for (long l = 0; l < kmax; ++l)
+      if (sv(l) > opts.rcond * sv(0)) ++ls_rank;
+    Uc = nda::array<ComplexType, 2>(ne, ls_rank);
+    Vs = nda::array<ComplexType, 2>(ls_rank, r);
+    for (long k = 0; k < ne; ++k)
+      for (long l = 0; l < ls_rank; ++l) Uc(k, l) = std::conj(U(k, l));
+    for (long l = 0; l < ls_rank; ++l)
+      for (long j = 0; j < r; ++j) Vs(l, j) = std::conj(VT(l, j)) / sv(l);
+  }
+
   long size() const { return s.size(); }
   long nE() const { return E.size(); }
 
@@ -205,8 +348,13 @@ struct time_id_t {
   nda::array<ComplexType, 2> transform_matrix(nda::array<ComplexType, 1> const &zeta, double *ls_residual = nullptr) const {
     const long nz = zeta.size(), ne = nE();
     nda::array<ComplexType, 2> B(nz, ne);
-    for (long i = 0; i < nz; ++i)
-      for (long k = 0; k < ne; ++k) B(i, k) = w(k) / (zeta(i) - E(k));
+    if (finite) {
+      for (long i = 0; i < nz; ++i)
+        for (long k = 0; k < ne; ++k) B(i, k) = w(k) * target_finite(zeta(i), E(k));
+    } else {
+      for (long i = 0; i < nz; ++i)
+        for (long k = 0; k < ne; ++k) B(i, k) = w(k) / (zeta(i) - E(k));
+    }
     auto F = detail::matmul(detail::matmul(B, Uc), Vs);
     if (ls_residual) {
       // R = F A_w^T - B with A_w(k, j) = w_k e^{-i E_k t_j}

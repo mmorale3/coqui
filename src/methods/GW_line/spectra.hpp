@@ -71,7 +71,7 @@ inline spectra_out_t line_spectra(boost::mpi3::communicator &comm, nda::array<Co
                                   nda::array<ComplexType, 4> const &Sig_p, nda::array<ComplexType, 4> const &Sig_h,
                                   nda::array<ComplexType, 1> const &zeta, double shift, line_basis_t const &bp,
                                   line_basis_t const &bh, closure_params_t const &p, double nelec,
-                                  spectra_params_t const &sp) {
+                                  spectra_params_t const &sp, closure_thermal_t const *th = nullptr) {
   auto all      = nda::range::all;
   const long nk = Hrel.extent(0), nb = Hrel.extent(1), ne = long(sp.eta.size()), nw = sp.nw;
   const long np = comm.size(), rank = comm.rank();
@@ -94,7 +94,7 @@ inline spectra_out_t line_spectra(boost::mpi3::communicator &comm, nda::array<Co
   for (long ik = rank; ik < nk; ik += np) {
     const long ks = sig_loc ? ik / np : ik;
     nda::array<ComplexType, 3> Sp(Sig_p(ks, all, all, all)), Sh(Sig_h(ks, all, all, all));
-    auto spk = fit_sigma_sectors(bp, bh, zeta, Sp, Sh);
+    auto spk = fit_sigma_closure(bp, bh, zeta, Sp, Sh, th);   // S8b: the thermal total fit in thermal mode
     spk.w -= shift;
     nda::array<ComplexType, 2> H(Hrel(ik, all, all));
     auto ck   = closure_k(H, spk, p);

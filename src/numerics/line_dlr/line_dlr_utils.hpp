@@ -59,6 +59,17 @@ inline nda::array<double, 1> logspace(double a, double b, long n) {
   return y;
 }
 
+/// np.linspace(a, b, n) (y_i = a + i step, y_{n-1} = b), S8b (guarded-ray panels, wedge band)
+inline nda::array<double, 1> linspace(double a, double b, long n) {
+  utils::check(n >= 1, "line_dlr::linspace: n = {}", n);
+  nda::array<double, 1> y(n);
+  if (n == 1) { y(0) = a; return y; }
+  const double step = (b - a) / double(n - 1);
+  for (long i = 0; i < n; ++i) y(i) = double(i) * step + a;
+  y(n - 1) = b;
+  return y;
+}
+
 /// Result of a column-pivoted QR: pivots (0-based, "column l of A P was column piv[l] of A") and |R_ll|.
 struct pivoted_qr_t {
   std::vector<long> piv;
