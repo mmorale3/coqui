@@ -1300,7 +1300,11 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   // state: restart or KS start
   state_t st;
   gw_line_result_t res;
-  const bool restart = prm.restart and std::filesystem::exists(chk);
+  // the decision of the root (S8b.2 fix: evaluated per rank, a slow rank saw the checkpoint the root had just created and
+  // went into read_state while the others wrote it: deadlock with restart = true and no checkpoint at 64 ranks)
+  long restart_l = (comm.root() and prm.restart and std::filesystem::exists(chk)) ? 1 : 0;
+  comm.broadcast_n(&restart_l, 1, 0);
+  const bool restart = restart_l != 0;
   if (prm.restart and not restart) app_log(1, "  restart requested but {} does not exist: starting from the KS poles", chk);
   aux_grid_t grid(mpi, Np);
   propagator_t<MEM> prop(thc, grid);
