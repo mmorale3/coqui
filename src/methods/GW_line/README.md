@@ -357,9 +357,14 @@ plt.show()
   (`qp_diag`, `qp_file`) save <= 1 iteration; the multilevel schedule (`coarse`) ~3% net.
 - Run-to-run floor: the same binary on two nodes differs by ~3e-10 Ha in mu at iteration 3; host CPU types (AMD vs Intel MKL
   code paths) by up to 2e-6 Ha (closure amplification); ranks / GPUs on the same CPU type <= 4e-11 Ha.
-- Convergence in the method parameters: `K`, `wp`, `theta_deg`, `eps`, the k mesh. TODO (S8a, running): the converged-answer
-  study of Si 4x4x4 IBZ (K / theta / eps / wp) will be summarized in notes sec:valid; until then use the defaults, which
-  reproduce CoQui's Matsubara scGW on Si 2x2x2 / 4x4x4 (section 9).
+- Convergence in the method parameters (S8a, notes sec:s8a; Si 4x4x4 IBZ, every setting converged from scratch): the defaults
+  (theta_deg 20, eps 1e-10, K 24, wp 0.11) are within 0.4 meV of the tightest setting (K 40, eps 1e-12) on the gap, 1.2 meV on
+  the band edges at G / X / L and the direct gap, 3 meV on levels 3 eV from the gap, 0.003% on eps_inf; the spread over K 16-40,
+  eps 1e-8..1e-12, theta 20-25, wp 0.08-0.15 is <= 3.4 meV and 0.04%. K = 32 (+8% per iteration) brings the deeper levels below
+  1 meV; theta_deg = 25 or eps = 1e-8 are ~24% cheaper per iteration at <= 1 meV. NOT resolved: the occupied band width (band
+  bottom 13 eV from the Cayley centre; +-0.45 eV with the settings) and the loss-function maximum (set by the optics closure; use
+  its error bar). Do not run the SCF below theta_deg = 20: 17.5 and 15 deg end in a limit cycle (dSigma 1e-3..8e-3); flatter
+  lines are for the one-pass optics only. The k mesh is not part of this study.
 - Spectra resolution near mu: delta_w ~ (pi / K) [(w - mu)^2 + wp^2] / wp; errors outside the window stay at the 10% level
   (notes sec:spectra). For optics, flatter lines (`optics.theta_deg = [10, 5]`) sharpen the spectra at one Pi -> W pass each.
 
@@ -542,8 +547,8 @@ consistency check only, not a reference).
 - Spin-restricted collinear; THC interactions only.
 - Optics: RPA polarization of the self-consistent G (no vertex corrections, no excitons; absorption onset = direct QP gap);
   q -> 0 from the extrapolation of the finite-q heads (variant dependent; the q0_<variant> groups quantify it).
-- Reproducibility of converged gaps +-0.5-1 meV (closure basins, section 6); the converged-answer parameter study (S8a) is in
-  progress.
+- Reproducibility of converged gaps +-0.5-1 meV (closure basins, section 6); parameter convergence (S8a): section 6; the SCF does
+  not converge below theta_deg = 20 (open).
 - Open performance items: the W node path's /dev/shm segments are not in the q-plan memory model and stay allocated through
   Sigma; closure k owners all on node 0 in multi-node runs; the W node path is host-only; the device FFT threshold is modelled,
   not measured.
