@@ -30,7 +30,7 @@ class LineSCGW:
     def __init__(self, X, Z, qk_to_k2, nk, nelec, H0, mu, theta=np.deg2rad(20), eps=1e-8, lam=6.0, bos_lam=4.0, bos_gap=0.02,
                  sig_gap=(0.02, 0.02), g_gap=(0.0, 0.0), wp=0.11, K=24, tol_gram=1e-10, mixing=0.5, verbose=True, k_weight=None,
                  nodes_per_ray=120, node_range=(1e-3, 60.0), beta=None, thermal_tol=1e-8, thermal_floor=30.0, thermal_floor_f=None,
-                 wp_floor=15.0, mu_rule='auto', bos_eps_T=1e-10, qminus=None, wstep=None):
+                 wp_floor=15.0, mu_rule='auto', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
         over node_range (Ha) — dense nodes are what pins the weight distribution of the far poles (dev/tune_sigma_fit.txt).
@@ -54,6 +54,7 @@ class LineSCGW:
         self.beta = beta
         if beta is not None:
             self.thermal_tol, self.thermal_floor, self.wp_floor, self.mu_rule = thermal_tol, thermal_floor, wp_floor, mu_rule
+            self.mu_dn_max, self.mu_th_factor = mu_dn_max, mu_th_factor           # rule "auto" (notes Eq. fT_nth)
             self.thermal_floor_f = thermal_floor if thermal_floor_f is None else thermal_floor_f
             self.qminus = np.asarray(qk_to_k2[:, 0] if qminus is None else qminus)
             self.bosT = BosonicLineBasis(theta, lam=bos_lam, eps=bos_eps_T, gap=0.0)
@@ -87,7 +88,8 @@ class LineSCGW:
             return chemical_potential_T(e, v, self.nk, self.nelec, self.beta, self.k_weight)[0], 'number'
         if self.mu_rule == 'gap':
             return chemical_potential(e, v, self.nk, self.nelec, self.k_weight)[0], 'gap'
-        dmu, rule, _ = chemical_potential_auto(e, v, self.nk, self.nelec, self.beta, self.thermal_tol, self.k_weight)
+        dmu, rule, _ = chemical_potential_auto(e, v, self.nk, self.nelec, self.beta, self.thermal_tol, self.k_weight,
+                                               mu_dn_max=self.mu_dn_max, mu_th_factor=self.mu_th_factor)
         return dmu, rule
 
     def _set_poles_T(self, e, v):

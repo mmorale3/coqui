@@ -104,16 +104,39 @@ def chemical_potential_T(e, v, nk, nelec, beta, k_weight=None, dropped=0.0, tol=
     return mid, Nm + nelec
 
 
-def chemical_potential_auto(e, v, nk, nelec, beta, thermal_tol=1e-8, k_weight=None, dropped=0.0, **kw):
-    """Rule mu_rule = "auto" (notes section 11.6): the widest admissible gap of chemical_potential first; if both its edges
-    lie outside the window around its midpoint (beta * min(e_lumo - mu, mu - e_homo) > c_T = ln(1/thermal_tol)) the midpoint
-    is used (T = 0 equivalent; thermal mode stays off), otherwise N(mu) = N_el (chemical_potential_T).
-    Returns (mu_shift, rule, N(mu)) with rule in {"gap", "number"}."""
-    mu, e_homo, e_lumo, N = chemical_potential(e, v, nk, nelec, k_weight, **kw)
-    if beta is None or beta * min(e_lumo - mu, mu - e_homo) > np.log(1.0 / thermal_tol):
-        return mu, 'gap', N
-    mu, N = chemical_potential_T(e, v, nk, nelec, beta, k_weight, dropped)
-    return mu, 'number', N
+def thermal_carriers(e, v, beta, mu=0.0, k_weight=None):
+    """n_th(mu) of notes Eq. fT_nth: thermal carriers across mu, 2 sum_k w_k [sum_{e > mu} f |v|^2 + sum_{e < mu} (1 - f) |v|^2]."""
+    nk_ = len(e)
+    wk = np.full(nk_, 1.0 / nk_) if k_weight is None else np.asarray(k_weight) / np.sum(k_weight)
+    n = 0.0
+    for k in range(nk_):
+        ek = np.asarray(e[k], float)
+        f = 0.5 * (1.0 - np.tanh(0.5 * beta * (ek - mu)))
+        n += 2.0 * wk[k] * float((np.where(ek > mu, f, 1.0 - f) * (np.abs(v[k]) ** 2).sum(0)).sum())
+    return n
+
+
+def chemical_potential_auto(e, v, nk, nelec, beta, thermal_tol=1e-8, k_weight=None, dropped=0.0, mu_dn_max=0.1,
+                            mu_th_factor=10.0, return_info=False, **kw):
+    """Rule mu_rule = "auto" (notes section 11.6, Eq. fT_nth; revised 2026-10-10): the widest admissible gap of
+    chemical_potential first (midpoint mu_g); dN = N_T(mu_g) - N_el (Eq. fT_mu, thermal count) and n_th(mu_g) (thermal carriers
+    across the gap). The midpoint is used (rule "gap"; dN = the closure's weight deficit) iff |dN| <= mu_dn_max AND
+    |dN| > mu_th_factor n_th(mu_g); otherwise N(mu) = N_el (chemical_potential_T, rule "number"). thermal_tol is unused (kept
+    for the interface; the first version's window condition is the n_th = 0 special case). Reference: dev/s8b_mu_rule.py.
+    Returns (mu_shift, rule, N(mu)) (+ dict(dN, n_th, mu_g, e_homo, e_lumo) with return_info)."""
+    mu_g, e_homo, e_lumo, N = chemical_potential(e, v, nk, nelec, k_weight, **kw)
+    info = dict(mu_g=mu_g, e_homo=e_homo, e_lumo=e_lumo, dN=0.0, n_th=0.0)
+    if beta is None:
+        return (mu_g, 'gap', N, info) if return_info else (mu_g, 'gap', N)
+    dN = electron_count_T(e, v, beta, mu_g, k_weight, dropped) - nelec
+    nth = thermal_carriers(e, v, beta, mu_g, k_weight)
+    info.update(dN=dN, n_th=nth)
+    if abs(dN) <= mu_dn_max and abs(dN) > mu_th_factor * nth:
+        out = (mu_g, 'gap', dN + nelec)
+    else:
+        mu, Nn = chemical_potential_T(e, v, nk, nelec, beta, k_weight, dropped)
+        out = (mu, 'number', Nn)
+    return out + (info,) if return_info else out
 
 
 def compress_sectors(basis_p, basis_h, zeta, e, v, emax=None):
