@@ -836,7 +836,12 @@ TEST_CASE("line_dlr_time_id_build_time", "[numerics][line_dlr][time_id]") {
   CHECK(b.size() == ray.size());
   CHECK(a.sector == sector_t::hole);
   CHECK(max_abs_diff(a.transform_matrix(z), id.transform_matrix(z)) == 0.0);
-  CHECK(max_abs_diff(b.transform_matrix(z), ray.transform_matrix(z)) == 0.0);
+  {   // the same arithmetic in two inlining contexts: gcc's fp-contract (FMA) may differ by an ulp (rusty, S8b.2)
+    auto Fr = ray.transform_matrix(z);
+    double fm = 0.0;
+    for (auto const &x : Fr) fm = std::max(fm, std::abs(x));
+    CHECK(max_abs_diff(b.transform_matrix(z), Fr) <= 1e-15 * fm);
+  }
   // Gram eps-rank (Eq. gram, closed form) vs the QR rank
   // (only where eps^2 is above the double-precision floor of the Gram eigenvalues, ~1e-16 lambda_max)
   for (double eps : {1e-5, 1e-6, 1e-7}) {
