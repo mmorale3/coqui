@@ -81,6 +81,7 @@
 #include "methods/GW_line/ibz.hpp"
 #include "methods/GW_line/head.hpp"
 #include "methods/GW_line/thermal_mu.hpp"
+#include "methods/GW_line/time_grids.hpp"
 
 namespace methods::gw_line {
 
@@ -354,15 +355,22 @@ struct tau_nodes_t {
   long rank = 0;
 };
 
-inline tau_nodes_t make_tau_nodes(thermal_params_t const &tp, double emax, double espread) {
+/// comm (optional): the tau ID is built on its rank 0 and broadcast (bitwise identical nodes on every rank, as the ray grids)
+inline tau_nodes_t make_tau_nodes(thermal_params_t const &tp, double emax, double espread,
+                                  boost::mpi3::communicator *comm = nullptr) {
   tau_nodes_t T;
   using numerics::line_dlr::sector_t;
   if (tp.tau_grid == "id") {
     numerics::line_dlr::time_id_opts_t o;
     o.pad          = 1.25;
     const double En = 2.0 * std::log(1.0 / tp.tau_eps) / tp.beta;   // KMS: E < -En is below tau_eps on [0, beta / 2]
-    auto g         = numerics::line_dlr::time_id_t::finite_interval(std::numbers::pi / 2.0, sector_t::particle, En,
-                                                                     std::max(espread, 2.0 * En), 0.5 * tp.beta, tp.tau_eps, o);
+    numerics::line_dlr::time_id_t g;
+    if (comm == nullptr or comm->rank() == 0)
+      g = numerics::line_dlr::time_id_t::finite_interval(std::numbers::pi / 2.0, sector_t::particle, En, std::max(espread, 2.0 * En),
+                                                         0.5 * tp.beta, tp.tau_eps, o);
+    else
+      g.opts = o;
+    if (comm != nullptr) detail::bcast_time_id(*comm, g, 0);
     T.rank         = g.rank;
     auto gh        = g;
     gh.sector      = sector_t::hole;

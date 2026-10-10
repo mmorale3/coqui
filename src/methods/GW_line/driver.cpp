@@ -1759,7 +1759,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
         sig_p.emplace(tg.sig_p);
         sig_h.emplace(tg.sig_h);
       }
-      taun = make_tau_nodes(tpar, emax_all, 2.0 * emax_all);
+      taun = make_tau_nodes(tpar, emax_all, 2.0 * emax_all, std::addressof(comm));
       app_log(2, "  tau leg: {} nodes on [0, beta / 2] ({}{})", taun.size(), taun.kind,
               taun.kind == "id" ? ", rank " + std::to_string(taun.rank) : std::string(""));
     } else if (prm.time_grid == "gl") {

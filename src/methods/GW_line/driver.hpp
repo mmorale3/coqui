@@ -131,7 +131,7 @@
  *                       (omega_p := max(wp, wp_floor zeta_T)), mu_rule = "auto" ("auto" | "gap" | "number"; mu_dn_max = 0.1,
  *                       mu_th_factor = 10, notes Eq. fT_nth), band_heights = 8, band_x = 21, band_top = 4, mats_factor = 4 (data set
  *                       D), bos_eps_T = 1e-12 (D-selected basis), bos_line_eps = 1e-10 (the line basis of D's line nodes),
- *                       cut_odd = 1e-13, cut_even = 1e-10 (split fit), tau_grid = "gl" | "id", tau_eps = 1e-12 (tau leg),
+ *                       cut_odd = 1e-13, cut_even = 1e-10 (split fit), tau_grid = "id" | "gl", tau_eps = 1e-13 (tau leg),
  *                       spectra.occupation = false, thermal_bases_file (parity: D, nu_b, the Sigma basis injected).
  *                       An iteration is THERMAL iff a pole lies within E_T of mu; otherwise it is the T = 0 code (bitwise).
  *                       Thermal iterations need g_repr = "lehmann"; sigma_gap / bos_gap are not used there (two-sided gapless
@@ -276,8 +276,8 @@ struct gw_line_params_t {
   double bos_eps_T = 1e-12;                     ///< eps_b of the D-selected bosonic basis
   double bos_line_eps = 1e-10;                  ///< eps of the gapless bosonic line basis whose unmasked nodes enter D
   double cut_odd = 1e-13, cut_even = 1e-10;     ///< split pair fit cutoffs
-  std::string tau_grid = "gl";                  ///< tau leg nodes "gl" | "id"
-  double tau_eps = 1e-12;                       ///< tau ID tolerance
+  std::string tau_grid = "id";                  ///< tau leg nodes "id" (finite-interval ID, ~40) | "gl" (composite GL, ~200-250)
+  double tau_eps = 1e-13;                       ///< tau ID tolerance (Pi(q, 0) to 2e-14 with 40 nodes, lih222 beta 200)
   bool spectra_occupation = false;              ///< spectra.occupation: also f(w - mu) A(k, w)
   std::string thermal_bases_file;               ///< parity: D (D_zeta_re/_im), nu_b, sigma_basis_w injected (python reference)
 

@@ -262,8 +262,8 @@ Hartree. "auto" defaults are computed at run time as described.
 | `bos_line_eps` | double | `1e-10` | eps of the gapless bosonic line basis whose unmasked nodes enter D | keep |
 | `cut_odd` | double | `1e-13` | relative SVD cutoff of the odd sector of the split pair fit | keep |
 | `cut_even` | double | `1e-10` | relative SVD cutoff of the even sector | keep |
-| `tau_grid` | string | `"gl"` | tau-leg nodes on [0, beta/2]: `"gl"` (composite GL, ~200-250) / `"id"` (finite-interval ID, ~30-40) | `"id"` for cost |
-| `tau_eps` | double | `1e-12` | tolerance of the tau ID | keep |
+| `tau_grid` | string | `"id"` | tau-leg nodes on [0, beta/2]: `"id"` (finite-interval ID, ~40; Pi(q, 0) to 2e-14) / `"gl"` (composite GL, ~200-250, the python grid) | keep |
+| `tau_eps` | double | `1e-13` | tolerance of the tau ID | keep |
 | `spectra.occupation` | bool | `false` | also write f(w - mu) on the spectra grid (spectra/fermi_w; f A = the occupied spectrum) | finite-T plots |
 | `thermal_bases_file` | string | `""` | parity: D (D_zeta_re/_im, D_kind), nu_b and the two-sided Sigma basis (sigma_basis_w) read from this h5 (the python finite-T SCF reference) | parity tests |
 

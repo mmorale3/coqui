@@ -775,7 +775,9 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   bool thermal_mu = false;
   numerics::line_dlr::chemical_potential_t cp;
   if (th != nullptr) {
-    auto r          = mu_rule_apply(out.leh.e, out.leh.v, nelec, p.k_weight, th->tp);
+    const bool prune = (gr.repr == "lehmann");   // the window ignores the in-gap artefacts that rule (iii) prunes at T = 0
+    auto r          = mu_rule_apply(out.leh.e, out.leh.v, nelec, p.k_weight, th->tp, 0.0, prune ? gr.emin_frac : 0.0,
+                                    prune ? gr.wsmall : 0.0);
     out.mu_rule     = r.rule;
     out.dN          = r.dN;
     out.n_th        = r.n_th;

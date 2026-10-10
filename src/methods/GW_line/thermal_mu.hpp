@@ -62,8 +62,8 @@ struct thermal_params_t {
   double cut_odd = 1e-13, cut_even = 1e-10, deg_tol = 1e-8;
   long tau_nn = 12;
   double tau_per_efold = 2.0, tau_x0 = 0.02;
-  std::string tau_grid = "gl";  ///< "gl" (composite GL, python) | "id" (finite-interval time ID at theta_t = pi / 2)
-  double tau_eps = 1e-12;       ///< tau ID tolerance
+  std::string tau_grid = "id";  ///< "id" (finite-interval time ID at theta_t = pi / 2) | "gl" (composite GL, python)
+  double tau_eps = 1e-13;       ///< tau ID tolerance
   bool mirror_D = true;         ///< D in the mirror layout (when the line nodes allow it)
 
   bool on() const { return beta > 0.0; }
@@ -84,18 +84,29 @@ struct mu_rule_out_t {
   bool window = false;      ///< a pole within E_T of the chosen mu
 };
 
-/// mu_rule (file header) on Lehmann (e, v) per k; window_at: any pole within E_T of mu_g (else T = 0: the midpoint)
+/// mu_rule (file header) on Lehmann (e, v) per k; window_at: any pole within E_T of mu_g (else T = 0: the midpoint).
+/// prune_frac, prune_w: the closure's near-mu pruning rule (iii) (g_emin_frac, g_wsmall): poles it would remove at the gap
+/// midpoint (|e - mu_g| < prune_frac x half gap and weight < prune_w: moment-truncation artefacts inside the gap) do not open
+/// the window, so that an empty-window run stays the T = 0 run (they are pruned there, as at T = 0)
 inline mu_rule_out_t mu_rule_apply(std::vector<nda::array<double, 1>> const &e, std::vector<nda::array<ComplexType, 2>> const &v,
                                    double nelec, std::vector<double> const &k_weight, thermal_params_t const &tp,
-                                   double dropped = 0.0) {
+                                   double dropped = 0.0, double prune_frac = 0.0, double prune_w = 0.0) {
   using namespace numerics::line_dlr;
   mu_rule_out_t r;
   r.gap = chemical_potential(e, v, nelec, k_weight);
-  const double ET = tp.E_T();
+  const double ET = tp.E_T(), e_near = prune_frac > 0.0 ? prune_frac * 0.5 * r.gap.gap : 0.0;
   auto win_at = [&](double mu) {
-    for (auto const &ek : e)
-      for (long m = 0; m < ek.size(); ++m)
-        if (std::abs(ek(m) - mu) <= ET) return true;
+    for (size_t k = 0; k < e.size(); ++k)
+      for (long m = 0; m < e[k].size(); ++m) {
+        const double x = std::abs(e[k](m) - mu);
+        if (x > ET) continue;
+        if (x < e_near) {   // an artefact the pruning (iii) removes?
+          double w = 0.0;
+          for (long i = 0; i < v[k].extent(0); ++i) w += std::norm(v[k](i, m));
+          if (w < prune_w) continue;
+        }
+        return true;
+      }
     return false;
   };
   r.dN   = electron_count_T(e, v, tp.beta, r.gap.mu, k_weight, dropped) - nelec;

@@ -361,6 +361,7 @@ bool run_t12(fx_t &F, double beta, std::string const &time_grid, bool do_t2) {
   tp.thermal_tol = 1e-12;
   tp.theta = 20.0 * deg;
   tp.theta_t = 10.0 * deg;
+  tp.tau_grid = "gl";   // the composite GL tau grid here (python's); the tau ID is checked against it below
   const double ET = tp.E_T();
   utils::TimerManager Timer;
   bool ok = true;
@@ -904,7 +905,8 @@ ptree ft_params(std::string const &out, long niter, double beta, std::string con
   ptree pt;
   pt.put("time_grid", time_grid);
   pt.put("g_repr", "lehmann");
-  if (parity) {   // the prototype keeps every Lehmann pole and cuts the Gram matrix at tol_gram only
+  if (parity) {   // the prototype keeps every Lehmann pole, cuts the Gram matrix at tol_gram only, and its tau grid is GL
+    pt.put("tau_grid", "gl");
     pt.put("g_emax", 1e4);
     pt.put("g_wtol", 0.0);
     pt.put("g_emin_frac", 0.0);
