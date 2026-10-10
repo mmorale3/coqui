@@ -920,6 +920,39 @@ TEST_CASE("gw_line_dump_lih223", "[.gw_line_dump_lih223]") {
   app_log(1, "wrote {} (Np {}) and system.h5 (mu0 {:.8f}, nelec {})", fthc, thc.Np(), 0.5 * (homo + lumo), mf->nelec());
 }
 
+/// S8c.0 (metals go/no-go): the THC of the SrVO3 fixture svo_kp222_nbnd40 (2x2x2 force_symmorphic, 40 bands, 41 e) for the
+/// FULL-BZ python prototype: QE xml reader with the q symmetry disabled (no_q_sym: Z(q) for all 8 q; the k symmetry is kept,
+/// X(k) of every full-BZ k from the rotated IBZ orbitals, as in every symmetric-fixture run), nIpts = 8 nbnd, and its
+/// system.h5 (KS eigenvalues of all k, qk_to_k2, nelec; mu0 = mid band-ordered "gap", unused for a metal) -> svo222_thc/,
+/// read by coqui/cayley/scripts/gen_finiteT_ref.py svo222 and the go/no-go study. Run once on 1 rank:
+/// test_gw_line_scf "[.gw_line_dump_svo222]".
+TEST_CASE("gw_line_dump_svo222", "[.gw_line_dump_svo222]") {
+  auto mpi = utils::make_unit_test_mpi_context();
+  const std::string qedir = std::string(PROJECT_SOURCE_DIR) + "/tests/unit_test_files/qe/svo_kp222_nbnd40/out/";
+  auto mf = std::make_shared<mf::MF>(mf::qe::qe_readonly(mf::qe::read_xml(mpi, qedir, "svo", -1, true)));
+  REQUIRE(mf->nqpts_ibz() == mf->nqpts());
+  if (mpi->comm.root()) std::filesystem::create_directories(gw_line_dir() + "svo222_thc");
+  mpi->comm.barrier();
+  const std::string fthc = gw_line_dir() + "svo222_thc/thc.eri.h5";
+  methods::thc_reader_t thc(
+      mf, methods::make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", fthc, "bdft", 1e-10, mf->ecutrho(), 1, 1024));
+  // H0 (IBZ k) from the h5 fixture qe_svo222_sym (its pseudopotential data are in svo.coqui.h5; the xml route lacks VKB)
+  auto mfh = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_svo222_sym"));
+  auto H0  = one_body_h0(*mfh);
+  const long nk = mf->nkpts(), nb = mf->nbnd(), nocc = long(std::llround(double(mf->nelec()) / 2.0));
+  double homo = -1e300, lumo = 1e300, de = 0.0;
+  for (long ik = 0; ik < nk; ++ik)
+    for (long n = 0; n < nb; ++n) {
+      (n < nocc ? homo : lumo) = (n < nocc) ? std::max(homo, mf->eigval()(0, ik, n)) : std::min(lumo, mf->eigval()(0, ik, n));
+      de = std::max(de, std::abs(mf->eigval()(0, ik, n) - mfh->eigval()(0, ik, n)));
+    }
+  REQUIRE(de < 1e-10);
+  write_system_h5(mpi->comm, gw_line_dir() + "svo222_thc/system.h5", *mf, thc.Np(), H0, 0.5 * (homo + lumo), true);
+  mpi->comm.barrier();
+  app_log(1, "wrote {} (Np {}, nk {} / ibz {}, nq {} / ibz {}) and system.h5 (nelec {})", fthc, thc.Np(), nk, mf->nkpts_ibz(),
+          mf->nqpts(), mf->nqpts_ibz(), mf->nelec());
+}
+
 namespace {
 void restart_test(std::string const &tg, std::string const &gr = "compressed") {
   lih_t L;
