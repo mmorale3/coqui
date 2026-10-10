@@ -20,5 +20,17 @@ Modules (`cayley/`):
 - `coqui_io.py`  readers for CoQui `*.mbpt.h5` checkpoints and `*.thc.h5` files.
 - `casida_g0w0.py` exact G0W0 Σ_c pole structure from a Casida RPA solution in the THC basis (exact moments, exact
                  reference spectra on small k-meshes).
+- `finite_t.py`  finite-temperature oracles (S8b, notes section 11), independent of the line code: finite-T transition sum
+                 for Pi(q, zeta), the imaginary-time (Matsubara) route for Pi(q, i nu_n), finite-T Casida W, Eq. fT_sigma from the
+                 exact Casida poles (values and Cayley moments), the Matsubara nu_0 term, KS mu_0 ("auto" rule).
+- `line/`        the line scGW prototype (`thc_gw.py` kernels, `timeray.py`, `line_dlr.py` bases, `closure.py`, `driver.py`).
+                 Finite T: `LineGW.set_poles(e, v, beta=B, thermal_tol=1e-8, thermal_floor=30)` builds the thermal sector lists
+                 (window poles in both sectors with (1-f)/f residues), the guarded rays (s <= beta/sin theta_t) and the node
+                 floor; `sigma()` adds the Bose-weighted W(t) terms; `closure.chemical_potential_T / _auto`, `fit_sigma_total`,
+                 `wp_thermal`. beta=None (default) runs the T = 0 code unchanged (bitwise).
+                 NOTE (S8b.1): the bosonic fit restricted to the unmasked nodes does NOT determine W below zeta_T, and Sigma_c
+                 at every node depends on it (progress entry "S8b.1"); the line Sigma_c matches Eq. fT_sigma to 1e-10 only
+                 with W known on all nodes.
 
-Tests: `tests/` (run `python3 -m pytest tests` or the files directly). Scripts: `scripts/`.
+Tests: `tests/` (run `python3 -m pytest tests` or the files directly). Scripts: `scripts/` (finite-T references for the C++
+tests: `scripts/gen_finiteT_ref.py <lih222|lih223>`; finite-T Casida: `scripts/make_casida.py ... --beta B`).

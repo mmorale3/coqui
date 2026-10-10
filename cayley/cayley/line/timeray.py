@@ -6,9 +6,14 @@ import numpy as np
 
 
 class TimeRay:
-    def __init__(self, theta_t, smax, smin=1e-5, per_efold=3, nn=16, sector='>'):
+    def __init__(self, theta_t, smax, smin=1e-5, per_efold=3, nn=16, sector='>', hmax=None):
+        """hmax (finite T, S8b): optional largest panel width in s; wider log panels are split evenly (the guarded rays of
+        finite T end at S_T = beta/sin(theta_t) where window-window pairs still oscillate with |E| <= 2 E_T). None = T = 0 rule."""
         xg, wg = np.polynomial.legendre.leggauss(nn)
         edges = np.concatenate([[0.0], np.exp(np.linspace(np.log(smin), np.log(smax), int(np.log(smax / smin) * per_efold) + 2))])
+        if hmax is not None:
+            edges = np.concatenate([[edges[0]]] + [np.linspace(a, b, int(np.ceil((b - a) / hmax)) + 1)[1:]
+                                                     for a, b in zip(edges[:-1], edges[1:])])
         s = ((edges[1:] + edges[:-1]) / 2)[:, None] + (edges[1:] - edges[:-1])[:, None] / 2 * xg[None, :]
         w = (edges[1:] - edges[:-1])[:, None] / 2 * wg[None, :]
         self.s, self.ws = s.ravel(), w.ravel()
@@ -21,6 +26,11 @@ class TimeRay:
     def for_spectrum(cls, theta_t, emin, decades=40.0, **kw):
         """smax from the smallest |pole energy| emin: e^{-emin smax sin(theta_t)} = e^{-decades}."""
         return cls(theta_t, decades / (emin * np.sin(theta_t)), **kw)
+
+    @classmethod
+    def guarded(cls, theta_t, beta, **kw):
+        """Finite-T ray truncated at the beta guard S_T = beta/sin(theta_t) (notes Eq. fT_guard): Im t = -tau in [0, beta]."""
+        return cls(theta_t, beta / np.sin(theta_t), **kw)
 
     def exponentials(self, E):
         """e^{-i E t} for pole energies E (np,) -> (nt, np)."""

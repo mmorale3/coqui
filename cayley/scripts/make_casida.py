@@ -1,10 +1,44 @@
 #!/usr/bin/env python3
 """Exact RPA (Casida) solution per q in the THC basis for a CoQui run: writes casida_q{iq}.npz (lam, alpha, bet, fp) compatible
 with cayley.casida_g0w0 (same construction as the user's real_axis_GW/scripts/si_pipeline.py::casida_q, T=0 occupations).
-Usage: make_casida.py <chkpt.mbpt.h5> <thc.h5> <outdir>"""
-import sys, os, time, numpy as np
+Usage: make_casida.py <chkpt.mbpt.h5> <thc.h5> <outdir>
+       make_casida.py <chkpt.mbpt.h5 | system.h5> <thc.h5> <outdir> --beta B [--mu0 M] [--thermal-tol 1e-8] [--deg-tol 1e-8]
+--beta (S8b, notes section 11): finite-T Casida (cayley.finite_t): every pair (n at k, m at k-q) with E = e_m - e_n != 0
+  (|E| >= deg_tol; degenerate pairs are the Matsubara nu_0 term, not part of the analytic W), sg = sign(E), columns scaled by
+  sqrt|f(e_n) - f(e_m)|; mu0 from the KS "auto" rule (gap midpoint if beta * half-gap > ln(1/thermal_tol), else N(mu0) = N_el)
+  unless --mu0. Checked against the Dyson W of the finite-T transition sum at i nu_n (n = 1, 2, 5) and at generic points.
+  A system.h5 (GW_line test dump: system/eigval, qk_to_k2, mu0, nelec) can replace the checkpoint."""
+import sys, os, time, numpy as np, h5py
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from cayley.coqui_io import Checkpoint, THC
+if '--beta' in sys.argv:
+    from cayley import finite_t as ft
+    opt = lambda nm, d: float(sys.argv[sys.argv.index(nm) + 1]) if nm in sys.argv else d
+    beta, ttol, dtol = opt('--beta', None), opt('--thermal-tol', 1e-8), opt('--deg-tol', 1e-8)
+    thc = THC(sys.argv[2]); out = sys.argv[3]; os.makedirs(out, exist_ok=True)
+    with h5py.File(sys.argv[1], 'r') as f:
+        if 'system' in f:
+            s = f['system']; eig = np.array(s['eigval']); qk = np.array(s['qk_to_k2']); nelec = float(s['nelec'][()])
+        else:
+            ck = Checkpoint(sys.argv[1]); eig = ck.eig[0]; qk = ck.qk_to_k2; nelec = None
+    if '--mu0' in sys.argv: mu0, rule = opt('--mu0', None), 'given'
+    elif nelec is None: mu0, rule = ck.mu[0], 'checkpoint'
+    else: mu0, rule = ft.mu0_auto(eig, nelec, beta, ttol)
+    X = thc.X[0]; Z = thc.Z; nk, nb, Np = eig.shape[0], eig.shape[1], thc.Np; e = eig - mu0
+    print(f"finite-T Casida: nk={nk} nb={nb} Np={Np} beta={beta} mu0={mu0:.10f} ({rule})")
+    for iq in range(nk):
+        t0 = time.time()
+        tr = ft.transitions(X, e, qk, iq, beta, deg_tol=dtol)
+        lam, alpha, bet, info = ft.casida_from_transitions(tr, Z[iq])
+        zs = np.concatenate([1j * 2 * np.pi * np.array([1, 2, 5]) / beta, [0.1j, 1j, 10j, 0.05 + 0.3j]])
+        Wd = ft.dyson_w(Z[iq], ft.pi_transition(tr, zs)); Wc = ft.casida_w(lam, alpha, bet, zs)
+        err = np.max(np.abs(Wd - Wc)) / np.max(np.abs(Wd))
+        fp = np.array([Np, nb, nk, np.abs(Z[iq]).sum(), np.abs(Z[iq][0]).sum(), np.abs(X).sum(), np.abs(X[:, -1]).sum(), eig.sum(), mu0])
+        np.savez(f"{out}/casida_q{iq}.npz", fp=fp, lam=lam, alpha=alpha, bet=bet, imlam=info['imlam'], condR=info['condR'],
+                 iwrel=err, beta=beta, mu0=mu0, ndeg=len(tr['wd']))
+        print(f"q={iq}: Nt={info['Nt']} (degenerate {len(tr['wd'])}) |Im lam|max={info['imlam']:.1e} min|lam|={np.min(np.abs(lam)):.2e} "
+              f"Casida-vs-Dyson {err:.1e}  [{time.time()-t0:.0f}s]", flush=True)
+    sys.exit(0)
 ck = Checkpoint(sys.argv[1]); thc = THC(sys.argv[2]); out = sys.argv[3]; os.makedirs(out, exist_ok=True)
 X = thc.X[0]; Z = thc.Z; eig = ck.eig[0]; mu0 = ck.mu[0]; nk, nb, Np = ck.nk, ck.nb, thc.Np
 e = eig - mu0; occ = e < 0
