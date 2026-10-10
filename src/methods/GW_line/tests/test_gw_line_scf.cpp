@@ -45,7 +45,7 @@
  *   (bitwise mu, poles, F, Sigma); the head group scf_line/iter<N>/head/ (shapes, eps_inf, h0 at the nodes = the
  *   extrapolated residue function at the nodes); F(iter0) gygi - F(iter0) ignore_g0 = -madelung D_KS; iteration-1 Sigma
  *   gygi - ignore_g0 = the head term (positive: its anti-Hermitian part at the nodes has a definite sign per sector).
- * [examples] (S8d) every src/methods/GW_line/examples/*.toml parsed (InputParser -> [gw_line] -> gw_line_params_t::from_ptree, no
+ * [examples] (S8d) every .toml file of src/methods/GW_line/examples parsed (InputParser -> [gw_line] -> gw_line_params_t::from_ptree, no
  *   exception, a few expected values); lih222_smoke.toml run end-to-end on the fixture ([mean_field] / [interaction] blocks
  *   of the file, paths relative to tests/unit_test_files) and the checkpoint groups / datasets of the README section 4 checked.
  * [.time_id_poles] (hidden diagnostic) kernels on the poles of a checkpoint iteration (GW_LINE_DIAG_FILE, GW_LINE_DIAG_ITER):
