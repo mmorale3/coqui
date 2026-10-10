@@ -23,6 +23,10 @@ Modules (`cayley/`):
 - `finite_t.py`  finite-temperature oracles (S8b, notes section 11), independent of the line code: finite-T transition sum
                  for Pi(q, zeta), the imaginary-time (Matsubara) route for Pi(q, i nu_n), finite-T Casida W, Eq. fT_sigma from the
                  exact Casida poles (values and Cayley moments), the Matsubara nu_0 term, KS mu_0 ("auto" rule).
+- `metal.py`     S8c helpers (oracles, no line code): finite-T Casida through the Hermitian form of the RPA problem (+ disk
+                 cache), Eq. fT_sigma values / Cayley moments in blocked gemm form (+ a binned copy for dense real-axis grids),
+                 `upfold_block_fast` (same realization and phase objective as `upfold_block`, no eigensolve per phase), the PH
+                 asymmetry max|Pi - Pi^T|/max|Pi|. Metals go/no-go study: `dev/s8c_gonogo.py` (progress entry "S8c.0").
 - `line/`        the line scGW prototype (`thc_gw.py` kernels, `timeray.py`, `line_dlr.py` bases, `closure.py`, `driver.py`).
                  Finite T: `LineGW.set_poles(e, v, beta=B, thermal_tol=1e-8, thermal_floor=30)` builds the thermal sector lists
                  (window poles in both sectors with (1-f)/f residues), the guarded rays (s <= beta/sin theta_t) and the node
@@ -33,4 +37,4 @@ Modules (`cayley/`):
                  with W known on all nodes.
 
 Tests: `tests/` (run `python3 -m pytest tests` or the files directly). Scripts: `scripts/` (finite-T references for the C++
-tests: `scripts/gen_finiteT_ref.py <lih222|lih223>`; finite-T Casida: `scripts/make_casida.py ... --beta B`).
+tests: `scripts/gen_finiteT_ref.py <lih222|lih223>`; svo222: `scripts/gen_metal_ref.py casida|ref|merge svo222 ...`; finite-T Casida: `scripts/make_casida.py ... --beta B`).
