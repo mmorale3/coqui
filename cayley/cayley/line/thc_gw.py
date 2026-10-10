@@ -26,10 +26,31 @@ truncated transform T_S (Eq. fT_TS). Pi and Sigma use the same formulas with the
 window poles nu_j <= E_T (Eq. fT_W, both terms, both legs); the bosonic fit uses only the nodes with rho B |zeta| >= c_zeta
 (Eq. fT_floor, rho = sin(theta - theta_t)/sin(theta_t)). Thermal mode is active iff some window is non-empty; otherwise
 (beta None or an empty window) every method runs the T = 0 code unchanged (bitwise).
+W step at finite T (S8b redesign, notes section 11.5 sec:fT_W; parameters in self.wstep, defaults WSTEP_DEFAULTS):
+  bosonic data set D = bos_data() = unmasked line nodes of self.bos (kind 0) U wedge band (kind 1: band_heights x band_x points,
+  heights v = y cos(theta_t) - |x| sin(theta_t) log-spaced in [d0, band_top zeta_T sin(theta)], d0 = c_band sin(theta_t)/beta,
+  c_band = thermal_floor) U {i nu_n, n = 1..ceil(mats_factor zeta_T beta/2 pi)} (kind 2) U {nu_0 = 0} (kind 3). Pi at kinds 0-2
+  from the guarded ray products (extra transform columns), Pi(q, 0) in the DYNAMIC convention from the tau leg pi_tau_leg()
+  (imaginary-time products with all poles weighted f e^{e tau} / (1-f) e^{-e tau}, bounded on [0, beta], minus the exactly
+  degenerate pairs). Basis self.bos_w = BosonicLineBasis.from_data(D) (eps_b), W by Dyson at every point of D, residues by the
+  decoupled odd/even fit (fit_split, cut_odd / cut_even); w(q) and w(-q) from ONE joint solve (w_step()). sigma() in thermal
+  mode uses the poles of self.bos_w unless nu is given.
 """
 import numpy as np
-from .timeray import TimeRay
+from .timeray import TimeRay, tau_grid
 from .line_dlr import LineBasis, BosonicLineBasis
+
+WSTEP_DEFAULTS = dict(
+    band_heights=8, band_x=21,     # wedge band B: heights x points per height (168 points)
+    band_c=None,                   # d0 = band_c sin(theta_t)/beta at the band bottom; None = thermal_floor (c_zeta)
+    band_top=4.0,                  # top height / x extent: band_top * zeta_T * sin(theta)
+    mats_factor=4.0,               # N_M = ceil(mats_factor zeta_T beta/(2 pi)) Matsubara points i nu_n, n >= 1
+    lam_b=None,                    # candidate pole range [1e-4 lam_b, lam_b] of the data-selected basis; None = self.bos.lam
+    eps_b=1e-12, npole_b=800,      # pivoted-QR tolerance / candidate count of BosonicLineBasis.from_data
+    cut_odd=1e-13, cut_even=1e-10, # relative SVD cutoffs of the odd / even sectors of fit_split
+    deg_tol=1e-8,                  # |e_n(k) - e_m(k-q)| below which a pair is degenerate (excluded from the dynamic Pi(q, 0))
+    tau_nn=12, tau_per_efold=2.0, tau_x0=0.02,   # tau-leg grid: composite GL, nn points per panel, log panels from x0/E_max
+)
 
 
 def fermi(e, beta):
@@ -60,7 +81,8 @@ def node_floor_mask(zeta, beta, theta, theta_t, c_zeta=30.0):
 
 
 class LineGW:
-    def __init__(self, X, Z, qk_to_k2, nk, mu, theta, theta_t, bos_basis, ferm_zeta, t_chunk=8, ray_decades=36.0, ray_kw=None):
+    def __init__(self, X, Z, qk_to_k2, nk, mu, theta, theta_t, bos_basis, ferm_zeta, t_chunk=8, ray_decades=36.0, ray_kw=None,
+                 wstep=None):
         """X: (nk, Np, nb) THC collocation; Z: (nq, Np, Np); qk_to_k2[iq, ik] = index of k - q; mu: absolute centre.
         bos_basis: BosonicLineBasis (mu-relative); ferm_zeta: mu-relative fermionic line nodes for Sigma/G.
         The time rays are built per call from the current pole spectrum (smallest |e_m| sets s_max)."""
@@ -70,6 +92,8 @@ class LineGW:
         self.bos, self.fz = bos_basis, np.asarray(ferm_zeta, complex)
         self.t_chunk, self.ray_decades, self.ray_kw = t_chunk, ray_decades, (ray_kw or {})
         self.poles = None
+        self.wstep = dict(WSTEP_DEFAULTS, **(wstep or {}))               # finite-T W step parameters (module docstring)
+        self.bos_w, self._wkey = None, None
 
     # ---------------------------------------------------------------- pole data
     def set_poles(self, e, v=None, coef=None, beta=None, thermal_tol=1e-8, thermal_floor=30.0, ray_kw_T=None):
@@ -118,16 +142,50 @@ class LineGW:
         kw.update(ray_kw_T or {})
         self.ray_p = TimeRay.guarded(self.theta_t, beta, sector='>', **kw)
         self.ray_h = TimeRay.guarded(self.theta_t, beta, sector='<', **kw)
+        # bosonic data set D and the basis selected on it: depend on beta / floor / line nodes / wstep only (not on the poles)
+        key = (beta, self.thermal_floor, tuple(sorted(self.wstep.items())), id(self.bos), len(self.bos.zeta))
+        if key != self._wkey:
+            self.zD, self.kD = self.bos_data()
+            ws = self.wstep
+            self.bos_w = BosonicLineBasis.from_data(self.theta, self.zD, self.bos.lam if ws['lam_b'] is None else ws['lam_b'],
+                                                    eps=ws['eps_b'], npole=ws['npole_b'])
+            self._wkey = key
+        # tau-leg grid (pi_tau_leg): graded composite GL on [0, beta], decay scale 1/E_max of the current poles
+        emax = float(np.abs(e[np.abs(e) < 1e5]).max())
+        self.tau, self.wtau = tau_grid(beta, emax, nn=self.wstep['tau_nn'], per_efold=self.wstep['tau_per_efold'],
+                                       x0=self.wstep['tau_x0'])
 
     def window_counts(self):
         """Number of window poles per k (thermal mode), zeros otherwise."""
         return self.win.sum(1) if self.thermal else np.zeros(self.poles[0].shape[0], int)
 
     def bos_nodes(self):
-        """Bosonic nodes used for Dyson + fit: all basis nodes at T = 0, the unmasked ones (rho beta |zeta| >= c_zeta) in
-        thermal mode."""
-        z = self.bos.zeta
-        return z if not self.thermal else z[node_floor_mask(z, self.beta, self.theta, self.theta_t, self.thermal_floor)]
+        """Bosonic points used for Dyson + fit: all basis nodes at T = 0; in thermal mode the data set D of bos_data()
+        (unmasked line nodes, wedge band, i nu_n, nu_0 = 0)."""
+        return self.bos.zeta if not self.thermal else self.zD
+
+    def bos_data(self):
+        """Bosonic data set D of the finite-T W step (notes section 11.5(a)) as (z (nD,), kind (nD,) int8):
+        kind 0 = line nodes of self.bos with rho beta |zeta| >= c_zeta; 1 = wedge band (heights v = y cos(theta_t) - |x| sin(theta_t)
+        log-spaced in [d0, vtop], d0 = c_band sin(theta_t)/beta, vtop = band_top zeta_T sin(theta); at each height band_x values of
+        x in [-xm, xm], xm = |vtop cos(theta_t) - v|/sin(theta_t), y = (v + |x| sin(theta_t))/cos(theta_t); symmetric under
+        z -> -conj(z)); 2 = i nu_n, n = 1..N_M; 3 = nu_0 (z = 0, from the tau leg)."""
+        ws, beta, tht = self.wstep, self.beta, self.theta_t
+        zT = self.thermal_floor / (thermal_rho(self.theta, tht) * beta)
+        zl = self.bos.zeta[node_floor_mask(self.bos.zeta, beta, self.theta, tht, self.thermal_floor)]
+        cb = self.thermal_floor if ws['band_c'] is None else ws['band_c']
+        d0 = cb * np.sin(tht) / beta; vtop = ws['band_top'] * zT * np.sin(self.theta)
+        band = []
+        for v in np.exp(np.linspace(np.log(d0), np.log(vtop), ws['band_heights'])):
+            xm = abs(vtop * np.cos(tht) - v) / np.sin(tht)
+            xs = np.linspace(-xm, xm, ws['band_x']); xs = 0.5 * (xs - xs[::-1])          # exactly symmetric: z -> -conj(z)
+            for x in xs:
+                band.append(x + 1j * (v + abs(x) * np.sin(tht)) / np.cos(tht))
+        nm = int(np.ceil(ws['mats_factor'] * zT * beta / (2 * np.pi)))
+        zm = 2j * np.pi * np.arange(1, nm + 1) / beta
+        z = np.concatenate([zl, np.array(band), zm, [0j]])
+        kind = np.concatenate([np.zeros(len(zl)), np.ones(len(band)), np.full(nm, 2), [3]]).astype(np.int8)
+        return z, kind
 
     def bose_weights(self, nu):
         """n_j on the window (nu_j <= E_T), 0 beyond (n < thermal_tol there) and at T = 0."""
@@ -175,8 +233,16 @@ class LineGW:
         with sum_m R~_m,PQ e^{+i e_m t} = conj(G~(k, conj t))_QP and conj(R~_m,PQ) e^{-i e_m t} = G~(k, t)_QP (Hermitian residues),
         and Pi^{>/<}(zeta) = -i int_0^inf dt e^{i zeta t} Pi^{>/<}(t).
         Thermal mode: the same products with the thermal lists on the guarded rays (Eq. fT_pi up to the end-point terms of
-        Eq. fT_floor); default nodes = the unmasked bosonic nodes."""
+        Eq. fT_floor; exact on the wedge Eq. fT_wedge); default points = the data set D; points zeta == 0 (nu_0, outside the
+        wedge) are taken from the tau leg in the dynamic convention (pi_tau_leg)."""
         zeta = self.bos_nodes() if zeta is None else np.asarray(zeta, complex)
+        if self.thermal and np.any(zeta == 0):
+            out = np.zeros((len(zeta), self.Np, self.Np), complex)
+            z0 = zeta == 0
+            if (~z0).any(): out[~z0] = self.polarization(iq, zeta[~z0])
+            PiM, dPi = self.pi_tau_leg(iq, [0])
+            out[z0] = PiM[0] - dPi
+            return out
         out = np.zeros((len(zeta), self.Np, self.Np), complex)
         for sector, ray, sign in (('>', self.ray_p, 1.0), ('<', self.ray_h, -1.0)):
             s_k, s_kmq = ('<', '>') if sector == '>' else ('>', '<')        # occupation of the state at k / at k-q
@@ -192,6 +258,60 @@ class LineGW:
                 out += (F[:, i0:i0 + self.t_chunk] @ acc.reshape(acc.shape[0], -1)).reshape(-1, acc.shape[1], acc.shape[2])
         return out
 
+    def gtilde_tau(self, ik, tau, kind):
+        """Imaginary-time factors of the tau leg with ALL poles (no window truncation; every factor bounded by 1 on [0, beta]):
+        kind 'h': X(k) [sum_m f_m e^{+e_m tau} coef_m] X(k)^dag  (= G~(k, -tau));
+        kind 'p': X(k) [sum_m (1 - f_m) e^{-e_m tau} coef_m] X(k)^dag  (= -G~(k, tau)); (ntau, Np, Np). Weights in log form."""
+        e, coef = self.poles
+        ek = np.asarray(e[ik], float); tau = np.asarray(tau, float)
+        if kind == 'h':
+            lw = -np.logaddexp(0.0, self.beta * ek)[None, :] + ek[None, :] * tau[:, None]
+        else:
+            lw = -np.logaddexp(0.0, -self.beta * ek)[None, :] - ek[None, :] * tau[:, None]
+        ph = np.exp(lw)
+        Gt = (ph @ coef[ik].reshape(ph.shape[1], -1)).reshape(ph.shape[0], self.nb, self.nb)
+        Xk = self.X[ik]
+        return (Xk @ Gt) @ Xk.conj().T
+
+    def pi_tau_dpi(self, iq):
+        """Degenerate-pair term of the tau leg at nu_0: the tau integral of the pairs (n at k, m at k-q) with |e_n - e_m| <
+        deg_tol, -(2/Nk) sum f_n (1 - f_m) phi_nm [X c_n X^dag]_PQ [X c_m X^dag]_QP, phi = int_0^beta e^{(e_n - e_m) tau} dtau
+        (= beta for an exact degeneracy). Pi^Mats(q, i nu_0) - this = Pi^an(q, 0), the dynamic (retarded) convention of the
+        line (exactly degenerate pairs carry no weight there; finite_t.pi_nu0_extra is the KS oracle of this term)."""
+        e, coef = self.poles; beta, tol = self.beta, self.wstep['deg_tol']
+        out = np.zeros((self.Np, self.Np), complex)
+        for ik in range(self.nk):
+            ikmq = self.qk[iq, ik]
+            en, em = np.asarray(e[ik], float), np.asarray(e[ikmq], float)
+            Ed = en[:, None] - em[None, :]
+            nn_, mm_ = np.nonzero(np.abs(Ed) < tol)
+            for n, m in zip(nn_, mm_):
+                x = Ed[n, m]
+                phi = beta if x == 0.0 else np.expm1(beta * x) / x
+                w = np.exp(-np.logaddexp(0.0, beta * en[n]) - np.logaddexp(0.0, -beta * em[m])) * phi
+                if w == 0.0: continue
+                A = self.X[ik] @ coef[ik][n] @ self.X[ik].conj().T
+                B = self.X[ikmq] @ coef[ikmq][m] @ self.X[ikmq].conj().T
+                out += w * (A * B.T)
+        return -(2.0 / self.nk) * out
+
+    def pi_tau_leg(self, iq, n_list=(0,), chunk=32):
+        """tau leg of the finite-T W step (notes section 11.5(a)): Pi(q, i nu_n) in the MATSUBARA convention by the tau quadrature
+        of Pi(q, tau)_PQ = -(2/Nk) sum_k [gtilde_tau(k, 'h')]_PQ [gtilde_tau(k-q, 'p')]_QP on the grid (self.tau, self.wtau)
+        (bounded products, KMS), and the degenerate-pair term dPi of nu_0 (pi_tau_dpi). Returns (PiM (len(n_list), Np, Np), dPi);
+        the dynamic Pi(q, 0) of the data set is PiM[n = 0] - dPi. Oracle: finite_t.pi_matsubara_tau / pi_nu0_extra."""
+        nus = 2 * np.pi * np.asarray(n_list, float) / self.beta
+        out = np.zeros((len(nus), self.Np, self.Np), complex)
+        for i0 in range(0, len(self.tau), chunk):
+            tt, wt = self.tau[i0:i0 + chunk], self.wtau[i0:i0 + chunk]
+            acc = np.zeros((len(tt), self.Np, self.Np), complex)
+            for ik in range(self.nk):
+                acc += self.gtilde_tau(ik, tt, 'h') * np.transpose(self.gtilde_tau(self.qk[iq, ik], tt, 'p'), (0, 2, 1))
+            acc *= -2.0 / self.nk
+            ph = np.exp(1j * nus[:, None] * tt[None, :]) * wt[None, :]
+            out += (ph @ acc.reshape(len(tt), -1)).reshape(len(nus), self.Np, self.Np)
+        return out, self.pi_tau_dpi(iq)
+
     def dyson_w(self, iq, Pi):
         """W(q, zeta_i) = ([1 - Z Pi]^-1 - 1) Z for each node; (nz, Np, Np)."""
         Z = self.Z[iq]; I = np.eye(self.Np)
@@ -200,17 +320,42 @@ class LineGW:
     def screened_interaction(self, iq, Pi=None, W_minus=None):
         """Residues w_j(q) (r, Np, Np) of the symmetric real-pole fit of W(q) on the bosonic nodes; also returns W at the nodes.
         W_minus: W(-q) at the nodes (required for q != -q, see the module docstring); None = self-inverse q.
-        Thermal mode: Dyson and fit on the unmasked nodes bos_nodes() only (Pi, W_minus given there)."""
+        Thermal mode: Dyson at every point of the data set D (bos_nodes(); Pi, W_minus given there), residues on the D-selected
+        basis self.bos_w by the decoupled odd/even fit (w(q) of the joint solve; w_step() keeps w(-q) of the same solve)."""
         z = self.bos_nodes()
         if Pi is None: Pi = self.polarization(iq, z)
         W = self.dyson_w(iq, Pi)
+        if self.thermal:
+            ws = self.wstep
+            return self.bos_w.fit_split(z, W, W_minus=W_minus, cut_odd=ws['cut_odd'], cut_even=ws['cut_even'])[0], W
         return self.bos.fit(z, W, W_minus=W_minus), W
+
+    def w_step(self, qminus, Pi=None):
+        """Residues of W for every q (list of (r, Np, Np)) and W at the bosonic points (list), Pi optional (list over q at
+        bos_nodes()). Thermal mode: Pi on D (rays + tau leg), Dyson on D, fit_split on self.bos_w with w(q) and w(-q) taken from
+        the ONE joint solve of each pair (q, -q). T = 0: screened_interaction per q (W_minus for q != -q)."""
+        z = self.bos_nodes()
+        if Pi is None: Pi = [self.polarization(iq, z) for iq in range(self.nk)]
+        W = [self.dyson_w(iq, Pi[iq]) for iq in range(self.nk)]
+        wres = [None] * self.nk
+        ws = self.wstep
+        for iq in range(self.nk):
+            if wres[iq] is not None: continue
+            qm = qminus[iq]
+            if not self.thermal:
+                wres[iq] = self.bos.fit(z, W[iq], W_minus=None if qm == iq else W[qm])
+                continue
+            w, wm = self.bos_w.fit_split(z, W[iq], W_minus=None if qm == iq else W[qm], cut_odd=ws['cut_odd'], cut_even=ws['cut_even'])
+            wres[iq] = w
+            if qm != iq: wres[qm] = wm
+        return wres, W
 
     # ---------------------------------------------------------------- self-energy
     def sigma(self, ik, wres, zeta=None, qminus=None, nu=None):
         """Sigma_c(k, zeta)_ab (nz, nb, nb), zeta mu-relative (default fermionic nodes); wres: list over q of residues (r, Np, Np).
         qminus: index of -q per q (the hole sector uses w(-q)^T); None = every q self-inverse.
-        nu: optional list over q of the positive pole energies of wres[q] (default: self.bos.nu for every q).
+        nu: optional list over q of the positive pole energies of wres[q] (default: self.bos.nu for every q at T = 0, the
+        D-selected basis self.bos_w.nu in thermal mode).
         Thermal mode: Eq. fT_W on the guarded rays,
           W^>(q,t) = sum_j (1+n_j) w_j(q) e^{-i nu_j t} + sum_win n_j w_j(-q)^T e^{+i nu_j t},
           W^<(q,t) = -sum_j (1+n_j) w_j(-q)^T e^{+i nu_j t} - sum_win n_j w_j(q) e^{-i nu_j t},
@@ -241,7 +386,8 @@ class LineGW:
         out = np.zeros((len(zeta), self.nb, self.nb), complex)
         Xk = self.X[ik]
         qm = (lambda iq: iq) if qminus is None else (lambda iq: qminus[iq])
-        nu_of = (lambda iq: self.bos.nu) if nu is None else (lambda iq: np.asarray(nu[iq], float))
+        nu0 = (self.bos_w if self.thermal else self.bos).nu
+        nu_of = (lambda iq: nu0) if nu is None else (lambda iq: np.asarray(nu[iq], float))
         def wt(w, E):                                                    # sum_j E_j(t) w_j  -> (nt, Np, Np)
             return (E @ w.reshape(w.shape[0], -1)).reshape(E.shape[0], w.shape[1], w.shape[2])
         for sector, ray in (('>', self.ray_p), ('<', self.ray_h)):

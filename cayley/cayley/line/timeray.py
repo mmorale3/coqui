@@ -42,3 +42,19 @@ class TimeRay:
 
     def __len__(self):
         return len(self.s)
+
+
+def tau_grid(beta, emax, nn=12, per_efold=2.0, x0=0.02):
+    """Imaginary-time grid of the finite-T tau leg (S8b): composite Gauss-Legendre on [0, beta/2] with panel edges
+    {0} U {x0/emax * e^{j/per_efold}} up to beta/2 (log-graded towards tau = 0, decay scale 1/emax of the fastest pair), mirrored
+    onto [beta/2, beta] (the products are bounded and decay away from both ends, KMS). Returns (tau, weights), sorted."""
+    xg, wg = np.polynomial.legendre.leggauss(nn)
+    half, a0 = 0.5 * beta, x0 / emax
+    if a0 >= half:
+        edges = np.array([0.0, half])
+    else:
+        edges = np.concatenate([[0.0], np.exp(np.linspace(np.log(a0), np.log(half), int(np.ceil(np.log(half / a0) * per_efold)) + 1))])
+    s = ((edges[1:] + edges[:-1]) / 2)[:, None] + (edges[1:] - edges[:-1])[:, None] / 2 * xg[None, :]
+    w = (edges[1:] - edges[:-1])[:, None] / 2 * wg[None, :]
+    s, w = s.ravel(), w.ravel()
+    return np.concatenate([s, beta - s[::-1]]), np.concatenate([w, w[::-1]])

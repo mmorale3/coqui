@@ -79,6 +79,40 @@ class BosonicLineBasis:
         _, R2, piv2 = qr(Ko.T, mode='economic', pivoting=True)
         self.zeta = self.zeta_dense[np.sort(piv2[:min(2 * r, len(self.zeta_dense))])]
 
+    @classmethod
+    def from_data(cls, theta, zdata, lam, eps=1e-12, numin=None, npole=800):
+        """Finite-T basis selected ON the bosonic data set D (S8b W step, notes section 11.5(c)): candidate poles on the log grid
+        [numin, lam] (numin = 1e-4 lam), column-pivoted QR of the column-normalized odd kernel [K-; -K+] evaluated at the points
+        zdata (unmasked line nodes, wedge band, i nu_n, nu_0 = 0), tolerance eps (eps_b = 1e-12). zeta = zeta_dense = zdata."""
+        b = cls.__new__(cls)
+        b.theta, b.lam, b.eps, b.gap = theta, lam, eps, 0.0
+        z = np.asarray(zdata, complex)
+        numin = 1e-4 * lam if numin is None else numin
+        nu = np.exp(np.linspace(np.log(numin), np.log(lam), npole))
+        Kst = np.vstack([1.0 / (z[:, None] - nu[None, :]), -1.0 / (z[:, None] + nu[None, :])])
+        Kn = Kst / np.linalg.norm(Kst, axis=0, keepdims=True)
+        _, R, piv = qr(Kn, mode='economic', pivoting=True)
+        d = np.abs(np.diag(R)); r = int((d > eps * d[0]).sum())
+        b.nu = np.sort(nu[piv[:r]]); b.r = r
+        b.zeta = b.zeta_dense = z
+        return b
+
+    def fit_split(self, zeta, W, W_minus=None, cut_odd=1e-13, cut_even=1e-10):
+        """Decoupled pair fit (notes Eq. fT_splitfit): with s_j = w_j(q) + w_j(-q)^T and d_j = w_j(q) - w_j(-q)^T,
+            sum_j [1/(z - nu_j) - 1/(z + nu_j)] s_j = W(q,z) + W(-q,z)^T,   sum_j [1/(z - nu_j) + 1/(z + nu_j)] d_j = W(q,z) - W(-q,z)^T,
+        two column-scaled SVD least-squares problems with their own relative singular-value cutoffs. ONE joint solve gives
+        both residue sets: returns (w(q), w(-q)) (r, N, N) with w(q) = (s + d)/2, w(-q) = ((s - d)/2)^T.
+        W_minus: W(-q) at the same points; None = self-inverse q (W(-q) = W(q); then w(-q) = w(q) up to roundoff)."""
+        Km, Kp = self.kernels(zeta); nz, N = W.shape[0], W.shape[1]
+        WmT = np.transpose(W if W_minus is None else W_minus, (0, 2, 1))      # W(-q,z)^T
+        out = []
+        for A, data, cut in ((Km - Kp, (W + WmT).reshape(nz, -1), cut_odd), (Km + Kp, (W - WmT).reshape(nz, -1), cut_even)):
+            cn = np.linalg.norm(A, axis=0); As = A / cn
+            U, sv, Vh = np.linalg.svd(As, full_matrices=False); keep = sv > cut * sv[0]
+            out.append(((Vh[keep].conj().T @ ((U[:, keep].conj().T @ data) / sv[keep][:, None])) / cn[:, None]).reshape(self.r, N, N))
+        s, d = out
+        return 0.5 * (s + d), np.transpose(0.5 * (s - d), (0, 2, 1))
+
     def kernels(self, zeta):
         z = np.asarray(zeta, complex)[:, None]
         return 1.0 / (z - self.nu[None, :]), 1.0 / (z + self.nu[None, :])
