@@ -343,7 +343,7 @@ TEST_CASE("gw_line_finiteT_mu_rule", "[gw_line][finiteT][mu_rule]") {
 namespace {
 
 /// one fixture / beta: T1 (Pi) and T2 (W, Sigma). time_grid: "gl" | "id"
-bool run_t12(fx_t &F, double beta, std::string const &time_grid, bool do_t2) {
+bool run_t12(fx_t &F, double beta, std::string const &time_grid, bool do_t2, double tt_frac = 0.5) {
   auto &comm    = F.mpi->comm;
   auto &mf      = *F.mf;
   auto &thc     = *F.thc;
@@ -360,7 +360,7 @@ bool run_t12(fx_t &F, double beta, std::string const &time_grid, bool do_t2) {
   tp.beta = beta;
   tp.thermal_tol = 1e-12;
   tp.theta = 20.0 * deg;
-  tp.theta_t = 10.0 * deg;
+  tp.theta_t = tt_frac * 20.0 * deg;   // theta_t_frac (0.5: the references' 10 deg; 0.25: the metals' theta / 4)
   tp.tau_grid = "gl";   // the composite GL tau grid here (python's); the tau ID is checked against it below
   const double ET = tp.E_T();
   utils::TimerManager Timer;
@@ -380,9 +380,9 @@ bool run_t12(fx_t &F, double beta, std::string const &time_grid, bool do_t2) {
     nda::h5_read(gb, "window_counts", wr);
     long dw = 0;
     for (long k = 0; k < nk; ++k) dw += std::abs(wc[k] - wr(k));
-    app_log(1, "\n[finiteT][T1{}] {} beta {} ({} grid): mu0 {:.12f}, E_T {:.4f} (thermal_tol 1e-12), window counts at 1e-8 vs "
+    app_log(1, "\n[finiteT][T1{}] {} beta {} ({} grid, theta_t = {} theta, rho {:.3f}): mu0 {:.12f}, E_T {:.4f} (thermal_tol 1e-12), window counts at 1e-8 vs "
                "reference: {} differences",
-            do_t2 ? "/T2" : "", F.name, beta, time_grid, mu0, ET, dw);
+            do_t2 ? "/T2" : "", F.name, beta, time_grid, tt_frac, tp.rho(), mu0, ET, dw);
     ok = (dw == 0) and ok;
   }
   aux_grid_t grid(*F.mpi, Np);
@@ -628,6 +628,8 @@ TEST_CASE("gw_line_finiteT_T12_lih222", "[gw_line][finiteT][T1][T2]") {
   bool ok = true;
   for (double beta : {200.0, 50.0}) ok = run_t12(F, beta, "gl", true) and ok;
   ok = run_t12(F, 200.0, "id", true) and ok;
+  // theta_t = theta / 4 (rho 2.97; the metals' setting, plan S8c): the references' points stay inside the wider wedge
+  ok = run_t12(F, 50.0, "id", true, 0.25) and ok;
   REQUIRE(ok);
 }
 
@@ -1136,24 +1138,39 @@ TEST_CASE("gw_line_finiteT_scf", "[gw_line][finiteT][scf]") {
     app_log(1, "  restart {} + {} vs {} straight:", NR, NIT - NR, NIT);
     ok = same_runs(comm, A, B, fa, fb, NIT) and ok;
   }
-  {   // 1 vs 2 ranks
-    const std::string mine = "gw_line_ft_scf_np" + std::to_string(comm.size()) + ".txt";
-    const std::string other = "gw_line_ft_scf_np" + std::to_string(comm.size() == 1 ? 2 : 1) + ".txt";
-    std::vector<double> mus;
-    for (auto const &h : A.history) mus.push_back(h.mu);
+  {   // 1 vs 2 ranks: the iteration-1 Sigma (kernels on the KS lists: reduction order only) to 1e-12; mu per iteration within
+      // 10 x the closure floor of these settings (FT_MU_FLOOR: 1e-13 in Sigma moves mu by up to 21 meV at iteration 1)
+    const std::string mine = "gw_line_ft_scf_np" + std::to_string(comm.size()) + ".h5";
+    const std::string other = "gw_line_ft_scf_np" + std::to_string(comm.size() == 1 ? 2 : 1) + ".h5";
+    nda::array<double, 1> mus(long(A.history.size()));
+    for (long i = 0; i < mus.size(); ++i) mus(i) = A.history[i].mu;
+    auto S1 = sigma_total_of(comm, fa + ".gw_line.h5", 1);
     if (comm.root()) {
-      std::ofstream o(mine);
-      o.precision(17);
-      for (double x : mus) o << x << "\n";
+      h5::file f(mine, 'w');
+      h5::group g(f);
+      nda::h5_write(g, "mu", mus, false);
+      nda::h5_write(g, "Sigma1", S1, false);
     }
+    comm.barrier();
     if (std::filesystem::exists(other)) {
-      std::ifstream in(other);
-      double x;
-      long i = 0;
-      double d = 0.0;
-      while (in >> x and i < long(mus.size())) d = std::max(d, std::abs(x - mus[i++]));
-      app_log(1, "  {} vs {}: max |dmu| {:.3e} over {} iterations", mine, other, d, i);
-      ok = gate("1 vs 2 ranks: max |dmu| (Ha)", d, 0.0) and ok;
+      nda::array<double, 1> mo;
+      nda::array<ComplexType, 4> So;
+      {
+        h5::file f(other, 'r');
+        h5::group g(f);
+        nda::h5_read(g, "mu", mo);
+        nda::h5_read(g, "Sigma1", So);
+      }
+      double ds = 0.0, ms = 0.0;
+      for (long a = 0; a < S1.size(); ++a) {
+        ds = std::max(ds, std::abs(S1.data()[a] - So.data()[a]));
+        ms = std::max(ms, std::abs(S1.data()[a]));
+      }
+      app_log(1, "  {} vs {}:", mine, other);
+      ok = gate("1 vs 2 ranks: iteration-1 Sigma rel", ds / ms, 1e-12) and ok;
+      for (long i = 0; i < std::min(mo.size(), mus.size()); ++i)
+        ok = gate(("1 vs 2 ranks: |dmu| (meV) iteration " + std::to_string(i + 1) + " [10 x floor]").c_str(),
+                  std::abs(mo(i) - mus(i)) * 27.211386e3, 10.0 * FT_MU_FLOOR[std::min(i, 2L)]) and ok;
     } else
       app_log(1, "  {} written; run with the other rank count to compare", mine);
   }

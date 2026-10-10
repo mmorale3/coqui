@@ -322,6 +322,9 @@ optics/      omega (nw), omega_eV, eta, eta_rel, wp2_valence (4 pi N / Omega), n
 ```
 
 The k index of `scf_line/` and `spectra/` is the IBZ k on the IBZ path (`system/kp_to_ibz` maps every k of the mesh to it).
+Finite temperature (`beta` > 0) adds `input/` beta, thermal_tol, thermal_floor(_f), wp_floor, mu_rule, mu_dn_max, mu_th_factor,
+tau_grid and the derived E_T, zeta_T, zeta_T_f, S_T; `history/thermal/` (thermal = 1 for a thermal iteration, mu_rule used, dN,
+n_th, wp_used, nD, rank_b, ntau, nwin) per iteration; `spectra/fermi_w` with `spectra.occupation`.
 
 `<output>.gw_line.sigma.h5` (checkpoint_sigma = "last", rewritten every iteration): `iter`, `Sigma_p`, `Sigma_h`
 (nk, n_nodes, nb, nb): the mixed Sigma^{>/<} at the fermionic nodes of the last iteration; needed by a restart.
@@ -541,6 +544,7 @@ Test executables (Catch2, `build/tests/bin`, MPI-aware; tags in brackets):
 | `test_gw_line_kernels` | `[gw_line]`: `[V0]` `[V1]` `[V2]` `[V3]` `[V6]` `[head]` `[optics]` `[flat]` `[time_id]` `[lehmann]` `[s7e]` `[perf71]` `[w]` `[kft]` `[device]` | V0: V_H + Sigma_x vs CoQui hf_t; V1: Pi on the line vs the Casida transition sum; V2: W vs Dyson / fit of gathered matrices, CoQui's W^c(q, i nu) and Casida; V3: Sigma_c vs the exact Casida Sigma_c and CoQui's iteration-1 Sigma_c(i w_n); V6: the Coulomb head and the optics vs Casida (exact) and CoQui; A/B of every performance path (bitwise or <= 1e-12); host vs device |
 | `test_gw_line_scf` | `[gw_line][scf]`: `[closure]` `[restart]` `[parity]` `[id_vs_gl]` `[gygi]` `[optics]` `[mixing]` `[qp_start]` `[multilevel]` `[qplan]` ...; `[gw_line][examples]` | closure on exact toy models; restart bitwise; python driver parity (gates 10x the measured noise floor); ID vs GL grids (5x floor); the examples of this README (parse + lih222 end-to-end + h5 layout) |
 | `test_gw_line_ibz` | `[gw_line][ibz]` | IBZ path vs the full-BZ path (<= 1e-12 with trivial tables; symmetric vs nosym fixtures) |
+| `test_gw_line_finiteT` | `[gw_line][finiteT]`: `[numerics]` `[mu_rule]` `[T1]` `[T2]` `[T3]` `[T4]` `[parity]` `[scf]` `[device]` | finite T (notes sec:finiteT): Pi on the guarded rays and the tau leg vs the finite-T transition sum; W (data set D, split fit) and Sigma_c vs the finite-T Casida references (`{lih222,lih223}_finiteT_ref.h5`); Sigma_c(i w_n) vs CoQui gw_t at the same beta after the nu_0 term; beta 1e4 == T = 0 bitwise; python thermal SCF parity (`lih222_finiteT_scf_ref.h5`); the mu rule vs `mu_rule_ref.h5`; restart / ranks; host vs device |
 
 Hidden cases (`[.name]`) are diagnostics and benchmarks. Fixtures: `qe_lih222`, `qe_si211`, `qe_lih223`, the `_sym` variants
 (tests/unit_test_files/qe), stored THC `tests/unit_test_files/gw_line/lih222_thc/`.
