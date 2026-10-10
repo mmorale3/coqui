@@ -1,0 +1,36 @@
+# gw_line smoke example: LiH 2x2x2 (16 bands, nosym) unit-test fixture, 2 iterations, small spectra and optics.
+# Paths are relative to coqui/tests/unit_test_files; run from there:
+#   cd coqui/tests/unit_test_files
+#   mpirun -np 2 <build>/bin/coqui --filenames ../../src/methods/GW_line/examples/lih222_smoke.toml
+# The unit test test_gw_line_scf "[gw_line][examples]" runs this file (paths prefixed with the unit-test directory).
+# Runtime: ~1.5 min on one laptop core (setup + 2 iterations ~45 s, the 20 and 10 deg optics passes ~40 s). Output: ./lih222_smoke.gw_line.h5 (+ .gw_line.sigma.h5).
+
+[mean_field.qe]
+name     = "mf_lih"
+prefix   = "pwscf"
+outdir   = "qe/lih_kp222_nbnd16/"     # QE output of the fixture (pwscf.save, pwscf.xml)
+filetype = "xml"                      # the THC below was built on the xml reader of this fixture
+
+[interaction.thc]
+name       = "eri"
+mean_field = "mf_lih"
+storage    = "incore"
+save       = "gw_line/lih222_thc/thc.eri.h5"   # stored THC (Np = 128): read if it exists, else built and written here
+nIpts      = 128                               # used only if the THC has to be built (8 x nbnd)
+thresh     = 1e-10
+
+[gw_line]
+interaction   = "eri"        # name of the THC [interaction] block (THC only)
+theta_deg     = 20.0         # line angle (deg); time rays at theta / 2
+eps           = 1e-8         # real-pole basis tolerance (production 1e-10; 1e-8 keeps the smoke run fast)
+lam           = 6.0          # fermionic pole range (Ha)
+                             # lam_b not set: auto = 2 g_emax = 12 Ha (must cover Pi's spectrum)
+g_repr        = "lehmann"    # G between iterations = the closure's Lehmann poles (default)
+K             = 8            # Cayley moments (production 24; 8 is enough for the smoke run)
+niter         = 2            # total iterations
+t_chunk       = 8            # time chunk of the ray products (0 = automatic)
+div_treatment = "gygi"       # q -> 0 head term of Sigma_c (+ exchange Madelung term, hf_div_treatment follows)
+outdir        = "./"
+prefix        = "lih222_smoke"
+spectra       = { eta = [0.01], wmin = -0.3, wmax = 0.3, nw = 61 }               # A(k, w) after the loop (w - mu, Ha)
+optics        = { enable = true, wmin = 0.0, wmax = 1.0, nw = 101, eta = [0.01], eta_rel = [0.05], theta_deg = [10.0] }

@@ -1,0 +1,36 @@
+# gw_line restart example: continue si444_scgw.toml after a time limit / preemption, or extend a finished run.
+# restart = true resumes from <outdir>/<prefix>.gw_line.h5:/scf_line/final_iter (+ <prefix>.gw_line.sigma.h5 for the
+# Sigma of the last iteration) and runs until niter iterations are done IN TOTAL; the continuation is bitwise identical to an
+# uninterrupted run (same ranks / build). If the checkpoint does not exist the run starts from the KS poles (logged).
+# Keep every line/basis/closure key equal to the original run (the fermionic nodes are checked against the checkpoint);
+# niter, conv_thr, spectra and optics may change. The DIIS history (mixing_alg = "diis") is not checkpointed (rebuilt);
+# the damped-tail state is.
+#   mpirun -np 128 coqui --filenames restart.toml
+
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "si"
+outdir   = "/path/to/Si/nscf_kp444_nbnd256/out/"
+filetype = "h5"
+nbnd     = 60
+
+[interaction.thc]
+name            = "eri"
+mean_field      = "mf_qe"
+thresh          = 1e-4
+ecut            = 60
+storage         = "incore"
+save            = "/path/to/data/si444s_thc1e-4.thc.h5"   # the THC of the original run (read, not rebuilt)
+chol_block_size = 8
+distr_tol       = 0.4
+
+[gw_line]
+interaction   = "eri"
+restart       = true           # resume from ./si444.gw_line.h5
+niter         = 16             # total iterations (e.g. 12 done -> 4 more, unless conv_thr is reached first)
+conv_thr      = 3e-5
+div_treatment = "gygi"         # as in the original run
+outdir        = "./"
+prefix        = "si444"        # checkpoint stem of the original run
+checkpoint_sigma = "last"      # Sigma of the last iteration only, in si444.gw_line.sigma.h5 (default; "all" = every iteration)
+spectra       = { eta = [0.004, 0.01], wmin = -0.6, wmax = 0.6, nw = 1201 }

@@ -1,0 +1,48 @@
+# gw_line optics-only rerun: real-axis eps(w), loss, absorption, reflectivity, conductivity from the checkpoint of
+# si444_scgw.toml (same prefix, same [gw_line] line settings), without iterating: restart = true and niter = 0 (any niter <= the
+# iterations already done also works). The SCF-angle line uses the head of the last checkpointed iteration if that run
+# converged, else it is recomputed from the final poles; every optics.theta_deg adds ONE Pi -> W -> head pass on a flatter
+# bosonic line (sharper spectra; 10 / 5 deg as in the Si study, notes S9b). Results: si444.gw_line.h5:/optics/theta<deg>/...
+#   mpirun -np 128 coqui --filenames si444_optics.toml
+
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "si"
+outdir   = "/path/to/Si/nscf_kp444_nbnd256/out/"
+filetype = "h5"
+nbnd     = 60
+
+[interaction.thc]
+name            = "eri"
+mean_field      = "mf_qe"
+thresh          = 1e-4
+ecut            = 60
+storage         = "incore"
+save            = "/path/to/data/si444s_thc1e-4.thc.h5"
+chol_block_size = 8
+distr_tol       = 0.4
+
+[gw_line]
+interaction   = "eri"
+restart       = true           # read ./si444.gw_line.h5 (scf_line/final_iter); the fermionic nodes must match the input
+niter         = 0              # nothing to iterate: straight to spectra / optics
+div_treatment = "gygi"         # must match the SCF run (the head data and q -> 0 variant come from it)
+outdir        = "./"
+prefix        = "si444"        # the checkpoint of si444_scgw.toml
+spectra       = { enable = false }   # A(k, w) already written by the SCF run (set true to recompute with other eta / grid)
+
+[gw_line.optics]               # sub-table form of optics = { ... } (every key optional; defaults in the README)
+enable    = true               # default: true when the optics table is present
+wmin      = 0.0                # omega grid (Ha)
+wmax      = 1.5
+nw        = 1501
+eta       = [0.01, 0.004]      # constant broadenings (Ha)
+eta_rel   = [0.05]             # energy-proportional broadening eta = 0.05 omega
+scales    = "auto"             # multi-scale closure scales (Ha): "auto" or an increasing list
+K         = "auto"             # moments of the response closure: "auto" (K rule) or an integer
+q0        = true               # q -> 0 (optical limit)
+finite_q  = true               # every mesh q != Gamma (loss / plasmon dispersion)
+theta_deg = [10.0, 5.0]        # flatter final lines (deg), one extra Pi -> W -> head pass each; omit for the SCF angle only
+time_grid = "id"               # time grid of the flatter passes
+mem_gb    = 1.5                # memory budget of a flatter pass (GB per rank)
+poles     = "final"            # G of the optics lines: "final" | "initial" (iteration 0: KS or the qp start)

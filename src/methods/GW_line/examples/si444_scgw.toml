@@ -1,0 +1,54 @@
+# gw_line production example: self-consistent GW of Si, 4x4x4 k mesh, 60 bands, symmetric (IBZ) mean field.
+# Settings: perf 7.2 SCF defaults with the gygi head (Si 4x4x4 gygi: gap stable to 0.3 meV from iteration 8) on the IBZ path;
+# measured cost per iteration (commit 7aec58a): 56.5 s on 1 rome node (128 ranks), 15.0 s on 4 genoa nodes (384 ranks).
+#   mpirun -np 128 coqui --filenames si444_scgw.toml          (OMP_NUM_THREADS=1, one rank per core)
+# Paths are placeholders: QE nscf with force_symmorphic (13 IBZ k of 64), 256 bands computed, 60 used.
+
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "si"
+outdir   = "/path/to/Si/nscf_kp444_nbnd256/out/"   # QE outdir (pw2coqui h5)
+filetype = "h5"
+nbnd     = 60                                      # bands used by GW (the THC and gw_line work on these)
+
+[interaction.thc]
+name            = "eri"
+mean_field      = "mf_qe"
+thresh          = 1e-4         # THC (ISDF) threshold: Np = 741 for this system
+ecut            = 60           # Ha, density cutoff of the THC
+storage         = "incore"
+save            = "/path/to/data/si444s_thc1e-4.thc.h5"   # written on the first run, read afterwards
+chol_block_size = 8
+distr_tol       = 0.4
+
+[gw_line]
+interaction   = "eri"          # the THC block above (gw_line requires THC)
+# ---- line and real-pole bases (defaults shown; change only for convergence studies)
+theta_deg     = 20.0           # line angle (deg)
+eps           = 1e-10          # tolerance of every real-pole basis and of the time-node ID
+lam           = 6.0            # fermionic pole range (Ha); lam_b (bosonic) auto = 2 g_emax = 12 Ha
+sigma_gap     = 0.02           # Sigma-basis gap on each side of mu (Ha); < 0 = auto from the QP gap
+bos_gap       = 0.02           # bosonic-basis gap (Ha); < 0 = auto
+g_repr        = "lehmann"      # G between iterations: the closure's Lehmann poles, pruned
+# ---- closure
+wp            = 0.11           # Cayley scale (Ha)
+K             = 24             # number of moments
+# ---- SCF (perf 7.2 defaults: mixing 1.0 until resid < damp_below, then linear damp_mixing)
+niter         = 12             # total iterations (a restart continues up to niter)
+mixing        = 1.0
+damp_below    = 3e-4
+damp_mixing   = 0.5
+conv_thr      = 3e-5           # on max|dSigma| at the nodes after mixing (= resid 6e-5 in the damped tail); the Si 4x4x4
+                               # closure-noise floor of resid is ~1e-4: expect convergence at iteration ~8 or stop by niter
+# ---- q -> 0 divergence (CoQui's gygi extrapolation of the head; exchange Madelung term follows)
+div_treatment = "gygi"
+# ---- symmetry, memory, distribution
+ibz           = true           # use the IBZ of the symmetric mean field (default; env COQUI_GWLINE_IBZ overrides)
+mem_frac      = 0.8            # q plan: fraction of the free host memory per rank the Pi -> W stage may fill
+mem_budget_gb = 0.0            # host GB per rank for the q plan (0 = measure MemAvailable / cgroup)
+t_chunk       = 0              # time chunk of the ray products (0 = automatic: 32 on the host)
+# ---- output
+outdir        = "./"
+prefix        = "si444"        # checkpoint ./si444.gw_line.h5 (+ ./si444.gw_line.sigma.h5)
+restart       = false          # true: continue from ./si444.gw_line.h5
+spectra       = { eta = [0.004, 0.01], wmin = -0.6, wmax = 0.6, nw = 1201 }   # A(k, w) at the IBZ k after the loop

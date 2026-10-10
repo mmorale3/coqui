@@ -1,0 +1,47 @@
+# gw_line on GPUs: Si 4x4x4 IBZ scGW in a CUDA build (cmake -DENABLE_CUDA=ON; the default compute space of such a build is
+# the device, `coqui --compute cpu` forces the host path). One MPI rank per GPU, 16 cores per rank (the closure uses them):
+#   srun -n 2 -c 16 --cpu-bind=none bash -c 'CUDA_VISIBLE_DEVICES=$((SLURM_PROCID % 2)) exec coqui --filenames gpu.toml'
+# Measured (Si 4x4x4 IBZ, A100 80 GB, perf 7.4b): 46.4 s / iteration on 1 GPU, 18.8 s on 2 GPUs (CPU: 56.5 s on 1 rome node).
+# On the device: G~ and the Pi / Sigma Hadamard products (fused CUDA kernels, cuBLAS), the k-mesh transforms (cuBLAS gemms;
+# cuFFT from N_k >= 100), W's Dyson solves (batched LU) and residue fits, the closure's dense eigenproblems / SVD
+# (cuSOLVER, closure_device). On the host: real-pole fits, moments and upfolding, mixing, checkpoint; the W node-shared
+# redistribute of CPU runs is host-only (device runs keep the MPI redistribute).
+# CoQui bug to know about: transform_k2g (symmetry_tools.cu) did not zero its device error flag -> random aborts when a
+# symmetric mean field is built in a CUDA build; fixed on this branch (373a07b), not yet in CoQui main.
+
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "si"
+outdir   = "/path/to/Si/nscf_kp444_nbnd256/out/"
+filetype = "h5"
+nbnd     = 60
+
+[interaction.thc]
+name            = "eri"
+mean_field      = "mf_qe"
+thresh          = 1e-4
+ecut            = 60
+storage         = "incore"
+save            = "/path/to/data/si444s_thc1e-4.thc.h5"
+chol_block_size = 8
+distr_tol       = 0.4
+
+[gw_line]
+interaction       = "eri"
+niter             = 12
+div_treatment     = "gygi"
+# ---- memory: the q plan picks the largest q group of the Pi -> W stage that fits both budgets
+dev_mem_budget_gb = 0.0        # device GB per rank (0 = mem_frac x the free device memory at the plan); set it when other
+                               # libraries hold device memory the measurement does not see
+mem_budget_gb     = 0.0        # host GB per rank (0 = mem_frac x MemAvailable / cgroup limit per rank)
+mem_frac          = 0.8
+t_chunk           = 0          # 0 = automatic: on the device from the free memory (capped)
+# ---- closure on the GPU node
+closure_device    = "auto"     # cuSOLVER Gram / Cayley / Lehmann eigensolvers + SVD in device runs ("on" | "off"); each call
+                               # falls back to the host LAPACK on a device failure (counted in the closure profile line)
+closure_dev_svd   = "gesvdp"   # device SVD: polar-decomposition gesvdp (default) | gesvd
+closure_threads   = -1         # host BLAS threads of the closure: -1 = the rank's cores (SLURM_CPUS_PER_TASK) in device runs
+closure_k_workers = -1         # concurrent k per rank: -1 = closure_threads / 2 in device runs
+outdir            = "./"
+prefix            = "si444_gpu"
+spectra           = { eta = [0.004, 0.01], wmin = -0.6, wmax = 0.6, nw = 1201 }

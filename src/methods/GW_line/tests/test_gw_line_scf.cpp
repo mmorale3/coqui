@@ -45,6 +45,9 @@
  *   (bitwise mu, poles, F, Sigma); the head group scf_line/iter<N>/head/ (shapes, eps_inf, h0 at the nodes = the
  *   extrapolated residue function at the nodes); F(iter0) gygi - F(iter0) ignore_g0 = -madelung D_KS; iteration-1 Sigma
  *   gygi - ignore_g0 = the head term (positive: its anti-Hermitian part at the nodes has a definite sign per sector).
+ * [examples] (S8d) every src/methods/GW_line/examples/*.toml parsed (InputParser -> [gw_line] -> gw_line_params_t::from_ptree, no
+ *   exception, a few expected values); lih222_smoke.toml run end-to-end on the fixture ([mean_field] / [interaction] blocks
+ *   of the file, paths relative to tests/unit_test_files) and the checkpoint groups / datasets of the README section 4 checked.
  * [.time_id_poles] (hidden diagnostic) kernels on the poles of a checkpoint iteration (GW_LINE_DIAG_FILE, GW_LINE_DIAG_ITER):
  *   default GL rays and ID grids (time_eps 1e-8/1e-10/1e-12, pad 1.25/2) vs a refined GL reference.
  */
@@ -65,6 +68,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include <map>
 
 #include "mpi3/communicator.hpp"
 #include "utilities/test_common.hpp"
@@ -98,6 +102,8 @@
 #include "methods/GW_line/head.hpp"
 #include "methods/GW_line/closure_device.hpp"
 #include "methods/GW_line/q_plan.hpp"
+#include "IO/ptree/InputParser.hpp"
+#include "mean_field/mf_utils.hpp"
 
 namespace {
 
@@ -890,6 +896,28 @@ TEST_CASE("gw_line_dump_bases", "[.gw_line_dump_bases]") {
             bos.zeta_nodes.size());
   }
   mpi->comm.barrier();
+}
+
+/// S8b: the THC of qe_lih223 (2x2x3, nosym, q != -q; nIpts = 8 nbnd, as every lih223 kernel test builds it) and its
+/// system.h5 (KS eigenvalues, qk_to_k2, mid-gap mu0, nelec) -> lih223_thc/, read by the python finite-T reference generator
+/// coqui/cayley/scripts/gen_finiteT_ref.py (lih223_finiteT_ref.h5) and by the C++ [finiteT] tests (same THC on both sides).
+/// Run once on 1 rank: test_gw_line_scf "[.gw_line_dump_lih223]".
+TEST_CASE("gw_line_dump_lih223", "[.gw_line_dump_lih223]") {
+  auto mpi = utils::make_unit_test_mpi_context();
+  auto mf  = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih223"));
+  if (mpi->comm.root()) std::filesystem::create_directories(gw_line_dir() + "lih223_thc");
+  mpi->comm.barrier();
+  const std::string fthc = gw_line_dir() + "lih223_thc/thc.eri.h5";
+  methods::thc_reader_t thc(
+      mf, methods::make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", fthc, "bdft", 1e-10, mf->ecutrho(), 1, 1024));
+  auto H0 = one_body_h0(*mf);
+  const long nk = mf->nkpts(), nb = mf->nbnd(), nocc = long(std::llround(double(mf->nelec()) / 2.0));
+  double homo = -1e300, lumo = 1e300;
+  for (long ik = 0; ik < nk; ++ik)
+    for (long n = 0; n < nb; ++n) (n < nocc ? homo : lumo) = (n < nocc) ? std::max(homo, mf->eigval()(0, ik, n)) : std::min(lumo, mf->eigval()(0, ik, n));
+  write_system_h5(mpi->comm, gw_line_dir() + "lih223_thc/system.h5", *mf, thc.Np(), H0, 0.5 * (homo + lumo), true);
+  mpi->comm.barrier();
+  app_log(1, "wrote {} (Np {}) and system.h5 (mu0 {:.8f}, nelec {})", fthc, thc.Np(), 0.5 * (homo + lumo), mf->nelec());
 }
 
 namespace {
@@ -2762,4 +2790,194 @@ TEST_CASE("gw_line_qplan_driver", "[gw_line][scf][qplan]") {
     remove_file(comm, "gw_line_qpB.gw_line.h5");
     remove_file(comm, "gw_line_qpC.gw_line.h5");
   }
+}
+
+// ======================================================================================================================
+// S8d [examples]: the example inputs of src/methods/GW_line/examples and the README checkpoint layout
+// ======================================================================================================================
+namespace {
+std::string examples_dir() { return std::string(PROJECT_SOURCE_DIR) + "/src/methods/GW_line/examples/"; }
+std::string unit_test_dir() { return std::string(PROJECT_SOURCE_DIR) + "/tests/unit_test_files/"; }
+
+/// root of an example file (TOML -> ptree exactly as the coqui executable reads it)
+ptree read_example(std::string const &name) {
+  const std::string f = examples_dir() + name;
+  REQUIRE(std::filesystem::exists(f));
+  InputParser parser(f);
+  return parser.get_root();
+}
+
+/// the README section 4 layout: every listed object must exist in the checkpoint (h5 path relative to the file root)
+bool h5_has(h5::group g, std::string const &path) {
+  std::string rest = path;
+  while (true) {
+    auto p = rest.find('/');
+    if (p == std::string::npos) return g.has_dataset(rest) or g.has_subgroup(rest);
+    const std::string head = rest.substr(0, p);
+    if (not g.has_subgroup(head)) return false;
+    g    = g.open_group(head);
+    rest = rest.substr(p + 1);
+  }
+}
+} // namespace
+
+TEST_CASE("gw_line_examples", "[gw_line][examples]") {
+  auto mpi   = utils::make_unit_test_mpi_context();
+  auto &comm = mpi->comm;
+
+  // ---- every example parses (main.cpp's blocks present, [gw_line] through gw_line_params_t::from_ptree)
+  const std::vector<std::string> names = {"lih222_smoke.toml", "si444_scgw.toml", "si444_g0w0.toml", "si444_optics.toml",
+                                          "restart.toml",      "gpu.toml"};
+  std::map<std::string, gw_line_params_t> P;
+  for (auto const &n : names) {
+    auto root = read_example(n);
+    REQUIRE(root.get_child_optional("mean_field.qe").has_value());
+    REQUIRE(root.get_child_optional("interaction.thc").has_value());
+    auto gl = root.get_child_optional("gw_line");
+    REQUIRE(gl.has_value());
+    // the [gw_line] interaction refers to the THC block by name (main.cpp get_eri_block)
+    REQUIRE(gl->get<std::string>("interaction") == root.get<std::string>("interaction.thc.name"));
+    REQUIRE(root.get<std::string>("interaction.thc.mean_field") == root.get<std::string>("mean_field.qe.name"));
+    gw_line_params_t p;
+    REQUIRE_NOTHROW(p = gw_line_params_t::from_ptree(*gl));
+    P[n] = p;
+  }
+  {
+    auto const &s = P["lih222_smoke.toml"];
+    REQUIRE(s.niter == 2);
+    REQUIRE(s.K == 8);
+    REQUIRE(s.lam_b_auto);
+    REQUIRE(s.lam_b == 12.0);
+    REQUIRE(s.div_treatment == "gygi");
+    REQUIRE(s.hf_div_treatment == "gygi");
+    REQUIRE(s.spectra.nw == 61);
+    REQUIRE(s.optics.enable);
+    REQUIRE(s.optics.theta_deg.size() == 1);
+    REQUIRE(s.output == ".//lih222_smoke");
+  }
+  {
+    auto const &s = P["si444_scgw.toml"];
+    REQUIRE(s.ibz);
+    REQUIRE(s.mixing == 1.0);
+    REQUIRE(s.mix.damp_below == 3e-4);
+    REQUIRE(s.mix.damp_mixing == 0.5);
+    REQUIRE(s.conv_thr == 3e-5);
+    REQUIRE(s.eps == 1e-10);
+    REQUIRE(s.time_eps == 1e-10);
+    REQUIRE(s.K == 24);
+    REQUIRE(s.g_repr == "lehmann");
+    REQUIRE(s.do_spectra);
+    REQUIRE(not s.optics.enable);
+  }
+  {
+    auto const &s = P["si444_g0w0.toml"];
+    REQUIRE(s.niter == 1);
+    REQUIRE(s.start == "ks");
+  }
+  {
+    auto const &s = P["si444_optics.toml"];
+    REQUIRE(s.restart);
+    REQUIRE(s.niter == 0);
+    REQUIRE(not s.do_spectra);
+    REQUIRE(s.optics.enable);
+    REQUIRE(s.optics.theta_deg.size() == 2);
+    REQUIRE(s.optics.theta_deg[1] == 5.0);
+    REQUIRE(s.optics.K < 0);          // "auto"
+    REQUIRE(s.optics.scales.empty()); // "auto"
+    REQUIRE(s.optics.eta.size() == 2);
+    REQUIRE(s.optics_poles == "final");
+  }
+  {
+    auto const &s = P["restart.toml"];
+    REQUIRE(s.restart);
+    REQUIRE(s.niter == 16);
+    REQUIRE(s.checkpoint_sigma == "last");
+  }
+  {
+    auto const &s = P["gpu.toml"];
+    REQUIRE(s.closure_device == "auto");
+    REQUIRE(s.closure_dev_svd == "gesvdp");
+    REQUIRE(s.closure_threads == -1);
+    REQUIRE(s.dev_mem_budget_gb == 0.0);
+  }
+
+  // ---- lih222_smoke.toml end-to-end: mean field and THC from the file's blocks (paths relative to tests/unit_test_files)
+  auto root   = read_example("lih222_smoke.toml");
+  ptree mf_pt = root.get_child("mean_field.qe");
+  mf_pt.put("outdir", unit_test_dir() + mf_pt.get<std::string>("outdir"));
+  auto mf = std::make_shared<mf::MF>(mf::make_MF(mpi, mf_pt, "qe"));
+  ptree thc_pt = root.get_child("interaction.thc");
+  thc_pt.put("save", unit_test_dir() + thc_pt.get<std::string>("save"));
+  REQUIRE(std::filesystem::exists(thc_pt.get<std::string>("save")));   // the stored fixture THC is read, never rebuilt here
+  auto thc = methods::make_thc(mf, thc_pt);
+  ptree pt = root.get_child("gw_line");
+  const std::string stem = "gw_line_example_smoke";   // MBPT_drivers resolve_mbpt_output_stem: "output" wins over outdir/prefix
+  pt.put("output", stem);
+  const std::string chk = stem + ".gw_line.h5", sfile = stem + ".gw_line.sigma.h5";
+  remove_file(comm, chk);
+  auto t0 = std::chrono::steady_clock::now();
+  auto R  = methods::gw_line::gw_line_scf<HOST_MEMORY>(thc, *mf, pt);
+  const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  REQUIRE(R.history.size() == 2);
+  REQUIRE(R.spectra.has_value());
+  REQUIRE(R.optics_theta.size() == 2);   // the SCF angle + the 10 deg line
+  REQUIRE(std::isfinite(R.mu));
+  const double gap_eV = (R.history.back().e_lumo - R.history.back().e_homo) * 27.211386;
+  app_log(1, "[examples] lih222_smoke: {} ranks, {:.1f} s; mu {:.6f} Ha, QP gap {:.4f} eV, eps_inf (q0, 20 / 10 deg) {:.5f} / {:.5f}",
+          comm.size(), secs, R.mu, gap_eV, R.optics_q0[0].eps_inf_h, R.optics_q0[1].eps_inf_h);
+  REQUIRE(gap_eV > 1.0);
+  REQUIRE(R.optics_q0[0].eps_inf_h > 1.0);
+
+  if (comm.root()) {
+    // README section 4: <output>.gw_line.h5
+    const std::vector<std::string> objs = {
+        "system/nkpts", "system/nbnd", "system/Np", "system/nelec", "system/mu0", "system/H0", "system/eigval", "system/qk_to_k2",
+        "system/kpoints", "input/theta_deg", "input/eps", "input/K", "input/div_treatment", "input/fermionic_nodes",
+        "scf_line/final_iter", "scf_line/iter0/mu", "scf_line/iter0/F", "scf_line/iter0/poles/particle_counts",
+        "scf_line/iter1/mu", "scf_line/iter1/mu_sigma", "scf_line/iter1/dmu", "scf_line/iter1/e_homo", "scf_line/iter1/e_lumo",
+        "scf_line/iter2/F", "scf_line/iter2/F_closure", "scf_line/iter2/has_sigma",
+        "scf_line/iter2/poles/particle_counts", "scf_line/iter2/poles/particle_e", "scf_line/iter2/poles/particle_v",
+        "scf_line/iter2/poles/hole_counts", "scf_line/iter2/poles/hole_e", "scf_line/iter2/poles/hole_v",
+        "scf_line/iter2/history/dSigma", "scf_line/iter2/history/resid", "scf_line/iter2/history/gap", "scf_line/iter2/history/time",
+        "scf_line/iter2/head/h_nodes", "scf_line/iter2/head/h_res", "scf_line/iter2/head/h_res_hole", "scf_line/iter2/head/h0_nodes",
+        "scf_line/iter2/head/zeta", "scf_line/iter2/head/nu", "scf_line/iter2/head/qpts", "scf_line/iter2/head/eps_inf",
+        "scf_line/iter2/head/madelung",
+        "spectra/mu", "spectra/omega", "spectra/eta", "spectra/A_k_w_diag", "spectra/A_k_w_trace", "spectra/e_homo",
+        "spectra/e_lumo", "spectra/vbm", "spectra/cbm", "spectra/gap",
+        "optics/omega", "optics/omega_eV", "optics/eta", "optics/eta_rel", "optics/wp2_valence", "optics/nelec", "optics/volume",
+        "optics/theta20.0/theta_deg", "optics/theta20.0/source", "optics/theta20.0/zeta", "optics/theta20.0/h_nodes",
+        "optics/theta20.0/qpts", "optics/theta10.0/source", "optics/theta10.0/q0/eps1", "optics/theta10.0/q0/eps2",
+        "optics/theta10.0/q0/eps2_err", "optics/theta10.0/q0/loss", "optics/theta10.0/q0/n", "optics/theta10.0/q0/kappa",
+        "optics/theta10.0/q0/alpha", "optics/theta10.0/q0/alpha_cm", "optics/theta10.0/q0/R", "optics/theta10.0/q0/sigma1",
+        "optics/theta10.0/q0/sigma2", "optics/theta10.0/q0/eps_inf", "optics/theta10.0/q0/fsum_h",
+        "optics/theta10.0/q0/mismatch_eps", "optics/theta10.0/q0_gygi_perdir/eps2", "optics/theta10.0/q0_gygi_average/loss",
+        "optics/theta10.0/iq1/loss", "optics/theta10.0/iq1/eps2"};
+    h5::file f(chk, 'r');
+    h5::group g(f);
+    long missing = 0;
+    for (auto const &o : objs)
+      if (not h5_has(g, o)) {
+        app_log(1, "[examples] missing in {}: {}", chk, o);
+        ++missing;
+      }
+    long fi = -1;
+    h5::h5_read(g, "scf_line/final_iter", fi);
+    nda::array<double, 4> A;
+    nda::h5_read(g, "spectra/A_k_w_diag", A);
+    app_log(1, "[examples] {}: {} objects checked, {} missing; final_iter {}; A_k_w_diag {}x{}x{}x{}", chk, objs.size(), missing, fi,
+            A.extent(0), A.extent(1), A.extent(2), A.extent(3));
+    REQUIRE(missing == 0);
+    REQUIRE(fi == 2);
+    REQUIRE(A.extent(0) == 1);
+    REQUIRE(A.extent(2) == 61);
+    REQUIRE(A.extent(3) == mf->nbnd());
+    // <output>.gw_line.sigma.h5 (checkpoint_sigma = "last")
+    h5::file fs(sfile, 'r');
+    h5::group gs(fs);
+    REQUIRE(gs.has_dataset("iter"));
+    REQUIRE(gs.has_dataset("Sigma_p"));
+    REQUIRE(gs.has_dataset("Sigma_h"));
+  }
+  comm.barrier();
+  remove_file(comm, chk);
 }

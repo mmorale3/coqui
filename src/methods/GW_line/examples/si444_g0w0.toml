@@ -1,0 +1,35 @@
+# gw_line one-shot example: G0W0@KS of Si 4x4x4 (60 bands, IBZ) on the line, full frequency, no diagonal approximation:
+# niter = 1 from the KS start = Pi[G_KS] -> W -> Sigma[G_KS] -> one Cayley closure. The stored poles (scf_line/iter1) and the
+# spectra are those of G0W0@KS = [w - (H0 + F[D_KS] - mu) - Sigma[G_KS](w)]^-1 (QP edges from the closure, satellites included).
+# Cost = one SCF iteration (56.5 s on 1 rome node for this system). Optics are left to si444_optics.toml (optics.poles).
+#   mpirun -np 128 coqui --filenames si444_g0w0.toml
+
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "si"
+outdir   = "/path/to/Si/nscf_kp444_nbnd256/out/"   # QE outdir (pw2coqui h5), symmetric mesh
+filetype = "h5"
+nbnd     = 60
+
+[interaction.thc]
+name            = "eri"
+mean_field      = "mf_qe"
+thresh          = 1e-4
+ecut            = 60
+storage         = "incore"
+save            = "/path/to/data/si444s_thc1e-4.thc.h5"   # same THC as si444_scgw.toml (read if present)
+chol_block_size = 8
+distr_tol       = 0.4
+
+[gw_line]
+interaction   = "eri"
+niter         = 1              # one iteration = G0W0 on the starting G
+start         = "ks"           # KS poles (default). start = "qp_diag" instead runs one extra Pi -> W -> Sigma pass on the KS
+                               # poles and solves the DIAGONAL G0W0 QP equation per k and band (QP energies and gap in the log,
+                               # start_eta = 1e-3 Ha broadening); iteration 1 is then GW on the KS vectors with those QP energies
+                               # (a QP-shifted G and W), i.e. NOT G0W0@KS: use it as a warm start of an SCF run (saves <= 1
+                               # iteration on Si), not as the one-shot answer
+div_treatment = "gygi"         # head term of Sigma_c and exchange Madelung term (CoQui's gygi extrapolation)
+outdir        = "./"
+prefix        = "si444_g0w0"
+spectra       = { eta = [0.004, 0.01], wmin = -0.6, wmax = 0.6, nw = 1201 }
