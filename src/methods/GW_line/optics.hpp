@@ -480,7 +480,9 @@ inline std::vector<optics_q_t> optics_line(boost::mpi3::communicator &comm, opti
   return out;
 }
 
-/// root writes /optics/<tag>/ (+ the common grid at /optics/omega etc. if absent)
+/// root writes /optics/<tag>/ with its own grid (omega, omega_eV, eta, eta_rel) and (re)writes the common grid and attributes at
+/// /optics/omega etc. on every call, so the common grid always describes the newest pass. Older /optics/<tag> groups of a rerun
+/// with a different grid keep their own, correct, grid datasets.
 inline void write_optics(boost::mpi3::communicator &comm, std::string const &file, std::string const &tag, optics_line_t const &L,
                          std::vector<optics_q_t> const &R, optics_params_t const &p, double nelec, double volume,
                          std::string const &extra_scope = "") {
@@ -488,17 +490,21 @@ inline void write_optics(boost::mpi3::communicator &comm, std::string const &fil
     h5::file f(file, 'a');
     h5::group g(f);
     auto og = g.has_subgroup("optics") ? g.open_group("optics") : g.create_group("optics");
-    if (not og.has_dataset("omega")) {
+    auto write_grid = [&p](h5::group &gg) {
       auto w = p.omega();
-      nda::h5_write(og, "omega", w, false);
       nda::array<double, 1> wev(w.size());
       for (long i = 0; i < w.size(); ++i) wev(i) = w(i) * rc::HA_EV;
-      nda::h5_write(og, "omega_eV", wev, false);
       nda::array<double, 1> e(p.eta.size()), er(p.eta_rel.size());
       for (size_t i = 0; i < p.eta.size(); ++i) e(i) = p.eta[i];
       for (size_t i = 0; i < p.eta_rel.size(); ++i) er(i) = p.eta_rel[i];
-      nda::h5_write(og, "eta", e, false);
-      nda::h5_write(og, "eta_rel", er, false);
+      for (auto const *n : {"omega", "omega_eV", "eta", "eta_rel"}) gg.unlink(n);
+      nda::h5_write(gg, "omega", w, false);
+      nda::h5_write(gg, "omega_eV", wev, false);
+      nda::h5_write(gg, "eta", e, false);
+      nda::h5_write(gg, "eta_rel", er, false);
+    };
+    write_grid(og);
+    if (not og.has_dataset("wp2_valence")) {   // attributes and scalars: grid independent, written once
       h5::h5_write_attribute(og, "broadening_order", std::string("rows of every (nbroad, nw) curve: the constant eta first, then eta = "
                                                                  "eta_rel x omega"));
       h5::h5_write_attribute(og, "units",
@@ -523,6 +529,7 @@ inline void write_optics(boost::mpi3::communicator &comm, std::string const &fil
     }
     if (og.has_subgroup(tag)) og.unlink(tag);
     auto tg = og.create_group(tag);
+    write_grid(tg);
     h5::h5_write(tg, "theta_deg", L.theta_deg);
     h5::h5_write(tg, "source", L.source);
     h5::h5_write(tg, "time_grid", L.time_grid);

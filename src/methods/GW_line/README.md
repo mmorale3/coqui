@@ -337,9 +337,9 @@ plt.show()
   Pi -> W pass; logged in `optics/theta<deg>/source`); every `optics.theta_deg` adds one pass on a flatter line.
 - `niter = 0` without restart: the spectra / optics of the initial G (KS, or the qp start).
 - `optics.poles = "initial"`: all optics lines from the iteration-0 poles (RPA@KS next to the GW optics of the same run).
-- Reruns replace the `spectra/` and `optics/theta<deg>/` groups, but the common grid `optics/omega`, `omega_eV`, `eta`,
-  `eta_rel` is written only when absent: after changing `optics.wmin / wmax / nw / eta / eta_rel` delete the `optics` group
-  (or work on a copy of the checkpoint), otherwise those datasets describe the old grid.
+- Reruns replace the `spectra/` and `optics/theta<deg>/` groups. Every `optics/theta<deg>/` group carries its own grid
+  (`omega`, `omega_eV`, `eta`, `eta_rel`); the common `optics/omega`, `omega_eV`, `eta`, `eta_rel` are rewritten on every pass
+  and describe the newest one. After changing `optics.wmin / wmax / nw / eta / eta_rel`, read the grid of the theta group.
 
 ## 6. Convergence guidance
 

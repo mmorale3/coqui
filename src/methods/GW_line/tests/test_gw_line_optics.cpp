@@ -39,6 +39,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <format>
 #include <map>
 #include <memory>
@@ -617,3 +618,43 @@ TEST_CASE("gw_line_flat_lih223", "[gw_line][V6][flat]") { run_flat("qe_lih223", 
 TEST_CASE("gw_line_flat_full_lih222", "[.flat_full]") { run_flat("qe_lih222", {20.0, 10.0, 5.0}, {"gl", "id"}, true); }
 TEST_CASE("gw_line_flat_full_si211", "[.flat_full]") { run_flat("qe_si211", {20.0, 10.0, 5.0}, {"gl", "id"}, true); }
 TEST_CASE("gw_line_flat_full_lih223", "[.flat_full]") { run_flat("qe_lih223", {20.0, 10.0, 5.0}, {"gl", "id"}, true); }
+
+// S8d finding: a rerun with another optics grid left the old /optics/omega next to the new curves. Every optics/<tag> group now
+// carries its own grid and the common grid is rewritten on every pass (write_optics); two passes with different grids, one file.
+TEST_CASE("gw_line_optics_grid_rerun", "[gw_line][optics]") {
+  auto mpi_ctx = utils::make_unit_test_mpi_context();
+  auto &world = mpi_ctx->comm;
+  std::string const file = "gw_line_optics_grid_rerun.h5";
+  if (world.root()) std::remove(file.c_str());
+  world.barrier();
+  optics_line_t L;
+  L.theta_deg = 20.0;
+  optics_params_t p1, p2;
+  p1.wmin = 0.0, p1.wmax = 1.0, p1.nw = 11, p1.eta = {0.01};
+  p2.wmin = 0.1, p2.wmax = 2.0, p2.nw = 21, p2.eta = {0.02, 0.03};
+  write_optics(world, file, "theta20.0", L, {}, p1, 8.0, 270.0);
+  write_optics(world, file, "theta10.0", L, {}, p2, 8.0, 270.0);
+  write_optics(world, file, "theta20.0", L, {}, p1, 8.0, 270.0);   // rerun of the first pass: overwrites its own group
+  world.barrier();
+  if (world.root()) {
+    h5::file f(file, 'r');
+    h5::group g(f);
+    nda::array<double, 1> w, w10, w20, e10, ev;
+    nda::h5_read(g, "optics/omega", w);
+    nda::h5_read(g, "optics/theta10.0/omega", w10);
+    nda::h5_read(g, "optics/theta10.0/eta", e10);
+    nda::h5_read(g, "optics/theta20.0/omega", w20);
+    nda::h5_read(g, "optics/theta20.0/omega_eV", ev);
+    REQUIRE(w10.size() == 21);
+    REQUIRE(e10.size() == 2);
+    REQUIRE(std::abs(w10(0) - 0.1) < 1e-15);
+    REQUIRE(w20.size() == 11);
+    REQUIRE(ev.size() == 11);
+    REQUIRE(w.size() == 11);   // the common grid = the newest pass
+    double nel = 0;
+    h5::h5_read(g, "optics/nelec", nel);
+    REQUIRE(nel == 8.0);
+    std::remove(file.c_str());
+  }
+  world.barrier();
+}

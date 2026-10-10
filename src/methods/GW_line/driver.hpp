@@ -96,12 +96,12 @@
  *                       discrete-decision noise (~1e-4 in Sigma for Si); damped steps let the decisions lock.
  *   start = "ks"        perf 7.2 initial G: "ks" (below) | "qp_diag": one Pi -> W -> Sigma pass on the KS poles (no SCF closure, not
  *                       counted as an iteration), diagonal G0W0 QP equation E_n = (H0 + F - mu)_nn + Re Sigma_nn(E_n + i
- *                       start_eta) per k and band, Sigma_c from the upfolded closure representation of each k (Newton;
+ *                       start_eta, default 1e-3 Ha) per k and band, Sigma_c from the upfolded closure representation of each k (Newton;
  *                       linearized fallback), then KS vectors with the QP energies (same density, F unchanged), mu = QP
  *                       mid-gap; the history of the run starts after it | "qp_file": the same with the energies
  *                       (absolute, Ha, band order, first nbnd bands) read from start_file (dataset start_dataset; default:
  *                       scf/iter<final_iter>/qp_approx/E_ska of a CoQui mbpt.h5, else "E_ska" / "qp_energies" at the root)
- *   coarse = { niter = 0, eps = 1e-8, K = 16, nodes_per_ray = 80, time_eps = 1e-8 }   perf 7.2 multilevel schedule: iterations
+ *   coarse = { niter = 0, eps = 1e-8, K = 16, nodes_per_ray = 80, time_eps = coarse.eps }   perf 7.2 multilevel schedule: iterations
  *                       1..niter at these settings (bases, closure, fermionic nodes, time grids), then the production ones;
  *                       the Sigma of the coarse level is dropped at the switch (the first production iteration takes Sigma[G]
  *                       unmixed), so the run ends with >= 2 production iterations (niter >= coarse.niter + 2 required)
@@ -123,6 +123,7 @@
  *                       Pi -> W stage chosen automatically as the largest group whose plan-6.7 model fits mem_frac of the free
  *                       host memory per rank (MemAvailable / cgroup, at the plan) and of the free device memory; the budgets
  *                       in GB per rank override the measurement; q_group_size > 0 (or env COQUI_GWLINE_QGROUP) fixes the size
+ *   ibz = true          perf 7.3: IBZ reduction (ibz.hpp) when the mean field is symmetric; false = full BZ (env COQUI_GWLINE_IBZ)
  *   output / outdir + prefix   checkpoint stem (MBPT_drivers resolve_mbpt_output_stem; the driver reads "output")
  *   div_treatment = "ignore_g0"   q -> 0 divergence of Sigma_c (S9a, head.hpp): "ignore_g0" (Z(Gamma) without its G = 0 term,
  *                       no head term) or a gygi variant of CoQui ("gygi" = axis-folded polynomial extrapolation of the head
@@ -136,7 +137,9 @@
  *   spectra = { enable = true, eta = [0.004, 0.01], wmin = -0.45, wmax = 0.45, nw = 601 }   A(k,w) at the end
  *   optics = { enable, wmin = 0, wmax = 1.5, nw = 1501, eta = [0.01], eta_rel = [0.05], scales = "auto" | [..], nscales = 4,
  *              K = "auto" | int, q0 = true, finite_q = true, theta_deg = <flatter final line(s), deg>, time_grid = "id",
- *              nline, npole, mem_gb = 2, nnls_n = 1500, q0_variants = ["gygi_perdir", "gygi_smallest_q", "gygi_average"] }
+ *              nline, npole, mem_gb = 2, nnls_n = 1500, delta_floor = 1e-10,
+ *              q0_variants = ["gygi_perdir", "gygi_smallest_q", "gygi_average"] }   (delta_floor: lower bound of the
+ *                       fit-residual noise level delta used by the optics closure)
  *                       S9b real-axis optics (optics.hpp, head_pass.hpp) after the loop (also from a restart with nothing
  *                       left to iterate): loss, eps1, eps2, n, kappa, alpha, R, sigma for q -> 0 and every mesh q != Gamma
  *                       from the head at the SCF angle (the last iteration of this run, else the checkpoint's last head
