@@ -1037,7 +1037,8 @@ TEST_CASE("gw_line_finiteT_T4_bitwise", "[gw_line][finiteT][T4]") {
 // 1e-13 in Sigma to 8-21 meV in mu at iteration 1 (python's closure itself: 2.4e-3 Ha spread at 1e-13), 140-720 meV / 1.7e-3 in
 // Sigma at iteration 2, 360-580 meV / 2.8e-2 at iteration 3. Iteration 1's Sigma (the kernels on the KS lists, no closure) is
 // strict: masked nodes rho beta |zeta| >= c_f only (below the floor the GL end-point terms differ by design, 1.6e-5).
-constexpr double FT_MU_FLOOR[3]  = {20.8, 717.0, 577.0};       // meV
+// iteration-1 mu floor = the max of the Mac noise meter (21 meV) and the rusty (MKL) spreads: 1 vs 2 ranks 152 meV, parity -135 meV
+constexpr double FT_MU_FLOOR[3]  = {152.0, 789.0, 825.0};      // meV (max over the Mac noise meter and the rusty 1 vs 2 ranks / parity spreads)
 constexpr double FT_SIG_FLOOR[3] = {1e-12, 1.70e-3, 2.78e-2};  // relative, masked nodes
 TEST_CASE("gw_line_finiteT_parity", "[gw_line][finiteT][parity]") {
   const std::string ref = ft_dir() + "lih222_finiteT_scf_ref.h5";
