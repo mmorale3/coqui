@@ -47,6 +47,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -72,6 +73,9 @@
 #include "methods/mb_state/mb_state.hpp"
 #include "methods/SCF/simple_dyson.h"
 #include "methods/SCF/scf_common.hpp"
+#include "methods/SCF/scf_driver.hpp"
+#include "methods/ERI/mb_eri_context.h"
+#include "numerics/iter_scf/iter_scf_utils.hpp"
 #include "methods/HF/hf_t.h"
 #include "methods/GW/gw_t.h"
 #include "methods/scr_coulomb/scr_coulomb_t.h"
@@ -1547,4 +1551,181 @@ TEST_CASE("gw_line_finiteT_lazy_scan", "[gw_line][finiteT][lazy]") {
   rm_ckpt(comm, "gw_line_ft_lazy_a");
   rm_ckpt(comm, "gw_line_ft_lazy_b");
   REQUIRE(ok);
+}
+
+// ============================================================================================================== T4c (hidden)
+// VALIDATION (plan S8b T4c, not a gate): the 5-iteration scGW on lih222 at beta 200 vs CoQui's imaginary-axis scGW (DLR,
+// damping 0.5, mu by the particle number), for scf_density = "closure" and "matsubara" (theta_t = theta/2 and theta/4).
+// Compared through G(i w_n) at CoQui's Matsubara points: X(i w_n) = i w_n + mu - G^{-1}(i w_n) = F + Sigma_c(i w_n) (both
+// codes, H0 included), so dX = the total self-energy difference; reported: mu, N(mu), dN, max|dX| relative to max|X|, the
+// dynamic part (dX - dX(i w_max)) relative to max|Sigma_c^CoQui| and the static offset dX(i w_max).
+namespace {
+/// G(i w_n) (nw, nk, nb, nb) of a pole set (e relative to its mu) at z = i w_n
+nda::array<ComplexType, 4> g_of_poles(pole_data_t const &pd, nda::array<ComplexType, 1> const &z) {
+  const long nk = pd.nk, nb = pd.nb, nw = z.size();
+  nda::array<ComplexType, 4> G(nw, nk, nb, nb);
+  G() = 0.0;
+  for (long k = 0; k < nk; ++k)
+    for (auto s : {sector_t::particle, sector_t::hole}) {
+      auto const &ps = pd(k, s);
+      for (long m = 0; m < ps.size(); ++m) {
+        nda::matrix<ComplexType> C(nb, nb);
+        if (ps.is_factorized())
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) C(i, j) = ps.v(i, m) * std::conj(ps.v(j, m));
+        else
+          C = ps.coef(m, nda::range::all, nda::range::all);
+        for (long n = 0; n < nw; ++n) {
+          const ComplexType r = 1.0 / (z(n) - ps.e(m));
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) G(n, k, i, j) += r * C(i, j);
+        }
+      }
+    }
+  return G;
+}
+/// X = z + mu - G^{-1}(z) per (n, k)
+nda::array<ComplexType, 4> x_of_g(nda::array<ComplexType, 4> const &G, nda::array<ComplexType, 1> const &z, double mu) {
+  nda::array<ComplexType, 4> X(G.shape());
+  const long nb = G.extent(2);
+  for (long n = 0; n < G.extent(0); ++n)
+    for (long k = 0; k < G.extent(1); ++k) {
+      nda::matrix<ComplexType> Gi = nda::inverse(nda::matrix<ComplexType>(G(n, k, nda::range::all, nda::range::all)));
+      for (long i = 0; i < nb; ++i)
+        for (long j = 0; j < nb; ++j) X(n, k, i, j) = (i == j ? z(n) + mu : ComplexType(0.0)) - Gi(i, j);
+    }
+  return X;
+}
+} // namespace
+
+TEST_CASE("gw_line_finiteT_T4c", "[.][gw_line][finiteT][T4c]") {
+  using namespace methods;
+  lih_ft_t L;
+  auto &comm = L.mpi->comm;
+  auto &mf   = *L.mf;
+  const long NIT = 5, nk = mf.nkpts(), nb = L.thc->nbnd();
+  const double beta = 200.0;
+  double w_max = 0.0;
+  for (long k = 0; k < nk; ++k)
+    for (long n = 0; n < nb; ++n) w_max = std::max(w_max, std::abs(mf.eigval()(0, k, n)));
+  w_max += 2.0;
+  // ---- CoQui scGW
+  imag_axes_ft::IAFT ft(beta, w_max + 1.0, imag_axes_ft::dlr_basis, "high");
+  const std::string cq = "coqui_gw_line_ft_t4c";
+  auto t0 = std::chrono::steady_clock::now();
+  {
+    simple_dyson dyson(&mf, &ft);
+    solvers::hf_t hf("ignore_g0");   // the line's hf_div_treatment (CoQui's default is gygi)
+    solvers::gw_t gw(&ft, "ignore_g0", cq);
+    solvers::scr_coulomb_t scr(&ft, "rpa", "ignore_g0");
+    auto eri = mb_eri_t(*L.thc, *L.thc);
+    MBState mb_state(L.mpi, ft, cq);
+    iter_scf::iter_scf_t damp(iter_scf::damp_t(0.5));
+    scf_loop(mb_state, dyson, eri, ft, solvers::mb_solver_t(&hf, &gw, &scr), &damp, NIT, false, 1e-14, false);
+  }
+  comm.barrier();
+  const double tC = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  auto wn = ft.wn_mesh_f();
+  const long nw = ft.nw_f();
+  nda::array<ComplexType, 1> z(nw);
+  for (long n = 0; n < nw; ++n) z(n) = ft.omega(wn(n));
+  double mu_C = 0.0;
+  long itC    = 0;
+  std::vector<double> muC_it;
+  nda::array<ComplexType, 4> XC, FC, GC;
+  {
+    nda::array<ComplexType, 5> Gt, Gw(nw, 1, nk, nb, nb);
+    nda::array<ComplexType, 4> F;
+    {
+      h5::file f(cq + ".mbpt.h5", 'r');
+      h5::group g(f);
+      auto sg = g.open_group("scf");
+      h5::h5_read(sg, "final_iter", itC);
+      auto gi = sg.open_group("iter" + std::to_string(itC));
+      h5::h5_read(gi, "mu", mu_C);
+      for (long i = 1; i <= itC; ++i) {
+        double m = 0.0;
+        h5::h5_read(sg.open_group("iter" + std::to_string(i)), "mu", m);
+        muC_it.push_back(m);
+      }
+      nda::h5_read(gi, "G_tskij", Gt);
+      nda::h5_read(gi, "F_skij", F);
+    }
+    ft.tau_to_w(Gt, Gw, imag_axes_ft::fermion);
+    nda::array<ComplexType, 4> G(nw, nk, nb, nb);
+    for (long n = 0; n < nw; ++n) G(n, nda::ellipsis{}) = Gw(n, 0, nda::ellipsis{});
+    XC = x_of_g(G, z, mu_C);
+    GC = G;
+    FC = F;
+  }
+  long nmax = 0;
+  for (long n = 0; n < nw; ++n)
+    if (std::abs(z(n).imag()) > std::abs(z(nmax).imag())) nmax = n;
+  app_log(1, "\n[finiteT][T4c] lih222 beta {}: CoQui scGW {} iterations ({:.1f} s, {} ranks): mu {:.10f}, {} Matsubara points "
+             "(max |w_n| {:.1f} Ha)",
+          beta, itC, tC, comm.size(), mu_C, nw, std::abs(z(nmax).imag()));
+  struct case_t {
+    std::string name, density;
+    double tfrac;
+  };
+  const std::vector<case_t> cases = {{"closure", "closure", 0.0}, {"matsubara", "matsubara", 0.0}, {"matsubara_t4", "matsubara", 0.25}};
+  for (auto const &c : cases) {
+    auto pt = ft_params("gw_line_ft_t4c_" + c.name, NIT, beta, "id", "auto");
+    pt.put("scf_density", c.density);
+    if (c.tfrac > 0.0) pt.put("theta_t_frac", c.tfrac);
+    auto t1 = std::chrono::steady_clock::now();
+    auto R  = gw_line_scf<HOST_MEMORY>(*L.thc, mf, pt);
+    const double tl = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+    app_log(1, "  -- gw_line scf_density {} theta_t_frac {} ({:.1f} s):", c.density,
+            c.tfrac > 0.0 ? std::to_string(c.tfrac) : std::string("default"), tl);
+    for (auto const &h : R.history) {
+      char ex[128] = "";
+      if (c.density == "matsubara") std::snprintf(ex, sizeof(ex), " | closure N %.6f max|D_cl - D| %.1e", h.N_closure, h.D_cl_err);
+      app_log(1, "     iter {}: mu {:.10f} (- CoQui same iteration {:+.3e}) rule {} dN {:+.2e} N(mu) {:.12f} gap {:.4f} eV{}", h.iter, h.mu,
+              h.mu - (h.iter <= long(muC_it.size()) ? muC_it[h.iter - 1] : mu_C), h.mu_rule, h.dN, h.N_mu, h.gap * 27.211386, std::string(ex));
+    }
+    utils::check(R.poles.nk == nk and R.H0.extent(0) == nk, "T4c: the line's poles are not on the full k mesh");
+    auto GL = g_of_poles(R.poles, z);
+    auto XL = x_of_g(GL, z, R.mu);
+    // the closure's Lehmann G keeps a total weight W0 = sum of residues != 1 (dropped / pruned poles): X grows like
+    // i w (1 - 1/W0) at large |w_n|, so Sigma is compared on |w_n| <= 2 Ha (the spectral range) and G on all points
+    double dg = 0.0, gm = 0.0, wdef = 0.0;
+    for (long k = 0; k < nk; ++k) {
+      for (long n = 0; n < nw; ++n)
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) {
+            dg = std::max(dg, std::abs(GL(n, k, i, j) - GC(n, k, i, j)));
+            gm = std::max(gm, std::abs(GC(n, k, i, j)));
+          }
+      double w0 = 0.0;
+      for (auto sct : {sector_t::particle, sector_t::hole}) {
+        auto const &ps = R.poles(k, sct);
+        for (long m = 0; m < ps.size(); ++m)
+          for (long i = 0; i < nb; ++i) w0 += ps.is_factorized() ? std::norm(ps.v(i, m)) : ps.coef(m, i, i).real();
+      }
+      wdef = std::max(wdef, std::abs(w0 / double(nb) - 1.0));
+    }
+    // total Sigma = X - H0 (both codes), Sigma_c = X - H0 - F (CoQui F_skij = V_H + Sigma_x; line F_closure, the F of the poles)
+    double dx = 0.0, xm = 0.0, ds = 0.0, sm = 0.0, df = 0.0, fm = 0.0;
+    for (long k = 0; k < nk; ++k)
+      for (long i = 0; i < nb; ++i)
+        for (long j = 0; j < nb; ++j) {
+          df = std::max(df, std::abs(R.F_closure(k, i, j) - FC(0, k, i, j)));
+          fm = std::max(fm, std::abs(FC(0, k, i, j)));
+          for (long n = 0; n < nw; ++n) {
+            if (std::abs(z(n).imag()) > 2.0) continue;
+            const ComplexType aC = XC(n, k, i, j) - R.H0(k, i, j), aL = XL(n, k, i, j) - R.H0(k, i, j);
+            const ComplexType sC = aC - FC(0, k, i, j), sL = aL - R.F_closure(k, i, j);
+            dx = std::max(dx, std::abs(aL - aC));
+            xm = std::max(xm, std::abs(aC));
+            ds = std::max(ds, std::abs(sL - sC));
+            sm = std::max(sm, std::abs(sC));
+          }
+        }
+    app_log(1, "     vs CoQui (final iteration): |dmu| {:.3e} Ha; G(i w_n) max|d| / max {:.3e} (all {} points; line weight deficit "
+               "max_k |Tr W0 / nb - 1| {:.1e}); |w_n| <= 2 Ha: total Sigma max|d| / max {:.3e} (max {:.3e} Ha), Sigma_c {:.3e} (max "
+               "{:.3e} Ha); F {:.3e} Ha (max {:.3e})",
+            std::abs(R.mu - mu_C), dg / gm, nw, wdef, dx / xm, xm, ds / sm, sm, df, fm);
+  }
+  REQUIRE(true);
 }
