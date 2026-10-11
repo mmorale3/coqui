@@ -37,7 +37,7 @@ W step at finite T (S8b redesign, notes section 11.5 sec:fT_W; parameters in sel
   mode uses the poles of self.bos_w unless nu is given.
 """
 import numpy as np
-from .timeray import TimeRay, tau_grid
+from .timeray import TimeRay, tau_grid, tau_panels, tau_fourier
 from .line_dlr import LineBasis, BosonicLineBasis
 
 WSTEP_DEFAULTS = dict(
@@ -50,6 +50,10 @@ WSTEP_DEFAULTS = dict(
     cut_odd=1e-13, cut_even=1e-10, # relative SVD cutoffs of the odd / even sectors of fit_split
     deg_tol=1e-8,                  # |e_n(k) - e_m(k-q)| below which a pair is degenerate (excluded from the dynamic Pi(q, 0))
     tau_nn=12, tau_per_efold=2.0, tau_x0=0.02,   # tau-leg grid: composite GL, nn points per panel, log panels from x0/E_max
+)
+
+HYBRID_DEFAULTS = dict(            # S8b.3 hybrid (sigma_tau_leg): Filon-GL tau grid of the Sigma leg (20 points, 1 panel per e-fold:
+    sig_tau_nn=20, sig_tau_per_efold=1.0, sig_tau_x0=0.02,   # ~1e-14 of max|Sigma(i w_n)| on exponentials, 440-480 nodes)
 )
 
 
@@ -379,6 +383,89 @@ class LineGW:
                 S_ab = (Xk.conj().T @ acc) @ Xk                           # (nt, nb, nb)
                 out += (F[:, i0:i0 + self.t_chunk] @ S_ab.reshape(S_ab.shape[0], -1)).reshape(-1, S_ab.shape[1], S_ab.shape[2])
         return out
+
+    def sigma_tau_leg(self, wres, iw, ks=None, qminus=None, nu=None, dW=None, tau_kw=None, chunk=32, Fmat=None):
+        """S8b.3 hybrid (notes section 11.6 "Hybrid"): Sigma_c(k, i w_n) from the imaginary-time products
+            Sigma(k, tau) = -(1/Nk) sum_q X(k)^dag [G~(k-q, tau) o W(q, tau)] X(k),   0 < tau < beta,
+            G~(k-q, tau) = -X [sum_m (1 - f_m) e^{-e_m tau} coef_m] X^dag              (ALL poles, gtilde_tau 'p'),
+            W(q, tau)    = -sum_j [(1 + n_j) e^{-nu_j tau} w_j(q) + n_j e^{+nu_j tau} w_j(-q)^T]  (ALL nu_j, exact n_j),
+        with every weight in log form ((1 + n) e^{-nu tau} = e^{-nu tau}/(1 - e^{-beta nu}), n e^{nu tau} = e^{-nu (beta - tau)}/
+        (1 - e^{-beta nu}); bounded on [0, beta] by KMS), then Sigma(i w_n) = int_0^beta e^{i w_n tau} Sigma(tau) dtau by the
+        Filon-GL matrix of timeray.tau_fourier (exact in w for the panel interpolant; any n). The transform of each
+        (m, j) pair is (1 - f_m + n_j)/(i w - e_m - nu_j) + (f_m + n_j)/(i w - e_m + nu_j): Eq. fT_sigma, the analytic
+        (dynamic) convention of the line. No degenerate-pair subtraction is needed (w_n != 0 for every fermionic n).
+        Optional dW (list over q of (Np, Np) or None): adds the Matsubara-convention nu_0 term, W(tau) += dW(q)/beta
+        (dW = W^Mats(q, i nu_0) - W^an(q, 0) from the degenerate pairs of the tau leg's Pi), = finite_t.sigma_nu0_term.
+        wres[q]: residues (r, Np, Np), or a factorized pair (L (Np, r), R (r, Np)) with w_j = L[:, j] R[j, :] (Casida
+        alpha / bet); nu[q]: their positive poles (default: self.bos_w.nu in thermal mode, else self.bos.nu); qminus: index
+        of -q (None: self-inverse q). iw: i w_n (nw,) (mu-relative, Im > 0). ks: list of k (default all).
+        Also returns the high-frequency moments of Sigma_c(i w) = S1/(i w) + S2/(i w)^2 + ... from the end points:
+        S1 = -(Sigma(0+) + Sigma(beta-)), S2 = Sigma'(0+) + Sigma'(beta-) (the tail of density_matsubara).
+        tau_kw: (nn, per_efold, x0) override of HYBRID_DEFAULTS; the grid's decay scale is E_max(G) + max nu.
+        Returns dict(sigma (nks, nw, nb, nb), S1, S2 (nks, nb, nb), ntau, ks)."""
+        beta = self.beta
+        e, coef = self.poles
+        ks = list(range(self.nk)) if ks is None else list(ks)
+        iw = np.atleast_1d(np.asarray(iw, complex))
+        qm = (lambda iq: iq) if qminus is None else (lambda iq: qminus[iq])
+        nu0 = (self.bos_w if (self.thermal and self.bos_w is not None) else self.bos).nu
+        nu_of = (lambda iq: np.asarray(nu0, float)) if nu is None else (lambda iq: np.asarray(nu[iq], float))
+        def factors(iq, minus):                         # (L (Np, r), R (r, Np), nu) of w_j(q), or of w_j(-q)^T if minus
+            w = wres[qm(iq)] if minus else wres[iq]
+            nuq = nu_of(qm(iq)) if minus else nu_of(iq)
+            if isinstance(w, tuple):
+                L, R = w
+                return (R.T, L.T, nuq) if minus else (L, R, nuq)
+            return (None, np.transpose(w, (0, 2, 1)) if minus else w, nuq)
+        ef = np.asarray(e, float); emax_g = float(np.abs(ef[np.abs(ef) < 1e5]).max())
+        numax = max(float(np.max(nu_of(iq))) if np.size(nu_of(iq)) else 0.0 for iq in range(self.nk))
+        hk = dict(HYBRID_DEFAULTS)
+        nn, pe, x0 = (hk['sig_tau_nn'], hk['sig_tau_per_efold'], hk['sig_tau_x0']) if tau_kw is None else tau_kw
+        pan = tau_panels(beta, emax_g + numax, nn, pe, x0)
+        tau = pan[0]
+        F = tau_fourier(beta, emax_g + numax, iw, nn, pe, x0, panels=pan) if Fmat is None else Fmat
+        tt_all = np.concatenate([tau, [0.0, beta]])     # + end points for the moments
+        nt = len(tau)
+        Stau = np.zeros((len(ks), nt + 2, self.nb, self.nb), complex)
+        dS = np.zeros((len(ks), 2, self.nb, self.nb), complex)        # Sigma'(0), Sigma'(beta)
+        def wtau(L, R, nuq, tt, deriv=False, minus=False):
+            """sum_j a_j(tau) w_j with a = (1+n) e^{-nu tau} (plus) or n e^{nu tau} (minus) [times -nu / +nu for d/dtau]."""
+            lg = -np.log(-np.expm1(-beta * nuq))[None, :]
+            a = np.exp(lg - (nuq[None, :] * tt[:, None] if not minus else nuq[None, :] * (beta - tt[:, None])))
+            if deriv: a = a * (nuq[None, :] if minus else -nuq[None, :])
+            if L is None:
+                return (a @ R.reshape(R.shape[0], -1)).reshape(len(tt), self.Np, self.Np)
+            return np.einsum('pj,tj,jq->tpq', L, a, R, optimize=True)
+        for iq in range(self.nk):
+            Lp, Rp, nup = factors(iq, False); Lm, Rm, num = factors(iq, True)
+            for i0 in range(0, nt + 2, chunk):
+                tt = tt_all[i0:i0 + chunk]
+                Wb = wtau(Lp, Rp, nup, tt) + wtau(Lm, Rm, num, tt, minus=True)
+                if dW is not None and dW[iq] is not None:
+                    Wb = Wb - dW[iq][None] / beta          # W(tau) = -Wb: W^Mats = W^an + dW/beta
+                end = i0 + len(tt) > nt
+                if end:                                    # derivatives at the end points
+                    je = np.arange(len(tt))[i0 + np.arange(len(tt)) >= nt]
+                    te = tt[je]
+                    dWb = wtau(Lp, Rp, nup, te, deriv=True) + wtau(Lm, Rm, num, te, deriv=True, minus=True)
+                for j, ik in enumerate(ks):
+                    ikmq = self.qk[iq, ik]
+                    gp = self.gtilde_tau(ikmq, tt, 'p')
+                    Xk = self.X[ik]
+                    Stau[j, i0:i0 + len(tt)] -= (Xk.conj().T @ (gp * Wb)) @ Xk
+                    if end:
+                        # d/dtau gtilde_tau 'p' = X [sum_m (-e_m)(1 - f_m) e^{-e_m tau} coef_m] X^dag
+                        ek = ef[ikmq]; lw = -np.logaddexp(0.0, -beta * ek)[None, :] - ek[None, :] * te[:, None]
+                        ph = np.exp(lw) * (-ek[None, :])
+                        Gd = (ph @ coef[ikmq].reshape(ph.shape[1], -1)).reshape(len(te), self.nb, self.nb)
+                        Xm = self.X[ikmq]
+                        gpd = (Xm @ Gd) @ Xm.conj().T
+                        dS[j] -= (Xk.conj().T @ (gpd * Wb[je] + gp[je] * dWb)) @ Xk
+        Stau /= self.nk; dS /= self.nk
+        sig = np.einsum('wt,ktab->kwab', F, Stau[:, :nt], optimize=True)
+        S1 = -(Stau[:, nt] + Stau[:, nt + 1])
+        S2 = dS[:, 0] + dS[:, 1]
+        return dict(sigma=sig, S1=S1, S2=S2, ntau=nt, ks=ks)
 
     def _sigma_general(self, ik, wres, zeta, qminus, nu):
         """sigma() with per-q pole energies and/or the thermal W(t) of Eq. fT_W (n_j = 0 at T = 0)."""

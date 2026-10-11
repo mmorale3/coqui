@@ -16,6 +16,10 @@ THC: X (nk, Np, nb) collocation, Z (nq, Np, Np); qk[iq, ik] = index of k - q; KS
   residues w_j(q) = alpha_s bet_s and of -q transposed,
     Sigma_c(k, zeta) = (1/Nk) sum_q sum_{m in k-q} sum_j [(1-f_m+n_j) X^+[c~_m o w_j(q)]X/(zeta - e_m - nu_j)
                                                        + (f_m+n_j) X^+[c~_m o w_j(-q)^T]X/(zeta - e_m + nu_j)].
+* S8b.3 hybrid (notes section 11.6 "Hybrid"): matsubara_set (the dense truncated fermionic set n = 0..N-1, N from w_max),
+  density_matsubara (Matsubara Dyson G(i w_n; mu) = [i w_n + dmu - H - Sigma_c(i w_n)]^-1, D by the Matsubara sum with the
+  free reference f(H - dmu) and the analytic 1/w^4 tail from the moments S1, S2 of Sigma_c, N(mu) = N_el by bisection at
+  fixed Sigma_c), sigma_fT_hf (exact S1, S2 of Eq. fT_sigma), density_upfold (continuation-free exact D for a small pole list).
 * nu_0 term (test T3): Sigma^Mats(k, i w_n) - Sigma^an(k, i w_n) = -(1/beta)(1/Nk) sum_q X^+[G~(k-q, i w_n) o dW(q)] X,
   dW(q) = W^Mats(q, i nu_0) - W^an(q, 0), Pi^Mats(q, 0) = Pi^an(q, 0) + dPi(q), dPi = -(2/Nk) beta sum_{|E|<deg_tol} f_n(1-f_m) S S^H.
 """
@@ -294,3 +298,113 @@ def mu0_auto(eig, nelec, beta, thermal_tol=1e-8, k_weight=None):
     if beta is None or (lumo > homo and beta * 0.5 * (lumo - homo) > np.log(1.0 / thermal_tol)):
         return mid, 'gap'
     return mu_number(eig, nelec, beta, k_weight), 'number'
+
+
+# ------------------------------------------------------------------------------------------------ S8b.3 hybrid: Matsubara density
+def matsubara_set(beta, wmax):
+    """Dense truncated fermionic set: (n (N,), i w_n (N,)) for n = 0..N-1 with w_{N-1} >= wmax (negative n by Hermitian
+    conjugation, G(-i w_n) = G(i w_n)^dagger). N = ceil((wmax beta/pi - 1)/2) + 1 grows linearly with beta."""
+    N = int(np.ceil((wmax * beta / np.pi - 1.0) / 2.0)) + 1
+    n = np.arange(N)
+    return n, 1j * np.pi * (2 * n + 1) / beta
+
+
+def matsubara_tail4(beta, N):
+    """(1/beta) sum_{|n| >= N, pairs (n, -n-1)} 2/w_n^4 = (2/beta) (beta/pi)^4 zeta(4, N + 1/2)/16 (Hurwitz zeta)."""
+    from scipy.special import zeta
+    return 2.0 / beta * (beta / np.pi) ** 4 * zeta(4.0, N + 0.5) / 16.0
+
+
+def sigma_fT_hf(X, e, qk, qminus, cas, beta, ik, lam_tol=0.0):
+    """Exact high-frequency moments of Eq. fT_sigma: S1 = sum_p R_p (total weight), S2 = sum_p R_p E_p (nb, nb)."""
+    nb = X.shape[2]
+    S1 = np.zeros((nb, nb), complex); S2 = np.zeros((nb, nb), complex)
+    for E, w, A, B in sigma_fT_blocks(X, e, qk, qminus, cas, beta, ik, lam_tol):
+        S1 += (A * w[None, :]) @ B; S2 += (A * (w * E)[None, :]) @ B
+    return S1, S2
+
+
+def density_upfold(H, E, U, beta, dmu=0.0):
+    """Continuation-free exact density of G(i w_n) = [i w_n + dmu - H - Sigma(i w_n)]^-1 with Sigma(z) = U diag(1/(z - E))
+    U^dagger (a positive pole list, U (nb, P)) held FIXED at the Matsubara points while mu moves (the convention of
+    density_matsubara and of the imaginary-axis code): D = [f(H_up)]_{11}, H_up = [[H - dmu, U], [U^dagger, diag(E)]]
+    (test oracle of density_matsubara; small P only)."""
+    nb, P = U.shape
+    Hu = np.zeros((nb + P, nb + P), complex)
+    Hu[:nb, :nb] = H - dmu * np.eye(nb); Hu[:nb, nb:] = U; Hu[nb:, :nb] = U.conj().T; Hu[nb:, nb:] = np.diag(E)
+    lam, V = np.linalg.eigh(Hu)
+    Vt = V[:nb]
+    return (Vt * fermi(lam, beta)[None, :]) @ Vt.conj().T
+
+
+def density_matsubara(H, Siw, iw, beta, S1, S2, nelec=None, k_weight=None, dmu=None, tol=4e-16, maxit=200, tail6=True):
+    """S8b.3 hybrid density and chemical potential (notes section 11.6 "Hybrid").
+    H (nk, nb, nb): Hermitian mu-relative static Hamiltonian (H0 + F - mu_old); Siw (nk, N, nb, nb): Sigma_c(k, i w_n) at the
+    dense set iw = i w_n, n = 0..N-1 (matsubara_set); S1, S2 (nk, nb, nb): Sigma_c(i w) = S1/(i w) + S2/(i w)^2 + ...
+    G(i w; dmu) = [i w + dmu - H - Sigma_c(i w)]^-1, G_ref = [i w + dmu - H]^-1 (exact density f(H - dmu)),
+      D(dmu) = f(H - dmu) + (1/beta) sum_{n=0}^{N-1} [dG(i w_n) + dG(i w_n)^dagger] + T4 B,
+      dG = G - G_ref = S1/(i w)^3 + B/(i w)^4 + O(w^-5), B = S2 + (H - dmu) S1 + S1 (H - dmu); the odd orders cancel in the
+      pair sum (n, -n-1) (Hermitian moments), T4 = matsubara_tail4(beta, N); truncation error O(w_N^-5).
+      tail6: the w^-6 term of the remainder, c zeta(6, N + 1/2), is eliminated from the partial sums at N/2 and N (same
+      inversions; exact shape of the term) -> error O(w_N^-7). Measured on the toy of tests/test_finite_t.py (beta 50):
+      w_N 50 / 100 / 200 Ha: 2.6e-9 / 8.3e-11 / 2.6e-12 without, see the test for with.
+    dmu None: N(dmu) = 2 sum_k w_k Tr D_k = nelec by bisection to the root in dmu (Sigma_c fixed; Tr G from the eigenvalues of
+    H + Sigma_c(i w_n), computed once); else D at the given dmu. D at the root by full inversion.
+    Returns (dmu, D (nk, nb, nb), N (full inversion), info dict(N_trace, nfreq, tail_max, wN))."""
+    H = np.asarray(H); nk, nb = H.shape[0], H.shape[1]
+    wk = np.full(nk, 1.0 / nk) if k_weight is None else np.asarray(k_weight, float) / np.sum(k_weight)
+    iw = np.asarray(iw); Nf = len(iw)
+    from scipy.special import zeta as hzeta
+    Nh = Nf // 2
+    T4, T4h = matsubara_tail4(beta, Nf), matsubara_tail4(beta, Nh)
+    z6, z6h = hzeta(6.0, Nf + 0.5), hzeta(6.0, Nh + 0.5)
+    def extrap(xN, xh):                    # x(N) = x_inf - c zeta(6, N + 1/2): eliminate c
+        return xN + (xN - xh) / (z6h - z6) * z6 if tail6 else xN
+    h, Vh = np.linalg.eigh(H)                                                 # (nk, nb)
+    trS1 = np.einsum('kii->k', S1).real; trS2 = np.einsum('kii->k', S2).real
+    trHS1 = np.einsum('kij,kji->k', H, S1).real
+    def ntrace(dm, lam):
+        """N(dm) from the eigenvalues lam (nk, N, nb) of H + Sigma_c(i w_n)."""
+        Nt = 0.0
+        for k in range(nk):
+            z = iw[:, None] + dm
+            d = ((1.0 / (z - lam[k])).sum(1) - (1.0 / (z - h[k][None, :])).sum(1)).real
+            f0, tB = fermi(h[k] - dm, beta).sum(), trS2[k] + 2.0 * trHS1[k] - 2.0 * dm * trS1[k]
+            trD = extrap(f0 + 2.0 * d.sum() / beta + T4 * tB, f0 + 2.0 * d[:Nh].sum() / beta + T4h * tB)
+            Nt += 2.0 * wk[k] * trD
+        return Nt
+    def dens(dm):
+        D = np.zeros((nk, nb, nb), complex); tmax = 0.0
+        I = np.eye(nb)
+        for k in range(nk):
+            z = (iw + dm)[:, None, None]
+            G = np.linalg.inv(z * I - H[k][None] - Siw[k])
+            G0 = (Vh[k][None] / (z[:, :, 0] - h[k][None, :])[:, None, :]) @ Vh[k].conj().T
+            dG = G - G0; dGh = dG[:Nh].sum(0); dG = dG.sum(0)
+            Hd = H[k] - dm * I
+            B = S2[k] + Hd @ S1[k] + S1[k] @ Hd
+            tail = T4 * B
+            D0 = (Vh[k] * fermi(h[k] - dm, beta)[None, :]) @ Vh[k].conj().T
+            D[k] = extrap(D0 + (dG + dG.conj().T) / beta + tail, D0 + (dGh + dGh.conj().T) / beta + T4h * B)
+            tmax = max(tmax, float(np.abs(tail).max()))
+        return D, tmax
+    info = dict(nfreq=Nf, wN=float(np.abs(iw[-1])))
+    if dmu is None:
+        lam = np.array([np.linalg.eigvals(H[k][None] + Siw[k]) for k in range(nk)])     # (nk, N, nb)
+        allh = np.concatenate([h.ravel(), lam.real.ravel()])
+        lo, hi = allh.min() - 1.0 - 50.0 / beta, allh.max() + 1.0 + 50.0 / beta
+        Nlo = ntrace(lo, lam) - nelec
+        for _ in range(maxit):
+            mid = 0.5 * (lo + hi)
+            Nm = ntrace(mid, lam) - nelec
+            if Nm == 0.0 or hi - lo < tol * max(1.0, abs(mid)):
+                break
+            if (Nm < 0) == (Nlo < 0):
+                lo, Nlo = mid, Nm
+            else:
+                hi = mid
+        dmu = mid; info['N_trace'] = Nm + nelec
+    D, tmax = dens(dmu)
+    Nfull = float(2.0 * np.sum(wk * np.einsum('kii->k', D).real))
+    info['tail_max'] = tmax
+    return dmu, D, Nfull, info
