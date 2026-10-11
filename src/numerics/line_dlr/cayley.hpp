@@ -178,6 +178,28 @@ inline nda::array<double, 1> herm_eig(cmatrix_F &A) {
   return lam;
 }
 
+/// S8b "lazy" scan: eigenvalues only (zheevd jobz = 'N'; A is destroyed)
+inline nda::array<double, 1> herm_eigvals(cmatrix_F &A) {
+  const int n = int(A.extent(0));
+  nda::array<double, 1> lam(n);
+  if (n == 0) return lam;
+  int info = 0, lwork = -1, lrwork = -1, liwork = -1, iwq = 0;
+  ComplexType wq;
+  double rwq = 0.0;
+  const char jobz = 'N', uplo = 'L';
+  f77::zheevd_(&jobz, &uplo, &n, A.data(), &n, lam.data(), &wq, &lwork, &rwq, &lrwork, &iwq, &liwork, &info);
+  lwork  = std::max(1, int(std::real(wq)));
+  lrwork = std::max(1, int(rwq));
+  liwork = std::max(1, iwq);
+  nda::array<ComplexType, 1> work(lwork);
+  nda::array<double, 1> rwork(lrwork);
+  nda::array<int, 1> iwork(liwork);
+  f77::zheevd_(&jobz, &uplo, &n, A.data(), &n, lam.data(), work.data(), &lwork, rwork.data(), &lrwork, iwork.data(), &liwork,
+               &info);
+  utils::check(info == 0, "cayley::herm_eigvals: zheevd info = {}", info);
+  return lam;
+}
+
 /// herm_eig through the external driver when one is installed (and the matrix is large enough), else the host zheevd.
 inline nda::array<double, 1> herm_eig(cmatrix_F &A, lapack_hooks_t const *h) {
   if (h and h->heevd and A.extent(0) >= h->min_dim) {
@@ -411,7 +433,10 @@ struct upfold_opts_t {
    */
   double ueig_accept = 1.0;
   /// perf 7.1c: held-out error of the golden-section refinement: "eigen" (python: the error of each realization) |
-  /// "poly" (heldout_poly_t: ||R U(z)^{K+1} R^dag - C^(K+1)|| as an exact recursion in z = e^{i phi}, no eigensolve)
+  /// "poly" (heldout_poly_t: ||R U(z)^{K+1} R^dag - C^(K+1)|| as an exact recursion in z = e^{i phi}, no eigensolve) |
+  /// "lazy" (S8b thermal closure): the coarse errors from heldout_poly_t too, the reject_unity screen by the EIGENVALUES of U
+  /// only (Hermitian Cayley image, no eigenvectors), evaluated in the order of increasing error until a phase is admissible
+  /// (the coarse decision is the same; only the near-tie diagnostic sees the unscreened phases); serial (no distributed scan)
   std::string scan_err = "eigen";
   lapack_hooks_t const *hooks = nullptr;   ///< external (device) drivers of the Gram eigen, SVD and Cayley path; null: host
 };
@@ -569,7 +594,7 @@ inline upfold_problem_t upfold_prepare(nda::array<ComplexType, 3> const &C, long
                "\"gesdd\" (got \"{}\")", o.svd_driver);
   utils::check(o.ueig == "schur" or o.ueig == "cayley", "cayley::upfold_block: ueig must be \"schur\" or \"cayley\" (got \"{}\")",
                o.ueig);
-  utils::check(o.scan_err == "eigen" or o.scan_err == "poly", "cayley::upfold_block: scan_err must be \"eigen\" or \"poly\" "
+  utils::check(o.scan_err == "eigen" or o.scan_err == "poly" or o.scan_err == "lazy", "cayley::upfold_block: scan_err must be \"eigen\", \"poly\" or \"lazy\" "
                "(got \"{}\")", o.scan_err);
   using clock_t_ = std::chrono::steady_clock;
   auto tlap      = clock_t_::now();
@@ -864,6 +889,36 @@ inline double unity_distance(nda::array<ComplexType, 1> const &u) {
 }
 
 /**
+ * S8b "lazy" scan: min_l |u_l - 1| of U(phi) from the eigenvalues of the Hermitian Cayley image H = Herm(i (U - 1)^{-1} (U + 1))
+ * (the matrix unitary_eig_cayley diagonalizes with the cut u0 = 1): lambda = cot(theta / 2), |u - 1| = 2 / sqrt(1 + lambda^2);
+ * 0 if U - 1 is singular (an eigenvalue at 1).
+ */
+inline double unity_distance_vals(upfold_problem_t const &pr, double phi) {
+  cmatrix_F U = detail::form_u(pr, phi);
+  const int n = int(U.extent(0));
+  if (n == 0) return std::numeric_limits<double>::infinity();
+  cmatrix_F A(U), X(U), H(n, n);
+  for (long i = 0; i < n; ++i) {
+    A(i, i) -= 1.0;
+    X(i, i) += 1.0;
+  }
+  nda::array<int, 1> ipiv(n);
+  int info = 0;
+  detail::f77::zgetrf_(&n, &n, A.data(), &n, ipiv.data(), &info);
+  if (info != 0) return 0.0;
+  const char tr = 'N';
+  detail::f77::zgetrs_(&tr, &n, &n, A.data(), &n, ipiv.data(), X.data(), &n, &info);
+  for (auto const &x : X)
+    if (not(std::isfinite(x.real()) and std::isfinite(x.imag()))) return 0.0;
+  for (long j = 0; j < n; ++j)
+    for (long i = j; i < n; ++i) H(i, j) = 0.5 * (ComplexType(0.0, 1.0) * X(i, j) + std::conj(ComplexType(0.0, 1.0) * X(j, i)));
+  auto lam = detail::herm_eigvals(H);
+  double lmax = 0.0;
+  for (auto x : lam) lmax = std::max(lmax, std::abs(x));
+  return 2.0 / std::sqrt(1.0 + lmax * lmax);
+}
+
+/**
  * Decision of the coarse scan from the held-out errors and the unity distances of the nphi coarse realizations: the
  * admissible minimum (reject_unity), phase continuity (o.phi_prev / o.phase_keep), the near-tie diagnostic. Returns the
  * centre phi0 of the golden-section bracket; sets res.phi_index, n_rejected, phi_kept, phi_tie.
@@ -994,21 +1049,50 @@ inline void upfold_complete(upfold_problem_t const &pr, upfold_opts_t const &o, 
   } else {
     const long nphi = o.nphi;
     std::vector<double> errs(nphi), umin(nphi);
-    for (long ip = 0; ip < nphi; ++ip) {
-      auto rz  = realize(pr, coarse_phase(ip, nphi), o, res);
-      errs[ip] = rz.err;
-      umin[ip] = unity_distance(rz.u);
-    }
+    heldout_poly_t hp;
+    const bool lazy = (o.scan_err == "lazy");
+    if (lazy) {   // S8b: poly errors for every coarse phase, eigenvalue-only unity screen in the order of increasing error
+      const auto tp = std::chrono::steady_clock::now();
+      hp            = heldout_poly(pr);
+      res.t_poly    = detail::seconds_since(tp);
+      std::vector<long> ord(nphi);
+      for (long ip = 0; ip < nphi; ++ip) {
+        errs[ip] = hp(coarse_phase(ip, nphi));
+        umin[ip] = std::numeric_limits<double>::infinity();
+        ord[ip]  = ip;
+        ++res.n_mfree;
+      }
+      std::stable_sort(ord.begin(), ord.end(), [&](long a, long b) { return errs[a] < errs[b]; });
+      long ipv = -1;   // phase continuity: the previous basin must be screened too
+      if (std::isfinite(o.phi_prev) and o.phase_keep > 0.0) {
+        double pp = std::fmod(o.phi_prev, 2.0 * std::numbers::pi);
+        if (pp < 0.0) pp += 2.0 * std::numbers::pi;
+        ipv = long(std::llround(pp / (2.0 * std::numbers::pi / double(nphi)))) % nphi;
+        umin[ipv] = unity_distance_vals(pr, coarse_phase(ipv, nphi));
+        ++res.n_eig;
+      }
+      for (long ip : ord) {
+        if (ip != ipv) {
+          umin[ip] = unity_distance_vals(pr, coarse_phase(ip, nphi));
+          ++res.n_eig;
+        }
+        if (umin[ip] >= o.reject_unity) break;
+      }
+    } else
+      for (long ip = 0; ip < nphi; ++ip) {
+        auto rz  = realize(pr, coarse_phase(ip, nphi), o, res);
+        errs[ip] = rz.err;
+        umin[ip] = unity_distance(rz.u);
+      }
     golden_t g(coarse_decide(errs, umin, o, res), nphi);
     res.t_coarse = detail::seconds_since(t0);
     const auto t1 = std::chrono::steady_clock::now();
-    heldout_poly_t hp;
     if (o.scan_err == "poly") {
       hp         = heldout_poly(pr);
       res.t_poly = detail::seconds_since(t1);
     }
     auto f = [&](double p) {
-      if (o.scan_err != "poly") return realize(pr, p, o, res).err;
+      if (o.scan_err != "poly" and not lazy) return realize(pr, p, o, res).err;
       ++res.n_mfree;
       return hp(p);
     };

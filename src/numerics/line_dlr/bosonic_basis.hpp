@@ -202,9 +202,13 @@ struct bosonic_basis_t {
     return b;
   }
 
-  /// S8b: the Sigma basis of Eq. fT_W (file header): n_j = 1 / (e^{beta nu_j} - 1) for nu_j <= E_T (0 beyond)
-  bosonic_basis_t with_bose(double beta_, double E_T_) const {
+  /// S8b: the Sigma basis of Eq. fT_W (file header): n_j = 1 / (e^{beta nu_j} - 1) for nu_j <= E_T (0 beyond).
+  /// S8b.3: E_rows > E_T creates Bose rows (residues w_j(-q)^T) also for E_T < nu_j <= E_rows with W(t) weight 0 here (the rays
+  /// keep the E_T cut) for the tau leg of the hybrid density, which takes every row with its exact weight (with_exact_bose).
+  /// E_rows <= E_T (default): the S8b.2 basis, unchanged.
+  bosonic_basis_t with_bose(double beta_, double E_T_, double E_rows = -1.0) const {
     utils::check(n_bose == 0, "bosonic_basis_t::with_bose: already augmented");
+    if (E_rows < E_T_) E_rows = E_T_;
     bosonic_basis_t b = *this;
     b.beta = beta_;
     b.E_T  = E_T_;
@@ -213,7 +217,7 @@ struct bosonic_basis_t {
     for (long j = 0; j < r; ++j) {
       const double x = beta_ * nu(j);
       if (nu(j) <= E_T_ and x <= 700.0) n[j] = 1.0 / std::expm1(x);
-      if (n[j] > 0.0) b.bose_src.push_back(j);
+      if (n[j] > 0.0 or (nu(j) <= E_rows and x <= 700.0)) b.bose_src.push_back(j);
     }
     b.n_bose = long(b.bose_src.size());
     b.rank   = r + b.n_bose;
@@ -227,6 +231,18 @@ struct bosonic_basis_t {
       b.nu(r + i) = nu(b.bose_src[i]);
       b.tw(r + i) = n[b.bose_src[i]];
     }
+    return b;
+  }
+
+  /// S8b.3 tau leg: the same rows with the EXACT Bose weights of every pole (1 + n_j on the fitted rows, n_j on the Bose rows;
+  /// n_j = 1 / (e^{beta nu_j} - 1), 0 where beta nu_j > 700: such a row's products are < e^{-350} on [0, beta / 2])
+  bosonic_basis_t with_exact_bose() const {
+    utils::check(tw.size() == rank, "bosonic_basis_t::with_exact_bose: not a Bose-augmented basis");
+    bosonic_basis_t b = *this;
+    auto nex = [&](double v) { const double x = beta * v; return x <= 700.0 ? 1.0 / std::expm1(x) : 0.0; };
+    const long rf = rank_fit();
+    for (long j = 0; j < rf; ++j) b.tw(j) = 1.0 + nex(nu(j));
+    for (long i = 0; i < n_bose; ++i) b.tw(rf + i) = nex(nu(rf + i));
     return b;
   }
 
@@ -514,6 +530,10 @@ struct bosonic_basis_t {
       for (long i = 0; i < nt; ++i)
         for (long j = 0; j < rank; ++j) {
           const double sg = (j < rf) ? 1.0 : -1.0;   // extra rows: the opposite exponential
+          if (tw(j) == 0.0) {   // a row without weight here (S8b.3 extra Bose rows on the rays): 0, never 0 x inf
+            E(i, j) = 0.0;
+            continue;
+          }
           E(i, j) = (sector == sector_t::particle) ? tw(j) * std::exp(-I * sg * nu(j) * t(i)) : -tw(j) * std::exp(I * sg * nu(j) * t(i));
         }
       return E;

@@ -133,6 +133,9 @@
  *                       D), bos_eps_T = 1e-12 (D-selected basis), bos_line_eps = 1e-10 (the line basis of D's line nodes),
  *                       cut_odd = 1e-13, cut_even = 1e-10 (split fit), tau_grid = "id" | "gl", tau_eps = 1e-13 (tau leg),
  *                       spectra.occupation = false, thermal_bases_file (parity: D, nu_b, the Sigma basis injected).
+ *                       scf_density = "closure" | "matsubara" (S8b.3 hybrid, hybrid.hpp: tau-leg Sigma_c(i w_n) on the dense set
+ *                       w_n <= hyb_wmax = 100 Ha, Matsubara Dyson D / N / mu (N = N_el exactly); the closure supplies only the next
+ *                       poles; hyb_tau_eps = 1e-13; needs mixing_alg = "linear" and div_treatment = "ignore_g0").
  *                       An iteration is THERMAL iff a pole lies within E_T of mu; otherwise it is the T = 0 code (bitwise).
  *                       Thermal iterations need g_repr = "lehmann"; sigma_gap / bos_gap are not used there (two-sided gapless
  *                       Sigma basis, D-selected bosonic basis); start = "ks"; no multilevel, no optics.
@@ -280,6 +283,9 @@ struct gw_line_params_t {
   double tau_eps = 1e-13;                       ///< tau ID tolerance (Pi(q, 0) to 2e-14 with 40 nodes, lih222 beta 200)
   bool spectra_occupation = false;              ///< spectra.occupation: also f(w - mu) A(k, w)
   std::string thermal_bases_file;               ///< parity: D (D_zeta_re/_im), nu_b, sigma_basis_w injected (python reference)
+  std::string scf_density = "closure";          ///< S8b.3: "closure" | "matsubara" (hybrid: tau-leg Sigma, Matsubara D / N / mu)
+  double hyb_wmax = 100.0;                      ///< S8b.3: w_max (Ha) of the dense Matsubara set
+  double hyb_tau_eps = 1e-13;                   ///< S8b.3: tolerance of the Sigma tau ID
 
   static gw_line_params_t from_ptree(ptree const &pt);
   void log() const;
@@ -308,6 +314,10 @@ struct gw_line_iter_t {
   std::string mu_rule = "";              ///< rule the closure used
   double dN = 0.0, n_th = 0.0, wp_used = 0.0;
   long nD = 0, rank_b = 0, ntau = 0, nwin = 0;
+  // S8b.3 hybrid (scf_density = "matsubara"): the closure's own choices at the hybrid mu (diagnostics)
+  double N_trace = 0.0, N_closure = 0.0, D_cl_err = 0.0, dmu_closure = 0.0, tail_max = 0.0;
+  std::string rule_closure = "";
+  long nfreq = 0;
 };
 
 struct gw_line_result_t {

@@ -896,6 +896,15 @@ TEST_CASE("gw_line_finiteT_T3_coqui", "[gw_line][finiteT][T3]") {
   REQUIRE(ok);
 }
 
+namespace {
+void bcast_nda_(mpi3::communicator &comm, nda::array<double, 1> &a) {
+  long n = a.size();
+  comm.broadcast_n(&n, 1, 0);
+  if (not comm.root()) a.resize(n);
+  if (n > 0) comm.broadcast_n(a.data(), n, 0);
+}
+} // namespace
+
 // ============================================================================================================== driver (T4, T5)
 namespace {
 
@@ -1269,3 +1278,273 @@ TEST_CASE("gw_line_finiteT_device", "[gw_line][finiteT][device]") {
   REQUIRE(ok);
 }
 #endif
+
+// ============================================================================================================== S8b.3 hybrid
+#include "methods/GW_line/hybrid.hpp"
+namespace {
+/// tau-leg Sigma_c(i w_n) with the line W (generator's D and nu_b, all poles Bose-augmented) vs Eq. fT_sigma, and the
+/// Matsubara density vs the hybrid reference (lih222_finiteT_hybrid_ref.h5)
+bool run_hybrid_unit(fx_t &F, double beta) {
+  auto &comm = F.mpi->comm;
+  auto &mf   = *F.mf;
+  auto &thc  = *F.thc;
+  const long nk = mf.nkpts(), nq = mf.nqpts(), nb = thc.nbnd(), Np = thc.Np();
+  const std::string gname = "beta_" + std::to_string(long(beta));
+  h5::file hf(ft_dir() + "lih222_finiteT_ref.h5", 'r');
+  h5::group root(hf);
+  auto gb = root.open_group(gname);
+  h5::file hh(ft_dir() + "lih222_finiteT_hybrid_ref.h5", 'r');
+  h5::group hroot(hh);
+  auto hb = hroot.open_group(gname);
+  const double mu0 = read_attr<double>(gb, "mu0"), wmax = read_attr<double>(hroot, "wmax");
+  const double deg = std::numbers::pi / 180.0;
+  thermal_params_t tp;
+  tp.beta = beta; tp.thermal_tol = 1e-12; tp.theta = 20.0 * deg; tp.theta_t = 10.0 * deg; tp.tau_grid = "gl";
+  utils::TimerManager Timer;
+  bool ok = true;
+  nda::array<double, 2> eig(nk, nb);
+  double emax = 0.0;
+  for (long k = 0; k < nk; ++k)
+    for (long n = 0; n < nb; ++n) {
+      eig(k, n) = mf.eigval()(0, k, n);
+      emax      = std::max(emax, std::abs(eig(k, n) - mu0));
+    }
+  auto ks = pole_data_t::from_ks(eig, mu0);
+  aux_grid_t grid(*F.mpi, Np);
+  propagator_t<HOST_MEMORY> prop(thc, grid);
+  ibz_t ibz(mf, nb, false);
+  std::vector<long> qall(nq);
+  std::iota(qall.begin(), qall.end(), 0L);
+  // the W of T2: generator's D, nu_b; Pi on D (GL rays + GL tau leg); split fit with w(q) and w(-q)^T rows of every pole
+  nda::array<ComplexType, 1> Dr = read_c<1>(gb, "D_zeta");
+  nda::array<double, 1> nub;
+  nda::h5_read(gb, "nu_b", nub);
+  const long r = nub.size();
+  auto tl = thermal_lists(ks, beta, tp.E_T());
+  auto rp = time_ray_t::guarded(tp.theta_t, beta, tp.E_T(), 1e-5, 3.0, 16, sector_t::particle);
+  auto rh = time_ray_t::guarded(tp.theta_t, beta, tp.E_T(), 1e-5, 3.0, 16, sector_t::hole);
+  auto tn = make_tau_nodes(tp, emax, 2.0 * emax);
+  memory::array<HOST_MEMORY, ComplexType, 4> Pt, Pi, w, Wn;
+  nda::array<ComplexType, 1> z0(1);
+  z0(0) = 0.0;
+  pi_tau_leg<HOST_MEMORY>(prop, ks, mf, ibz, grid, tp, tn, z0, 8, Pt, Timer, qall);
+  polarization<HOST_MEMORY>(prop, tl, mf, grid, Dr, numerics::line_dlr::time_nodes_t(rp), numerics::line_dlr::time_nodes_t(rh), 8, Pi,
+                            Timer, sector_t::both, qall);
+  for (long i = 0; i < Dr.size(); ++i)
+    if (Dr(i) == ComplexType(0.0))
+      for (long q = 0; q < nq; ++q) Pi(q, i, nda::range::all, nda::range::all) = Pt(q, 0, nda::range::all, nda::range::all);
+  auto B  = bosonic_basis_t::with_poles(tp.theta, Dr, 4.0, nub);
+  auto B2 = B;
+  B2.n_bose = r;
+  B2.rank   = 2 * r;
+  B2.bose_src.resize(r);
+  std::iota(B2.bose_src.begin(), B2.bose_src.end(), 0L);
+  B2.nu = nda::array<double, 1>(2 * r);
+  B2.nu(nda::range(r)) = nub;
+  B2.nu(nda::range(r, 2 * r)) = nub;
+  coulomb_blocks_t<HOST_MEMORY> Zb(thc, grid, qall, Timer);
+  screened_interaction<HOST_MEMORY>(Pi, Zb, B2, grid, *F.mpi, w, Timer, &Wn, qall, false);
+  B2.beta = beta;
+  B2.tw   = nda::array<double, 1>(2 * r);
+  B2.tw() = 1.0;
+  auto Bx = B2.with_exact_bose();
+  // the tau leg
+  auto HN = make_hybrid_nodes(beta, emax + nda::max_element(nub), 1e-13, comm);
+  nda::array<ComplexType, 4> Sp, Sh;
+  auto tq = tau_lists(ks, beta);
+  auto t0 = std::chrono::steady_clock::now();
+  self_energy<HOST_MEMORY>(prop, tq, w, Bx, mf, grid, *F.mpi, HN.zdummy, *HN.kp, *HN.kh, 8, Sp, Timer, sector_t::both, false, nullptr, 0,
+                           &Sh);
+  const double tsec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  nda::array<long, 1> np_;
+  nda::h5_read(hb, "n_probe", np_);
+  nda::array<ComplexType, 1> izp(np_.size());
+  for (long i = 0; i < np_.size(); ++i) izp(i) = ComplexType(0.0, std::numbers::pi * double(2 * np_(i) + 1) / beta);
+  auto [Fp, Fh] = HN.fourier(izp);
+  auto SE = read_c<4>(hb, "Sigma_probe_exact");
+  double d = 0.0, m = 0.0;
+  const long ksel[2] = {0, 3};
+  for (int a = 0; a < 2; ++a)
+    for (long i = 0; i < izp.size(); ++i) {
+      nda::matrix<ComplexType> S(nb, nb);
+      S() = 0.0;
+      for (long j = 0; j < HN.ntau; ++j)
+        S += Fp(i, j) * Sp(ksel[a], j, nda::range::all, nda::range::all) + Fh(i, j) * Sh(ksel[a], j, nda::range::all, nda::range::all);
+      for (long x = 0; x < nb; ++x)
+        for (long y = 0; y < nb; ++y) {
+          d = std::max(d, std::abs(S(x, y) - SE(a, i, x, y)));
+          m = std::max(m, std::abs(SE(a, i, x, y)));
+        }
+    }
+  app_log(1, "\n[finiteT][hybrid] lih222 beta {}: Sigma tau ID {} nodes per leg (rank {}, E in [{:.3f}, {:.3f}]), Bose rows {}, tau leg "
+             "{:.1f} s; probes n up to {}",
+          beta, HN.ntau, HN.idp.rank, -HN.Eneg, HN.Emax, r, tsec, np_(np_.size() - 1));
+  ok = gate("tau-leg Sigma_c(i w_n) (line W) vs Eq. fT_sigma", d / m, 1e-10) and ok;
+  {   // moments vs exact S1, S2
+    auto S1e = read_c<3>(hb, "S1_exact");
+    auto S2e = read_c<3>(hb, "S2_exact");
+    double d1 = 0.0, m1 = 0.0, d2 = 0.0, m2 = 0.0;
+    for (long k = 0; k < nk; ++k) {
+      nda::array<ComplexType, 3> sp(Sp(k, nda::ellipsis{})), sh(Sh(k, nda::ellipsis{}));
+      auto [S1, S2] = hybrid_moments(HN, sp, sh);
+      for (long x = 0; x < nb; ++x)
+        for (long y = 0; y < nb; ++y) {
+          d1 = std::max(d1, std::abs(S1(x, y) - S1e(k, x, y)));
+          m1 = std::max(m1, std::abs(S1e(k, x, y)));
+          d2 = std::max(d2, std::abs(S2(x, y) - S2e(k, x, y)));
+          m2 = std::max(m2, std::abs(S2e(k, x, y)));
+        }
+    }
+    ok = gate("S1 (end points) vs exact", d1 / m1, 1e-10) and ok;
+    ok = gate("S2 (third-order differences) vs exact", d2 / m2, 1e-5) and ok;
+  }
+  // the Matsubara density with H = diag(eig - mu0) (the reference's), k rows of this rank
+  nda::array<ComplexType, 3> H(nk, nb, nb);
+  H() = 0.0;
+  for (long k = 0; k < nk; ++k)
+    for (long n = 0; n < nb; ++n) H(k, n, n) = eig(k, n) - mu0;
+  std::vector<long> krows;
+  for (long k = comm.rank(); k < nk; k += comm.size()) krows.push_back(k);
+  nda::array<ComplexType, 4> Spl(long(krows.size()), HN.size(), nb, nb), Shl(long(krows.size()), HN.size(), nb, nb);
+  for (long l = 0; l < long(krows.size()); ++l) {
+    Spl(l, nda::ellipsis{}) = Sp(krows[l], nda::ellipsis{});
+    Shl(l, nda::ellipsis{}) = Sh(krows[l], nda::ellipsis{});
+  }
+  t0 = std::chrono::steady_clock::now();
+  auto hd = matsubara_density(comm, H, Spl, Shl, krows, {}, HN, beta, wmax, 4.0);
+  const double tden = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  auto Dl = read_c<3>(hb, "D_lineW");
+  auto De = read_c<3>(hb, "D_exact");
+  double dl = 0.0, de = 0.0;
+  for (long x = 0; x < Dl.size(); ++x) {
+    dl = std::max(dl, std::abs(hd.D.data()[x] - Dl.data()[x]));
+    de = std::max(de, std::abs(hd.D.data()[x] - De.data()[x]));
+  }
+  const double dmu_l = read_attr<double>(hb, "dmu_lineW"), dmu_e = read_attr<double>(hb, "dmu_exact");
+  app_log(1, "  Matsubara density: N = {} frequencies, {} bisection steps, {:.1f} s; dmu {:.15f} (reference line W {:.15f}, exact {:.15f})",
+          hd.nfreq, hd.nbisect, tden, hd.dmu, dmu_l, dmu_e);
+  ok = gate("D vs the reference's line-W hybrid D", dl, 1e-9) and ok;
+  ok = gate("D vs the exact-G Matsubara sum", de, 1e-9) and ok;
+  ok = gate("|dmu - dmu_exact| (Ha)", std::abs(hd.dmu - dmu_e), 1e-9) and ok;
+  ok = gate("|N(mu) - N_el| (inversion)", std::abs(hd.N - 4.0), 1e-9) and ok;
+  ok = gate("|N(mu) - N_el| (trace)", std::abs(hd.N_trace - 4.0), 1e-12) and ok;
+  return ok;
+}
+} // namespace
+
+TEST_CASE("gw_line_finiteT_hybrid_unit", "[gw_line][finiteT][hybrid]") {
+  fx_t F("lih222");
+  bool ok = run_hybrid_unit(F, 200.0);
+  ok      = run_hybrid_unit(F, 50.0) and ok;
+  REQUIRE(ok);
+}
+
+// S8b.3 hybrid SCF: lih222 beta 200, theta_t = theta / 4 (the prototype's dev/s8b3_scf.py settings), scf_density = "matsubara":
+// N(mu) = N_el every iteration, mu vs the prototype (iteration 1: kernels + the exact density only), restart bitwise,
+// 1 vs 2 ranks (iteration 1 sharp; later iterations carry the closure's noise through the next poles: gated at 1 mHa)
+TEST_CASE("gw_line_finiteT_hybrid_scf", "[gw_line][finiteT][hybrid][scf]") {
+  lih_ft_t L;
+  auto &comm = L.mpi->comm;
+  const long NIT = 3, NR = 2;
+  const double mu_py[5] = {0.20608474063937182, 0.2141961519644476, 0.2150988899866979, 0.21540045798415544, 0.21554059947920648};
+  auto params = [&](std::string const &out, long niter, bool restart) {
+    auto pt = ft_params(out, niter, 200.0, "id", "auto", restart);
+    pt.put("theta_t_frac", 0.25);
+    pt.put("scf_density", "matsubara");
+    return pt;
+  };
+  const std::string fa = "gw_line_ft_hyb_a", fb = "gw_line_ft_hyb_b";
+  auto t0 = std::chrono::steady_clock::now();
+  auto A  = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, params(fa, NIT, false));
+  const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  bool ok = long(A.history.size()) == NIT;
+  app_log(1, "\n[finiteT][hybrid][scf] {} iterations in {:.1f} s ({} ranks), beta 200, theta_t = theta / 4, scf_density matsubara", NIT, dt,
+          comm.size());
+  for (auto const &h : A.history) {
+    app_log(1, "  iter {}: mu {:.12f} (prototype {:.12f}, diff {:+.2e} Ha) N(mu) {:.15f} | closure N {:.8f} max|D_cl - D| {:.1e} own mu "
+               "{:+.2e} ({}) | gap {:.4f} eV, {} frequencies, {:.1f} s",
+            h.iter, h.mu, mu_py[h.iter - 1], h.mu - mu_py[h.iter - 1], h.N_mu, h.N_closure, h.D_cl_err, h.dmu_closure, h.rule_closure,
+            h.gap * 27.211386, h.nfreq, h.time);
+    ok = gate("|N(mu) - N_el|", std::abs(h.N_mu - 4.0), 1e-12) and ok;
+    if (h.iter == 1) ok = gate("iteration-1 |mu - mu_prototype| (Ha)", std::abs(h.mu - mu_py[0]), 1e-6) and ok;
+  }
+  {   // restart
+    gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, params(fb, NR, false));
+    auto B = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, params(fb, NIT, true));
+    app_log(1, "  restart {} + {} vs {} straight:", NR, NIT - NR, NIT);
+    ok = same_runs(comm, A, B, fa, fb, NIT) and ok;
+  }
+  {   // 1 vs 2 ranks
+    const std::string mine = "gw_line_ft_hyb_np" + std::to_string(comm.size()) + ".h5";
+    const std::string other = "gw_line_ft_hyb_np" + std::to_string(comm.size() == 1 ? 2 : 1) + ".h5";
+    nda::array<double, 1> mus(long(A.history.size()));
+    for (long i = 0; i < mus.size(); ++i) mus(i) = A.history[i].mu;
+    if (comm.root()) {
+      h5::file f(mine, 'w');
+      h5::group g(f);
+      nda::h5_write(g, "mu", mus, false);
+    }
+    comm.barrier();
+    if (std::filesystem::exists(other)) {
+      nda::array<double, 1> mo;
+      {
+        h5::file f(other, 'r');
+        h5::group g(f);
+        nda::h5_read(g, "mu", mo);
+      }
+      for (long i = 0; i < std::min(mo.size(), mus.size()); ++i)
+        ok = gate(("1 vs 2 ranks: |dmu| (Ha) iteration " + std::to_string(i + 1)).c_str(), std::abs(mo(i) - mus(i)),
+                  i == 0 ? 1e-10 : 1e-3) and ok;
+    } else
+      app_log(1, "  {} written; run with the other rank count to compare", mine);
+  }
+  rm_ckpt(comm, fa);
+  rm_ckpt(comm, fb);
+  REQUIRE(ok);
+}
+
+// S8b thermal closure perf: the "lazy" terminal-phase scan (default in thermal iterations) vs the S8b.2 distributed eigen scan
+// (COQUI_GWLINE_THERMAL_SCAN = parallel): one thermal iteration (lih222 beta 200, the [scf] settings) -> the same closure
+// decisions (terminal phases), mu and poles within the roundoff of the two held-out error evaluations
+TEST_CASE("gw_line_finiteT_lazy_scan", "[gw_line][finiteT][lazy]") {
+  lih_ft_t L;
+  auto &comm = L.mpi->comm;
+  auto run = [&](std::string const &mode, std::string const &out) {
+    setenv("COQUI_GWLINE_THERMAL_SCAN", mode.c_str(), 1);
+    auto t0 = std::chrono::steady_clock::now();
+    auto R  = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, ft_params(out, 1, 200.0, "id", "number"));
+    unsetenv("COQUI_GWLINE_THERMAL_SCAN");
+    nda::array<double, 1> phi;
+    if (comm.root()) {
+      h5::file f(out + ".gw_line.h5", 'r');
+      h5::group g(f);
+      auto gi = g.open_group("scf_line/iter1");
+      nda::h5_read(gi, "closure_phi", phi);
+    }
+    bcast_nda_(comm, phi);
+    return std::make_tuple(R, phi, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+  };
+  auto [A, pa, ta] = run("lazy", "gw_line_ft_lazy_a");
+  auto [B, pb, tb] = run("parallel", "gw_line_ft_lazy_b");
+  double dphi = 0.0, dP = 0.0, emax = 0.0;
+  for (long k = 0; k < pa.size(); ++k) dphi = std::max(dphi, std::abs(pa(k) - pb(k)));
+  for (long k = 0; k < A.poles.nk; ++k)
+    for (int s = 0; s < 2; ++s) {
+      auto const &x = s ? A.poles.part[k] : A.poles.hole[k];
+      auto const &y = s ? B.poles.part[k] : B.poles.hole[k];
+      if (x.size() != y.size()) { dP = 1e300; continue; }
+      for (long m = 0; m < x.size(); ++m) {
+        dP   = std::max(dP, std::abs(x.e(m) - y.e(m)));
+        emax = std::max(emax, std::abs(x.e(m)));
+      }
+    }
+  app_log(1, "\n[finiteT][lazy] one thermal iteration: lazy {:.1f} s, parallel {:.1f} s; max|d phi| {:.2e}, |d mu| {:.2e} Ha, max|d e_m| "
+             "{:.2e} (max|e| {:.1f}), phases {}",
+          ta, tb, dphi, std::abs(A.history[0].mu - B.history[0].mu), dP, emax, pa.size());
+  bool ok = gate("terminal phases: lazy vs parallel scan", dphi, 1e-6);
+  ok      = gate("mu: lazy vs parallel scan (Ha)", std::abs(A.history[0].mu - B.history[0].mu), 1e-8) and ok;
+  ok      = gate("Lehmann poles: lazy vs parallel scan (Ha)", dP, 1e-6) and ok;
+  rm_ckpt(comm, "gw_line_ft_lazy_a");
+  rm_ckpt(comm, "gw_line_ft_lazy_b");
+  REQUIRE(ok);
+}

@@ -213,7 +213,7 @@ struct closure_params_t {
     o.svd_driver = svd_driver;
     o.ueig       = ueig;
     o.hooks      = hooks;
-    o.scan_err   = (scan == "serial") ? "eigen" : "poly";
+    o.scan_err   = (scan == "serial") ? "eigen" : (scan == "lazy" ? "lazy" : "poly");   // S8b: "lazy" (thermal closure)
     utils::check(ueig_cut == "mu" or ueig_cut == "inf", "gw_line::closure: ueig_cut must be \"mu\" or \"inf\" (got \"{}\")", ueig_cut);
     o.ueig_cut   = (ueig_cut == "mu") ? std::numbers::pi : 0.0;
     o.ueig_accept = ueig_accept;
@@ -564,7 +564,8 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   };
   std::vector<std::unique_ptr<pending_t>> pend(nk);
   const bool par_scan = (p.scan == "parallel");
-  utils::check(par_scan or p.scan == "serial", "gw_line::closure: scan must be \"parallel\" or \"serial\" (got \"{}\")", p.scan);
+  utils::check(par_scan or p.scan == "serial" or p.scan == "lazy",
+               "gw_line::closure: scan must be \"parallel\", \"serial\" or \"lazy\" (got \"{}\")", p.scan);
   std::array<long, 5> kcores{1, -1, -1, 0, 0};   // perf 7.5a: this owner's cores in the k loop (closure_cores_t)
   auto store_k = [&](long ik, closure_k_t &ck, double t_fit, double *pr) {   // writes only the slots of ik
     ck.prof.t_fit = t_fit;

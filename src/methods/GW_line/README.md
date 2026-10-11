@@ -266,6 +266,9 @@ Hartree. "auto" defaults are computed at run time as described.
 | `tau_eps` | double | `1e-13` | tolerance of the tau ID | keep |
 | `spectra.occupation` | bool | `false` | also write f(w - mu) on the spectra grid (spectra/fermi_w; f A = the occupied spectrum) | finite-T plots |
 | `thermal_bases_file` | string | `""` | parity: D (D_zeta_re/_im, D_kind), nu_b and the two-sided Sigma basis (sigma_basis_w) read from this h5 (the python finite-T SCF reference) | parity tests |
+| `scf_density` | string | `"closure"` | `"matsubara"` (S8b.3 hybrid, beta > 0): Sigma_c(i w_n) from the tau leg, D, N(mu) = N_el and mu from the Matsubara Dyson equation; the closure supplies only the next poles. Needs mixing_alg linear, div_treatment ignore_g0 | metals / exact particle number |
+| `hyb_wmax` | double | `100.0` | w_max (Ha) of the dense Matsubara set of the hybrid (N = ceil((w_max beta/pi - 1)/2) + 1 frequencies; truncation ~1e-12) | keep |
+| `hyb_tau_eps` | double | `1e-13` | tolerance of the tau ID of the hybrid Sigma leg | keep |
 
 **Diagnostics**
 
@@ -462,6 +465,7 @@ Developer / A-B switches (defaults = the production paths; for benchmarks and bi
 | `COQUI_GWLINE_CLOSURE_BORROW` | 1 | 0: ranks beyond N_k do not lend cores to the closure |
 | `COQUI_GWLINE_CLOSURE_KTABLE` | 0 | > 0: closure profile line for every k |
 | `COQUI_GWLINE_CLOSURE_SCAN` | parallel | terminal-phase scan `parallel` (over ranks, eigensolve-free held-out error) or `serial` (pre-7.1c) |
+| `COQUI_GWLINE_THERMAL_SCAN` | lazy | terminal-phase scan of THERMAL closures (S8b): `lazy` (held-out errors without eigensolves, eigenvalue-only unity screen in order of the error, on the owner) or `parallel` (the S8b.2 path) |
 | `COQUI_GWLINE_CLOSURE_WEIGHTS` | 0 | > 0: core blocks weighted by the previous closure's per-k cost |
 | `COQUI_GWLINE_SCAN_MB` | 512 | broadcast budget per rank (MB) of the parallel scan |
 | `COQUI_GWLINE_SCAN_THREADS` | 16 | cores per busy rank in the scan (0 = no cap) |
