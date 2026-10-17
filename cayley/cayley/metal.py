@@ -172,7 +172,8 @@ def pi_ph_asymmetry(trs, beta, n_list=(0, 1, 2, 5, 20)):
     return num / den
 
 
-def upfold_block_fast(C, K, wp, mu=0.0, tol_c0=1e-12, tol_gram=1e-12, tol_svd=1e-12, nphi=72, reject_unity=1e-6, phase_refine=True):
+def upfold_block_fast(C, K, wp, mu=0.0, tol_c0=1e-12, tol_gram=1e-12, tol_svd=1e-12, nphi=72, reject_unity=1e-6, phase_refine=True,
+                      free_block='orbital', mixing=None):
     """cayley.upfold.upfold_block with the same realization and the same terminal-phase objective, evaluated without an
     eigensolve per phase: the held-out moment of U(phi) = U1 + x U0 (x = e^{i phi}) is the degree-(K+1) polynomial
     P(x) = R U(x)^{K+1} R^dagger, whose K+2 coefficients come from K+2 samples on the roots of unity (FFT); the scan and the
@@ -180,7 +181,7 @@ def upfold_block_fast(C, K, wp, mu=0.0, tol_c0=1e-12, tol_gram=1e-12, tol_svd=1e
     K = 32: ~30 s instead of ~100 Schur forms of 1300 x 1300). The admissibility test min|u - 1| >= reject_unity is applied
     at the optimum only; if it fails the original scanning routine is called."""
     from scipy.linalg import schur
-    from cayley.upfold import normalize_c0, block_toeplitz, upfold_block
+    from cayley.upfold import normalize_c0, block_toeplitz, upfold_block, terminal_block
     from cayley.maps import inv_cayley
     C = np.asarray(C)
     B, Bp, Chat = normalize_c0(C, tol_c0)
@@ -193,9 +194,10 @@ def upfold_block_fast(C, K, wp, mu=0.0, tol_c0=1e-12, tol_gram=1e-12, tol_svd=1e
     P, s, Qh = np.linalg.svd(Dp @ Dm.conj().T)
     r1 = int((s > tol_svd * s[0]).sum())
     U1 = P[:, :r1] @ Qh[:r1]
-    U0 = P[:, r1:] @ Qh[r1:]
-    nfree = U0.shape[0] - r1 if U0.size else 0
+    nfree = Xg.shape[0] - r1
     R = B @ Xg[:, :r].conj().T
+    V, _ = terminal_block(U1, P[:, r1:], Qh[r1:].conj().T, R, K, free_block, mixing)      # S8b.4 free terminal block
+    U0 = (P[:, r1:] @ V) @ Qh[r1:] if nfree else np.zeros_like(U1)
     Cheld = C[K + 1]
     nrm = 1 + np.linalg.norm(Cheld)
     if nfree > 0:
@@ -227,7 +229,7 @@ def upfold_block_fast(C, K, wp, mu=0.0, tol_c0=1e-12, tol_gram=1e-12, tol_svd=1e
     u = np.diag(Tu)
     if nfree > 0 and np.min(np.abs(u - 1)) < reject_unity:
         return upfold_block(C, K, wp, mu=mu, tol_c0=tol_c0, tol_gram=tol_gram, tol_svd=tol_svd, nphi=nphi,
-                            reject_unity=reject_unity, phase_refine=phase_refine)
+                            reject_unity=reject_unity, phase_refine=phase_refine, free_block=free_block, mixing=mixing)
     W = R @ Zs
     d = inv_cayley(u, wp, mu)
     order = np.argsort(d)
