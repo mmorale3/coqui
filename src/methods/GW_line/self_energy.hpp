@@ -313,7 +313,7 @@ void self_energy(propagator_t<MEM> &prop, pole_data_t const &poles, memory::arra
     // t_chunk <= 0: automatic (host default; device from the free device memory: G~, acc of all k, W(q) (all q when
     // fused k-outer), contraction buffers)
     const long tc = (t_chunk > 0) ? std::min(t_chunk, nt)
-                                  : detail::auto_t_chunk<MEM>(nt, double(2 * nk + nwq) * nP * nQ * 16.0 +
+                                  : detail::auto_t_chunk_all<MEM>(comm, nt, double(2 * nk + nwq) * nP * nQ * 16.0 +
                                                                       double(nk * nb + nQ) * nb * 16.0);
     auto &Sigma_out = out_of(leg.s);
     // perf 7.1: the hole leg on the conjugate of the ray whose A^ polarization cached (propagator_t::ahat): G^(R) of the

@@ -41,6 +41,8 @@
 #include <climits>
 #include <cstdlib>
 
+#include <mpi.h>
+
 #include "configuration.hpp"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
@@ -184,6 +186,19 @@ long auto_t_chunk(long nt, double bytes_per_t, double frac = 0.4, long tmax = 12
     if (bytes_per_t > 0.0) tc = std::max(8L, std::min(tmax, long(frac * freeb / bytes_per_t)));
   }
   return std::max(1L, std::min(tc, nt));
+}
+
+/**
+ * auto_t_chunk for kernels with a collective per time chunk (the Sigma kernels reduce every chunk over comm): device: the
+ * MIN over the ranks of comm. The free device memory differs between ranks (Dyson slabs, k rows, caches), so a per-rank
+ * chunk gives different chunk counts and sizes per rank and the per-chunk reduce deadlocks (Si 4x4x4 IBZ on 4 A100, job
+ * 7210272: hung in the Sigma stage of iteration 1; 2 ranks happened to agree). Host: auto_t_chunk (no collective).
+ */
+template <MEMORY_SPACE MEM, typename Comm>
+long auto_t_chunk_all(Comm &comm, long nt, double bytes_per_t) {
+  long tc = auto_t_chunk<MEM>(nt, bytes_per_t);
+  if constexpr (MEM != HOST_MEMORY) MPI_Allreduce(MPI_IN_PLACE, &tc, 1, MPI_LONG, MPI_MIN, comm.get());
+  return tc;
 }
 
 } // namespace methods::gw_line::detail

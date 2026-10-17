@@ -187,7 +187,7 @@ void self_energy_ibz(propagator_t<MEM> &prop, pole_data_t const &poles, memory::
     long ncmax            = 1;
     for (auto const &cl : ibz.cls) ncmax = std::max(ncmax, long(cl.q_eff.size()));
     const long tc = (t_chunk > 0) ? std::min(t_chunk, nt)
-                                  : detail::auto_t_chunk<MEM>(nt, double(3 * nk + nR + ncmax + ncl * nkI) * blk * 16.0);
+                                  : detail::auto_t_chunk_all<MEM>(comm, nt, double(3 * nk + nR + ncmax + ncl * nkI) * blk * 16.0);
     auto &Sigma_out = out_of(leg.s);
     bool use_cache  = leg.s == sector_t::hole and prop.ahat_key >= 0.0 and prop.ahat_key == prop.pole_key and
                      prop.ahat_t.size() == nt and prop.ahat.extent(0) == nk and prop.ahat.extent(2) == nP and
