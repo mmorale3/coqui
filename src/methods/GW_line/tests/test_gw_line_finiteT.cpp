@@ -1649,15 +1649,25 @@ TEST_CASE("gw_line_finiteT_hybrid_scf", "[gw_line][finiteT][hybrid][scf]") {
 }
 
 // S8b thermal closure perf: the "lazy" terminal-phase scan (default in thermal iterations) vs the S8b.2 distributed eigen scan
-// (COQUI_GWLINE_THERMAL_SCAN = parallel): one thermal iteration (lih222 beta 200, the [scf] settings) -> the same closure
-// decisions (terminal phases), mu and poles within the roundoff of the two held-out error evaluations
+// (COQUI_GWLINE_THERMAL_SCAN = parallel): one thermal iteration (lih222 beta 200, the [scf] settings; n_free 16 at every k)
+// -> the same closure decisions (terminal phases), mu and poles within the roundoff of the two held-out error evaluations.
+// S8b.3 lazy-scan fix (2026-10-17): for n_free > 1 the family U(phi) = A1 + e^{i phi} P0 Q0^dag is fixed by the roundoff of the
+// reference SVD (the pairing of the null singular vectors), so both scans must do that SVD in the same place with the same
+// BLAS threads. The second pass makes the k loop and the scan differ in BLAS threads (closure_threads 4 over 4 k workers:
+// 1 thread per k in the k loop, 4 in the scan), the situation of Si 4x4x4 on rusty (k loop 9-11 borrowed cores, scan
+// phase A 16) where the lazy scan with its SVD in the k loop chose other phases (iteration-1 mu 0.279015 vs 0.278035 Ha).
 TEST_CASE("gw_line_finiteT_lazy_scan", "[gw_line][finiteT][lazy]") {
   lih_ft_t L;
   auto &comm = L.mpi->comm;
-  auto run = [&](std::string const &mode, std::string const &out) {
+  auto run = [&](std::string const &mode, std::string const &out, long threads) {
     setenv("COQUI_GWLINE_THERMAL_SCAN", mode.c_str(), 1);
     auto t0 = std::chrono::steady_clock::now();
-    auto R  = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, ft_params(out, 1, 200.0, "id", "number"));
+    auto pt = ft_params(out, 1, 200.0, "id", "number");
+    if (threads > 0) {
+      pt.put("closure_threads", threads);
+      pt.put("closure_k_workers", threads);
+    }
+    auto R = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
     unsetenv("COQUI_GWLINE_THERMAL_SCAN");
     nda::array<double, 1> phi;
     if (comm.root()) {
@@ -1669,28 +1679,32 @@ TEST_CASE("gw_line_finiteT_lazy_scan", "[gw_line][finiteT][lazy]") {
     bcast_nda_(comm, phi);
     return std::make_tuple(R, phi, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
   };
-  auto [A, pa, ta] = run("lazy", "gw_line_ft_lazy_a");
-  auto [B, pb, tb] = run("parallel", "gw_line_ft_lazy_b");
-  double dphi = 0.0, dP = 0.0, emax = 0.0;
-  for (long k = 0; k < pa.size(); ++k) dphi = std::max(dphi, std::abs(pa(k) - pb(k)));
-  for (long k = 0; k < A.poles.nk; ++k)
-    for (int s = 0; s < 2; ++s) {
-      auto const &x = s ? A.poles.part[k] : A.poles.hole[k];
-      auto const &y = s ? B.poles.part[k] : B.poles.hole[k];
-      if (x.size() != y.size()) { dP = 1e300; continue; }
-      for (long m = 0; m < x.size(); ++m) {
-        dP   = std::max(dP, std::abs(x.e(m) - y.e(m)));
-        emax = std::max(emax, std::abs(x.e(m)));
+  bool ok = true;
+  for (long threads : {0L, 4L}) {
+    auto [A, pa, ta] = run("lazy", "gw_line_ft_lazy_a", threads);
+    auto [B, pb, tb] = run("parallel", "gw_line_ft_lazy_b", threads);
+    double dphi = 0.0, dP = 0.0, emax = 0.0;
+    for (long k = 0; k < pa.size(); ++k) dphi = std::max(dphi, std::abs(pa(k) - pb(k)));
+    for (long k = 0; k < A.poles.nk; ++k)
+      for (int s = 0; s < 2; ++s) {
+        auto const &x = s ? A.poles.part[k] : A.poles.hole[k];
+        auto const &y = s ? B.poles.part[k] : B.poles.hole[k];
+        if (x.size() != y.size()) { dP = 1e300; continue; }
+        for (long m = 0; m < x.size(); ++m) {
+          dP   = std::max(dP, std::abs(x.e(m) - y.e(m)));
+          emax = std::max(emax, std::abs(x.e(m)));
+        }
       }
-    }
-  app_log(1, "\n[finiteT][lazy] one thermal iteration: lazy {:.1f} s, parallel {:.1f} s; max|d phi| {:.2e}, |d mu| {:.2e} Ha, max|d e_m| "
-             "{:.2e} (max|e| {:.1f}), phases {}",
-          ta, tb, dphi, std::abs(A.history[0].mu - B.history[0].mu), dP, emax, pa.size());
-  bool ok = gate("terminal phases: lazy vs parallel scan", dphi, 1e-6);
-  ok      = gate("mu: lazy vs parallel scan (Ha)", std::abs(A.history[0].mu - B.history[0].mu), 1e-8) and ok;
-  ok      = gate("Lehmann poles: lazy vs parallel scan (Ha)", dP, 1e-6) and ok;
-  rm_ckpt(comm, "gw_line_ft_lazy_a");
-  rm_ckpt(comm, "gw_line_ft_lazy_b");
+    app_log(1, "\n[finiteT][lazy] one thermal iteration (closure threads {}): lazy {:.1f} s, parallel {:.1f} s; max|d phi| {:.2e}, "
+               "|d mu| {:.2e} Ha, max|d e_m| {:.2e} (max|e| {:.1f}), phases {}",
+            threads, ta, tb, dphi, std::abs(A.history[0].mu - B.history[0].mu), dP, emax, pa.size());
+    const std::string tag = " (closure threads " + std::to_string(threads) + ")";
+    ok = gate(("terminal phases: lazy vs parallel scan" + tag).c_str(), dphi, 1e-6) and ok;
+    ok = gate(("mu: lazy vs parallel scan (Ha)" + tag).c_str(), std::abs(A.history[0].mu - B.history[0].mu), 1e-8) and ok;
+    ok = gate(("Lehmann poles: lazy vs parallel scan (Ha)" + tag).c_str(), dP, 1e-6) and ok;
+    rm_ckpt(comm, "gw_line_ft_lazy_a");
+    rm_ckpt(comm, "gw_line_ft_lazy_b");
+  }
   REQUIRE(ok);
 }
 

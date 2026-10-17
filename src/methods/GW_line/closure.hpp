@@ -566,6 +566,12 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   const bool par_scan = (p.scan == "parallel");
   utils::check(par_scan or p.scan == "serial" or p.scan == "lazy",
                "gw_line::closure: scan must be \"parallel\", \"serial\" or \"lazy\" (got \"{}\")", p.scan);
+  // S8b.3 lazy-scan fix (2026-10-17): the "lazy" scan defers its k exactly as the parallel scan does, so that the reference
+  // SVD of a free block is done in the SAME place (distributed_phase_scan phase A, same batches, same borrowed BLAS threads).
+  // For n_free > 1 the pairing P0 Q0^dag of the (structurally) null singular vectors -- hence the whole family U(phi) -- is
+  // set by the roundoff of that SVD (another BLAS thread count = another family: Si 4x4x4 beta 300, iteration-1 mu
+  // 0.279015 vs 0.278035 Ha when the lazy scan did the SVD in the k loop with the k-loop cores)
+  const bool defer_scan = par_scan or p.scan == "lazy";
   std::array<long, 5> kcores{1, -1, -1, 0, 0};   // perf 7.5a: this owner's cores in the k loop (closure_cores_t)
   auto store_k = [&](long ik, closure_k_t &ck, double t_fit, double *pr) {   // writes only the slots of ik
     ck.prof.t_fit = t_fit;
@@ -595,8 +601,8 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     nda::array<ComplexType, 3> Sp(Sig_p(ks, all, all, all)), Sh(Sig_h(ks, all, all, all));
     auto sp = fit_sigma_closure(bp, bh, zeta, Sp, Sh, th);
     const double t_fit = std::chrono::duration<double>(clk::now() - tf0).count();
-    auto w = closure_k_begin(sp, p, ik, par_scan);
-    if (par_scan and numerics::line_dlr::needs_phase_scan(w.pr, w.o)) {
+    auto w = closure_k_begin(sp, p, ik, defer_scan);
+    if (defer_scan and numerics::line_dlr::needs_phase_scan(w.pr, w.o)) {
       pend[ik] = std::make_unique<pending_t>(pending_t{std::move(w), t_fit});
       return;
     }
@@ -685,7 +691,8 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     };
     std::string ks;
     for (long k : dk) ks += (ks.empty() ? "" : " ") + std::to_string(k);
-    app_log(1, "          closure: terminal-phase scan (n_free > 0) of k {} distributed over the ranks", ks);
+    app_log(1, "          closure: terminal-phase scan (n_free > 0) of k {} {}", ks,
+            par_scan ? "distributed over the ranks" : "lazy (reference SVD as the parallel scan, scan on the owners)");
     distributed_phase_scan(comm, dk, probs, ups, [&](long k) { return p.upfold_opts(k); }, p.blas_threads, p.scan_threads_max,
                            p.scan_budget_mb * 1024.0 * 1024.0, finish, &Timer);
   }

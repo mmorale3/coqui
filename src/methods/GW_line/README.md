@@ -465,7 +465,8 @@ Developer / A-B switches (defaults = the production paths; for benchmarks and bi
 | `COQUI_GWLINE_CLOSURE_BORROW` | 1 | 0: ranks beyond N_k do not lend cores to the closure |
 | `COQUI_GWLINE_CLOSURE_KTABLE` | 0 | > 0: closure profile line for every k |
 | `COQUI_GWLINE_CLOSURE_SCAN` | parallel | terminal-phase scan `parallel` (over ranks, eigensolve-free held-out error) or `serial` (pre-7.1c) |
-| `COQUI_GWLINE_THERMAL_SCAN` | lazy | terminal-phase scan of THERMAL closures (S8b): `lazy` (held-out errors without eigensolves, eigenvalue-only unity screen in order of the error, on the owner) or `parallel` (the S8b.2 path) |
+| `COQUI_GWLINE_THERMAL_SCAN` | lazy | terminal-phase scan of THERMAL closures (S8b): `lazy` (held-out errors without eigensolves, eigenvalue-only unity screen in order of the error, on the owner, after the reference SVD of the free block done exactly as in `parallel`: for n_free > 1 that SVD's roundoff fixes the family U(phi)) or `parallel` (the S8b.2 path) |
+| `COQUI_GWLINE_SCAN_DEBUG` | 0 | 1: per k with a free block, tr(A0), the eigensolve-free coarse errors, and the same with the reference SVD redone at half the BLAS threads (diagnostic) |
 | `COQUI_GWLINE_CLOSURE_WEIGHTS` | 0 | > 0: core blocks weighted by the previous closure's per-k cost |
 | `COQUI_GWLINE_SCAN_MB` | 512 | broadcast budget per rank (MB) of the parallel scan |
 | `COQUI_GWLINE_SCAN_THREADS` | 16 | cores per busy rank in the scan (0 = no cap) |

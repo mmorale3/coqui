@@ -35,6 +35,12 @@
  *     one exact all_reduce), while the owner builds the eigensolve-free held-out error (cayley::heldout_poly_t);
  *   - (C) the owner: the same decision (cayley::coarse_decide), the 30-step golden section on the eigensolve-free error
  *     (exact in exact arithmetic; microseconds per phase), the final realization, then finish(j) (Lehmann).
+ * S8b.3 lazy-scan fix: with opts(k).scan_err == "lazy" (thermal closures) phase A is the same (same batches, same borrowed
+ * cores: the free block A0 = P0 Q0^dag of n_free > 1 is set by the roundoff of this SVD, so the two scans share it), phase B
+ * is skipped, and after the last batch the owners run the lazy scan (cayley::upfold_complete: eigensolve-free coarse errors,
+ * eigenvalue-only unity screen, golden section, final realization) on all their k at once with the cores of their host.
+ * Env COQUI_GWLINE_SCAN_DEBUG = 1: per k, a fingerprint of A0, the eigensolve-free coarse errors, and the same for the
+ * reference SVD redone with half the BLAS threads (the sensitivity of the free block to the BLAS context).
  * The deferred k are processed in batches whose broadcast problems fit in budget_bytes per rank. Each coarse realization
  * is the same code on the same data as in the serial scan: the result depends on the BLAS thread counts / MKL code paths
  * at the roundoff floor only (as the per-k closure, perf 7.1 (f)).
@@ -43,6 +49,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 #include <mpi.h>
@@ -65,6 +74,26 @@ inline void bcast_doubles(double *x, long n, int root, MPI_Comm c) {
 /// A is only read on the root (MPI_Bcast semantics)
 inline void bcast_matrix(numerics::line_dlr::cmatrix_F const &A, int root, MPI_Comm c) {
   bcast_doubles(const_cast<double *>(reinterpret_cast<double const *>(A.data())), 2 * long(A.size()), root, c);
+}
+/// S8b.3 debug (COQUI_GWLINE_SCAN_DEBUG): tr(A0) and the eigensolve-free coarse errors of a problem with a free block
+inline std::string scan_fingerprint(numerics::line_dlr::upfold_problem_t const &pr, long nphi) {
+  namespace ldlr = numerics::line_dlr;
+  ComplexType tr(0.0);
+  for (long i = 0; i < pr.Nr; ++i) tr += pr.A0(i, i);
+  auto hp = ldlr::heldout_poly(pr);
+  std::string e;
+  long imin = 0;
+  std::vector<double> v(nphi);
+  for (long ip = 0; ip < nphi; ++ip) {
+    v[ip] = hp(ldlr::coarse_phase(ip, nphi));
+    if (v[ip] < v[imin]) imin = ip;
+    char b[32];
+    std::snprintf(b, sizeof(b), " %.6e", v[ip]);
+    e += b;
+  }
+  char h[160];
+  std::snprintf(h, sizeof(h), "n_free %ld tr(A0) %+.12e %+.12e | coarse argmin %ld | errs", pr.n_free, tr.real(), tr.imag(), imin);
+  return std::string(h) + e;
 }
 } // namespace detail
 
@@ -102,6 +131,18 @@ void distributed_phase_scan(boost::mpi3::communicator &comm, std::vector<long> c
     return 16.0 * (2.0 * Nr * Nr + n * Nr + n * n);
   };
 
+  // S8b.3: "lazy" (identical on every rank): phase A as below, no phase B, the owners' lazy scans after the last batch
+  const bool lazy = (opts(dk[0]).scan_err == "lazy");
+  const bool dbg  = [] {
+    char const *e = std::getenv("COQUI_GWLINE_SCAN_DEBUG");
+    return e != nullptr and *e != '\0' and std::strtod(e, nullptr) > 0.0;
+  }();
+  auto wait = [&](closure_cores_t &c) {
+    if (T) T->start("closure_wait");
+    c.wait();
+    if (T) T->stop("closure_wait");
+  };
+  auto bthreads = [&](closure_cores_t const &c) { return c.blas_threads() > 0 ? c.blas_threads() : threads; };
   for (long j0 = 0; j0 < D;) {
     long j1      = j0 + 1;
     double bytes = bytes_of(j0);
@@ -128,24 +169,56 @@ void distributed_phase_scan(boost::mpi3::communicator &comm, std::vector<long> c
       }
       for (long ip = 0; ip < nphi[j]; ++ip) in_S = in_S or (task_rank(j, ip) == rank);
     }
-    MPI_Comm sc = MPI_COMM_NULL;
-    MPI_Comm_split(comm.get(), in_S ? 0 : MPI_UNDEFINED, int(rank), &sc);
-    auto wait = [&](closure_cores_t &c) {
-      if (T) T->start("closure_wait");
-      c.wait();
-      if (T) T->stop("closure_wait");
-    };
-    auto bthreads = [&](closure_cores_t const &c) { return c.blas_threads() > 0 ? c.blas_threads() : threads; };
     // phase A: the owners redo the SVD with the reference driver, with the cores of every other rank of their host
     {
       closure_cores_t cores(comm, own_ref ? 1L : 0L, max_threads);
       if (own_ref) {
-        blas_threads_scope_t bscope(bthreads(cores));
+        const long bt = bthreads(cores);
+        blas_threads_scope_t bscope(bt);
         for (long j = 0; j < B; ++j)
-          if (owner(j0 + j) == rank) ldlr::upfold_prepare_ref(*prob[j0 + j], ob[j], *res[j0 + j]);
+          if (owner(j0 + j) == rank) {
+            auto &q = *prob[j0 + j];
+            ldlr::cmatrix_F Mc;
+            if (dbg and q.need_ref) Mc = q.Mref;
+            ldlr::upfold_prepare_ref(q, ob[j], *res[j0 + j]);
+            if (dbg and q.n_free > 0) {   // the same problem with the reference SVD at half the BLAS threads
+              std::string alt = "(no reference SVD)";
+              if (Mc.size() > 0) {
+                const long bt2 = std::max(1L, bt / 2);
+                blas_threads_scope_t s2(bt2);
+                const long Nr = q.Nr;
+                ldlr::cmatrix_F P(Nr, Nr), Qh(Nr, Nr);
+                nda::array<double, 1> sv(Nr);
+                nda::lapack::gesvd(Mc, sv, P, Qh);
+                ldlr::upfold_result_t rt;
+                auto q2 = q;
+                ldlr::detail::set_free_block(q2, P, Qh, ldlr::detail::svd_rank(sv, ob[j], rt), rt);
+                double dA = 0.0, nA = 0.0;
+                if (q2.n_free == q.n_free)
+                  for (long x = 0; x < long(q.A0.size()); ++x) {
+                    dA += std::norm(q.A0.data()[x] - q2.A0.data()[x]);
+                    nA += std::norm(q.A0.data()[x]);
+                  }
+                char h[96];
+                std::snprintf(h, sizeof(h), "threads %ld: |dA0|/|A0| %.3e | ", bt2, std::sqrt(dA / std::max(nA, 1e-300)));
+                alt = std::string(h) + detail::scan_fingerprint(q2, nphi[j]);
+              }
+              std::printf("          scan debug k %ld (rank %ld, %s): reference SVD threads %ld: %s\n          scan debug k %ld "
+                          "alternative reference SVD %s\n",
+                          dk[j0 + j], rank, lazy ? "lazy" : "parallel", bt, detail::scan_fingerprint(q, nphi[j]).c_str(),
+                          dk[j0 + j], alt.c_str());
+              std::fflush(stdout);
+            }
+          }
       }
       wait(cores);
     }
+    if (lazy) {   // S8b.3: the owners' lazy scans after the last batch (no broadcasts, no coarse ranks)
+      j0 = j1;
+      continue;
+    }
+    MPI_Comm sc = MPI_COMM_NULL;
+    MPI_Comm_split(comm.get(), in_S ? 0 : MPI_UNDEFINED, int(rank), &sc);
     // phase B: problems owner -> scan ranks; coarse scan on the coarse ranks, eigensolve-free error built by the owners
     int ns = 0;
     std::vector<double> tb(B, 0.0), tpoly(B, 0.0), cv;
@@ -260,6 +333,16 @@ void distributed_phase_scan(boost::mpi3::communicator &comm, std::vector<long> c
             }
             up.n_eig += nphi[j];
             up.n_realize += nphi[j];
+            if (dbg) {
+              std::string e;
+              for (long ip = 0; ip < nphi[j]; ++ip) {
+                char b[32];
+                std::snprintf(b, sizeof(b), " %.6e", errs[ip]);
+                e += b;
+              }
+              std::printf("          scan debug k %ld (rank %ld, parallel): eigen coarse errs%s\n", dk[j0 + j], rank, e.c_str());
+              std::fflush(stdout);
+            }
             ldlr::golden_t g(ldlr::coarse_decide(errs, umin, ob[j], up), nphi[j]);
             up.t_coarse   = t_coarse;
             up.t_poly     = tpoly[j];
@@ -280,6 +363,24 @@ void distributed_phase_scan(boost::mpi3::communicator &comm, std::vector<long> c
       wait(cores);
     }
     j0 = j1;
+  }
+  if (lazy) {   // S8b.3: the lazy scan of every deferred k by its owner, all k at once, with the cores of the host
+    bool own_any = false;
+    for (long j = 0; j < D; ++j) own_any = own_any or (owner(j) == rank);
+    closure_cores_t cores(comm, own_any ? 1L : 0L, max_threads);
+    if (own_any) {
+      const long bt = bthreads(cores);
+      blas_threads_scope_t bscope(bt);
+      for (long j = 0; j < D; ++j) {
+        if (owner(j) != rank) continue;
+        auto &up        = *res[j];
+        up.scan_ranks   = 0;
+        up.scan_threads = bt;   // owner BLAS threads (log: x % 1000)
+        ldlr::upfold_complete(*prob[j], opts(dk[j]), up);
+        finish(j);
+      }
+    }
+    wait(cores);
   }
 }
 
