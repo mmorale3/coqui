@@ -145,6 +145,7 @@ Hartree. "auto" defaults are computed at run time as described.
 | `phase_keep` | double | `0.0` | > 0: keep the previous phase basin within this factor (phase continuity) | as above |
 | `closure_threads` | long | `-1` (auto) | BLAS threads of the per-k host closure: -1 = the rank's cores in device runs (SLURM_CPUS_PER_TASK, else affinity / node ranks), untouched in host runs; 0 = untouched; n > 0 = n | device runs with unusual binding |
 | `closure_k_workers` | long | `-1` (auto) | concurrent host threads over the rank's k (>= 1 or -1): auto = closure_threads / 2 in device runs, 1 in host runs | rarely |
+| `closure_free_block` | string | `"orbital"` | S8b.4: unitary V of the free terminal block A0 = P0 V Q0^dag when n_free > 1 (finite T, omega_p floor): `"orbital"` (polar(L^dag F Rm^dag), covariant and continuous), `"canonical"` (polar(P0^dag Q0)), `"svd"` (V = 1, pre-S8b.4, roundoff-chaotic); n_free <= 1 unchanged | A/B only |
 | `closure_svd` | string | `"gesdd"` | SVD driver of the upfolding: `"gesdd"` or `"gesvd"` (python / pre-S7g) | A/B only |
 | `closure_ueig` | string | `"cayley"` | eigenvectors of the unitary U: `"cayley"` (Hermitian Cayley image + Rayleigh-Ritz, Schur fallback) or `"schur"` | A/B only |
 | `closure_device` | string | `"auto"` | cuSOLVER Gram / Cayley / Lehmann eigensolvers and SVD: `"auto"` (device runs) / `"on"` / `"off"`; each call falls back to host LAPACK on a device failure | `"off"` to A/B |
@@ -260,7 +261,7 @@ Hartree. "auto" defaults are computed at run time as described.
 | `mats_factor` | double | `4.0` | Matsubara points i nu_n of D, n = 1..ceil(mats_factor zeta_T beta / 2 pi) | keep |
 | `bos_eps_T` | double | `1e-12` | tolerance of the D-selected bosonic basis (pivoted QR on D) | keep |
 | `bos_line_eps` | double | `1e-10` | eps of the gapless bosonic line basis whose unmasked nodes enter D | keep |
-| `cut_odd` | double | `1e-13` | relative SVD cutoff of the odd sector of the split pair fit | keep |
+| `cut_odd` | double | `1e-11` | relative SVD cutoff of the odd sector of the split pair fit (S8b.4: 1e-11, was 1e-13; residue gauge noise 2e-6 per 1e-15 of Pi, Sigma_c accuracy 1.2e-11 at the masked nodes) | keep |
 | `cut_even` | double | `1e-10` | relative SVD cutoff of the even sector | keep |
 | `tau_grid` | string | `"id"` | tau-leg nodes on [0, beta/2]: `"id"` (finite-interval ID, ~40; Pi(q, 0) to 2e-14) / `"gl"` (composite GL, ~200-250, the python grid) | keep |
 | `tau_eps` | double | `1e-13` | tolerance of the tau ID | keep |

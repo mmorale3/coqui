@@ -102,6 +102,13 @@ public:
   std::deque<entry_t> H;
   std::vector<std::vector<double>> B;   ///< B[i][j] = Re <r_i, r_j>
   bool damped = false;                  ///< the damped tail is active (damp_below)
+  /**
+   * S8b.4 (notes sec:fT_wcond): fermionic-node mask of a thermal iteration (1 = rho beta |zeta| >= c_f; size = the node
+   * extent of Sigma). Sigma_c below the floor is not an output of the thermal W step (wrong by design, 1e10 x the Pi noise):
+   * the residual / change maxima and the DIIS overlaps skip those nodes (the linear / DIIS updates still act on every node).
+   * null: every node (T = 0, bitwise the pre-S8b.4 arithmetic).
+   */
+  std::vector<char> const *node_mask = nullptr;
 
   scf_mixer_t() = default;
   explicit scf_mixer_t(mixing_params_t p) : prm(std::move(p)) {}
@@ -131,10 +138,11 @@ public:
                      long(k_rows.size()) == nloc,
                  "gw_line::scf_mixer_t: shape mismatch");
     const long row = Sp.size() / std::max(1L, nloc);
+    check_mask(Sp);
     // residual maxima (always) and F residual
     double rmax = 0.0;
     for (long a = 0; a < Sp.size(); ++a)
-      rmax = std::max(rmax, std::abs(Sp.data()[a] + Sh.data()[a] - Sp_in.data()[a] - Sh_in.data()[a]));
+      if (node_on(Sp, a)) rmax = std::max(rmax, std::abs(Sp.data()[a] + Sh.data()[a] - Sp_in.data()[a] - Sh_in.data()[a]));
     if (distributed) rmax = comm.all_reduce_value(rmax, boost::mpi3::max<>{});
     info.resid = rmax;
     double rF = 0.0;
@@ -191,7 +199,8 @@ public:
           auto const &rh = (i < m0) ? H[i].rh : e.rh;
           double s = 0.0;
           for (long a = l * row; a < (l + 1) * row; ++a)
-            s += std::real(std::conj(rp.data()[a]) * e.rp.data()[a]) + std::real(std::conj(rh.data()[a]) * e.rh.data()[a]);
+            if (node_on(Sp, a))
+              s += std::real(std::conj(rp.data()[a]) * e.rp.data()[a]) + std::real(std::conj(rh.data()[a]) * e.rh.data()[a]);
           pk(k, i) = s;
         }
       }
@@ -299,7 +308,7 @@ public:
         sp += c[i] * H[i].yp.data()[a];
         sh += c[i] * H[i].yh.data()[a];
       }
-      dS = std::max(dS, std::abs(sp + sh - Sp_in.data()[a] - Sh_in.data()[a]));
+      if (node_on(Sp, a)) dS = std::max(dS, std::abs(sp + sh - Sp_in.data()[a] - Sh_in.data()[a]));
       Sp.data()[a] = sp;
       Sh.data()[a] = sh;
     }
@@ -319,6 +328,16 @@ public:
   }
 
 private:
+  /// element a of a Sigma array (rows, nodes, nb, nb) is at a node kept by node_mask (always true without a mask)
+  bool node_on(arr4 const &S, long a) const {
+    if (node_mask == nullptr) return true;
+    const long nz = S.extent(1), blk = S.extent(2) * S.extent(3);
+    return (*node_mask)[(a / blk) % nz] != 0;
+  }
+  void check_mask(arr4 const &S) const {
+    utils::check(node_mask == nullptr or long(node_mask->size()) == S.extent(1), "gw_line::scf_mixer_t: node mask of size {} for {} nodes",
+                 node_mask ? long(node_mask->size()) : 0L, S.extent(1));
+  }
   void linear_step(boost::mpi3::communicator &comm, bool distributed, arr4 const &Sp_in, arr4 const &Sh_in, arr4 &Sp, arr4 &Sh,
                    mix_info_t &info, double mix = -1.0) const {
     const double a = mix > 0.0 ? mix : prm.mixing, b = 1.0 - a;
@@ -326,7 +345,7 @@ private:
     for (long a_ = 0; a_ < Sp.size(); ++a_) {
       const ComplexType sp = a * Sp.data()[a_] + b * Sp_in.data()[a_];
       const ComplexType sh = a * Sh.data()[a_] + b * Sh_in.data()[a_];
-      dS = std::max(dS, std::abs(sp + sh - Sp_in.data()[a_] - Sh_in.data()[a_]));
+      if (node_on(Sp, a_)) dS = std::max(dS, std::abs(sp + sh - Sp_in.data()[a_] - Sh_in.data()[a_]));
       Sp.data()[a_] = sp;
       Sh.data()[a_] = sh;
     }

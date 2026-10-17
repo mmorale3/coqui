@@ -782,7 +782,7 @@ bool run_t3(double beta, std::string const &time_grid) {
   ibz_t ibz(mf, nb, false);
   bosonic_basis_t bline(tp.theta, 4.0, 1e-10, 0.0);
   auto Dm = make_bos_data(bline.zeta_nodes, tp);
-  auto B  = bosonic_basis_t::from_data(tp.theta, Dm.z, 4.0, 1e-12).with_bose(beta, ET);
+  auto B  = bosonic_basis_t::from_data(tp.theta, Dm.z, 4.0, 1e-12, 800, -1.0, tp.cut_odd, tp.cut_even).with_bose(beta, ET);   // S8b.4: cut_odd 1e-11
   nda::array<ComplexType, 1> zi(nwf), ziu(nwf);
   for (long n = 0; n < nwf; ++n) {
     zi(n)  = (mu_C - mu_C) + ft.omega(wn_f(n));
@@ -1044,15 +1044,15 @@ TEST_CASE("gw_line_finiteT_T4_bitwise", "[gw_line][finiteT][T4]") {
   REQUIRE(ok);
 }
 
-// T5 (a): 3 iterations vs the prototype's thermal SCF (lih222_finiteT_scf_ref.h5), bases / D / nu_b injected, mu_rule "number"
-// Gates = 10 x the measured floor. Floor (Mac 2026-10-10, GW_LINE_FT_NOISE = 1e-13 / 2e-13 relative noise on the Sigma of
-// iteration 1 vs none; S7f [.scf_noise] style): the reference's closure (omega_p = 15 zeta_T = 2.25 Ha, K 8: held-out 1e-2) maps
-// 1e-13 in Sigma to 8-21 meV in mu at iteration 1 (python's closure itself: 2.4e-3 Ha spread at 1e-13), 140-720 meV / 1.7e-3 in
-// Sigma at iteration 2, 360-580 meV / 2.8e-2 at iteration 3. Iteration 1's Sigma (the kernels on the KS lists, no closure) is
-// strict: masked nodes rho beta |zeta| >= c_f only (below the floor the GL end-point terms differ by design, 1.6e-5).
-// iteration-1 mu floor = the max of the Mac noise meter (21 meV) and the rusty (MKL) spreads: 1 vs 2 ranks 152 meV, parity -135 meV
-constexpr double FT_MU_FLOOR[3]  = {152.0, 789.0, 825.0};      // meV (max over the Mac noise meter and the rusty 1 vs 2 ranks / parity spreads)
-constexpr double FT_SIG_FLOOR[3] = {1e-12, 1.70e-3, 2.78e-2};  // relative, masked nodes
+// T5 (a): 3 iterations vs the prototype's thermal SCF (lih222_finiteT_scf_ref.h5), bases / D / nu_b injected, mu_rule "auto"
+// (the reference's rule per iteration: gap / number / number). Gates = 10 x the measured floor.
+// S8b.4 (free_block "orbital", cut_odd 1e-11; Mac 2026-10-17): parity |dmu| 4.1e-3 / 1.3e-2 / 0.12 meV, Sigma (masked nodes)
+// 5.2e-14 / 1.3e-7 / 4.2e-7 at iterations 1 / 2 / 3; noise meter (GW_LINE_FT_NOISE = 1e-13 / 2e-13 on the iteration-1 Sigma vs
+// none): |dmu| 4.0e-3 / 2.7e-3 / 4.4e-3 meV, Sigma 6.6e-13 / 7.3e-9 / 5.9e-7 (iteration 1: the injected noise itself). The floors
+// below round these up (x 2-3, room for the MKL / rank spreads). Pre-S8b.4 floors (SVD pairing of the free terminal block, n_free
+// 16 at iteration 1): 152 / 789 / 825 meV and 1e-12 / 1.7e-3 / 2.8e-2 -- the closure floor was the gauge, not the data.
+constexpr double FT_MU_FLOOR[3]  = {0.01, 0.05, 0.3};       // meV
+constexpr double FT_SIG_FLOOR[3] = {1e-12, 3e-7, 1.5e-6};   // relative, masked nodes
 TEST_CASE("gw_line_finiteT_parity", "[gw_line][finiteT][parity]") {
   const std::string ref = ft_dir() + "lih222_finiteT_scf_ref.h5";
   REQUIRE(std::filesystem::exists(ref));
@@ -1061,19 +1061,29 @@ TEST_CASE("gw_line_finiteT_parity", "[gw_line][finiteT][parity]") {
   nda::array<long, 1> idx;
   nda::array<signed char, 1> fmask;
   std::vector<double> mu_r, N_r, gap_r;
+  std::vector<std::string> rule_r;
   std::vector<nda::array<ComplexType, 3>> S0_r, S3_r;
   long niter = 0;
+  double cut_odd_r = 1e-13;
+  std::string free_block_r = "svd";
+  nda::array<ComplexType, 2> F_r;
   {
     h5::file f(ref, 'r');
     h5::group g(f);
     nda::h5_read(g, "node_index", idx);
     nda::h5_read(g, "fmask", fmask);
     niter = read_attr<long>(g, "niter");
+    cut_odd_r = read_attr<double>(g, "wstep_cut_odd");
+    if (g.has_dataset("mixing_F_re")) {   // S8b.4 references: the closure's free_block rule and its fixed unitary F
+      free_block_r = read_attr<std::string>(g, "free_block");
+      F_r          = read_c<2>(g, "mixing_F");
+    }
     for (long it = 1; it <= niter; ++it) {
       auto gi = g.open_group("iter" + std::to_string(it));
       mu_r.push_back(read_attr<double>(gi, "mu"));
       N_r.push_back(read_attr<double>(gi, "N_mu"));
       gap_r.push_back(read_attr<double>(gi, "gap"));
+      rule_r.push_back(read_attr<std::string>(gi, "mu_rule_used"));
       S0_r.push_back(read_c<3>(gi, "Sigma_k0"));
       S3_r.push_back(read_c<3>(gi, "Sigma_k3"));
     }
@@ -1081,7 +1091,9 @@ TEST_CASE("gw_line_finiteT_parity", "[gw_line][finiteT][parity]") {
   std::string fo = "gw_line_ft_parity";
   if (char const *e = std::getenv("GW_LINE_FT_PARITY_NIT")) niter = std::min(niter, long(std::atol(e)));   // diagnostics
   if (char const *e = std::getenv("GW_LINE_FT_TAG")) fo += std::string("_") + e;
-  auto pt = ft_params(fo, niter, 200.0, "gl", "number", false, true);
+  // S8b.4: with the continuous closure the "auto" rule of the reference is reproduced (before: "number" pinned, the rule
+  // decision flipped with the closure noise); the rule per iteration is gated equal to the prototype's
+  auto pt = ft_params(fo, niter, 200.0, "gl", "auto", false, true);
   if (char const *e = std::getenv("GW_LINE_FT_NOISE")) {   // noise-floor meter: relative noise on Sigma of iteration 1
     pt.put("debug_noise_sigma", std::atof(e));
     pt.put("debug_noise_iter", 1);
@@ -1091,13 +1103,23 @@ TEST_CASE("gw_line_finiteT_parity", "[gw_line][finiteT][parity]") {
     pt.put("closure_ueig", "schur");
   }
   pt.put("thermal_bases_file", ref);
+  pt.put("cut_odd", cut_odd_r);                 // S8b.4: the reference's split-fit cut (the C++ default 1e-11)
+  pt.put("closure_free_block", free_block_r);   // S8b.4: the reference's free-block rule ("orbital")
+  bool ok = true;
+  if (F_r.size() > 0) {   // the closed-form F of the orbital rule = the prototype's
+    auto const &F = numerics::line_dlr::mixing_unitary(F_r.extent(0));
+    double dF = 0.0;
+    for (long i = 0; i < F_r.extent(0); ++i)
+      for (long j = 0; j < F_r.extent(1); ++j) dF = std::max(dF, std::abs(F(i, j) - F_r(i, j)));
+    app_log(1, "\n[finiteT][parity] reference: free_block {}, cut_odd {:.0e}", free_block_r, cut_odd_r);
+    ok = gate("mixing unitary F (nb x nb) vs the reference's", dF, 1e-12) and ok;
+  }
   auto t0 = std::chrono::steady_clock::now();
   auto R  = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
   const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   REQUIRE(long(R.history.size()) == niter);
   app_log(1, "\n[finiteT][parity] {} iterations in {:.1f} s ({} ranks)", niter, dt, comm.size());
   app_log(1, "  iter |   mu C++ (Ha)       mu py (Ha)      d(meV)  |  N(mu) C++        N py     | rule | Sigma(k=0,3) rel");
-  bool ok = true;
   for (long it = 0; it < niter; ++it) {
     auto S = sigma_total_of(comm, fo + ".gw_line.h5", it + 1);
     double d = 0.0, m = 0.0;
@@ -1113,7 +1135,11 @@ TEST_CASE("gw_line_finiteT_parity", "[gw_line][finiteT][parity]") {
     app_log(1, "  {:4d} | {:.12f}  {:.12f}  {:+.2e} | {:.12f}  {:.12f} | {} | {:.2e}", it + 1, h.mu, mu_r[it], dmu, h.N_mu, N_r[it],
             h.mu_rule, d / m);
     ok = gate("|dmu| (meV) [10 x floor]", std::abs(dmu), 10.0 * FT_MU_FLOOR[std::min(it, 2L)]) and ok;
-    ok = gate("|N(mu) - N_el|", std::abs(h.N_mu - 4.0), 1e-10) and ok;
+    if (h.mu_rule != rule_r[it]) {
+      app_log(1, "    mu rule {} vs the reference's {}: FAIL", h.mu_rule, rule_r[it]);
+      ok = false;
+    }
+    if (h.mu_rule == "number") ok = gate("|N(mu) - N_el| (rule number)", std::abs(h.N_mu - 4.0), 1e-10) and ok;
     ok = gate("Sigma(k = 0, 3) rel, masked nodes [10 x floor]", d / m, 10.0 * FT_SIG_FLOOR[std::min(it, 2L)]) and ok;
   }
   if (not std::getenv("GW_LINE_FT_KEEP")) rm_ckpt(comm, fo);
@@ -1153,7 +1179,7 @@ TEST_CASE("gw_line_finiteT_scf", "[gw_line][finiteT][scf]") {
     ok = same_runs(comm, A, B, fa, fb, NIT) and ok;
   }
   {   // 1 vs 2 ranks: the iteration-1 Sigma (kernels on the KS lists: reduction order only) to 1e-12; mu per iteration within
-      // 10 x the closure floor of these settings (FT_MU_FLOOR: 1e-13 in Sigma moves mu by up to 21 meV at iteration 1)
+      // 10 x the closure floor of these settings (FT_MU_FLOOR, S8b.4: 1e-13 in Sigma moves mu by 4e-3 meV at iteration 1)
     const std::string mine = "gw_line_ft_scf_np" + std::to_string(comm.size()) + ".h5";
     const std::string other = "gw_line_ft_scf_np" + std::to_string(comm.size() == 1 ? 2 : 1) + ".h5";
     nda::array<double, 1> mus(long(A.history.size()));
@@ -1175,13 +1201,28 @@ TEST_CASE("gw_line_finiteT_scf", "[gw_line][finiteT][scf]") {
         nda::h5_read(g, "mu", mo);
         nda::h5_read(g, "Sigma1", So);
       }
-      double ds = 0.0, ms = 0.0;
-      for (long a = 0; a < S1.size(); ++a) {
-        ds = std::max(ds, std::abs(S1.data()[a] - So.data()[a]));
-        ms = std::max(ms, std::abs(S1.data()[a]));
+      // S8b.4: the masked nodes rho beta |zeta| >= c_f only (the reference's mask: same fermionic nodes); sub-floor reported
+      nda::array<signed char, 1> fm;
+      {
+        h5::file f(ft_dir() + "lih222_finiteT_scf_ref.h5", 'r');
+        h5::group g(f);
+        nda::h5_read(g, "fmask", fm);
       }
-      app_log(1, "  {} vs {}:", mine, other);
-      ok = gate("1 vs 2 ranks: iteration-1 Sigma rel", ds / ms, 1e-12) and ok;
+      REQUIRE(fm.size() == S1.extent(1));
+      double ds = 0.0, ms = 0.0, du = 0.0;
+      for (long k = 0; k < S1.extent(0); ++k)
+        for (long n = 0; n < S1.extent(1); ++n)
+          for (long i = 0; i < S1.extent(2); ++i)
+            for (long j = 0; j < S1.extent(3); ++j) {
+              const double d = std::abs(S1(k, n, i, j) - So(k, n, i, j));
+              if (fm(n)) {
+                ds = std::max(ds, d);
+                ms = std::max(ms, std::abs(S1(k, n, i, j)));
+              } else
+                du = std::max(du, d);
+            }
+      app_log(1, "  {} vs {}: iteration-1 Sigma below the floor (report) max|d| {:.3e}", mine, other, du);
+      ok = gate("1 vs 2 ranks: iteration-1 Sigma rel (masked nodes)", ds / ms, 1e-12) and ok;
       for (long i = 0; i < std::min(mo.size(), mus.size()); ++i)
         ok = gate(("1 vs 2 ranks: |dmu| (meV) iteration " + std::to_string(i + 1) + " [10 x floor]").c_str(),
                   std::abs(mo(i) - mus(i)) * 27.211386e3, 10.0 * FT_MU_FLOOR[std::min(i, 2L)]) and ok;
@@ -1197,7 +1238,25 @@ TEST_CASE("gw_line_finiteT_scf", "[gw_line][finiteT][scf]") {
 namespace {
 struct wdbg_out_t {
   nda::array<ComplexType, 4> Pi, Wn, w, S;
+  std::vector<char> fmask;   ///< S8b.4: fermionic node kept (rho beta |zeta| >= c_f): Sigma_c is an output only there
 };
+/// S8b.4 (notes sec:fT_wcond): max |a - b| / max |a| of Sigma (k, node, nb, nb) over the nodes with mask == want (all ranks)
+template <typename C> double rel_nodes(C &comm, nda::array<ComplexType, 4> const &a, nda::array<ComplexType, 4> const &b,
+                                       std::vector<char> const &mask, bool want) {
+  double d = 0.0, m = 0.0;
+  for (long k = 0; k < a.extent(0); ++k)
+    for (long n = 0; n < a.extent(1); ++n) {
+      if ((mask[n] != 0) != want) continue;
+      for (long i = 0; i < a.extent(2); ++i)
+        for (long j = 0; j < a.extent(3); ++j) {
+          d = std::max(d, std::abs(a(k, n, i, j) - b(k, n, i, j)));
+          m = std::max(m, std::abs(a(k, n, i, j)));
+        }
+    }
+  d = comm.all_reduce_value(d, mpi3::max<>{});
+  m = comm.all_reduce_value(m, mpi3::max<>{});
+  return d / std::max(m, 1e-300);
+}
 /// the thermal pass of [finiteT][device] in MEM with injection points: Pi_in (host, the block layout of this rank) replaces
 /// the computed Pi, noise > 0 multiplies it by (1 + noise x uniform(-1, 1)), w_in (host) replaces the W stage
 template <MEMORY_SPACE MEM>
@@ -1267,8 +1326,13 @@ wdbg_out_t wdbg_run(fx_t &F, double beta, double mu0, nda::array<ComplexType, 4>
   nda::array<ComplexType, 4> Sp, Sh;
   self_energy<MEM>(prop, tl, w, B, mf, grid, *F.mpi, zf, T.sig_p, T.sig_h, 0, Sp, Timer, sector_t::both, false, nullptr, 0, &Sh);
   out.S = Sp + Sh;
-  app_log(1, "  wdbg: basis rank {} (fit {}, Bose rows {}), {} nodes, mirror_half {}", B.rank, B.rank_fit(), B.n_bose,
-          B.zeta_nodes.size(), numerics::line_dlr::mirror_half(B.zeta_nodes));
+  out.fmask.assign(zf.size(), 0);
+  long nkeep = 0;
+  for (long i = 0; i < zf.size(); ++i) nkeep += (out.fmask[i] = (tp.rho() * beta * std::abs(zf(i)) >= tp.c_f) ? 1 : 0);
+  app_log(1, "  wdbg: basis rank {} (fit {}, Bose rows {}), {} nodes, mirror_half {}, cut_odd {:.0e}; fermionic nodes {} of which {} "
+             "above the floor rho beta |zeta| >= {}",
+          B.rank, B.rank_fit(), B.n_bose, B.zeta_nodes.size(), numerics::line_dlr::mirror_half(B.zeta_nodes), tp.cut_odd, zf.size(), nkeep,
+          tp.c_f);
   return out;
 }
 } // namespace
@@ -1296,8 +1360,9 @@ TEST_CASE("gw_line_finiteT_wdbg", "[.][finiteT][wdbg]") {
     return d / m;
   };
   auto report = [&](char const *what, wdbg_out_t const &a, wdbg_out_t const &b) {
-    app_log(1, "  {:<44s} Pi {:.3e}  W(nodes) {:.3e}  w {:.3e}  Sigma {:.3e}", what, rel(a.Pi, b.Pi),
-            (a.Wn.size() == b.Wn.size() and a.Wn.size() > 0) ? rel(a.Wn, b.Wn) : -1.0, rel(a.w, b.w), rel(a.S, b.S));
+    app_log(1, "  {:<44s} Pi {:.3e}  W(nodes) {:.3e}  w {:.3e}  Sigma masked {:.3e} (sub-floor {:.3e})", what, rel(a.Pi, b.Pi),
+            (a.Wn.size() == b.Wn.size() and a.Wn.size() > 0) ? rel(a.Wn, b.Wn) : -1.0, rel(a.w, b.w), rel_nodes(comm, a.S, b.S, a.fmask, true),
+            rel_nodes(comm, a.S, b.S, a.fmask, false));
   };
   auto H0 = wdbg_run<HOST_MEMORY>(F, beta, mu0, nullptr, 0.0, nullptr);
   {
@@ -1357,12 +1422,12 @@ TEST_CASE("gw_line_finiteT_wdbg", "[.][finiteT][wdbg]") {
  * host, stage by stage with identical inputs:
  *   Pi (rays + tau leg)                      <= 1e-12
  *   W at the nodes (device Dyson, own Pi)    <= 1e-12
- *   Sigma_c from the HOST residues           <= 1e-11   (the device Sigma path alone)
- *   Sigma_c of the device chain (own w)      <= 1e-4    (noise floor, not a device property: the split fit's even sector
- *       (cut 1e-10) and the Bose rows (individual window-pole residues) amplify round-off; on the host alone, Pi x (1 + eps
- *       noise) moves Sigma_c by 3.9e-7 / 1.6e-6 / 1.1e-5 at eps = 1e-16 / 1e-15 / 1e-14 with W at the nodes within 2e-15 /
- *       2e-15 / 7e-15 ([.][finiteT][wdbg], Mac 2 ranks); the device's Pi differs by ~2e-15)
- * The residues w themselves are determined only up to the near-threshold directions (report only).
+ *   Sigma_c from the HOST residues           <= 1e-11   (the device Sigma path alone)   } at the masked nodes
+ *   Sigma_c of the device chain (own w)      <= 1e-11   (full chain)                    } rho beta |zeta| >= c_f only
+ * S8b.4 (notes sec:fT_wcond): Sigma_c below the floor (|zeta| <~ 0.02 Ha here) is not an output of the thermal W step (wrong by
+ * design, 8e-2 vs Eq. fT_sigma) and moves by 1e10 x the Pi noise (the pre-S8b.4 1e-4 gate of the full chain measured those
+ * nodes: 1.5e-5); it is reported, not gated. The residues w are a gauge of the split fit (near-null directions of the kernel
+ * on D), compared only through W at the nodes and the masked Sigma_c (their own difference is reported).
  */
 TEST_CASE("gw_line_finiteT_device", "[gw_line][finiteT][device]") {
   fx_t F("lih222");
@@ -1391,9 +1456,11 @@ TEST_CASE("gw_line_finiteT_device", "[gw_line][finiteT][device]") {
   app_log(1, "\n[finiteT][device] lih222 beta {}: host vs device (thermal lists, tau leg, D, split fit, Bose rows)", beta);
   bool ok = gate("Pi on D (rays + tau leg)", rel(H.Pi, D.Pi), 1e-12);
   ok      = gate("W at the nodes (device Dyson, own Pi)", rel(H.Wn, D.Wn), 1e-12) and ok;
-  ok      = gate("Sigma_c at 80 nodes from the host residues", rel(H.S, Dh.S), 1e-11) and ok;
-  ok      = gate("Sigma_c at 80 nodes, device chain [noise floor]", rel(H.S, D.S), 1e-4) and ok;
-  app_log(1, "    residues w (report only)                             {:.3e}", rel(H.w, D.w));
+  ok      = gate("Sigma_c masked nodes, from the host residues", rel_nodes(comm, H.S, Dh.S, H.fmask, true), 1e-11) and ok;
+  ok      = gate("Sigma_c masked nodes, device chain (own Pi, W, w)", rel_nodes(comm, H.S, D.S, H.fmask, true), 1e-11) and ok;
+  app_log(1, "    Sigma_c sub-floor nodes (report: not an output)      {:.3e} (host residues) / {:.3e} (device chain)",
+          rel_nodes(comm, H.S, Dh.S, H.fmask, false), rel_nodes(comm, H.S, D.S, H.fmask, false));
+  app_log(1, "    residues w (report only: a gauge)                    {:.3e}", rel(H.w, D.w));
   REQUIRE(ok);
 }
 #endif
@@ -1883,4 +1950,257 @@ TEST_CASE("gw_line_finiteT_T4c", "[.][gw_line][finiteT][T4c]") {
             std::abs(R.mu - mu_C), dg / gm, nw, wdef, dx / xm, xm, ds / sm, sm, df, fm);
   }
   REQUIRE(true);
+}
+
+// ============================================================================================================== S8b.4 gauge
+// [finiteT][gauge] (plan S8b.4 task 4a, notes sec:fT_gauge): the free terminal block A0 = P0 V Q0^dag of the closure when
+// n_free > 1. Problems: a synthetic 3 x 3 measure (40 poles, K 6: n_free 3) and the Si 2x2x2 Gamma moments of
+// si222_moments_k0.h5 at K 4 (Nr 290, r1 232, n_free 58 = n; the Gram rank exceeds K r there already at the stored omega_p).
+//   (i)   A0 invariant under random unitary mixing of the null bases P0 -> P0 V_L, Q0 -> Q0 V_R ("orbital", "canonical"; "svd"
+//         reported: O(1));
+//   (ii)  the moments 0..K reproduced by every rule;
+//   (iii) BLAS threads 1 vs 4: Sigma_c(z) and the poles of "orbital" identical to 1e-10 ("svd" reported: O(1) with MKL;
+//         OpenBLAS on the Mac is thread-invariant here);
+//   (iv)  continuity: 1e-15 relative noise on the moments moves Sigma_c(z) of "orbital" continuously ("svd" reported);
+//   (v)   n_free <= 1: every rule bitwise the pre-S8b.4 realization ("svd").
+#include "methods/GW_line/blas_scope.hpp"
+#include <random>
+namespace {
+namespace ldlr = numerics::line_dlr;
+
+/// Cayley moments 0..K+1 of npol poles in [-emax, emax] with seeded rank-1 residues v v^dag
+nda::array<ComplexType, 3> gauge_measure(long n, long npol, double emax, double wp, long K, unsigned seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<double> U(-1.0, 1.0);
+  nda::array<double, 1> w(npol);
+  nda::array<ComplexType, 3> g(npol, n, n);
+  for (long l = 0; l < npol; ++l) {
+    w(l) = emax * U(rng);
+    std::vector<ComplexType> v(n);
+    for (auto &x : v) x = ComplexType(U(rng), U(rng)) / std::sqrt(double(npol));
+    for (long i = 0; i < n; ++i)
+      for (long j = 0; j < n; ++j) g(l, i, j) = v[i] * std::conj(v[j]);
+  }
+  return ldlr::moments_from_poles(w, g, wp, K + 1);
+}
+
+ldlr::cmatrix_F random_unitary(long n, unsigned seed) {
+  std::mt19937 rng(seed);
+  std::normal_distribution<double> N(0.0, 1.0);
+  ldlr::cmatrix_F M(n, n);
+  for (long j = 0; j < n; ++j)
+    for (long i = 0; i < n; ++i) M(i, j) = ComplexType(N(rng), N(rng));
+  nda::array<double, 1> s;
+  return ldlr::detail::polar_unitary(M, s);
+}
+
+/// Sigma_c(z) = sum_l W_l W_l^dag / (z - d_l) at 25 points x + 0.05 i, x in [-3, 3] Ha (flattened)
+std::vector<ComplexType> gauge_sigma(ldlr::upfold_result_t const &r) {
+  const long n = r.W.extent(0), np = r.d.size();
+  std::vector<ComplexType> out;
+  for (long p = 0; p < 25; ++p) {
+    const ComplexType z(-3.0 + 0.25 * double(p), 0.05);
+    for (long i = 0; i < n; ++i)
+      for (long j = 0; j < n; ++j) {
+        ComplexType s(0.0);
+        for (long l = 0; l < np; ++l) s += r.W(i, l) * std::conj(r.W(j, l)) / (z - r.d(l));
+        out.push_back(s);
+      }
+  }
+  return out;
+}
+double rel_vec(std::vector<ComplexType> const &a, std::vector<ComplexType> const &b) {
+  double d = 0.0, m = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    d = std::max(d, std::abs(a[i] - b[i]));
+    m = std::max(m, std::abs(a[i]));
+  }
+  return d / std::max(m, 1e-300);
+}
+/// max_m<=K ||W diag(u^m) W^dag - C^(m)|| / ||C^(0)|| (and the held-out m = K + 1)
+std::pair<double, double> gauge_moment_err(ldlr::upfold_result_t const &r, nda::array<ComplexType, 3> const &C, long K) {
+  const long n = r.W.extent(0), np = r.d.size();
+  double c0 = 0.0, emax = 0.0, eheld = 0.0;
+  for (long i = 0; i < n; ++i)
+    for (long j = 0; j < n; ++j) c0 += std::norm(C(0, i, j));
+  c0 = std::sqrt(c0);
+  for (long m = 0; m <= K + 1; ++m) {
+    double e = 0.0;
+    for (long i = 0; i < n; ++i)
+      for (long j = 0; j < n; ++j) {
+        ComplexType s(0.0);
+        for (long l = 0; l < np; ++l) s += r.W(i, l) * std::pow(r.u(l), double(m)) * std::conj(r.W(j, l));
+        e += std::norm(s - C(m, i, j));
+      }
+    e = std::sqrt(e) / c0;
+    if (m <= K) emax = std::max(emax, e);
+    else eheld = e;
+  }
+  return {emax, eheld};
+}
+
+ldlr::upfold_opts_t gauge_opts(std::string const &rule, double tol_gram) {
+  ldlr::upfold_opts_t o;
+  o.tol_gram   = tol_gram;
+  o.nphi       = 8;
+  o.svd_driver = "gesvd";
+  o.scan_err   = "poly";
+  o.free_block = rule;
+  return o;
+}
+
+/// one problem: the checks (i)-(iv) of the test-case comment
+bool gauge_checks(std::string const &name, nda::array<ComplexType, 3> const &C, long K, double wp, double tol_gram) {
+  bool ok = true;
+  const long nC = C.extent(1);
+  // (i) invariance of A0 under the null-basis ambiguity (the reference SVD of phase A, then mixed)
+  {
+    auto o = gauge_opts("orbital", tol_gram);
+    o.svd_driver = "gesdd";
+    ldlr::upfold_result_t res;
+    auto pr = ldlr::upfold_prepare(C, K, wp, o, res, true);
+    REQUIRE(pr.need_ref);
+    const long Nr = pr.Nr;
+    ldlr::cmatrix_F M = pr.Mref, P(Nr, Nr), Qh(Nr, Nr);
+    nda::array<double, 1> sv(Nr);
+    nda::lapack::gesvd(M, sv, P, Qh);
+    const long r1 = ldlr::detail::svd_rank(sv, o, res), f = Nr - r1;
+    REQUIRE(f > 1);
+    auto VL = random_unitary(f, 11), VR = random_unitary(f, 12);
+    ldlr::cmatrix_F P2(P), Qh2(Qh);
+    {
+      ldlr::cmatrix_F P0 = P(nda::range::all, nda::range(r1, Nr)), Q0h = Qh(nda::range(r1, Nr), nda::range::all);
+      P2(nda::range::all, nda::range(r1, Nr))  = ldlr::detail::mm(P0, VL);
+      Qh2(nda::range(r1, Nr), nda::range::all) = ldlr::detail::mm(VR, Q0h, 'C', 'N');   // Q0 V_R
+    }
+    app_log(1, "\n[finiteT][gauge] {}: n {} K {} wp {} | Nr {} r1 {} n_free {}", name, nC, K, wp, Nr, r1, f);
+    for (std::string rule : {"orbital", "canonical", "svd"}) {
+      auto oo = gauge_opts(rule, tol_gram);
+      auto qa = pr, qb = pr;
+      ldlr::upfold_result_t ra, rb;
+      ldlr::detail::set_free_block(qa, P, Qh, r1, ra, oo);
+      ldlr::detail::set_free_block(qb, P2, Qh2, r1, rb, oo);
+      double d = 0.0, m = 0.0;
+      for (long x = 0; x < qa.A0.size(); ++x) {
+        d += std::norm(qa.A0.data()[x] - qb.A0.data()[x]);
+        m += std::norm(qa.A0.data()[x]);
+      }
+      const double rel = std::sqrt(d / m);
+      if (rule == "svd")
+        app_log(1, "    {:<52s} {:.3e}  (report: the SVD pairing)", "(i) svd: |A0(mixed) - A0| / |A0|", rel);
+      else
+        ok = gate(("(i) " + rule + ": |A0(mixed) - A0| / |A0| (sigma ratio " + std::to_string(ra.free_sig).substr(0, 8) + ")").c_str(), rel,
+                  1e-13) and ok;
+    }
+  }
+  // (ii) moments, (iii) threads, (iv) continuity
+  nda::array<ComplexType, 3> Cn(C);
+  {
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<double> U(-1.0, 1.0);
+    for (long a = 0; a < Cn.size(); ++a) Cn.data()[a] *= 1.0 + 1e-15 * ComplexType(U(rng), U(rng));
+  }
+  for (std::string rule : {"orbital", "canonical", "svd"}) {
+    auto o = gauge_opts(rule, tol_gram);
+    ldlr::upfold_result_t r1t, r4t, rn;
+    {
+      blas_threads_scope_t b(1);
+      r1t = ldlr::upfold_block(C, K, wp, o);
+    }
+    {
+      blas_threads_scope_t b(4);
+      r4t = ldlr::upfold_block(C, K, wp, o);
+    }
+    {
+      blas_threads_scope_t b(1);
+      rn = ldlr::upfold_block(Cn, K, wp, o);
+    }
+    auto [em, eh] = gauge_moment_err(r1t, C, K);
+    auto s1 = gauge_sigma(r1t), s4 = gauge_sigma(r4t), sn = gauge_sigma(rn);
+    const double dthr = rel_vec(s1, s4), dnz = rel_vec(s1, sn);
+    app_log(1, "    {:<9s}: n_free {} free-block sigma ratio {:.2e} phi {:.6f} | moments <= K {:.2e} held-out {:.2e} | threads 1 vs 4 "
+               "Sigma {:.2e} | 1e-15 noise Sigma {:.2e}",
+            rule, r1t.n_free, r1t.free_sig, r1t.phi, em, eh, dthr, dnz);
+    ok = gate(("(ii) " + rule + ": moments 0..K (rel. ||C0||)").c_str(), em, 1e-12) and ok;
+    if (rule == "orbital") {
+      ok = gate("(iii) orbital: BLAS threads 1 vs 4, Sigma_c(z)", dthr, 1e-10) and ok;
+      ok = gate("(iv) orbital: 1e-15 moment noise, Sigma_c(z) [continuity]", dnz, 1e-7) and ok;
+    }
+  }
+  return ok;
+}
+} // namespace
+
+TEST_CASE("gw_line_finiteT_gauge", "[gw_line][finiteT][gauge]") {
+  bool ok = true;
+  {   // synthetic 3 x 3 measure
+    const long K = 6;
+    auto C = gauge_measure(3, 40, 3.0, 1.0, K, 7);
+    ok = gauge_checks("synthetic 3x3 (40 poles)", C, K, 1.0, 1e-12) and ok;
+  }
+  {   // Si 2x2x2 Gamma moments (T = 0 G0W0, stored omega_p 0.11)
+    h5::file f(ft_dir() + "si222_moments_k0.h5", 'r');
+    h5::group g(f);
+    auto gs = g.open_group("si_k0");
+    const double wp = read_attr<double>(gs, "wp"), tg = read_attr<double>(gs, "tol_gram");
+    nda::array<double, 3> Cre, Cim;
+    nda::h5_read(gs, "C_re", Cre);
+    nda::h5_read(gs, "C_im", Cim);
+    const long K = 4;
+    nda::array<ComplexType, 3> C(K + 2, Cre.extent(1), Cre.extent(2));
+    for (long m = 0; m < K + 2; ++m)
+      for (long i = 0; i < C.extent(1); ++i)
+        for (long j = 0; j < C.extent(2); ++j) C(m, i, j) = ComplexType(Cre(m, i, j), Cim(m, i, j));
+    ok = gauge_checks("si222 Gamma moments", C, K, wp, tg) and ok;
+    // vs the prototype (si222_gauge_ref.h5, gen_gauge_ref.py): the closed-form F, phi, held-out error, Sigma_c(z)
+    h5::file fr(ft_dir() + "si222_gauge_ref.h5", 'r');
+    h5::group gr(fr);
+    REQUIRE(read_attr<long>(gr, "K") == K);
+    auto Fpy = read_c<2>(gr, "mixing_F");
+    auto const &F = ldlr::mixing_unitary(C.extent(1));
+    double dF = 0.0;
+    for (long i = 0; i < F.extent(0); ++i)
+      for (long j = 0; j < F.extent(1); ++j) dF = std::max(dF, std::abs(F(i, j) - Fpy(i, j)));
+    app_log(1, "\n[finiteT][gauge] si222 K {} vs the prototype (free_block rules of cayley/upfold.py):", K);
+    ok = gate("closed-form mixing unitary F (58 x 58) vs python", dF, 1e-12) and ok;
+    for (std::string rule : {"orbital", "canonical"}) {
+      auto o = gauge_opts(rule, tg);
+      o.nphi = read_attr<long>(gr, "nphi");
+      auto r  = ldlr::upfold_block(C, K, wp, o);
+      auto gg = gr.open_group(rule);
+      auto Spy = read_c<3>(gg, "sigma");
+      std::vector<ComplexType> sp(Spy.data(), Spy.data() + Spy.size());
+      const double dphi = std::abs(r.phi - read_attr<double>(gg, "phi"));
+      const double dres = std::abs(r.residual / read_attr<double>(gg, "heldout_err") - 1.0);
+      app_log(1, "    {:<9s}: n_free {} ({}) phi {:.10f} ({:.10f}) held-out {:.6e} ({:.6e}) sigma ratio {:.6e} ({:.6e})", rule, r.n_free,
+              read_attr<long>(gg, "n_free"), r.phi, read_attr<double>(gg, "phi"), r.residual, read_attr<double>(gg, "heldout_err"),
+              r.free_sig, read_attr<double>(gg, "sig_min"));
+      ok = ok and r.n_free == read_attr<long>(gg, "n_free");
+      ok = gate((rule + ": |phi - phi_py| (golden-section roundoff)").c_str(), dphi, 1e-5) and ok;
+      ok = gate((rule + ": held-out error rel. to python").c_str(), dres, 1e-6) and ok;
+      app_log(1, "    {:<52s} {:.3e}  (report: phi of the golden section differs by {:.1e})", (rule + ": Sigma_c(z) vs python, own phi").c_str(),
+              rel_vec(sp, gauge_sigma(r)), dphi);
+      o.force_phi = read_attr<double>(gg, "phi");   // the same terminal phase: the realization of the same free block
+      auto rf = ldlr::upfold_block(C, K, wp, o);
+      ok = gate((rule + ": Sigma_c(z) vs python at phi_py (25 points)").c_str(), rel_vec(sp, gauge_sigma(rf)), 1e-8) and ok;
+      if (rule == "orbital")
+        ok = gate("orbital: sigma_min / sigma_max of L^dag F Rm^dag rel. to python",
+                  std::abs(r.free_sig / read_attr<double>(gg, "sig_min") - 1.0), 1e-8) and ok;
+    }
+  }
+  {   // (v) n_free <= 1: every rule bitwise "svd" (synthetic 3 x 3 measure with 8 poles: Nr 8 <= K r)
+    const long K = 6;
+    auto C = gauge_measure(3, 8, 3.0, 1.0, K, 9);
+    auto a = ldlr::upfold_block(C, K, 1.0, gauge_opts("svd", 1e-12));
+    bool same = true;
+    for (std::string rule : {"orbital", "canonical"}) {
+      auto b = ldlr::upfold_block(C, K, 1.0, gauge_opts(rule, 1e-12));
+      same = same and a.d.size() == b.d.size() and a.phi == b.phi;
+      for (long x = 0; same and x < a.d.size(); ++x) same = (a.d(x) == b.d(x));
+      for (long x = 0; same and x < a.W.size(); ++x) same = (a.W.data()[x] == b.W.data()[x]);
+    }
+    app_log(1, "\n[finiteT][gauge] n_free {} (<= 1): orbital / canonical bitwise svd: {}", a.n_free, same ? "yes" : "NO");
+    ok = ok and same and a.n_free <= 1;
+  }
+  REQUIRE(ok);
 }

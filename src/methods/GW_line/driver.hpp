@@ -56,6 +56,9 @@
  *                       S7f closure options (closure.hpp closure_params_t, cayley.hpp upfold_opts_t): SVD cutoff, Gram /
  *                       SVD cut placement ("gap": at the largest eigenvalue ratio within a window of the tolerance;
  *                       "smooth": smooth-step weights of the Gram rows in the window), phase continuity (> 0)
+ *   closure_free_block = "orbital"   S8b.4 (notes sec:fT_gauge): the unitary V of the free terminal block A0 = P0 V Q0^dag when
+ *                       n_free > 1: "orbital" = polar(L^dag F Rm^dag) (covariant, continuous), "canonical" = polar(P0^dag Q0),
+ *                       "svd" = 1 (pre-S8b.4: roundoff-chaotic); n_free <= 1 unchanged by the option
  *   closure_threads = -1, closure_svd = "gesdd", closure_ueig = "cayley"   (pre-S7g: "gesvd", "schur")
  *                       S7g closure performance: BLAS threads of the per-k host closure (-1 = auto: the cores of the rank
  *                       (SLURM_CPUS_PER_TASK, else affinity / node ranks) in device runs, untouched in host runs where the
@@ -131,7 +134,7 @@
  *                       (omega_p := max(wp, wp_floor zeta_T)), mu_rule = "auto" ("auto" | "gap" | "number"; mu_dn_max = 0.1,
  *                       mu_th_factor = 10, notes Eq. fT_nth), band_heights = 8, band_x = 21, band_top = 4, mats_factor = 4 (data set
  *                       D), bos_eps_T = 1e-12 (D-selected basis), bos_line_eps = 1e-10 (the line basis of D's line nodes),
- *                       cut_odd = 1e-13, cut_even = 1e-10 (split fit), tau_grid = "id" | "gl", tau_eps = 1e-13 (tau leg),
+ *                       cut_odd = 1e-11 (S8b.4; was 1e-13), cut_even = 1e-10 (split fit), tau_grid = "id" | "gl", tau_eps = 1e-13 (tau leg),
  *                       spectra.occupation = false, thermal_bases_file (parity: D, nu_b, the Sigma basis injected).
  *                       scf_density = "closure" | "matsubara" (S8b.3 hybrid, hybrid.hpp: tau-leg Sigma_c(i w_n) on the dense set
  *                       w_n <= hyb_wmax = 100 Ha, Matsubara Dyson D / N / mu (N = N_el exactly); the closure supplies only the next
@@ -230,6 +233,7 @@ struct gw_line_params_t {
   long closure_threads = -1;             ///< S7g: BLAS threads of the host closure (-1 auto: device runs the rank's cores, host runs untouched; 0 untouched)
   std::string closure_svd  = "gesdd";    ///< S7g: SVD driver of the upfolding "gesdd" (default) | "gesvd" (python / pre-S7g)
   std::string closure_ueig = "cayley";   ///< S7g: eigenvectors of U "cayley" (default; Hermitian Cayley image) | "schur" (zgees, pre-S7g)
+  std::string closure_free_block = "orbital";   ///< S8b.4: free terminal block (n_free > 1) "orbital" | "canonical" | "svd" (pre-S8b.4)
   std::string closure_device = "auto";   ///< S7g: cuSOLVER eigensolvers/SVD in the closure "auto" (device runs) | "on" | "off"
   std::string closure_dev_svd = "gesvdp"; ///< S7g: device SVD "gesvdp" (polar decomposition, default) | "gesvd"
   double debug_noise_h0 = 0.0;           ///< diagnostics: relative Hermitian Gaussian noise on H0 (seed debug_noise_seed)
@@ -278,7 +282,7 @@ struct gw_line_params_t {
   double mats_factor = 4.0, band_top = 4.0;     ///< N_M = ceil(mats_factor zeta_T beta / 2 pi); band top
   double bos_eps_T = 1e-12;                     ///< eps_b of the D-selected bosonic basis
   double bos_line_eps = 1e-10;                  ///< eps of the gapless bosonic line basis whose unmasked nodes enter D
-  double cut_odd = 1e-13, cut_even = 1e-10;     ///< split pair fit cutoffs
+  double cut_odd = 1e-11, cut_even = 1e-10;     ///< split pair fit cutoffs (S8b.4: cut_odd 1e-11, was 1e-13)
   std::string tau_grid = "id";                  ///< tau leg nodes "id" (finite-interval ID, ~40) | "gl" (composite GL, ~200-250)
   double tau_eps = 1e-13;                       ///< tau ID tolerance (Pi(q, 0) to 2e-14 with 40 nodes, lih222 beta 200)
   bool spectra_occupation = false;              ///< spectra.occupation: also f(w - mu) A(k, w)

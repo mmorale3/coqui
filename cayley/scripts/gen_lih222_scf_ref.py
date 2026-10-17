@@ -20,7 +20,7 @@ Run: LineSCGW from the KS poles at mu0 with the small settings of the C++ test (
   theta 20 deg, eps 1e-8, lam 6, lam_b (--lam-b, default 12 since S7f; 4 = python's default, which is narrower than Pi's
   spectrum after iteration 1 and amplifies roundoff ~1e5x, S7c), sigma_gap = bos_gap = 0.02, g_gap 0, 120 nodes per ray in [1e-3, 60], wp 0.11, K 8,
   tol_gram 1e-10, nphi 8 (the C++ default; python's lehmann_from_sigma default is 72, patched here), mixing 0.5, 6 iterations.
-Output: tests/unit_test_files/gw_line/lih222_scf_ref.h5 with per-iteration mu, gap (Ha), nelec (compressed), nelec_lehmann,
+Output: tests/unit_test_files/gw_line/lih222_scf_ref.h5 (S8b.4: closure free_block "orbital", attr free_block) with per-iteration mu, gap (Ha), nelec (compressed), nelec_lehmann,
   dSigma, and the total Sigma at k = 0 at every 4th fermionic node (Sigma_k0_re/_im (niter, nsel, nb, nb), node_index).
 Usage: gen_lih222_scf_ref.py [niter=6] [--native-bases] [--lam-b L (12)] [--bases FILE (lih222_thc/bases_lamb<L>.h5)]
        [--out FILE]"""
@@ -76,6 +76,8 @@ with h5py.File(out, 'w') as f:
         f[k] = np.array(v, float)
     f['node_index'] = idx.astype(np.int64)
     f['Sigma_k0_re'] = Sig.real; f['Sigma_k0_im'] = Sig.imag
+    import inspect; from cayley.upfold import upfold_block as _ub   # S8b.4: the closure's free-block rule (default)
+    f.attrs['free_block'] = inspect.signature(_ub).parameters['free_block'].default
     f.attrs.update(mu0=mu0, nelec=nelec, theta_deg=20.0, eps=1e-8, lam=6.0, lam_b=lam_b, sigma_gap=0.02, bos_gap=0.02, g_gap=0.0,
                    nodes_per_ray=120, node_tmin=1e-3, node_tmax=60.0, wp=0.11, K=8, tol_gram=1e-10, nphi=8, mixing=0.5,
                    cpp_bases=int(not native), bases=("" if native else os.path.basename(bases_file)))

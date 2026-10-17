@@ -76,7 +76,7 @@ inline void bcast_matrix(numerics::line_dlr::cmatrix_F const &A, int root, MPI_C
   bcast_doubles(const_cast<double *>(reinterpret_cast<double const *>(A.data())), 2 * long(A.size()), root, c);
 }
 /// S8b.3 debug (COQUI_GWLINE_SCAN_DEBUG): tr(A0) and the eigensolve-free coarse errors of a problem with a free block
-inline std::string scan_fingerprint(numerics::line_dlr::upfold_problem_t const &pr, long nphi) {
+inline std::string scan_fingerprint(numerics::line_dlr::upfold_problem_t const &pr, long nphi, double free_sig = -1.0) {
   namespace ldlr = numerics::line_dlr;
   ComplexType tr(0.0);
   for (long i = 0; i < pr.Nr; ++i) tr += pr.A0(i, i);
@@ -91,8 +91,9 @@ inline std::string scan_fingerprint(numerics::line_dlr::upfold_problem_t const &
     std::snprintf(b, sizeof(b), " %.6e", v[ip]);
     e += b;
   }
-  char h[160];
-  std::snprintf(h, sizeof(h), "n_free %ld tr(A0) %+.12e %+.12e | coarse argmin %ld | errs", pr.n_free, tr.real(), tr.imag(), imin);
+  char h[200];
+  std::snprintf(h, sizeof(h), "n_free %ld (free block sigma_min/max %.3e) tr(A0) %+.12e %+.12e | coarse argmin %ld | errs", pr.n_free,
+                free_sig, tr.real(), tr.imag(), imin);
   return std::string(h) + e;
 }
 } // namespace detail
@@ -192,7 +193,7 @@ void distributed_phase_scan(boost::mpi3::communicator &comm, std::vector<long> c
                 nda::lapack::gesvd(Mc, sv, P, Qh);
                 ldlr::upfold_result_t rt;
                 auto q2 = q;
-                ldlr::detail::set_free_block(q2, P, Qh, ldlr::detail::svd_rank(sv, ob[j], rt), rt);
+                ldlr::detail::set_free_block(q2, P, Qh, ldlr::detail::svd_rank(sv, ob[j], rt), rt, ob[j]);
                 double dA = 0.0, nA = 0.0;
                 if (q2.n_free == q.n_free)
                   for (long x = 0; x < long(q.A0.size()); ++x) {
@@ -201,11 +202,11 @@ void distributed_phase_scan(boost::mpi3::communicator &comm, std::vector<long> c
                   }
                 char h[96];
                 std::snprintf(h, sizeof(h), "threads %ld: |dA0|/|A0| %.3e | ", bt2, std::sqrt(dA / std::max(nA, 1e-300)));
-                alt = std::string(h) + detail::scan_fingerprint(q2, nphi[j]);
+                alt = std::string(h) + detail::scan_fingerprint(q2, nphi[j], rt.free_sig);
               }
               std::printf("          scan debug k %ld (rank %ld, %s): reference SVD threads %ld: %s\n          scan debug k %ld "
                           "alternative reference SVD %s\n",
-                          dk[j0 + j], rank, lazy ? "lazy" : "parallel", bt, detail::scan_fingerprint(q, nphi[j]).c_str(),
+                          dk[j0 + j], rank, lazy ? "lazy" : "parallel", bt, detail::scan_fingerprint(q, nphi[j], res[j0 + j]->free_sig).c_str(),
                           dk[j0 + j], alt.c_str());
               std::fflush(stdout);
             }

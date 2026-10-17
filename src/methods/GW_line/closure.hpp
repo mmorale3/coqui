@@ -182,6 +182,8 @@ struct closure_params_t {
   long k_workers         = 1;         ///< concurrent host threads over the rank's k (each with blas_threads / k_workers)
   std::string svd_driver = "gesvd";   ///< numerics::line_dlr::upfold_opts_t::svd_driver
   std::string ueig       = "schur";   ///< numerics::line_dlr::upfold_opts_t::ueig
+  /// S8b.4: unitary of the free terminal block for n_free > 1, "orbital" | "canonical" | "svd" (upfold_opts_t::free_block)
+  std::string free_block = "orbital";
   numerics::line_dlr::lapack_hooks_t const *hooks = nullptr;   ///< external (device) eigensolvers; null: host LAPACK
   /**
    * perf 7.1c: the terminal-phase scan of the k with a free block (n_free > 0). "parallel": the coarse realizations on
@@ -213,6 +215,7 @@ struct closure_params_t {
     o.svd_driver = svd_driver;
     o.ueig       = ueig;
     o.hooks      = hooks;
+    o.free_block = free_block;
     o.scan_err   = (scan == "serial") ? "eigen" : (scan == "lazy" ? "lazy" : "poly");   // S8b: "lazy" (thermal closure)
     utils::check(ueig_cut == "mu" or ueig_cut == "inf", "gw_line::closure: ueig_cut must be \"mu\" or \"inf\" (got \"{}\")", ueig_cut);
     o.ueig_cut   = (ueig_cut == "mu") ? std::numbers::pi : 0.0;
@@ -234,22 +237,23 @@ struct closure_params_t {
 struct upfold_diag_t {
   long r_gram = 0, r1 = 0, gram_near = 0, svd_near = 0, phi_index = -1, n_rejected = 0, phi_kept = 0;
   double phi = 0.0, gram_margin = 0.0, gram_ratio = 0.0, svd_margin = 0.0, phi_tie = 0.0;
+  double free_sig = 0.0;   ///< S8b.4: sigma_min / sigma_max of the free-block polar problem (0: V = 1)
   static constexpr long nfields = 13;
   void pack(double *x) const {
     double v[nfields] = {double(r_gram), double(r1), double(gram_near), double(svd_near), double(phi_index), double(n_rejected),
-                         double(phi_kept), phi, gram_margin, gram_ratio, svd_margin, phi_tie, 0.0};
+                         double(phi_kept), phi, gram_margin, gram_ratio, svd_margin, phi_tie, free_sig};
     std::copy_n(v, nfields, x);
   }
   void unpack(double const *x) {
     r_gram = std::llround(x[0]); r1 = std::llround(x[1]); gram_near = std::llround(x[2]); svd_near = std::llround(x[3]);
     phi_index = std::llround(x[4]); n_rejected = std::llround(x[5]); phi_kept = std::llround(x[6]);
-    phi = x[7]; gram_margin = x[8]; gram_ratio = x[9]; svd_margin = x[10]; phi_tie = x[11];
+    phi = x[7]; gram_margin = x[8]; gram_ratio = x[9]; svd_margin = x[10]; phi_tie = x[11]; free_sig = x[12];
   }
   static upfold_diag_t from(numerics::line_dlr::upfold_result_t const &u) {
     upfold_diag_t d;
     d.r_gram = u.r_gram; d.r1 = u.r1; d.gram_near = u.gram_near; d.svd_near = u.svd_near; d.phi_index = u.phi_index;
     d.n_rejected = u.n_rejected; d.phi_kept = u.phi_kept ? 1 : 0; d.phi = u.phi; d.gram_margin = u.gram_margin;
-    d.gram_ratio = u.gram_ratio; d.svd_margin = u.svd_margin; d.phi_tie = u.phi_tie;
+    d.gram_ratio = u.gram_ratio; d.svd_margin = u.svd_margin; d.phi_tie = u.phi_tie; d.free_sig = u.free_sig;
     return d;
   }
 };
@@ -754,12 +758,12 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
       auto const &f = out.kprof[ik];
       if (not(f.n_free > 0 or f.retry > 0 or f.fallback > 0 or ik == kslow)) continue;
       auto const &d = out.diag[ik];
-      app_log(2, "          closure k {} (rank {}): Nr {} r1 {} n_free {} | fit {:.2f} mom {:.2f} C0+Gram {:.2f} SVD {:.2f} (ref "
+      app_log(2, "          closure k {} (rank {}): Nr {} r1 {} n_free {} (free block {} sigma_min/max {:.2e}) | fit {:.2f} mom {:.2f} C0+Gram {:.2f} SVD {:.2f} (ref "
                  "{:.2f}) | scan bcast {:.2f} coarse {:.2f} refine {:.2f} final {:.2f} | eigen realizations {} ({:.2f} s, RR + "
                  "retries {:.2f} s, retries {}, max RR columns {}, Schur fallbacks {}), eigensolve-free errors {} (build {:.2f} s) | "
                  "Lehmann {:.2f} | total {:.2f} | scan ranks {} BLAS threads coarse {} owner {} | phi {:.9f} basin {} tie {:.3f} rejected {}"
                  " | cores {} [{}-{}] sockets {:#x} CPUs used {} / {}",
-              ik, ik % np, d.r_gram, d.r1, f.n_free, f.t_fit, f.t_mom, f.t_gram, f.t_svd, f.t_svd_ref, f.t_bcast, f.t_coarse,
+              ik, ik % np, d.r_gram, d.r1, f.n_free, p.free_block, d.free_sig, f.t_fit, f.t_mom, f.t_gram, f.t_svd, f.t_svd_ref, f.t_bcast, f.t_coarse,
               f.t_refine, f.t_final, f.n_eig, f.t_eig, f.t_rr, f.retry, f.nflag, f.fallback, f.n_mfree, f.t_poly, f.t_leh, f.total(),
               f.scan_ranks, f.scan_threads / 1000, f.scan_threads % 1000, d.phi, d.phi_index, d.phi_tie, d.n_rejected, f.cores,
               f.core_first, f.core_last, f.sock_mask, f.cpus_start, f.cpus_end);

@@ -9,7 +9,9 @@ Settings (attrs; mirror gen_lih222_scf_ref.py where they exist): theta 20 deg, t
 gapless Sigma basis), lam_b 12 (gapless bosonic line basis, eps bos_eps_T 1e-10; its unmasked nodes enter D; candidates of the
 D-selected basis [1e-4 lam_b, lam_b]), 120 log nodes per ray in [1e-3, 60] Ha, wp 0.11 -> omega_p = max(wp, wp_floor zeta_T),
 K 8, tol_gram 1e-10, nphi 8, mixing 0.5 (linear, total Sigma_c), beta 200, thermal_tol 1e-8, c_zeta = c_f = 30, wp_floor 15,
-mu_rule "auto"; W-step parameters = cayley.line.thc_gw.WSTEP_DEFAULTS (root attrs wstep_*).
+mu_rule "auto"; W-step parameters = cayley.line.thc_gw.WSTEP_DEFAULTS with cut_odd = 1e-11 (S8b.4: the C++ default; root attrs
+wstep_*). Closure: cayley.upfold free_block = "orbital" (S8b.4 default, notes section 11.10): root attrs free_block, dataset mixing_F_re/_im
+(nb x nb, the fixed unitary F = cayley.upfold.mixing_unitary(nb) of the orbital rule).
 BASES: the pivoted-QR pole / node choices differ between LAPACK builds (gen_lih222_scf_ref.py docstring); this file therefore
 stores every basis the loop used so that the C++ test can inject them (like bases.h5 of the T = 0 parity test):
   sigma_basis_w (r_s)          poles of the two-sided gapless Sigma basis (LineBasis(theta, lam, eps, gap=(0, 0)))
@@ -34,6 +36,11 @@ sys.path.insert(0, ROOT + '/coqui/cayley')
 import cayley.line.driver as drv
 from cayley.line.closure import lehmann_from_sigma
 from cayley.line.thc_gw import WSTEP_DEFAULTS
+from cayley.upfold import mixing_unitary
+import inspect
+from cayley.upfold import upfold_block as _ub
+FREE_BLOCK = inspect.signature(_ub).parameters['free_block'].default   # the rule lehmann_from_sigma's upfold_block uses
+WSTEP = dict(WSTEP_DEFAULTS, cut_odd=1e-11)
 from cayley.coqui_io import THC, _c
 
 def opt(name, default):
@@ -54,7 +61,7 @@ assert np.all(qk[0] == np.arange(nk)), "python hartree_exchange assumes q index 
 drv.lehmann_from_sigma = functools.partial(lehmann_from_sigma, nphi=8)
 P = dict(theta=np.deg2rad(20.0), eps=1e-8, lam=6.0, bos_lam=12.0, bos_gap=0.02, sig_gap=(0.02, 0.02), g_gap=(0.0, 0.0), wp=0.11, K=8,
          tol_gram=1e-10, mixing=0.5, nodes_per_ray=120, node_range=(1e-3, 60.0), beta=beta, thermal_tol=1e-8, thermal_floor=30.0,
-         thermal_floor_f=30.0, wp_floor=15.0, mu_rule='auto', bos_eps_T=1e-10)
+         thermal_floor_f=30.0, wp_floor=15.0, mu_rule='auto', bos_eps_T=1e-10, wstep=WSTEP)
 sc = drv.LineSCGW(X, Z, qk, nk, nelec, H0, mu0, **P)
 sc.start_from_hamiltonian(np.array([np.diag(eig[k]) for k in range(nk)]).astype(complex))
 mu_start = sc.mu
@@ -78,7 +85,9 @@ with h5py.File(out, 'w') as f:
                    nodes_per_ray=P['nodes_per_ray'], node_tmin=1e-3, node_tmax=60.0, wp=P['wp'], K=P['K'], tol_gram=P['tol_gram'], nphi=8,
                    mixing=P['mixing'], beta=beta, thermal_tol=P['thermal_tol'], thermal_floor=P['thermal_floor'],
                    thermal_floor_f=P['thermal_floor_f'], wp_floor=P['wp_floor'], mu_rule=P['mu_rule'], g_repr='lehmann',
-                   **{'wstep_' + k: (np.nan if v is None else v) for k, v in WSTEP_DEFAULTS.items()})
+                   free_block=FREE_BLOCK, **{'wstep_' + k: (np.nan if v is None else v) for k, v in WSTEP.items()})
+    Fm = mixing_unitary(nb)
+    f['mixing_F_re'] = Fm.real; f['mixing_F_im'] = Fm.imag
     f['fz_re'] = sc.fz.real; f['fz_im'] = sc.fz.imag; f['node_index'] = idx.astype(np.int64); f['fmask'] = sc.fmask.astype(np.int8)
     f['sigma_basis_w'] = sc.bt.w
     f['D_zeta_re'] = sc.gw.zD.real; f['D_zeta_im'] = sc.gw.zD.imag; f['D_kind'] = sc.gw.kD; f['nu_b'] = sc.gw.bos_w.nu

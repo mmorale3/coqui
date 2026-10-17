@@ -127,6 +127,8 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   io::tolower(p.closure_svd);
   p.closure_ueig  = io::get_value_with_default<std::string>(pt, "closure_ueig", p.closure_ueig);
   io::tolower(p.closure_ueig);
+  p.closure_free_block = io::get_value_with_default<std::string>(pt, "closure_free_block", p.closure_free_block);
+  io::tolower(p.closure_free_block);
   p.closure_device = io::get_value_with_default<std::string>(pt, "closure_device", p.closure_device);
   io::tolower(p.closure_device);
   p.closure_dev_svd = io::get_value_with_default<std::string>(pt, "closure_dev_svd", p.closure_dev_svd);
@@ -298,6 +300,8 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
                "gw_line: closure_svd_cut must be \"hard\" or \"gap\" (got \"{}\")", p.closure_svd_cut);
   utils::check(p.closure_svd == "gesvd" or p.closure_svd == "gesdd", "gw_line: closure_svd must be \"gesvd\" or \"gesdd\" (got \"{}\")",
                p.closure_svd);
+  utils::check(p.closure_free_block == "orbital" or p.closure_free_block == "canonical" or p.closure_free_block == "svd",
+               "gw_line: closure_free_block must be \"orbital\", \"canonical\" or \"svd\" (got \"{}\")", p.closure_free_block);
   utils::check(p.closure_ueig == "schur" or p.closure_ueig == "cayley",
                "gw_line: closure_ueig must be \"schur\" or \"cayley\" (got \"{}\")", p.closure_ueig);
   utils::check(p.closure_k_workers >= 1 or p.closure_k_workers == -1, "gw_line: closure_k_workers must be >= 1 or -1 (auto)");
@@ -344,9 +348,10 @@ void gw_line_params_t::log() const {
              "cuts {} / {} (window {}), phase continuity {}",
           wp, K, tol_gram, std::max(tol_gram, tol_gram_eps * eps), tol_gram_eps, nphi, tol_svd, closure_cut, closure_svd_cut, closure_cut_window,
           phase_keep > 0.0 ? "on (x " + std::to_string(phase_keep) + ")" : std::string("off"));
-  app_log(1, "    closure linear algebra: SVD {}, U eigenvectors {}, BLAS threads {}, k workers {}, device {} (SVD {})", closure_svd,
+  app_log(1, "    closure linear algebra: SVD {}, U eigenvectors {}, BLAS threads {}, k workers {}, device {} (SVD {}), free "
+             "terminal block {}", closure_svd,
           closure_ueig, closure_threads < 0 ? std::string("auto") : std::to_string(closure_threads), closure_k_workers,
-          closure_device, closure_dev_svd);
+          closure_device, closure_dev_svd, closure_free_block);
   if (debug_noise_h0 > 0.0)
     app_log(1, "    DIAGNOSTIC: relative noise {:.1e} on H0 (seed {})", debug_noise_h0, debug_noise_seed);
   if (debug_noise_sigma > 0.0)
@@ -711,6 +716,7 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "phase_keep", p.phase_keep);
   h5::h5_write(ig, "closure_svd", p.closure_svd);
   h5::h5_write(ig, "closure_ueig", p.closure_ueig);
+  h5::h5_write(ig, "closure_free_block", p.closure_free_block);
   h5::h5_write(ig, "closure_device", p.closure_device);
   h5::h5_write(ig, "closure_k_workers", p.closure_k_workers);
   h5::h5_write(ig, "closure_dev_svd", p.closure_dev_svd);
@@ -1311,6 +1317,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   cprm.phase_keep = prm.phase_keep;
   cprm.svd_driver = prm.closure_svd;
   cprm.ueig       = prm.closure_ueig;
+  cprm.free_block = prm.closure_free_block;
   // S7g: BLAS threads of the host closure. Device runs have one rank per GPU and idle cores; host runs fill the cores
   cprm.blas_threads = prm.closure_threads >= 0 ? prm.closure_threads
                                                : (MEM != HOST_MEMORY ? cores_per_rank(long(mpi.node_comm.size())) : 0);
@@ -2063,6 +2070,9 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     mix_info_t mi;
     nda::array<ComplexType, 3> F_next = st.F;
     const bool mixed = st.have_sigma;
+    // S8b.4: in a thermal iteration the residual / change maxima (dSigma, the convergence metric, damp_below) and the DIIS
+    // overlaps use the masked nodes rho beta |zeta| >= c_f only (Sigma below the floor is not an output; notes sec:fT_wcond)
+    mixer.node_mask = (thermal and cth.mask.size() == size_t(Sp_new.extent(1))) ? &cth.mask : nullptr;
     if (mixed)
       mi = mixer.step(comm, st.iter + 1, nk, k_rows, prm.sigma_kdist, st.Sig_p, st.Sig_h, Sp_new, Sh_new, st.F_cl, st.F, F_next);
     else

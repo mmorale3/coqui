@@ -41,6 +41,8 @@
 #include <complex>
 #include <functional>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <numbers>
 #include <numeric>
 #include <string>
@@ -439,6 +441,15 @@ struct upfold_opts_t {
   /// (the coarse decision is the same; only the near-tie diagnostic sees the unscreened phases); serial (no distributed scan)
   std::string scan_err = "eigen";
   lapack_hooks_t const *hooks = nullptr;   ///< external (device) drivers of the Gram eigen, SVD and Cayley path; null: host
+  /**
+   * S8b.4 (notes sec:fT_gauge, Eqs. fT_freeblock / fT_VF; python upfold.terminal_block): the unitary V of the free terminal
+   * block A0 = P0 V Q0^dag when n_free > 1 (every V reproduces the moments 0..K; the SVD pairs the null vectors by roundoff).
+   * "orbital" (default): V = polar(L^dag F Rm^dag), L = R P0 (= heldout X_0), Rm = Q0^dag A1^K R^dag (= Y_K), F a fixed generic
+   * unitary of the orbital basis (mixing_unitary, or *mixing): invariant under P0 -> P0 V_L, Q0 -> Q0 V_R, continuous in the
+   * data; "canonical": V = polar(P0^dag Q0); "svd": V = 1 (the pre-S8b.4 realization). n_free <= 1: V = 1 for every rule.
+   */
+  std::string free_block = "orbital";
+  cmatrix_F const *mixing = nullptr;   ///< F of "orbital" (n x n unitary); null: mixing_unitary(n)
 };
 
 /// Result of upfold_block: Sigma_c(z) = sum_l W[:, l] W[:, l]^dagger / (z - d_l), d mu-RELATIVE (sorted ascending).
@@ -481,6 +492,7 @@ struct upfold_result_t {
   double t_bcast  = 0.0;             ///< distributed scan: broadcast of the problem
   long n_eig = 0, n_mfree = 0;       ///< eigen realizations | eigensolve-free held-out evaluations
   long scan_ranks = 0, scan_threads = 0;   ///< distributed scan: ranks of the batch, BLAS threads of the owner
+  double free_sig = 0.0;             ///< S8b.4: sigma_min / sigma_max of the matrix whose polar factor is V (0: V = 1)
 };
 
 namespace detail {
@@ -562,8 +574,92 @@ inline cmatrix_F form_u(upfold_problem_t const &pr, double phi) {
     for (long i = 0; i < Nr; ++i) U(i, j) = pr.A1(i, j) + (pr.n_free > 0 ? eph * pr.A0(i, j) : ComplexType(0.0));
   return U;
 }
-/// A1 = P1 Q1^dag, A0 = P0 Q0^dag (+ P0, Q0h) of the SVD P diag(s) Qh with rank r1; sets r1 / n_free
-inline void set_free_block(upfold_problem_t &pr, cmatrix_F const &P, cmatrix_F const &Qh, long r1, upfold_result_t &res) {
+/// unitary polar factor U = P Qh of the SVD M = P diag(s) Qh (square M, destroyed); s returns the singular values
+inline cmatrix_F polar_unitary(cmatrix_F &M, nda::array<double, 1> &s) {
+  const long m = M.extent(0);
+  utils::check(M.extent(1) == m, "cayley::polar_unitary: matrix not square");
+  cmatrix_F P(m, m), Qh(m, m);
+  s.resize(m);
+  if (m == 0) return P;
+  nda::lapack::gesvd(M, s, P, Qh);
+  return mm(P, Qh);
+}
+} // namespace detail
+
+/**
+ * S8b.4: the fixed generic unitary F (n x n) of free_block = "orbital" (python upfold.mixing_unitary(n, "golden")):
+ * F = polar(G), G_ab = exp(2 pi i phi_g (a+1)(b+1)) (1 + cos(a - b) / 2), phi_g = (sqrt 5 - 1) / 2 (a, b = 0..n-1); a closed
+ * form, identical in every implementation up to the roundoff of one n x n SVD. Computed once per n and process (mutex).
+ */
+inline cmatrix_F const &mixing_unitary(long n) {
+  static std::mutex mx;
+  static std::map<long, cmatrix_F> cache;
+  std::lock_guard<std::mutex> lk(mx);
+  if (auto it = cache.find(n); it != cache.end()) return it->second;
+  const double phi = (std::sqrt(5.0) - 1.0) / 2.0, c = 2.0 * std::numbers::pi * phi;   // python: 2j * pi * phi * outer
+  cmatrix_F G(n, n);
+  for (long b = 0; b < n; ++b)
+    for (long a = 0; a < n; ++a) {
+      const double x = double(a + 1) * double(b + 1);
+      G(a, b) = std::exp(ComplexType(0.0, c * x)) * (1.0 + 0.5 * std::cos(double(a) - double(b)));
+    }
+  nda::array<double, 1> s;
+  return cache.emplace(n, detail::polar_unitary(G, s)).first->second;
+}
+
+namespace detail {
+/**
+ * S8b.4: the unitary V (f x f) of the free block A0 = P0 V Q0^dag for o.free_block (upfold_opts_t); needs pr.A1, pr.R, pr.K.
+ * res.free_sig = sigma_min / sigma_max of the matrix whose polar factor V is (0 when V = 1).
+ */
+inline cmatrix_F free_block_unitary(upfold_problem_t const &pr, upfold_opts_t const &o, upfold_result_t &res) {
+  const long f = pr.n_free, n = pr.n, Nr = pr.Nr;
+  res.free_sig = 0.0;
+  utils::check(o.free_block == "orbital" or o.free_block == "canonical" or o.free_block == "svd",
+               "cayley::upfold_block: free_block must be \"orbital\", \"canonical\" or \"svd\" (got \"{}\")", o.free_block);
+  cmatrix_F V(f, f);
+  V() = ComplexType(0.0);
+  for (long i = 0; i < f; ++i) V(i, i) = 1.0;
+  if (f <= 1 or o.free_block == "svd") return V;
+  cmatrix_F M;
+  if (o.free_block == "canonical") {
+    M = mm(pr.P0, pr.Q0h, 'C', 'C');                                // P0^dag Q0
+  } else {
+    cmatrix_F const &F = o.mixing ? *o.mixing : mixing_unitary(n);
+    utils::check(F.extent(0) == n and F.extent(1) == n, "cayley::upfold_block: mixing unitary is {} x {}, need {} x {}", F.extent(0),
+                 F.extent(1), n, n);
+    const ComplexType one(1.0), zero(0.0);
+    auto L = mm(pr.R, pr.P0);                                       // n x f (= heldout X_0)
+    cmatrix_F Rm;                                                   // f x n: Q0^dag A1^K R^dag (= heldout Y_K)
+    if (f <= n) {   // K products of the f x Nr block by A1
+      cmatrix_F T(pr.Q0h), T2(f, Nr);
+      for (long m = 0; m < pr.K; ++m) {
+        nda::blas::gemm(one, T, pr.A1, zero, T2);
+        std::swap(T, T2);
+      }
+      Rm = mm(T, pr.R, 'N', 'C');
+    } else {        // K products of A1 by the Nr x n block R^dag
+      cmatrix_F S(Nr, n), S2(Nr, n);
+      for (long i = 0; i < Nr; ++i)
+        for (long j = 0; j < n; ++j) S(i, j) = std::conj(pr.R(j, i));
+      for (long m = 0; m < pr.K; ++m) {
+        nda::blas::gemm(one, pr.A1, S, zero, S2);
+        std::swap(S, S2);
+      }
+      Rm = mm(pr.Q0h, S);
+    }
+    M = mm(mm(L, F, 'C', 'N'), Rm, 'N', 'C');                       // L^dag F Rm^dag (f x f)
+  }
+  nda::array<double, 1> s;
+  V = polar_unitary(M, s);
+  res.free_sig = (s.size() > 0 and s(0) > 0.0) ? s(s.size() - 1) / s(0) : 0.0;
+  return V;
+}
+
+/// A1 = P1 Q1^dag, A0 = P0 V Q0^dag (+ P0 := P0 V, Q0h) of the SVD P diag(s) Qh with rank r1 (S8b.4: V = free_block_unitary
+/// for o.free_block; V = 1 and the pre-S8b.4 arithmetic when n_free <= 1 or free_block = "svd"); sets r1 / n_free
+inline void set_free_block(upfold_problem_t &pr, cmatrix_F const &P, cmatrix_F const &Qh, long r1, upfold_result_t &res,
+                           upfold_opts_t const &o) {
   using nda::range;
   const long Nr = pr.Nr;
   res.r1     = r1;
@@ -573,7 +669,9 @@ inline void set_free_block(upfold_problem_t &pr, cmatrix_F const &P, cmatrix_F c
   pr.P0  = P(range::all, range(r1, Nr));
   pr.Q0h = Qh(range(r1, Nr), range::all);
   pr.A1  = mm(P1, Q1h);                                             // P1 Q1^dag
-  pr.A0  = mm(pr.P0, pr.Q0h);                                       // P0 Q0^dag
+  res.free_sig = 0.0;
+  if (pr.n_free > 1 and o.free_block != "svd") pr.P0 = mm(pr.P0, free_block_unitary(pr, o, res));   // P0 := P0 V
+  pr.A0  = mm(pr.P0, pr.Q0h);                                       // P0 V Q0^dag
 }
 } // namespace detail
 
@@ -709,7 +807,7 @@ inline upfold_problem_t upfold_prepare(nda::array<ComplexType, 3> const &C, long
       res.svd_reference = true;
       res.t_svd_ref     = detail::seconds_since(tref);
     }
-    detail::set_free_block(pr, P, Qh, r1, res);
+    detail::set_free_block(pr, P, Qh, r1, res, o);
   }
   pr.Cheld = cmatrix_F(n, n);
   for (long i = 0; i < n; ++i)
@@ -729,7 +827,7 @@ inline void upfold_prepare_ref(upfold_problem_t &pr, upfold_opts_t const &o, upf
   nda::lapack::gesvd(pr.Mref, sv, P, Qh);
   const long r1     = detail::svd_rank(sv, o, res);
   res.svd_reference = true;
-  detail::set_free_block(pr, P, Qh, r1, res);
+  detail::set_free_block(pr, P, Qh, r1, res, o);
   pr.need_ref = false;
   pr.Mref     = cmatrix_F();
   res.t_svd_ref = detail::seconds_since(t0);

@@ -59,7 +59,7 @@ struct thermal_params_t {
   double band_top = 4.0, mats_factor = 4.0;
   double eps_b = 1e-12, lam_b = 0.0, bos_eps_T = 1e-10;   ///< D-selected basis tolerance, candidate range, line basis eps
   long npole_b = 800;
-  double cut_odd = 1e-13, cut_even = 1e-10, deg_tol = 1e-8;
+  double cut_odd = 1e-11, cut_even = 1e-10, deg_tol = 1e-8;   // S8b.4: cut_odd 1e-11 (was 1e-13)
   long tau_nn = 12;
   double tau_per_efold = 2.0, tau_x0 = 0.02;
   std::string tau_grid = "id";  ///< "id" (finite-interval time ID at theta_t = pi / 2) | "gl" (composite GL, python)
