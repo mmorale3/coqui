@@ -1193,13 +1193,16 @@ TEST_CASE("gw_line_finiteT_scf", "[gw_line][finiteT][scf]") {
   REQUIRE(ok);
 }
 
-// ============================================================================================================== device A/B
-#if defined(ENABLE_DEVICE)
+// ======================================================================================== W-stage diagnostics (hidden)
 namespace {
-/// one thermal Pi (rays + tau leg) -> W -> Sigma pass in memory space MEM (KS lists of lih222 at beta, ID grids)
+struct wdbg_out_t {
+  nda::array<ComplexType, 4> Pi, Wn, w, S;
+};
+/// the thermal pass of [finiteT][device] in MEM with injection points: Pi_in (host, the block layout of this rank) replaces
+/// the computed Pi, noise > 0 multiplies it by (1 + noise x uniform(-1, 1)), w_in (host) replaces the W stage
 template <MEMORY_SPACE MEM>
-std::tuple<nda::array<ComplexType, 4>, nda::array<ComplexType, 4>, nda::array<ComplexType, 4>>
-thermal_pass(fx_t &F, double beta, double mu0) {
+wdbg_out_t wdbg_run(fx_t &F, double beta, double mu0, nda::array<ComplexType, 4> const *Pi_in, double noise,
+                    nda::array<ComplexType, 4> const *w_in) {
   auto &mf = *F.mf;
   auto &thc = *F.thc;
   const long nk = mf.nkpts(), nq = mf.nqpts(), nb = thc.nbnd(), Np = thc.Np();
@@ -1219,7 +1222,6 @@ thermal_pass(fx_t &F, double beta, double mu0) {
   auto tl = thermal_lists(ks, beta, ET);
   aux_grid_t grid(*F.mpi, Np);
   propagator_t<MEM> prop(thc, grid);
-  ibz_t ibz(mf, nb, false);
   bosonic_basis_t bline(tp.theta, 4.0, 1e-10, 0.0);
   auto Dm = make_bos_data(bline.zeta_nodes, tp);
   auto B  = bosonic_basis_t::from_data(tp.theta, Dm.z, 4.0, 1e-12).with_bose(beta, ET);
@@ -1228,28 +1230,140 @@ thermal_pass(fx_t &F, double beta, double mu0) {
   o.pad  = 1.25;
   auto T = line_time_grids_t::thermal(tp.theta_t, 2.0 * ET, 2.0 * emax + nda::max_element(B.nu), tp.S_T(), 1e-10, o, Dm.z, zf,
                                       F.mpi->comm);
-  auto tn = make_tau_nodes(tp, emax, 2.0 * emax);
   std::vector<long> qall(nq);
   std::iota(qall.begin(), qall.end(), 0L);
-  memory::array<MEM, ComplexType, 4> Pt, Pi, w, Wn;
-  nda::array<ComplexType, 1> z0(1);
-  z0(0) = 0.0;
-  pi_tau_leg<MEM>(prop, ks, mf, ibz, grid, tp, tn, z0, 0, Pt, Timer, qall);
-  polarization<MEM>(prop, tl, mf, grid, Dm.z, T.pi_p, T.pi_h, 0, Pi, Timer, sector_t::both, qall);
-  for (long i = 0; i < Dm.z.size(); ++i)
-    if (Dm.z(i) == ComplexType(0.0))
-      for (long q = 0; q < nq; ++q) Pi(q, i, nda::range::all, nda::range::all) = Pt(q, 0, nda::range::all, nda::range::all);
-  nda::array<ComplexType, 4> Pi_h(memory::to_memory_space<HOST_MEMORY>(Pi));
-  coulomb_blocks_t<MEM> Zb(thc, grid, qall, Timer);
-  screened_interaction<MEM>(Pi, Zb, B, grid, *F.mpi, w, Timer, &Wn, qall, false);
-  nda::array<ComplexType, 4> w_h(memory::to_memory_space<HOST_MEMORY>(w));
+  wdbg_out_t out;
+  memory::array<MEM, ComplexType, 4> Pi, w, Wn;
+  if (Pi_in == nullptr) {
+    ibz_t ibz(mf, nb, false);
+    auto tn = make_tau_nodes(tp, emax, 2.0 * emax);
+    memory::array<MEM, ComplexType, 4> Pt;
+    nda::array<ComplexType, 1> z0(1);
+    z0(0) = 0.0;
+    pi_tau_leg<MEM>(prop, ks, mf, ibz, grid, tp, tn, z0, 0, Pt, Timer, qall);
+    polarization<MEM>(prop, tl, mf, grid, Dm.z, T.pi_p, T.pi_h, 0, Pi, Timer, sector_t::both, qall);
+    for (long i = 0; i < Dm.z.size(); ++i)
+      if (Dm.z(i) == ComplexType(0.0))
+        for (long q = 0; q < nq; ++q) Pi(q, i, nda::range::all, nda::range::all) = Pt(q, 0, nda::range::all, nda::range::all);
+    out.Pi = nda::array<ComplexType, 4>(memory::to_memory_space<HOST_MEMORY>(Pi));
+  } else {
+    out.Pi = *Pi_in;
+  }
+  if (noise > 0.0) {
+    std::srand(12345 + F.mpi->comm.rank());
+    for (long a = 0; a < out.Pi.size(); ++a)
+      out.Pi.data()[a] *= 1.0 + noise * (2.0 * double(std::rand()) / double(RAND_MAX) - 1.0);
+  }
+  Pi = memory::to_memory_space<MEM>(out.Pi);
+  if (w_in == nullptr) {
+    coulomb_blocks_t<MEM> Zb(thc, grid, qall, Timer);
+    screened_interaction<MEM>(Pi, Zb, B, grid, *F.mpi, w, Timer, &Wn, qall, false);
+    out.Wn = nda::array<ComplexType, 4>(memory::to_memory_space<HOST_MEMORY>(Wn));
+    out.w  = nda::array<ComplexType, 4>(memory::to_memory_space<HOST_MEMORY>(w));
+  } else {
+    out.w = *w_in;
+    w     = memory::to_memory_space<MEM>(out.w);
+  }
   nda::array<ComplexType, 4> Sp, Sh;
   self_energy<MEM>(prop, tl, w, B, mf, grid, *F.mpi, zf, T.sig_p, T.sig_h, 0, Sp, Timer, sector_t::both, false, nullptr, 0, &Sh);
-  nda::array<ComplexType, 4> S = Sp + Sh;
-  return {std::move(Pi_h), std::move(w_h), std::move(S)};
+  out.S = Sp + Sh;
+  app_log(1, "  wdbg: basis rank {} (fit {}, Bose rows {}), {} nodes, mirror_half {}", B.rank, B.rank_fit(), B.n_bose,
+          B.zeta_nodes.size(), numerics::line_dlr::mirror_half(B.zeta_nodes));
+  return out;
 }
 } // namespace
 
+// [.][finiteT][wdbg]: where host and device (or two host W paths) diverge in the thermal pass of [finiteT][device]
+TEST_CASE("gw_line_finiteT_wdbg", "[.][finiteT][wdbg]") {
+  fx_t F("lih222");
+  const double beta = 50.0;
+  double mu0 = 0.0;
+  {
+    h5::file hf(ft_dir() + "lih222_finiteT_ref.h5", 'r');
+    h5::group root(hf);
+    auto gb = root.open_group("beta_50");
+    mu0     = read_attr<double>(gb, "mu0");
+  }
+  auto &comm = F.mpi->comm;
+  auto rel   = [&](auto const &a, auto const &b) {
+    double d = 0.0, m = 0.0;
+    for (long i = 0; i < a.size(); ++i) {
+      d = std::max(d, std::abs(a.data()[i] - b.data()[i]));
+      m = std::max(m, std::abs(a.data()[i]));
+    }
+    d = comm.all_reduce_value(d, mpi3::max<>{});
+    m = comm.all_reduce_value(m, mpi3::max<>{});
+    return d / m;
+  };
+  auto report = [&](char const *what, wdbg_out_t const &a, wdbg_out_t const &b) {
+    app_log(1, "  {:<44s} Pi {:.3e}  W(nodes) {:.3e}  w {:.3e}  Sigma {:.3e}", what, rel(a.Pi, b.Pi),
+            (a.Wn.size() == b.Wn.size() and a.Wn.size() > 0) ? rel(a.Wn, b.Wn) : -1.0, rel(a.w, b.w), rel(a.S, b.S));
+  };
+  auto H0 = wdbg_run<HOST_MEMORY>(F, beta, mu0, nullptr, 0.0, nullptr);
+  {
+    auto H = wdbg_run<HOST_MEMORY>(F, beta, mu0, &H0.Pi, 0.0, nullptr);
+    report("host node path, again", H0, H);
+  }
+  {
+    setenv("COQUI_GWLINE_W_REDIST", "old", 1);
+    auto H = wdbg_run<HOST_MEMORY>(F, beta, mu0, &H0.Pi, 0.0, nullptr);
+    unsetenv("COQUI_GWLINE_W_REDIST");
+    report("host mirror redistribute path (old)", H0, H);
+  }
+  {
+    setenv("COQUI_GWLINE_W_MIRROR", "0", 1);
+    auto H = wdbg_run<HOST_MEMORY>(F, beta, mu0, &H0.Pi, 0.0, nullptr);
+    unsetenv("COQUI_GWLINE_W_MIRROR");
+    report("host full-node path (mirror off)", H0, H);
+  }
+  for (double nz : {1e-16, 1e-15, 1e-14}) {
+    auto H = wdbg_run<HOST_MEMORY>(F, beta, mu0, &H0.Pi, nz, nullptr);
+    char lab[64];
+    std::snprintf(lab, sizeof(lab), "host, Pi x (1 + %.0e noise)", nz);
+    report(lab, H0, H);
+  }
+#if defined(ENABLE_DEVICE)
+  {
+    auto D = wdbg_run<DEVICE_MEMORY>(F, beta, mu0, nullptr, 0.0, nullptr);
+    report("device, own Pi", H0, D);
+  }
+  {
+    auto D = wdbg_run<DEVICE_MEMORY>(F, beta, mu0, &H0.Pi, 0.0, nullptr);
+    report("device W + Sigma from the host Pi", H0, D);
+  }
+  {
+    setenv("COQUI_GWLINE_DYSON_BATCHED", "0", 1);
+    auto D = wdbg_run<DEVICE_MEMORY>(F, beta, mu0, &H0.Pi, 0.0, nullptr);
+    unsetenv("COQUI_GWLINE_DYSON_BATCHED");
+    report("device (per-matrix Dyson) from the host Pi", H0, D);
+  }
+  {
+    setenv("COQUI_GWLINE_W_MIRROR", "0", 1);
+    auto D = wdbg_run<DEVICE_MEMORY>(F, beta, mu0, &H0.Pi, 0.0, nullptr);
+    unsetenv("COQUI_GWLINE_W_MIRROR");
+    report("device full-node path from the host Pi", H0, D);
+  }
+  {
+    auto D = wdbg_run<DEVICE_MEMORY>(F, beta, mu0, &H0.Pi, 0.0, &H0.w);
+    report("device Sigma from the host w", H0, D);
+  }
+#endif
+}
+
+// ============================================================================================================== device A/B
+#if defined(ENABLE_DEVICE)
+/**
+ * [finiteT][device] lih222 beta 50: the thermal pass (thermal lists, tau leg, D, split fit, Bose rows) on the device vs the
+ * host, stage by stage with identical inputs:
+ *   Pi (rays + tau leg)                      <= 1e-12
+ *   W at the nodes (device Dyson, own Pi)    <= 1e-12
+ *   Sigma_c from the HOST residues           <= 1e-11   (the device Sigma path alone)
+ *   Sigma_c of the device chain (own w)      <= 1e-4    (noise floor, not a device property: the split fit's even sector
+ *       (cut 1e-10) and the Bose rows (individual window-pole residues) amplify round-off; on the host alone, Pi x (1 + eps
+ *       noise) moves Sigma_c by 3.9e-7 / 1.6e-6 / 1.1e-5 at eps = 1e-16 / 1e-15 / 1e-14 with W at the nodes within 2e-15 /
+ *       2e-15 / 7e-15 ([.][finiteT][wdbg], Mac 2 ranks); the device's Pi differs by ~2e-15)
+ * The residues w themselves are determined only up to the near-threshold directions (report only).
+ */
 TEST_CASE("gw_line_finiteT_device", "[gw_line][finiteT][device]") {
   fx_t F("lih222");
   const double beta = 50.0;
@@ -1260,25 +1374,26 @@ TEST_CASE("gw_line_finiteT_device", "[gw_line][finiteT][device]") {
     auto gb = root.open_group("beta_50");
     mu0     = read_attr<double>(gb, "mu0");
   }
-  auto [Ph, wh, Sh] = thermal_pass<HOST_MEMORY>(F, beta, mu0);
-  auto [Pd, wd, Sd] = thermal_pass<DEVICE_MEMORY>(F, beta, mu0);
-  auto rel = [&](auto const &a, auto const &b) {
+  auto &comm = F.mpi->comm;
+  auto rel   = [&](auto const &a, auto const &b) {
     double d = 0.0, m = 0.0;
     for (long i = 0; i < a.size(); ++i) {
       d = std::max(d, std::abs(a.data()[i] - b.data()[i]));
       m = std::max(m, std::abs(a.data()[i]));
     }
-    d = F.mpi->comm.all_reduce_value(d, mpi3::max<>{});
-    m = F.mpi->comm.all_reduce_value(m, mpi3::max<>{});
+    d = comm.all_reduce_value(d, mpi3::max<>{});
+    m = comm.all_reduce_value(m, mpi3::max<>{});
     return d / m;
   };
+  auto H  = wdbg_run<HOST_MEMORY>(F, beta, mu0, nullptr, 0.0, nullptr);
+  auto D  = wdbg_run<DEVICE_MEMORY>(F, beta, mu0, nullptr, 0.0, nullptr);
+  auto Dh = wdbg_run<DEVICE_MEMORY>(F, beta, mu0, &H.Pi, 0.0, &H.w);
   app_log(1, "\n[finiteT][device] lih222 beta {}: host vs device (thermal lists, tau leg, D, split fit, Bose rows)", beta);
-  bool ok = gate("Pi on D (rays + tau leg)", rel(Ph, Pd), 1e-12);
-  ok      = gate("Sigma_c at 80 nodes", rel(Sh, Sd), 1e-11) and ok;
-  {   // the residues are determined only up to the near-threshold directions: compared through Sigma
-    const double r = rel(wh, wd);
-    app_log(1, "    residues w (report only)                             {:.3e}", r);
-  }
+  bool ok = gate("Pi on D (rays + tau leg)", rel(H.Pi, D.Pi), 1e-12);
+  ok      = gate("W at the nodes (device Dyson, own Pi)", rel(H.Wn, D.Wn), 1e-12) and ok;
+  ok      = gate("Sigma_c at 80 nodes from the host residues", rel(H.S, Dh.S), 1e-11) and ok;
+  ok      = gate("Sigma_c at 80 nodes, device chain [noise floor]", rel(H.S, D.S), 1e-4) and ok;
+  app_log(1, "    residues w (report only)                             {:.3e}", rel(H.w, D.w));
   REQUIRE(ok);
 }
 #endif
