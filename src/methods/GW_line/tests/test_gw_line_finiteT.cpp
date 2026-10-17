@@ -1403,7 +1403,7 @@ TEST_CASE("gw_line_finiteT_device", "[gw_line][finiteT][device]") {
 namespace {
 /// tau-leg Sigma_c(i w_n) with the line W (generator's D and nu_b, all poles Bose-augmented) vs Eq. fT_sigma, and the
 /// Matsubara density vs the hybrid reference (lih222_finiteT_hybrid_ref.h5)
-bool run_hybrid_unit(fx_t &F, double beta) {
+bool run_hybrid_unit(fx_t &F, double beta, [[maybe_unused]] bool device_ab = false) {
   auto &comm = F.mpi->comm;
   auto &mf   = *F.mf;
   auto &thc  = *F.thc;
@@ -1475,6 +1475,25 @@ bool run_hybrid_unit(fx_t &F, double beta) {
   self_energy<HOST_MEMORY>(prop, tq, w, Bx, mf, grid, *F.mpi, HN.zdummy, *HN.kp, *HN.kh, 8, Sp, Timer, sector_t::both, false, nullptr, 0,
                            &Sh);
   const double tsec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+#if defined(ENABLE_DEVICE)
+  if (device_ab) {   // [hybrid][device]: the tau-leg Sigma kernels on the device from the same residues (exact up to BLAS order)
+    propagator_t<DEVICE_MEMORY> prop_d(thc, grid);
+    memory::array<DEVICE_MEMORY, ComplexType, 4> w_d = memory::to_memory_space<DEVICE_MEMORY>(w);
+    nda::array<ComplexType, 4> Sp_d, Sh_d;
+    self_energy<DEVICE_MEMORY>(prop_d, tq, w_d, Bx, mf, grid, *F.mpi, HN.zdummy, *HN.kp, *HN.kh, 8, Sp_d, Timer, sector_t::both, false,
+                               nullptr, 0, &Sh_d);
+    double dd = 0.0, mm = 0.0;
+    for (long a = 0; a < Sp.size(); ++a) {
+      dd = std::max({dd, std::abs(Sp.data()[a] - Sp_d.data()[a]), std::abs(Sh.data()[a] - Sh_d.data()[a])});
+      mm = std::max({mm, std::abs(Sp.data()[a]), std::abs(Sh.data()[a])});
+    }
+    dd = comm.all_reduce_value(dd, mpi3::max<>{});
+    mm = comm.all_reduce_value(mm, mpi3::max<>{});
+    app_log(1, "\n[finiteT][hybrid][device] lih222 beta {}: tau-leg Sigma_c ({} nodes per leg, Bose rows {}) host vs device, same w",
+            beta, HN.ntau, r);
+    return gate("tau-leg nodal Sigma_c^>, Sigma_c^< host vs device", dd / mm, 1e-11);
+  }
+#endif
   nda::array<long, 1> np_;
   nda::h5_read(hb, "n_probe", np_);
   nda::array<ComplexType, 1> izp(np_.size());
@@ -1557,6 +1576,13 @@ TEST_CASE("gw_line_finiteT_hybrid_unit", "[gw_line][finiteT][hybrid]") {
   ok      = run_hybrid_unit(F, 50.0) and ok;
   REQUIRE(ok);
 }
+
+#if defined(ENABLE_DEVICE)
+TEST_CASE("gw_line_finiteT_hybrid_device", "[gw_line][finiteT][hybrid][device]") {
+  fx_t F("lih222");
+  REQUIRE(run_hybrid_unit(F, 50.0, true));
+}
+#endif
 
 // S8b.3 hybrid SCF: lih222 beta 200, theta_t = theta / 4 (the prototype's dev/s8b3_scf.py settings), scf_density = "matsubara":
 // N(mu) = N_el every iteration, mu vs the prototype (iteration 1: kernels + the exact density only), restart bitwise,
