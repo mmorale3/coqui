@@ -152,3 +152,86 @@ def compress_sectors(basis_p, basis_h, zeta, e, v, emax=None):
     Gp = lehmann(keep & (e > 0)); Gh = lehmann(keep & (e < 0))
     cp = basis_p.fit(zeta, Gp); ch = basis_h.fit(zeta, Gh)
     return np.concatenate([basis_h.w, basis_p.w]), np.concatenate([ch, cp], axis=0), dropped
+
+
+def upfold_sigma(w, g, wp, K, tol_gram=1e-10, nphi=72):
+    """Upfolded real-pole form of Sigma_c(k) from its sector fit (w, g): Sigma_c(z) = W (z - d)^{-1} W^dagger (mu-relative d)."""
+    C = sigma_moments(w, g, wp, K + 1)
+    d, W, info = upfold_block(C, K, wp, 0.0, tol_gram=tol_gram, nphi=nphi, return_info=True)
+    return np.asarray(d, float), np.asarray(W), info
+
+
+def qp_secular(h, d, g, gtol_rel=1e-14, merge_tol=1e-12, nbisect=200, nn=16):
+    """Diagonal QP equation E = h + sum_j g_j / (E - d_j) (eta = 0; d real, g >= 0: the upfolded Sigma_nn) solved EXACTLY:
+    f(E) = h - E + sum_j g_j/(E - d_j) is strictly decreasing between consecutive poles, from +inf to -inf, so it has exactly
+    one root in each of the r + 1 intervals (the roots = the eigenvalues of the arrowhead matrix [[h, sqrt g^T], [sqrt g,
+    diag d]]); the weight of root E is Z = 1/(1 + sum g/(E - d)^2) (sum Z = 1). Returns the root of LARGEST Z (the QP) and Z.
+    Poles with g <= gtol_rel * sum g are dropped; poles closer than merge_tol are merged (summed g). The outer brackets:
+    root_low >= min(h, d_0) - sqrt(sum g) (there f >= s - G/s >= 0), symmetric above. Bisection to the double resolution.
+    Replaces the Newton / linearized solve of the C++ qp_diag start (D2: the linearization near a pole of Sigma_nn sent 157
+    (k, band) of Si 4^3 by up to 162 eV)."""
+    d = np.asarray(d, float); g = np.asarray(g, float)
+    G = g.sum()
+    if len(d) == 0 or G <= 0.0:
+        return float(h), 1.0
+    keep = g > gtol_rel * G
+    d, g = d[keep], g[keep]
+    o = np.argsort(d, kind='stable'); d, g = d[o], g[o]
+    dm, gm = [d[0]], [g[0]]
+    for x, y in zip(d[1:], g[1:]):
+        if x - dm[-1] < merge_tol: gm[-1] += y
+        else: dm.append(x); gm.append(y)
+    d, g = np.array(dm), np.array(gm)
+    s = np.sqrt(g.sum()) + 1e-3
+    r = len(d)
+    LO = np.concatenate([[min(h, d[0]) - s], d]); HI = np.concatenate([d, [max(h, d[-1]) + s]])
+
+    @np.errstate(divide='ignore', invalid='ignore')
+    def solve(js):                                                           # x == d_j only if the interval collapsed: Z = 0
+        lo, hi = LO[js].copy(), HI[js].copy()
+        f = lambda x: h - x + (g[None, :] / (x[:, None] - d[None, :])).sum(1)
+        for _ in range(nbisect):
+            x = 0.5 * (lo + hi)
+            if np.all((x == lo) | (x == hi)): break
+            pos = f(x) > 0
+            lo = np.where(pos, x, lo); hi = np.where(pos, hi, x)
+        x = 0.5 * (lo + hi)
+        return x, 1.0 / (1.0 + (g[None, :] / (x[:, None] - d[None, :]) ** 2).sum(1))
+    # candidates: the two outer intervals and the one containing h; then every interior interval (d_j, d_j+1) whose rigorous
+    # bound beats them: for x in it, S(x) = sum_i g_i/(x - d_i)^2 >= (g_j^1/3 + g_j+1^1/3)^3 / L^2 (the minimum of the two
+    # neighbour terms) + sum over the next nn poles on each side of g_i / (farthest end - d_i)^2, Z = 1/(1 + S)
+    # (pruning is exact: the result is the largest-Z root over ALL intervals; ties -> the lowest energy)
+    js0 = np.unique([0, r, int(np.searchsorted(d, h))])
+    x0, z0 = solve(js0)
+    if z0.max() > 0.5:                                                       # sum Z = 1: no other root can beat it
+        j = int(np.argmax(z0)); return float(x0[j]), float(z0[j])
+    if r > 1:
+        L = d[1:] - d[:-1]
+        S = (np.cbrt(g[:-1]) + np.cbrt(g[1:])) ** 3 / L ** 2
+        jl = np.arange(r - 1)                                                # interval jl = (d[jl], d[jl + 1])
+        for m in range(1, nn + 1):
+            il, ir = jl - m, jl + 1 + m
+            okl, okr = il >= 0, ir < r
+            S[okl] += g[il[okl]] / (d[jl[okl] + 1] - d[il[okl]]) ** 2
+            S[okr] += g[ir[okr]] / (d[ir[okr]] - d[jl[okr]]) ** 2
+        ub = 1.0 / (1.0 + S)
+        js = np.union1d(js0, 1 + np.where(ub > z0.max())[0])
+    else:
+        js = js0
+    x, Z = (x0, z0) if len(js) == len(js0) else solve(js)
+    j = int(np.argmax(Z))
+    return float(x[j]), float(Z[j])
+
+
+def qp_diag(Hstat_rel, w, g, wp, K, V=None, tol_gram=1e-10, nphi=72):
+    """Diagonal QP energies (mu-relative) and Z of the orbitals V (nb, nb) columns (default: the basis vectors) from the
+    sector fit (w, g) of Sigma_c(k): E_n = h_nn + Sigma_nn(E_n), h = V^dag Hstat_rel V, Sigma_nn from the upfolded form."""
+    d, W, info = upfold_sigma(w, g, wp, K, tol_gram=tol_gram, nphi=nphi)
+    nb = Hstat_rel.shape[0]
+    V = np.eye(nb) if V is None else V
+    WV = V.conj().T @ W
+    h = np.real(np.einsum('in,ij,jn->n', V.conj(), Hstat_rel, V))
+    E, Z = np.zeros(nb), np.zeros(nb)
+    for n in range(nb):
+        E[n], Z[n] = qp_secular(h[n], d, np.abs(WV[n]) ** 2)
+    return E, Z, dict(npoles=len(d), **info)

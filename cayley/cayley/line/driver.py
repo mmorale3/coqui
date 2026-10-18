@@ -25,12 +25,26 @@ Finite temperature (S8b, notes section 11; beta given): the thermal loop _iterat
       free reference + analytic tail, finite_t.density_matsubara), mu by N(mu) = N_el (bisection, Sigma_c fixed): mu, D (-> F)
       and N come from here; the closure (step 3) supplies only the next propagator poles, re-centred at the new mu. Its own
       density / count / mu choice are logged next to the hybrid ones (D_cl_err = max|D_closure - D|, N_closure, dN_closure,
-      dmu_closure + rule). Initial state: mu_0 by N(mu_0) = N_el, D = f(H) exactly (Sigma_c = 0)."""
+      dmu_closure + rule). Initial state: mu_0 by N(mu_0) = N_el, D = f(H) exactly (Sigma_c = 0).
+
+Schemes (D2, T = 0 only; argument scheme):
+  "scgw"  (default) the loop above.
+  "scgw0" W frozen at iteration 1 (RPA on the starting G: the residues wres of the first iterate() are cached and reused),
+          G self-consistent (Sigma = G W0, closure, mu, F[D] as in scgw).
+  "evgw"  eigenvalue self-consistency: G = sum_n v_n v_n^dag / (zeta - E_n) with the STARTING orbitals v_n (KS) and QP energies
+          E_n; per iteration W[G] (evgw) or W0 (evgw0), Sigma[G, W] at the nodes (not mixed), per k the upfolded Sigma_c and
+          the diagonal QP equation E_n = h_nn + Sigma_nn(E_n) solved exactly (closure.qp_secular: largest-Z root, eta = 0),
+          h = v^dag (H0 + F - mu) v with F = F[D_start] fixed (orbitals and occupations unchanged => D unchanged);
+          E <- mixing E_new + (1 - mixing) E_old from iteration 2 on (iteration 1 = the diagonal G0W0 energies);
+          mu = QP mid-gap (KS band order; nocc = nelec / 2). ev_window (Ha, None = all bands): bands with |e_start - mu_start|
+          > ev_window take the shift of the nearest in-window band of the same k (scissor). No closure / Lehmann G.
+  "evgw0" evgw with W frozen at iteration 1."""
 import numpy as np, time
 from .line_dlr import LineBasis, BosonicLineBasis
 from .thc_gw import LineGW
 from .closure import fit_sigma_sectors, lehmann_from_sigma, chemical_potential, compress_sectors
 from .closure import fit_sigma_total, wp_thermal, chemical_potential_auto, chemical_potential_T, electron_count_T
+from .closure import qp_diag
 from .thc_gw import node_floor_mask, thermal_rho
 from .. import finite_t as _ft
 
@@ -41,7 +55,7 @@ class LineSCGW:
                  nodes_per_ray=120, node_range=(1e-3, 60.0), beta=None, thermal_tol=1e-8, thermal_floor=30.0, thermal_floor_f=None,
                  wp_floor=15.0, mu_rule='auto', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
                  scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5,
-                 g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4):
+                 g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
         over node_range (Ha) — dense nodes are what pins the weight distribution of the far poles (dev/tune_sigma_fit.txt).
@@ -57,6 +71,9 @@ class LineSCGW:
         The compressed fit does not conserve the electron count when the node range barely exceeds the pole range (molecules:
         node_tmax = 2 lam, lam 55 Ha -> N drifts 10.03 and the loop diverges after ~8 iterations); the Lehmann form is exact."""
         self.X, self.Z, self.qk, self.nk, self.nelec, self.H0 = X, Z, qk_to_k2, nk, nelec, H0
+        assert scheme in ('scgw', 'scgw0', 'evgw', 'evgw0'), scheme
+        assert scheme == 'scgw' or beta is None, "schemes other than scgw: T = 0 only"
+        self.scheme, self.ev_window, self.w0 = scheme, ev_window, None
         self.nb = X.shape[2]; self.mu = mu; self.theta, self.eps, self.lam = theta, eps, lam
         self.theta_t = theta * theta_t_frac
         self.wp, self.K, self.mixing, self.verbose = wp, K, mixing, verbose
@@ -117,6 +134,9 @@ class LineSCGW:
             return
         self.gw.set_poles(e, v)
         self.F = self.gw.hartree_exchange(self.gw.density_matrix())
+        if self.scheme in ('evgw', 'evgw0'):
+            self.ev_v, self.ev_E0 = v, e + self.mu                           # starting orbitals, energies (absolute)
+            self.ev_E, self.ev_Z, self.ev_mu0 = self.ev_E0.copy(), None, self.mu
 
     # ---------------------------------------------------------------- finite temperature (S8b)
     def _mu_shift(self, e, v):
@@ -239,11 +259,11 @@ class LineSCGW:
     def iterate(self):
         if self.beta is not None:
             return self._iterate_thermal()
+        if self.scheme in ('evgw', 'evgw0'):
+            return self._iterate_ev()
         t0 = time.time(); gw = self.gw; nk, nb = self.nk, self.nb
-        # 1. screened interaction
-        wres = []
-        for iq in range(nk):
-            w, _ = gw.screened_interaction(iq); wres.append(w)
+        # 1. screened interaction (scgw0: frozen at iteration 1)
+        wres = self._w_residues()
         tW = time.time() - t0
         # 2. self-energy per k and sector, mixing
         Sig = [self.sigma_sectors(ik, wres) for ik in range(nk)]
@@ -287,6 +307,56 @@ class LineSCGW:
             print(f"iter {len(self.history)}: dSigma {dS:.2e}  mu {self.mu:.6f} (dmu {dmu*27.2114:+.4f} eV)  QP gap {rec['gap_eV']:.4f} eV  "
                   f"nelec {nel:.6f} (Lehmann {nel_exact:.6f}, dropped weight {dropped:.1e})  npoles {min(rec['npoles'])}-{max(rec['npoles'])}  "
                   f"held-out {max(rec['heldout']):.1e}  [W {tW:.0f}s, Sigma {tS:.0f}s, total {rec['ttot']:.0f}s]", flush=True)
+        return rec
+
+    def _w_residues(self):
+        """W residues of the current G (all q); scgw0 / evgw0: those of the first call, cached (W0 = RPA on the starting G)."""
+        if self.w0 is not None:
+            return self.w0
+        wres = [self.gw.screened_interaction(iq)[0] for iq in range(self.nk)]
+        if self.scheme in ('scgw0', 'evgw0'):
+            self.w0 = wres
+        return wres
+
+    def _iterate_ev(self):
+        """One evGW / evGW0 iteration (class docstring "Schemes")."""
+        t0 = time.time(); gw = self.gw; nk, nb = self.nk, self.nb
+        wres = self._w_residues(); tW = time.time() - t0
+        Sig = [self.sigma_sectors(ik, wres) for ik in range(nk)]
+        dS = 0.0 if self.Sig_prev is None else max(np.abs(s[0] + s[1] - p[0] - p[1]).max() for s, p in zip(Sig, self.Sig_prev))
+        self.Sig_prev = Sig; self.mu_sigma = self.mu
+        tS = time.time() - t0 - tW
+        Hstat = self.H0 + self.F - self.mu * np.eye(nb)[None]
+        Enew, Z, npl = np.zeros((nk, nb)), np.zeros((nk, nb)), []
+        for ik in range(nk):
+            w, g = fit_sigma_sectors(self.bp, self.bh, self.fz, Sig[ik][0], Sig[ik][1])
+            e, z, info = qp_diag(Hstat[ik], w, g, self.wp, self.K, V=self.ev_v[ik], tol_gram=self.tol_gram)
+            Enew[ik], Z[ik] = e + self.mu, z; npl.append(info['npoles'])
+        if self.ev_window is not None:                                       # scissor outside the window
+            rel = self.ev_E0 - self.ev_mu0
+            for ik in range(nk):
+                inw = np.where(np.abs(rel[ik]) <= self.ev_window)[0]
+                assert len(inw) > 0, "ev_window contains no band"
+                sh = Enew[ik] - self.ev_E[ik]                               # shift of this iteration's input energies
+                for n in range(nb):
+                    if abs(rel[ik, n]) > self.ev_window:
+                        j = inw[np.argmin(np.abs(inw - n))]
+                        Enew[ik, n] = self.ev_E[ik, n] + sh[j]
+        first = len(self.history) == 0
+        E = Enew if first else self.mixing * Enew + (1.0 - self.mixing) * self.ev_E
+        dE = float(np.abs(E - self.ev_E).max())
+        nocc = int(round(self.nelec / 2))
+        homo, lumo = E[:, :nocc].max(), E[:, nocc:].min()
+        assert lumo > homo, f"evgw: QP energies have no gap in the KS band order (homo {homo}, lumo {lumo})"
+        self.ev_E, self.ev_Z, self.ev_Enew = E, Z, Enew
+        self.mu = 0.5 * (homo + lumo); gw.mu = self.mu
+        gw.set_poles(E - self.mu, self.ev_v)
+        rec = dict(dE=dE, dSigma=dS, mu=self.mu, gap_eV=(lumo - homo) * 27.211386, e_homo=homo - self.mu, e_lumo=lumo - self.mu,
+                   npoles=npl, tW=tW, tS=tS, ttot=time.time() - t0)
+        self.history.append(rec)
+        if self.verbose:
+            print(f"{self.scheme} iter {len(self.history)}: max|dE_QP| {dE:.2e}  mu {self.mu:.6f}  QP gap {rec['gap_eV']:.4f} eV  "
+                  f"dSigma {dS:.2e}  npoles {min(npl)}-{max(npl)}  [W {tW:.0f}s, Sigma {tS:.0f}s, total {rec['ttot']:.0f}s]", flush=True)
         return rec
 
     def _prune_lehmann(self, e_arr, v_arr, half_gap):
