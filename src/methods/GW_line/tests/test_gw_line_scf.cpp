@@ -3014,3 +3014,211 @@ TEST_CASE("gw_line_examples", "[gw_line][examples]") {
   comm.barrier();
   remove_file(comm, chk);
 }
+
+namespace {
+/// D2 [scheme]: a dataset of scf_line/iter<it> (root reads, broadcast)
+template <int R> nda::array<double, R> read_iter_real(boost::mpi3::communicator &comm, std::string const &file, long it,
+                                                      std::string const &ds) {
+  nda::array<double, R> A;
+  if (comm.root()) {
+    h5::file f(file, 'r');
+    h5::group g(f);
+    auto gi = g.open_group("scf_line/iter" + std::to_string(it));
+    nda::h5_read(gi, ds, A);
+  }
+  std::array<long, R> shp{};
+  if (comm.root()) shp = A.shape();
+  comm.broadcast_n(shp.data(), R, 0);
+  if (not comm.root()) A.resize(shp);
+  if (A.size() > 0) comm.broadcast_n(A.data(), A.size(), 0);
+  return A;
+}
+nda::array<ComplexType, 2> read_head_res(boost::mpi3::communicator &comm, std::string const &file, long it) {
+  nda::array<ComplexType, 2> A;
+  if (comm.root()) {
+    h5::file f(file, 'r');
+    h5::group g(f);
+    auto gi = g.open_group("scf_line/iter" + std::to_string(it) + "/head");
+    nda::h5_read(gi, "h_res", A);
+  }
+  std::array<long, 2> shp{};
+  if (comm.root()) shp = A.shape();
+  comm.broadcast_n(shp.data(), 2, 0);
+  if (not comm.root()) A.resize(shp);
+  if (A.size() > 0) comm.broadcast_n(A.data(), A.size(), 0);
+  return A;
+}
+/// parity settings (gw_line_scf_parity) + scheme
+ptree scheme_params(std::string const &out, long niter, bool restart, std::string const &scheme) {
+  auto pt = scf_params(out, niter, restart, "gl", "compressed");
+  pt.put("lam_b", 12.0);
+  pt.put("bases_file", gw_line_dir() + "lih222_thc/bases_lamb12.h5");
+  pt.put("tol_gram_eps", 0.0);
+  pt.put("scheme", scheme);
+  return pt;
+}
+/// D2 gates of the ev schemes vs python (Ha), per iteration: QP energies of the (k, band) with Z > 0.5 within 10 eV of mu, and mu;
+/// all bands: the Li 1s (-49 eV) and the bands > 13 eV are outside what K = 8 / lam 6 resolve (the exact Casida check
+/// check_scheme_casida.py: 0.08-0.56 eV off there vs <= 0.1 meV within 10 eV) and move ~1e-5 Ha with the closure roundoff
+/// (measured Mac 1 / 2 ranks: 7e-6, 3.9e-5, 2.0e-5)
+constexpr std::array<double, 3> EV_GATE = {1e-6, 1e-6, 1e-6};
+constexpr double EV_GATE_ALL = 1e-3;
+} // namespace
+
+/**
+ * D2 [scheme] (driver.hpp "scheme"; python oracle cayley.line.driver.LineSCGW(scheme), references
+ * coqui/cayley/scripts/gen_lih222_scheme_ref.py -> lih222_{scgw0,evgw,evgw0}_ref.h5; parity settings of [parity]):
+ *  scgw0: iteration 1 = scgw iteration 1 bitwise (mu, gap, Sigma); the head residues (W) of iterations 2, 3 = iteration 1
+ *         bitwise; mu / gap / Sigma(k0 nodes) vs python at the [parity] gates; restart (2 + 1) = 3 iterations bitwise.
+ *  evgw:  iteration 1 = the qp_diag start pass (same mu / e_homo / e_lumo bitwise); F = F[D_KS] bitwise; E_QP vs python.
+ *  evgw0: E_QP vs python; W heads frozen; restart (2 + 1) = 3 iterations bitwise (E_QP, mu).
+ */
+TEST_CASE("gw_line_scf_scheme", "[gw_line][scf][scheme]") {
+  lih_t L;
+  auto &comm  = L.mpi->comm;
+  auto ref_of = [](std::string const &s) { return gw_line_dir() + "lih222_" + s + "_ref.h5"; };
+  for (auto s : {"scgw0", "evgw", "evgw0"})
+    if (not std::filesystem::exists(ref_of(s))) FAIL("missing python reference: run coqui/cayley/scripts/gen_lih222_scheme_ref.py");
+  auto rd = [](std::string const &file, std::string const &ds) {
+    nda::array<double, 1> a;
+    h5::file f(file, 'r');
+    h5::group g(f);
+    nda::h5_read(g, ds, a);
+    return a;
+  };
+  bool ok = true;
+
+  SECTION("scgw0") {
+    const std::string fa = "gw_line_scheme_s0", fb = "gw_line_scheme_s0r", fc = "gw_line_scheme_sc";
+    auto A  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scheme_params(fa, 3, false, "scgw0"));
+    auto C  = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scheme_params(fc, 1, false, "scgw"));
+    auto mu_r = rd(ref_of("scgw0"), "mu"), gap_r = rd(ref_of("scgw0"), "gap");
+    nda::array<double, 4> re, im;
+    nda::array<long, 1> idx;
+    {
+      h5::file f(ref_of("scgw0"), 'r');
+      h5::group g(f);
+      nda::h5_read(g, "Sigma_k0_re", re);
+      nda::h5_read(g, "Sigma_k0_im", im);
+      nda::h5_read(g, "node_index", idx);
+    }
+    REQUIRE(A.history.size() == 3);
+    // iteration 1 = scgw iteration 1 bitwise
+    REQUIRE(A.history[0].mu == C.history[0].mu);
+    REQUIRE(A.history[0].gap == C.history[0].gap);
+    {
+      auto Sa = read_sigma_total(comm, fa + ".gw_line.h5", 1), Sc = read_sigma_total(comm, fc + ".gw_line.h5", 1);
+      REQUIRE(nda::max_element(nda::abs(Sa - Sc)) == 0.0);
+    }
+    // W frozen: head residues and eps_inf of iterations 2, 3 = iteration 1
+    auto h1 = read_head_res(comm, fa + ".gw_line.h5", 1);
+    for (long it : {2, 3}) REQUIRE(nda::max_element(nda::abs(read_head_res(comm, fa + ".gw_line.h5", it) - h1)) == 0.0);
+    REQUIRE(A.eps_inf.size() == 3);
+    REQUIRE((A.eps_inf[1] == A.eps_inf[0] and A.eps_inf[2] == A.eps_inf[0]));
+    // vs python
+    const long nb = A.F.extent(1);
+    for (long it = 0; it < 3; ++it) {
+      auto S = read_sigma_total(comm, fa + ".gw_line.h5", it + 1);
+      double dmax = 0.0, smax = 0.0;
+      for (long n = 0; n < idx.size(); ++n)
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) {
+            const ComplexType r(re(it, n, i, j), im(it, n, i, j));
+            dmax = std::max(dmax, std::abs(S(0, idx(n), i, j) - r));
+            smax = std::max(smax, std::abs(r));
+          }
+      auto const &h     = A.history[it];
+      const double dmu  = (h.mu - mu_r(it)) * 27.211386e3, dgap = (h.gap - gap_r(it)) * 27.211386e3;
+      app_log(1, "[scheme scgw0] it {}: mu {:.8f} (py {:.8f}), gap {:.6f} eV (py {:.6f})", it + 1, h.mu, mu_r(it), h.gap * 27.211386,
+              gap_r(it) * 27.211386);
+      auto const &fl = parity_floor[it];
+      ok = gate_line("|dmu| (meV)", dmu, it == 0 ? 1e-3 : std::max(1e-3, PARITY_K * fl[0])) and ok;
+      ok = gate_line("|dgap| (meV)", dgap, it == 0 ? 1e-3 : std::max(1e-3, PARITY_K * fl[1])) and ok;
+      ok = gate_line("Sigma(k=0) rel", dmax / smax, it == 0 ? 1e-10 : std::max(1e-10, PARITY_K * fl[2])) and ok;
+    }
+    // restart: 2 + 1 = 3 bitwise (W0 rebuilt from the KS poles)
+    methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scheme_params(fb, 2, false, "scgw0"));
+    auto B = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scheme_params(fb, 3, true, "scgw0"));
+    REQUIRE(B.history.size() == 3);
+    REQUIRE(B.history[2].mu == A.history[2].mu);
+    REQUIRE(B.history[2].gap == A.history[2].gap);
+    REQUIRE(nda::max_element(nda::abs(read_sigma_total(comm, fb + ".gw_line.h5", 3) - read_sigma_total(comm, fa + ".gw_line.h5", 3))) ==
+            0.0);
+    REQUIRE(ok);
+    for (auto const &f : {fa, fb, fc}) remove_file(comm, f + ".gw_line.h5");
+  }
+
+  for (std::string sch : {"evgw", "evgw0"}) {
+    DYNAMIC_SECTION(sch) {
+      const std::string fa = "gw_line_scheme_" + sch;
+      auto A    = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scheme_params(fa, 3, false, sch));
+      auto mu_r = rd(ref_of(sch), "mu");
+      nda::array<double, 3> E_r, Z_r;
+      {
+        h5::file f(ref_of(sch), 'r');
+        h5::group g(f);
+        nda::h5_read(g, "E_qp", E_r);
+        nda::h5_read(g, "Z_qp", Z_r);
+      }
+      REQUIRE(A.history.size() == 3);
+      // F = F[D_KS] (iteration 0) bitwise
+      {
+        nda::array<ComplexType, 3> F0;
+        if (comm.root()) {
+          h5::file f(fa + ".gw_line.h5", 'r');
+          h5::group g(f);
+          auto gi = g.open_group("scf_line/iter0");
+          nda::h5_read(gi, "F", F0);
+        }
+        if (comm.root()) REQUIRE(nda::max_element(nda::abs(A.F - F0)) == 0.0);
+      }
+      for (long it = 0; it < 3; ++it) {
+        auto E      = read_iter_real<2>(comm, fa + ".gw_line.h5", it + 1, "E_qp");
+        double dq = 0.0, dall = 0.0;   // Z > 0.5 within 10 eV of mu (well-defined quasiparticles; band edges) / all bands
+        for (long k = 0; k < E.extent(0); ++k)
+          for (long n = 0; n < E.extent(1); ++n) {
+            const double dd = std::abs(E(k, n) - E_r(it, k, n));
+            dall            = std::max(dall, dd);
+            if (Z_r(it, k, n) > 0.5 and std::abs(E_r(it, k, n) - mu_r(it)) < 10.0 / 27.211386) dq = std::max(dq, dd);
+          }
+        app_log(1, "[scheme {}] it {}: mu {:.8f} (py {:.8f}), gap {:.6f} eV, max|dE_QP| {:.2e}", sch, it + 1, A.history[it].mu,
+                mu_r(it), A.history[it].gap * 27.211386, A.history[it].dE_qp);
+        ok = gate_line("max|E_QP - py| Z>0.5, 10 eV (Ha)", dq, EV_GATE[it]) and ok;
+        ok = gate_line("max|E_QP - py| all bands (Ha)", dall, EV_GATE_ALL) and ok;
+        ok = gate_line("|dmu| (Ha)", A.history[it].mu - mu_r(it), EV_GATE[it]) and ok;
+      }
+      if (sch == "evgw") {   // iteration 1 = the qp_diag start pass
+        const std::string fq = "gw_line_scheme_qpd";
+        auto pq = scheme_params(fq, 1, false, "scgw");
+        pq.put("start", "qp_diag");
+        methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pq);
+        double mq = 0.0, hq = 0.0, lq = 0.0;
+        if (comm.root()) {
+          h5::file f(fq + ".gw_line.h5", 'r');
+          h5::group g(f);
+          auto gi = g.open_group("scf_line/iter0");
+          h5::h5_read(gi, "mu", mq);
+          h5::h5_read(gi, "e_homo", hq);
+          h5::h5_read(gi, "e_lumo", lq);
+          REQUIRE(mq == A.history[0].mu);
+          REQUIRE(hq == A.history[0].e_homo);
+          REQUIRE(lq == A.history[0].e_lumo);
+        }
+        remove_file(comm, fq + ".gw_line.h5");
+      } else {   // W0 frozen; restart 2 + 1 = 3 bitwise
+        auto h1 = read_head_res(comm, fa + ".gw_line.h5", 1);
+        for (long it : {2, 3}) REQUIRE(nda::max_element(nda::abs(read_head_res(comm, fa + ".gw_line.h5", it) - h1)) == 0.0);
+        const std::string fb = fa + "_r";
+        methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scheme_params(fb, 2, false, sch));
+        auto B = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, scheme_params(fb, 3, true, sch));
+        REQUIRE(B.history.size() == 3);
+        REQUIRE(B.history[2].mu == A.history[2].mu);
+        REQUIRE(nda::max_element(nda::abs(read_iter_real<2>(comm, fb + ".gw_line.h5", 3, "E_qp") -
+                                          read_iter_real<2>(comm, fa + ".gw_line.h5", 3, "E_qp"))) == 0.0);
+        remove_file(comm, fb + ".gw_line.h5");
+      }
+      REQUIRE(ok);
+      remove_file(comm, fa + ".gw_line.h5");
+    }
+  }
+}

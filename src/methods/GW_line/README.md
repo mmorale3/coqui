@@ -172,7 +172,9 @@ Hartree. "auto" defaults are computed at run time as described.
 | `start` | string | `"ks"` | initial G: `"ks"` (KS poles, mu = KS mid-gap) / `"qp_diag"` (one extra Pi -> W -> Sigma pass on the KS poles + diagonal G0W0 QP equation; KS vectors with the QP energies) / `"qp_file"` (QP energies read from `start_file`) | warm starts save <= 1 iteration on Si |
 | `start_file` | string | `""` | h5 file of `start = "qp_file"` (e.g. a CoQui Matsubara `mbpt.h5`) | with qp_file |
 | `start_dataset` | string | `""` | dataset of absolute QP energies (Ha, band order); empty: `scf/iter<final_iter>/qp_approx/E_ska`, else `E_ska` / `qp_energies` at the root | with qp_file |
-| `start_eta` | double | `1e-3` | broadening (Ha) of the diagonal QP equation of `qp_diag` | rarely |
+| `start_eta` | double | `1e-3` | unused since D2: the diagonal QP equation of `qp_diag` / evGW is solved exactly at eta = 0 (largest-Z root of the upfolded Sigma_nn, `warm_start.hpp`) | never |
+| `scheme` | string | `"scgw"` | D2: `"scgw"` / `"scgw0"` (W frozen at iteration 1 = RPA@KS, own copy of the bosonic basis; G self-consistent) / `"evgw"` (KS vectors + QP energies; W[G_QP] every iteration; diagonal QP equation; energies mixed with `mixing`; converged on max abs(dE_QP) < `conv_thr`) / `"evgw0"` (evgw with W0 frozen). Non-scgw: T = 0, `start = "ks"`, no coarse levels; checkpoint `iter<N>/{E_qp, Z_qp}` | GW0-type comparisons |
+| `ev_window` | double | `0.0` | evgw*: bands with abs(e_KS - mu0) > ev_window (Ha) take the QP shift of the nearest in-window band of the same k (scissor); <= 0: all bands | high bands with low Z |
 | `coarse.niter` | long | `0` | multilevel schedule: iterations 1..coarse.niter at coarse settings, then production (niter >= coarse.niter + 2; incompatible with `bases_file`) | not recommended (net gain ~3% on Si) |
 | `coarse.eps` | double | `1e-8` | coarse-level basis tolerance | with coarse |
 | `coarse.K` | long | `16` | coarse-level moments | with coarse |

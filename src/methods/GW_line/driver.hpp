@@ -104,6 +104,18 @@
  *                       mid-gap; the history of the run starts after it | "qp_file": the same with the energies
  *                       (absolute, Ha, band order, first nbnd bands) read from start_file (dataset start_dataset; default:
  *                       scf/iter<final_iter>/qp_approx/E_ska of a CoQui mbpt.h5, else "E_ska" / "qp_energies" at the root)
+ *   scheme = "scgw"     D2: "scgw" (the loop below) | "scgw0": W frozen at iteration 1 (RPA on the KS G: Pi -> W of the first
+ *                       iteration on the KS poles with its own copy of the bosonic basis; iterations >= 2 skip Pi -> W and the
+ *                       head and reuse those residues; G, mu, F[D] self-consistent as in scgw; a restart rebuilds W0 by one
+ *                       Pi -> W pass on the KS poles) | "evgw" / "evgw0": eigenvalue self-consistency, G = KS vectors with QP
+ *                       energies; every iteration Pi -> W (evgw; evgw0: W0 frozen as in scgw0), Sigma at the nodes (not mixed),
+ *                       the diagonal QP equation per k and band (warm_start.hpp qp_diag_energies, exact, largest-Z root),
+ *                       E <- mixing E_new + (1 - mixing) E_old from iteration 2 (iteration 1 = diagonal G0W0@KS), mu = QP
+ *                       mid-gap, F = F[D_KS] fixed, no closure; converged when max|dE_QP| < conv_thr; ev_window (Ha, <= 0:
+ *                       all bands): bands with |e_KS - mu0| > ev_window take the shift of the nearest in-window band of the same
+ *                       k (scissor). Checkpoint scf_line/iter<N>/{E_qp, Z_qp} (absolute Ha). Non-scgw schemes: T = 0,
+ *                       start = "ks", no coarse levels; the spectra use the last Sigma with F_closure = F[D_KS].
+ *                       Python oracle: cayley.line.driver.LineSCGW(scheme = ...).
  *   coarse = { niter = 0, eps = 1e-8, K = 16, nodes_per_ray = 80, time_eps = coarse.eps }   perf 7.2 multilevel schedule: iterations
  *                       1..niter at these settings (bases, closure, fermionic nodes, time grids), then the production ones;
  *                       the Sigma of the coarse level is dropped at the switch (the first production iteration takes Sigma[G]
@@ -246,7 +258,9 @@ struct gw_line_params_t {
   mixing_params_t mix;                   ///< perf 7.2: mixing algorithm (scf_mixing.hpp); mix.mixing == mixing
   std::string start = "ks";              ///< perf 7.2: initial G "ks" | "qp_diag" | "qp_file"
   std::string start_file, start_dataset; ///< perf 7.2: QP energies for start = "qp_file"
-  double start_eta = 1e-3;               ///< perf 7.2: broadening of the diagonal QP equation (Ha)
+  double start_eta = 1e-3;               ///< perf 7.2: unused since D2 (the diagonal QP equation is solved exactly at eta = 0)
+  std::string scheme = "scgw";           ///< D2: "scgw" | "scgw0" (W frozen at iteration 1) | "evgw" | "evgw0" (driver.hpp doc)
+  double ev_window = 0.0;                ///< D2: evgw*: bands with |e_KS - mu0| > ev_window (Ha) get a scissor shift; <= 0: all bands
   long coarse_niter = 0;                 ///< perf 7.2: multilevel schedule, iterations 1..coarse_niter at coarse settings
   double coarse_eps = 1e-8, coarse_time_eps = 1e-8;
   long coarse_K = 16, coarse_nodes_per_ray = 80;
@@ -309,6 +323,7 @@ struct gw_line_iter_t {
   double g_emin = 0.0;                   ///< smallest retained |e_m| (sets the ID E_min of the next iteration)
   long pruned_w = 0, pruned_near = 0;    ///< lehmann: poles pruned by weight / near-mu rule (all k)
   double pruned_w_weight = 0.0, pruned_near_weight = 0.0;
+  double dE_qp = 0.0;                    ///< D2 evgw*: max|E_QP(this iteration) - E_QP(previous)| (Ha, after mixing)
   double resid = 0.0, residF = 0.0;      ///< perf 7.2: max|Sigma[G] - Sigma_in| (total Sigma), max|F[D] - F_in| (0 before 7.2)
   std::string mix = "none";              ///< perf 7.2: mixing step of this iteration (none | linear | diis | reset)
   long ndiis = 0;                        ///< perf 7.2: DIIS history entries used

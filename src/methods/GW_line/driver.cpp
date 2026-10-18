@@ -264,6 +264,11 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
                "gw_line: start must be \"ks\", \"qp_diag\" or \"qp_file\" (got \"{}\")", p.start);
   utils::check(p.start != "qp_file" or not p.start_file.empty(), "gw_line: start = \"qp_file\" needs start_file");
   utils::check(p.start_eta > 0.0, "gw_line: start_eta must be > 0");
+  p.scheme    = io::get_value_with_default<std::string>(pt, "scheme", p.scheme);
+  io::tolower(p.scheme);
+  p.ev_window = io::get_value_with_default<double>(pt, "ev_window", p.ev_window);
+  utils::check(p.scheme == "scgw" or p.scheme == "scgw0" or p.scheme == "evgw" or p.scheme == "evgw0",
+               "gw_line: scheme must be \"scgw\", \"scgw0\", \"evgw\" or \"evgw0\" (got \"{}\")", p.scheme);
   p.coarse_niter         = io::get_value_with_default<long>(pt, "coarse.niter", p.coarse_niter);
   p.coarse_eps           = io::get_value_with_default<double>(pt, "coarse.eps", p.coarse_eps);
   p.coarse_K             = io::get_value_with_default<long>(pt, "coarse.K", p.coarse_K);
@@ -323,6 +328,11 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
     utils::check(p.coarse_niter == 0, "gw_line: beta > 0 does not support the multilevel schedule (coarse.niter)");
     utils::check(not p.optics.enable, "gw_line: beta > 0 does not support the optics passes");
   }
+  if (p.scheme != "scgw") {   // D2
+    utils::check(p.beta <= 0.0, "gw_line: scheme = \"{}\" supports T = 0 only (beta = 0)", p.scheme);
+    utils::check(p.start == "ks", "gw_line: scheme = \"{}\" supports start = \"ks\" only", p.scheme);
+    utils::check(p.coarse_niter == 0, "gw_line: scheme = \"{}\" does not support the multilevel schedule (coarse.niter)", p.scheme);
+  }
   if (p.scf_density == "matsubara") {   // S8b.3 hybrid
     utils::check(p.beta > 0.0, "gw_line: scf_density = \"matsubara\" needs beta > 0");
     utils::check(p.mix.alg == "linear", "gw_line: scf_density = \"matsubara\" needs mixing_alg = \"linear\"");
@@ -368,10 +378,17 @@ void gw_line_params_t::log() const {
     app_log(1, "    mixing algorithm: linear (Sigma at the nodes, F unmixed)");
   if (mix.damp_below > 0.0)
     app_log(1, "    damped tail: linear mixing {} once max|Sigma[G] - Sigma_in| < {:.1e}", mix.damp_mixing, mix.damp_below);
+  if (scheme != "scgw")
+    app_log(1, "    scheme: {}{}", scheme,
+            scheme == "scgw0"   ? " (W frozen at iteration 1 = RPA@KS; G self-consistent)"
+            : scheme == "evgw0" ? " (KS vectors + QP energies; W frozen at iteration 1 = RPA@KS)"
+                                : " (KS vectors + QP energies; W from the QP G every iteration)");
+  if ((scheme == "evgw" or scheme == "evgw0") and ev_window > 0.0)
+    app_log(1, "    ev_window: {:.4f} Ha (bands outside: scissor shift of the nearest in-window band)", ev_window);
   if (start == "ks") app_log(1, "    start: KS poles");
   else if (start == "qp_diag")
-    app_log(1, "    start: qp_diag (one Pi -> W -> Sigma pass on the KS poles, diagonal QP equation, eta {:.1e} Ha; KS vectors + QP "
-               "energies)", start_eta);
+    app_log(1, "    start: qp_diag (one Pi -> W -> Sigma pass on the KS poles, diagonal QP equation solved exactly (largest-Z root); "
+               "KS vectors + QP energies)");
   else app_log(1, "    start: qp_file (KS vectors + the QP energies of {}{})", start_file, start_dataset.empty() ? "" : ":" + start_dataset);
   if (coarse_niter > 0)
     app_log(1, "    multilevel: iterations 1..{} at eps {:.1e}, K {}, {} nodes per ray, time_eps {:.1e}; then production", coarse_niter,
@@ -622,6 +639,7 @@ void write_history(h5::group &g, gw_line_iter_t const &r) {
   h5::h5_write(hg, "mix", r.mix);
   h5::h5_write(hg, "ndiis", r.ndiis);
   h5::h5_write(hg, "level", r.level);
+  if (r.dE_qp > 0.0) h5::h5_write(hg, "dE_qp", r.dE_qp);   // D2 evgw*
   if (not r.mu_rule.empty()) {   // S8b
     auto tg = hg.create_group("thermal");
     h5::h5_write(tg, "thermal", r.thermal);
@@ -690,6 +708,7 @@ gw_line_iter_t read_history(h5::group &g) {
     h5::h5_read(hg, "ndiis", r.ndiis);
     h5::h5_read(hg, "level", r.level);
   }
+  if (hg.has_dataset("dE_qp")) h5::h5_read(hg, "dE_qp", r.dE_qp);   // D2
   if (hg.has_subgroup("thermal")) {   // S8b
     auto tg = hg.open_group("thermal");
     h5::h5_read(tg, "thermal", r.thermal);
@@ -734,6 +753,8 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "closure_device", p.closure_device);
   h5::h5_write(ig, "closure_k_workers", p.closure_k_workers);
   h5::h5_write(ig, "closure_dev_svd", p.closure_dev_svd);
+  h5::h5_write(ig, "scheme", p.scheme);   // D2
+  h5::h5_write(ig, "ev_window", p.ev_window);
   h5::h5_write(ig, "mixing", p.mixing);
   h5::h5_write(ig, "conv_thr", p.conv_thr);
   h5::h5_write(ig, "t_chunk", p.t_chunk);
@@ -795,6 +816,7 @@ struct state_t {
   nda::array<double, 1> phi;   ///< terminal phase phi* of the last closure per k (S7f phase continuity; empty = none)
   bool have_stau = false;      ///< S8b.3 hybrid: the mixed tau-leg nodal Sigma (hybrid.hpp), k-distributed like Sig_p
   nda::array<ComplexType, 4> Stau_p, Stau_h;
+  nda::array<double, 2> E_qp, Z_qp;   ///< D2 evgw*: QP energies (absolute, Ha; KS band order) and weights (empty otherwise)
 };
 
 /// S9a: the head data of one iteration (scf_line/iter<N>/head/, see driver.hpp)
@@ -919,6 +941,10 @@ void write_state(boost::mpi3::communicator &comm, std::string const &file, state
     }
     h5::h5_write(it, "has_sigma", long(st.have_sigma ? 1 : 0));
     if (st.phi.size() > 0) nda::h5_write(it, "closure_phi", st.phi, false);
+    if (st.E_qp.size() > 0) {   // D2 evgw*
+      nda::h5_write(it, "E_qp", st.E_qp, false);
+      nda::h5_write(it, "Z_qp", st.Z_qp, false);
+    }
     write_poles(it, st.poles);
     if (rec != nullptr) write_history(it, *rec);
     if (head != nullptr) write_head(it, *head);
@@ -927,7 +953,7 @@ void write_state(boost::mpi3::communicator &comm, std::string const &file, state
   comm.barrier();
 }
 
-static constexpr int NHIST = 38;   ///< columns of the broadcast history table
+static constexpr int NHIST = 39;   ///< columns of the broadcast history table
 static const std::vector<std::string> mix_names = {"none", "linear", "diis", "reset", "damped"};
 double mix_code(std::string const &m) {
   auto it = std::find(mix_names.begin(), mix_names.end(), m);
@@ -1000,6 +1026,10 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     }
     st.poles = read_poles(it, nk, nb);
     if (it.has_dataset("closure_phi")) nda::h5_read(it, "closure_phi", st.phi);
+    if (it.has_dataset("E_qp")) {   // D2 evgw*
+      nda::h5_read(it, "E_qp", st.E_qp);
+      nda::h5_read(it, "Z_qp", st.Z_qp);
+    }
     utils::check(st.F.extent(0) == nk and st.F.extent(1) == nb, "gw_line restart: F shape mismatch");
     nhist = st.iter;
     hist  = nda::array<double, 2>(nhist, NHIST);
@@ -1012,7 +1042,7 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
                          double(r.nt_sig_p), double(r.nt_sig_h), r.g_repr == "lehmann" ? 1.0 : 0.0, double(r.ng_min),
                          double(r.ng_max), r.g_emin, double(r.pruned_w), r.pruned_w_weight, double(r.pruned_near),
                          r.pruned_near_weight, r.resid, r.residF, mix_code(r.mix), double(r.ndiis), double(r.level),
-                         double(r.thermal), r.wp_used};
+                         double(r.thermal), r.wp_used, r.dE_qp};
       for (int j = 0; j < NHIST; ++j) hist(i - 1, j) = v[j];
     }
   }
@@ -1029,6 +1059,8 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
   st.have_sigma = sc[6] > 0.5;
   bcast_array(comm, st.F);
   bcast_array(comm, st.F_cl);
+  bcast_array(comm, st.E_qp);   // D2
+  bcast_array(comm, st.Z_qp);
   if (st.have_sigma and kd != nullptr) {   // k-distributed: every rank receives the rows of its k only
     st.Sig_p = kd_scatter_full(comm, *kd, st.Sig_p);
     st.Sig_h = kd_scatter_full(comm, *kd, st.Sig_h);
@@ -1064,6 +1096,7 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     r.resid = hist(i, 31); r.residF = hist(i, 32); r.mix = mix_name(long(std::llround(hist(i, 33))));
     r.ndiis = long(std::llround(hist(i, 34))); r.level = long(std::llround(hist(i, 35)));
     r.thermal = long(std::llround(hist(i, 36))); r.wp_used = hist(i, 37);   // S8b
+    r.dE_qp = hist(i, 38);   // D2
     history.push_back(r);
   }
   return st;
@@ -1433,19 +1466,20 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   std::optional<bosonic_basis_t> bos;
   std::optional<line_basis_t> bp, bh;
   double lv_eps = prm.eps, lv_time_eps = prm.time_eps;   // perf 7.2: eps / time_eps of the current level
+  auto make_bos = [&](std::optional<bosonic_basis_t> &b, double bgap) {
+    b.emplace(theta, prm.lam_b, lv_eps, bgap);
+    if (not prm.bases_file.empty()) {
+      b->nu   = read_w("bos_nu");
+      b->rank = b->nu.size();
+      h5::file f(prm.bases_file, 'r');
+      h5::group g(f);
+      nda::h5_read(g, "bos_zeta_nodes", b->zeta_nodes);
+    }
+  };
   auto update_bases = [&]() {
     Timer.start("bases");
     const double bgap = prm.bos_gap >= 0.0 ? prm.bos_gap : 0.5 * (st.e_lumo - st.e_homo);
-    if (not bos or bos->gap != bgap) {
-      bos.emplace(theta, prm.lam_b, lv_eps, bgap);
-      if (not prm.bases_file.empty()) {
-        bos->nu   = read_w("bos_nu");
-        bos->rank = bos->nu.size();
-        h5::file f(prm.bases_file, 'r');
-        h5::group g(f);
-        nda::h5_read(g, "bos_zeta_nodes", bos->zeta_nodes);
-      }
-    }
+    if (not bos or bos->gap != bgap) make_bos(bos, bgap);
     double gpp = prm.sigma_gap, ghh = prm.sigma_gap;
     if (prm.sigma_gap < 0.0) {
       gpp = 0.8 * (st.e_lumo + bos->gap);
@@ -1805,6 +1839,22 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   bool converged = false;
   head_out_t hout_last;   // S9b: the head of the last iteration of this run (optics)
   bool have_hout = false;
+  // D2 schemes (driver.hpp "scheme"): frozen W0 = Pi -> W of the KS poles p0 with its own bosonic basis bos0 (update_bases
+  // rebuilds bos when the gap changes); computed in the first iteration of this run (iteration 1, or once after a restart)
+  const bool ev_scheme = (prm.scheme == "evgw" or prm.scheme == "evgw0");
+  const bool w_frozen  = (prm.scheme == "scgw0" or prm.scheme == "evgw0");
+  bool have_w0         = false;
+  std::optional<bosonic_basis_t> bos0;
+  head_out_t hout0;
+  pole_data_t p0;
+  if (w_frozen) p0 = pole_data_t::from_ks(eig, mu0);
+  if (ev_scheme and st.E_qp.size() == 0) {   // iteration 0: KS energies, Z = 1
+    st.E_qp = nda::array<double, 2>(nk, nb);
+    st.Z_qp = nda::array<double, 2>(nk, nb);
+    for (long ik = 0; ik < nk; ++ik)
+      for (long n = 0; n < nb; ++n) st.E_qp(ik, n) = eig(ik, n);
+    st.Z_qp() = 1.0;
+  }
   while (st.iter < prm.niter) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto ph0 = phase_snapshot(Timer);
@@ -1824,6 +1874,11 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     const bool thermal = tpar.on() and (hybrid or window_active(st.poles, E_T));   // S8b.3: the hybrid always runs thermal
     if (thermal) ensure_thermal();
     bcur = thermal ? &*bosT : &*bos;
+    if (w_frozen) {   // D2: W0's bosonic basis at the KS gap (iteration 1 of a fresh run: identical to bos)
+      if (not bos0) make_bos(bos0, prm.bos_gap >= 0.0 ? prm.bos_gap : 0.5 * ((lumo - mu0) - (homo - mu0)));
+      bcur = &*bos0;
+    }
+    const bool do_W = not(w_frozen and have_w0);   // D2: Pi -> W in this iteration
     bosonic_basis_t const &BB = *bcur;
     pole_data_t kp_store;
     if (thermal) kp_store = thermal_lists(st.poles, prm.beta, E_T);
@@ -1889,6 +1944,21 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       sig_p.emplace(tg.sig_p);
       sig_h.emplace(tg.sig_h);
     }
+    if (do_W and w_frozen and st.iter > 0) {   // D2 restart: W0 from the KS poles -> the Pi time grids of p0
+      if (prm.time_grid == "gl") {
+        pi_p.emplace(time_ray_t::for_spectrum(theta_t, p0.emin(), prm.ray_decades, 1e-5, 3.0, 16, sector_t::particle));
+        pi_h.emplace(time_ray_t::for_spectrum(theta_t, p0.emin(), prm.ray_decades, 1e-5, 3.0, 16, sector_t::hole));
+      } else {
+        numerics::line_dlr::time_id_opts_t topt;
+        topt.pad        = prm.time_pad;
+        topt.oversample = prm.time_oversample;
+        line_time_grids_t tg0(p0, BB.nu, theta_t, lv_time_eps, topt, BB.zeta_nodes, zeta, comm, prm.time_snap);
+        pi_p.emplace(tg0.pi_p);
+        pi_h.emplace(tg0.pi_h);
+      }
+      app_log(1, "  scheme {}: restart -> W0 rebuilt by one Pi -> W pass on the KS poles", prm.scheme);
+    }
+    pole_data_t const &kpW = w_frozen ? p0 : kp;   // D2: the poles of Pi
     Timer.stop("time_grid");
     {
       // S7c: Pi's spectrum (summed pole energies) vs the bosonic range (see from_ptree)
@@ -1911,7 +1981,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
     Hn()     = ComplexType(0.0);
     hres_p() = ComplexType(0.0);
     hres_h() = ComplexType(0.0);
-    for (long G = 0; G < qg.n; ++G) {   // one group (all q) unless the Pi group does not fit
+    for (long G = 0; G < (do_W ? qg.n : 0); ++G) {   // one group (all q) unless the Pi group does not fit; D2: none if W0 frozen
       e0 = tic("phase_Pi");
       arr4_t Pi_tau;
       if (thermal) {   // S8b tau leg first (the ray call below refills the propagator's A^ cache): dynamic Pi(q, 0)
@@ -1919,7 +1989,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
         z0(0) = ComplexType(0.0);
         pi_tau_leg<MEM>(prop, st.poles, mf, ibz, grid, tpar, taun, z0, qplan.t_chunk, Pi_tau, Timer, qg.rows(G));
       }
-      polarization<MEM>(prop, kp, mf, grid, BB.zeta_nodes, *pi_p, *pi_h, qplan.t_chunk, Pi, Timer, sector_t::both,
+      polarization<MEM>(prop, kpW, mf, grid, BB.zeta_nodes, *pi_p, *pi_h, qplan.t_chunk, Pi, Timer, sector_t::both,
                         qg.rows(G));
       if (thermal)   // the nu_0 points of D (z = 0, outside the wedge) from the tau leg
         for (long i = 0; i < nzb; ++i)
@@ -1951,9 +2021,17 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       }
       tW += toc("phase_W", e0);
     }
-    if (ibz.active) std::swap(w, wI);   // w: rows R in ibz.rows order (head residues, Sigma)
+    if (ibz.active and do_W) std::swap(w, wI);   // w: rows R in ibz.rows order (head residues, Sigma)
     head_out_t hout;
-    {
+    if (not do_W) {   // D2: the frozen W0 (residues kept in w / w_h since iteration 1 of this run) and its head
+      hout = hout0;
+      res.eps_inf.push_back(hout.eps_inf);
+      hout_last    = hout;
+      have_hout    = true;
+      res.head_hp0 = hout.h0_res;
+      res.head_hh0 = hout.h0_res_hole;
+      app_log(1, "  scheme {}: W0 frozen (Pi -> W skipped), eps_inf = {:.6f}", prm.scheme, hout.eps_inf);
+    } else {
       e0 = tic("phase_W");
       Timer.start("W_head");
       if (not qplan.w_host) head_residues_partial<MEM>(w, q_all, hbasis, hres_p, hres_h);
@@ -1975,7 +2053,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       hout.h0_res        = hextra.apply(hout.h_res);
       hout.h0_res_hole   = hextra.apply(hout.h_res_hole);
       hout.zeta          = BB.zeta_nodes;
-      hout.nu            = thermal ? BB.nu_fit() : bos->nu;
+      hout.nu            = thermal ? BB.nu_fit() : BB.nu;
       hout.q_weights     = hextra.c;
       hout.qpts          = ibz.active ? nda::array<double, 2>(mf.Qpts()) : nda::array<double, 2>(mf.Qpts_ibz());
       hout.madelung      = madelung;
@@ -1999,6 +2077,10 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       have_hout = true;
       res.head_hp0 = hout.h0_res;
       res.head_hh0 = hout.h0_res_hole;
+      if (w_frozen) {
+        hout0   = hout;
+        have_w0 = true;
+      }
     }
 
     // 2. Sigma per sector at the dense nodes, mixing
@@ -2011,7 +2093,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
                            sector_t::both, prm.sigma_kdist, &Sh_new);
     else
       self_energy<MEM>(prop, kp, w, BB, mf, grid, mpi, zeta, *sig_p, *sig_h, qplan.t_chunk, Sp_new, Timer, sector_t::both,
-                       prm.sigma_kdist, whp, qplan.gs_sigma, &Sh_new, (qplan.wR_inplace and not hybrid) ? &w : nullptr);   // 7.4b: w consumed
+                       prm.sigma_kdist, whp, qplan.gs_sigma, &Sh_new, (qplan.wR_inplace and not hybrid and not w_frozen) ? &w : nullptr);   // 7.4b: w consumed
     nda::array<ComplexType, 4> Stp_new, Sth_new;   // S8b.3 hybrid: the tau-leg nodal Sigma (hybrid.hpp), same rows as Sp_new
     if (hybrid) {
       Timer.add("Sigma_tau_leg");
@@ -2032,7 +2114,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
         head_sigma_thermal(kp, st.poles, Thead, hout.nu, hout.h0_res, hout.h0_res_hole, madelung, prm.beta, E_T, zeta, k_rows, Sp_new,
                            Sh_new);
       else
-        head_sigma_correction(st.poles, Thead, bos->nu, hout.h0_res, hout.h0_res_hole, madelung, zeta, k_rows, Sp_new, Sh_new);
+        head_sigma_correction(st.poles, Thead, hout.nu, hout.h0_res, hout.h0_res_hole, madelung, zeta, k_rows, Sp_new, Sh_new);
       Timer.stop("Sigma_head");
     }
     if (prm.debug_noise_sigma > 0.0 and st.iter + 1 == prm.debug_noise_iter and not qp_pending) {
@@ -2058,11 +2140,12 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
         for (long i = 0; i < nb; ++i)
           for (long j = 0; j < nb; ++j) Hq(ik, i, j) = H0(ik, i, j) + st.F(ik, i, j) - (i == j ? st.mu : 0.0);
       }
-      auto qp = qp_diag_energies(comm, eks, Hq, Sp_new, Sh_new, k_rows, prm.sigma_kdist, zeta, *bp, *bh, cprm, prm.start_eta);
+      auto qp = qp_diag_energies(comm, eks, Hq, Sp_new, Sh_new, k_rows, prm.sigma_kdist, zeta, *bp, *bh, cprm);
       nda::array<double, 2> Eabs(nk, nb);
       for (long ik = 0; ik < nk; ++ik)
         for (long n = 0; n < nb; ++n) Eabs(ik, n) = qp.e(ik, n) + st.mu;
-      app_log(1, "  qp_diag start pass: diagonal QP equation solved for {} (k, band) by Newton, {} linearized; max shift {:.4f} eV",
+      app_log(1, "  qp_diag start pass: diagonal QP equation solved exactly for {} (k, band) (largest-Z root), {} without poles; max "
+                 "shift {:.4f} eV",
               qp.n_newton, qp.n_lin, qp.max_shift * HA_EV);
       apply_qp_start(Eabs, "qp_diag");
       qp_pending = false;
@@ -2077,6 +2160,111 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       res.start_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       app_log(1, "  qp_diag start pass: {:.1f} s (Pi {:.1f}s W {:.1f}s Sigma {:.1f}s)", res.start_time, tPi, tW,
               Timer.elapsed("phase_Sigma") - e0);
+      continue;
+    }
+    if (ev_scheme) {   // D2 evgw / evgw0: diagonal QP energies from Sigma[G_QP, W], mixing, KS vectors + QP energies; no closure
+      nda::array<ComplexType, 3> Hq(nk, nb, nb);
+      nda::array<double, 2> eprev(nk, nb);
+      for (long ik = 0; ik < nk; ++ik) {
+        for (long n = 0; n < nb; ++n) eprev(ik, n) = st.E_qp(ik, n) - st.mu;
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) Hq(ik, i, j) = H0(ik, i, j) + st.F(ik, i, j) - (i == j ? st.mu : 0.0);
+      }
+      auto qp = qp_diag_energies(comm, eprev, Hq, Sp_new, Sh_new, k_rows, prm.sigma_kdist, zeta, *bp, *bh, cprm);
+      nda::array<double, 2> Enew(nk, nb), E(nk, nb);
+      for (long ik = 0; ik < nk; ++ik)
+        for (long n = 0; n < nb; ++n) Enew(ik, n) = qp.e(ik, n) + st.mu;
+      long nscissor = 0;
+      if (prm.ev_window > 0.0) {   // bands outside the window: the shift of the nearest in-window band of this k
+        nda::array<double, 2> Ein = Enew;
+        for (long ik = 0; ik < nk; ++ik) {
+          std::vector<long> inw;
+          for (long n = 0; n < nb; ++n)
+            if (std::abs(eig(ik, n) - mu0) <= prm.ev_window) inw.push_back(n);
+          utils::check(not inw.empty(), "gw_line: ev_window = {} Ha contains no band at k {}", prm.ev_window, ik);
+          for (long n = 0; n < nb; ++n) {
+            if (std::abs(eig(ik, n) - mu0) <= prm.ev_window) continue;
+            long j = inw[0];
+            for (long c : inw)
+              if (std::abs(c - n) < std::abs(j - n)) j = c;
+            Enew(ik, n) = st.E_qp(ik, n) + (Ein(ik, j) - st.E_qp(ik, j));
+            ++nscissor;
+          }
+        }
+      }
+      const bool first = (st.iter == 0);
+      double dE = 0.0;
+      for (long ik = 0; ik < nk; ++ik)
+        for (long n = 0; n < nb; ++n) {
+          E(ik, n) = first ? Enew(ik, n) : prm.mixing * Enew(ik, n) + (1.0 - prm.mixing) * st.E_qp(ik, n);
+          dE       = std::max(dE, std::abs(E(ik, n) - st.E_qp(ik, n)));
+        }
+      double dS = 0.0;
+      if (st.have_sigma) {
+        for (long a = 0; a < Sp_new.size(); ++a)
+          dS = std::max(dS, std::abs(Sp_new.data()[a] + Sh_new.data()[a] - st.Sig_p.data()[a] - st.Sig_h.data()[a]));
+        if (prm.sigma_kdist) dS = comm.all_reduce_value(dS, boost::mpi3::max<>{});
+      }
+      const double mu_s = st.mu;
+      st.Sig_p      = Sp_new;
+      st.Sig_h      = Sh_new;
+      st.have_sigma = true;
+      st.F_cl       = st.F;   // F[D_KS]: the spectra use H0 + F[D_KS] + Sigma_c of this iteration
+      st.E_qp       = E;
+      st.Z_qp       = qp.z;
+      apply_qp_start(E, prm.scheme);
+      st.mu_sigma = mu_s;
+      st.dmu      = st.mu - mu_s;
+      Timer.stop("phase_Sigma");
+      const double tS = Timer.elapsed("phase_Sigma") - e0;
+      double zmin_edge = 1.0;
+      for (long ik = 0; ik < nk; ++ik)
+        for (long n : {nocc - 1, nocc}) zmin_edge = std::min(zmin_edge, qp.z(ik, n));
+      st.iter += 1;
+      gw_line_iter_t rec;
+      rec.iter        = st.iter;
+      rec.dSigma      = dS;
+      rec.mu          = st.mu;
+      rec.dmu         = st.dmu;
+      rec.gap         = st.e_lumo - st.e_homo;
+      rec.e_homo      = st.e_homo;
+      rec.e_lumo      = st.e_lumo;
+      rec.nelec       = nelec;
+      rec.nelec_lehmann = nelec;
+      rec.N_mu        = nelec;
+      rec.bos_gap     = BB.gap;
+      rec.sigma_gap_p = bp->gap[1];
+      rec.sigma_gap_h = bh->gap[0];
+      rec.time_grid   = prm.time_grid;
+      rec.nt_pi_p     = pi_p->size();
+      rec.nt_pi_h     = pi_h->size();
+      rec.nt_sig_p    = sig_p->size();
+      rec.nt_sig_h    = sig_h->size();
+      rec.g_repr      = "lehmann";   // KS vectors + QP energies (factorized Lehmann form)
+      pole_counts(st.poles, rec.ng_min, rec.ng_max, rec.g_emin);
+      rec.dE_qp = dE;
+      rec.resid = dE;
+      rec.mix   = first ? std::string("none") : std::string("linear");
+      rec.level = cur_level;
+      rec.time  = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      res.history.push_back(rec);
+      app_log(1, "iter {:3d} ({}): max|dE_QP| {:.3e} Ha  mu {:.6f} (dmu {:+.4f} eV)  QP gap {:.4f} eV  dSigma {:.2e}  min Z (band edges) "
+                 "{:.3f}{}  [Pi {:.1f}s W {:.1f}s Sigma+QP {:.1f}s total {:.1f}s]",
+              rec.iter, prm.scheme, dE, rec.mu, rec.dmu * HA_EV, rec.gap * HA_EV, dS, zmin_edge,
+              nscissor > 0 ? ", scissor " + std::to_string(nscissor) + " (k, band)" : std::string(""), tPi, tW, tS, rec.time);
+      if (st.iter == 1) {
+        hout_first      = hout;
+        have_hout_first = true;
+      }
+      Timer.start("checkpoint");
+      write_state(comm, chk, st, &rec, kdp, sig_all, &hout);
+      Timer.stop("checkpoint");
+      Timer.stop("iteration");
+      if (rec.iter > 1 and dE < prm.conv_thr) {
+        converged = true;
+        app_log(1, "  converged: max|dE_QP| = {:.2e} < conv_thr = {:.1e}", dE, prm.conv_thr);
+        break;
+      }
       continue;
     }
     Timer.start("Sigma_mix");
@@ -2304,7 +2492,10 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       break;
     }
   }
-  if (not converged and not res.history.empty() and res.history.back().iter > 1 and res.history.back().dSigma < prm.conv_thr) {
+  if (ev_scheme and not converged and not res.history.empty() and res.history.back().iter > 1)   // D2
+    converged = res.history.back().dE_qp < prm.conv_thr;
+  if (not ev_scheme and not converged and not res.history.empty() and res.history.back().iter > 1 and
+      res.history.back().dSigma < prm.conv_thr) {
     auto const &h = res.history.back();
     converged     = (h.mix != "none" or (h.resid == 0.0 and h.dSigma > 0.0)) and
                 (h.mix != "diis" and h.mix != "reset" ? true : prm.mixing * h.resid < prm.conv_thr);
