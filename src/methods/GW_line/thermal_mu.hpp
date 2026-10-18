@@ -31,6 +31,11 @@
  *                      carriers across mu_g), else "number". With NO pole within E_T of mu_g (empty window: the T = 0 path,
  *                      notes section 11.1) the midpoint is kept ("gap(T=0)"), so that a run whose windows stay empty is
  *                      bitwise the T = 0 run (gate T4).
+ *           "neutral": (S8b.4 (e)) continuous version of "auto": eps0 = N_0(mu_g) + dropped - N_el (the T = 0 count at the gap
+ *                      midpoint = the closure's weight error; 0 for an exact insulator); if |eps0| <= mu_dn_max AND
+ *                      n_th(mu_g) <= mu_dn_max, N_T(mu) = N_el + eps0 (thermal electrons = thermal holes: the intrinsic mu,
+ *                      continuous in the poles), else "number". Same empty-window branch as "auto". python
+ *                      line/closure.py::chemical_potential_neutral. An exact closure has eps0 = 0: the rule is then "number".
  */
 
 #include <cmath>
@@ -52,7 +57,7 @@ struct thermal_params_t {
   double c_f         = 30.0;    ///< thermal_floor_f (fermionic node floor)
   double theta = 0.0, theta_t = 0.0;
   double wp_floor    = 15.0;    ///< omega_p >= wp_floor zeta_T
-  std::string mu_rule = "auto";
+  std::string mu_rule = "neutral";   ///< S8b.4 (e): default "neutral" (was "auto": discontinuous gap <-> number switches)
   double mu_dn_max = 0.1, mu_th_factor = 10.0;
   long band_heights = 8, band_x = 21;
   double band_c = -1.0;         ///< <= 0: c_zeta
@@ -117,10 +122,19 @@ inline mu_rule_out_t mu_rule_apply(std::vector<nda::array<double, 1>> const &e, 
   else if (tp.mu_rule == "number")
     use_gap = false;
   else {
-    utils::check(tp.mu_rule == "auto", "gw_line: mu_rule must be \"auto\", \"gap\" or \"number\" (got \"{}\")", tp.mu_rule);
+    utils::check(tp.mu_rule == "auto" or tp.mu_rule == "neutral",
+                 "gw_line: mu_rule must be \"neutral\", \"auto\", \"gap\" or \"number\" (got \"{}\")", tp.mu_rule);
     if (not win_at(r.gap.mu)) {
       use_gap = true;
       r.rule  = "gap(T=0)";
+    } else if (tp.mu_rule == "neutral") {
+      const double eps0 = r.gap.N + dropped - nelec;   // the closure's count error at the gap midpoint
+      if (std::abs(eps0) <= tp.mu_dn_max and r.n_th <= tp.mu_dn_max) {
+        auto [mu, N] = chemical_potential_T(e, v, nelec + eps0, tp.beta, k_weight, dropped);
+        r.mu = mu, r.N = N, r.rule = "neutral";
+        r.window = win_at(r.mu);
+        return r;
+      }
     } else if (std::abs(r.dN) <= tp.mu_dn_max and std::abs(r.dN) > tp.mu_th_factor * r.n_th) {
       use_gap = true;
       r.rule  = "gap";

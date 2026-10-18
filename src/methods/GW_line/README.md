@@ -198,6 +198,7 @@ Hartree. "auto" defaults are computed at run time as described.
 | `spectra.wmin` | double | `-0.45` | grid start, w - mu (Ha) | per plot |
 | `spectra.wmax` | double | `0.45` | grid end, w - mu (Ha) | per plot |
 | `spectra.nw` | long | `601` | grid points | per plot |
+| `spectra.origin` | double | final mu | absolute energy (Ha) that w = 0 refers to (spectra/origin; the QP edges stay mu-relative) | comparisons on a fixed frame |
 
 **Optics (after the loop; `optics = { ... }` or `[gw_line.optics]`)**
 
@@ -254,8 +255,8 @@ Hartree. "auto" defaults are computed at run time as described.
 | `thermal_floor` | double | `30.0` | c_zeta: bosonic line nodes with rho beta abs(zeta) < c_zeta are excluded; wedge band bottom | keep |
 | `thermal_floor_f` | double | = `thermal_floor` | c_f: fermionic node floor of the thermal closure fit (c_zeta + ln(1/tau_T) = the strict option) | keep |
 | `wp_floor` | double | `15.0` | omega_p := max(`wp`, wp_floor zeta_T), zeta_T = c_zeta/(rho beta), in thermal iterations | keep (E3 study) |
-| `mu_rule` | string | `"auto"` | `"auto"` (gap midpoint iff abs(dN) <= mu_dn_max and abs(dN) > mu_th_factor n_th, else N(mu) = N_el) / `"gap"` / `"number"` | metals: auto gives "number" |
-| `mu_dn_max` | double | `0.1` | rule auto: largest thermal count mismatch at the gap midpoint read as a closure weight error | keep |
+| `mu_rule` | string | `"neutral"` | `"neutral"` (eps0 = T = 0 count at the gap midpoint - N_el; if abs(eps0) <= mu_dn_max and n_th <= mu_dn_max: N_T(mu) = N_el + eps0, the charge-neutral mu, continuous in the poles; else N(mu) = N_el) / `"auto"` (gap midpoint iff abs(dN) <= mu_dn_max and abs(dN) > mu_th_factor n_th, else N(mu) = N_el; discontinuous) / `"gap"` / `"number"` | metals: neutral and auto give "number" |
+| `mu_dn_max` | double | `0.1` | rules neutral / auto: largest count mismatch at the gap midpoint read as a closure weight error (neutral: also the largest n_th of a gap) | keep |
 | `mu_th_factor` | double | `10.0` | rule auto: abs(dN) must exceed this times the thermal carriers n_th(mu_g) | keep |
 | `band_heights` | long | `8` | heights of the wedge band of the bosonic data set D | keep |
 | `band_x` | long | `21` | points per band height (odd: symmetric under z -> -conj z) | keep |
@@ -268,6 +269,12 @@ Hartree. "auto" defaults are computed at run time as described.
 | `tau_grid` | string | `"id"` | tau-leg nodes on [0, beta/2]: `"id"` (finite-interval ID, ~40; Pi(q, 0) to 2e-14) / `"gl"` (composite GL, ~200-250, the python grid) | keep |
 | `tau_eps` | double | `1e-13` | tolerance of the tau ID | keep |
 | `spectra.occupation` | bool | `false` | also write f(w - mu) on the spectra grid (spectra/fermi_w; f A = the occupied spectrum) | finite-T plots |
+| `final_pass.enable` | bool | `false` | sharper final pass (notes 12.6): one more unmixed iteration from the final poles at theta_t' on a copy of the checkpoint (`<output>.final_pass.gw_line.h5`); its spectra in `/final_pass/spectra` | metals: near-E_F spectra |
+| `final_pass.theta_t_frac` | double | `0.25` | theta_t' = theta_t_frac theta of the pass (0.125 allowed) | 0.25 |
+| `final_pass.wp` | double / "auto" | `"auto"` | omega_p of the pass's closure; auto = max(wp, wp_floor zeta_T') | auto |
+| `final_pass.K` | long / "auto" | `"auto"` | closure order of the pass; auto = K | 32 for spectra at eta >= 0.02 Ha |
+| `final_pass.thermal_tol` | double / "auto" | `"auto"` | thermal_tol of the pass; auto = thermal_tol | 1e-12 |
+| `final_pass.spectra` | bool | `true` | spectra of the pass (the spectra.* grid) | keep |
 | `thermal_bases_file` | string | `""` | parity: D (D_zeta_re/_im, D_kind), nu_b and the two-sided Sigma basis (sigma_basis_w) read from this h5 (the python finite-T SCF reference) | parity tests |
 | `scf_density` | string | `"closure"` | `"matsubara"` (S8b.3 hybrid, beta > 0): Sigma_c(i w_n) from the tau leg, D, N(mu) = N_el and mu from the Matsubara Dyson equation; the closure supplies only the next poles. Needs mixing_alg linear, div_treatment ignore_g0 | metals / exact particle number |
 | `hyb_wmax` | double | `100.0` | w_max (Ha) of the dense Matsubara set of the hybrid (N = ceil((w_max beta/pi - 1)/2) + 1 frequencies; truncation ~1e-12) | keep |
@@ -331,6 +338,8 @@ The k index of `scf_line/` and `spectra/` is the IBZ k on the IBZ path (`system/
 Finite temperature (`beta` > 0) adds `input/` beta, thermal_tol, thermal_floor(_f), wp_floor, mu_rule, mu_dn_max, mu_th_factor,
 tau_grid and the derived E_T, zeta_T, zeta_T_f, S_T; `history/thermal/` (thermal = 1 for a thermal iteration, mu_rule used, dN,
 n_th, wp_used, nD, rank_b, ntau, nwin) per iteration; `spectra/fermi_w` with `spectra.occupation`.
+Sharper final pass (`final_pass.enable`): `final_pass/` {theta_t, theta_t_frac, zeta_T, wp, K, mu, iteration, file (the pass's own
+checkpoint `<output>.final_pass.gw_line.h5` with its poles, Sigma and history)} and `final_pass/spectra/` (as `spectra/`).
 
 `<output>.gw_line.sigma.h5` (checkpoint_sigma = "last", rewritten every iteration): `iter`, `Sigma_p`, `Sigma_h`
 (nk, n_nodes, nb, nb): the mixed Sigma^{>/<} at the fermionic nodes of the last iteration; needed by a restart.

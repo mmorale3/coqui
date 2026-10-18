@@ -136,7 +136,11 @@ struct fx_t {
   std::string name;
   explicit fx_t(std::string const &nm) : name(nm) {
     mpi = utils::make_unit_test_mpi_context();
-    mf  = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_" + nm));
+    if (nm == "svo222") {   // S8c: the xml route of the svo222_thc dump (test_gw_line_scf [.gw_line_dump_svo222]): all 8 k
+      const std::string qedir = std::string(PROJECT_SOURCE_DIR) + "/tests/unit_test_files/qe/svo_kp222_nbnd40/out/";
+      mf = std::make_shared<mf::MF>(mf::qe::qe_readonly(mf::qe::read_xml(mpi, qedir, "svo", -1, true)));
+    } else
+      mf = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_" + nm));
     thc = std::make_unique<methods::thc_reader_t>(mf, "incore", ft_dir() + nm + "_thc/thc.eri.h5");
   }
 };
@@ -321,10 +325,10 @@ TEST_CASE("gw_line_finiteT_mu_rule", "[gw_line][finiteT][mu_rule]") {
     thermal_params_t tp;
     tp.beta = beta;
     tp.thermal_tol = 1e-8;
-    double mus[3];
-    std::string rules[3];
-    const char *names[3] = {"auto", "gap", "number"};
-    for (int r = 0; r < 3; ++r) {
+    double mus[4];
+    std::string rules[4];
+    const char *names[4] = {"auto", "gap", "number", "neutral"};   // S8b.4 (e): "neutral" (the continuous rule, default)
+    for (int r = 0; r < 4; ++r) {
       tp.mu_rule = names[r];
       auto o     = mu_rule_apply(e, v, nelec, {}, tp);
       mus[r]     = o.mu;
@@ -332,11 +336,13 @@ TEST_CASE("gw_line_finiteT_mu_rule", "[gw_line][finiteT][mu_rule]") {
     }
     const auto rule_ref = read_attr<std::string>(gc, "rule_auto");
     const double d = std::max({std::abs(mus[0] - read_attr<double>(gc, "mu_auto")), std::abs(mus[1] - read_attr<double>(gc, "mu_gap")),
-                               std::abs(mus[2] - read_attr<double>(gc, "mu_number"))});
+                               std::abs(mus[2] - read_attr<double>(gc, "mu_number")),
+                               std::abs(mus[3] - read_attr<double>(gc, "mu_neutral"))});
     dmax = std::max(dmax, d);
-    const bool same = (rules[0] == rule_ref);
-    app_log(1, "  {} beta {:4.0f} err {:+.0e}: auto -> {:7s} (python {:6s}) mu {:+.12f}, max |dmu| (auto, gap, number) {:.1e}", fx, beta,
-            err, rules[0], rule_ref, mus[0], d);
+    const bool same = (rules[0] == rule_ref) and (rules[3] == read_attr<std::string>(gc, "rule_neutral"));
+    app_log(1, "  {} beta {:4.0f} err {:+.0e}: auto -> {:7s} (python {:6s}) mu {:+.12f}, neutral -> {:7s} mu {:+.12f}, max |dmu| (auto, "
+               "gap, number, neutral) {:.1e}",
+            fx, beta, err, rules[0], rule_ref, mus[0], rules[3], mus[3], d);
     ok = ok and same and d <= 1e-12;
   }
   ok = gate("max |dmu| over cases and rules", dmax, 1e-12) and ok;
@@ -592,10 +598,10 @@ bool run_t12(fx_t &F, double beta, std::string const &time_grid, bool do_t2, dou
     self_energy<HOST_MEMORY>(prop, tl, ws, Bs, mf, grid, *F.mpi, zz, *sp_, *sh_, 8, Sp, Timer, sector_t::both, false, nullptr, 0, &Sh);
     auto SZ = read_c<4>(gb, "Sigma_zeta");
     auto SI = read_c<4>(gb, "Sigma_iw");
-    // attr sigma_k of the generator: k = 0 and the gap k (lih222: 3, lih223: 9)
+    // attr sigma_k of the generator: k = 0 and the gap k (lih222: 3, lih223: 9, svo222: 1)
     nda::array<long, 1> sk(2);
     sk(0) = 0;
-    sk(1) = (F.name == "lih222") ? 3 : 9;
+    sk(1) = (F.name == "lih222") ? 3 : (F.name == "lih223" ? 9 : 1);
     double dz = 0.0, mz = 0.0, di = 0.0, mi = 0.0;
     for (long a = 0; a < sk.size(); ++a) {
       const long k = sk(a);
@@ -645,6 +651,17 @@ TEST_CASE("gw_line_finiteT_T12_lih223", "[gw_line][finiteT][T1][T2]") {
   REQUIRE(ok);
 }
 
+
+// S8c task 2 (metals, svo222 = SrVO3 2x2x2, 41 e, 40 bands; reference svo222_finiteT_ref.h5 of cayley/scripts/gen_metal_ref.py):
+// T1 / T2 at beta 200 on the KS poles with the gates of lih222 (notes section 12; the 2x2x2 mesh at beta 200 is a finite system,
+// level spacing 0.065 Ha >> k_B T: kernel / W / Sigma consistency tests). theta_t = theta / 2 (the references' 10 deg) and theta / 4
+// (the metals' SCF setting, rho 2.97). Not in the [finiteT] suite (cost); run with "[metal]".
+TEST_CASE("gw_line_metal_T12_svo222", "[gw_line][metal][T1][T2]") {
+  fx_t F("svo222");
+  bool ok = run_t12(F, 200.0, "id", true);
+  ok      = run_t12(F, 200.0, "id", true, 0.25) and ok;
+  REQUIRE(ok);
+}
 
 // ============================================================================================================== T3
 namespace {
@@ -1146,7 +1163,9 @@ TEST_CASE("gw_line_finiteT_parity", "[gw_line][finiteT][parity]") {
   REQUIRE(ok);
 }
 
-// T5 (b): 5 iterations, mu_rule "auto" (ID grids): the rule per iteration, mu in the central half of the admissible gap,
+// T5 (b): 5 iterations, mu_rule "neutral" (the default since S8b.4 (e); ID grids): the rule per iteration, mu in the central half
+// of the admissible gap (with "auto" the rule flipped gap -> number at iteration 2 and mu sat at 0.275 of the gap at iteration 3:
+// the closure's count error dN ~ 4e-3 ~ n_th compensated by moving mu towards an edge; "neutral" removes the error first),
 // N(mu) of the Lehmann G, restart bitwise (3 + restart vs 5); 1 vs 2 ranks: mu per iteration written to
 // gw_line_ft_scf_np<np>.txt and compared with the other rank count's file when present (run 1 then 2 ranks)
 TEST_CASE("gw_line_finiteT_scf", "[gw_line][finiteT][scf]") {
@@ -1155,26 +1174,23 @@ TEST_CASE("gw_line_finiteT_scf", "[gw_line][finiteT][scf]") {
   const long NIT = 5, NR = 3;
   const std::string fa = "gw_line_ft_scf_a", fb = "gw_line_ft_scf_b";
   auto t0 = std::chrono::steady_clock::now();
-  auto A  = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, ft_params(fa, NIT, 200.0, "id", "auto"));
+  auto A  = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, ft_params(fa, NIT, 200.0, "id", "neutral"));
   const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   bool ok = long(A.history.size()) == NIT;
-  app_log(1, "\n[finiteT][scf] {} iterations in {:.1f} s ({} ranks), beta 200, mu_rule auto, time grid id", NIT, dt, comm.size());
+  app_log(1, "\n[finiteT][scf] {} iterations in {:.1f} s ({} ranks), beta 200, mu_rule neutral, time grid id", NIT, dt, comm.size());
   for (auto const &h : A.history) {
     const double D = h.gap, off = std::abs(0.5 * (h.e_homo + h.e_lumo));
     app_log(1, "  iter {}: mu {:.12f} rule {:8s} dN {:+.3e} n_th {:.2e} N(mu) {:.12f} gap {:.4f} eV, |mu - mid gap| / gap {:.3f}, "
                "thermal {}, wp {:.3f}, |D| {}, rank_b {}, tau nodes {}, {:.1f} s",
             h.iter, h.mu, h.mu_rule, h.dN, h.n_th, h.N_mu, D * 27.211386, off / D, h.thermal, h.wp_used, h.nD, h.rank_b, h.ntau, h.time);
-    // plan T5(b) asks for the central half (<= 0.25); measured: the rule picks "number" when the closure's own near-edge
-    // weight makes n_th(mu_g) ~ 1e-3 (held-out 1e-2 at omega_p 2.25 Ha), and then mu can sit at 0.34 of the gap (iteration 3
-    // with the tau ID): reported, not gated (Fable decision pending); gate: mu strictly inside the admissible gap
-    if (off / D > 0.25) app_log(1, "    NOTE: mu outside the central half of the gap ({:.3f}, rule {})", off / D, h.mu_rule);
-    ok = gate("|mu - gap midpoint| / gap (inside the gap: < 0.5)", off / D, 0.4999) and ok;
-    if (h.mu_rule == "number") ok = gate("|N(mu) - N_el| (rule number)", std::abs(h.N_mu - 4.0), 1e-10) and ok;
-    else ok = gate("|dN| (rule gap)", std::abs(h.dN), 0.1) and ok;
+    // plan T5(b): mu in the central half of the gap (<= 0.25); rule "neutral" at every iteration (|eps0| and n_th <= 0.1)
+    ok = gate("|mu - gap midpoint| / gap (central half: <= 0.25)", off / D, 0.25) and ok;
+    ok = (h.mu_rule == "neutral") and ok;
+    ok = gate("|dN| (closure count error at the midpoint)", std::abs(h.dN), 0.1) and ok;
   }
   {   // restart: NR iterations, then resume to NIT
-    gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, ft_params(fb, NR, 200.0, "id", "auto"));
-    auto B = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, ft_params(fb, NIT, 200.0, "id", "auto", true));
+    gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, ft_params(fb, NR, 200.0, "id", "neutral"));
+    auto B = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, ft_params(fb, NIT, 200.0, "id", "neutral", true));
     app_log(1, "  restart {} + {} vs {} straight:", NR, NIT - NR, NIT);
     ok = same_runs(comm, A, B, fa, fb, NIT) and ok;
   }
@@ -1705,8 +1721,10 @@ TEST_CASE("gw_line_finiteT_hybrid_scf", "[gw_line][finiteT][hybrid][scf]") {
         nda::h5_read(g, "mu", mo);
       }
       for (long i = 0; i < std::min(mo.size(), mus.size()); ++i)
+        // S8b.4 (c): with the covariant free block the hybrid SCF is rank invariant (Mac 2026-10-18: 2.4e-15 / 1.6e-14 / 1.2e-11 Ha);
+        // gate = the plan's rank-invariance gate 1e-8 Ha (was 1e-3 beyond iteration 1)
         ok = gate(("1 vs 2 ranks: |dmu| (Ha) iteration " + std::to_string(i + 1)).c_str(), std::abs(mo(i) - mus(i)),
-                  i == 0 ? 1e-10 : 1e-3) and ok;
+                  i == 0 ? 1e-10 : 1e-8) and ok;
     } else
       app_log(1, "  {} written; run with the other rank count to compare", mine);
   }
@@ -2202,5 +2220,274 @@ TEST_CASE("gw_line_finiteT_gauge", "[gw_line][finiteT][gauge]") {
     app_log(1, "\n[finiteT][gauge] n_free {} (<= 1): orbital / canonical bitwise svd: {}", a.n_free, same ? "yes" : "NO");
     ok = ok and same and a.n_free <= 1;
   }
+  REQUIRE(ok);
+}
+
+// ============================================================================================================== [sharp]
+// S8c task 3 (notes section 12.6): the sharper final pass (lih222 and svo222 at beta 200: zeta_T' 0.0505, omega_p' 0.758 Ha). G0W0@KS (niter = 0 + final_pass: the pass IS the first iteration,
+// from the KS poles at theta_t' = theta / 4, K 32, omega_p' = 15 zeta_T', node data at eps 1e-10, thermal_tol 1e-12 in the pass):
+//  (i)  Sigma_c of the pass at the nodes vs the exact finite-T Casida Sigma_c (sharp_ref.h5, the run's 240 nodes) on the theta / 2 mask
+//       (rho beta |z| >= c_f at theta / 2) and on the pass's own mask (rho' beta |z| >= c_f, rho' = 2.97): <= 1e-8;
+//  (ii) A(k, w) of the pass's closure in |w - mu0| <= 0.3 Ha vs the exact A from the exact Sigma_c(w + i eta) (sharp_ref.h5,
+//       cayley/scripts/gen_sharp_ref.py) with the run's own static part H0 + F[D_KS]: max|dA| / max A <= 1e-2 at eta 0.02 and
+//       <= 1e-3 at eta 0.05 (S8c.0 assessment, k = 1 of svo222: 2.9e-3 / 1.5e-4); the SCF-angle (theta / 2) G0W0 closure is
+//       reported next to it (no gate);
+//  (iii) lih222: the pass from a restart (niter = 1 done, restart, final_pass) == the in-run pass (niter = 1 + final_pass), bitwise.
+namespace {
+ptree sharp_params(std::string const &out, double beta, long niter, bool restart, double mu0, bool pass) {
+  auto pt = ft_params(out, niter, beta, "id", "neutral", restart);
+  pt.put("eps", 1e-10);   // node data at 1e-10 (the S8c.0 assessment's level)
+  pt.put("nphi", 72);
+  pt.put("K", 32);
+  pt.put("spectra.enable", true);
+  ptree eta, v1, v2;
+  v1.put("", 0.02);
+  v2.put("", 0.05);
+  eta.push_back({"", v1});
+  eta.push_back({"", v2});
+  pt.put_child("spectra.eta", eta);
+  pt.put("spectra.wmin", -0.3);
+  pt.put("spectra.wmax", 0.3);
+  pt.put("spectra.nw", 151);
+  pt.put("spectra.origin", mu0);   // the reference's frame: w relative to the KS number-rule mu0
+  pt.put("final_pass.enable", pass);
+  pt.put("final_pass.theta_t_frac", 0.25);
+  pt.put("final_pass.K", 32);
+  pt.put("final_pass.thermal_tol", 1e-12);
+  return pt;
+}
+
+/// exact A(k, w) (trace) from the exact Sigma_c(w + i eta) of sharp_ref.h5 and the static part H (absolute) of the run
+nda::array<double, 3> exact_A(nda::array<ComplexType, 5> const &Sw, nda::array<double, 1> const &om, nda::array<double, 1> const &eta,
+                              double mu0, std::vector<nda::array<ComplexType, 2>> const &H) {
+  const long nks = Sw.extent(0), ne = Sw.extent(1), nw = Sw.extent(2), nb = Sw.extent(3);
+  nda::array<double, 3> A(nks, ne, nw);
+  for (long a = 0; a < nks; ++a)
+    for (long ie = 0; ie < ne; ++ie)
+      for (long iw = 0; iw < nw; ++iw) {
+        nda::matrix<ComplexType> M(nb, nb);
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j)
+            M(i, j) = (i == j ? ComplexType(om(iw) + mu0, eta(ie)) : ComplexType(0.0)) - H[a](i, j) - Sw(a, ie, iw, i, j);
+        auto G   = nda::inverse(M);
+        double t = 0.0;
+        for (long i = 0; i < nb; ++i) t += -std::imag(G(i, i)) / std::numbers::pi;
+        A(a, ie, iw) = t;
+      }
+  return A;
+}
+
+bool run_sharp(std::string const &fxn, double beta, bool check_restart) {
+  fx_t F(fxn);
+  auto &comm = F.mpi->comm;
+  auto &mf   = *F.mf;
+  const long nb = F.thc->nbnd();
+  bool ok = true;
+  // references
+  h5::file hs(ft_dir() + "sharp_ref.h5", 'r');
+  h5::group rs(hs);
+  auto gs          = rs.open_group(fxn);
+  const double mu0 = read_attr<double>(gs, "mu0");
+  nda::array<double, 1> om, eta;
+  nda::h5_read(gs, "om", om);
+  nda::h5_read(gs, "eta", eta);
+  nda::array<float, 5> swr, swi;
+  nda::h5_read(gs, "Sw_re", swr);
+  nda::h5_read(gs, "Sw_im", swi);
+  nda::array<ComplexType, 5> Sw(swr.shape());
+  for (long a = 0; a < Sw.size(); ++a) Sw.data()[a] = ComplexType(swr.data()[a], swi.data()[a]);
+  const std::vector<long> ks = (fxn == "lih222") ? std::vector<long>{0, 3} : std::vector<long>{1};
+  REQUIRE(long(ks.size()) == Sw.extent(0));
+  nda::array<double, 1> zr, zi;
+  nda::array<double, 4> szr, szi;
+  nda::h5_read(gs, "zeta_re", zr);
+  nda::h5_read(gs, "zeta_im", zi);
+  nda::h5_read(gs, "Sz_re", szr);
+  nda::h5_read(gs, "Sz_im", szi);
+  nda::array<ComplexType, 1> zf(zr.size());
+  for (long i = 0; i < zf.size(); ++i) zf(i) = ComplexType(zr(i), zi(i));
+  nda::array<ComplexType, 4> SZ(szr.shape());   // exact Sigma_c at the run's line nodes (n_k, 240, nb, nb)
+  for (long a = 0; a < SZ.size(); ++a) SZ.data()[a] = ComplexType(szr.data()[a], szi.data()[a]);
+  const std::vector<long> &kz = ks;
+
+  // (i) + (ii): the G0W0@KS pass
+  const std::string fo = "gw_line_sharp_" + fxn;
+  auto t0  = std::chrono::steady_clock::now();
+  auto R   = gw_line_scf<HOST_MEMORY>(*F.thc, mf, sharp_params(fo, beta, 0, false, mu0, true));
+  const double tp = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  REQUIRE(R.fp_done);
+  REQUIRE(R.fp_spectra.has_value());
+  app_log(1, "\n[finiteT][sharp] {} beta {}: pass theta_t' {:.3f} deg, zeta_T' {:.4f} Ha, omega_p' {:.4f} Ha, K {}, mu {:.12f} (mu0 {:.12f}), {:.1f} s",
+          fxn, beta, R.fp_theta_t * 180.0 / std::numbers::pi, R.fp_zeta_T, R.fp_wp, R.fp_K, R.fp_mu, mu0, tp);
+  // the reference's fermionic nodes are a subset of the run's line nodes (same rays / node set): map them
+  std::vector<long> zmap(zf.size(), -1);
+  {
+    double dzn = 0.0;
+    for (long i = 0; i < zf.size(); ++i) {
+      double best = 1e300;
+      for (long j = 0; j < R.zeta.size(); ++j)
+        if (std::abs(R.zeta(j) - zf(i)) < best) best = std::abs(R.zeta(j) - zf(i)), zmap[i] = j;
+      dzn = std::max(dzn, best);
+    }
+    ok = gate("reference nodes found among the run's nodes", dzn, 1e-12) and ok;
+  }
+  {
+    auto S = sigma_total_of(comm, R.fp_file, 1);
+    const double deg = std::numbers::pi / 180.0, rho4 = std::sin(20.0 * deg - 5.0 * deg) / std::sin(5.0 * deg);
+    double d1 = 0.0, d2 = 0.0, m = 0.0;
+    long n2 = 0;
+    for (size_t a = 0; a < kz.size(); ++a)
+      for (long i = 0; i < zf.size(); ++i) {
+        const bool own = rho4 * beta * std::abs(zf(i)) >= 30.0, half = beta * std::abs(zf(i)) >= 30.0;   // rho(theta / 2) = 1
+        const bool fmi = half;
+        if (own and not fmi) ++n2;
+        if (not own) continue;
+        for (long x = 0; x < nb; ++x)
+          for (long y = 0; y < nb; ++y) {
+            const double d = std::abs(S(kz[a], zmap[i], x, y) - SZ(a, i, x, y));
+            m = std::max(m, std::abs(SZ(a, i, x, y)));
+            if (fmi) d1 = std::max(d1, d);
+            else d2 = std::max(d2, d);
+          }
+      }
+    ok = gate("(i) pass Sigma_c vs exact, reference mask (theta / 2 floor)", d1 / m, 1e-8) and ok;
+    ok = gate(("(i) pass Sigma_c vs exact, the pass's extra nodes (" + std::to_string(n2 / long(kz.size())) + ", theta / 4 floor)").c_str(),
+              d2 / m, 1e-8) and ok;
+  }
+  {
+    std::vector<nda::array<ComplexType, 2>> H;
+    for (long k : ks) H.emplace_back(R.fp_H0(k, nda::range::all, nda::range::all) + R.fp_F_closure(k, nda::range::all, nda::range::all));
+    auto Ae = exact_A(Sw, om, eta, mu0, H);
+    auto const &sp = *R.fp_spectra;
+    REQUIRE(sp.omega.size() == om.size());
+    double dom = 0.0;
+    for (long i = 0; i < om.size(); ++i) dom = std::max(dom, std::abs(sp.omega(i) - om(i)));
+    ok = gate("spectra grid == reference grid (origin mu0)", dom, 1e-12) and ok;
+    const double gates[2] = {1e-2, 1e-3};
+    for (long ie = 0; ie < eta.size(); ++ie)
+      for (size_t a = 0; a < ks.size(); ++a) {
+        double d = 0.0, m = 0.0;
+        for (long iw = 0; iw < om.size(); ++iw) {
+          d = std::max(d, std::abs(sp.A_trace(ie, ks[a], iw) - Ae(a, ie, iw)));
+          m = std::max(m, Ae(a, ie, iw));
+        }
+        ok = gate(("(ii) pass A(k = " + std::to_string(ks[a]) + ", w) vs exact, eta " + std::to_string(eta(ie)).substr(0, 4) + " (max A " +
+                   std::to_string(m).substr(0, 6) + ")").c_str(),
+                  d / m, gates[std::min(ie, 1L)]) and ok;
+      }
+  }
+  rm_ckpt(comm, fo);
+  rm_ckpt(comm, fo + ".final_pass");
+  // the SCF-angle (theta / 2) G0W0@KS closure, reported
+  {
+    auto pt = sharp_params(fo + "_scf", beta, 1, false, mu0, false);
+    pt.put("thermal_tol", 1e-12);
+    auto Q  = gw_line_scf<HOST_MEMORY>(*F.thc, mf, pt);
+    std::vector<nda::array<ComplexType, 2>> H;
+    for (long k : ks) H.emplace_back(Q.H0(k, nda::range::all, nda::range::all) + Q.F_closure(k, nda::range::all, nda::range::all));
+    auto Ae = exact_A(Sw, om, eta, mu0, H);
+    for (long ie = 0; ie < eta.size(); ++ie)
+      for (size_t a = 0; a < ks.size(); ++a) {
+        double d = 0.0, m = 0.0;
+        for (long iw = 0; iw < om.size(); ++iw) {
+          d = std::max(d, std::abs(Q.spectra->A_trace(ie, ks[a], iw) - Ae(a, ie, iw)));
+          m = std::max(m, Ae(a, ie, iw));
+        }
+        app_log(1, "    SCF-angle (theta / 2, omega_p {:.4f}) G0W0 closure: A(k = {}, w) vs exact, eta {}: {:.3e} (report)",
+                Q.history.back().wp_used, ks[a], eta(ie), d / m);
+      }
+    rm_ckpt(comm, fo + "_scf");
+  }
+  // (iii) restart pass == in-run pass
+  if (check_restart) {
+    const std::string fa = "gw_line_sharp_a", fb = "gw_line_sharp_b";
+    auto A = gw_line_scf<HOST_MEMORY>(*F.thc, mf, sharp_params(fa, beta, 1, false, mu0, true));
+    gw_line_scf<HOST_MEMORY>(*F.thc, mf, sharp_params(fb, beta, 1, false, mu0, false));
+    auto B = gw_line_scf<HOST_MEMORY>(*F.thc, mf, sharp_params(fb, beta, 1, true, mu0, true));
+    REQUIRE((A.fp_done and B.fp_done and A.fp_spectra and B.fp_spectra));
+    double dA = 0.0;
+    for (long a = 0; a < A.fp_spectra->A_trace.size(); ++a)
+      dA = std::max(dA, std::abs(A.fp_spectra->A_trace.data()[a] - B.fp_spectra->A_trace.data()[a]));
+    auto Sa = sigma_total_of(comm, A.fp_file, 2), Sb = sigma_total_of(comm, B.fp_file, 2);
+    double dS = 0.0;
+    for (long a = 0; a < Sa.size(); ++a) dS = std::max(dS, std::abs(Sa.data()[a] - Sb.data()[a]));
+    app_log(1, "  (iii) restart pass vs in-run pass: mu {:.15f} / {:.15f}, max|dA| {:.1e}, max|dSigma| {:.1e}", A.fp_mu, B.fp_mu, dA, dS);
+    ok = (A.fp_mu == B.fp_mu and dA == 0.0 and dS == 0.0) and ok;
+    for (auto const &s : {fa, fb}) {
+      rm_ckpt(comm, s);
+      rm_ckpt(comm, s + ".final_pass");
+    }
+  }
+  return ok;
+}
+} // namespace
+
+TEST_CASE("gw_line_finiteT_sharp_lih222", "[gw_line][finiteT][sharp]") { REQUIRE(run_sharp("lih222", 200.0, true)); }
+
+TEST_CASE("gw_line_metal_sharp_svo222", "[gw_line][metal][sharp]") { REQUIRE(run_sharp("svo222", 200.0, false)); }
+
+// S8c task 2 (metals): svo222 thermal SCF at beta 200 with the metals' settings (option A of the S8c.0 assessment: theta_t = theta / 4,
+// scf_density "matsubara" = hybrid, K 24, omega_p = 15 zeta_T = 0.758 Ha, mu_rule default): N(mu) = 41 to 1e-10 at every iteration,
+// restart (NIT / 2 + rest) bitwise = straight, 1 vs 2 ranks mu <= 1e-8 Ha per iteration (file gw_line_metal_scf_np<np>.h5; run 1 then 2
+// ranks). The mu vs CoQui scGW at beta 200 (<= 5 meV) is the demo comparison (S8c task 4, runs/s8c_mats), not gated here.
+// GW_LINE_METAL_NIT (default 6) for a local smoke run. Heavy (rusty): "[metal][scf]".
+TEST_CASE("gw_line_metal_scf_svo222", "[gw_line][metal][scf]") {
+  fx_t F("svo222");
+  auto &comm = F.mpi->comm;
+  long NIT   = 6;
+  if (char const *e = std::getenv("GW_LINE_METAL_NIT")) NIT = std::max(2L, std::strtol(e, nullptr, 10));
+  const long NR = NIT / 2;
+  const double nel = double(F.mf->nelec());
+  auto params = [&](std::string const &out, long niter, bool restart) {
+    auto pt = ft_params(out, niter, 200.0, "id", "neutral", restart);
+    pt.put("theta_t_frac", 0.25);
+    pt.put("scf_density", "matsubara");
+    pt.put("K", 24);
+    pt.put("nphi", 72);
+    return pt;
+  };
+  const std::string fa = "gw_line_metal_scf_a", fb = "gw_line_metal_scf_b";
+  auto t0 = std::chrono::steady_clock::now();
+  auto A  = gw_line_scf<HOST_MEMORY>(*F.thc, *F.mf, params(fa, NIT, false));
+  const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  bool ok = long(A.history.size()) == NIT;
+  app_log(1, "\n[metal][scf] svo222: {} iterations in {:.1f} s ({} ranks), beta 200, theta_t = theta / 4, hybrid, K 24", NIT, dt, comm.size());
+  for (auto const &h : A.history) {
+    app_log(1, "  iter {}: mu {:.12f} Ha N(mu) {:.15f} dSigma {:.2e} | closure N {:.8f} own mu {:+.2e} ({}) | wp {:.4f}, {} frequencies, "
+               "{:.1f} s",
+            h.iter, h.mu, h.N_mu, h.dSigma, h.N_closure, h.dmu_closure, h.rule_closure, h.wp_used, h.nfreq, h.time);
+    ok = gate("|N(mu) - N_el|", std::abs(h.N_mu - nel), 1e-10) and ok;
+  }
+  {   // restart
+    gw_line_scf<HOST_MEMORY>(*F.thc, *F.mf, params(fb, NR, false));
+    auto B = gw_line_scf<HOST_MEMORY>(*F.thc, *F.mf, params(fb, NIT, true));
+    app_log(1, "  restart {} + {} vs {} straight:", NR, NIT - NR, NIT);
+    ok = same_runs(comm, A, B, fa, fb, NIT) and ok;
+  }
+  {   // 1 vs 2 ranks
+    const std::string mine = "gw_line_metal_scf_np" + std::to_string(comm.size()) + ".h5";
+    const std::string other = "gw_line_metal_scf_np" + std::to_string(comm.size() == 1 ? 2 : 1) + ".h5";
+    nda::array<double, 1> mus(long(A.history.size()));
+    for (long i = 0; i < mus.size(); ++i) mus(i) = A.history[i].mu;
+    if (comm.root()) {
+      h5::file f(mine, 'w');
+      h5::group g(f);
+      nda::h5_write(g, "mu", mus, false);
+    }
+    comm.barrier();
+    if (std::filesystem::exists(other)) {
+      nda::array<double, 1> mo;
+      {
+        h5::file f(other, 'r');
+        h5::group g(f);
+        nda::h5_read(g, "mu", mo);
+      }
+      for (long i = 0; i < std::min(mo.size(), mus.size()); ++i)
+        ok = gate(("1 vs 2 ranks: |dmu| (Ha) iteration " + std::to_string(i + 1)).c_str(), std::abs(mo(i) - mus(i)), 1e-8) and ok;
+    } else
+      app_log(1, "  {} written; run with the other rank count to compare", mine);
+  }
+  rm_ckpt(comm, fa);
+  rm_ckpt(comm, fb);
   REQUIRE(ok);
 }

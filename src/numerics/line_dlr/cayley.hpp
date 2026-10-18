@@ -1459,6 +1459,25 @@ inline double thermal_carriers(std::vector<nda::array<double, 1>> const &e_k, st
   return n;
 }
 
+/// -dN/dmu = 2 sum_k w_k sum_m beta f (1 - f) |v_m|^2: the thermal density of states at mu (S8c diagnostic, metals)
+inline double thermal_dos(std::vector<nda::array<double, 1>> const &e_k, std::vector<nda::array<ComplexType, 2>> const &v_k,
+                          double beta, double mu = 0.0, std::vector<double> const &k_weight = {}) {
+  const long nk = long(e_k.size());
+  auto wk       = detail::norm_k_weights(nk, k_weight);
+  double n      = 0.0;
+  for (long k = 0; k < nk; ++k) {
+    double acc = 0.0;
+    for (long m = 0; m < e_k[k].size(); ++m) {
+      double w = 0.0;
+      for (long i = 0; i < v_k[k].extent(0); ++i) w += std::norm(v_k[k](i, m));
+      const double f = fermi(e_k[k](m) - mu, beta);
+      acc += beta * f * (1.0 - f) * w;
+    }
+    n += 2.0 * wk[k] * acc;
+  }
+  return n;
+}
+
 /// N(mu) = N_el by bisection to the root in mu (python chemical_potential_T; poles with |e| >= 1e5 are not bracketing
 /// candidates). Returns {mu, N(mu)}.
 inline std::pair<double, double> chemical_potential_T(std::vector<nda::array<double, 1>> const &e_k,

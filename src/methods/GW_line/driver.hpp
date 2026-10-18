@@ -143,11 +143,11 @@
  *   beta = 0            S8b finite temperature (notes section 11; thermal.hpp): 0 = T = 0. beta > 0: thermal_tol = 1e-8 (tau_T,
  *                       window E_T = ln(1/tau_T)/beta), thermal_floor = 30 (c_zeta: bosonic node floor rho beta |zeta| >= c_zeta,
  *                       band bottom), thermal_floor_f = thermal_floor (c_f: fermionic node floor of the closure fit), wp_floor = 15
- *                       (omega_p := max(wp, wp_floor zeta_T)), mu_rule = "auto" ("auto" | "gap" | "number"; mu_dn_max = 0.1,
+ *                       (omega_p := max(wp, wp_floor zeta_T)), mu_rule = "neutral" ("neutral" | "auto" | "gap" | "number"; mu_dn_max = 0.1,
  *                       mu_th_factor = 10, notes Eq. fT_nth), band_heights = 8, band_x = 21, band_top = 4, mats_factor = 4 (data set
  *                       D), bos_eps_T = 1e-12 (D-selected basis), bos_line_eps = 1e-10 (the line basis of D's line nodes),
  *                       cut_odd = 1e-11 (S8b.4; was 1e-13), cut_even = 1e-10 (split fit), tau_grid = "id" | "gl", tau_eps = 1e-13 (tau leg),
- *                       spectra.occupation = false, thermal_bases_file (parity: D, nu_b, the Sigma basis injected).
+ *                       spectra.occupation = false, spectra.origin (S8c), final_pass.* (S8c, below), thermal_bases_file (parity: D, nu_b, the Sigma basis injected).
  *                       scf_density = "closure" | "matsubara" (S8b.3 hybrid, hybrid.hpp: tau-leg Sigma_c(i w_n) on the dense set
  *                       w_n <= hyb_wmax = 100 Ha, Matsubara Dyson D / N / mu (N = N_el exactly); the closure supplies only the next
  *                       poles; hyb_tau_eps = 1e-13; needs mixing_alg = "linear" and div_treatment = "ignore_g0").
@@ -209,6 +209,7 @@
  */
 
 #include <optional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -281,6 +282,17 @@ struct gw_line_params_t {
   long q_group_size = 0;                   ///< perf 7.4b: > 0 fixes the largest q-group size (0 = automatic, q_plan.hpp)
   bool do_spectra = true;
   spectra_params_t spectra;
+  double spectra_origin = std::numeric_limits<double>::quiet_NaN();   ///< S8c: spectra.origin (absolute Ha; NaN: the final mu)
+  /// S8c task 3 (notes section 12.6): the sharper final pass = ONE more iteration Pi -> W -> Sigma -> closure from the final poles
+  /// at the flatter time angle theta_t' = theta_t_frac theta (own guarded rays, wedge, floors, data set D and bosonic basis, as any
+  /// iteration builds them from theta_t), unmixed, omega_p' = wp > 0 ? wp : max(run's wp, wp_floor zeta_T') ("auto"), closure order
+  /// K (<= 0: the run's), thermal_tol (<= 0: the run's); run on a copy of the checkpoint (<output>.final_pass.gw_line.h5), its
+  /// spectra next to the SCF-angle ones (<output>.gw_line.h5:/final_pass). Works from a restart with niter = done iterations.
+  struct final_pass_t {
+    bool enable = false, spectra = true;
+    double theta_t_frac = 0.25, omega_p = -1.0, ttol = -1.0;   ///< final_pass.wp / final_pass.thermal_tol ("auto" = -1)
+    long order = -1;                                             ///< final_pass.K ("auto" = -1)
+  } final_pass;
   std::string div_treatment = "ignore_g0";      ///< S9a: Sigma_c head term ("ignore_g0" | gygi variants, head.hpp)
   std::string hf_div_treatment = "ignore_g0";   ///< S9a: exchange Madelung term ("ignore_g0" | "gygi")
   std::string head_extrapolation = "gygi";      ///< S9a: q -> 0 variant of the head data when div_treatment = "ignore_g0"
@@ -290,7 +302,7 @@ struct gw_line_params_t {
   double beta = 0.0;                            ///< 0: T = 0
   double thermal_tol = 1e-8, thermal_floor = 30.0, thermal_floor_f = -1.0;   ///< tau_T, c_zeta, c_f (< 0: c_zeta)
   double wp_floor = 15.0;                       ///< omega_p >= wp_floor zeta_T in thermal iterations
-  std::string mu_rule = "auto";                 ///< "auto" | "gap" | "number"
+  std::string mu_rule = "neutral";              ///< "neutral" (S8b.4 (e) default) | "auto" | "gap" | "number"
   double mu_dn_max = 0.1, mu_th_factor = 10.0;  ///< rule "auto" (Eq. fT_nth)
   long band_heights = 8, band_x = 21;           ///< wedge band of the bosonic data set D
   double mats_factor = 4.0, band_top = 4.0;     ///< N_M = ceil(mats_factor zeta_T beta / 2 pi); band top
@@ -352,6 +364,14 @@ struct gw_line_result_t {
                                              ///< sigma_kdist (default) the rows of the k owned by this rank (k mod np)
   nda::array<ComplexType, 1> zeta;       ///< fermionic nodes (mu-relative)
   std::optional<spectra_out_t> spectra;
+  // S8c task 3: the sharper final pass (final_pass.enable)
+  bool fp_done = false;
+  double fp_theta_t = 0.0, fp_zeta_T = 0.0, fp_wp = 0.0, fp_mu = 0.0, fp_mu_sigma = 0.0;
+  long fp_K = 0;
+  std::string fp_file;                   ///< the pass's own checkpoint
+  std::optional<spectra_out_t> fp_spectra;
+  nda::array<ComplexType, 4> fp_Sig_p, fp_Sig_h;   ///< the pass's (unmixed) Sigma at the nodes (k rows as Sig_p)
+  nda::array<ComplexType, 3> fp_H0, fp_F_closure;
   std::vector<double> eps_inf;           ///< S9a: 1 / (1 + Re h0(0)) of the iterations done in this run
   nda::array<ComplexType, 1> head_hp0, head_hh0;   ///< S9a: extrapolated head residues of the last iteration of this run
   std::vector<double> optics_theta;                ///< S9b: angles of the optics lines (SCF angle first)

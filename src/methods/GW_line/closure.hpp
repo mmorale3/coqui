@@ -517,6 +517,7 @@ struct closure_out_t {
   // S8b (closure_thermal_t given)
   std::string mu_rule = "gap";    ///< rule used ("gap" T = 0 / "gap" / "number" / "gap(T=0)")
   double dN = 0.0, n_th = 0.0;    ///< N_T(mu_g) - N_el and the thermal carriers at the gap midpoint
+  double dNdmu = 0.0;             ///< S8c: -dN/dmu at the chosen mu (thermal DOS of the Lehmann G, states / Ha / cell)
   bool window_next = false;       ///< a pole of the new G within E_T of the new mu (the next iteration is thermal)
 };
 
@@ -814,7 +815,10 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
       if (out.leh.e[ik](m) < 0.0)
         for (long i = 0; i < nb; ++i) out.nel_lehmann += 2.0 / double(nk) * std::norm(out.leh.v[ik](i, m));
   }
-  if (thermal_mu) out.nel_lehmann = cp.N;   // N_T(mu) of the Lehmann G (k-weighted, Eq. fT_mu)
+  if (thermal_mu) {
+    out.nel_lehmann = cp.N;   // N_T(mu) of the Lehmann G (k-weighted, Eq. fT_mu)
+    out.dNdmu       = numerics::line_dlr::thermal_dos(out.leh.e, out.leh.v, th->tp.beta, 0.0, p.k_weight);   // e re-centred
+  }
   Timer.stop("closure_mu");
 
   // 3a. Lehmann representation: pruning only (every rank, same data, k in order -> rank-count independent)

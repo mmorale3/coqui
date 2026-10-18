@@ -174,6 +174,23 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.spectra.wmin  = io::get_value_with_default<double>(pt, "spectra.wmin", p.spectra.wmin);
   p.spectra.wmax  = io::get_value_with_default<double>(pt, "spectra.wmax", p.spectra.wmax);
   p.spectra.nw    = io::get_value_with_default<long>(pt, "spectra.nw", p.spectra.nw);
+  p.spectra_origin = io::get_value_with_default<double>(pt, "spectra.origin", p.spectra_origin);   // S8c
+  // S8c task 3: the sharper final pass ("auto" = -1 for wp / K / thermal_tol)
+  {
+    auto num_or_auto = [](std::string x) {   // "auto" -> -1
+      io::tolower(x);
+      return (x.empty() or x == "auto") ? -1.0 : std::stod(x);
+    };
+    auto &fp        = p.final_pass;
+    fp.enable       = io::get_value_with_default<bool>(pt, "final_pass.enable", fp.enable);
+    fp.spectra      = io::get_value_with_default<bool>(pt, "final_pass.spectra", fp.spectra);
+    fp.theta_t_frac = io::get_value_with_default<double>(pt, "final_pass.theta_t_frac", fp.theta_t_frac);
+    fp.omega_p           = num_or_auto(io::get_value_with_default<std::string>(pt, "final_pass.wp", "auto"));
+    fp.order            = long(std::llround(num_or_auto(io::get_value_with_default<std::string>(pt, "final_pass.K", "auto"))));
+    fp.ttol  = num_or_auto(io::get_value_with_default<std::string>(pt, "final_pass.thermal_tol", "auto"));
+    utils::check(fp.theta_t_frac > 0.0 and fp.theta_t_frac < 1.0, "gw_line: final_pass.theta_t_frac must be in (0, 1)");
+    utils::check(fp.ttol < 1.0, "gw_line: final_pass.thermal_tol must be < 1 (or \"auto\")");
+  }
 
   // S9a: q -> 0 divergence (head.hpp). Defaults: ignore_g0 (unchanged); hf_div_treatment follows div_treatment
   p.div_treatment = io::get_value_with_default<std::string>(pt, "div_treatment", p.div_treatment);
@@ -225,8 +242,8 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   utils::check(p.beta >= 0.0, "gw_line: beta must be >= 0");
   utils::check(p.thermal_tol > 0.0 and p.thermal_tol < 1.0 and p.thermal_floor > 0.0 and p.thermal_floor_f > 0.0 and p.wp_floor >= 0.0,
                "gw_line: invalid thermal_tol / thermal_floor / thermal_floor_f / wp_floor");
-  utils::check(p.mu_rule == "auto" or p.mu_rule == "gap" or p.mu_rule == "number",
-               "gw_line: mu_rule must be \"auto\", \"gap\" or \"number\" (got \"{}\")", p.mu_rule);
+  utils::check(p.mu_rule == "neutral" or p.mu_rule == "auto" or p.mu_rule == "gap" or p.mu_rule == "number",
+               "gw_line: mu_rule must be \"neutral\", \"auto\", \"gap\" or \"number\" (got \"{}\")", p.mu_rule);
   utils::check(p.band_heights >= 2 and p.band_x >= 3 and p.mats_factor > 0.0 and p.bos_eps_T > 0.0 and p.cut_odd > 0.0 and p.cut_even > 0.0,
                "gw_line: invalid finite-T W-step parameters");
   utils::check(p.tau_grid == "gl" or p.tau_grid == "id", "gw_line: tau_grid must be \"gl\" or \"id\" (got \"{}\")", p.tau_grid);
@@ -413,6 +430,11 @@ void gw_line_params_t::log() const {
     app_log(1, "    spectra: off");
   }
   app_log(1, "    theta_t = {} theta", theta_t_frac);
+  if (final_pass.enable)
+    app_log(1, "    final_pass (S8c): theta_t' = {} theta, wp {}, K {}, thermal_tol {}, spectra {}", final_pass.theta_t_frac,
+            final_pass.omega_p > 0.0 ? std::to_string(final_pass.omega_p) : std::string("auto"),
+            final_pass.order > 0 ? std::to_string(final_pass.order) : std::string("auto"),
+            final_pass.ttol > 0.0 ? std::to_string(final_pass.ttol) : std::string("auto"), final_pass.spectra);
   if (beta > 0.0)
     app_log(1, "    finite temperature: beta = {} (T = {:.1f} K), thermal_tol = {:.1e} (E_T = {:.5f} Ha), c_zeta = {}, c_f = {}, wp_floor = {}, "
                "mu_rule = {} (mu_dn_max {}, mu_th_factor {}), band {} x {}, mats_factor {}, eps_b {:.1e} (line basis {:.1e}), split "
@@ -1102,13 +1124,22 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
   return st;
 }
 
-void write_spectra(boost::mpi3::communicator &comm, std::string const &file, spectra_out_t const &s, double mu) {
+void write_spectra(boost::mpi3::communicator &comm, std::string const &file, spectra_out_t const &s, double mu,
+                   std::string const &gname = "spectra", double origin = std::numeric_limits<double>::quiet_NaN()) {
   if (comm.root()) {
     utils::h5_quiesce();
     h5::file f(file, 'a');
     h5::group g(f);
-    auto sg = g.create_group("spectra");
+    h5::group base = g;
+    std::string leaf = gname;
+    if (auto pos = gname.find('/'); pos != std::string::npos) {   // "final_pass/spectra"
+      const std::string top = gname.substr(0, pos);
+      base = g.has_subgroup(top) ? g.open_group(top) : g.create_group(top);
+      leaf = gname.substr(pos + 1);
+    }
+    auto sg = base.create_group(leaf);
     h5::h5_write(sg, "mu", mu);
+    h5::h5_write(sg, "origin", std::isnan(origin) ? mu : origin);   // S8c: omega is relative to origin (spectra.origin)
     nda::h5_write(sg, "omega", s.omega, false);
     nda::h5_write(sg, "eta", s.eta, false);
     nda::h5_write(sg, "A_k_w_diag", s.A_diag, false);
@@ -1259,7 +1290,7 @@ void print_line(gw_line_iter_t const &r, double tPi, double tW, double tS, doubl
 // ------------------------------------------------------------------------------------------------------------------
 // driver
 // ------------------------------------------------------------------------------------------------------------------
-template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &thc, mf::MF &mf, ptree const &pt) {
+template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reader_t &thc, mf::MF &mf, ptree const &pt) {
   using arr4_t = memory::array<MEM, ComplexType, 4>;
   auto prm     = gw_line_params_t::from_ptree(pt);
   auto &mpi    = *thc.mpi();
@@ -2446,9 +2477,9 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
                 co.dmu - hyb_dmu, co.mu_rule);
       }
       app_log(1, "          finite T: {} iteration (window poles {}), mu rule {} (dN = N_T(mu_g) - N_el {:+.3e}, n_th {:.3e}), N(mu) {:.12f}, "
-                 "omega_p {:.4f}, |D| {}, rank_b {}, tau nodes {}; next window {}",
-              thermal ? "thermal" : "T = 0", nwin, co.mu_rule, co.dN, co.n_th, co.N_mu, wp_used, rec.nD, rec.rank_b, rec.ntau,
-              co.window_next ? "non-empty" : "empty");
+                 "-dN/dmu {:.4e} /Ha, min|e| {:.3e} Ha, omega_p {:.4f}, |D| {}, rank_b {}, tau nodes {}; next window {}",
+              thermal ? "thermal" : "T = 0", nwin, co.mu_rule, co.dN, co.n_th, co.N_mu, co.dNdmu, rec.g_emin, wp_used, rec.nD, rec.rank_b,
+              rec.ntau, co.window_next ? "non-empty" : "empty");
     }
     rec.time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     res.history.push_back(rec);
@@ -2525,9 +2556,15 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
       cth.active = true;
       cprm_sp.wp = res.history.back().wp_used;
     }
+    // S8c: spectra.origin = an absolute energy for omega = 0 (default: the final mu); the grid is shifted, not the physics
+    const double sh_o = std::isnan(prm.spectra_origin) ? 0.0 : prm.spectra_origin - st.mu;
+    auto sp_prm       = prm.spectra;
+    sp_prm.wmin += sh_o;
+    sp_prm.wmax += sh_o;
     auto sp = line_spectra(comm, Hrel, st.Sig_p, st.Sig_h, zeta, st.mu - st.mu_sigma, *bp, *bh, th_last ? cprm_sp : cprm, nelec,
-                           prm.spectra, th_last ? &cth : nullptr);
-    write_spectra(comm, chk, sp, st.mu);
+                           sp_prm, th_last ? &cth : nullptr);
+    for (long i = 0; i < sp.omega.size(); ++i) sp.omega(i) -= sh_o;   // omega relative to the origin; e_homo / e_lumo stay mu-relative
+    write_spectra(comm, chk, sp, st.mu, "spectra", prm.spectra_origin);
     if (prm.spectra_occupation and prm.beta > 0.0 and comm.root()) {   // S8b: f(w - mu) on the spectra grid
       utils::h5_quiesce();
       h5::file f(chk, 'a');
@@ -2711,6 +2748,95 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   res.Sig_p     = std::move(st.Sig_p);
   res.Sig_h     = std::move(st.Sig_h);
   res.zeta      = zeta;
+  return res;
+}
+
+/**
+ * gw_line_scf = the run (gw_line_scf_impl) + the optional sharper final pass (S8c task 3, final_pass.enable, notes section 12.6):
+ * a second gw_line_scf_impl on a COPY of the checkpoint (<output>.final_pass.gw_line.h5 + its Sigma file) that does exactly one
+ * more iteration from the final poles with theta_t_frac' (every theta_t-dependent object of an iteration -- guarded rays, wedge,
+ * node floors / mask, data set D, D-selected bosonic basis, time grids -- is rebuilt from it), linear mixing 1 (Sigma[G_final]
+ * unmixed), omega_p' = max(wp, wp_floor zeta_T') unless final_pass.wp > 0, closure order final_pass.K (<= 0: the run's), and its
+ * spectra; no optics, no further pass. Without an iteration in the run (niter = 0, no checkpoint state) the pass is a G0W0 from
+ * the KS start at theta_t'. The pass's spectra and scales are copied to <output>.gw_line.h5:/final_pass. The run's buffers are
+ * released before the pass (it allocates its own).
+ */
+template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &thc, mf::MF &mf, ptree const &pt) {
+  const auto prm = gw_line_params_t::from_ptree(pt);
+  auto res       = gw_line_scf_impl<MEM>(thc, mf, pt);
+  if (not prm.final_pass.enable) return res;
+  auto &comm       = thc.mpi()->comm;
+  auto const &fp   = prm.final_pass;
+  const long done  = res.history.empty() ? 0 : res.history.back().iter;
+  const std::string chk = prm.output + ".gw_line.h5", out_fp = prm.output + ".final_pass", chk_fp = out_fp + ".gw_line.h5";
+  ptree pp = pt;
+  pp.put("output", out_fp);
+  pp.put("theta_t_frac", fp.theta_t_frac);
+  pp.put("niter", done + 1);
+  pp.put("restart", done > 0);
+  pp.put("mixing", 1.0);
+  pp.put("mixing_alg", "linear");
+  pp.put("damp_below", 0.0);
+  pp.put("final_pass.enable", false);
+  pp.put("optics.enable", false);
+  pp.put("spectra.enable", fp.spectra);
+  if (fp.omega_p > 0.0) pp.put("wp", fp.omega_p);
+  if (fp.order > 0) pp.put("K", fp.order);
+  if (fp.ttol > 0.0) pp.put("thermal_tol", fp.ttol);
+  if (comm.root()) {
+    namespace fs = std::filesystem;
+    for (auto const &f : {chk_fp, sigma_file(chk_fp)})
+      if (fs::exists(f)) fs::remove(f);
+    if (done > 0) {
+      fs::copy_file(chk, chk_fp);
+      if (fs::exists(sigma_file(chk))) fs::copy_file(sigma_file(chk), sigma_file(chk_fp));
+    }
+  }
+  comm.barrier();
+  const auto t0 = std::chrono::steady_clock::now();
+  app_log(1, "\n  ======== sharper final pass (S8c): theta_t = {} theta (run: {}), {} iteration {} on {} ========", fp.theta_t_frac,
+          prm.theta_t_frac, done > 0 ? "one more" : "a G0W0 (KS start) as", done + 1, chk_fp);
+  auto rp = gw_line_scf_impl<MEM>(thc, mf, pp);
+  utils::check(not rp.history.empty() and rp.history.back().iter == done + 1, "gw_line: the final pass did not run its iteration");
+  thermal_params_t tq;
+  tq.beta    = prm.beta;
+  tq.theta   = prm.theta_deg * std::numbers::pi / 180.0;
+  tq.theta_t = fp.theta_t_frac * tq.theta;
+  tq.c_zeta  = prm.thermal_floor;
+  res.fp_done     = true;
+  res.fp_theta_t  = tq.theta_t;
+  res.fp_zeta_T   = prm.beta > 0.0 ? tq.zeta_T() : 0.0;
+  res.fp_wp       = rp.history.back().wp_used > 0.0 ? rp.history.back().wp_used : (fp.omega_p > 0.0 ? fp.omega_p : prm.wp);
+  res.fp_K        = fp.order > 0 ? fp.order : prm.K;
+  res.fp_mu       = rp.mu;
+  res.fp_mu_sigma = rp.mu_sigma;
+  res.fp_file     = chk_fp;
+  res.fp_Sig_p    = std::move(rp.Sig_p);
+  res.fp_Sig_h    = std::move(rp.Sig_h);
+  res.fp_H0       = std::move(rp.H0);
+  res.fp_F_closure = std::move(rp.F_closure);
+  if (rp.spectra) {
+    write_spectra(comm, chk, *rp.spectra, rp.mu, "final_pass/spectra", prm.spectra_origin);
+    res.fp_spectra = std::move(rp.spectra);
+  }
+  if (comm.root()) {
+    utils::h5_quiesce();
+    h5::file f(chk, 'a');
+    h5::group g(f);
+    auto fg = g.has_subgroup("final_pass") ? g.open_group("final_pass") : g.create_group("final_pass");
+    h5::h5_write(fg, "theta_t", res.fp_theta_t);
+    h5::h5_write(fg, "theta_t_frac", fp.theta_t_frac);
+    h5::h5_write(fg, "zeta_T", res.fp_zeta_T);
+    h5::h5_write(fg, "wp", res.fp_wp);
+    h5::h5_write(fg, "K", res.fp_K);
+    h5::h5_write(fg, "mu", res.fp_mu);
+    h5::h5_write(fg, "iteration", done + 1);
+    h5::h5_write(fg, "file", chk_fp);   // the pass's checkpoint (its poles, Sigma, history)
+  }
+  comm.barrier();
+  app_log(1, "  sharper final pass: theta_t' {:.4f} deg, zeta_T' {:.4f} Ha, omega_p' {:.4f} Ha, K {}, mu {:.10f} Ha; {:.1f} s -> {}:/final_pass",
+          res.fp_theta_t * 180.0 / std::numbers::pi, res.fp_zeta_T, res.fp_wp, res.fp_K, res.fp_mu,
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), chk);
   return res;
 }
 
