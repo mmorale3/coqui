@@ -139,6 +139,27 @@ def chemical_potential_auto(e, v, nk, nelec, beta, thermal_tol=1e-8, k_weight=No
     return out + (info,) if return_info else out
 
 
+def chemical_potential_neutral(e, v, nk, nelec, beta, k_weight=None, dropped=0.0, mu_dn_max=0.1, return_info=False, **kw):
+    """Rule mu_rule = "neutral" (S8b.4 (e), notes section 11.6): a continuous version of "auto". The widest admissible gap of
+    chemical_potential (midpoint mu_g, T = 0 count N_g = 2 sum_k w_k sum_{e < mu_g} |v|^2) gives the closure's count error
+    eps0 = N_g + dropped - N_el (zero for an exact insulator: the weight below the gap is N_el). If |eps0| <= mu_dn_max AND
+    n_th(mu_g) <= mu_dn_max (a gap with few thermal carriers), mu solves N_T(mu) = N_el + eps0, i.e. thermal electrons = thermal
+    holes (the intrinsic, charge-neutral mu: continuous in the poles, the error eps0 is not compensated by moving mu towards an
+    edge); otherwise N_T(mu) = N_el (rule "number"; metals: |eps0| = O(0.5) or many carriers). With an exact closure eps0 = 0 and
+    the rule IS "number". Returns (mu_shift, rule, N(mu)) (+ dict(dN = eps0, n_th, mu_g, e_homo, e_lumo) with return_info)."""
+    mu_g, e_homo, e_lumo, Ng = chemical_potential(e, v, nk, nelec, k_weight, **kw)
+    eps0 = Ng + dropped - nelec
+    nth = thermal_carriers(e, v, beta, mu_g, k_weight)
+    info = dict(mu_g=mu_g, e_homo=e_homo, e_lumo=e_lumo, dN=eps0, n_th=nth)
+    if abs(eps0) <= mu_dn_max and nth <= mu_dn_max:
+        mu, Nn = chemical_potential_T(e, v, nk, nelec + eps0, beta, k_weight, dropped)
+        out = (mu, 'neutral', Nn)
+    else:
+        mu, Nn = chemical_potential_T(e, v, nk, nelec, beta, k_weight, dropped)
+        out = (mu, 'number', Nn)
+    return out + (info,) if return_info else out
+
+
 def compress_sectors(basis_p, basis_h, zeta, e, v, emax=None):
     """Compressed matrix-coefficient real-pole representation of the Lehmann G per sector by LS fit on the line nodes.
     Poles beyond emax (default: the basis range lam) cannot be represented and are dropped; their weight is returned.

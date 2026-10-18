@@ -14,7 +14,7 @@ Finite temperature (S8b, notes section 11; beta given): the thermal loop _iterat
   2. TOTAL Sigma_c at the fermionic nodes (thermal G lists, Bose-weighted W(t) of Eq. fT_W), linear mixing
   3. per k: fit of the total Sigma_c at the nodes rho beta |zeta| >= c_f on the two-sided gapless basis self.bt, Cayley moments at
      omega_p = max(wp, wp_floor zeta_T), upfolding, Lehmann G (g_repr = "lehmann": poles and vectors kept as they are)
-  4. mu by rule mu_rule ("auto": gap midpoint if both edges are outside the window, else N(mu) = N_el; "number"; "gap"),
+  4. mu by rule mu_rule ("neutral" default: N_T(mu) = N_el + eps0, eps0 = the T = 0 count error at the gap midpoint, if the gap has few carriers, else "number"; "auto": gap midpoint or N(mu) = N_el; "number"; "gap"),
      re-centre, thermal sector lists of the new poles, D = density of the thermal hole list, F = V_H + Sigma_x.
   If the window is empty at an iteration (no pole within E_T of mu) the same loop runs with the T = 0 kernels (gapless
   bosonic basis fitted on all its nodes, all fermionic nodes) - T = 0 equivalent, not the T = 0 driver above.
@@ -43,7 +43,7 @@ import numpy as np, time
 from .line_dlr import LineBasis, BosonicLineBasis
 from .thc_gw import LineGW
 from .closure import fit_sigma_sectors, lehmann_from_sigma, chemical_potential, compress_sectors
-from .closure import fit_sigma_total, wp_thermal, chemical_potential_auto, chemical_potential_T, electron_count_T
+from .closure import fit_sigma_total, wp_thermal, chemical_potential_auto, chemical_potential_neutral, chemical_potential_T, electron_count_T
 from .closure import qp_diag
 from .thc_gw import node_floor_mask, thermal_rho
 from .. import finite_t as _ft
@@ -53,7 +53,7 @@ class LineSCGW:
     def __init__(self, X, Z, qk_to_k2, nk, nelec, H0, mu, theta=np.deg2rad(20), eps=1e-8, lam=6.0, bos_lam=4.0, bos_gap=0.02,
                  sig_gap=(0.02, 0.02), g_gap=(0.0, 0.0), wp=0.11, K=24, tol_gram=1e-10, mixing=0.5, verbose=True, k_weight=None,
                  nodes_per_ray=120, node_range=(1e-3, 60.0), beta=None, thermal_tol=1e-8, thermal_floor=30.0, thermal_floor_f=None,
-                 wp_floor=15.0, mu_rule='auto', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
+                 wp_floor=15.0, mu_rule='neutral', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
                  scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5,
                  g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
@@ -145,6 +145,9 @@ class LineSCGW:
             return chemical_potential_T(e, v, self.nk, self.nelec, self.beta, self.k_weight)[0], 'number'
         if self.mu_rule == 'gap':
             return chemical_potential(e, v, self.nk, self.nelec, self.k_weight)[0], 'gap'
+        if self.mu_rule == 'neutral':
+            dmu, rule, _ = chemical_potential_neutral(e, v, self.nk, self.nelec, self.beta, self.k_weight, mu_dn_max=self.mu_dn_max)
+            return dmu, rule
         dmu, rule, _ = chemical_potential_auto(e, v, self.nk, self.nelec, self.beta, self.thermal_tol, self.k_weight,
                                                mu_dn_max=self.mu_dn_max, mu_th_factor=self.mu_th_factor)
         return dmu, rule
