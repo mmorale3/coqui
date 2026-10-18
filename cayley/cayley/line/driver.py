@@ -40,7 +40,8 @@ class LineSCGW:
                  sig_gap=(0.02, 0.02), g_gap=(0.0, 0.0), wp=0.11, K=24, tol_gram=1e-10, mixing=0.5, verbose=True, k_weight=None,
                  nodes_per_ray=120, node_range=(1e-3, 60.0), beta=None, thermal_tol=1e-8, thermal_floor=30.0, thermal_floor_f=None,
                  wp_floor=15.0, mu_rule='auto', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
-                 scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5):
+                 scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5,
+                 g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
         over node_range (Ha) — dense nodes are what pins the weight distribution of the far poles (dev/tune_sigma_fit.txt).
@@ -49,11 +50,19 @@ class LineSCGW:
         qminus: index of -q per q (default qk_to_k2[:, 0], k index 0 = Gamma); wstep: LineGW W-step parameters.
         scf_density (finite T only): "closure" (default) or "matsubara" (S8b.3 hybrid, module docstring); hyb_wmax: w_max (Ha)
         of the dense Matsubara set; hyb_tau_kw: (nn, per_efold, x0) of the Sigma tau leg (default thc_gw.HYBRID_DEFAULTS).
-        theta_t_frac: ray angle theta_t = theta_t_frac * theta (0.5 = theta/2, bitwise the previous rule; metals: 0.25)."""
+        theta_t_frac: ray angle theta_t = theta_t_frac * theta (0.5 = theta/2, bitwise the previous rule; metals: 0.25).
+        g_repr (T = 0 loop): "compressed" (default, per-sector LS fit of G on the G bases) or "lehmann" (D1 2026-10-18: the poles and
+        vectors of the closure kept, pruned like the C++ driver, closure.hpp g_repr_params_t: (i) |e_m| > g_emax (default lam) or
+        e_m == 0 dropped, (ii) weight < g_wtol, (iii) |e_m| < g_emin_frac * QP half gap AND weight < g_wsmall; C++ defaults).
+        The compressed fit does not conserve the electron count when the node range barely exceeds the pole range (molecules:
+        node_tmax = 2 lam, lam 55 Ha -> N drifts 10.03 and the loop diverges after ~8 iterations); the Lehmann form is exact."""
         self.X, self.Z, self.qk, self.nk, self.nelec, self.H0 = X, Z, qk_to_k2, nk, nelec, H0
         self.nb = X.shape[2]; self.mu = mu; self.theta, self.eps, self.lam = theta, eps, lam
         self.theta_t = theta * theta_t_frac
         self.wp, self.K, self.mixing, self.verbose = wp, K, mixing, verbose
+        assert g_repr in ('compressed', 'lehmann')
+        self.g_repr, self.g_emax = g_repr, (lam if g_emax is None else g_emax)
+        self.g_wtol, self.g_emin_frac, self.g_wsmall = g_wtol, g_emin_frac, g_wsmall
         self.tol_gram = tol_gram if tol_gram is not None else 1e-10
         self.k_weight = k_weight
         tmax = node_range[1]
@@ -258,21 +267,43 @@ class LineSCGW:
         self.mu += dmu; e_arr = e_arr - dmu; self.gw.mu = self.mu
         wk_ = np.full(nk, 1.0 / nk) if self.k_weight is None else np.asarray(self.k_weight) / np.sum(self.k_weight)
         nel_exact = float(sum(2.0 * wk_[k] * (np.abs(v_arr[k][:, e_arr[k] < 0]) ** 2).sum() for k in range(nk)))
-        # compressed per-sector G and the new static part
-        w_g, c_g, dropped = [], [], 0.0
-        for ik in range(nk):
-            wk, ck_, dr = compress_sectors(self.gp, self.gh, self.fz, e_arr[ik], v_arr[ik]); w_g.append(wk); c_g.append(ck_); dropped = max(dropped, dr)
-        gw.set_poles(np.array(w_g), coef=np.array(c_g))
+        if self.g_repr == 'lehmann':                                         # pruned Lehmann G (C++ g_repr "lehmann")
+            e_k, v_k, dropped, npr = self._prune_lehmann(e_arr, v_arr, 0.5 * (e_lumo - e_homo))
+            M = max(len(e) for e in e_k)                                     # pad: zero vectors far away (no contribution)
+            gw.set_poles(np.array([np.pad(e, (0, M - len(e)), constant_values=1e6) for e in e_k]),
+                         np.array([np.pad(v, ((0, 0), (0, M - v.shape[1]))) for v in v_k]))
+        else:                                                                # compressed per-sector G
+            w_g, c_g, dropped = [], [], 0.0
+            for ik in range(nk):
+                wk, ck_, dr = compress_sectors(self.gp, self.gh, self.fz, e_arr[ik], v_arr[ik]); w_g.append(wk); c_g.append(ck_); dropped = max(dropped, dr)
+            gw.set_poles(np.array(w_g), coef=np.array(c_g)); npr = (0, 0.0, 0, 0.0)
+        # the new static part
         Dm = gw.density_matrix(); nel = 2 * np.einsum('kii->', Dm).real / nk
         self.F = gw.hartree_exchange(Dm)
         rec = dict(dSigma=dS, mu=self.mu, dmu=dmu, gap_eV=(e_lumo - e_homo) * 27.211386, nelec=nel, nelec_exact=nel_exact, dropped_weight=dropped,
-                   npoles=[i['npoles'] for i in info_all], heldout=[i['heldout_err'] for i in info_all], tW=tW, tS=tS, ttot=time.time() - t0)
+                   pruned=npr, npoles=[i['npoles'] for i in info_all], heldout=[i['heldout_err'] for i in info_all], tW=tW, tS=tS, ttot=time.time() - t0)
         self.history.append(rec)
         if self.verbose:
             print(f"iter {len(self.history)}: dSigma {dS:.2e}  mu {self.mu:.6f} (dmu {dmu*27.2114:+.4f} eV)  QP gap {rec['gap_eV']:.4f} eV  "
                   f"nelec {nel:.6f} (Lehmann {nel_exact:.6f}, dropped weight {dropped:.1e})  npoles {min(rec['npoles'])}-{max(rec['npoles'])}  "
                   f"held-out {max(rec['heldout']):.1e}  [W {tW:.0f}s, Sigma {tS:.0f}s, total {rec['ttot']:.0f}s]", flush=True)
         return rec
+
+    def _prune_lehmann(self, e_arr, v_arr, half_gap):
+        """C++ closure.hpp (g_repr "lehmann"): per k, drop |e| > g_emax or e == 0 (weight -> dropped, max over k), prune weight < g_wtol
+        and (|e| < g_emin_frac * half_gap and weight < g_wsmall). Returns (e list, v list, dropped, (n_w, w_w, n_near, w_near))."""
+        e_near = self.g_emin_frac * half_gap if self.g_emin_frac > 0 else 0.0
+        e_out, v_out, dropped, nw, ww, nn, wn = [], [], 0.0, 0, 0.0, 0, 0.0
+        for e, v in zip(e_arr, v_arr):
+            w = (np.abs(v) ** 2).sum(axis=0); ae = np.abs(e)
+            far = (ae > self.g_emax) | (e == 0.0)
+            small = ~far & (w < self.g_wtol)
+            near = ~far & ~small & (ae < e_near) & (w < self.g_wsmall)
+            keep = ~(far | small | near)
+            dropped = max(dropped, float(w[far].sum())); nw += int(small.sum()); ww += float(w[small].sum())
+            nn += int(near.sum()); wn += float(w[near].sum())
+            e_out.append(e[keep]); v_out.append(v[:, keep])
+        return e_out, v_out, dropped, (nw, ww, nn, wn)
 
     def sigma_total(self, ik):
         if self.beta is not None:
