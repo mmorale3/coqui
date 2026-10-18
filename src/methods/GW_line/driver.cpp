@@ -427,6 +427,20 @@ nda::array<ComplexType, 3> one_body_h0(mf::MF &mf) {
     for (long i = 0; i < nb; ++i)
       for (long j = 0; j < nb; ++j) H0(ik, i, j) = 0.5 * (H0l(0, ik, i, j) + std::conj(H0l(0, ik, j, i)));   // hermitize
   mpi->comm.barrier();
+  // GW_line assumes an orthonormal band basis (S = 1, never reads the overlap). A pyscf molecule written in the AO basis
+  // (converter mo=False, e.g. tests/unit_test_files/pyscf/h2o_mol) would run silently wrong: require the MO basis (D1).
+  if (mf.mf_type() == mf::pyscf_source) {
+    auto sS = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(*mpi, {ns, nkI, nb, nb});
+    hamilt::set_ovlp(mf, sS);
+    auto Sl = sS.local();
+    double err = 0.0;
+    for (long ik = 0; ik < nkI; ++ik)
+      for (long i = 0; i < nb; ++i)
+        for (long j = 0; j < nb; ++j) err = std::max(err, std::abs(Sl(0, ik, i, j) - ComplexType(i == j ? 1.0 : 0.0)));
+    mpi->comm.barrier();
+    utils::check(err <= 1e-8, "gw_line: pyscf mean field in a non-orthonormal basis (max|S - 1| = {:.3e}); write it in the MO basis "
+                              "(scripts/molecules/pyscf_to_coqui.py --mo)", err);
+  }
   return H0;
 }
 
