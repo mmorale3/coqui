@@ -1313,8 +1313,12 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
   const k_dist_t kd(nk, comm);                         // owner of Sigma(k) (S7e: k-distributed Sigma)
   k_dist_t const *kdp = prm.sigma_kdist ? &kd : nullptr;
   const bool sig_all  = (prm.checkpoint_sigma == "all");
-  utils::check(std::abs(nelec - 2.0 * nocc) < 1e-8 and nocc > 0 and nocc < nb,
-               "gw_line: need an even electron count with 0 < nelec/2 < nbnd (nelec {}, nbnd {})", nelec, nb);
+  // S8c: metals at finite T only (user decision 2026-10-10): beta > 0 allows an odd electron count and a KS spectrum without a
+  // band-ordered gap (mu0 is then only the reference of the mu-relative poles; the finite-T start sets mu by mu_rule)
+  const bool metal_ok = prm.beta > 0.0;
+  utils::check((metal_ok or std::abs(nelec - 2.0 * nocc) < 1e-8) and nocc > 0 and nocc < nb,
+               "gw_line: need an even electron count with 0 < nelec/2 < nbnd (nelec {}, nbnd {}; odd counts / metals need beta > 0)",
+               nelec, nb);
 
   utils::TimerManager Timer;
   for (auto nm : {"total", "H0", "bases", "time_grid", "phase_Pi", "phase_W", "phase_Sigma", "phase_closure", "phase_F",
@@ -1358,7 +1362,10 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
       if (n < nocc) homo = std::max(homo, eig(ik, n));
       else lumo = std::min(lumo, eig(ik, n));
     }
-  utils::check(lumo > homo, "gw_line: the KS spectrum has no gap (homo {} lumo {})", homo, lumo);
+  utils::check(metal_ok or lumo > homo, "gw_line: the KS spectrum has no gap (homo {} lumo {}; metals need beta > 0)", homo, lumo);
+  if (lumo <= homo or std::abs(nelec - 2.0 * nocc) > 1e-8)
+    app_log(1, "  KS spectrum without a band-ordered gap (nelec {}, band edges {:.6f} / {:.6f} Ha): metal at finite T (S8c)", nelec, homo,
+            lumo);
   const double mu0 = 0.5 * (homo + lumo);
 
   // fixed grids and bases
@@ -1509,12 +1516,12 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
   };
   auto update_bases = [&]() {
     Timer.start("bases");
-    const double bgap = prm.bos_gap >= 0.0 ? prm.bos_gap : 0.5 * (st.e_lumo - st.e_homo);
+    const double bgap = prm.bos_gap >= 0.0 ? prm.bos_gap : std::max(0.0, 0.5 * (st.e_lumo - st.e_homo));   // S8c: >= 0 (metals)
     if (not bos or bos->gap != bgap) make_bos(bos, bgap);
     double gpp = prm.sigma_gap, ghh = prm.sigma_gap;
     if (prm.sigma_gap < 0.0) {
-      gpp = 0.8 * (st.e_lumo + bos->gap);
-      ghh = 0.8 * (std::abs(st.e_homo) + bos->gap);
+      gpp = std::max(0.0, 0.8 * (st.e_lumo + bos->gap));   // S8c: >= 0 (metals: e_lumo may be < 0)
+      ghh = std::max(0.0, 0.8 * (-st.e_homo + bos->gap));
     }
     if (not bp or bp->gap[1] != gpp) {
       bp.emplace(theta, prm.lam, lv_eps, prm.lam, gpp, -1.0, prm.node_tmax);
