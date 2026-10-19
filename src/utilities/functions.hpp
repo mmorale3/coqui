@@ -22,6 +22,8 @@
 #ifndef UTILITIES_FUNCTIONS_HPP
 #define UTILITIES_FUNCTIONS_HPP
 
+#include <limits>
+#include <vector>
 #include "utilities/check.hpp"
 #include "mpi3/communicator.hpp"
 #include "nda/nda.hpp"
@@ -95,6 +97,68 @@ requires( std::is_same_v<typename std::decay_t<Apairs>::value_type,
     }
   }
   gcomm.broadcast_n(g.data(),N,0);
+}
+
+/*
+ * Pivot selection of a distributed pivoted Cholesky: the N largest entries of the residual
+ * diagonal D (local slice; global grid index of local entry i = gidx(i)), with the output
+ * convention of max_element_multi + find_distributed_maximum: g(n) = (value, owner*N + n) and
+ * on the owner indx(n) = local position of pick n.
+ *
+ * rtol <= 0: exactly max_element_multi + find_distributed_maximum (the legacy selection).
+ * rtol > 0 : tie-robust and deterministic. Pick n is the SMALLEST global index among the
+ *   not-yet-picked entries within rtol*|m| of the current maximum m. Entries that are equal in
+ *   exact arithmetic (e.g. grid points related by a crystal symmetry outside the k-point group)
+ *   differ in D only by roundoff, which depends on the reduction order (MPI distribution, GPU
+ *   architecture, library kernels). The legacy argmax resolves such ties by that roundoff, so
+ *   the selected point set changes with the rank count and the GPU model; the index tie-break
+ *   removes the dependence (up to an entry falling within roundoff of the window edge).
+ *   Cost: 4 scalar all-reduces per pick.
+ */
+template<typename communicator, nda::ArrayOfRank<1> Ain, typename GidxFn,
+         nda::ArrayOfRank<1> Avals, nda::ArrayOfRank<1> Aindx, nda::ArrayOfRank<1> Apairs>
+void select_pivots(communicator & gcomm, Ain const& D, GidxFn && gidx, double rtol,
+                   Avals && vals, Aindx && indx, Apairs & g)
+{
+  int N = vals.size();
+  if(rtol <= 0.0) {
+    max_element_multi(D,vals,indx);
+    find_distributed_maximum(gcomm,vals,g);
+    return;
+  }
+  utils::check(N > 0 and indx.size() >= N and g.size() == N, "select_pivots - size mismatch");
+  utils::check(D.size() >= N, "select_pivots - fewer local entries ({}) than pivots ({})", D.size(), N);
+  static_assert(nda::mem::on_host<Avals,Aindx>, "Memory location mismatch");
+  auto Dh = nda::to_host(D);
+  long n = Dh.size();
+  std::vector<double> d(n);
+  for(long i=0; i<n; ++i) d[i] = double(std::real(Dh(i)));
+  std::vector<char> taken(n,0);
+  int rank = gcomm.rank();
+  const double lowest = std::numeric_limits<double>::lowest();
+  for(int p=0; p<N; ++p) {
+    double m = lowest;
+    for(long i=0; i<n; ++i) if(not taken[i] and d[i] > m) m = d[i];
+    gcomm.all_reduce_in_place_n(&m,1,boost::mpi3::max<>{});
+    double edge = m - rtol*std::abs(m);
+    long gl = std::numeric_limits<long>::max(), il = -1;
+    for(long i=0; i<n; ++i)
+      if(not taken[i] and d[i] >= edge and long(gidx(i)) < gl) { gl = long(gidx(i)); il = i; }
+    long gw = gl;
+    gcomm.all_reduce_in_place_n(&gw,1,boost::mpi3::min<>{});
+    utils::check(gw != std::numeric_limits<long>::max(), "select_pivots - no candidate for pick {}", p);
+    int owner = (il >= 0 and gl == gw) ? rank : -1;
+    gcomm.all_reduce_in_place_n(&owner,1,boost::mpi3::max<>{});
+    double v = (owner == rank) ? d[il] : lowest;
+    gcomm.all_reduce_in_place_n(&v,1,boost::mpi3::max<>{});
+    if(owner == rank) {
+      taken[il] = 1;
+      indx(p) = il;
+      vals(p) = v;
+    }
+    g(p).first  = v;
+    g(p).second = owner*N + p;
+  }
 }
 
 // same as above but over multiple sets of data

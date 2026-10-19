@@ -1,0 +1,592 @@
+#ifndef COQUI_VERTEX_SIGMA_PAIR_ICC
+#define COQUI_VERTEX_SIGMA_PAIR_ICC
+#include "methods/vertex/vertex_debug.hpp"
+#include <set>
+#include <cstdlib>
+
+/**
+ * The PAIR-RESOLVED static-ladder vertex in the SELF-ENERGY, built from the same pair-space machinery as the
+ * polarization ladder (dynbse.hpp / vertex_dynbse.icc) in the frozen secondary frame of the readout instance.
+ *
+ * Conventions (all inherited from the P side; nothing new is defined here):
+ *   pair space P = (k, a, b), D = nk nc^2, row k nc^2 + a nc + b;  D_N(k,a,b) = Xb(k,N,a) Xb(k+q,N,b)^*
+ *   Cb(q, i nu)(k; (p1'p3),(ab)) = -int e^{i nu tau} G_{a p1'}(k, beta-tau) G_{p3 b}(k+q, tau)   (build_cb_tau)
+ *   K_s = (sign_ks / nk) Kbig[W-bar_0]  (build_kbig),  T_s = K_s (1 - Cb K_s)^-1  (static_resolvent)
+ *   P side:  Pi = (spin/nk) D^dag Cb (1 + T_s Cb) D  =  Lambda(-nu)^dag Cb D  with the LEFT vertex
+ *            Lambda(-nu)^dag = D^dag (1 + Cb T_s)(nu).
+ * Sigma side: in the code's THC collocation convention the LEFT GW leg is X_i(k) X_c(k')^* = D_M(k',c,i)^* and the
+ * RIGHT leg is X_c'(k') X_j(k)^* = D_N(k',c',j), a RIGHT-type pair density, so its ladder dressing is the P side's own
+ * right vertex,
+ *            D_N  ->  D_N + A_N,     A(q, i nu) = T_s(nu) Cb(nu) D     (one rung: K_s Cb D)
+ * at +nu with no conjugation, and W enters as W_NM (N on the dressed leg). With these choices the one-rung term
+ * reproduces the static-rung Sigma^{C,x} kernel (vertex_sigma.icc) exactly; the left-vertex form [Cb T_s]^T D^* and
+ * its conjugate do not (W_MN instead of W_NM differs only by the anti-Hermitian part of W-bar_0).
+ * Then, with the loop's bosonic nu -> tau transform Ttw (the same rows the dynamic rung uses for W),
+ *     dSigma_ij(k, tau) = -(scale/nk) sum_q sum_cc' G_cc'(k', tau) [Ttw . H](tau; k', (c,i), (c',j)),
+ *     H(nu; k', ci, c'j) = sum_MN D_M(k',c,i)^* W-bar_NM(q, nu) A_N(k',c',j; nu),
+ * W-bar(q, nu) = W-bar_0 + [W_dyn(nu) - W_dyn(0)] (the cache _Wb_qwmm, even in nu as in the dynamic rung) or
+ * W-bar_0 alone ("outer static"). Externals i, j and the internal c, c' all in the C window (the
+ * "C-restricted externals" convention); the result is Hermitized in (i, j) and the residual metered.
+ *
+ * Every (s, q) unit is independent (all bosonic nodes of the unit are evaluated inside it: one D x D LU + an Nm-column
+ * solve per node for col "static"); units are round-robin over ranks and the (nt, ns, nk, nc, nc) result is all-reduced.
+ */
+
+namespace methods {
+namespace solvers {
+
+  namespace vertex_sigma_pair_detail {
+
+    using cplx = ComplexType;
+    namespace db = dynbse;
+    namespace vd = vertex_dynbse_detail;
+
+    /** Cb(q, i nu) at ALL bosonic nodes: Cb_all(l, k, (p1'p3), (ab)) -- build_cb_tau's arithmetic with every row kept. */
+    inline void build_cb_all(nda::MemoryArrayOfRank<5> auto const &G_CC, vertex_pi::iaft_tools const &tools,
+                             long is, long iq, nda::array<long, 2> const &kpq, nda::array<cplx, 4> &Cb_all) {
+      const long nt = G_CC.shape(0), nk = G_CC.shape(2), nc = G_CC.shape(3), nc2 = nc * nc, nw_b = tools.nw_b;
+      utils::check(Cb_all.shape(0) == nw_b and Cb_all.shape(1) == nk and Cb_all.shape(2) == nc2 and Cb_all.shape(3) == nc2,
+                   "vertex_sigma_pair::build_cb_all: output shape.");
+      nda::array<cplx, 2> Pf(nt, nc2 * nc2), Bf(nw_b, nc2 * nc2);
+      for (long ik = 0; ik < nk; ++ik) {
+        const long ikpq = kpq(iq, ik);
+        for (long s = 0; s < nt; ++s) {
+          const long sm = tools.t_mirror(s);
+          for (long p1p = 0; p1p < nc; ++p1p)
+            for (long p3 = 0; p3 < nc; ++p3)
+              for (long a = 0; a < nc; ++a)
+                for (long b = 0; b < nc; ++b)
+                  Pf(s, (p1p * nc + p3) * nc2 + (a * nc + b)) = G_CC(sm, is, ik, a, p1p) * G_CC(s, is, ikpq, p3, b);
+        }
+        nda::blas::gemm(cplx(-1.0), tools.Twt_bb, Pf, cplx(0.0), Bf);
+        for (long l = 0; l < nw_b; ++l)
+          for (long r = 0; r < nc2; ++r)
+            for (long c = 0; c < nc2; ++c) Cb_all(l, ik, r, c) = Bf(l, r * nc2 + c);
+      }
+    }
+
+    /**
+     * THE DRIVER. dSig (nt, ns, nk, nc, nc) is ZEROED here and accumulated by the units this rank owns (the caller
+     * all-reduces and Hermitizes). Wbh = the cache _Wb_qwmm (nq, nw_half, Nm, Nm), read only for outer = "dynamic".
+     * opt.Pi_check (nw_b, nq, Nm, Nm), when non-null, receives (spin/nk) D^dag Cb A = the static-ladder correction
+     * of Pi in the P side's own normalization (equals the P-side static-ladder Pi at the +nu half nodes).
+     * opt.nu_diag: the Gram spectrum over nu of A per unit (max over units, normalized, descending) -> met->nu_spec.
+     */
+    inline void eval_pair_sigma(nda::MemoryArrayOfRank<5> auto const &G_CC,    // (nt,ns,nk,nc,nc) full BZ
+                                nda::array<cplx, 4> const &Xb,                 // (ns,nk,Nm,nc)
+                                nda::array<cplx, 3> const &W0b,                // (nq,Nm,Nm)
+                                nda::array_view<cplx, 4> const *Wbh,           // (nq,nw_half,Nm,Nm) or nullptr (a view, no copy)
+                                nda::array<long, 2> const &kmq, nda::array<long, 2> const &kpq,
+                                vertex_pi::iaft_tools const &tools, long rank, long nproc,
+                                vertex_t::sigma_pair_opts const &opt, nda::array<cplx, 5> &dSig,
+                                vertex_t::sigma_pair_meter *met, vertex_sym::sym_ctx const *symc = nullptr,
+                                nda::array<cplx, 5> const *G_close = nullptr) {
+      // G_close (Wannier frame): the G of the tau CLOSURE sum_cc' G_cc'(k', tau) H(ci, c'j). The closure pairs the
+      // CONJUGATED collocation with G's first index (the band-frame pattern), the ladder's pair bubble pairs the
+      // unconjugated one -- so under a unitary change of the window basis the ladder wants G-bar = U^dag G U (the P side's
+      // Wannier inputs, G_CC here) while the closure wants U^T G U^* (using G-bar there is wrong for a complex U;
+      // the two coincide for real U, for U = 1 and for time-reversal images, where the transpose is the conjugate).
+      decltype(nda::range::all) all;
+      vertex_ladder_detail::prof_watch watch;
+      const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3);
+      const long Nm = Xb.shape(2), nc2 = nc * nc, D = nc2 * nk, nq = W0b.shape(0), nw_b = tools.nw_b;
+      // The SYMMETRIC mesh: W0b / the cache carry nq_ibz rows; kmq / kpq the FULL transfer mesh; the units
+      // run over the FULL mesh of external transfers q (every k' + q must reach the IBZ externals), the rung and the outer
+      // W-bar are read at q_star(q) (PQ-TRANSPOSED for a time-reversal transfer, as build_kbig does), the legs are the full-BZ
+      // collocations, and dSigma is accumulated for the IBZ representatives only (the first nk_ibz points of the full list).
+      const bool sym = (symc != nullptr and symc->active);
+      // The IBZ solve: with opt.ibz the units run over the IBZ transfers only (identity-frame legs, W-bar read
+      // directly), each unit deposits its contribution for EVERY k of the full mesh into a scratch, and the star fold
+      // (vertex_sym::fold_star_into_ibz) rotates it onto the IBZ externals -- nq_ibz solves instead of nq_full.
+      const bool ibz = sym and opt.ibz;
+      const long nq_units = (sym and not ibz) ? symc->nq_full : nq;
+      const long nk_ext = sym ? symc->nk_ibz : nk;
+      long n_trev_images = 0, n_cjg_rot = 0;
+      const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+      const bool dyn_outer = (opt.outer == "dynamic");
+      const bool one_rung = (opt.col == "static1");
+      // The dressed JUNCTION. "right" = the ladder on the right GW leg (A = T_s Cb D, see the file header);
+      // "left" = the ladder on the LEFT leg, the P side's left vertex D^dag (1 + Cb T_s): A~ = [Cb T_s]^T D^* (one rung
+      // [Cb K_s]^T D^*), contracted as H(ci, c'j) = sum_MN A~_M(ci) W_NM D_N(c'j); "both" = the average of the two
+      // one-sided insertions (the diagram set whose mirror image is its own Hermitian conjugate).
+      const bool side_r = (opt.side == "right" or opt.side == "both"), side_l = (opt.side == "left" or opt.side == "both");
+      utils::check(side_r or side_l, "vertex_sigma_pair: unknown junction \"{}\" (right | left | both).", opt.side);
+      utils::check(opt.col == "static" or opt.col == "static1",
+                   "vertex_sigma_pair: unknown column \"{}\" (static | static1).", opt.col);
+      utils::check(opt.outer == "dynamic" or opt.outer == "static",
+                   "vertex_sigma_pair: unknown outer W \"{}\" (dynamic | static).", opt.outer);
+      if (sym)
+        utils::check(nq == symc->nq_ibz and kmq.shape(0) == symc->nq_full and kpq.shape(0) == symc->nq_full and kmq.shape(1) == nk and
+                     symc->nk_full == nk, "vertex_sigma_pair: symmetry mesh mismatch (nq_w = {}, nq_ibz = {}, kmq {} x {}, nq_full = {}).",
+                     nq, symc->nq_ibz, kmq.shape(0), kmq.shape(1), symc->nq_full);
+      else
+        utils::check(kmq.shape(0) == nq and kpq.shape(0) == nq and kmq.shape(1) == nk,
+                     "vertex_sigma_pair: nosym mesh expected (nq = {}, kmq {} x {}).", nq, kmq.shape(0), kmq.shape(1));
+      utils::check(nt == tools.nt_f, "vertex_sigma_pair: G tau axis {} != nt_f {}.", nt, tools.nt_f);
+      // The full-mesh symmetric path writes Pi_check for the external transfers iq < nq (= nq_ibz) and dSigma for
+      // the external k < nk_ext (= nk_ibz) as if those leading points of the FULL lists were the IBZ representatives
+      // themselves (identity-mapped). Assert it instead of assuming it (the k side is asserted by the caller, which owns
+      // the k maps: vertex_t::eval_sigma_pair).
+      if (sym)
+        for (long q = 0; q < nq; ++q)
+          utils::check(symc->q_star(q) == q and not symc->q_trev(q) and symc->q_isym(q) == 0,
+                       "vertex_sigma_pair: the full transfer list does not start with the IBZ transfers (q = {}: star {}, "
+                       "trev {}, isym {}); the IBZ-first layout this kernel indexes by is violated.", q, symc->q_star(q),
+                       int(symc->q_trev(q)), symc->q_isym(q));
+      if (dyn_outer) {
+        utils::check(Wbh != nullptr and Wbh->shape(0) == nq and Wbh->shape(1) == nw_half and Wbh->shape(2) == Nm and
+                     Wbh->shape(3) == Nm, "vertex_sigma_pair: the W-bar cache is absent or mis-shaped (outer = dynamic).");
+      }
+      utils::check(dSig.shape(0) == nt and dSig.shape(1) == ns and dSig.shape(2) == nk_ext and dSig.shape(3) == nc and
+                   dSig.shape(4) == nc, "vertex_sigma_pair: dSigma shape (expected nk_ext = {}).", nk_ext);
+      dSig() = cplx(0.0);
+      if (opt.Pi_check != nullptr) {
+        utils::check(opt.Pi_check->shape(0) == nw_b and opt.Pi_check->shape(1) == nq and opt.Pi_check->shape(2) == Nm and
+                     opt.Pi_check->shape(3) == Nm, "vertex_sigma_pair: Pi_check shape.");
+        (*opt.Pi_check)() = cplx(0.0);
+      }
+      const double spinfac = (ns == 1) ? 2.0 : 1.0;
+      const cplx scale_k(opt.sign_ks / double(nk), 0.0);
+      // transfer lookup (build_kbig's qx_of) and the full-mesh nu unfold of the PH-sym half cache (the dynamic rung's map)
+      nda::array<long, 2> qx_of(nk, nk);
+      qx_of() = -1;
+      for (long iqx = 0; iqx < kmq.shape(0); ++iqx)
+        for (long ik = 0; ik < nk; ++ik) qx_of(ik, kmq(iqx, ik)) = iqx;
+      for (long ik = 0; ik < nk; ++ik)
+        for (long ikp = 0; ikp < nk; ++ikp)
+          utils::check(qx_of(ik, ikp) >= 0, "vertex_sigma_pair: transfer mesh does not connect k = {} to k' = {}.", ik, ikp);
+      const long lpos0 = std::max(tools.m0, tools.w_mirror_b(tools.m0)) - nw_b / 2;
+      auto lpos_of = [&](long l) { return std::max(l, tools.w_mirror_b(l)) - nw_b / 2; };
+      if (met) { met->t_setup += watch.lap(); met->nu_spec = nda::array<double, 1>(nw_b); met->nu_spec() = 0.0; }
+
+      nda::array<cplx, 2> Kbig(D, D), Ks(D, D), Dm(D, Nm), Dconj(D, Nm), Amp(D, Nm), CbD(D, Nm), CbA;
+      nda::matrix<cplx> Mlu(one_rung ? 0 : D, one_rung ? 0 : D);                     // the LU of 1 - Cb K_s
+      nda::matrix<cplx, nda::F_layout> Yf(one_rung ? 0 : D, one_rung ? 0 : Nm);      // getrs wants a Fortran-layout RHS
+      nda::array<int, 1> ipiv(one_rung ? 0 : D);
+      // the left junction: A~ = (1 - K_s^T Cb^T)^-1 K_s^T Cb^T D^* = one LU of M^T + an Nm-column solve (one rung: K_s^T Cb^T D^*)
+      const bool lu_left = side_l and not one_rung;
+      nda::matrix<cplx> Mt(lu_left ? D : 0, lu_left ? D : 0);
+      nda::matrix<cplx, nda::F_layout> Yl(lu_left ? D : 0, lu_left ? Nm : 0);
+      nda::array<int, 1> ipivt(lu_left ? D : 0);
+      nda::array<cplx, 2> CtD(side_l ? D : 0, side_l ? Nm : 0), Al(side_l ? D : 0, side_l ? Nm : 0), Bl, Hl;
+      if (side_l) { Bl = nda::array<cplx, 2>(nc2, Nm); Hl = nda::array<cplx, 2>(nc2, nc2); }
+      nda::array<cplx, 4> Cb_all(nw_b, nk, nc2, nc2);
+      nda::array<cplx, 2> Hall(nw_b, nk * nc2 * nc2), Ht(nt, nk * nc2 * nc2);
+      nda::array<cplx, 2> Wq(Nm, Nm), Bk(nc2, Nm), Hk(nc2, nc2), Pchk;
+      nda::array<cplx, 3> Astore;
+      if (opt.Pi_check != nullptr) { CbA = nda::array<cplx, 2>(D, Nm); Pchk = nda::array<cplx, 2>(Nm, Nm); }
+      if (opt.nu_diag) Astore = nda::array<cplx, 3>(nw_b, D, Nm);
+      nda::array<cplx, 4> dSq;                                            // IBZ solve: one unit's contribution on the full k mesh
+      if (ibz) dSq = nda::array<cplx, 4>(nt, nk, nc, nc);
+      // diagnostic dump (vertex_debug sigpair_ibz_dump = <file prefix>): every unit's deposit -- the full-k object of the IBZ path,
+      // the IBZ-k deposit of the full-mesh path -- and the symmetry tables, for the offline per-image check of the fold
+      const auto dump_opt = sym ? vertex_debug::get("sigpair_ibz_dump") : std::nullopt;   // vertex_debug: sigpair_ibz_dump = <file prefix>
+      const char *dump_env = dump_opt ? dump_opt->c_str() : nullptr;
+      nda::array<cplx, 4> dS_unit;
+      if (dump_env != nullptr and not ibz) dS_unit = nda::array<cplx, 4>(nt, nk_ext, nc, nc);
+      auto dump_unit = [&](long is_, long iq_, nda::array<cplx, 4> const &A) {
+        const std::string fn = std::string(dump_env) + (ibz ? ".ibz" : ".full") + ".r" + std::to_string(rank) + ".h5";
+        static std::set<std::string> opened;
+        h5::file f(fn, opened.count(fn) ? 'a' : 'w');
+        opened.insert(fn);
+        h5::group g(f);
+        nda::h5_write(g, "unit_" + std::to_string(is_) + "_" + std::to_string(iq_), A);
+        if (ibz and not g.has_dataset("q_star")) {
+          nda::h5_write(g, "q_star", symc->q_star); nda::h5_write(g, "q_isym", symc->q_isym);
+          nda::array<long, 1> qt(symc->nq_full); for (long q = 0; q < symc->nq_full; ++q) qt(q) = symc->q_trev(q) ? 1 : 0;
+          nda::h5_write(g, "q_trev", qt); nda::h5_write(g, "krot", symc->krot); nda::h5_write(g, "ktrev_pair", symc->ktrev_pair); nda::h5_write(g, "kminus", symc->kminus);
+          nda::h5_write(g, "qminus", symc->qminus); nda::h5_write(g, "Dc", symc->Dc);
+          nda::array<long, 2> cj(symc->nsym, symc->nk_full);
+          for (long a = 0; a < symc->nsym; ++a) for (long b = 0; b < symc->nk_full; ++b) cj(a, b) = symc->cjg(a, b) ? 1 : 0;
+          nda::h5_write(g, "cjg", cj);
+          nda::h5_write(g, "kpq", kpq);
+        }
+      };
+      const long nunits = ns * nq_units;
+      for (long u = rank; u < nunits; u += nproc) {
+        const long is = u / nq_units, iq = u % nq_units;
+        const long qsx = (sym and not ibz) ? symc->q_star(iq) : iq;            // the stored (IBZ) transfer of this unit's external q
+        // read W-bar(q) PQ-transposed for a time-reversal transfer; honours vertex_debug sym_trev_notrans like
+        // the rung read of this same unit (build_kbig) and every Pi-side read
+        const bool trx = (sym and not ibz) ? (bool(symc->q_trev(iq)) and vertex_sym::trev_read_transposed()) : false;
+        // ---- the external legs (pair densities) of this transfer ------------------------------------
+        // symmetric mesh: W-bar(q) is stored at q_star in the aux frame of the mapping symmetry q_isym(q), so the legs
+        // that couple the pair to it are the EFFECTIVE columns Xhat(is, jsym, k) (rotation into that frame + the trev
+        // conjugation; identity for jsym = 0) -- the rung builder's own routing (build_U_legs). The C-window bands carry
+        // no rotation (identity D by convention), so G_CC(k') pairs with them unchanged.
+        const long jsx = (sym and not ibz) ? symc->q_isym(iq) : 0;
+        for (long k = 0; k < nk; ++k) {
+          const long kq = kpq(iq, k);
+          if (sym and not ibz) {
+            auto Xk = symc->Xhat(is, jsx, k, all, all);
+            auto Xkq = symc->Xhat(is, jsx, kq, all, all);
+            for (long a = 0; a < nc; ++a)
+              for (long b = 0; b < nc; ++b)
+                for (long N = 0; N < Nm; ++N) {
+                  const cplx v = Xk(N, a) * std::conj(Xkq(N, b));
+                  Dm(k * nc2 + a * nc + b, N) = v;
+                  Dconj(k * nc2 + a * nc + b, N) = std::conj(v);
+                }
+          } else {
+            for (long a = 0; a < nc; ++a)
+              for (long b = 0; b < nc; ++b)
+                for (long N = 0; N < Nm; ++N) {
+                  const cplx v = Xb(is, k, N, a) * std::conj(Xb(is, kq, N, b));
+                  Dm(k * nc2 + a * nc + b, N) = v;
+                  Dconj(k * nc2 + a * nc + b, N) = std::conj(v);
+                }
+          }
+        }
+        // ---- the static rung and its hermiticity meter ---------------------------------------------
+        vd::build_kbig(Xb, W0b, is, iq, kpq, qx_of, Kbig, symc);
+        Ks() = Kbig * scale_k;
+        if (met) {
+          double dh = 0.0, kmx = 0.0;
+          for (long i = 0; i < D; ++i)
+            for (long j = 0; j < D; ++j) {
+              dh = std::max(dh, std::abs(Ks(i, j) - std::conj(Ks(j, i))));
+              kmx = std::max(kmx, std::abs(Ks(i, j)));
+            }
+          met->ks_herm = std::max(met->ks_herm, (kmx > 0.0) ? dh / kmx : 0.0);
+          met->t_ks += watch.lap();
+        }
+        // ---- the pair bubble at every bosonic node ---------------------------------------------------
+        build_cb_all(G_CC, tools, is, iq, kpq, Cb_all);
+        if (met) met->t_cb += watch.lap();
+        // ---- per node: the amplitude A~(nu) = [Cb T_s]^T D^*  and  H(nu) = D . W-bar(nu) . A~(nu) ---------
+        for (long l = 0; l < nw_b; ++l) {
+          nda::array<cplx, 3> Cb_k(nk, nc2, nc2);
+          Cb_k() = Cb_all(l, all, all, all);
+          // Cb D (block-diagonal Cb: nk gemms) and the dressed amplitude A = (T_s | K_s) . Cb D  (D x Nm):
+          //   T_s Cb D = K_s (1 - Cb K_s)^-1 Cb D  ->  ONE LU of M = 1 - Cb K_s and a solve with Nm right-hand sides
+          //   (cheaper than the explicit inverse + a D x D gemm of build_static_resolvent; identical to rounding)
+          for (long k = 0; k < nk; ++k) {
+            auto Ck = Cb_k(k, all, all);
+            auto Dk = Dm(nda::range(k * nc2, (k + 1) * nc2), all);
+            auto Ok = CbD(nda::range(k * nc2, (k + 1) * nc2), all);
+            nda::blas::gemm(Ck, Dk, Ok);
+          }
+          if (one_rung) {
+            nda::blas::gemm(Ks, CbD, Amp);
+          } else {
+            for (long k = 0; k < nk; ++k) {                       // M = 1 - Cb K_s (Cb block-diagonal: nk gemms)
+              auto Ck = Cb_k(k, all, all);
+              auto Kk = Ks(nda::range(k * nc2, (k + 1) * nc2), all);
+              auto Mk = Mlu(nda::range(k * nc2, (k + 1) * nc2), all);
+              nda::blas::gemm(cplx(-1.0), Ck, Kk, cplx(0.0), Mk);
+            }
+            for (long i = 0; i < D; ++i) Mlu(i, i) += cplx(1.0);
+            if (lu_left)
+              for (long i = 0; i < D; ++i)
+                for (long j = 0; j < D; ++j) Mt(i, j) = Mlu(j, i);                    // M^T before M is factorized
+            Yf() = CbD;
+            const int info_f = nda::lapack::getrf(Mlu, ipiv);
+            utils::check(info_f == 0, "vertex_sigma_pair: getrf of (1 - Cb K_s) failed (info {}) at node {}, q {}.", info_f, l, iq);
+            const int info_s = nda::lapack::getrs(Mlu, Yf, ipiv);
+            utils::check(info_s == 0, "vertex_sigma_pair: getrs failed (info {}).", info_s);
+            if (met) met->t_lu += watch.lap();
+            nda::blas::gemm(Ks, Yf, Amp);
+          }
+          if (side_l) {
+            // Cb^T D^* per k block, then K_s^T . (Cb^T D^*), then the resolvent (1 - K_s^T Cb^T)^-1 = (M^T)^-1
+            for (long k = 0; k < nk; ++k) {
+              auto Ck = Cb_k(k, all, all);
+              auto Dk = Dconj(nda::range(k * nc2, (k + 1) * nc2), all);
+              auto Ok = CtD(nda::range(k * nc2, (k + 1) * nc2), all);
+              nda::blas::gemm(nda::transpose(Ck), Dk, Ok);
+            }
+            if (one_rung) {
+              nda::blas::gemm(nda::transpose(Ks), CtD, Al);
+            } else {
+              nda::array<cplx, 2> Rl(D, Nm);
+              nda::blas::gemm(nda::transpose(Ks), CtD, Rl);
+              Yl() = Rl;
+              const int info_tf = nda::lapack::getrf(Mt, ipivt);
+              utils::check(info_tf == 0, "vertex_sigma_pair: getrf of (1 - K_s^T Cb^T) failed (info {}) at node {}, q {}.", info_tf, l, iq);
+              const int info_ts = nda::lapack::getrs(Mt, Yl, ipivt);
+              utils::check(info_ts == 0, "vertex_sigma_pair: getrs (left) failed (info {}).", info_ts);
+              Al() = Yl;
+              if (met) met->t_lu += watch.lap();
+            }
+          }
+          if (opt.Pi_check != nullptr) {
+            if (opt.side == "left") {
+              // (spin/nk) A~^T (Cb D): the same P-side object from the LEFT amplitude (== D^dag Cb A by K_s hermiticity)
+              nda::blas::gemm(nda::transpose(Al), CbD, Pchk);
+            } else {
+            // (spin/nk) D^dag (Cb A): the P side's static-ladder correction from these amplitudes
+            for (long k = 0; k < nk; ++k) {
+              auto Ck = Cb_k(k, all, all);
+              auto Ak = Amp(nda::range(k * nc2, (k + 1) * nc2), all);
+              auto Ok = CbA(nda::range(k * nc2, (k + 1) * nc2), all);
+              nda::blas::gemm(Ck, Ak, Ok);
+            }
+            nda::blas::gemm(nda::transpose(Dconj), CbA, Pchk);        // (Nm x D)(D x Nm)
+            }
+            for (long M = 0; M < Nm; ++M)
+              for (long N = 0; N < Nm; ++N) if (not sym or iq < nq) (*opt.Pi_check)(l, iq, M, N) = cplx(spinfac / double(nk)) * Pchk(M, N);
+          }
+          if (opt.nu_diag) Astore(l, all, all) = Amp;
+          if (met) met->t_amp += watch.lap();
+          // W-bar(q, nu): W-bar_0 (+ the dynamic fluctuation of the cache, even in nu)
+          if (trx) Wq() = nda::transpose(W0b(qsx, all, all));
+          else Wq() = W0b(qsx, all, all);
+          if (dyn_outer) {
+            const long lp = lpos_of(l);
+            for (long M = 0; M < Nm; ++M)
+              for (long N = 0; N < Nm; ++N) {
+                const cplx dw = trx ? ((*Wbh)(qsx, lp, N, M) - (*Wbh)(qsx, lpos0, N, M)) : ((*Wbh)(qsx, lp, M, N) - (*Wbh)(qsx, lpos0, M, N));
+                Wq(M, N) += dw;
+              }
+          }
+          for (long kp = 0; kp < nk; ++kp) {
+            auto Ak = Amp(nda::range(kp * nc2, (kp + 1) * nc2), all);     // (nc2, Nm): rows (c', j), the dressed right leg
+            auto Dk = Dconj(nda::range(kp * nc2, (kp + 1) * nc2), all);   // (nc2, Nm): rows (c, i), the left leg D^*
+            if (side_r) {
+              nda::blas::gemm(Ak, Wq, Bk);                                  // B(c'j, M) = sum_N A(c'j, N) W(N, M)
+              nda::blas::gemm(Dk, nda::transpose(Bk), Hk);                 // H(ci, c'j) = sum_M D^*(ci, M) B(c'j, M)
+            } else {
+              Hk() = cplx(0.0);
+            }
+            if (side_l) {
+              auto Alk = Al(nda::range(kp * nc2, (kp + 1) * nc2), all);   // (nc2, Nm): rows (c, i), the dressed LEFT leg A~
+              auto Dmk = Dm(nda::range(kp * nc2, (kp + 1) * nc2), all);   // (nc2, Nm): rows (c', j), the bare right leg D
+              nda::blas::gemm(Alk, nda::transpose(Wq), Bl);               // B'(ci, N) = sum_M A~(ci, M) W(N, M)
+              nda::blas::gemm(Bl, nda::transpose(Dmk), Hl);               // H_L(ci, c'j) = sum_N B'(ci, N) D(c'j, N)
+              if (side_r) { Hk += Hl; Hk *= cplx(0.5); } else { Hk() = Hl; }
+            }
+            for (long r = 0; r < nc2; ++r)
+              for (long c = 0; c < nc2; ++c) Hall(l, (kp * nc2 + r) * nc2 + c) = Hk(r, c);
+          }
+          if (met) met->t_con += watch.lap();
+        }
+        // ---- nu -> tau (one gemm) and the tau-local contraction with G ------------------------------
+        nda::blas::gemm(tools.Ttw_bb, Hall, Ht);                          // (nt x nw_b)(nw_b x nk nc^4)
+        const cplx pref(-opt.scale / double(nk), 0.0);
+        if (ibz) dSq() = cplx(0.0);
+        if (dS_unit.size() > 0) dS_unit() = cplx(0.0);
+        for (long kp = 0; kp < nk; ++kp) {
+          const long k = kpq(iq, kp);                                     // k = k' + q
+          if (not ibz and k >= nk_ext) continue;                         // symmetric full-mesh path: IBZ representatives only
+          for (long it = 0; it < nt; ++it)
+            for (long i = 0; i < nc; ++i)
+              for (long j = 0; j < nc; ++j) {
+                cplx acc(0.0);
+                if (G_close != nullptr) {
+                  for (long c = 0; c < nc; ++c)
+                    for (long cp = 0; cp < nc; ++cp)
+                      acc += (*G_close)(it, is, kp, c, cp) * Ht(it, (kp * nc2 + c * nc + i) * nc2 + cp * nc + j);
+                } else {
+                  for (long c = 0; c < nc; ++c)
+                    for (long cp = 0; cp < nc; ++cp)
+                      acc += G_CC(it, is, kp, c, cp) * Ht(it, (kp * nc2 + c * nc + i) * nc2 + cp * nc + j);
+                }
+                if (ibz) dSq(it, k, i, j) += pref * acc;
+                else dSig(it, is, k, i, j) += pref * acc;
+                if (dS_unit.size() > 0) dS_unit(it, k, i, j) += pref * acc;
+              }
+        }
+        if (ibz) vertex_sym::fold_star_into_ibz(*symc, iq, dSq, dSig(all, is, all, all, all), &n_trev_images, &n_cjg_rot);
+        if (dump_env != nullptr) dump_unit(is, iq, ibz ? dSq : dS_unit);
+        if (ibz and vertex_debug::flag("sigpair_ibz_diag")) {   // vertex_debug: sigpair_ibz_diag
+          // IBZ-solve diagnostic: the Hermiticity of this unit's deposit at the IBZ and the non-IBZ externals, and its star
+          double ah_ibz = 0.0, ah_out = 0.0, mx = 0.0;
+          for (long k = 0; k < nk; ++k)
+            for (long it = 0; it < nt; ++it)
+              for (long i = 0; i < nc; ++i)
+                for (long j = 0; j < nc; ++j) {
+                  const double d = std::abs(dSq(it, k, i, j) - std::conj(dSq(it, k, j, i)));
+                  mx = std::max(mx, std::abs(dSq(it, k, i, j)));
+                  if (k < nk_ext) ah_ibz = std::max(ah_ibz, d); else ah_out = std::max(ah_out, d);
+                }
+          std::string star;
+          for (long qp = 0; qp < symc->nq_full; ++qp)
+            if (symc->q_star(qp) == iq) {
+              long ncj = 0;
+              for (long k = 0; k < nk_ext; ++k) if (symc->q_isym(qp) != 0 and symc->cjg(symc->q_isym(qp), k)) ++ncj;
+              star += " (" + std::to_string(qp) + ", js " + std::to_string(symc->q_isym(qp)) + (symc->q_trev(qp) ? ", trev" : "") +
+                      ", cjg at " + std::to_string(ncj) + " IBZ k)";
+            }
+          app_log(1, "  [Sigma vertex, pair] IBZ diagnostic, unit is {} iq {}: max |dSq| {:.3e}, anti-Hermitian at the IBZ k {:.3e}, at the other k {:.3e}; qminus {}; star:{}",
+                  is, iq, mx, ah_ibz, ah_out, symc->qminus(iq), star);
+        }
+        if (opt.nu_diag) {
+          // the Gram matrix over nu of the amplitude (all pairs and legs), normalized spectrum, max over units
+          nda::matrix<cplx> Gm(nw_b, nw_b);
+          const long len = D * Nm;
+          for (long l = 0; l < nw_b; ++l)
+            for (long l2 = l; l2 < nw_b; ++l2) {
+              cplx acc(0.0);
+              cplx const *a = Astore.data() + l * len;
+              cplx const *b = Astore.data() + l2 * len;
+              for (long n = 0; n < len; ++n) acc += std::conj(a[n]) * b[n];
+              Gm(l, l2) = acc; Gm(l2, l) = std::conj(acc);
+            }
+          auto [lam, V] = nda::linalg::eigenelements(Gm);   // ascending
+          double tr = 0.0;
+          for (long l = 0; l < nw_b; ++l) tr += std::max(lam(l), 0.0);
+          if (met and tr > 0.0)
+            for (long l = 0; l < nw_b; ++l) met->nu_spec(l) = std::max(met->nu_spec(l), std::max(lam(nw_b - 1 - l), 0.0) / tr);
+        }
+        if (met) { ++met->nunits; met->n_trev_images = n_trev_images; met->t_con += watch.lap(); met->rss_gb = std::max(met->rss_gb, vertex_ladder_detail::prof_rss_gb()); }
+      }
+    }
+
+  } // namespace vertex_sigma_pair_detail
+
+  /**
+   * The pair-resolved static-ladder vertex self-energy on the ladder's C window (see the file header). Runs on the
+   * READOUT instance (frozen secondary frame; W-bar_0 from build_w0 this update; the W-bar cache from cache_w, called
+   * here on demand when outer = "dynamic"). dSig OUT: (nt, ns, nk, nc, nc), replicated, Hermitized in (i, j).
+   */
+  void vertex_t::eval_sigma_pair(MBState &mb_state, THC_ERI auto &thc, sigma_pair_opts const &opt,
+                                 nda::array<ComplexType, 5> &dSig, sigma_pair_meter *met) {
+    decltype(nda::range::all) all;
+    namespace vs = vertex_sigma_pair_detail;
+    vertex_ladder_detail::prof_watch twatch;
+    utils::check(active() and secondary(), "vertex_t::eval_sigma_pair: requires an ACTIVE secondary-basis vertex (the readout instance).");
+    utils::check(_W0b_qmm.has_value(), "vertex_t::eval_sigma_pair: W0bar is absent -- build_w0 must run first.");
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    if (opt.outer == "dynamic" and not has_cached_w()) {
+      app_log(1, "  [Sigma vertex, pair] outer W = dynamic: folding this iteration's W into the W-bar cache (cache_w on demand).");
+      cache_w(mb_state, thc);
+    }
+    nda::array<ComplexType, 5> G_CC;
+    nda::array<long, 2> kmq, kpq;
+    vertex_sym::sym_ctx const *symc = nullptr;
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);   // full-BZ G_CC / kmq / kpq (MLWF frame in Wannier mode) + symc on a sym mesh
+    const bool sym = (symc != nullptr and symc->active);
+    utils::check(sym or MF->nkpts() == MF->nkpts_ibz(), "vertex_t::eval_sigma_pair: a symmetry-reduced mesh without a symmetry context.");
+    if (sym) {
+      // dSigma's external k axis is the first nk_ibz points of the FULL list (eval_pair_sigma's `k >= nk_ext`
+      // skip and the dSig(., ., k) writes) -- valid only if those points ARE the IBZ representatives, identity-mapped
+      auto k2i = MF->kp_to_ibz();
+      auto ktr = MF->kp_trev();
+      for (long k = 0; k < MF->nkpts_ibz(); ++k)
+        utils::check(long(k2i(k)) == k and not bool(ktr(k)),
+                     "vertex_t::eval_sigma_pair: the full k list does not start with the IBZ points (k = {}: kp_to_ibz {}, "
+                     "trev {}); the IBZ-first layout the Sigma pair vertex indexes its externals by is violated.", k,
+                     long(k2i(k)), int(bool(ktr(k))));
+    }
+    utils::check(not sym or opt.Pi_check == nullptr or opt.Pi_check->shape(1) == MF->nqpts_ibz(),
+                 "vertex_t::eval_sigma_pair: Pi_check must carry nq_ibz rows on a symmetric mesh.");
+    vertex_pi::iaft_tools tools(*_ft);                 // the LOOP's grid: Sigma(tau) lives there
+    const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk_full = G_CC.shape(2), nc = G_CC.shape(3);
+    const long nk = sym ? symc->nk_ibz : nk_full;      // the EXTERNAL k axis of Sigma (the IBZ under symmetry)
+    dSig = nda::array<ComplexType, 5>(nt, ns, nk, nc, nc);
+    sigma_pair_meter mloc;
+    std::optional<nda::array<ComplexType, 5>> G_close;
+    if (_wannier) {
+      // the closure's G in the MLWF frame: U^T G_W U^* from the band-window block of the loop's G (see eval_pair_sigma)
+      const long M = nc, nW = long(_band_window.size());
+      nda::array<ComplexType, 5> Gw(nt, ns, nk_full, nW, nW);
+      vertex_ladder_detail::expand_G_CC_fullbz(mb_state.sG_tskij.value().local(), _band_window,
+                                               MF->nkpts() != MF->nkpts_ibz(), MF->kp_to_ibz(), MF->kp_trev(), Gw);
+      G_close.emplace(nt, ns, nk_full, M, M);
+      nda::array<ComplexType, 2> Ut(M, nW), Uc(nW, M), S(nW, nW), T1(M, nW), R(M, M);
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk_full; ++k) {
+          for (long a = 0; a < nW; ++a)
+            for (long m = 0; m < M; ++m) { Ut(m, a) = _U_skia(is, k, a, m); Uc(a, m) = std::conj(_U_skia(is, k, a, m)); }
+          for (long it = 0; it < nt; ++it) {
+            S() = Gw(it, is, k, all, all);
+            nda::blas::gemm(Ut, S, T1);                                   // U^T G
+            nda::blas::gemm(T1, Uc, R);                                   // (U^T G) U^*
+            G_close.value()(it, is, k, all, all) = R;
+          }
+        }
+    }
+    std::optional<nda::array_view<ComplexType, 4>> Wbh_v;
+    if (has_cached_w()) Wbh_v.emplace(wb_cache());
+    vs::eval_pair_sigma(G_CC, _Xb_skma, _W0b_qmm.value(), Wbh_v.has_value() ? std::addressof(Wbh_v.value()) : nullptr,
+                        kmq, kpq, tools, mpi->comm.rank(), mpi->comm.size(), opt, dSig, &mloc, symc,
+                        G_close.has_value() ? std::addressof(G_close.value()) : nullptr);
+    mpi->comm.all_reduce_in_place_n(dSig.data(), dSig.size(), std::plus<>{});
+    if (_wannier) {
+      // The contraction ran in the MLWF frame (X_bar = X U; the closure with U^T G U^*, see eval_pair_sigma), so the
+      // block it produces carries the closure's TRANSPOSED convention, dSigma_bar = U^T dSigma U^* (it transforms as V^T . V^*
+      // under U -> U V, like its closure G): back to the band window with U^* dSigma_bar U^T (the inverse of that map; NOT
+      // U dSigma_bar U^dag, which is the inverse of the P side's U^dag G U convention and is wrong for a complex U),
+      // nW = |C| bands, U(s, k) = _U_skia(s, k, :, :)
+      const long M = nc, nW = long(_band_window.size());
+      utils::check(_U_skia.shape(0) == ns and _U_skia.shape(1) >= nk and _U_skia.shape(2) == nW and _U_skia.shape(3) == M,
+                   "vertex_t::eval_sigma_pair: Wannier projector shape ({}, {}, {}, {}) vs (ns {}, nk {}, nW {}, M {}).",
+                   _U_skia.shape(0), _U_skia.shape(1), _U_skia.shape(2), _U_skia.shape(3), ns, nk, nW, M);
+      nda::array<ComplexType, 5> dSb(nt, ns, nk, nW, nW);
+      nda::array<ComplexType, 2> Uc(nW, M), Ut(M, nW), T1(nW, M), S(M, M), Sb(nW, nW);
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk; ++k) {
+          for (long a = 0; a < nW; ++a)
+            for (long m = 0; m < M; ++m) { Uc(a, m) = std::conj(_U_skia(is, k, a, m)); Ut(m, a) = _U_skia(is, k, a, m); }
+          for (long it = 0; it < nt; ++it) {
+            S() = dSig(it, is, k, all, all);
+            nda::blas::gemm(Uc, S, T1);                                  // U^* dSigma_bar
+            nda::blas::gemm(T1, Ut, Sb);                                 // (U^* dSigma_bar) U^T
+            dSb(it, is, k, all, all) = Sb;
+          }
+        }
+      dSig = std::move(dSb);
+      app_log(1, "  [Sigma vertex, pair] Wannier mode: dSigma rotated from the MLWF frame (M = {}) to the band window [{}, {}) (nW = {}).",
+              M, _band_window.first(), _band_window.last(), nW);
+    }
+    const long ncb = dSig.shape(3);
+    if (opt.Pi_check != nullptr) mpi->comm.all_reduce_in_place_n(opt.Pi_check->data(), opt.Pi_check->size(), std::plus<>{});
+    // meters: the anti-Hermitian residual in (i, j) at fixed tau, then the Hermitization
+    double dmax = 0.0, dherm = 0.0;
+    for (long it = 0; it < nt; ++it)
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk; ++k)
+          for (long i = 0; i < ncb; ++i)
+            for (long j = 0; j < ncb; ++j) {
+              dmax = std::max(dmax, std::abs(dSig(it, is, k, i, j)));
+              dherm = std::max(dherm, std::abs(dSig(it, is, k, i, j) - std::conj(dSig(it, is, k, j, i))));
+            }
+    if (opt.hermitize)
+      for (long it = 0; it < nt; ++it)
+        for (long is = 0; is < ns; ++is)
+          for (long k = 0; k < nk; ++k)
+            for (long i = 0; i < ncb; ++i)
+              for (long j = i; j < ncb; ++j) {
+                const ComplexType h = 0.5 * (dSig(it, is, k, i, j) + std::conj(dSig(it, is, k, j, i)));
+                dSig(it, is, k, i, j) = h;
+                dSig(it, is, k, j, i) = std::conj(h);
+              }
+    mloc.dsig_max = dmax; mloc.dsig_herm = (dmax > 0.0) ? dherm / dmax : 0.0;
+    mloc.ks_herm = mpi->comm.all_reduce_value(mloc.ks_herm, boost::mpi3::max<>{});
+    mloc.nunits = mpi->comm.all_reduce_value(mloc.nunits, std::plus<>{});
+    mloc.rss_gb = mpi->comm.all_reduce_value(mloc.rss_gb, boost::mpi3::max<>{});
+    for (auto *t : {&mloc.t_setup, &mloc.t_ks, &mloc.t_cb, &mloc.t_lu, &mloc.t_amp, &mloc.t_con})
+      *t = mpi->comm.all_reduce_value(*t, boost::mpi3::max<>{});
+    if (opt.nu_diag and mloc.nu_spec.size() > 0)
+      mpi->comm.all_reduce_in_place_n(mloc.nu_spec.data(), mloc.nu_spec.size(), boost::mpi3::max<>{});
+    mloc.t_total = twatch.lap();
+    std::string spec;
+    if (opt.nu_diag and mloc.nu_spec.size() > 0) {
+      double cum = 0.0; long n2 = -1, n3 = -1, n4 = -1;
+      for (long l = 0; l < mloc.nu_spec.size(); ++l) {
+        cum += mloc.nu_spec(l);
+        if (n2 < 0 and 1.0 - cum < 1e-2) n2 = l + 1;
+        if (n3 < 0 and 1.0 - cum < 1e-3) n3 = l + 1;
+        if (n4 < 0 and 1.0 - cum < 1e-4) n4 = l + 1;
+      }
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "; nu-rank of A~ (Gram tail, max over units): 1e-2 -> %ld modes, 1e-3 -> %ld, 1e-4 -> %ld of %ld; top weights %.3f %.3f %.3f %.3f",
+                    n2, n3, n4, long(mloc.nu_spec.size()), mloc.nu_spec(0), mloc.nu_spec.size() > 1 ? mloc.nu_spec(1) : 0.0,
+                    mloc.nu_spec.size() > 2 ? mloc.nu_spec(2) : 0.0, mloc.nu_spec.size() > 3 ? mloc.nu_spec(3) : 0.0);
+      spec = buf;
+    }
+    app_log(1, "  [Sigma vertex, pair] col {} outer {} junction {} scale {}: {} (s, q) units on {} bosonic nodes (C = [{}, {}), N_m = {}): "
+               "max |dSigma(tau)| = {:.4e}, anti-Hermitian residual {:.3e} ({}), |K_s - K_s^dag|/|K_s| = {:.2e}; wall {:.1f} s "
+               "(slowest rank: rung {:.1f}, Cb {:.1f}, LU {:.1f}, amplitude {:.1f}, contraction {:.1f}), RSS {:.2f} GB{}",
+            opt.col, opt.outer, opt.side, opt.scale, mloc.nunits, tools.nw_b, _band_window.first(), _band_window.last(), _Xb_skma.shape(2),
+            mloc.dsig_max, mloc.dsig_herm, opt.hermitize ? "Hermitized" : "NOT Hermitized", mloc.ks_herm, mloc.t_total,
+            mloc.t_ks, mloc.t_cb, mloc.t_lu, mloc.t_amp, mloc.t_con, mloc.rss_gb, spec);
+    if (met) *met = mloc;
+    (void)all;
+  }
+
+} // namespace solvers
+} // namespace methods
+
+#endif // COQUI_VERTEX_SIGMA_PAIR_ICC

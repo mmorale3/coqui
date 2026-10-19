@@ -31,6 +31,7 @@
 #include "numerics/device_kernels/cuda/symmetry_tools.cuh"
 #include "numerics/device_kernels/cuda/kpoint_tools.cuh"
 #include "numerics/device_kernels/cuda/potentials.cuh"
+#include "numerics/device_kernels/cuda/gw_tools.cuh"
 
 #endif
 

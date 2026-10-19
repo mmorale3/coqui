@@ -22,6 +22,7 @@
 #ifndef SPARSE_CUDA_GPU_HPP
 #define SPARSE_CUDA_GPU_HPP
 
+#include <algorithm>
 #include <type_traits>
 #include <cassert>
 #include <vector>
@@ -34,6 +35,7 @@
 #include "utilities/check.hpp"
 
 #include "numerics/sparse/detail/CUDA/cusparse_aux.hpp"
+#include "numerics/detail/ops_aux.hpp"
 
 namespace math::sparse::device
 {
@@ -42,39 +44,39 @@ namespace math::sparse::device
 cusparseHandle_t &get_cusparse_handle_ptr();
 
 // MAM: csr_matrix stores row pointers in host, so right now pntrb/pntre are host pointers.
-//      They are copied to devide on the fly here. Write alternative routine that takes
+//      They are copied to device on the fly here. Write alternative routine that takes
 //      the (compact) arrays in device
-template<typename A_t, ::nda::MemoryVector X, ::nda:: MemoryVector Y>
-requires((CSRMatrix<A_t> or math::detail::is_tagged_matrix<A_t>) and
-         ::nda::have_same_value_type_v<X, Y>) 
-void csrmv(::nda::get_value_t<X> alpha, A_t const& a, X const &x, ::nda::get_value_t<X> beta, Y &&y)
+template<CSRMatrix A, ::nda::MemoryVector X, ::nda:: MemoryVector Y>
+requires(::nda::have_same_value_type_v<X, Y> and
+         ::nda::mem::have_device_compatible_addr_space<A,X,Y>) 
+void csrmv(char oper_A,typename A::value_type alpha, A const& a, X const &x, typename A::value_type beta, Y &&y)
 {
-  using math::detail::arg;
-
-  auto spA = arg(a);
-  auto [m, n] = arg(a).shape();
+  utils::check(math::is_valid_op(oper_A), "Invalid operation: {}",oper_A);
+  auto [m, n] = a.shape();
  
-  using csr = std::decay_t<decltype(spA)>;
-  constexpr MEMORY_SPACE MEM = csr::mem_type; 
-  using value_type = std::decay_t<typename csr::value_type>;
-  using int_type   = std::decay_t<typename csr::int_type>;
+  constexpr MEMORY_SPACE MEM = A::mem_type; 
+  using value_type = std::decay_t<typename A::value_type>;
+  using int_type   = std::decay_t<typename A::int_type>;
   static_assert( std::is_same_v<value_type,::nda::get_value_t<X>>, "value_type mismatch.");
   static_assert( std::is_same_v<value_type,::nda::get_value_t<Y>>, "value_type mismatch.");
 
   auto handle = get_cusparse_handle_ptr(); 
-  auto op_A = get_operation<A_t>();
   auto cuX = cuDn(x);  
   auto cuY = cuDn(y);  
 
-  memory::array<MEM,int_type,1> ofs(m+1,int_type(0));
-  auto cuA = cuCSR(spA,ofs);
+  memory::buffered_array<MEM,int_type,1> ofs(m+1,int_type(0));
+  auto op_A = get_operation<value_type>(oper_A);
+  auto cuA = cuCSR(a,ofs);
    
   // allocate an external buffer if needed
   size_t bufferSize = 0;
   CUSPARSE_CHECK( cusparseSpMV_bufferSize, handle, op_A, 
                   &alpha, cuA, cuX, &beta, cuY, cusparse_datatype<value_type>,
                   CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize) 
-  memory::array<MEM,char,1> buffer(bufferSize,char(0));
+  // cuSPARSE reports bufferSize = 0 for small problems; a zero-length device array is a null
+  // pointer and nda's value-init then calls cudaMemset(nullptr, 0, 0) -> cudaErrorInvalidValue
+  // (seen with CUDA 12.5). Always allocate at least one byte.
+  memory::buffered_array<MEM,char,1> buffer(std::max<size_t>(bufferSize, size_t(1)),char(0));
 
   // execute preprocess (optional)
 //  CUSPARSE_CHECK( cusparseSpMV_preprocess, handle, op_A, 
@@ -92,62 +94,95 @@ void csrmv(::nda::get_value_t<X> alpha, A_t const& a, X const &x, ::nda::get_val
   arch::synchronize_if_set();
 }
 
-template<typename T, typename A_t, ::nda::MemoryMatrix B, ::nda::MemoryMatrix C> 
-requires((CSRMatrix<A_t> or math::detail::is_tagged_matrix<A_t>) and
-         (::nda::MemoryMatrix<B>) and   
+template<CSRMatrix A, typename B, typename C> 
+requires((::nda::MemoryMatrix<B> or ::nda::MemoryArrayOfRank<B,3>) and   
+         (::nda::MemoryMatrix<C> or ::nda::MemoryArrayOfRank<C,3>) and   
+         (::nda::get_rank<B> == ::nda::get_rank<C>) and
+         ::nda::mem::have_device_compatible_addr_space<A,B,C> and 
          ::nda::have_same_value_type_v<B,C>)
-void csrmm(T alpha, A_t const& a, B const &b, T beta, C &&c) 
+void csrmm(char oper_A, char oper_B, typename A::value_type alpha, A const& a, B const &b, typename A::value_type beta, C &&c) 
 { 
-  using math::detail::arg;
-
-  auto spA = arg(a);
-  auto [m, n] = arg(a).shape();
+  utils::check(math::is_valid_op(oper_A), "Invalid operation: {}",oper_A);
+  auto [m, n] = a.shape();
   
-  using csr = std::decay_t<decltype(spA)>;
-  constexpr MEMORY_SPACE MEM = csr::mem_type; 
-  using value_type = std::decay_t<typename csr::value_type>;
-  using int_type   = std::decay_t<typename csr::int_type>;
+  constexpr MEMORY_SPACE MEM = A::mem_type; 
+  using value_type = std::decay_t<typename A::value_type>;
+  using int_type   = std::decay_t<typename A::int_type>;
 
-  if constexpr (std::is_same_v<::nda::get_value_t<B>,std::complex<T>>) {
+  if constexpr (std::is_same_v<::nda::get_value_t<B>,std::complex<value_type>>) {
     static_assert(std::decay_t<B>::is_stride_order_C() and std::decay_t<C>::is_stride_order_C(),
         "Mixed real/complex csrmm only with row-major matrices.");
     utils::check(b.indexmap().min_stride() == 1, "Stride mismatch");
     utils::check(c.indexmap().min_stride() == 1, "Stride mismatch");
-    memory::array_view< memory::get_memory_space<B>(), T, 2, typename B::layout_policy_t> b_(std::array<long,2>{b.extent(0),2*b.extent(1)},reinterpret_cast<const T*>(b.data()));
-    memory::array_view< memory::get_memory_space<C>(), T, 2, typename C::layout_policy_t> c_(std::array<long,2>{c.extent(0),2*c.extent(1)},reinterpret_cast<const T*>(c.data()));
-    csrmm(alpha,a,b_,beta,c_);
+    // can bypass this by constructing indexmap with array strides
+    utils::check(b.is_contiguous(), "Layout mismatch");
+    utils::check(c.is_contiguous(), "Layout mismatch");
+    if constexpr (::nda::MemoryMatrix<B>) {
+      memory::array_view< memory::get_memory_space<B>(), const value_type, 2, typename B::layout_policy_t> b_(std::array<long,2>{b.extent(0),2*b.extent(1)},reinterpret_cast<const value_type*>(b.data()));
+      memory::array_view< memory::get_memory_space<C>(), value_type, 2, typename std::decay_t<C>::layout_policy_t> c_(std::array<long,2>{c.extent(0),2*c.extent(1)},reinterpret_cast<value_type*>(c.data()));
+      csrmm(oper_A,oper_B,alpha,a,b_,beta,c_);
+    } else {
+      memory::array_view< memory::get_memory_space<B>(), const value_type, 3, typename B::layout_policy_t> b_(std::array<long,3>{b.extent(0),b.extent(1),2*b.extent(2)},reinterpret_cast<const value_type*>(b.data()));
+      memory::array_view< memory::get_memory_space<C>(), value_type, 3, typename std::decay_t<C>::layout_policy_t> c_(std::array<long,3>{c.extent(0),c.extent(1),2*c.extent(2)},reinterpret_cast<value_type*>(c.data()));
+      csrmm(oper_A,oper_B,alpha,a,b_,beta,c_);
+    }
     return;
+  } else {
+    static_assert( std::is_same_v<value_type,::nda::get_value_t<B>>, "value_type mismatch.");
+    static_assert( std::is_same_v<value_type,::nda::get_value_t<C>>, "value_type mismatch.");
   }
-
-  static_assert( std::is_same_v<value_type,T>, "value_type mismatch.");
-  static_assert( std::is_same_v<value_type,::nda::get_value_t<B>>, "value_type mismatch.");
-  static_assert( std::is_same_v<value_type,::nda::get_value_t<C>>, "value_type mismatch.");
   
   auto handle = get_cusparse_handle_ptr();
-  auto op_A = get_operation<A_t>();
-  auto op_B = CUSPARSE_OPERATION_NON_TRANSPOSE; 
+  // not enabled yet. Take as argument if needed and implement custom backend in cpu.
+  auto op_A = get_operation<value_type>(oper_A);
+  auto op_B = get_operation<value_type>(oper_B);
   auto cuB = cuDn(b);
   auto cuC = cuDn(c);
-  
-  memory::array<MEM,int_type,1> ofs(m+1,int_type(0));
-  auto cuA = cuCSR(spA,ofs);
 
-  // allocate an external buffer if needed
+  int batchCountB=1, batchCountC=1;
+  int64_t batchStride=0;
+  CUSPARSE_CHECK( cusparseDnMatGetStridedBatch, cuB, &batchCountB, &batchStride ); 
+  CUSPARSE_CHECK( cusparseDnMatGetStridedBatch, cuC, &batchCountC, &batchStride ); 
+  utils::check(batchCountB == batchCountC, "Batch count mismatch.");
+  
+  memory::buffered_array<MEM,int_type,1> ofs(m+1,int_type(0));
+  auto cuA = cuCSR(a,ofs,batchCountB);
+
+  // allocate an external buffer if needed. CSR_ALG2 (deterministic) is preferred; should cuSPARSE reject it
+  // for an (op, layout) combination with CUSPARSE_STATUS_INVALID_VALUE / NOT_SUPPORTED at the bufferSize
+  // query, fall back to ALG_DEFAULT for that call (a safety net; its diagnostics name the call). A conjugate
+  // transpose of a REAL matrix is mapped to a plain transpose by get_operation<value_type>.
   size_t bufferSize = 0;
-  CUSPARSE_CHECK( cusparseSpMM_bufferSize, handle, op_A, op_B, 
-                  &alpha, cuA, cuB, &beta, cuC, cusparse_datatype<value_type>,
-                  CUSPARSE_SPMM_CSR_ALG2, &bufferSize)
-  memory::array<MEM,char,1> buffer(bufferSize,char{0});
+  cusparseSpMMAlg_t alg = CUSPARSE_SPMM_CSR_ALG2;
+  {
+    auto st = cusparseSpMM_bufferSize(handle, op_A, op_B, &alpha, cuA, cuB, &beta, cuC,
+                                      cusparse_datatype<value_type>, alg, &bufferSize);
+    if (st == CUSPARSE_STATUS_INVALID_VALUE or st == CUSPARSE_STATUS_NOT_SUPPORTED) {
+      alg = CUSPARSE_SPMM_ALG_DEFAULT;
+      bufferSize = 0;
+      st = cusparseSpMM_bufferSize(handle, op_A, op_B, &alpha, cuA, cuB, &beta, cuC,
+                                   cusparse_datatype<value_type>, alg, &bufferSize);
+    }
+    utils::check(st == CUSPARSE_STATUS_SUCCESS,
+                 "cusparseSpMM_bufferSize failed (op_A {}, op_B {}, m {}, n {}, B {}x{} ld {} {}, C {}x{} ld {}): {} ({})",
+                 oper_A, oper_B, m, n, b.extent(0), b.extent(1),
+                 std::decay_t<B>::is_stride_order_C() ? b.strides()[0] : b.strides()[1],
+                 std::decay_t<B>::is_stride_order_C() ? "row-major" : "col-major",
+                 c.extent(0), c.extent(1),
+                 std::decay_t<C>::is_stride_order_C() ? c.strides()[0] : c.strides()[1],
+                 int(st), std::string(cusparseGetErrorString(st)));
+  }
+  memory::buffered_array<MEM,char,1> buffer(std::max<size_t>(bufferSize, size_t(1)),char{0});   // >= 1 byte, see csrmv
   
   // execute preprocess (optional)
   CUSPARSE_CHECK( cusparseSpMM_preprocess, handle, op_A, op_B, 
                   &alpha, cuA, cuB, &beta, cuC, cusparse_datatype<value_type>,
-                  CUSPARSE_SPMM_CSR_ALG2, (void*) buffer.data() )
+                  alg, (void*) buffer.data() )
   
   // execute SpMM
   CUSPARSE_CHECK( cusparseSpMM, handle, op_A, op_B, 
                   &alpha, cuA, cuB, &beta, cuC, cusparse_datatype<value_type>,
-                  CUSPARSE_SPMM_CSR_ALG2, (void*) buffer.data() )
+                  alg, (void*) buffer.data() )
   
   CUSPARSE_CHECK( cusparseDestroySpMat, cuA )
   CUSPARSE_CHECK( cusparseDestroyDnMat, cuB )

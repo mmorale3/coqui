@@ -32,6 +32,7 @@
 #include "mean_field/MF.hpp"
 #include "methods/ERI/detail/concepts.hpp"
 #include "methods/ERI/chol_reader_t.hpp"
+#include "methods/vertex/vertex_t.h"
 #include "methods/GW/gw_t.h"
 #include "methods/GW/cholesky_gw.icc"
 
@@ -44,7 +45,10 @@ namespace methods {
     //   - Check will q-dependent Np lead to a bug?
     //   - Profiling
 
+    template<MEMORY_SPACE MEM>
     void gw_t::evaluate(MBState &mb_state, Cholesky_ERI auto &chol, bool verbose) {
+      static_assert(MEM == HOST_MEMORY,
+                    "gw_t::evaluate (Cholesky path) is HOST-only");
       using namespace math::shm;
       using Array_3D_t = nda::array_view<ComplexType, 3>;
       if (verbose) {
@@ -64,6 +68,9 @@ namespace methods {
                    "gw_t::cholesky_gw::evaluate: sSigma_tskij is not initialized in MBState.");
       utils::check(chol.MF()->nkpts() == chol.MF()->nkpts_ibz(),
                    "gw_t::cholesky_gw::evaluate: Symmetry is not implemented yet.");
+      utils::check(_vertex == nullptr or not _vertex->active(),
+                   "gw_t::cholesky_gw::evaluate: vertex corrections are only "
+                   "implemented for THC ERIs.");
       utils::check(_ft->nt_f() == _ft->nt_b(),
                    "chol-gw:: we assume nt_f == nt_b at least for now \n"
                    "(will lift the restriction at some point...)");
@@ -384,7 +391,11 @@ namespace methods {
     template void gw_t::evaluate(const Arrv &, sArray_t<Arrv> &, chol_reader_t &, scr_coulomb_t*, bool);
     template void gw_t::evaluate(const Arrv2 &, sArray_t<Arrv> &, chol_reader_t &, scr_coulomb_t*, bool);
 
-    template void gw_t::evaluate(MBState &mb_state, chol_reader_t&, bool);
+    template void gw_t::evaluate<HOST_MEMORY>(MBState &mb_state, chol_reader_t&, bool);
+    // DEVICE_MEMORY not instantiated: the Cholesky path is HOST-only and
+    // the body's static_assert(MEM==HOST_MEMORY) would fire. mbpt routes
+    // Cholesky-corr ERIs to scf_loop<HOST> via SCF_MEM, so no caller asks
+    // for gw_t::evaluate<DEVICE_MEMORY>(chol).
 
     template void gw_t::evaluate_P0(size_t, const Arr &, sArray_t<Arrv3> &, chol_reader_t &, int , bool);
     template void gw_t::evaluate_P0(size_t, const Arrv &, sArray_t<Arrv3> &, chol_reader_t &, int , bool);

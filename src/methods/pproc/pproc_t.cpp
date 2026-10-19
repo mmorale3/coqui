@@ -37,6 +37,8 @@
 #include "utilities/kpoint_utils.hpp"
 #include "utilities/interpolation_utils.hpp"
 #include "mean_field/symmetry/unfold_bz.h"
+#include "methods/SCF/simple_dyson.h"
+#include "methods/scr_coulomb/cvv_head.hpp"   // cvv_eps readout
 #include "pproc_t.h"
 
 namespace methods {
@@ -685,6 +687,162 @@ namespace methods {
     app_log(1, "####### wannier interpolation routines end #######\n");
   }
 
+  // The interpolation kernel of the qp_gaps fine-mesh report.
+  // The chain is the "quasiparticle" branch of wannier_interpolation above -- projector downfold on
+  // the coarse full-BZ mesh, k -> R with utils::k_to_R_coefficients on the Wigner-Seitz R grid,
+  // R -> k with utils::R_to_k_coefficients (1/degeneracy weights) -- with two deliberate differences:
+  // (i) the target k list is the uniform fine mesh (crystal coordinates (i/n1, j/n2, l/n3), all points),
+  // (ii) the imaginary part of H(R) is kept. With (ii) the round trip k -> R -> k is the identity on the
+  // coarse mesh (e^{ik.T} = 1 for every supercell vector T at a mesh k, and the WS copies of an R class
+  // carry weights 1/deg summing to 1), so the fine-mesh bands at a coarse k are EXACTLY the eigenvalues
+  // of the downfolded Heff(k) (checked by test_methods_pproc). H(R) obeys H(-R) = H(R)^dag, so the
+  // interpolant is Hermitian at every k up to rounding; it is Hermitized explicitly before heev.
+  auto pproc_t::interpolate_qp_bands_on_mesh(utils::mpi_context_t<mpi3::communicator> &context, mf::MF &mf,
+                                             projector_t const& proj,
+                                             nda::array_view<ComplexType, 4> Heff_skij_full,
+                                             nda::array<long, 2> const& Rpts_idx,
+                                             nda::array<long, 1> const& Rpts_weights,
+                                             std::array<long, 3> const& mesh)
+    -> std::tuple<nda::array<double, 2>, nda::array<RealType, 3>>
+  {
+    decltype(nda::range::all) all;
+    const long ns = mf.nspin();
+    const long nkpts = mf.nkpts();
+    const long nRpts = Rpts_idx.shape(0);
+    const long nImp = proj.nImps();
+    const long nImpOrbs = proj.nImpOrbs();
+    utils::check(nImp == 1, "interpolate_qp_bands_on_mesh: nImp != 1");
+    utils::check(Heff_skij_full.shape()[0] == ns and Heff_skij_full.shape()[1] == nkpts,
+                 "interpolate_qp_bands_on_mesh: Heff_skij_full is ({}, {}, ...), expected the full BZ ({}, {}, ...).",
+                 Heff_skij_full.shape()[0], Heff_skij_full.shape()[1], ns, nkpts);
+    utils::check(Rpts_weights.shape(0) == nRpts, "interpolate_qp_bands_on_mesh: Rpts_idx / Rpts_weights size mismatch.");
+    utils::check(mesh[0] > 0 and mesh[1] > 0 and mesh[2] > 0,
+                 "interpolate_qp_bands_on_mesh: mesh ({}, {}, {}) must be positive.", mesh[0], mesh[1], mesh[2]);
+
+    // 1. downfold Heff to the Wannier basis on the coarse full-BZ mesh: H_ab(k) = C(k) Heff_W(k) C(k)^dag
+    auto H_skIab = proj.downfold_k(Heff_skij_full, context.comm);   // (ns, nkpts, nImp, a, b)
+
+    // 2. k -> R on the WS grid (H(R) = 1/Nk sum_k e^{-ikR} H(k)); the imaginary part is KEPT (see above)
+    nda::array<ComplexType, 5> H_sRIab(ns, nRpts, nImp, nImpOrbs, nImpOrbs);
+    {
+      math::shm::shared_array<nda::array_view<ComplexType, 2>> sf_Rk(
+          std::addressof(context.comm), std::addressof(context.internode_comm), std::addressof(context.node_comm),
+          {nRpts, nkpts});
+      utils::k_to_R_coefficients(context.comm, Rpts_idx, mf.kpts(), mf.lattv(), sf_Rk);
+      auto f_Rk = sf_Rk.local();
+      for (long is = 0; is < ns; ++is) {
+        auto H_kab_2D = nda::reshape(H_skIab(is, nda::ellipsis{}),
+                                     std::array<long, 2>{nkpts, nImp*nImpOrbs*nImpOrbs});
+        auto H_Rab_2D = nda::reshape(H_sRIab(is, nda::ellipsis{}),
+                                     std::array<long, 2>{nRpts, nImp*nImpOrbs*nImpOrbs});
+        nda::blas::gemm(f_Rk, H_kab_2D, H_Rab_2D);
+      }
+      double max_imag = 0.0;
+      nda::for_each(H_sRIab.shape(),
+                    [&H_sRIab, &max_imag](auto ...i) { max_imag = std::max(max_imag, std::abs(H_sRIab(i...).imag())); });
+      app_log(2, "  interpolate_qp_bands_on_mesh: {} R vectors; largest |Im H(R)| = {:.3e} Ha (kept).", nRpts, max_imag);
+    }
+
+    // 3. the fine mesh: crystal coordinates for the report, cartesian for the phases
+    const long nkf = mesh[0]*mesh[1]*mesh[2];
+    nda::array<double, 2> kpts_crys(nkf, 3), kpts_cart(nkf, 3);
+    {
+      auto recv = mf.recv();
+      long ik = 0;
+      for (long i = 0; i < mesh[0]; ++i)
+        for (long j = 0; j < mesh[1]; ++j)
+          for (long l = 0; l < mesh[2]; ++l, ++ik) {
+            kpts_crys(ik, 0) = double(i) / double(mesh[0]);
+            kpts_crys(ik, 1) = double(j) / double(mesh[1]);
+            kpts_crys(ik, 2) = double(l) / double(mesh[2]);
+            for (int d = 0; d < 3; ++d)
+              kpts_cart(ik, d) = kpts_crys(ik, 0) * recv(0, d) + kpts_crys(ik, 1) * recv(1, d) + kpts_crys(ik, 2) * recv(2, d);
+          }
+    }
+
+    // 4. R -> k on the fine mesh: H(k) = sum_R e^{ikR} H(R) / deg(R)
+    nda::array<ComplexType, 4> H_skab(ns, nkf, nImpOrbs, nImpOrbs);
+    {
+      math::shm::shared_array<nda::array_view<ComplexType, 2>> sf_kR(
+          std::addressof(context.comm), std::addressof(context.internode_comm), std::addressof(context.node_comm),
+          {nkf, nRpts});
+      utils::R_to_k_coefficients(context.comm, Rpts_idx, Rpts_weights, kpts_cart, mf.lattv(), sf_kR);
+      auto f_kR = sf_kR.local();
+      for (long is = 0; is < ns; ++is) {
+        auto H_Rab_2D = nda::reshape(H_sRIab(is, nda::ellipsis{}),
+                                     std::array<long, 2>{nRpts, nImp*nImpOrbs*nImpOrbs});
+        auto H_kab_2D = nda::reshape(H_skab(is, nda::ellipsis{}),
+                                     std::array<long, 2>{nkf, nImp*nImpOrbs*nImpOrbs});
+        nda::blas::gemm(f_kR, H_Rab_2D, H_kab_2D);
+      }
+    }
+
+    // 5. Hermitize, diagonalize (round robin over (s, k)), reduce
+    nda::array<RealType, 3> E_ska(ns, nkf, nImpOrbs);
+    E_ska() = 0.0;
+    nda::array<ComplexType, 2> Hk(nImpOrbs, nImpOrbs);
+    for (long isk = context.comm.rank(); isk < ns*nkf; isk += context.comm.size()) {
+      const long is = isk / nkf;
+      const long ik = isk % nkf;
+      for (long a = 0; a < nImpOrbs; ++a)
+        for (long b = 0; b < nImpOrbs; ++b)
+          Hk(a, b) = 0.5 * (H_skab(is, ik, a, b) + std::conj(H_skab(is, ik, b, a)));
+      E_ska(is, ik, all) = nda::linalg::eigenvalues(Hk);
+    }
+    context.comm.all_reduce_in_place_n(E_ska.data(), E_ska.size(), std::plus<>{});
+
+    return std::make_tuple(std::move(kpts_crys), std::move(E_ska));
+  }
+
+  auto pproc_t::qp_bands_on_mesh(mf::MF &mf, std::string project_file, std::array<long, 3> const& mesh,
+                                 std::string grp_name, long iter, bool translate_home_cell)
+    -> std::tuple<nda::array<double, 2>, nda::array<RealType, 3>>
+  {
+    std::string filename = _scf_output + ".mbpt.h5";
+    // resolve the iteration and the Heff_skij location exactly as wannier_interpolation does
+    // (Dyson-SCF writes qp_approx/Heff_skij, QP-SCF writes Heff_skij directly); broadcast as numbers
+    long has_qp_approx = 0;
+    if (_context.comm.root()) {
+      h5::file file(filename, 'r');
+      utils::check(h5::group(file).has_subgroup(grp_name),
+                   "qp_bands_on_mesh: {} does not exist in {}", grp_name, filename);
+      auto grp = h5::group(file).open_group(grp_name);
+      if (iter == -1) h5::h5_read(grp, "final_iter", iter);
+      auto iter_grp = grp.open_group("iter"+std::to_string(iter));
+      has_qp_approx = (iter_grp.has_subgroup("qp_approx")) ? 1 : 0;
+      utils::check(has_qp_approx ? iter_grp.open_group("qp_approx").has_dataset("Heff_skij")
+                                 : iter_grp.has_dataset("Heff_skij"),
+                   "qp_bands_on_mesh: Heff_skij not found in {}/iter{} (run compute_qp_on_ibz_kmesh first).",
+                   grp_name, iter);
+    }
+    _context.comm.broadcast_n(&iter, 1, 0);
+    _context.comm.broadcast_n(&has_qp_approx, 1, 0);
+    std::string Heff_path = grp_name + "/iter" + std::to_string(iter) + (has_qp_approx ? "/qp_approx/Heff_skij" : "/Heff_skij");
+
+    // the R grid: the Wannier90 converter's (r_vector, r_degeneracy) when present, else the WS grid of the mesh
+    nda::array<long, 2> Rpts_idx;
+    nda::array<long, 1> Rpts_weights;
+    {
+      h5::file file(project_file, 'r');
+      auto dft_grp = h5::group(file).open_group("dft_input");
+      if (dft_grp.has_dataset("r_vector") and dft_grp.has_dataset("r_degeneracy")) {
+        nda::h5_read(dft_grp, "r_vector", Rpts_idx);
+        nda::h5_read(dft_grp, "r_degeneracy", Rpts_weights);
+      } else {
+        std::tie(Rpts_weights, Rpts_idx) = utils::WS_rgrid(mf.lattv(), mf.kp_grid());
+      }
+    }
+
+    projector_t proj(mf, project_file, translate_home_cell);
+    app_log(1, "  [qp_gaps] Wannier interpolation of {} ({} Wannier orbitals, primary bands [{}, {})) onto the {}x{}x{} mesh",
+            Heff_path, proj.nImpOrbs(), proj.W_rng()[0].first(), proj.W_rng()[0].last(), mesh[0], mesh[1], mesh[2]);
+
+    auto sHeff_skij_full = unfold_1e_hamiltonian(_context, mf, filename, Heff_path, false);
+    auto res = interpolate_qp_bands_on_mesh(_context, mf, proj, sHeff_skij_full.local(), Rpts_idx, Rpts_weights, mesh);
+    _context.comm.barrier();
+    return res;
+  }
+
   void pproc_t::compute_qp_on_ibz_kmesh(mf::MF &mf, const qp_params_t &qp_params, 
                                         std::string grp_name, long iter) {
 
@@ -1086,5 +1244,84 @@ namespace methods {
       math::nda::redistribute(buffer2_diag, GS_diag);
       return GS_diag;
    }
+
+  void pproc_t::cvv_eps(mf::MF &mf, ptree const& pt, std::string grp_name, long iter) {
+    std::string filename = _scf_output + ".mbpt.h5";
+    app_log(1, "\nCVV dielectric readout (covariant-velocity q -> 0 head "
+               "of the polarizability)");
+    auto ft = imag_axes_ft::read_iaft(filename);
+    utils::check(ft.basis() == imag_axes_ft::dlr_basis,
+                 "cvv_eps: the CVV machinery requires the DLR IAFT backend "
+                 "(the checkpoint was run with iaft basis != \"dlr\").");
+
+    double mu = 0.0;
+    if (_context.comm.root()) {
+      h5::file file(filename, 'r');
+      utils::check(h5::group(file).has_subgroup(grp_name),
+                   "cvv_eps: {} does not exist in {}", grp_name, filename);
+      auto grp = h5::group(file).open_group(grp_name);
+      if (iter == -1) h5::h5_read(grp, "final_iter", iter);
+      h5::h5_read(grp, "iter" + std::to_string(iter) + "/mu", mu);
+    }
+    _context.comm.broadcast_n(&mu, 1, 0);
+    _context.comm.broadcast_n(&iter, 1, 0);
+
+    const double tol = io::get_value_with_default<double>(pt, "cvv_rspace_tol", 1e-6);
+    const long ns = mf.nspin(), nk_ibz = mf.nkpts_ibz(), nb = mf.nbnd();
+    const long nt = ft.nt_f();
+
+    using view4 = nda::array_view<ComplexType, 4>;
+    using view5 = nda::array_view<ComplexType, 5>;
+    auto sF = math::shm::make_shared_array<view4>(_context, {ns, nk_ibz, nb, nb});
+    auto sSigma = math::shm::make_shared_array<view5>(_context, {nt, ns, nk_ibz, nb, nb});
+    if (_context.node_comm.root()) {
+      h5::file file(filename, 'r');
+      auto grp = h5::group(file);
+      auto F_loc = sF.local();
+      nda::h5_read(grp, grp_name + "/iter" + std::to_string(iter) + "/F_skij", F_loc);
+      auto S_loc = sSigma.local();
+      nda::h5_read(grp, grp_name + "/iter" + std::to_string(iter) + "/Sigma_tskij", S_loc);
+    }
+    _context.comm.barrier();
+    sF.node_sync();
+    sSigma.node_sync();
+
+    // rebuild G(tau) by Dyson at the stored mu (G is not checkpointed)
+    simple_dyson dyson(&mf, &ft);
+    auto sG = math::shm::make_shared_array<view5>(_context, {nt, ns, nk_ibz, nb, nb});
+    dyson.solve_dyson(sG, sF, sSigma, mu);
+
+    solvers::cvv_head_t cvv(&ft, tol);
+    cvv.build(mf, dyson.H0(), sF.local(), sSigma.local());
+    auto head = cvv.eval_head_tensor(mf, sG.local());
+
+    // eps_M(q^) = 1 - v(q) P00(q -> 0) = 1 - 4 pi q^_a q^_b Phead_ab(inu = 0)
+    // (head-only, wings dropped as in the gygi treatment; an explicit O(q^2)
+    // coefficient, so no q -> 0 extrapolation and no stored-vs-quadratic convention)
+    const long i0 = ft.nw_b() / 2;
+    nda::array<double, 1> eps_diag(3);
+    for (int a = 0; a < 3; ++a)
+      eps_diag(a) = 1.0 - 4.0 * M_PI * head.Phead_wab(i0, a, a).real();
+    const double eps_iso = (eps_diag(0) + eps_diag(1) + eps_diag(2)) / 3.0;
+    app_log(1, "  cvv_eps [iter {}]: eps_inf(xx, yy, zz) = ({:.6f}, {:.6f}, {:.6f}); "
+               "isotropic avg = {:.6f}\n"
+               "    R store: {}/{} WS points kept; pole-fit err_max = {:.3e}, residue "
+               "ratio max = {:.3g}",
+            iter, eps_diag(0), eps_diag(1), eps_diag(2), eps_iso,
+            cvv.nR_kept(), cvv.nR(), head.fit_error_max, head.res_ratio_max);
+
+    if (_context.comm.root()) {
+      h5::file file(filename, 'a');
+      auto iter_grp = h5::group(file).open_group(grp_name + "/iter" + std::to_string(iter));
+      auto g = iter_grp.has_subgroup("cvv_eps") ? iter_grp.open_group("cvv_eps")
+                                                : iter_grp.create_group("cvv_eps");
+      nda::h5_write(g, "Pi_wab", head.Pi_wab, false);
+      nda::h5_write(g, "Phead_wab", head.Phead_wab, false);
+      nda::h5_write(g, "eps_inf_diag", eps_diag, false);
+      h5::h5_write(g, "fit_error_max", head.fit_error_max);
+      h5::h5_write(g, "res_ratio_max", head.res_ratio_max);
+    }
+    _context.comm.barrier();
+  }
 
 } // methods

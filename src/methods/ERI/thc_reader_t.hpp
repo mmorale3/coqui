@@ -23,6 +23,7 @@
 #define COQUI_THC_READER_T_HPP
 
 #include <string>
+#include "utilities/h5_background_writer.hpp"
 #include <optional>
 
 #include "configuration.hpp"
@@ -104,6 +105,12 @@ namespace methods {
       if (thresh < 0.0) {
         thresh = (_Np > 0) ? 1e-13 : 1e-5;
       }
+      // Seed the EFFECTIVE threshold with the RESOLVED requested thresh so it is meaningful
+      // before/without point selection (e.g. the read-existing path, which never calls
+      // build()). build() overwrites this with the ACHIEVED residual once the global
+      // interpolating points are selected -- see thresh().
+      _effective_thresh = thresh;
+      _chol_tie_rtol = _thc_builder_opt.value().tie_rtol();
       utils::check( _Np>0 or thresh>0.0, "Error in thc_reader_t: Must set nIpts and/or thresh");
       if(_storage == eri_storage_e::outcore and _eri_file == "") 
         _eri_file = "./thc.eri.h5";
@@ -210,8 +217,12 @@ namespace methods {
 
       _Timer.start("BUILD_THC");
       {
-        auto eval = [&]<MEMORY_SPACE MEM>() { 
-          auto [ri,dXa,dXb] = _thc_builder_opt.value().interpolating_points<MEM>(0, _Np, x_range, y_range);
+        auto eval = [&]<MEMORY_SPACE MEM>() {
+          double eff = _effective_thresh;
+          auto [ri,dXa,dXb] = _thc_builder_opt.value().interpolating_points<MEM>(0, _Np, x_range, y_range, &eff);
+          // The pivoted-Cholesky may have stopped on the nIpts cap before reaching the
+          // requested thresh; store the ACHIEVED residual as the effective threshold.
+          _effective_thresh = eff;
           _rp = std::move(ri);
           _Np = _rp.size();
           _Timer.stop("BUILD_THC");
@@ -259,6 +270,7 @@ namespace methods {
       if (_eri_file != "") {
         _Timer.start("BUILD_WRITE");
         if (_mpi->comm.root()) {
+          utils::h5_quiesce();  // see h5_background_writer.hpp
           h5::file file(_eri_file, 'w');
           h5::group grp(file);
           // MAM: write thc meta-data to into a "metadata" dataset. Useful for external codes/afqmc
@@ -266,6 +278,7 @@ namespace methods {
             std::vector<int> arng = {x_range.first(),x_range.last()};
             std::vector<int> brng = {y_range.first(),y_range.last()};
             h5::h5_write(grp, "Np", (int)_Np);
+            h5::h5_write(grp, "chol_tie_rtol", _chol_tie_rtol);
             h5::h5_write(grp, "number_of_bands", (int)_nbnd);
             h5::h5_write(grp, "X_orbital_range", arng);
             h5::h5_write(grp, "Y_orbital_range", brng);
@@ -410,12 +423,14 @@ namespace methods {
       if (_eri_file != "") {
         _Timer.start("BUILD_WRITE");
         if (_mpi->comm.root()) {
+          utils::h5_quiesce();  // see h5_background_writer.hpp
           h5::file file(_eri_file, 'w');
           h5::group grp(file);
           if (_format == "bdft") {
             std::vector<int> arng = {x_range.first(),x_range.last()};
             std::vector<int> brng = {y_range.first(),y_range.last()};
             h5::h5_write(grp, "Np", (int)_Np);
+            h5::h5_write(grp, "chol_tie_rtol", _chol_tie_rtol);
             h5::h5_write(grp, "number_of_bands", (int)_nbnd);
             h5::h5_write(grp, "X_orbital_range", arng);
             h5::h5_write(grp, "Y_orbital_range", brng);
@@ -490,10 +505,12 @@ namespace methods {
       if (_eri_file != "") {
         _Timer.start("BUILD_WRITE");
         if (_mpi->comm.root()) {
+          utils::h5_quiesce();  // see h5_background_writer.hpp
           h5::file file(_eri_file, 'w');
           h5::group grp(file);
           if (_format == "bdft") {
             h5::h5_write(grp, "Np", (int)_Np);
+            h5::h5_write(grp, "chol_tie_rtol", _chol_tie_rtol);
             nda::h5_write(grp, "kpts", _MF->kpts(), false);
             nda::h5_write(grp, "qpts", _MF->Qpts(), false);
             h5::h5_write(grp, "nkpts_ibz", _nkpts_ibz);
@@ -533,6 +550,7 @@ namespace methods {
     void read() {
       _Timer.start("BUILD_TOTAL");
       // Cache precomputed THC ERIs
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(_eri_file, 'r');
       h5::group grp(file);
 
@@ -549,6 +567,8 @@ namespace methods {
                      "thc_reader::read(): Invalid Y_orbital_range."); 
         y_range = nda::range(arng[0],arng[1]);
       }
+      _chol_tie_rtol = 0.0;
+      if (grp.has_key("chol_tie_rtol")) h5::h5_read(grp, "chol_tie_rtol", _chol_tie_rtol);
       nda::h5_read(grp, "interpolating_points", _rp);
       nda::h5_read(grp, "interpolating_vectors_G0", _Chi_head);
       nda::h5_read(grp, "dual_interpolating_vectors_G0", _Chi_bar_head);
@@ -601,6 +621,7 @@ namespace methods {
 
     int read_Np() {
       int Np;
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(_eri_file, 'r');
       h5::group grp(file);
       h5::h5_read(grp, "Np", Np);
@@ -692,6 +713,7 @@ namespace methods {
         _dZ.communicator()->all_reduce_in_place_n(Zq.data(), Zq.size(), std::plus<>{});
       } else {
         if (_dZ.communicator()->rank()==0) {
+          utils::h5_quiesce();  // see h5_background_writer.hpp
           h5::file file(_eri_file, 'r');
           h5::group grp(file);
           nda::h5_read(grp, "coulomb_matrix", Zq,
@@ -722,6 +744,7 @@ namespace methods {
           math::nda::gather_sub_matrix(iq_at_ip, ip, _dZ, &Zq);
         }
       } else {
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file(_eri_file, 'r');
         h5::group grp(file);
         nda::h5_read(grp, "coulomb_matrix", Zq,
@@ -763,6 +786,7 @@ namespace methods {
           }
         }
       } else {
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file(_eri_file, 'r');
         h5::group grp(file);
         nda::h5_read(grp, "coulomb_matrix", Z_PQ, std::tuple{iq, P_rng, Q_rng});
@@ -827,6 +851,17 @@ namespace methods {
     bool initialized() const { return _initialized; }
     bool thc_builder_is_null() const { return _thc_builder_opt == std::nullopt; }
     int Np() const { return _Np; }
+    // The EFFECTIVE threshold of the GLOBAL THC basis: seeded from the resolved requested
+    // thresh at construction, then overwritten in build() with the ACHIEVED pivoted-
+    // Cholesky residual (which is what the requested thresh describes only when thresh --
+    // not the nIpts cap -- stopped point selection). Consumers (e.g. the vertex secondary
+    // ISDF) reuse this so a secondary selection lands in the span of the global basis
+    // rather than over-resolving past its actual resolution.
+    double thresh() const { return _effective_thresh; }
+    // pivot tie tolerance the global points were selected with (thc chol_tie_rtol; stored in
+    // the save file, 0 for files written before the key existed). The vertex secondary ISDF
+    // selection uses the same value.
+    double chol_tie_rtol() const { return _chol_tie_rtol; }
     int nkpts() const { return _nkpts; }
     int nkpts_ibz() const { return _nkpts_ibz; }
     int nqpts() const { return _nqpts; }
@@ -959,6 +994,9 @@ namespace methods {
     std::optional<thc> _thc_builder_opt;
 
     int _Np;
+    double _chol_tie_rtol = 0.0;
+    double _effective_thresh = -1.0;   // effective global-THC thresh: resolved-requested at
+                                       // construction, ACHIEVED residual after build() (see thresh())
     int _nkpts;
     int _nkpts_ibz;
     int _nqpts;

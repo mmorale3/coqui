@@ -43,10 +43,10 @@ namespace methods
 /**
  * @brief Many-body perturbation calculations from a given mean-field and ERI objects with arguments in property tree.
  */
-template<typename eri_t>
+template<MEMORY_SPACE MEM = HOST_MEMORY, typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt);
 
-template<typename eri_t>
+template<MEMORY_SPACE MEM = HOST_MEMORY, typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
           nda::array<ComplexType, 5> const& projector_ksIai,
           nda::array<long, 3> const& band_window,

@@ -23,6 +23,7 @@
 #define COQUI_VSPACE_FOCK_SIGMA_HPP
 
 #include "numerics/iter_scf/diis/vspace.h"
+#include "utilities/h5_background_writer.hpp"
 namespace iter_scf {
 
 // Implementation of vector algebra for Fock matrix and self-energy union
@@ -162,6 +163,7 @@ public:
     }
 
     void read_from_file(std::string filename, const size_t vec_number) {
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file(filename, 'r');
         auto vec_grp = h5::group(file).open_group("vec" + std::to_string(vec_number));
         
@@ -175,6 +177,7 @@ public:
     void write_to_file(std::string filename, const size_t vec_number) const {
         utils::check(inited_F, "FockSigma: Fock matrix is not initialized");
         utils::check(inited_S, "FockSigma: Sigma is not initialized");
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file(filename, 'a');
         if(!h5::group(file).has_subgroup("vec" + std::to_string(vec_number))) {
             //app_log(2, "write_to_file: creating {} in file {}", "vec" + std::to_string(vec_number), filename);

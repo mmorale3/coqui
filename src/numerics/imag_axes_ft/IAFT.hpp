@@ -282,6 +282,15 @@ namespace imag_axes_ft {
       }
     }
  
+    /**
+     * Reduce the leading/trailing IR coefficient magnitudes over the
+     * communicator, report the resulting leakage and warn when it is large.
+     * Shared by the host and device paths of both leakage checks.
+     */
+    template<typename comm_t>
+    void report_leakage(double coeff_first, double coeff_last,
+                        comm_t *comm, std::string A_name) const;
+
   private:
 #ifdef ENABLE_DLR
     std::variant<ir::IR, dlr::DLR> grid_var;

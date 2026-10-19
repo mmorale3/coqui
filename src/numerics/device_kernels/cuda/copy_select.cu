@@ -58,14 +58,14 @@ void copy_select_impl(bool expand, int dim, V1 const& m, T alpha, V3 const& A, T
         long j = n - i*N;
         B_d(m_d(i),j) = scl_d*B_d(m_d(i),j) + alpha_d * A_d(i,j);
       };
-      cub::DeviceFor::Bulk(N*M,f);
+      check_launch(cub::DeviceFor::Bulk(N*M,f), "copy_select");
     } else {
       auto f = [=] __device__(long n) {
         long i = n/N;
         long j = n - i*N;
         B_d(i,j) = scl_d*B_d(i,j) + alpha_d * A_d(m_d(i),j);
       };
-      cub::DeviceFor::Bulk(N*M,f);
+      check_launch(cub::DeviceFor::Bulk(N*M,f), "copy_select");
     }
   } else if( dim == 1 ) {
     if(expand) {
@@ -83,14 +83,14 @@ void copy_select_impl(bool expand, int dim, V1 const& m, T alpha, V3 const& A, T
         long j = n - i*N;
         B_d(i,m_d(j)) = scl_d*B_d(i,m_d(j)) + alpha_d * A_d(i,j);
       };
-      cub::DeviceFor::Bulk(N*M,f);
+      check_launch(cub::DeviceFor::Bulk(N*M,f), "copy_select");
     } else {
       auto f = [=] __device__(long n) {
         long i = n/N;
         long j = n - i*N;
         B_d(i,j) = scl_d*B_d(i,j) + alpha_d * A_d(i,m_d(j));
       };
-      cub::DeviceFor::Bulk(N*M,f);
+      check_launch(cub::DeviceFor::Bulk(N*M,f), "copy_select");
     }
   }
   arch::synchronize_if_set();
@@ -115,14 +115,14 @@ void copy_select_impl(bool expand, int dim, V1 const& m, V2 const& s, T alpha, V
         long j = n - i*N;
         B_d(m_d(i),j) = scl_d*B_d(m_d(i),j) + alpha_d * s_d(i) * A_d(i,j);
       };
-      cub::DeviceFor::Bulk(N*M,f);
+      check_launch(cub::DeviceFor::Bulk(N*M,f), "copy_select");
     } else { 
       auto f = [=] __device__(long n) {
         long i = n/N;
         long j = n - i*N;
         B_d(i,j) = scl_d*B_d(i,j) + alpha_d * s_d(i) * A_d(m_d(i),j);
       };
-      cub::DeviceFor::Bulk(N*M,f);
+      check_launch(cub::DeviceFor::Bulk(N*M,f), "copy_select");
     }
   } else if( dim == 1 ) {
     if(expand) {
@@ -131,14 +131,14 @@ void copy_select_impl(bool expand, int dim, V1 const& m, V2 const& s, T alpha, V
         long j = n - i*N;
         B_d(i,m_d(j)) = scl_d*B_d(i,m_d(j)) + alpha_d * s_d(j) * A_d(i,j);
       };
-      cub::DeviceFor::Bulk(N*M,f);
+      check_launch(cub::DeviceFor::Bulk(N*M,f), "copy_select");
     } else {
       auto f = [=] __device__(long n) {
         long i = n/N;
         long j = n - i*N;
         B_d(i,j) = scl_d*B_d(i,j) + alpha_d * s_d(j) * A_d(i,m_d(j));
       };
-      cub::DeviceFor::Bulk(N*M,f);
+      check_launch(cub::DeviceFor::Bulk(N*M,f), "copy_select");
     }
   }
   arch::synchronize_if_set();
@@ -157,12 +157,12 @@ void copy_select_impl(bool expand, V1 const& m, T alpha, V3 const& A, T scl, V4&
     auto f = [=] __device__(long i) {  
       B_d(m_d(i)) = scl_d*B_d(m_d(i)) + alpha_d * A_d(i);
     };
-    cub::DeviceFor::Bulk(N,f);
+    check_launch(cub::DeviceFor::Bulk(N,f), "copy_select");
   } else {
     auto f = [=] __device__(long i) {   
       B_d(i) = scl_d*B_d(i) + alpha_d * A_d(m_d(i));
     };
-    cub::DeviceFor::Bulk(N,f);
+    check_launch(cub::DeviceFor::Bulk(N,f), "copy_select");
   }
   arch::synchronize_if_set();
 }
@@ -181,12 +181,12 @@ void copy_select_impl(bool expand, V1 const& m, V2 const& s, T alpha, V3 const& 
     auto f = [=] __device__(long i) {
       B_d(m_d(i)) = scl_d*B_d(m_d(i)) + alpha_d * s_d(i) * A_d(i);
     };
-    cub::DeviceFor::Bulk(N,f);
+    check_launch(cub::DeviceFor::Bulk(N,f), "copy_select");
   } else {
     auto f = [=] __device__(long i) {
       B_d(i) = scl_d*B_d(i) + alpha_d * s_d(i) * A_d(m_d(i));
     };
-    cub::DeviceFor::Bulk(N,f);
+    check_launch(cub::DeviceFor::Bulk(N,f), "copy_select");
   }
   arch::synchronize_if_set();
 }

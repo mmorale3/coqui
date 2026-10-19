@@ -24,6 +24,7 @@
 
 #include "configuration.hpp"
 #include "utilities/check.hpp"
+#include "utilities/omp_threads.hpp"
 #include "nda/nda.hpp"
 
 #include <boost/multiprecision/cpp_dec_float.hpp>
@@ -65,22 +66,50 @@ namespace analyt_cont {
       _iw_fit = nda::array<mp_complex, 1>(_Nfit);
       _coeffs = nda::array<mp_complex, 2>(_dim1, _Nfit);
       _orders = nda::array<long, 1>(_dim1);
-      nda::array<mp_complex, 1> Ad_iw(_Nfit);
 
       for (long w=0; w<_Nfit; ++w)
         _iw_fit(w) = mp_complex(mp_float(iw_mesh(w).real()), mp_float(iw_mesh(w).imag()));
 
-      for (long d=0; d<_dim1; ++d) {
-        for (long w=0; w<_Nfit; ++w)
-          Ad_iw(w) = mp_complex(mp_float(A_iw(w, d).real()),
-                                mp_float(A_iw(w, d).imag()));
-        // the effective order of the pade approx. can be smaller than Nfit due to truncation. 
-        _orders(d) = fit(Ad_iw, _iw_fit, _coeffs(d,nda::range::all));
+      // ---------------- threaded region (omp_threads) ----------------
+      // The per-state Thiele reciprocal-difference fit; it dominates the cost of the
+      // AC/Pade quasiparticle map.
+      //
+      // THREAD SAFETY:
+      //   * no MPI, no HDF5, no logging, no utils::check on this path -- init's own checks
+      //     and pade_driver::init's app_log are all OUTSIDE this loop;
+      //   * `Ad_iw` is a per-thread buffer declared INSIDE the parallel region;
+      //   * `fit()` takes its (_Nfit,_Nfit) `g` table as a per-thread scratch buffer,
+      //     allocated once per thread and passed in, which avoids per-state malloc/free;
+      //   * `_coeffs(d,:)` and `_orders(d)` are disjoint per `d`; `_iw_fit` is read-only;
+      //   * cpp_dec_float is a fixed-size backend -- no allocation per arithmetic op.
+      //
+      // DETERMINISM: iterations are independent and nothing is reassociated, so the result
+      // is bitwise identical at any thread count.
+      [[maybe_unused]] const long nthr = utils::omp_threads_for(_dim1);
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthr) if (nthr > 1)
+#endif
+      {
+        nda::array<mp_complex, 1> Ad_iw(_Nfit);
+        nda::array<mp_complex, 2> g_scr(_Nfit, _Nfit);
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (long d=0; d<_dim1; ++d) {
+          for (long w=0; w<_Nfit; ++w)
+            Ad_iw(w) = mp_complex(mp_float(A_iw(w, d).real()),
+                                  mp_float(A_iw(w, d).imag()));
+          // the effective order of the pade approx. can be smaller than Nfit due to truncation.
+          _orders(d) = fit(Ad_iw, _iw_fit, _coeffs(d,nda::range::all), g_scr);
+        }
       }
     }
 
+    // The evaluate family is `const`: it only reads _orders/_coeffs/_iw_fit, and concurrent
+    // calls on one shared kernel are exactly what the threaded qp_approx / solve_qp_eqn
+    // regions do -- so this is pinned in the type system instead of left to inspection.
     template<nda::ArrayOfRank<1> w_mesh_t>
-    auto evaluate(w_mesh_t &&w_mesh) -> nda::array<ComplexType, 2> {
+    auto evaluate(w_mesh_t &&w_mesh) const -> nda::array<ComplexType, 2> {
       long Nw = w_mesh.shape(0);
       nda::array<ComplexType, 2> A_wI(Nw, _dim1);
       for (long d1 = 0; d1 < _dim1; ++d1) {
@@ -95,7 +124,7 @@ namespace analyt_cont {
     }
 
     template<nda::ArrayOfRank<1> w_mesh_t>
-    auto evaluate(w_mesh_t &&w_mesh, long d1) -> nda::array<ComplexType, 1> {
+    auto evaluate(w_mesh_t &&w_mesh, long d1) const -> nda::array<ComplexType, 1> {
       long Nw = w_mesh.shape(0);
       nda::array<ComplexType, 1> A_w(Nw);
       for (long w = 0; w < Nw; ++w) {
@@ -108,7 +137,7 @@ namespace analyt_cont {
       return A_w;
     }
 
-    ComplexType evaluate(ComplexType w, long d1) {
+    ComplexType evaluate(ComplexType w, long d1) const {
       mp_complex w_hpc( mp_float(w.real()), mp_float(w.imag()) );
       mp_complex Xw = _evaluate_impl(w_hpc, d1);
 
@@ -150,10 +179,18 @@ namespace analyt_cont {
       return a;
     }
 
-    template<nda::ArrayOfRank<1> Az_t, nda::ArrayOfRank<1> w_mesh_t, nda::ArrayOfRank<1> coeff_t>
-    long fit(Az_t &&Az, w_mesh_t &&z_fit, coeff_t &&coeffs) {
+    /**
+     * `g` is a CALLER-OWNED (_Nfit,_Nfit) scratch table rather than a local allocation, so
+     * the threaded `d` loop in init() does not malloc/free one table per state (tens of KB
+     * each in multiprecision). It is fully overwritten
+     * on entry (the `g() = 0` below), so reuse across calls is arithmetically identical to
+     * a fresh allocation. `const` because the fit mutates no member -- only `coeffs` and
+     * the caller's scratch.
+     */
+    template<nda::ArrayOfRank<1> Az_t, nda::ArrayOfRank<1> w_mesh_t, nda::ArrayOfRank<1> coeff_t,
+             nda::ArrayOfRank<2> scratch_t>
+    long fit(Az_t &&Az, w_mesh_t &&z_fit, coeff_t &&coeffs, scratch_t &&g) const {
       // g(i, j) = g_i(z_j)
-      nda::array<mp_complex, 2> g(_Nfit, _Nfit);
       g() = mp_complex{mp_float(0), mp_float(0)};
       g(0, nda::range::all) = Az();
 

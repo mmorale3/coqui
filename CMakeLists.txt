@@ -104,6 +104,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(ENABLE_ROCM " Build device code with ROCM backend" OFF)
 option(ENABLE_OPENMP " Build device code with OPENMP backend" OFF)
 option(ENABLE_FFTW "Build using FFTW3 library." ON)
+# ENABLE_FINUFFT defaults OFF: cmake/finufft.cmake pulls FINUFFT with FetchContent at
+# CONFIGURE time, i.e. it needs network access, which cluster compute nodes often lack.
+# Builds that need the real-axis module turn it ON explicitly; with it OFF the real-axis
+# module and every finufft target are left out of the build.
+option(ENABLE_FINUFFT "Enable FINUFFT non-uniform FFT backend" OFF)
+option(ENABLE_CUFINUFFT "Enable cuFINUFFT (GPU NUFFT) backend. Requires CUDA + ENABLE_FINUFFT." OFF)
 option(ENABLE_HEFFTE "Build using heFFTe library." OFF)
 option(ENABLE_SLATE "Build using Slate library." ON)
 option(ENABLE_CUTENSOR "Build using cutensor library. Must set CUTENSOR_ROOT" OFF)
@@ -148,11 +154,23 @@ endif()
 set(ENABLE_NCCL FALSE)
 if(ENABLE_CUDA)
   enable_language(CUDA)
-  if(DEFINED CUDA_ARCH)
+  # Architecture selection. Honour both the standard CMAKE_CUDA_ARCHITECTURES and the legacy
+  # CUDA_ARCH spelling, prefer the standard one, default to 80 only when neither is set, and
+  # report the choice. A user-supplied CMAKE_CUDA_ARCHITECTURES must never be overwritten: a
+  # binary built for the wrong architecture (e.g. sm_80 only, no PTX) cannot launch its kernels
+  # on a newer GPU (cudaErrorNoKernelImageForDevice).
+  if(DEFINED CUDA_ARCH AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
-  else()
+  elseif(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 80)
   endif()
+  if(DEFINED CUDA_ARCH AND DEFINED CMAKE_CUDA_ARCHITECTURES
+     AND NOT "${CUDA_ARCH}" STREQUAL "${CMAKE_CUDA_ARCHITECTURES}")
+    message(WARNING "Both CUDA_ARCH (${CUDA_ARCH}) and CMAKE_CUDA_ARCHITECTURES "
+                    "(${CMAKE_CUDA_ARCHITECTURES}) are set and disagree; using "
+                    "CMAKE_CUDA_ARCHITECTURES.")
+  endif()
+  message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
   find_package(CUDAToolkit 12.0.0 REQUIRED)
   if(NOT FETCH_CCCL)
     find_package(CCCL REQUIRED)
@@ -252,13 +270,106 @@ cmake_print_properties(TARGETS MPI::MPI_CXX PROPERTIES INTERFACE_LINK_LIBRARIES 
 ######################################################################
 #find_package(BLAS REQUIRED)
 #find_package(LAPACK REQUIRED)
-#cmake_print_properties(TARGETS BLAS::BLAS PROPERTIES INTERFACE_LINK_LIBRARIES) 
+#cmake_print_properties(TARGETS BLAS::BLAS PROPERTIES INTERFACE_LINK_LIBRARIES)
 #cmake_print_properties(TARGETS LAPACK::LAPACK PROPERTIES INTERFACE_LINK_LIBRARIES)
 
 ######################################################################
-# FFTW: not using MKL's FFTW yet, figure out how if requested 
+# MKL threading layer link order
+#
+# Because find_package(BLAS) is commented out just above, MKL enters the link ONLY through
+# the slate / blaspp / lapackpp imported targets, which may have been configured against
+# libmkl_sequential. ELF first-definition-wins then hands every MKL entry point to the
+# SEQUENTIAL layer, so MKL_NUM_THREADS (and the `blas_threads` knob) are silently inert.
+# This puts the GNU OpenMP threading layer on the link line AHEAD of the imported targets
+# that drag in the sequential one, so no LD_PRELOAD of libmkl_gnu_thread is needed.
+#
+# IT MUST BE A LINK *OPTION*, NOT A LINK LIBRARY. The obvious spelling --
+#   target_link_libraries(... "-Wl,--no-as-needed" <path> "-Wl,--as-needed")
+# -- does NOT work: CMake treats a full-path library as a reorderable/dedupable item and
+# hoists it towards the END of the link line, behind -lmkl_sequential, while the bare -Wl
+# flags stay put. Link OPTIONS are emitted verbatim, ahead of both the objects and the whole
+# library list, so passing the library THROUGH -Wl, makes it the first shared-object input
+# and therefore the first MKL entry in DT_NEEDED.
+#
+# --push-state/--no-as-needed ... --pop-state is required because the layer is placed
+# before anything that references an MKL symbol, so a default --as-needed linker would
+# drop it again; pop-state restores the previous setting so no other dependency changes.
+#
+# This is a NO-OP wherever MKL is not the BLAS in use (e.g. an OpenBLAS build): the library
+# is not found and the interface target stays empty.
+######################################################################
+option(COQUI_MKL_THREADED_LINK
+       "Link MKL's GNU OpenMP threading layer ahead of the sequential layer" ON)
+add_library(coqui_blas_threading INTERFACE)
+if(COQUI_MKL_THREADED_LINK)
+  find_library(COQUI_MKL_GNU_THREAD
+               NAMES mkl_gnu_thread
+               HINTS $ENV{MKLROOT} ${MKLROOT} $ENV{MKL_ROOT} ${MKL_ROOT}
+               PATH_SUFFIXES lib lib/intel64 lib/intel64_lin
+                             latest/lib latest/lib/intel64)
+  if(COQUI_MKL_GNU_THREAD)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      target_link_options(coqui_blas_threading INTERFACE
+        "-Wl,--push-state,--no-as-needed,${COQUI_MKL_GNU_THREAD},--pop-state")
+    else()
+      target_link_libraries(coqui_blas_threading INTERFACE ${COQUI_MKL_GNU_THREAD})
+    endif()
+    message(STATUS "MKL threading layer placed ahead of the sequential layer: ${COQUI_MKL_GNU_THREAD}")
+    message(STATUS "  -> MKL_NUM_THREADS / blas_threads take effect without LD_PRELOAD")
+  else()
+    message(STATUS "MKL threading layer not found (MKLROOT unset, or a non-MKL BLAS is in "
+                   "use): BLAS threading follows whatever slate/blaspp linked.")
+  endif()
+endif()
+
+######################################################################
+# Host OpenMP
+#
+# This is CoQui's OWN threading of its OWN loops (the `omp_threads` knob, see
+# src/utilities/omp_threads.hpp). It is NOT the ENABLE_OPENMP option a few dozen lines
+# above -- that one selects an OpenMP *device offload* backend and turns on ENABLE_DEVICE.
+# Do not conflate them.
+#
+# The flag is applied to the `utils` target PUBLICly, and every CoQui library reaches utils
+# transitively, so all C++ TUs are compiled with the same -fopenmp state. That uniformity is
+# deliberate and not cosmetic: the threaded regions live in headers/templates (pade_t.hpp's
+# init, thc_gw.icc's Hadamard) that are instantiated in several targets, and compiling one
+# instantiation with OpenMP and another without would be an ODR violation whose symptom is
+# a region that silently does not thread.
+#
+# DEFAULT: ON on Linux, OFF on Apple. On macOS a typical toolchain mixes two OpenMP
+# runtimes (e.g. libomp and the BLAS's own), and any run with more than one thread then
+# aborts with OMP Error #179; macOS builds therefore run CoQui's loops serially.
+######################################################################
+if(APPLE)
+  set(COQUI_HOST_OPENMP_DEFAULT OFF)
+else()
+  set(COQUI_HOST_OPENMP_DEFAULT ON)
+endif()
+option(COQUI_ENABLE_HOST_OPENMP
+       "Build CoQui's own OpenMP regions (the omp_threads knob)"
+       ${COQUI_HOST_OPENMP_DEFAULT})
+if(COQUI_ENABLE_HOST_OPENMP)
+  find_package(OpenMP COMPONENTS CXX)
+  if(OpenMP_CXX_FOUND)
+    message(STATUS "Host OpenMP enabled: ${OpenMP_CXX_FLAGS} (the omp_threads knob is live)")
+  else()
+    message(STATUS "Host OpenMP requested but not found: the omp_threads knob will warn and "
+                   "CoQui's own loops stay serial")
+  endif()
+else()
+  message(STATUS "Host OpenMP disabled (COQUI_ENABLE_HOST_OPENMP=OFF): CoQui's own loops "
+                 "stay serial")
+endif()
+
+######################################################################
+# FFTW: not using MKL's FFTW yet, figure out how if requested
 ######################################################################
 if(ENABLE_FFTW)
+  # The component list only names DOUBLE_OPENMP_LIB, but FindFFTW searches for every
+  # flavour unconditionally and exports FFTW::DoubleThreads / FFTW::DoubleOpenMP whenever it
+  # finds them, so nothing has to be promoted to a REQUIRED component to pick one. See
+  # src/numerics/fft/CMakeLists.txt for WHICH one gets linked and why.
   find_package(FFTW REQUIRED DOUBLE_OPENMP_LIB)
   add_compile_definitions(ENABLE_FFTW)
 endif()
@@ -470,14 +581,27 @@ endif(ENABLE_CPPTRACE)
 ########################
 if(COQUI_PYTHON_SUPPORT)
   find_package(Python COMPONENTS Interpreter Development NumPy)
-  # Fetch the c2py library
-  FetchContent_Declare(
-    c2py
-    GIT_REPOSITORY https://github.com/flatironinstitute/c2py
-    GIT_TAG        unstable
-    EXCLUDE_FROM_ALL
-  )
-  FetchContent_MakeAvailable(c2py)
+  # Fetch the c2py library.
+  #
+  # h5 -- pulled in transitively by nda once PythonSupport=ON, see the nda block above --
+  # may fetch c2py ITSELF through nda's external_dependency(), which add_subdirectory()s
+  # it under _deps/nda-build/deps/h5/deps/c2py_src and thereby defines the c2py,
+  # c2py_warnings and c2py::c2py targets. FetchContent has no record of that population,
+  # so an unconditional FetchContent_MakeAvailable(c2py) here aborts the configure with
+  #   "_add_library cannot create target \"c2py_warnings\" because another target with the
+  #    same name already exists"  (CMP0002).
+  # Both paths track flatironinstitute/c2py @ unstable, so reuse whatever is already there.
+  if(TARGET c2py::c2py)
+    message(STATUS "c2py already provided by a dependency (h5 via nda); reusing its targets.")
+  else()
+    FetchContent_Declare(
+      c2py
+      GIT_REPOSITORY https://github.com/flatironinstitute/c2py
+      GIT_TAG        unstable
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(c2py)
+  endif()
 
   if (COQUI_UPDATE_PYTHON_BINDINGS)
     find_program(clair-c2py clair-c2py REQUIRED)
@@ -527,6 +651,30 @@ if(ENABLE_WANNIER90)
     target_include_directories(Wannier90_lib PRIVATE "${GFORTRAN_INCLUDE_DIR}")
     add_compile_definitions(ENABLE_WANNIER90)
 endif(ENABLE_WANNIER90)
+
+######################################################################
+# FINUFFT: Flatiron Institute NUFFT library
+######################################################################
+if(ENABLE_FINUFFT)
+  include(${CMAKE_SOURCE_DIR}/cmake/finufft.cmake)
+  add_compile_definitions(ENABLE_FINUFFT)
+endif()
+
+# cuFINUFFT (GPU NUFFT) -- enables the device-side dispatch in
+# numerics/fft/cufinufft.cpp. The CUDA target is built by the same FINUFFT
+# FetchContent superbuild via FINUFFT_USE_CUDA, so ENABLE_CUFINUFFT requires
+# ENABLE_FINUFFT to be on.
+if(ENABLE_CUFINUFFT)
+  if(NOT ENABLE_FINUFFT)
+    message(FATAL_ERROR
+      "ENABLE_CUFINUFFT requires ENABLE_FINUFFT=ON (cuFINUFFT is built as "
+      "part of the FINUFFT superbuild via FINUFFT_USE_CUDA).")
+  endif()
+  add_compile_definitions(COQUI_HAVE_CUFINUFFT)
+  message(STATUS "cuFINUFFT: enabled (defined COQUI_HAVE_CUFINUFFT). "
+                 "Ensure CUDA is available and FINUFFT_USE_CUDA was set in "
+                 "the FetchContent flow (see cmake/finufft.cmake).")
+endif()
 
 ######################################################################
 # cppdlr: Discrete Lehmann Representation backend (optional)

@@ -339,6 +339,25 @@ namespace methods {
     }
 
     // Read Vhf_imp, Vhf_dc, Sigma_imp, and Vcorr_dc
+    //
+    // TRAP (made loud here): unlike dmft_embed_impl, this branch ALSO needs
+    // Vcorr_dc_sIab, and no external setter populates it -- MBState::set_local_hf_potentials
+    // only fills Vhf_imp/Vhf_dc and set_local_selfenergies only fills Sigma_imp/Sigma_dc.
+    // A caller that supplies local corrections (the python `coqui.dmft_embed(...,
+    // local_hf_potentials=..., local_sigma_dynamic=...)` entry points) with
+    // qp_approx_mbpt=true therefore always fell into the "read from checkpoint" path
+    // below, which OVERWRITES the caller's Sigma_imp/Vhf_imp with whatever
+    // "downfold_1e/iter{weiss_f_iter}" happens to hold -- silently substituting stale
+    // impurity data from an earlier cycle for the solution just computed. Refuse instead.
+    utils::check(not (mb_state.Sigma_imp_wsIab and mb_state.Vhf_imp_sIab)
+                 or mb_state.Vcorr_dc_sIab.has_value(),
+                 "embed_t::dmft_embed_qp_impl: local self-energy corrections were provided in "
+                 "MBState (Sigma_imp_wsIab and Vhf_imp_sIab are set) but Vcorr_dc_sIab is not. "
+                 "The qp_approx_mbpt=true embedding requires all of them together; continuing "
+                 "would discard the provided corrections and silently re-read stale ones from "
+                 "\"downfold_1e/iter{}\" of {}. Either set MBState::Vcorr_dc_sIab as well (it is "
+                 "produced by embed_t::downfold_mb_solution_qp_impl) or run this embedding with "
+                 "qp_approx_mbpt=false.", weiss_f_iter, filename);
     bool sigma_local_given = false;
     if (!mb_state.Sigma_imp_wsIab or !mb_state.Vcorr_dc_sIab) {
       // 1) if the sigma_imp and Vcorr_dc are not set, we read them from the file

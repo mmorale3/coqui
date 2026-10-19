@@ -1,0 +1,773 @@
+/**
+ * ==========================================================================
+ * CoQuí: Correlated Quantum ínterface
+ *
+ * Copyright (c) 2022-2025 Simons Foundation & The CoQuí developer team
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==========================================================================
+ */
+
+#ifndef NUMERICS_FFT_FINUFFT_NDA_HPP
+#define NUMERICS_FFT_FINUFFT_NDA_HPP
+
+/*
+ * nda-level interface for the (cu)FINUFFT non-uniform FFT backend.
+ *
+ * Mirrors the structure of nda.hpp but for NUFFTs. Both host (FINUFFT)
+ * and device (cuFINUFFT) backends are dispatched on the array memory
+ * space: host nda arrays route to math::nufft::impl::host::* and device
+ * nda::cuarrays route to math::nufft::impl::dev::*. The `nuplan_t::bend`
+ * field carries the backend tag so it stays consistent across the
+ * create_plan / setpts / fwdnufft / invnufft / destroy_plan lifecycle.
+ *
+ * To create a device plan, pass `MEMORY_SPACE` explicitly:
+ *
+ *     auto p = math::nufft::create_plan<DEVICE_MEMORY>(nmodes, npts, ...);
+ *
+ * The default is `HOST_MEMORY`, so existing host code is unchanged.
+ *
+ * Device array support requires CoQui to be built with the
+ * `COQUI_HAVE_CUFINUFFT` flag; without it the device path links but
+ * aborts at runtime with a clear "compiled without cuFINUFFT" message.
+ *
+ * Transform conventions (matching finufft):
+ *
+ *   Type 1 — nonuniform → uniform  ("forward"):
+ *     f[k] = sum_{j=0}^{M-1} c[j] exp(+i * iflag * k . x[j])
+ *
+ *   Type 2 — uniform → nonuniform  ("adjoint / inverse"):
+ *     c[j] = sum_k f[k] exp(-i * iflag * k . x[j])
+ *
+ * Rank conventions:
+ *   - The Fourier-mode array F has shape (N1) / (N1,N2) / (N1,N2,N3)
+ *     for 1-D / 2-D / 3-D transforms.
+ *   - For batched ("many") transforms F has an extra "slowest" dimension
+ *     ntrans, giving shape (ntrans, N1[, N2[, N3]]) in C_layout
+ *     and (N1[, N2[, N3]], ntrans) in F_layout.
+ *   - The nonuniform coordinate arrays x, y, z are always rank-1
+ *     with length M (number of nonuniform points).
+ *   - The strength array C has shape (M) for a single transform,
+ *     or (ntrans, M) for C_layout [ and (M, ntrans) for F_layout ] 
+ *     for a batched transform.
+ *
+ * Notes:
+ *   - finufft does NOT apply a 1/N normalisation; __normalize__ = false.
+ *   - The coordinate arrays must remain unmodified between create_plan /
+ *     setpts and the execute call.
+ *   - For C_layout Fourier-mode arrays F, the order of the modes in create_plan
+ *     and the order of nonuniform coordinate arrays must be transposed.
+ *     For example, for a 3-d transform with dimensions {N1,N2,N3}, the correct
+ *     calls would be:
+ *     
+ *       nda::array<T,3> F(N1,N2,N3);
+ *       auto p = create_plan(std::array<int,3>{N3,N2,N1}, ...)
+ *       setpts(p,z,y,x);
+ *       fwdnufft(C,F,...);
+ */
+
+#include "configuration.hpp"
+#include "numerics/fft/finufft_define.hpp"
+#include "numerics/fft/finufft.h"
+#include "numerics/fft/cufinufft.h"
+#include "utilities/check.hpp"
+#include "nda/nda.hpp"
+
+namespace math::nufft
+{
+
+namespace detail
+{
+
+template<::nda::MemoryArray CMat, ::nda::MemoryArray FMat>
+void check_dimensions(nuplan_t &p, CMat &&C, FMat &&F)
+{
+  using C_t = std::decay_t<CMat>;
+  using F_t = std::decay_t<FMat>;
+  utils::check(F.is_contiguous() and C.is_contiguous(), "Only contiguous arrays allowed.");
+  static_assert(F_t::layout_t::is_stride_order_Fortran(), "Layout mismatch");
+  static_assert(::nda::mem::on_host<CMat> == ::nda::mem::on_host<FMat>,
+                "C and F must be in the same memory space (both host or both device).");
+  // Plan-vs-array memory-space consistency: a host-built plan must be
+  // executed with host arrays and vice versa.
+  if constexpr (::nda::mem::on_host<CMat>) {
+    utils::check(p.bend == NUFFT_BACKEND_FINUFFT,
+                 "nufft: host arrays passed to a non-FINUFFT plan (bend={}).",
+                 int(p.bend));
+  } else {
+    utils::check(p.bend == NUFFT_BACKEND_CUFINUFFT,
+                 "nufft: device arrays passed to a non-cuFINUFFT plan (bend={}).",
+                 int(p.bend));
+  }
+
+  constexpr int rank = ::nda::get_rank<C_t>;
+  static_assert(rank == 1 or rank == 2, "Rank mismatch.");
+  
+  if constexpr (rank==2) {
+    constexpr int C_td = ( C_t::layout_t::is_stride_order_C() ? 0 : 1 );
+    utils::check(int(C.shape()[C_td]) == p.ntrans,
+                 "nufft: C.shape[0]={} != p.ntrans={}",
+                 C.shape()[C_td], p.ntrans);
+    utils::check(int64_t(C.shape()[1-C_td]) == p.npts,
+                 "nufft: C.shape[1]={} != p.npts={}",
+                 C.shape()[1-C_td], p.npts);
+    utils::check(::nda::get_rank<F_t> == p.rank+1, "Rank mismatch");
+    utils::check(F.shape()[(F_t::layout_t::is_stride_order_C() ? 0 : p.rank)] == p.ntrans,
+               "nufft: Shape mismatch"); 
+  } else {     
+    utils::check(int64_t(C.shape()[0]) == p.npts,
+                 "nufft: C.shape[0]={} != p.npts={}",
+                 C.shape()[0], p.npts);
+    utils::check(::nda::get_rank<F_t> == p.rank, "Rank mismatch");
+  } 
+  // F order: {x, y, z, n}
+  for( int i=0; i<p.rank; ++i)
+    utils::check(F.shape()[i] == p.nmodes[i], "nufft: Shape mismatch");
+}
+
+}
+
+// finufft / cufinufft do not normalise — disable the normalisation step.
+namespace impl::host { static constexpr bool __normalize__ = false; }
+namespace impl::dev  { static constexpr bool __normalize__ = false; }
+
+// =========================================================================
+// Precision helper
+//
+// Selects double or float eps based on the value_type of the nda array,
+// analogous to the way fftw.h dispatches on ComplexType vs RealType.
+// =========================================================================
+namespace impl
+{
+template<typename VT>
+struct eps_type { using type = double; };
+template<>
+struct eps_type<std::complex<float>> { using type = float; };
+template<>
+struct eps_type<float> { using type = float; };
+
+template<typename VT>
+using eps_t = typename eps_type<VT>::type;
+
+// Default precision: 1e-6 (double) or 1e-6f (float).
+template<typename VT>
+constexpr eps_t<VT> default_eps()
+{
+  if constexpr (std::is_same_v<eps_t<VT>, float>) return 1e-6f;
+  else return 1e-6;
+}
+} // namespace impl
+
+// =========================================================================
+// create_plan
+//
+// Single-transform plan. The MEMORY_SPACE template parameter selects the
+// backend: HOST_MEMORY uses FINUFFT, DEVICE_MEMORY uses cuFINUFFT.
+//
+// nmodes: 1-D array with the number of modes in each dimension.
+//         Its shape implicitly defines the rank of the transformation.
+// npts:   Number of non-uniform points on the grid.
+// ntrans: Number of transformations.
+//
+// Usage:
+//   auto p = math::nufft::create_plan<HOST_MEMORY>(nmodes, npts, ...);  // CPU
+//   auto p = math::nufft::create_plan<DEVICE_MEMORY>(nmodes, npts, ...); // GPU
+// The default is HOST_MEMORY for backwards compatibility.
+// =========================================================================
+
+template<MEMORY_SPACE MEM = HOST_MEMORY,
+         typename Itype = int64_t, std::size_t rank = 1, typename value_type = double>
+nuplan_t create_plan(std::array<Itype,rank> nmodes, int64_t npts,
+                     int ntrans = 1,
+                     value_type eps = impl::default_eps<value_type>(),
+                     int iflag = NUFFT_FORWARD)
+{
+  static_assert(rank >= 1 && rank <= 3, "Fourier-mode rank must be 1, 2, or 3.");
+  static_assert(MEM == HOST_MEMORY || MEM == DEVICE_MEMORY,
+                "create_plan: MEMORY_SPACE must be HOST_MEMORY or DEVICE_MEMORY "
+                "(UNIFIED is not yet supported by the cuFINUFFT backend).");
+
+  // nmodes: the shape of F gives N1[,N2[,N3]]
+  std::array<int64_t,rank> nm;
+  for (int d = 0; d < rank; ++d) nm[d] = int64_t(nmodes[d]);
+
+  if constexpr (MEM == HOST_MEMORY)
+    return impl::host::create_plan(rank, nm.data(), npts, ntrans, eps, iflag);
+  else
+    return impl::dev::create_plan(rank, nm.data(), npts, ntrans, eps, iflag);
+}
+
+// =========================================================================
+// create_plan_t3 — type-3 (NU → NU) plan.
+//
+// Use when both source AND target frequencies are nonuniform. The
+// uniform-time intermediary is skipped. Internally cuFINUFFT/FINUFFT
+// implement type-3 as an outer type-1 spreading + inner type-2 plan; for
+// 1D batched workloads this is typically slower than the type-1+type-2
+// chain we already use (because the fixed FFT cost amortizes well across
+// `ntrans` batches). The benchmark in tests/test_real_axis_pi_t3.cpp
+// quantifies the trade-off for the real-axis kernel.
+// =========================================================================
+template<MEMORY_SPACE MEM = HOST_MEMORY, typename value_type = double>
+nuplan_t create_plan_t3(int rank, int64_t npts_in, int64_t npts_out,
+                        int ntrans = 1,
+                        value_type eps = impl::default_eps<value_type>(),
+                        int iflag = NUFFT_FORWARD)
+{
+  utils::check(rank >= 1 && rank <= 3,
+               "create_plan_t3: rank must be 1, 2, or 3 (got {})", rank);
+  static_assert(MEM == HOST_MEMORY || MEM == DEVICE_MEMORY,
+                "create_plan_t3: MEMORY_SPACE must be HOST_MEMORY or DEVICE_MEMORY.");
+
+  if constexpr (MEM == HOST_MEMORY)
+    return impl::host::create_plan_t3(rank, npts_in, npts_out, ntrans, eps, iflag);
+  else
+    return impl::dev::create_plan_t3(rank, npts_in, npts_out, ntrans, eps, iflag);
+}
+
+// =========================================================================
+// setpts — attach nonuniform coordinate arrays to a plan.
+//
+// For arrays with fortran ordering:
+// 1-D:  setpts(p, x)
+// 2-D:  setpts(p, x, y)
+// 3-D:  setpts(p, x, y, z)
+//
+// For arrays with C ordering:
+// 1-D:  setpts(p, x)
+// 2-D:  setpts(p, y, x)
+// 3-D:  setpts(p, z, y, x)
+//
+// The coordinate arrays must remain valid and unmodified until after the
+// execute (fwdnufft / invnufft) call.
+// =========================================================================
+
+// Helper: dispatch setpts to host or device based on plan backend.
+namespace detail {
+template<typename val_t>
+inline void setpts_dispatch(nuplan_t &p, val_t *x, val_t *y, val_t *z)
+{
+  if (p.bend == NUFFT_BACKEND_FINUFFT)
+    impl::host::setpts(p, x, y, z);
+  else if (p.bend == NUFFT_BACKEND_CUFINUFFT)
+    impl::dev::setpts(p, x, y, z);
+  else
+    utils::check(false, "setpts: unknown NUFFT backend (bend={}).", int(p.bend));
+}
+
+// Memory-space consistency check between coordinate array and plan.
+template<typename CoordMat>
+inline void check_coord_memspace(nuplan_t const& p)
+{
+  if constexpr (::nda::mem::on_host<CoordMat>) {
+    utils::check(p.bend == NUFFT_BACKEND_FINUFFT,
+                 "setpts: host coordinate array passed to a non-FINUFFT plan.");
+  } else {
+    utils::check(p.bend == NUFFT_BACKEND_CUFINUFFT,
+                 "setpts: device coordinate array passed to a non-cuFINUFFT plan.");
+  }
+}
+}
+
+template<::nda::MemoryArrayOfRank<1> CoordMat>
+void setpts(nuplan_t &p, CoordMat &&x)
+{
+  using X_t = std::decay_t<CoordMat>;
+  detail::check_coord_memspace<CoordMat>(p);
+  utils::check(p.rank == 1, "setpts: plan rank={} but only x supplied.", p.rank);
+  utils::check(int64_t(x.shape()[0]) == p.npts,
+               "setpts: x.size={} != p.npts={}", x.shape()[0], p.npts);
+
+  using val_t = typename X_t::value_type;
+  detail::setpts_dispatch<val_t>(p, const_cast<val_t*>(x.data()), nullptr, nullptr);
+}
+
+template<::nda::MemoryArrayOfRank<1> CoordMat>
+void setpts(nuplan_t &p, CoordMat &&x, CoordMat &&y)
+{
+  using X_t = std::decay_t<CoordMat>;
+  detail::check_coord_memspace<CoordMat>(p);
+  utils::check(p.rank == 2, "setpts: plan rank={} but x,y supplied.", p.rank);
+  utils::check(int64_t(x.shape()[0]) == p.npts &&
+               int64_t(y.shape()[0]) == p.npts,
+               "setpts: coordinate array sizes don't match p.npts={}.", p.npts);
+
+  using val_t = typename X_t::value_type;
+  detail::setpts_dispatch<val_t>(p,
+                                  const_cast<val_t*>(x.data()),
+                                  const_cast<val_t*>(y.data()),
+                                  nullptr);
+}
+
+template<::nda::MemoryArrayOfRank<1> CoordMat>
+void setpts(nuplan_t &p, CoordMat &&x, CoordMat &&y, CoordMat &&z)
+{
+  using X_t = std::decay_t<CoordMat>;
+  detail::check_coord_memspace<CoordMat>(p);
+  utils::check(p.rank == 3, "setpts: plan rank={} but x,y,z supplied.", p.rank);
+  utils::check(int64_t(x.shape()[0]) == p.npts &&
+               int64_t(y.shape()[0]) == p.npts &&
+               int64_t(z.shape()[0]) == p.npts,
+               "setpts: coordinate array sizes don't match p.npts={}.", p.npts);
+
+  using val_t = typename X_t::value_type;
+  detail::setpts_dispatch<val_t>(p,
+                                  const_cast<val_t*>(x.data()),
+                                  const_cast<val_t*>(y.data()),
+                                  const_cast<val_t*>(z.data()));
+}
+
+// =========================================================================
+// setpts_t3 — bind source AND target NU coordinate arrays to a type-3
+// plan. 1-D variant: `x` is source coords (M points), `s` is target coords
+// (N points).
+// =========================================================================
+namespace detail {
+template<typename val_t>
+inline void setpts_t3_dispatch(nuplan_t &p,
+                                val_t *x, val_t *y, val_t *z,
+                                val_t *s, val_t *t, val_t *u)
+{
+  if (p.bend == NUFFT_BACKEND_FINUFFT)
+    impl::host::setpts_t3(p, x, y, z, s, t, u);
+  else if (p.bend == NUFFT_BACKEND_CUFINUFFT)
+    impl::dev::setpts_t3(p, x, y, z, s, t, u);
+  else
+    utils::check(false, "setpts_t3: unknown NUFFT backend (bend={}).", int(p.bend));
+}
+}
+
+template<::nda::MemoryArrayOfRank<1> CoordMat>
+void setpts_t3(nuplan_t &p, CoordMat &&x, CoordMat &&s)
+{
+  using X_t = std::decay_t<CoordMat>;
+  detail::check_coord_memspace<CoordMat>(p);
+  utils::check(p.rank == 1, "setpts_t3: plan rank={} but only x,s supplied.", p.rank);
+  utils::check(int64_t(x.shape()[0]) == p.npts,
+               "setpts_t3: x.size={} != p.npts={}", x.shape()[0], p.npts);
+  utils::check(int64_t(s.shape()[0]) == p.npts_out,
+               "setpts_t3: s.size={} != p.npts_out={}", s.shape()[0], p.npts_out);
+  using val_t = typename X_t::value_type;
+  detail::setpts_t3_dispatch<val_t>(p,
+      const_cast<val_t*>(x.data()), nullptr, nullptr,
+      const_cast<val_t*>(s.data()), nullptr, nullptr);
+}
+
+// =========================================================================
+// execnufft_t3 — type-3 (NU → NU) execution. Mirrors fwdnufft API.
+//
+// Single transform:    C: rank-1 (M),         F: rank-1 (N)
+// Batched transform:   C: rank-2 (ntrans, M), F: rank-2 (ntrans, N)
+// =========================================================================
+template<::nda::MemoryArray CMat, ::nda::MemoryArray FMat>
+void execnufft_t3(nuplan_t &p, CMat &&C, FMat &&F)
+{
+  using C_t = std::decay_t<CMat>;
+  using F_t = std::decay_t<FMat>;
+  // Shape checks: leading dim must match ntrans; trailing must match
+  // npts (input C) / npts_out (output F).
+  if constexpr (::nda::get_rank<C_t> == 1) {
+    utils::check(p.ntrans == 1,
+                 "execnufft_t3: plan ntrans={} but rank-1 C supplied.", p.ntrans);
+    utils::check(int64_t(C.shape()[0]) == p.npts,
+                 "execnufft_t3: C.size={} != p.npts={}", C.shape()[0], p.npts);
+    utils::check(int64_t(F.shape()[0]) == p.npts_out,
+                 "execnufft_t3: F.size={} != p.npts_out={}", F.shape()[0], p.npts_out);
+  } else if constexpr (::nda::get_rank<C_t> == 2) {
+    utils::check(int64_t(C.shape()[0]) == p.ntrans &&
+                 int64_t(C.shape()[1]) == p.npts,
+                 "execnufft_t3: C shape mismatch with (ntrans, npts) "
+                 "= ({}, {})", p.ntrans, p.npts);
+    utils::check(int64_t(F.shape()[0]) == p.ntrans &&
+                 int64_t(F.shape()[1]) == p.npts_out,
+                 "execnufft_t3: F shape mismatch with (ntrans, npts_out) "
+                 "= ({}, {})", p.ntrans, p.npts_out);
+  } else {
+    static_assert(::nda::get_rank<C_t> == 1 || ::nda::get_rank<C_t> == 2,
+                  "execnufft_t3: C must be rank 1 (single) or 2 (batched).");
+  }
+
+  if constexpr (::nda::mem::on_host<CMat>)
+    impl::host::execnufft_t3(p, C.data(), F.data());
+  else
+    impl::dev::execnufft_t3(p, C.data(), F.data());
+}
+
+// =========================================================================
+// destroy_plan — dispatched on the plan's backend tag.
+// =========================================================================
+inline void destroy_plan(nuplan_t &p)
+{
+  if (p.bend == NUFFT_BACKEND_FINUFFT)
+    impl::host::destroy_plan(p);
+  else if (p.bend == NUFFT_BACKEND_CUFINUFFT)
+    impl::dev::destroy_plan(p);
+  else if (p.fwd != nullptr || p.inv != nullptr)
+    utils::check(false, "destroy_plan: unknown NUFFT backend (bend={}).", int(p.bend));
+  // bend==UNDEFINED + nullptrs: silently ignore (default-constructed plan).
+}
+
+// =========================================================================
+// fwdnufft  — type 1 : nonuniform → uniform
+//
+// Single transform:
+//   fwdnufft(p, C, F)    C: rank-1 (M),         F: rank-D (N1[,N2[,N3]])
+//
+// Batched transform:
+//   fwdnufft(p, C, F)    C: rank-2 (ntrans,M),  F: rank-D+1 (ntrans,N1,...) C_layout
+//                                               F: rank-D+1 (N1,...,ntrans) F_layout
+//
+// The template selects single vs batched automatically from rank(C).
+// =========================================================================
+
+template<::nda::MemoryArray CMat, ::nda::MemoryArray FMat>
+void fwdnufft(nuplan_t &p, CMat &&C, FMat &&F)
+{
+  using F_t = std::decay_t<FMat>;
+
+  // Change layouts if needed
+  if constexpr (::nda::get_rank<F_t> > 1 and F_t::layout_t::is_stride_order_C()) {
+    fwdnufft(p,std::forward<CMat>(C),::nda::transpose(F));
+    return;
+  } else {
+    detail::check_dimensions(p,C,F);
+  }
+
+  if constexpr (::nda::mem::on_host<CMat>)
+    impl::host::fwdnufft(p, C.data(), F.data());
+  else
+    impl::dev::fwdnufft(p, C.data(), F.data());
+}
+
+// =========================================================================
+// invnufft  — type 2 : uniform → nonuniform
+//
+// Single transform:
+//   invnufft(p, F, C)    F: rank-D,     C: rank-1
+//
+// Batched transform:
+//   invnufft(p, F, C)    F: rank-D+1,   C: rank-2
+// =========================================================================
+
+template<::nda::MemoryArray FMat, ::nda::MemoryArray CMat>
+void invnufft(nuplan_t &p, FMat &&F, CMat &&C)
+{
+  using F_t = std::decay_t<FMat>;
+
+  // Change layouts if needed
+  if constexpr (::nda::get_rank<F_t> > 1 and F_t::layout_t::is_stride_order_C()) {
+    invnufft(p,::nda::transpose(F),std::forward<CMat>(C));
+    return;
+  } else {
+    detail::check_dimensions(p,C,F);
+  }
+
+  if constexpr (::nda::mem::on_host<CMat>)
+    impl::host::invnufft(p, F.data(), C.data());
+  else
+    impl::dev::invnufft(p, F.data(), C.data());
+}
+
+// =========================================================================
+// Plan-less convenience wrappers
+//
+// These mirror the plan-less fwdfft / invfft in nda.hpp.
+// They create a plan, set the nonuniform points, execute, and destroy.
+// =========================================================================
+
+/// 1-D, single transform
+template<::nda::MemoryArray CMat, ::nda::MemoryArray FMat,
+         ::nda::MemoryArrayOfRank<1> CoordMat>
+void fwdnufft(CMat &&C, FMat &&F, CoordMat &&x,
+              impl::eps_t<typename std::decay_t<FMat>::value_type> eps
+                = impl::default_eps<typename std::decay_t<FMat>::value_type>(),
+              int iflag = NUFFT_FORWARD)
+{
+  using C_t = std::decay_t<CMat>;
+  using F_t = std::decay_t<FMat>;
+  constexpr int rank = ::nda::get_rank<C_t>;
+  utils::check(::nda::get_rank<F_t> == rank, "Rank mismatch");
+  
+  // Change layouts if needed
+  if constexpr (::nda::get_rank<F_t> > 1 and F_t::layout_t::is_stride_order_C()) {
+    fwdnufft(std::forward<CMat>(C),::nda::transpose(F),std::forward<CoordMat>(x),eps,iflag);
+    return;
+  } else {
+    if constexpr (rank==2) {
+      constexpr int C_td = ( C_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      constexpr int F_td = ( F_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      std::array<int64_t,1> nm = { F.extent(1-F_td) }; 
+      auto p = create_plan(nm, C.extent(1-C_td), C.extent(C_td), eps, iflag);
+      setpts(p, x);
+      fwdnufft(p, C, F);
+      destroy_plan(p);
+    } else {
+      auto p = create_plan(F.shape(), C.extent(0), 1, eps, iflag);
+      setpts(p, x);
+      fwdnufft(p, C, F);
+      destroy_plan(p);
+    }
+  }
+}
+
+/// 2-D, single transform
+template<::nda::MemoryArray CMat, ::nda::MemoryArray FMat,
+         ::nda::MemoryArray CoordMat>
+void fwdnufft(CMat &&C, FMat &&F, CoordMat &&x, CoordMat &&y,
+              impl::eps_t<typename std::decay_t<FMat>::value_type> eps
+                = impl::default_eps<typename std::decay_t<FMat>::value_type>(),
+              int iflag = NUFFT_FORWARD)
+{
+  using C_t = std::decay_t<CMat>;
+  using F_t = std::decay_t<FMat>;
+  constexpr int rank = ::nda::get_rank<C_t>; 
+  utils::check(::nda::get_rank<F_t> == rank+1, "Rank mismatch");
+  
+  // Change layouts if needed
+  if constexpr (F_t::layout_t::is_stride_order_C()) {
+    fwdnufft(std::forward<CMat>(C),::nda::transpose(F),std::forward<CoordMat>(x),std::forward<CoordMat>(y),eps,iflag);
+    return;
+  } else {
+    if constexpr (rank==2) { 
+      constexpr int C_td = ( C_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      constexpr int F_td = ( F_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      std::array<int64_t,2> nm = { F.extent(1-F_td), F.extent(2-F_td) }; 
+      auto p = create_plan(nm, C.extent(1-C_td), C.extent(C_td), eps, iflag);
+      setpts(p, x, y);
+      fwdnufft(p, C, F);
+      destroy_plan(p);
+    } else { 
+      auto p = create_plan(F.shape(), C.extent(0), 1, eps, iflag);
+      setpts(p, x, y);
+      fwdnufft(p, C, F);
+      destroy_plan(p);
+    }
+  }
+}
+
+/// 3-D, single transform
+template<::nda::MemoryArray CMat, ::nda::MemoryArray FMat,
+         ::nda::MemoryArray CoordMat>
+void fwdnufft(CMat &&C, FMat &&F, CoordMat &&x, CoordMat &&y, CoordMat &&z,
+              impl::eps_t<typename std::decay_t<FMat>::value_type> eps
+                = impl::default_eps<typename std::decay_t<FMat>::value_type>(),
+              int iflag = NUFFT_FORWARD)
+{
+  using C_t = std::decay_t<CMat>;
+  using F_t = std::decay_t<FMat>;
+  constexpr int rank = ::nda::get_rank<C_t>; 
+  utils::check(::nda::get_rank<F_t> == rank+2, "Rank mismatch");
+  
+  // Change layouts if needed
+  if constexpr (F_t::layout_t::is_stride_order_C()) {
+    fwdnufft(std::forward<CMat>(C),::nda::transpose(F),std::forward<CoordMat>(x),std::forward<CoordMat>(y),std::forward<CoordMat>(z),eps,iflag);
+    return;
+  } else {
+    if constexpr (rank==2) { 
+      constexpr int C_td = ( C_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      constexpr int F_td = ( F_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      std::array<int64_t,3> nm = { F.extent(1-F_td), F.extent(2-F_td), F.extent(3-F_td) }; 
+      auto p = create_plan(nm, C.extent(1-C_td), C.extent(C_td), eps, iflag);
+      setpts(p, x, y, z);
+      fwdnufft(p, C, F);
+      destroy_plan(p);
+    } else { 
+      auto p = create_plan(F.shape(), C.extent(0), 1, eps, iflag);
+      setpts(p, x, y, z);
+      fwdnufft(p, C, F);
+      destroy_plan(p);
+    }
+  }
+}
+
+/// 1-D, adjoint (type 2)
+template<::nda::MemoryArray FMat, ::nda::MemoryArray CMat,
+         ::nda::MemoryArrayOfRank<1> CoordMat>
+void invnufft(FMat &&F, CMat &&C, CoordMat &&x,
+              impl::eps_t<typename std::decay_t<FMat>::value_type> eps
+                = impl::default_eps<typename std::decay_t<FMat>::value_type>(),
+              int iflag = NUFFT_FORWARD)
+{
+  using C_t = std::decay_t<CMat>;
+  using F_t = std::decay_t<FMat>;
+  constexpr int rank = ::nda::get_rank<C_t>; 
+  utils::check(::nda::get_rank<F_t> == rank, "Rank mismatch");
+  
+  // Change layouts if needed
+  if constexpr (::nda::get_rank<F_t> > 1 and F_t::layout_t::is_stride_order_C()) {
+    invnufft(::nda::transpose(F),std::forward<CMat>(C),std::forward<CoordMat>(x),eps,iflag);
+    return;
+  } else {
+    if constexpr (rank==2) { 
+      constexpr int C_td = ( C_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      constexpr int F_td = ( F_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      std::array<int64_t,1> nm = { F.extent(1-F_td) }; 
+      auto p = create_plan(nm, C.extent(1-C_td), C.extent(C_td), eps, iflag);
+      setpts(p, x);
+      invnufft(p, F, C);
+      destroy_plan(p);
+    } else { 
+      auto p = create_plan(F.shape(), C.extent(0), 1, eps, iflag);
+      setpts(p, x);
+      invnufft(p, F, C);
+      destroy_plan(p);
+    }
+  }
+}
+
+/// 2-D, adjoint
+template<::nda::MemoryArray FMat, ::nda::MemoryArray CMat,
+         ::nda::MemoryArray CoordMat>
+void invnufft(FMat &&F, CMat &&C, CoordMat &&x, CoordMat &&y,
+              impl::eps_t<typename std::decay_t<FMat>::value_type> eps
+                = impl::default_eps<typename std::decay_t<FMat>::value_type>(),
+              int iflag = NUFFT_FORWARD)
+{
+  using C_t = std::decay_t<CMat>;
+  using F_t = std::decay_t<FMat>;
+  constexpr int rank = ::nda::get_rank<C_t>;
+  utils::check(::nda::get_rank<F_t> == rank+1, "Rank mismatch");
+
+  // Change layouts if needed
+  if constexpr (F_t::layout_t::is_stride_order_C()) {
+    invnufft(::nda::transpose(F),std::forward<CMat>(C),std::forward<CoordMat>(x),std::forward<CoordMat>(y),eps,iflag);
+    return;
+  } else {
+    if constexpr (rank==2) {
+      constexpr int C_td = ( C_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      constexpr int F_td = ( F_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      std::array<int64_t,2> nm = { F.extent(1-F_td), F.extent(2-F_td) };
+      auto p = create_plan(nm, C.extent(1-C_td), C.extent(C_td), eps, iflag);
+      setpts(p, x, y);
+      invnufft(p, F, C);
+      destroy_plan(p);
+    } else {
+      auto p = create_plan(F.shape(), C.extent(0), 1, eps, iflag);
+      setpts(p, x, y);
+      invnufft(p, F, C);
+      destroy_plan(p);
+    }
+  }
+}
+
+/// 3-D, adjoint
+template<::nda::MemoryArray FMat, ::nda::MemoryArray CMat,
+         ::nda::MemoryArray CoordMat>
+void invnufft(FMat &&F, CMat &&C, CoordMat &&x, CoordMat &&y, CoordMat &&z,
+              impl::eps_t<typename std::decay_t<FMat>::value_type> eps
+                = impl::default_eps<typename std::decay_t<FMat>::value_type>(),
+              int iflag = NUFFT_FORWARD)
+{
+  using C_t = std::decay_t<CMat>;
+  using F_t = std::decay_t<FMat>;
+  constexpr int rank = ::nda::get_rank<C_t>;
+  utils::check(::nda::get_rank<F_t> == rank+2, "Rank mismatch");
+  
+  // Change layouts if needed
+  if constexpr (F_t::layout_t::is_stride_order_C()) {
+    invnufft(::nda::transpose(F),std::forward<CMat>(C),std::forward<CoordMat>(x),std::forward<CoordMat>(y),std::forward<CoordMat>(z),eps,iflag);
+    return;
+  } else {
+    if constexpr (rank==2) { 
+      constexpr int C_td = ( C_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      constexpr int F_td = ( F_t::layout_t::is_stride_order_C() ? 0 : 1 );
+      std::array<int64_t,3> nm = { F.extent(1-F_td), F.extent(2-F_td), F.extent(3-F_td) };
+      auto p = create_plan(nm, C.extent(1-C_td), C.extent(C_td), eps, iflag);
+      setpts(p, x, y, z);
+      invnufft(p, F, C);
+      destroy_plan(p);
+    } else { 
+      auto p = create_plan(F.shape(), C.extent(0), 1, eps, iflag);
+      setpts(p, x, y, z);
+      invnufft(p, F, C);
+      destroy_plan(p);
+    }
+  }
+}
+
+// =========================================================================
+// RAII wrapper class  math::nda::nufft
+//
+// Mirrors math::nda::fft from nda.hpp.
+// Usage:
+//   math::nda::nufft nft(F, C, x, eps, iflag);
+//   nft.setpts(x);
+//   nft.forward(C, F);   // type-1
+//   nft.backward(F, C);  // type-2
+// =========================================================================
+
+} // namespace math::nufft
+
+namespace math::nda
+{
+
+template<MEMORY_SPACE MEM = HOST_MEMORY>
+class nufft_t
+{
+public:
+  static constexpr MEMORY_SPACE memory_space = MEM;
+
+  /// Construct and plan (does NOT call setpts — call it separately).
+  /// MEM selects the FINUFFT (host) or cuFINUFFT (device) backend.
+  template<typename Itype = int64_t, std::size_t rank = 1, typename value_type = double>
+  nufft_t(std::array<Itype,rank> const& nmodes, int64_t npts, int ntrans = 1,
+          value_type eps = math::nufft::impl::default_eps<value_type>(),
+          int iflag = math::nufft::NUFFT_FORWARD)
+    : plan(math::nufft::create_plan<MEM>(nmodes, npts, ntrans, eps, iflag))
+  {}
+
+  ~nufft_t() { math::nufft::destroy_plan(plan); }
+
+  nufft_t(nufft_t const &) = delete;
+  nufft_t(nufft_t &&other) : plan(other.plan)
+  {
+    other.plan = math::nufft::nuplan_t{};
+  }
+  nufft_t &operator=(nufft_t const &) = delete;
+  nufft_t &operator=(nufft_t &&other)
+  {
+    math::nufft::destroy_plan(plan);
+    plan = other.plan;
+    other.plan = math::nufft::nuplan_t{};
+    return *this;
+  }
+
+  /// Attach nonuniform points (1-D, 2-D, or 3-D).
+  void setpts(::nda::MemoryArrayOfRank<1> auto &&x)
+  { math::nufft::setpts(plan, x); }
+
+  void setpts(::nda::MemoryArrayOfRank<1> auto &&x, ::nda::MemoryArrayOfRank<1> auto &&y)
+  { math::nufft::setpts(plan, x, y); }
+
+  void setpts(::nda::MemoryArrayOfRank<1> auto &&x, ::nda::MemoryArrayOfRank<1> auto &&y,
+              ::nda::MemoryArrayOfRank<1> auto &&z)
+  { math::nufft::setpts(plan, x, y, z); }
+
+  /// Type-1: nonuniform strengths C → uniform modes F.
+  void forward(::nda::MemoryArray auto &&C, ::nda::MemoryArray auto &&F)
+  { math::nufft::fwdnufft(plan, C, F); }
+
+  /// Type-2 (adjoint): uniform modes F → nonuniform values C.
+  void backward(::nda::MemoryArray auto &&F, ::nda::MemoryArray auto &&C)
+  { math::nufft::invnufft(plan, F, C); }
+
+private:
+  math::nufft::nuplan_t plan;
+};
+
+/// Backwards-compatibility alias for the host backend.
+using nufft = nufft_t<HOST_MEMORY>;
+
+} // namespace math::nda
+
+#endif // NUMERICS_FFT_FINUFFT_NDA_HPP

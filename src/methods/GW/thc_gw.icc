@@ -1,6 +1,12 @@
 #ifndef COQUI_THC_GW_ICC
 #define COQUI_THC_GW_ICC
 
+#include <algorithm>
+#include <vector>
+
+#include <optional>
+
+#include "itertools/itertools.hpp"
 #include "mpi3/communicator.hpp"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
@@ -13,6 +19,7 @@
 #include "IO/app_loggers.h"
 #include "utilities/Timer.hpp"
 #include "utilities/kpoint_utils.hpp"
+#include "utilities/omp_threads.hpp"
 
 #include "mean_field/MF.hpp"
 #include "methods/ERI/detail/concepts.hpp"
@@ -22,14 +29,18 @@
 namespace methods {
   namespace solvers {
 
-    template<nda::MemoryArray Array_view_5D_t, typename dArray_4D_t>
+    template<MEMORY_SPACE MEM,
+             nda::MemoryArray Array_view_5D_t, typename dArray_4D_t>
     void gw_t::thc_gw_Xqindep(const nda::MemoryArrayOfRank<5> auto &G_tskij,
                               sArray_t<Array_view_5D_t> &sSigma_tskij,
                               THC_ERI auto &thc, dArray_4D_t &dW_qtPQ,
                               const nda::MemoryArrayOfRank<1> auto &eps_inv_head) {
-      eval_Sigma_all(G_tskij, dW_qtPQ, sSigma_tskij, thc,
-                     (thc.MF()->nqpts() == thc.MF()->nqpts_ibz()? "R" : "k"));
+      eval_Sigma_all<MEM>(G_tskij, dW_qtPQ, sSigma_tskij, thc,
+                          (thc.MF()->nqpts() == thc.MF()->nqpts_ibz()? "R" : "k"));
+      // Timed separately: the divergence correction runs between TOTAL and EVALUATE_SIGMA_*.
+      _Timer.start("SIGMA_DIV_CORR");
       Sigma_div_correction(sSigma_tskij, G_tskij, thc, eps_inv_head);
+      _Timer.stop("SIGMA_DIV_CORR");
     }
 
     template<nda::MemoryArray Array_primary_t, nda::MemoryArray Array_aux_t, typename communicator_t>
@@ -63,7 +74,7 @@ namespace methods {
       _Timer.stop("SIGMA_AUX_TO_PRIM");
     }
 
-    template<bool Winp_in_Rspace, bool Wout_in_Rspace,
+    template<MEMORY_SPACE MEM, bool Winp_in_Rspace, bool Wout_in_Rspace,
         nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t,
         typename communicator_t>
     void gw_t::eval_Sigma_all_Rspace(const nda::MemoryArrayOfRank<5> auto &G_tskij,
@@ -85,7 +96,7 @@ namespace methods {
                    dW_qtPQ.local_shape()[0]);
       utils::check(qpools == 1, "gw_t::eval_Sigma_all_Rspace: qpools = {} != 1", qpools);
 
-      using local_Array_5D_t = memory::array<HOST_MEMORY, ComplexType, 5>;
+      using local_Array_5D_t = memory::array<MEM, ComplexType, 5>;
       using local_Arrayv_5D_t = memory::array_view<HOST_MEMORY, ComplexType, 5>;
       using math::nda::make_distributed_array;
 
@@ -132,22 +143,36 @@ namespace methods {
       _Timer.stop("SIGMA_ALLOC_R");
 
       math::shm::shared_array<nda::array_view<ComplexType,2>> sf_Rk(*mpi, {nkpts,nkpts});
+      // Device mirror of the FT coefficient matrix; refreshed on demand to
+      // avoid host/device gemm dispatch.
+      [[maybe_unused]] memory::array<MEM, ComplexType, 2> f_Rk_dev;
+      auto refresh_f = [&]() {
+        if constexpr (MEM != HOST_MEMORY)
+          f_Rk_dev = memory::to_memory_space<MEM>(sf_Rk.local());
+      };
 
       if (nkpts != 1) {
         _Timer.start("SIGMA_FT_R");
-        auto f_Rk = sf_Rk.local();
         utils::k_to_R_coefficients(mpi->comm, nda::range(nkpts), MF->kpts(), MF->lattv(), MF->kp_grid(), sf_Rk);
+        refresh_f();
         auto GR_3D = nda::reshape(dG_sRtPQ.local(), shape_t<3>{ns, nkpts, nt_loc * NP_loc * NQ_loc});
-        nda::matrix<ComplexType> R_buffer(nkpts, nt_loc*NP_loc*NQ_loc);
+        memory::array<MEM, ComplexType, 2> R_buffer(nkpts, nt_loc*NP_loc*NQ_loc);
         for (long s = 0; s < ns; ++s) {
-          nda::blas::gemm(f_Rk, GR_3D(s, nda::ellipsis{}), R_buffer);
+          if constexpr (MEM == HOST_MEMORY)
+            nda::blas::gemm(sf_Rk.local(), GR_3D(s, nda::ellipsis{}), R_buffer);
+          else
+            nda::blas::gemm(f_Rk_dev,      GR_3D(s, nda::ellipsis{}), R_buffer);
           GR_3D(s, nda::ellipsis{}) = R_buffer;
         }
 
         if constexpr (!Winp_in_Rspace) {
           utils::k_to_R_coefficients(mpi->comm, nda::range(nkpts), MF->Qpts(), MF->lattv(), MF->kp_grid(), sf_Rk);
+          refresh_f();
           auto WR_2D = nda::reshape(dW_qtPQ.local(), shape_t<2>{nkpts, nt_loc * NP_loc * NQ_loc});
-          nda::blas::gemm(f_Rk, WR_2D, R_buffer);
+          if constexpr (MEM == HOST_MEMORY)
+            nda::blas::gemm(sf_Rk.local(), WR_2D, R_buffer);
+          else
+            nda::blas::gemm(f_Rk_dev,      WR_2D, R_buffer);
           WR_2D = R_buffer;
         }
         _Timer.stop("SIGMA_FT_R");
@@ -157,33 +182,54 @@ namespace methods {
       auto dSigma_sktPQ = make_distributed_array<local_Array_5D_t>(
           mpi->comm, {1, qpools, tpools, np_P, np_Q}, {ns, nkpts, nt_half, NP, NQ}, {1, bsize[0], bsize[1], bsize[2], bsize[3]});
       _Timer.start("SIGMA_HADPROD_R");
-      auto had_prod2 = nda::map([](ComplexType x, ComplexType y) { return -1.0 * (x * y) ; });
+      // Sigma_R = -G_R * W_R elementwise. On host nda::map is fine; on
+      // device lazy expressions trigger nda's "no expressions with
+      // device arrays" static_assert, so we use tensor::* primitives.
       auto W_RtPQ = dW_qtPQ.local();
       for (long s = 0; s < ns; ++s) {
         auto G_RtPQ = dG_sRtPQ.local()(s, nda::ellipsis{});
         auto Sigma_RtPQ = dSigma_sktPQ.local()(s, nda::ellipsis{});
-        Sigma_RtPQ = had_prod2(G_RtPQ, W_RtPQ);
+        if constexpr (::nda::mem::on_host<decltype(Sigma_RtPQ)>) {
+          auto had_prod2 = nda::map(
+              [](ComplexType x, ComplexType y) { return -1.0 * (x * y); });
+          Sigma_RtPQ = had_prod2(G_RtPQ, W_RtPQ);
+        } else {
+          // Sigma = -G * W: copy G into Sigma, then multiply by W in place,
+          // then negate via scale(-1).
+          Sigma_RtPQ = G_RtPQ;
+          nda::tensor::elementwise(ComplexType(1.0), W_RtPQ,    "RtPQ",
+                                   ComplexType(1.0), Sigma_RtPQ, "RtPQ",
+                                   nda::tensor::op::MUL);
+          nda::tensor::scale(ComplexType(-1.0), Sigma_RtPQ);
+        }
       }
       _Timer.stop("SIGMA_HADPROD_R");
       dG_sRtPQ.reset();
 
       if (nkpts != 1) {
         // FT back to q-space
-        auto f_kR = sf_Rk.local();
         utils::R_to_k_coefficients(mpi->comm, nda::range(nkpts), MF->kpts(), MF->lattv(), MF->kp_grid(), sf_Rk);
+        refresh_f();
 
         _Timer.start("SIGMA_FT_R");
         auto SigmaR_3D = nda::reshape(dSigma_sktPQ.local(), shape_t<3>{ns, nkpts, nt_loc * NP_loc * NQ_loc});
-        nda::matrix <ComplexType> buffer(nkpts, nt_loc*NP_loc*NQ_loc);
+        memory::array<MEM, ComplexType, 2> buffer(nkpts, nt_loc*NP_loc*NQ_loc);
         for (long s = 0; s < ns; ++s) {
-          nda::blas::gemm(f_kR, SigmaR_3D(s, nda::ellipsis{}), buffer);
+          if constexpr (MEM == HOST_MEMORY)
+            nda::blas::gemm(sf_Rk.local(), SigmaR_3D(s, nda::ellipsis{}), buffer);
+          else
+            nda::blas::gemm(f_Rk_dev,      SigmaR_3D(s, nda::ellipsis{}), buffer);
           SigmaR_3D(s, nda::ellipsis{}) = buffer;
         }
 
         if constexpr (!Wout_in_Rspace) {
           utils::R_to_k_coefficients(mpi->comm, nda::range(nkpts), MF->Qpts(), MF->lattv(), MF->kp_grid(), sf_Rk);
+          refresh_f();
           auto WR_2D = nda::reshape(dW_qtPQ.local(), shape_t < 2 > {nkpts, nt_loc * NP_loc * NQ_loc});
-          nda::blas::gemm(f_kR, WR_2D, buffer);
+          if constexpr (MEM == HOST_MEMORY)
+            nda::blas::gemm(sf_Rk.local(), WR_2D, buffer);
+          else
+            nda::blas::gemm(f_Rk_dev,      WR_2D, buffer);
           WR_2D = buffer;
         }
         _Timer.stop("SIGMA_FT_R");
@@ -211,13 +257,16 @@ namespace methods {
       _Timer.stop("EVALUATE_SIGMA_R");
     }
 
-    template<nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
+    template<MEMORY_SPACE MEM, nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
     void gw_t::eval_Sigma_all_kspace(const nda::MemoryArrayOfRank<5> auto &G_tskij,
                                      const memory::darray_t<Array_4D_t, communicator_t> &dW_qtPQ,
                                      sArray_t<Array_5D_t> &sSigma_tskij,
                                      THC_ERI auto &thc,
                                      bool minus_t) {
-      using local_Array_4D_t = nda::array<ComplexType, 4>;
+      // MEM = DEVICE: the aux-basis objects (G, W, Sigma in the THC basis) live on the device -- G is transformed there
+      // (primary_to_aux), the Hadamard kernel and the redistribution run there, and aux_to_primary brings the
+      // (nbnd x nbnd) blocks down; the symmetry rotations of those blocks and the writes into the shared Sigma are host work.
+      using local_Array_4D_t = memory::array<MEM, ComplexType, 4>;
       using math::nda::make_distributed_array;
       using math::shm::make_shared_array;
       decltype(nda::range::all) all;
@@ -287,6 +336,7 @@ namespace methods {
         for( auto isym : nda::range(MF->qsymms().size()) ) {
           // evaluate dSigma_skPQ. mpi over (P, Q)
           eval_Sigma_all_k_impl(it, dG_skPQ, dW_qtPQ, dSigma_skPQ, thc, isym);
+          if constexpr (MEM != HOST_MEMORY) utils::device_sync();
 
           sSigma_tskab.set_zero();
           _Timer.start("SIGMA_AUX_TO_PRIM");
@@ -297,9 +347,7 @@ namespace methods {
 
           _Timer.start("SIGMA_MULTIPLY_DMAT_K");
           if (!minus_t or it_global != nt_half-1) { // to avoid double counting at it_global == nt_half-1
-            using math::sparse::T;                                    // when nt is an odd number
-            using math::sparse::H;
-            using math::sparse::csrmm;
+            using math::sparse::csrmm;                                // when nt is an odd number
             for (long isk=t_intra_comm.rank(); isk<ns*nkpts_ibz; isk+=t_intra_comm.size()) {
               long is = isk / nkpts_ibz;
               long ik = isk % nkpts_ibz;
@@ -310,10 +358,10 @@ namespace methods {
                 auto [cjg,D] = MF->symmetry_rotation(isym,ik);
                 utils::check(not cjg, "Oh oh.");
                 // Sigma_tskij = sum_ab conj(d[isym,k](a,i)) * Sigma_tskab * d[isym,k](b,j)
-                csrmm(ComplexType(1.0),H(*D),sSigma_tskab.local()(tpool_id,is,ik,all,all),
-                      ComplexType(0.0),Tm);
-                csrmm(ComplexType(1.0),T(*D),nda::transpose(Tm),
-                      ComplexType(1.0),nda::transpose(sSigma_tskij.local()(it_global,is,ik,all,all)));
+                csrmm<'H'>(ComplexType(1.0),*D,sSigma_tskab.local()(tpool_id,is,ik,all,all),
+                           ComplexType(0.0),Tm);
+                csrmm<'T'>(ComplexType(1.0),*D,nda::transpose(Tm),
+                           ComplexType(1.0),nda::transpose(sSigma_tskij.local()(it_global,is,ik,all,all)));
               }
             }
           }
@@ -363,38 +411,196 @@ namespace methods {
 
       _Timer.start("SIGMA_HADPROD_K");
       Sigma_skPQ() = 0.0;
-      for (size_t isk=0; isk<ns*nkpts_ibz; isk++) {
-        size_t is = isk/nkpts_ibz;
-        size_t ik = isk%nkpts_ibz;
-        long ks = MF->ks_to_k(isym,ik);
-        auto Sigma_k = Sigma_skPQ(is,ik,nda::ellipsis{});
+      // Device-safe Hadamard accumulators. On host the inline nda::map
+      // expressions evaluate cleanly; on device they trigger nda's "no
+      // expressions with device arrays" static_assert, so we route the
+      // four had_prod variants through tensor::* primitives via a small
+      // tmp scratch buffer (allocated once outside the loop).
+      using Sigma_t = std::decay_t<decltype(Sigma_skPQ)>;
+      constexpr bool sigma_on_host = ::nda::mem::on_host<Sigma_t>;
+      [[maybe_unused]] memory::array<
+          (sigma_on_host ? HOST_MEMORY : DEVICE_MEMORY), ComplexType, 2>
+        tmp_PQ;
+      if constexpr (not sigma_on_host) {
+        tmp_PQ = memory::array<DEVICE_MEMORY, ComplexType, 2>(Np_loc, Nq_loc);
+      }
+      [[maybe_unused]] auto accum_prod = [&](auto& Sout, auto const& X, auto const& Y,
+                            bool conj_Y, bool conj_result) {
+        if constexpr (sigma_on_host) {
+          if (conj_result) Sout += nda::conj(had_prod2(X, Y));
+          else if (conj_Y)  Sout += had_prod2_conj(X, Y);
+          else              Sout += had_prod2(X, Y);
+        } else {
+          // tmp = X * (conj(Y) if conj_Y else Y)
+          tmp_PQ() = X;
+          if (conj_Y) {
+            nda::tensor::elementwise(ComplexType(1.0), nda::conj(Y), "PQ",
+                                     ComplexType(1.0), tmp_PQ,        "PQ",
+                                     nda::tensor::op::MUL);
+          } else {
+            nda::tensor::elementwise(ComplexType(1.0), Y, "PQ",
+                                     ComplexType(1.0), tmp_PQ, "PQ",
+                                     nda::tensor::op::MUL);
+          }
+          if (conj_result)
+            nda::tensor::scale(ComplexType(1.0), tmp_PQ,
+                               nda::tensor::op::CONJ);
+          // Sout += factor * tmp
+          nda::tensor::elementwise(ComplexType(factor), tmp_PQ, "PQ",
+                                   ComplexType(1.0),    Sout,  "PQ",
+                                   nda::tensor::op::SUM);
+        }
+      };
+      if constexpr (not sigma_on_host) {
+        // DEVICE path: the same term list as the host path (built below for both), ONE fused kernel launch per tau slice:
+        // every output element walks its terms in list order on one thread (deterministic, no atomics), the four symmetry
+        // modes resolved per term (kernels::device::sigma_hadamard_terms). Per-term tensor::* calls would cost four
+        // whole-tile passes and a cuTENSOR plan per term (65 IBZ k x 512 q terms at an 8^3 mesh).
+        (void)accum_prod;
+        struct had_term_t { long is, ik, ikmq, iqs, mode; };
+        std::vector<had_term_t> terms;
+        terms.reserve(size_t(ns*nkpts_ibz*std::max(nqs, 1l)));
+        for (long isk=0; isk<long(ns*nkpts_ibz); isk++) {
+          long is = isk/nkpts_ibz;
+          long ik = isk%nkpts_ibz;
+          long ks = MF->ks_to_k(isym,ik);
+          for (long iq=0; iq<nqs; iq++) {
+            long qp = MF->Qs(isym,iq);
+            long qs = MF->qp_to_ibz(qp);
+            if (qp_trev(qp)) {
+              long ksmqs_m = MF->qk_to_k2(qminus(qs),ks);
+              if (kp_trev(ksmqs_m)) terms.push_back({is, ik, kp_trev_pair(ksmqs_m), qs, 0});
+              else                  terms.push_back({is, ik, ksmqs_m,               qs, 1});
+            } else {
+              long ksmqs = MF->qk_to_k2(qs,ks);
+              if (kp_trev(ksmqs)) terms.push_back({is, ik, kp_trev_pair(ksmqs), qs, 2});
+              else                terms.push_back({is, ik, ksmqs,               qs, 3});
+            }
+          }
+        }
+        utils::check(Sigma_skPQ.is_contiguous() and G_skPQ.is_contiguous() and W_qtPQ.is_contiguous(),
+                     "gw_t::eval_Sigma_all_k_impl: the device tiles are not contiguous.");
+        const long nsk = long(ns*nkpts_ibz), tile = long(Np_loc*Nq_loc), nk_g = G_skPQ.shape(1);
+        const long wq = W_qtPQ.strides()[0];                       // the q stride of the W tiles (tau slices interleaved)
+        std::vector<long> first(size_t(nsk + 1), 0l), g_of(terms.size()), w_of(terms.size());
+        std::vector<int> mode(terms.size());
+        for (size_t t = 0; t < terms.size(); ++t) {
+          const auto &T = terms[t];
+          const long isk = T.is * nkpts_ibz + T.ik;
+          utils::check(t == 0 or isk >= terms[t - 1].is * nkpts_ibz + terms[t - 1].ik, "gw_t::eval_Sigma_all_k_impl: term list not grouped.");
+          ++first[size_t(isk + 1)];
+          g_of[t] = T.is * nk_g + T.ikmq; w_of[t] = T.iqs; mode[t] = int(T.mode);
+        }
+        for (long i = 0; i < nsk; ++i) first[size_t(i + 1)] += first[size_t(i)];
+#if defined(ENABLE_CUDA)
+        kernels::device::sigma_hadamard_terms(Sigma_skPQ.data(), G_skPQ.data(), W_qtPQ.data() + it * W_qtPQ.strides()[1], nsk, tile, wq,
+                                              long(terms.size()), first.data(), g_of.data(), w_of.data(), mode.data(), ComplexType(factor));
+#else
+        utils::check(false, "gw_t::eval_Sigma_all_k_impl: device tiles without a CUDA build.");
+#endif
+      } else {
+      // HOST path: term list + P-blocked threaded accumulate, deterministic at any thread count.
 
-        for (size_t iq=0; iq<nqs; iq++) {
+      // ---------------- threaded region: the Sigma Hadamard product ----------------
+      // WHAT IS THREADED, AND WHAT IS NOT:
+      //   * NOT the `iq` loop -- it accumulates Sigma_k += across q, i.e. it is a reduction;
+      //   * NOT the `isk` loop -- ns*nkpts_ibz is often small (O(10)), which load-balances
+      //     poorly over a thread team;
+      //   * threading is a BLOCKING OF THE TILE'S LEADING P INDEX into fixed PBLK-row
+      //     blocks; each block walks the whole (isk, iq) term list on its own rows, and
+      //     OpenMP distributes blocks over the team.
+      // The blocking also improves locality on its own: a block's Sigma/G/W stripes stay in
+      // cache across the whole `terms` walk, whereas the whole-tile form streams the full
+      // tiles once per term.
+      //
+      // DETERMINISM -- and why the chunk boundaries are FIXED BY PBLK, not by the team.
+      // Splitting over the OUTPUT index means every element's accumulation order over
+      // (isk, iq) is exactly the serial order, so no floating-point REASSOCIATION happens at
+      // any thread count. That alone is not bitwise invariance: the elementwise kernel's
+      // vector peel/tail and pointer alignment depend on the chunk's LENGTH and OFFSET, so
+      // a stripe derived from omp_get_thread_num()/omp_get_num_threads() (the runtime team
+      // size is not a guaranteed constant) can move the last bit from run to run. A one-ulp
+      // change in Sigma matters because a Pade analytic continuation (qp_map = ac_pade) can
+      // amplify it by many orders of magnitude in the QP Hamiltonian, whereas the
+      // Matsubara-native map (qp_map = mats_lin) does not.
+      // So: (a) omp_threads <= 1 runs the whole-tile expression, identical to the serial
+      // path; (b) above 1, the tile is cut into fixed PBLK-row blocks whose boundaries
+      // depend on nothing but PBLK -- identical for every thread count and every run -- and
+      // OpenMP only decides WHICH thread takes which block, which cannot change a single bit.
+      //
+      // THREAD SAFETY: every mean-field / symmetry lookup
+      // (ks_to_k, Qs, qp_to_ibz, qk_to_k2, qp_trev, kp_trev, kp_trev_pair, qminus) is
+      // HOISTED into the serial term-list build below -- each of those goes through
+      // MF::var's std::visit, and hoisting them keeps the parallel body free of everything
+      // but local array memory: no MPI, no HDF5, no logging, no aborts. `had_prod2` /
+      // `had_prod2_conj` are stateless nda::map functors; `terms` is read-only once built.
+      // The expression is elementwise on views, so no BLAS runs inside the region and
+      // omp_threads x blas_threads oversubscription cannot arise.
+      struct had_term_t { long is, ik, ikmq, iqs, mode; };
+      std::vector<had_term_t> terms;
+      terms.reserve(size_t(ns*nkpts_ibz*std::max(nqs, 1l)));
+      for (long isk=0; isk<ns*nkpts_ibz; isk++) {
+        long is = isk/nkpts_ibz;
+        long ik = isk%nkpts_ibz;
+        long ks = MF->ks_to_k(isym,ik);
+
+        for (long iq=0; iq<nqs; iq++) {
           long qp = MF->Qs(isym,iq);   // qpoint index in the 1st BZ which can be mapped to IBZ through isym
           long qs = MF->qp_to_ibz(qp); // associated qp index in the IBZ
-          auto W_q = W_qtPQ(qs, it, nda::ellipsis{});
 
           if (qp_trev(qp)) {
             long ksmqs_m = MF->qk_to_k2(qminus(qs),ks); // ksmqs_m + G = ks + qs = ks - (-qs)
-            if (kp_trev(ksmqs_m)) {
-              auto G_kmq = G_skPQ(is, kp_trev_pair(ksmqs_m), nda::ellipsis{});
-              Sigma_k += nda::conj(had_prod2(W_q, G_kmq));
-            } else {
-              auto G_kmq = G_skPQ(is, ksmqs_m, nda::ellipsis{});
-              Sigma_k += had_prod2_conj(G_kmq, W_q);
-            }
+            if (kp_trev(ksmqs_m)) terms.push_back({is, ik, kp_trev_pair(ksmqs_m), qs, 0});
+            else                  terms.push_back({is, ik, ksmqs_m,               qs, 1});
           } else {
             long ksmqs = MF->qk_to_k2(qs,ks);
-            if (kp_trev(ksmqs)) {
-              auto G_kmq = G_skPQ(is, kp_trev_pair(ksmqs), nda::ellipsis{});
-              Sigma_k += had_prod2_conj(W_q, G_kmq);
-            } else {
-              auto G_kmq = G_skPQ(is, ksmqs, nda::ellipsis{});
-              Sigma_k += had_prod2(G_kmq, W_q);
-            } // if ( kp_trev )
+            if (kp_trev(ksmqs)) terms.push_back({is, ik, kp_trev_pair(ksmqs), qs, 2});
+            else                terms.push_back({is, ik, ksmqs,               qs, 3});
           } // if ( qp_trev )
         } // iq
       } // isk
+
+      // One accumulator for both paths, so the four symmetry cases exist once.
+      auto accumulate = [&](auto &&Sigma_k, auto &&G_kmq, auto &&W_q, long mode) {
+        switch (mode) {
+          case 0:  Sigma_k += nda::conj(had_prod2(W_q, G_kmq)); break;
+          case 1:  Sigma_k += had_prod2_conj(G_kmq, W_q);       break;
+          case 2:  Sigma_k += had_prod2_conj(W_q, G_kmq);       break;
+          default: Sigma_k += had_prod2(G_kmq, W_q);            break;
+        }
+      };
+
+      const long np_tile = Np_loc;    // structured bindings must not appear in omp clauses
+      [[maybe_unused]] const long nthr = utils::omp_threads_for(np_tile);
+      if (nthr <= 1) {
+        // The serial path on whole-tile views: deliberately not "the chunked loop with one
+        // chunk", so a single-threaded run evaluates exactly the serial expression.
+        for (auto const &T : terms)
+          accumulate(Sigma_skPQ(T.is, T.ik, nda::ellipsis{}),
+                     G_skPQ(T.is, T.ikmq, nda::ellipsis{}),
+                     W_qtPQ(T.iqs, it, nda::ellipsis{}), T.mode);
+      } else {
+        // PBLK = rows of P per block. Fixed, so the block boundaries -- and therefore every
+        // element's arithmetic -- are independent of the thread count and of the runtime team
+        // size (see DETERMINISM above). 8 rows x Nq_loc complex is O(100 KB) per block per
+        // array, small enough that a block's Sigma stripe stays resident across the whole
+        // `terms` walk, while typical Np_loc (a few hundred) still gives enough blocks to
+        // balance a team of a few tens of threads.
+        constexpr long PBLK = 8;
+        const long nblk = (np_tile + PBLK - 1) / PBLK;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr)
+#endif
+        for (long ib = 0; ib < nblk; ++ib) {
+          const long p0 = ib*PBLK, p1 = std::min(np_tile, p0 + PBLK);
+          auto p_rng = nda::range(p0, p1);
+          for (auto const &T : terms)
+            accumulate(Sigma_skPQ(T.is, T.ik, p_rng, nda::range::all),
+                       G_skPQ(T.is, T.ikmq, p_rng, nda::range::all),
+                       W_qtPQ(T.iqs, it, p_rng, nda::range::all), T.mode);
+        }
+      }
+      }
 
       /*for (size_t iq=0; iq<nqs; iq++) {
         long qp = MF->Qs(isym,iq);   // qpoint index
@@ -458,7 +664,12 @@ namespace methods {
 
       if (div_treatment == "ignore_g0") {
         return;
-      } else if (div_treatment.find("gygi") != std::string::npos) {
+      } else if (div_treatment.find("gygi") != std::string::npos
+                 or div_treatment == "cvv") {
+        // CVV head: under div_treatment = "cvv" the correction formula below is the
+        // same -- it reads the same madelung x eps_inv_head(tau) weight; only the
+        // CONTENT of mb_state.eps_inv_head differs (the covariant-velocity subtracted
+        // head instead of the q -> 0 extrapolation), so the correction stays single-sourced.
         auto MF = thc.MF();
         auto mpi = thc.mpi();
         app_log(1, "    - madelung = {}", MF->madelung());
@@ -475,27 +686,52 @@ namespace methods {
         auto T_skia_loc = T_skia.local();
         auto chi_head = thc.basis_head()(0, nda::range::all);
         // T^{k}_{ia} = conj(X^{k}_{Pi}) * X^{k}_{Pa} * conj(chi_head(P) )
+        // T^{k}_{ia} = sum_P conj(X^{k}_{Pi}) X^{k}_{Pa} conj(chi_head(P))
+        //            = (Y^T X)_{ia}  with  Y_{Pi} = conj(chi_head(P)) conj(X^{k}_{Pi}),
+        // i.e. one gemm per (s,k) instead of a scalar loop over (i,a,P), which would
+        // walk X(P,i) with stride nbnd and miss cache on nearly every term. Each rank
+        // writes only the (s,k) blocks it owns and the all-reduce below combines them.
+        _Timer.start("SIGMA_DIV_T");
         T_skia.win().fence();
-        for (size_t skia = rank; skia < ns * nkpts * nbnd * nbnd; skia += size) {
-          // skia = is * nkpts*nbnd*nbnd + ik * nbnd*nbnd + i * nbnd + a
-          size_t is = skia / (nkpts * nbnd * nbnd);
-          size_t ik = (skia / (nbnd * nbnd)) % nkpts;
-          size_t i = (skia / nbnd) % nbnd;
-          size_t a = skia % nbnd;
-
-          auto Xsk = thc.X(is, 0, ik);
-          for (size_t P = 0; P < NP; ++P) {
-            T_skia_loc(is, ik, i, a) += nda::conj(Xsk(P, i)) * Xsk(P, a) * nda::conj(chi_head(P));
+        {
+          nda::array<ComplexType, 2> Y_Pi(NP, nbnd);
+          for (size_t sk = rank; sk < ns * nkpts; sk += size) {
+            size_t is = sk / nkpts;
+            size_t ik = sk % nkpts;
+            auto Xsk = thc.X(is, 0, ik);                       // (NP, nbnd)
+            for (size_t P = 0; P < NP; ++P) {
+              auto cP = nda::conj(chi_head(P));
+              for (size_t i_ = 0; i_ < nbnd; ++i_) Y_Pi(P, i_) = cP * nda::conj(Xsk(P, i_));
+            }
+            nda::blas::gemm(nda::transpose(Y_Pi), Xsk, T_skia_loc(is, ik, nda::ellipsis{}));
           }
         }
         T_skia.win().fence();
         T_skia.all_reduce();
+        _Timer.stop("SIGMA_DIV_T");
 
         nda::array<ComplexType, 2> buffer_ib(nbnd, nbnd);
 
-        auto sDelta_tskij = make_shared_array<Array_view_5D_t>(*mpi, sSigma_tskij.shape());
-        auto Delta_loc = sDelta_tskij.local();
-        sDelta_tskij.win().fence();
+        // Every (t,s,k) block below is written by exactly one rank, so on a
+        // single node the node's shm copy already holds the complete
+        // correction: the Sigma-sized staging buffer,
+        // its all-reduce and the final add are all pure overhead there, and we
+        // accumulate straight into Sigma instead (beta = 1 rather than 0).
+        // Across nodes the buffer is still needed, because each node computes
+        // only its own share and every node needs the whole correction.
+        _Timer.start("SIGMA_DIV_ALLOC");
+        const bool stage_delta = (sSigma_tskij.internode_comm()->size() > 1);
+        std::optional<sArray_t<Array_view_5D_t>> sDelta_tskij;
+        if (stage_delta)
+          sDelta_tskij.emplace(make_shared_array<Array_view_5D_t>(*mpi, sSigma_tskij.shape()));
+        _Timer.stop("SIGMA_DIV_ALLOC");
+
+        auto Delta_loc = (stage_delta)? sDelta_tskij.value().local() : sSigma_tskij.local();
+        auto& out_win = (stage_delta)? sDelta_tskij.value().win() : sSigma_tskij.win();
+        const ComplexType beta = (stage_delta)? ComplexType(0.0) : ComplexType(1.0);
+
+        _Timer.start("SIGMA_DIV_GEMM");
+        out_win.fence();
         for (size_t tsk = rank; tsk < nts * ns * nkpts; tsk += size) {
           // tsk = it * ns*nkpts + is * nkpts + ik
           size_t it = tsk / (ns * nkpts);
@@ -509,14 +745,31 @@ namespace methods {
           auto Delta_ij = Delta_loc(it, is, ik, nda::ellipsis{});
           auto T_ia = T_skia_loc(is, ik, nda::ellipsis{});
           nda::blas::gemm(T_ia, G_ab, buffer_ib);
-          nda::blas::gemm(ComplexType(factor), buffer_ib, nda::dagger(T_skia_loc(is, ik, nda::ellipsis{})), 
-                     ComplexType(0.0), Delta_ij);
+          nda::blas::gemm(ComplexType(factor), buffer_ib, nda::dagger(T_skia_loc(is, ik, nda::ellipsis{})),
+                     beta, Delta_ij);
         }
-        sDelta_tskij.win().fence();
-        sDelta_tskij.all_reduce();
+        out_win.fence();
+        _Timer.stop("SIGMA_DIV_GEMM");
 
-        if (sSigma_tskij.node_comm()->root())
-          sSigma_tskij.local() += sDelta_tskij.local();
+        if (stage_delta) {
+          _Timer.start("SIGMA_DIV_REDUCE");
+          sDelta_tskij.value().all_reduce();
+          _Timer.stop("SIGMA_DIV_REDUCE");
+
+          // Sum into Sigma with every rank on the node, not just its root:
+          // the add touches several Sigma-sized arrays and is memory-bound.
+          _Timer.start("SIGMA_DIV_ADD");
+          int node_rank = sSigma_tskij.node_comm()->rank();
+          int node_size = sSigma_tskij.node_comm()->size();
+          long nelem = long(sSigma_tskij.local().size());
+          auto [i0, i1] = itertools::chunk_range(0, nelem, node_size, node_rank);
+          auto Sigma_1D = nda::reshape(sSigma_tskij.local(), std::array<long, 1>{nelem});
+          auto Delta_1D = nda::reshape(sDelta_tskij.value().local(), std::array<long, 1>{nelem});
+          sSigma_tskij.win().fence();
+          Sigma_1D(nda::range(i0, i1)) += Delta_1D(nda::range(i0, i1));
+          sSigma_tskij.win().fence();
+          _Timer.stop("SIGMA_DIV_ADD");
+        }
         sSigma_tskij.communicator()->barrier();
       } else {
         utils::check(false, "Unsupported divergence treatment: {}", div_treatment);

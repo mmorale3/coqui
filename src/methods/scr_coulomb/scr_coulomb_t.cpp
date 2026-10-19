@@ -19,16 +19,101 @@
  */
 
 
+#include <filesystem>
 #include <unordered_set>
+#include <sstream>
+#include <fstream>
+#include <iomanip>
+#include <chrono>
+#include <optional>
+#include <sys/resource.h>
+#include "methods/vertex/vertex_debug.hpp"
+#include "utilities/omp_threads.hpp"
+#include "utilities/h5_background_writer.hpp"
+#include "utilities/freemem.h"
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/GW/g0_div_utils.hpp"
+#include "methods/vertex/vertex_t.h"
+#include "methods/vertex/vertex_sigma_interp.hpp"
+#include "methods/vertex/nu_sampling.hpp"
+#include "methods/vertex/vertex_secondary_fold.hpp"
+#include "methods/vertex/ladder_cond.hpp"
+#if defined(ENABLE_CUDA)
+#include "methods/vertex/cuda/l0_cuda.cuh"   // dev_maxabs / dev_add_rows: the Pi hooks on the device Pi
+#endif
+#include "utilities/proc_grid_partition.hpp"
+#include "nda/linalg/eigenelements.hpp"
+#include "hamiltonian/one_body_hamiltonian.hpp"   // CVV head: H0 for the covariant velocity
+#include "hamiltonian/pseudo/pseudopot.h"
+#include "cvv_head.hpp"
 #include "scr_coulomb_t.h"
 #include "rpa_pi.icc"
 #include "edmft_pi.icc"
 
 namespace methods {
 namespace solvers {
+
+  namespace ladder_meter {
+    // Injection-side profiling meters.
+    // PURE OBSERVERS: nothing here is read by the physics.
+    inline double rss_gb() {
+      struct rusage ru;
+      if (getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
+#if defined(__APPLE__)
+      return double(ru.ru_maxrss) / (1024.0 * 1024.0 * 1024.0);
+#else
+      return double(ru.ru_maxrss) / (1024.0 * 1024.0);
+#endif
+    }
+    struct watch {
+      std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+      double lap() {
+        auto t1 = std::chrono::steady_clock::now();
+        double d = std::chrono::duration<double>(t1 - t0).count();
+        t0 = t1;
+        return d;
+      }
+    };
+    // cumulative ladder wall time across outer iterations
+    inline double cum_eval = 0.0, cum_inject = 0.0;
+    inline long ncalls = 0;
+  }
+
+  bool scr_coulomb_t::has_active_vertex() const {
+    return _vertex != nullptr and _vertex->active();
+  }
+
+  bool scr_coulomb_t::sigma_vertex_active() const {
+    return _vertex != nullptr and (_vertex->sigma_pair_enabled() or _vertex->sigma_lff_enabled() or
+                                   (_vertex->enabled() and _vertex->active()));
+  }
+
+  bool scr_coulomb_t::sigma_dyn_final_full() const {
+    return _vertex != nullptr and _vertex->sigma_pair_enabled() and _vertex->sigma_pair_dynamic() and _vertex->sigma_dyn_self_ref()
+           and _vertex->sigma_dyn_final_full() and _vertex->sigma_interp_file().empty();
+  }
+
+  bool scr_coulomb_t::needs_dw_retention() const {
+    // GLOBAL-basis vertex: next iteration's eval_Pi_C consumes the retained dW.
+    // SECONDARY-basis vertex with the W-bar cache enabled: the downfolded rung is
+    // cached at the update_w tail (vertex_t::cache_w); dW can be freed
+    // unconditionally. With the cache disabled, dW is retained as on the global path.
+    // STATIC/LINEAR rung modes: neither dW retention nor the W-bar cache is used --
+    // every rung those modes consume (W0[G] and, in the linear mode, the same-iteration
+    // dW) is produced inside the iteration that consumes it, so nothing crosses the
+    // boundary and the memory profile is plain GW's.
+    return _vertex != nullptr and _vertex->active() and
+           _vertex->rung() == dynamic_rung and
+           (not _vertex->secondary() or not _vertex->w_cache_enabled());
+  }
+
+  bool scr_coulomb_t::vertex_has_rung(MBState const &mb_state) const {
+    if (_vertex == nullptr or not _vertex->active()) return false;
+    if (_vertex->secondary() and _vertex->w_cache_enabled())
+      return _vertex->has_cached_w();
+    return mb_state.dW_qtPQ.has_value();
+  }
 
   scr_coulomb_t::scr_coulomb_t(const imag_axes_ft::IAFT *ft,
                                std::string screen_type,
@@ -56,8 +141,41 @@ namespace solvers {
       utils::check(diff <= 1e-6, "scr_coulomb_t: IAFT grid is not compatible with particle-hole symmetry. {}, {}",
                    tau_mesh(it), tau_mesh(imt));
     }
+
+    // Pre-register every timer print_timers() reads: TimerManager::elapsed() aborts on an
+    // unregistered name, and these phases are conditional (EVALUATE_W only runs on the THC
+    // path, the IMAG_FT pair only when a transform is needed).
+    // The THC-RPA sub-timers (EVALUATE_PI_R / _K, PI_ALLOC_*, PI_HADPROD_R, PI_PRIM_TO_AUX,
+    // PI_FT_R) are collected by rpa_pi.icc and printed by print_timers() as a breakdown of
+    // EVALUATE_PI.
+    for (auto const &v : {"EVALUATE_PI", "DYSON_W", "EVALUATE_W",
+                          "IMAG_FT_TtoW", "IMAG_FT_WtoT", "FT_REDISTRIBUTE",
+                          "EVALUATE_PI_R", "PI_ALLOC_R", "PI_HADPROD_R",
+                          "EVALUATE_PI_K", "PI_ALLOC_K", "PI_PRIM_TO_AUX", "PI_FT_R"})
+      _Timer.add(v);
   }
 
+  void scr_coulomb_t::print_timers() {
+    app_log(2, "\n  SCREENED-COULOMB timers");
+    app_log(2, "  -----------------------");
+    app_log(2, "    Evaluate Pi (RPA + vertex): {0:.3f} sec", _Timer.elapsed("EVALUATE_PI"));
+    // The RPA Pi internals (collected by rpa_pi.icc). Zero rows mean that flavour of the RPA
+    // kernel did not run on this path.
+    app_log(2, "      - RPA Pi, R space:        {0:.3f} sec", _Timer.elapsed("EVALUATE_PI_R"));
+    app_log(2, "      - RPA Pi, k space:        {0:.3f} sec", _Timer.elapsed("EVALUATE_PI_K"));
+    app_log(2, "        - Gij->Guv:             {0:.3f} sec", _Timer.elapsed("PI_PRIM_TO_AUX"));
+    app_log(2, "        - Hadamard product:     {0:.3f} sec", _Timer.elapsed("PI_HADPROD_R"));
+    app_log(2, "        - FT k<->R:             {0:.3f} sec", _Timer.elapsed("PI_FT_R"));
+    app_log(2, "        - alloc/zero (R + k):   {0:.3f} sec",
+            _Timer.elapsed("PI_ALLOC_R") + _Timer.elapsed("PI_ALLOC_K"));
+    app_log(2, "    Dyson W:                    {0:.3f} sec", _Timer.elapsed("DYSON_W"));
+    app_log(2, "      - solve (1-Z.Pi)^-1:      {0:.3f} sec", _Timer.elapsed("EVALUATE_W"));
+    app_log(2, "    Imaginary FT tau->w:        {0:.3f} sec", _Timer.elapsed("IMAG_FT_TtoW"));
+    app_log(2, "    Imaginary FT w->tau:        {0:.3f} sec", _Timer.elapsed("IMAG_FT_WtoT"));
+    app_log(2, "      - FT_REDISTRIBUTE:        {0:.3f} sec\n", _Timer.elapsed("FT_REDISTRIBUTE"));
+  }
+
+  template<MEMORY_SPACE MEM>
   void scr_coulomb_t::update_w(MBState &mb_state, THC_ERI auto &thc, long h5_iter) {
     using math::nda::make_distributed_array;
     using math::shm::make_shared_array;
@@ -78,6 +196,52 @@ namespace solvers {
 
     utils::check(thc.mpi() == mb_state.mpi,
                  "scr_coulomb_t::update_w: THC_ERI and MBState should have the same MPI context.");
+    // In-process vertex chain (pol_vertex_chain): from the second dynamic readout on, the injected all-nu object is the
+    // dump THIS run wrote at the previous update (equivalent to restarting and injecting the previous run's dump);
+    // the user's pol_vertex_interp_file seeds the first update. Every consumer reads the file name from the vertex
+    // objects, so the substitution is made here, once per update.
+    if (h5_iter >= 0 and _vertex != nullptr and _vertex->pol_chain() and _pol_dyn_calls > 0) {
+      utils::check(_pol_vtx != nullptr and _pol_vtx->ladder_dyn_all_nu(),
+                   "scr_coulomb_t::update_w: pol_vertex_chain needs the all-nu dump (pol_vertex_dyn_all_nu = true).");
+      const std::string prev = mb_state.coqui_prefix + ".pol_wh_dyn.g" + std::to_string(_pol_dyn_calls) + ".h5";
+      utils::check(std::filesystem::exists(prev), "scr_coulomb_t::update_w: pol_vertex_chain: the previous update's dump {} is missing.", prev);
+      _vertex->set_pol_interp(prev, _vertex->pol_interp_col());
+      _pol_vtx->set_pol_interp(prev, _pol_vtx->pol_interp_col());
+      app_log(1, "  [vertex chain] update {}: injecting this run's previous all-nu dump {} (generation {})", h5_iter, prev, _pol_dyn_calls);
+    }
+
+    // ---- vertex BOOTSTRAP: a SCREENED rung for Pi^C on the first update -------------
+    // Pi^C = -2 dPhi_2^C/dW is a functional of the SCREENED interaction, but on the very
+    // first update of a run no W exists yet -- neither a retained dW (global path) nor a
+    // folded W-bar cache (secondary path) -- and eval_Pi_C would fall back to the BARE rung
+    // W = Z. The bare rung grossly over-screens W in the first iteration, and that W feeds
+    // Sigma^GW, Sigma^C and hence G for every subsequent iteration; the iteration need
+    // not recover from it.
+    // Therefore, on that first update only, solve the RPA problem FIRST with the vertex
+    // detached and publish its W, then redo the update with the vertex attached so Pi^C
+    // starts from a physically screened rung. The self-consistent FIXED POINT is
+    // unchanged (there Pi^C already consumes the converged W); only the starting point
+    // of the iteration moves. Cost: one extra RPA polarization + Dyson solve, once.
+    // The bootstrap is needed for the DYNAMIC rung only. In the static modes the rung is
+    // W0[G], built from THIS iteration's RPA polarizability BEFORE any vertex piece runs,
+    // so a physically screened rung exists from iteration 1 by construction.
+    if (has_active_vertex() and _vertex->rung() == dynamic_rung
+        and not vertex_has_rung(mb_state)) {
+      app_log(1, "  [vertex] bootstrap: no screened W is available yet, so Pi^C would "
+                 "use the BARE\n"
+                 "           rung W = Z. Solving the RPA problem first and re-running "
+                 "this update\n"
+                 "           with the vertex attached (one extra RPA + Dyson solve, "
+                 "this iteration only).\n");
+      auto *vtx = _vertex;
+      _vertex = nullptr;                      // RPA-only pass (no Pi^C, no cache_w)
+      update_w(mb_state, thc, -1);            // publishes dW + eps_inv_head
+      _vertex = vtx;
+      // secondary path: fold the freshly published RPA W into the N_m x N_m rung cache,
+      // exactly as the update_w tail would have done had the vertex been attached.
+      if (_vertex->secondary() and _vertex->w_cache_enabled())
+        _vertex->cache_w(mb_state, thc);
+    }
 
     if (_screen_type.find("edmft") != std::string::npos) {
       if (!mb_state.sPi_imp_wabcd or !mb_state.sPi_dc_wabcd) {
@@ -92,43 +256,2385 @@ namespace solvers {
         }
       }
     }
-    auto dPi_tqPQ = eval_Pi_qdep(mb_state, thc);
+    // Vertex on the DEVICE path -- the host bridge: the vertex machinery is host code that reads the host
+    // shared-memory G / Sigma (host-resident on the device path), the host mirror of W and host copies of Pi.
+    // Pi is mirrored inside eval_Pi_qdep's hooks. The W mirror (built by update_w's tail only on request) is kept
+    // only for the consumers that still read it -- the dynamic / linear rungs' Sigma^C and no-cache Pi^C
+    // (vertex_t::reads_host_W) and the interp-file Sigma-vertex build (build_sigma_lff). The W-bar cache fill reads the device W, the
+    // static rung reads W0-bar, the readout instance reads its own cache, so a static-rung / pol-vertex run skips
+    // the (large) mirror allocation and the bulk D->H copy. vertex_debug keep_host_W = 1 forces the mirror.
+    // The CVV head (div_treatment = "cvv") has its own host machinery and is not bridged.
+    if constexpr (MEM != HOST_MEMORY) {
+      if (_vertex != nullptr and (_vertex->active() or _vertex->pol_vertex_active())) {
+        const bool host_W = _vertex->reads_host_W() or _vertex->sigma_lff_enabled() or
+                            methods::vertex_debug::number("keep_host_W", 0.0) != 0.0;   // vertex_debug: keep_host_W
+        if (host_W and not mb_state.keep_host_W)
+          app_log(1, "  [vertex] device path: keeping the host mirror of W for the vertex (keep_host_W = true).");
+        else if (not host_W and not mb_state.keep_host_W)
+          app_log(2, "  [vertex] device path: no vertex consumer reads the host mirror of W -- not kept (keep_host_W = false).");
+        if (host_W) mb_state.keep_host_W = true;
+      }
+      utils::check(_div_treatment != "cvv",
+                   "scr_coulomb_t::update_w<DEVICE_MEMORY>: div_treatment = \"cvv\" is host-only.");
+    }
+    // The pol-vertex ladder -- the kernel build AND the injection -- runs INSIDE eval_Pi_qdep
+    // (kernel from the pure-RPA Pi; injection last, still before the Dyson). What stays here is
+    // the eps_M READOUT, which needs the post-Dyson head: it consumes the inu = 0 RPA row
+    // stashed at that pure-RPA point (_pol_pi0_qPQ) instead of gathering it here.
+    const bool pol_readout = (_vertex != nullptr and _vertex->pol_vertex_active()
+                              and not _vertex->active());
+    // Only the injection that runs inside THIS eval_Pi_qdep may hand its inu = 0 row
+    // to the readout below (the bosonic closure calls eval_Pi_qdep outside update_w, and
+    // that row must not survive into a later iteration's readout).
+    _pol_nu0_row.reset();
+    // Phase timers of update_w: EVALUATE_PI / DYSON_W feed print_timers(); the TEMP_* timers
+    // give a finer per-phase breakdown (host and device paths).
+    // Pre-register every TEMP_* timer referenced in the dump below:
+    // elapsed()/number_of_calls() abort on unregistered names, and some
+    // timers only ever start on the DEVICE path (e.g. the dev-alloc ones).
+    for (auto const& name : {"TEMP_UW_TOTAL", "TEMP_UW_eval_Pi_qdep",
+         "TEMP_UW_dyson_W_from_Pi", "TEMP_DWFP_tau_to_w",
+         "TEMP_DWFP_dyson_W_in_place", "TEMP_DWFP_w_to_tau",
+         "TEMP_DWiP_alloc", "TEMP_DWiP_Z_load", "TEMP_DWiP_Pi_load",
+         "TEMP_DWiP_gemm_ZPi", "TEMP_DWiP_diag_I_minus_A",
+         "TEMP_DWiP_inverse", "TEMP_DWiP_diag_A_minus_I",
+         "TEMP_DWiP_gemm_AZ", "TEMP_DWiP_writeback", "TEMP_UW_eps_inv_head",
+         "TEMP_UW_dW_qtPQ_alloc", "TEMP_UW_dW_transpose_and_mirror",
+         "TEMP_UW_dW_qtPQ_dev_alloc", "TEMP_UW_dW_dev_transpose",
+         "TEMP_UW_dW_d2h_mirror", "TEMP_UW_dump_eps_inv_head",
+         "TEMP_FT_alloc", "TEMP_FT_redist", "TEMP_FT_leakage",
+         "TEMP_FT_gemm", "TEMP_FT_reset", "TEMP_FT_barrier"})
+      _Timer.add(name);
+    _Timer.start("TEMP_UW_TOTAL");
+    _Timer.start("TEMP_UW_eval_Pi_qdep");
+    _Timer.start("EVALUATE_PI");
+    auto dPi_tqPQ = eval_Pi_qdep<MEM>(mb_state, thc);
+    utils::device_sync();
+    _Timer.stop("EVALUATE_PI");
+    _Timer.stop("TEMP_UW_eval_Pi_qdep");
 
     // evaluate screened interaction (dW_tqPQ) and reset polarizability (dPi_tqPQ)
     // a) dPi_tqPQ is reset during dyson_W_from_Pi_tau()
     // b) pgrid and bsize of dW_tqPQ are forced to be the same as in dPi_tqPQ
+    _Timer.start("DYSON_W");
+    _Timer.start("TEMP_UW_dyson_W_from_Pi");
     auto dW_tqPQ = dyson_W_from_Pi_tau<false>(dPi_tqPQ, thc, true);
+    utils::device_sync();
+    _Timer.stop("TEMP_UW_dyson_W_from_Pi");
+    _Timer.stop("DYSON_W");
+    // CVV head (div_treatment = "cvv"): the q -> 0 HEAD comes from the
+    // covariant-velocity subtracted head (eval_cvv_eps_inv_head) INSTEAD of the
+    // stored/gygi extrapolation; the q-RESOLVED eps_inv (diagnostics + dump) is
+    // div-treatment-independent, so eps_inv_head_t runs with "ignore_g0" (its head
+    // slot -- the smallest-q value -- is then replaced). Every consumer reads the
+    // same mb_state.eps_inv_head (single-sourced; see the coupling warning in vertex_t.h).
+    const bool cvv = (_div_treatment == "cvv");
+
+    // div_utils::eval_eps_inv_q (called inside eps_inv_head_t) is
+    // MEM-aware; it runs the per-(ix,iq) gemv/dot on whatever MEM the
+    // dW darray lives in. No full host copy of dW needed.
+    _Timer.start("TEMP_UW_eps_inv_head");
     auto [eps_inv_head_q, eps_inv_head] =
-        div_utils::eps_inv_head_t(dW_tqPQ, thc, *thc.MF(), _ft, _div_treatment);
+        div_utils::eps_inv_head_t(dW_tqPQ, thc, *thc.MF(), _ft,
+                                  cvv ? "ignore_g0" : _div_treatment);
+    if (cvv) eps_inv_head = eval_cvv_eps_inv_head(mb_state, thc);
     mb_state.eps_inv_head = eps_inv_head;
+    utils::device_sync();
+    _Timer.stop("TEMP_UW_eps_inv_head");
+
+    // Report the static macroscopic dielectric constant
+    //   epsilon_inf = 1 / Re[ eps^{-1}_head(q->0, i.nu = 0) ],
+    // with eps_inv_head the q->0-extrapolated head of the inverse dielectric (in tau).
+    // The vertex correction P^C enters automatically through Pi -> W -> eps_inv_head, so with
+    // an active vertex this is the vertex-corrected epsilon_inf; without it, the RPA value.
+    // Logged every iteration and written to the h5 checkpoint by dump_eps_inv_head below.
+    {
+      // NB: eps_inv_head stores (eps^{-1}_head - 1)  (see g0_div_utils::eval_eps_inv_q,
+      // "Computes eps^{-1}_{G=0,G'=0} - 1"; the metal branch sets it to -1 so eps^{-1}=0).
+      // The PHYSICAL inverse-dielectric head is therefore 1 + eps_inv_head, and
+      //   epsilon_inf = 1 / Re[ eps^{-1}_head(inu=0) ] = 1 / (1 + Re[eps_inv_head_w(inu=0)]).
+      long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+      nda::array<ComplexType, 2> eih_w(nw_half, 1);
+      auto eih_t = nda::reshape(eps_inv_head, shape_t<2>{eps_inv_head.shape(0), 1});
+      _ft->tau_to_w_PHsym(eih_t, eih_w);   // inu=0 (static) node = index 0 of the PH-sym half grid
+      ComplexType eps_inv_static = ComplexType(1.0) + eih_w(0, 0);   // physical eps^{-1}_head(inu=0)
+      double eps_inf = 1.0 / eps_inv_static.real();
+      app_log(1, "  Macroscopic dielectric constant (static, q->0):\n"
+                 "    epsilon_inf = {:.6f}   [eps^-1_head(inu=0) = {:.6e} {:+.6e}i]\n",
+              eps_inf, eps_inv_static.real(), eps_inv_static.imag());
+    }
+    // [gw] eps_inf_fit = true (default off): epsilon_inf from the
+    // SMALL-q FIT eps_M(q) = eps_inf + A |q|^2 (+ B |q|^4) of the loop's OWN static dielectric function
+    // on the smallest nonzero |q| of the IBZ mesh -- eps_M(q) = 1 / (1 + Re[eps^-1_{00}(q, i nu = 0) - 1])
+    // from eps_inv_head_q (the q-resolved head of THIS dW, div_treatment-independent), reported next to
+    // the stored head above as the check of the div_treatment's q -> 0 recipe. Report-only, all ranks
+    // evaluate the same replicated numbers; when off, no output line or dataset changes.
+    std::optional<eps_fit::eps_inf_fit_t> eps_inf_fit_res;
+    if (_eps_inf_fit) {
+      eps_inf_fit_res = eval_eps_inf_fit(eps_inv_head_q, *thc.MF());
+      auto const &f = eps_inf_fit_res.value();
+      // the stored head's epsilon_inf (the line above), recomputed here so that block stays untouched
+      double eps_inf_head = 0.0;
+      {
+        long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+        nda::array<ComplexType, 2> eih_w(nw_half, 1);
+        auto eih_t = nda::reshape(eps_inv_head, shape_t<2>{eps_inv_head.shape(0), 1});
+        _ft->tau_to_w_PHsym(eih_t, eih_w);
+        eps_inf_head = 1.0 / (1.0 + eih_w(0, 0).real());
+      }
+      if (f.ok) {
+        std::string qs, bs;
+        for (size_t i = 0; i < f.q_used.size(); ++i) {
+          char buf[48];
+          std::snprintf(buf, sizeof(buf), "%s%.6f", (i == 0) ? "" : ", ", f.q_used[i]);
+          qs += buf;
+        }
+        if (f.degree >= 2) {
+          char buf[48];
+          std::snprintf(buf, sizeof(buf), ", B = %+.6e", f.coeffs[2]);
+          bs = buf;
+        }
+        app_log(1, "    eps_inf (small-q fit, {} points |q| = {}; degree {} in |q|^2): {:.6f}, "
+                   "A = {:+.6e}{}, residual = {:.3e}   [stored head - fit = {:+.6e}]\n",
+                f.q_used.size(), qs, f.degree, f.eps_inf, f.coeffs[1], bs, f.residual,
+                eps_inf_head - f.eps_inf);
+      } else {
+        app_log(1, "    eps_inf (small-q fit): skipped -- fewer than 2 distinct nonzero |q| on the IBZ mesh.\n");
+      }
+    }
+
+    // The ladder eps_M readout (report-only; see pol_ladder_eps_readout).
+    // eps_inv_head_q carries the loop's OWN q-resolved head, so the readout also
+    // reports the loop-side eps_M(q_min) as a cross-check of the injected Pi.
+    // The DYNAMIC-rung readout needs THIS iteration's dW folded into the readout
+    // instance's W-bar cache, so it runs after the dW publication below; the static readout
+    // runs here.
+    const bool pol_dyn_readout = (pol_readout and _pol_vtx != nullptr and _pol_vtx->ladder_dynamic_rung());
+    if (pol_readout and not pol_dyn_readout)
+      pol_ladder_eps_readout(mb_state, thc, _pol_pi0_qPQ, std::addressof(eps_inv_head_q));
 
     // make routine to transposed distributed arrays over any 2 indices, so should
     // be easy to template to an array type and to indexes, and replace repeated code
+    // Stage W into MBState. The on-device pipeline keeps a device-typed
+    // dW_qtPQ_dev so gw_t::evaluate<DEVICE> can read it without a
+    // host->device round-trip. The host mirror dW_qtPQ is also written
+    // for cross-method consumers (GF2, h5 dump, EDMFT) that still run
+    // on host.
     auto t_pgrid = dW_tqPQ.grid();
     auto t_bsize = dW_tqPQ.block_size();
     auto gshape = dW_tqPQ.global_shape();
-    mb_state.dW_qtPQ.emplace(make_distributed_array<nda::array<ComplexType, 4>> (
-                             thc.mpi()->comm, {t_pgrid[1], t_pgrid[0], t_pgrid[2], t_pgrid[3]},
-                             {gshape[1], gshape[0], gshape[2], gshape[3]},
-                             {t_bsize[1], t_bsize[0], t_bsize[2], t_bsize[3]}));
-    auto W_tqPQ = dW_tqPQ.local();
-    auto W_qtPQ = mb_state.dW_qtPQ.value().local();
+    std::array<long,4> q_pgrid = {t_pgrid[1], t_pgrid[0], t_pgrid[2], t_pgrid[3]};
+    std::array<long,4> q_bsize = {t_bsize[1], t_bsize[0], t_bsize[2], t_bsize[3]};
+    std::array<long,4> q_gshape = {gshape[1],  gshape[0],  gshape[2],  gshape[3]};
+
     long nt_loc = dW_tqPQ.local_shape()[0];
     long nq_loc = dW_tqPQ.local_shape()[1];
-    for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
-      size_t iq = qt / nt_loc;
-      size_t it = qt % nt_loc;
-      W_qtPQ(iq, it, nda::ellipsis{}) = W_tqPQ(it, iq, nda::ellipsis{});
+
+    // On the device path the host mirror is only needed by consumers that run
+    // on the host (GF2, EDMFT, the optional W h5 dump), and a pure scGW run has
+    // none of them: gw_t::evaluate<DEVICE> reads dW_qtPQ_dev. The mirror is as
+    // large as W itself and costs an allocation plus a bulk device->host copy per
+    // iteration, so it is skipped here; MBState builds it on demand from the
+    // device array (see MBState::W_host()).
+    const bool need_host_W = (MEM == HOST_MEMORY) or mb_state.keep_host_W;
+    if (need_host_W) {
+      _Timer.start("TEMP_UW_dW_qtPQ_alloc");
+      mb_state.dW_qtPQ.emplace(make_distributed_array<nda::array<ComplexType, 4>> (
+                               thc.mpi()->comm, q_pgrid, q_gshape, q_bsize));
+      utils::device_sync();
+      _Timer.stop("TEMP_UW_dW_qtPQ_alloc");
     }
+
+    _Timer.start("TEMP_UW_dW_transpose_and_mirror");
+    if constexpr (MEM == HOST_MEMORY) {
+      auto W_qtPQ_h = mb_state.dW_qtPQ.value().local();
+      auto W_tqPQ = dW_tqPQ.local();
+      for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
+        size_t iq = qt / nt_loc;
+        size_t it = qt % nt_loc;
+        W_qtPQ_h(iq, it, nda::ellipsis{}) = W_tqPQ(it, iq, nda::ellipsis{});
+      }
+    }
+#if defined(ENABLE_DEVICE)
+    else {
+      // Device path:
+      //  (1) allocate a device-typed (q,t,P,Q) darray and transpose on device,
+      //  (2) mirror to the host darray as a single bulk copy (one device->host
+      //      transfer per SCF iter — what host-side consumers still need).
+      using dev_local_t = memory::array<DEVICE_MEMORY, ComplexType, 4>;
+      _Timer.start("TEMP_UW_dW_qtPQ_dev_alloc");
+      mb_state.dW_qtPQ_dev.emplace(make_distributed_array<dev_local_t>(
+                                   thc.mpi()->comm, q_pgrid, q_gshape, q_bsize));
+      utils::device_sync();
+      _Timer.stop("TEMP_UW_dW_qtPQ_dev_alloc");
+      auto W_qtPQ_d = mb_state.dW_qtPQ_dev.value().local();
+      auto W_tqPQ_d = dW_tqPQ.local();
+      // On-device (t,q) -> (q,t) transpose, P,Q axes preserved.
+      _Timer.start("TEMP_UW_dW_dev_transpose");
+      for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
+        size_t iq = qt / nt_loc;
+        size_t it = qt % nt_loc;
+        W_qtPQ_d(iq, it, nda::ellipsis{}) = W_tqPQ_d(it, iq, nda::ellipsis{});
+      }
+      utils::device_sync();
+      _Timer.stop("TEMP_UW_dW_dev_transpose");
+      // Only when a host consumer asked for it; see need_host_W above.
+      if (need_host_W) {
+        _Timer.start("TEMP_UW_dW_d2h_mirror");
+        mb_state.dW_qtPQ.value().local() = nda::to_host(W_qtPQ_d);
+        utils::device_sync();
+        _Timer.stop("TEMP_UW_dW_d2h_mirror");
+      }
+    }
+#endif
     dW_tqPQ.reset();
+    utils::device_sync();
+    _Timer.stop("TEMP_UW_dW_transpose_and_mirror");
 
     mb_state.screen_type = _screen_type;
 
+    // wall clock of the vertex-side blocks of update_w (the TEMP_UW timers do not separate them)
+    auto uw_wall = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    // the vertex drivers below size their device-resident units (the dense tau rungs, D^2 each) from the free device
+    // memory, and the scGW W (nq nt_half Np^2 / nranks elements per rank) is the
+    // largest other resident -- and none of them reads it (the W-bar caches are filled first). It is PARKED on the host for
+    // the drivers and restored at the end of update_w (two bulk copies). vertex_debug park_W_device = 0 keeps it on the device.
+    bool W_parked = false;
+    const bool W_host_before = mb_state.dW_qtPQ.has_value();
+    [[maybe_unused]] auto park_W = [&]() {
+#if defined(ENABLE_DEVICE)
+      if constexpr (MEM != HOST_MEMORY) {
+        if (W_parked or not mb_state.dW_qtPQ_dev.has_value() or
+            methods::vertex_debug::number("park_W_device", 1.0) == 0.0) return;   // vertex_debug: park_W_device
+        const double t0 = uw_wall();
+        (void)mb_state.W_host();                         // the host copy (from the device W when update_w kept none)
+        mb_state.dW_qtPQ_dev.reset();
+        utils::device_sync();
+        W_parked = true;
+        app_log(1, "  [update_w] the device W parked on the host for the vertex drivers ({:.1f} s)", uw_wall() - t0);
+      }
+#endif
+    };
+    [[maybe_unused]] auto unpark_W = [&]() {
+#if defined(ENABLE_DEVICE)
+      if constexpr (MEM != HOST_MEMORY) {
+        if (not W_parked) return;
+        const double t0 = uw_wall();
+        auto &Wh = mb_state.dW_qtPQ.value();
+        mb_state.dW_qtPQ_dev.emplace(make_distributed_array<memory::array<DEVICE_MEMORY, ComplexType, 4>>(
+            thc.mpi()->comm, Wh.grid(), Wh.global_shape(), Wh.block_size()));
+        mb_state.dW_qtPQ_dev.value().local() = Wh.local();
+        utils::device_sync();
+        if (not W_host_before and not mb_state.keep_host_W) mb_state.dW_qtPQ.reset();
+        W_parked = false;
+        app_log(1, "  [update_w] the device W restored ({:.1f} s)", uw_wall() - t0);
+      }
+#endif
+    };
+    // the conditioning meter of the static ladders (ladder_cond.hpp): one record set for this update's P-side ladder pass
+    (void)solvers::ladder_cond::take_pending();          // summaries no h5 group took (passes outside update_w)
+    if (pol_dyn_readout) solvers::ladder_cond::begin("P refresh");
+    if (pol_dyn_readout and _pol_sc.cfg.enabled()) {
+      // pol_vertex_sc: no full-mesh ladder. When a refresh is due the vertex polarization is recomputed from THIS update's
+      // G and W on the coarse sublattice; the next updates inject it (inject_pol_ladder).
+      if (h5_iter >= 0) {
+        ++_pol_sc_updates;
+        if (_pol_sc.due(_pol_sc_updates)) {
+          const double w0 = uw_wall();
+          // the rungs of the sublattice ladder read W-bar at the sublattice transfers only: restrict the cache to them
+          if (_pol_vtx->wcache_rows().empty() and methods::vertex_debug::number("sc_wcache_rows", 1.0) != 0.0) {   // vertex_debug: sc_wcache_rows
+            auto MFp = thc.MF();
+            const nda::array<double, 2> kc(MFp->kpts_crystal());
+            auto v0 = solvers::vertex_view::make_view(*MFp, solvers::vertex_view::sublattice(kc, _pol_sc.cfg.mesh), std::vector<long>{0});
+            if (long(v0.wrows.size()) < MFp->nqpts_ibz()) _pol_vtx->set_wcache_rows(v0.wrows, MFp->nqpts_ibz());
+          }
+          _pol_vtx->cache_w(mb_state, thc);
+          const double w1 = uw_wall();
+          park_W();
+          refresh_pol_sc(mb_state, thc);
+          app_log(1, "  [update_w wall] vertex self-consistency: W-bar cache fill {:.1f} s, refresh {:.1f} s", w1 - w0, uw_wall() - w1);
+        } else {
+          app_log(1, "  [vertex self-consistency] update {}: no refresh (period {}, start {}); the stored vertex polarization "
+                     "(refresh {}) stays.", _pol_sc_updates, _pol_sc.cfg.period, _pol_sc.cfg.start, _pol_sc.n_refresh);
+        }
+      }
+    } else if (pol_dyn_readout) {
+      const double w0 = uw_wall();
+      _pol_vtx->cache_w(mb_state, thc);
+      const double w1 = uw_wall();
+      park_W();
+      pol_ladder_eps_readout(mb_state, thc, _pol_pi0_qPQ, std::addressof(eps_inv_head_q));
+      app_log(1, "  [update_w wall] readout instance: W-bar cache fill {:.1f} s, eps readout (incl. the dynamic-rung driver) {:.1f} s",
+              w1 - w0, uw_wall() - w1);
+    }
+    if (pol_dyn_readout) (void)solvers::ladder_cond::report(thc.mpi()->comm);
+
+    const double w_dump0 = uw_wall();
+    _Timer.start("TEMP_UW_dump_eps_inv_head");
     if (h5_iter>=0) {
+      // This writes the same file, the same scf/iter<N> group and from the same
+      // rank as the checkpoint, so it is the one place a background checkpoint
+      // write would collide with certainty. Joining here, at the end of update_w,
+      // leaves most of the iteration for the background write to overlap with.
+      utils::h5_quiesce();
       dump_eps_inv_head(eps_inv_head_q, eps_inv_head,
                         mb_state.coqui_prefix, h5_iter,
-                        thc.mpi()->comm, *thc.MF());
+                        thc.mpi()->comm, *thc.MF(),
+                        eps_inf_fit_res.has_value() ? std::addressof(eps_inf_fit_res.value()) : nullptr);
+      // Publish the ladder half of the bosonic double counting next to the other scf/iter
+      // outputs so BOTH consumers can read it -- python's DC assembly (weiss.py) and the
+      // C++ bosonic closure (downfold_edmft_impl). Written only when THIS update_w
+      // injected (a stale MBState copy must not be re-published).
+      // The scalar injection meters are written on every injecting run, including the ones
+      // with no bosonic projector (where P^lad_loc is never built); the pi_lad_loc datasets
+      // additionally require sPi_lad_loc_wabcd.
+      if (pol_readout and _vertex->pol_vertex_inject_enabled() and thc.mpi()->comm.root()) {
+        h5::file file(mb_state.coqui_prefix + ".mbpt.h5", 'a');
+        h5::group grp(file);
+        auto scf_grp = (grp.has_subgroup("scf")) ? grp.open_group("scf")
+                                                 : grp.create_group("scf");
+        std::string grp_name = "iter" + std::to_string(h5_iter);
+        auto iter_grp = (scf_grp.has_subgroup(grp_name)) ? scf_grp.open_group(grp_name)
+                                                         : scf_grp.create_group(grp_name);
+        if (mb_state.sPi_lad_loc_wabcd) {
+          nda::h5_write(iter_grp, "pi_lad_loc_wabcd",
+                        mb_state.sPi_lad_loc_wabcd.value().local(), false);
+          // the DC-ready orbital/chi-convention object rides in the same group
+          // (dataset name distinct -- the consumers select with pi_lad_dc).
+          if (mb_state.sPi_lad_loc_orb_wabcd)
+            nda::h5_write(iter_grp, "pi_lad_loc_orb_wabcd",
+                          mb_state.sPi_lad_loc_orb_wabcd.value().local(), false);
+        }
+        // Persist the injection meters next to the object they describe (read by the python
+        // outer loop). These are the SAME numbers the pol_lambda_nu0()/pol_lambda_max()/
+        // pol_round_trip()/pol_ladder_ratio() accessors return for THIS update_w -- read,
+        // not recomputed.
+        h5::h5_write(iter_grp, "lambda_nu0", _pol_lam_nu0);
+        h5::h5_write(iter_grp, "lambda_max", _pol_lam_max);
+        h5::h5_write(iter_grp, "r_rt", _pol_r_rt);
+        h5::h5_write(iter_grp, "lad_ratio", _pol_lad_ratio);
+      }
+      thc.mpi()->comm.barrier();
     }
+
+    // W-bar iteration cache: with an
+    // active SECONDARY-basis vertex, fold the freshest W into the N_m x N_m cache now
+    // -- dW is alive here and mb_state.eps_inv_head is the SAME-iteration head (both
+    // stored above), so the gygi Gamma augmentation is captured consistently. The
+    // cache is consumed by the NEXT iteration's eval_Pi_C (identical one-iteration
+    // lag as the retained-dW path); the scf driver then frees dW unconditionally in
+    // this mode (needs_dw_retention() == false -- plain-GW memory profile).
+    // (dynamic rung only: the static modes do not use the cache -- see needs_dw_retention)
+    const double w_c0 = uw_wall();
+    // the user vertex's W-bar cache reads the device W: bring it back if the readout above parked it (the Sigma pair vertex
+    // below parks it again)
+    if (_vertex != nullptr and _vertex->active() and _vertex->rung() == dynamic_rung and _vertex->secondary() and
+        _vertex->w_cache_enabled())
+      unpark_W();
+    if (_vertex != nullptr and _vertex->active() and _vertex->rung() == dynamic_rung
+        and _vertex->secondary() and _vertex->w_cache_enabled())
+      _vertex->cache_w(mb_state, thc);
+    const double w_c1 = uw_wall();
+
+    // Sigma vertex, interp-file form: the vertex correction of W for Sigma ONLY, from THIS iteration's W -- after every
+    // other consumer of dW (the kernel cache above included), so W, W-bar and the readout are exactly those without it.
+    if (_vertex != nullptr and _vertex->sigma_lff_enabled()) build_sigma_lff(mb_state, thc, t_pgrid, t_bsize);
+    // Sigma vertex, pair-resolved form: the static-ladder vertex in Sigma, on the readout instance (same placement). The
+    // device W is parked on the host while it runs and restored before returning (park_W / unpark_W).
+    if (_vertex != nullptr and _vertex->sigma_pair_enabled()) {
+      park_W();
+      build_sigma_pair(mb_state, thc);
+    }
+    app_log(1, "  [update_w wall] from the eps-head dump to the vertex caches {:.1f} s; the user vertex's W-bar cache fill {:.1f} s; "
+               "the Sigma vertex (pol_vertex_sigma = lff / pair) {:.1f} s", w_c0 - w_dump0, w_c1 - w_c0, uw_wall() - w_c1);
+    // the conditioning meter's summaries of this update's ladder passes -> scf/iter<N>/ladder_cond/<pass> (next to the
+    // injection meters above): min sigma_min(1 - Cb K_s) with its location, the median and the max over the units
+    {
+      auto cond = solvers::ladder_cond::take_pending();
+      if (h5_iter >= 0 and not cond.empty()) {
+        utils::h5_quiesce();
+        if (thc.mpi()->comm.root()) {
+          h5::file file(mb_state.coqui_prefix + ".mbpt.h5", 'a');
+          h5::group grp(file);
+          auto scf_grp = grp.has_subgroup("scf") ? grp.open_group("scf") : grp.create_group("scf");
+          const std::string gname = "iter" + std::to_string(h5_iter);
+          auto iter_grp = scf_grp.has_subgroup(gname) ? scf_grp.open_group(gname) : scf_grp.create_group(gname);
+          auto cgrp = iter_grp.has_subgroup("ladder_cond") ? iter_grp.open_group("ladder_cond") : iter_grp.create_group("ladder_cond");
+          for (auto const &c : cond) {
+            if (not c.valid) continue;
+            const std::string pn = (c.label == "P refresh") ? "P" : (c.label == "Sigma pass") ? "Sigma" : c.label;
+            auto g = cgrp.has_subgroup(pn) ? cgrp.open_group(pn) : cgrp.create_group(pn);
+            h5::h5_write(g, "sigma_min", c.smin);
+            h5::h5_write(g, "sigma_median", c.smed);
+            h5::h5_write(g, "sigma_max", c.smax);
+            h5::h5_write(g, "spin", c.is);
+            h5::h5_write(g, "q", c.iq);
+            h5::h5_write(g, "nu_node", c.m);
+            h5::h5_write(g, "driver_call", c.call);
+            h5::h5_write(g, "n_units", c.n);
+            h5::h5_write(g, "n_unconverged", c.n_unconv);
+            h5::h5_write(g, "all_nu", long(c.all_nu ? 1 : 0));
+          }
+        }
+        thc.mpi()->comm.barrier();
+      }
+    }
+    unpark_W();
+
+    print_timers();
+  }
+
+  // CVV head: see the declaration in scr_coulomb_t.h for the contract. The
+  // returned array matches div_utils::eps_inv_head_t's head slot exactly: the PH-sym
+  // tau half grid storing (eps^{-1}_head - 1)(tau).
+  nda::array<ComplexType, 1> scr_coulomb_t::eval_cvv_eps_inv_head(MBState &mb_state,
+                                                                  THC_ERI auto &thc) {
+    mf::MF &mf = *thc.MF();
+    utils::check(mb_state.sF_skij.has_value() and mb_state.sG_tskij.has_value(),
+                 "eval_cvv_eps_inv_head: mb_state must carry F and G at update_w time.");
+    if (not _sH0_cvv.has_value()) {
+      _sH0_cvv = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+          *thc.mpi(), {mf.nspin(), mf.nkpts_ibz(), mf.nbnd(), mf.nbnd()});
+      auto psp = hamilt::make_pseudopot(mf);
+      hamilt::set_H0(mf, psp.get(), _sH0_cvv.value());
+    }
+
+    solvers::cvv_head_t cvv(_ft, _cvv_rspace_tol);
+    if (mb_state.sSigma_tskij.has_value())
+      cvv.build(mf, _sH0_cvv.value().local(), mb_state.sF_skij.value().local(),
+                mb_state.sSigma_tskij.value().local());
+    else {
+      nda::array<ComplexType, 5> sig_empty(0, 0, 0, 0, 0);
+      cvv.build(mf, _sH0_cvv.value().local(), mb_state.sF_skij.value().local(), sig_empty);
+    }
+    auto head = cvv.eval_head_tensor(mf, mb_state.sG_tskij.value().local());
+
+    // eps^{-1}_head(inu) - 1 on the PH-sym half grid (full-grid index i0 + j):
+    // scalar head Dyson per cartesian direction, angular average of eps^{-1}
+    const long nwb = _ft->nw_b(), i0 = nwb / 2;
+    const long nw_half = (nwb % 2 == 0) ? nwb / 2 : nwb / 2 + 1;
+    nda::array<ComplexType, 2> Ew(nw_half, 1);
+    for (long j = 0; j < nw_half; ++j) {
+      ComplexType acc(0.0);
+      for (int a = 0; a < 3; ++a)
+        acc += 1.0 / (1.0 - 4.0 * M_PI * head.Phead_wab(i0 + j, a, a));
+      Ew(j, 0) = acc / 3.0 - 1.0;
+    }
+    // head meter v(q).P00: a value approaching 1 signals dielectric collapse (the
+    // J > 1 feedback)
+    double td = 0.0;
+    for (int a = 0; a < 3; ++a)
+      td = std::max(td, std::abs(4.0 * M_PI * head.Phead_wab(i0, a, a)));
+    app_log(1, "  [CVV] head (div_treatment = cvv): eps_inf(x, y, z) = "
+               "({:.6f}, {:.6f}, {:.6f}); head meter v.P00 = {:.4f}{}",
+            1.0 - 4.0 * M_PI * head.Phead_wab(i0, 0, 0).real(),
+            1.0 - 4.0 * M_PI * head.Phead_wab(i0, 1, 1).real(),
+            1.0 - 4.0 * M_PI * head.Phead_wab(i0, 2, 2).real(), td,
+            (td > 0.9) ? "  [WARNING: v.P00 approaching 1 -- dielectric collapse]" : "");
+
+    nda::array<ComplexType, 1> Et(_ft->nt_b() % 2 == 0 ? _ft->nt_b() / 2
+                                                       : _ft->nt_b() / 2 + 1);
+    auto Et_2D = nda::reshape(Et, shape_t<2>{Et.shape(0), 1});
+    _ft->w_to_tau_PHsym(Ew, Et_2D);
+    return Et;
+  }
+
+  // ---- pol-vertex ladder helpers (pol_vertex = "ladder" readout / injection) ------------
+
+  void scr_coulomb_t::ensure_pol_vertex(THC_ERI auto &thc) {
+    if (_pol_vtx) return;
+    utils::check(_vertex != nullptr, "ensure_pol_vertex: no knob carrier attached.");
+    auto w = _vertex->pol_band_window();
+    // The readout instance takes the q -> 0 policy of the KNOB CARRIER, i.e. the user's vertex_div_treatment when set.
+    // Unset, the carrier was constructed with the SAME div_treatment string as this scr_coulomb_t (every MBPT driver
+    // site), so both coincide.
+    const std::string pol_div = _vertex->div_treatment();
+    if (pol_div != _div_treatment)
+      app_log(1, "  [vertex ladder] readout instance q -> 0 policy = \"{}\" (vertex_div_treatment) -- the GW/W "
+                 "div_treatment \"{}\" is untouched.", pol_div, _div_treatment);
+    _pol_vtx = std::make_shared<vertex_t>(
+        _ft, "2nd_exchange", w, thc.MF()->nbnd(), pol_div, "secondary",
+        _vertex->pol_isdf_rank(), _vertex->pol_isdf_svd_tol(),
+        _vertex->pol_isdf_thresh(), _vertex->pol_isdf_cond_max(), "static");
+    _pol_vtx->set_isdf_distr_tol(_vertex->pol_isdf_distr_tol());
+    // the fallback policies travel with the other knobs (the readout instance runs build_w0 / cache_w).
+    _pol_vtx->set_allow_missing_head(_vertex->allow_missing_head());
+    _pol_vtx->set_allow_bare_rung(_vertex->allow_bare_rung());
+    _pol_vtx->set_allow_unprojected(_vertex->allow_unprojected());
+    _pol_vtx->set_allow_unchecked_reflection(_vertex->allow_unchecked_reflection());
+    // if the user vertex is Wannierized, the private readout instance inherits the MLWF state
+    // so the pol-vertex/dynbse runs in the mesh-independent Wannier-pair frame (coarse->fine interpolation).
+    if (_vertex->wannier()) {
+      _pol_vtx->adopt_wannier(*_vertex);
+      app_log(1, "  [vertex ladder] readout instance inherits the Wannier projector (M = {}): the vertex "
+                 "polarization is produced in the MLWF-pair frame.", _vertex->subspace_rank());
+    }
+    // the ladder solve-grid knobs live on the knob carrier; the READOUT
+    // instance is the one that actually runs eval_pol_ladder_whalf, so they travel here.
+    _pol_vtx->set_ladder_solve(_vertex->ladder_solve_grid(),
+                               _vertex->ladder_solve_budget_gb());
+    // the TDA / head-scale / q-nu meter knobs travel to the READOUT instance for the same
+    // reason the solve-grid knobs do -- this is the vertex that actually builds W0 (the
+    // ladder rung W-bar_0) and runs the pair-space ladder. Every knob the ladder reads must
+    // be forwarded here, or it is silently ignored.
+    _pol_vtx->set_ladder_da(_vertex->ladder_tda(), _vertex->ladder_head_scale(),
+                            _vertex->ladder_qnu_meter());
+    // the knob carrier's q -> 0 head scale travels too.
+    // It multiplies the madelung weight of EVERY analytic q -> 0 head the vertex kernel inserts (build_w0's static
+    // rung W-bar_0 AND cache_w's dynamic W-bar(q, i nu)); 0 = a fully HEAD-FREE (body-only) coarse vertex, the
+    // interpolable object; the loop's own RPA W and its div_treatment are untouched. Default 1 = full head.
+    _pol_vtx->set_bl_head_scale(_vertex->bl_head_scale());
+    // pol_vertex_sc: the ladder's internal transfers run over a coarse sublattice (N_c points, sums normalised by N_c).
+    // Its Gamma transfer stands for the Gamma cell of the SUBLATTICE, so the analytic q -> 0 head of the rung, stored
+    // with the mesh's weight N_k xi (xi = the Madelung constant of the mesh's supercell), is rescaled to the
+    // sublattice's N_c xi_c: head = "coarse". "fine" keeps the mesh's weight, "none" removes the head (body only).
+    _pol_sc.cfg = _vertex->pol_sc();
+    // "hybrid" on the identity sublattice: every fine transfer is a sublattice transfer, so nothing is interpolated and the
+    // scheme is "direct" (P: every IBZ transfer solved once; Sigma: S2). Resolved here, before the Sigma vertex reads the mode.
+    if (_pol_sc.cfg.mode == "hybrid" and _pol_sc.cfg.mesh[0] * _pol_sc.cfg.mesh[1] * _pol_sc.cfg.mesh[2] == thc.MF()->nkpts()) {
+      app_log(1, "  [vertex self-consistency] pol_vertex_sc = \"hybrid\" on the identity sublattice {} x {} x {} (= the k mesh): run as "
+                 "\"direct\" (no transfer to interpolate).", _pol_sc.cfg.mesh[0], _pol_sc.cfg.mesh[1], _pol_sc.cfg.mesh[2]);
+      _pol_sc.cfg.mode = "direct";
+    }
+    _pol_vtx->set_pol_sc(_pol_sc.cfg);   // the readout instance's Sigma vertex runs on the same sublattice (eval_sigma_pair_dyn)
+    if (_pol_sc.cfg.enabled()) {
+      auto MF = thc.MF();
+      auto const &sc = _pol_sc.cfg;
+      utils::check(_vertex->ladder_rung() == "dynamic" and _vertex->pol_vertex_inject_enabled() and _vertex->pol_interp_file().empty()
+                   and not _vertex->pol_chain(),
+                   "pol_vertex_sc = \"{}\" needs pol_vertex_rung = \"dynamic\" and pol_vertex_inject = \"ladder_n2\", without "
+                   "pol_vertex_interp_file / pol_vertex_chain (the injected polarization is the one this run computes).", sc.mode);
+      const double Nc = double(sc.mesh[0] * sc.mesh[1] * sc.mesh[2]), Nk = double(MF->nkpts());
+      double ratio = 1.0, xi_c = 0.0;
+      if (sc.head == "none") ratio = 0.0;
+      else if (sc.head == "coarse") {
+        nda::array<double, 1> mp = {double(sc.mesh[0]), double(sc.mesh[1]), double(sc.mesh[2])};
+        xi_c = -2.0 * utils::madelung(MF->lattv(), MF->recv(), mp, MF->fft_grid_dim(), 1e-10);
+        utils::check(MF->madelung() != 0.0, "pol_vertex_sc_head = \"coarse\": the mean field carries no Madelung constant.");
+        ratio = (Nc * xi_c) / (Nk * MF->madelung());
+      }
+      _pol_vtx->set_bl_head_scale(_vertex->bl_head_scale() * ratio);
+      app_log(1, "  [vertex self-consistency] pol_vertex_sc = \"{}\": sublattice {} x {} x {} ({} of {} k points), refresh every {} "
+                 "update(s) from update {}, mixing {}, column {}.\n"
+                 "  [vertex self-consistency] q -> 0 head of the rung: \"{}\" -- Madelung constant of the mesh {:.6e}, of the "
+                 "sublattice {:.6e}; head weight scaled by {:.6e} (x vertex_bl_head_scale {}).",
+              sc.mode, sc.mesh[0], sc.mesh[1], sc.mesh[2], long(Nc), MF->nkpts(), sc.period, sc.start, sc.mix, sc.col, sc.head,
+              MF->madelung(), xi_c, ratio, _vertex->bl_head_scale());
+    }
+    // the leg vertex travels the same way.
+    _pol_vtx->set_ladder_legs(_vertex->ladder_legs());
+    // the rung (static / dynamic) and its solve knobs too.
+    _pol_vtx->set_ladder_rung(_vertex->ladder_rung(), _vertex->ladder_dyn_tol(), _vertex->ladder_dyn_maxit(),
+                              _vertex->ladder_dyn_gmres(), _vertex->ladder_dyn_sign());
+    _pol_vtx->set_ladder_dyn_rhs_block(_vertex->ladder_dyn_rhs_block());
+    _pol_vtx->set_ladder_dyn_dump(_vertex->ladder_dyn_dump());
+    _pol_vtx->set_wcache_mode(_vertex->wcache_mode());
+    _pol_vtx->set_ladder_dyn_dense(_vertex->ladder_dyn_dense());
+    _pol_vtx->set_ladder_dyn_rung(_vertex->ladder_dyn_rung_rank(), _vertex->ladder_dyn_rung_tol());
+    _pol_vtx->set_ladder_dyn_rung_apply(_vertex->ladder_dyn_rung_apply(), _vertex->ladder_dyn_rung_apply_given());
+    _pol_vtx->set_ladder_dyn_resolvent(_vertex->ladder_dyn_resolvent());
+    _pol_vtx->set_ladder_dyn_union_stride(_vertex->ladder_dyn_union_stride());
+    _pol_vtx->set_ladder_dyn_table_mode(_vertex->ladder_dyn_table_mode());
+    _pol_vtx->set_ladder_dyn_schedule(_vertex->ladder_dyn_schedule());
+    _pol_vtx->set_ladder_dyn_iaft_prec(_vertex->ladder_dyn_iaft_prec());
+    _pol_vtx->set_ladder_dyn_tfold(_vertex->ladder_dyn_tfold());
+    _pol_vtx->set_ladder_dyn_vmask(_vertex->ladder_dyn_vmask_lo(), _vertex->ladder_dyn_vmask_hi());
+    _pol_vtx->set_ladder_dyn_gamma1_only(_vertex->ladder_dyn_gamma1_only());
+    _pol_vtx->set_ladder_dyn_all_nu(_vertex->ladder_dyn_all_nu());
+    _pol_vtx->set_ladder_dyn_cut_r1(_vertex->ladder_dyn_cut_r1());
+    _pol_vtx->set_ladder_dyn_bubble_only(_vertex->ladder_dyn_bubble_only());
+    _pol_vtx->set_ladder_dyn_all_nu_nodes(_vertex->ladder_dyn_all_nu_nodes());
+    _pol_vtx->set_ladder_dyn_fit(_vertex->ladder_dyn_fit_file(), _vertex->ladder_dyn_fit_rank(), _vertex->ladder_dyn_fit_mode(), _vertex->ladder_dyn_fit_auto_nodes());
+    _pol_vtx->set_ladder_dyn_resum_mu_file(_vertex->ladder_dyn_resum_mu_file());
+    // the coarse->fine interpolation knobs travel to the readout instance too
+    _pol_vtx->set_isdf_points(_vertex->isdf_points_file(), _vertex->isdf_points_dump());
+    _pol_vtx->set_wannier_frame(_vertex->wannier_frame());
+    _pol_vtx->set_pol_interp(_vertex->pol_interp_file(), _vertex->pol_interp_col());
+    _pol_vtx->set_pol_chain(_vertex->pol_chain());
+    _pol_vtx->set_sigma_share(_vertex->sigma_share());
+    // print the EFFECTIVE window (after a Wannier adoption it is the projector's W_rng, not pol_vertex_band_window)
+    // and the readout's own q -> 0 policy
+    app_log(1, "  [vertex ladder] ladder readout instance: C window = [{}, {}){}, "
+               "secondary rank knob = {}, div_treatment = {} (kernel head follows "
+               "build_w0's policy; W0bar is SAME-iteration -- coincides with "
+               "pol_vertex_kernel = \"w0_prev\" at a fixed point).",
+            _pol_vtx->band_window().first(), _pol_vtx->band_window().last(),
+            _pol_vtx->wannier() ? " (the Wannier projector's W_rng)" : "", _vertex->pol_isdf_rank(),
+            _pol_vtx->div_treatment());
+    app_log(1, "  [vertex ladder] ladder-kernel options on the readout instance: ladder_tda = "
+               "{}, ladder_head_scale = {:.6g}, ladder_qnu_meter = {}.",
+            _vertex->ladder_tda() ? "true" : "false", _vertex->ladder_head_scale(),
+            _vertex->ladder_qnu_meter() ? "true" : "false");
+  }
+
+  template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+  nda::array<ComplexType, 3>
+  scr_coulomb_t::gather_nu0_row(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ) {
+    auto [nt_h, nq, Np, Nq2] = dPi_tqPQ.global_shape();
+    auto R = solvers::vertex_w0_detail::nu0_transform_row(*_ft);
+    utils::check(R.shape(0) == nt_h,
+                 "gather_nu0_row: PH-sym tau half grid mismatch ({} vs {}).",
+                 R.shape(0), nt_h);
+    auto t_rng = dPi_tqPQ.local_range(0);
+    auto q_rng = dPi_tqPQ.local_range(1);
+    auto P_rng = dPi_tqPQ.local_range(2);
+    auto Q_rng = dPi_tqPQ.local_range(3);
+    auto Pi_loc = dPi_tqPQ.local();
+    nda::array<ComplexType, 3> out(nq, Np, Nq2);
+    out() = ComplexType(0.0);
+    for (long it = 0; it < long(t_rng.size()); ++it) {
+      const ComplexType r = R(t_rng.first() + it);
+      for (long iq = 0; iq < long(q_rng.size()); ++iq)
+        for (long iP = 0; iP < long(P_rng.size()); ++iP)
+          for (long iQ = 0; iQ < long(Q_rng.size()); ++iQ)
+            out(q_rng.first() + iq, P_rng.first() + iP, Q_rng.first() + iQ) +=
+                r * Pi_loc(it, iq, iP, iQ);
+    }
+    dPi_tqPQ.communicator()->all_reduce_in_place_n(out.data(), out.size(), std::plus<>{});
+    return out;
+  }
+
+  /**
+   * eps(q_i, i nu) cuts: select the transfers once (q_min plus evenly spaced
+   * ranks of |q| among the non-Gamma IBZ transfers) and gather the RPA Pi rows at those
+   * transfers on EVERY PH-sym bosonic half node j (the same folded transform rows
+   * tau_to_w_PHsym applies, iw = nw_b/2 + j), reduced to rank 0 only (the per-(q, nu)
+   * single-frequency Dysons of the cut report are rank-0 work; nothing is replicated).
+   */
+  template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+  void scr_coulomb_t::gather_cut_rows(THC_ERI auto &thc,
+                                      memory::darray_t<Array_t, communicator_t> &dPi_tqPQ) {
+    auto [nt_h, nq, Np, Nq2] = dPi_tqPQ.global_shape();
+    auto MF = thc.MF();
+    const long nsel_req = _vertex->eps_cut_nq();
+    if (_pol_cut_q.empty()) {
+      std::vector<std::pair<double, long>> qs;
+      for (long iq = 0; iq < nq; ++iq) {
+        auto qp = MF->Qpts_ibz(iq);
+        const double q2 = qp(0) * qp(0) + qp(1) * qp(1) + qp(2) * qp(2);
+        if (q2 > 1e-12) qs.emplace_back(q2, iq);
+      }
+      std::sort(qs.begin(), qs.end());
+      const long navail = long(qs.size());
+      const long nsel = std::min(nsel_req, navail);
+      for (long i = 0; i < nsel; ++i) {
+        const long r = (nsel == 1) ? 0 : std::lround(double(i) * double(navail - 1) / double(nsel - 1));
+        _pol_cut_q.push_back(qs[size_t(r)].second);
+      }
+      std::string sel;
+      for (long i = 0; i < nsel; ++i) {
+        auto qp = MF->Qpts_ibz(_pol_cut_q[size_t(i)]);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), " iq %ld (|q| %.6f)", _pol_cut_q[size_t(i)],
+                      std::sqrt(qp(0) * qp(0) + qp(1) * qp(1) + qp(2) * qp(2)));
+        sel += buf;
+      }
+      app_log(1, "  [eps-cut] transfers selected ({} of {} non-Gamma IBZ q, by |q| rank):{}", nsel, navail, sel);
+    }
+    const long nsel = long(_pol_cut_q.size());
+    if (nsel == 0) { _pol_pi_cut.reset(); return; }
+    const long nt_b = _ft->nt_b(), nw_b = _ft->nw_b();
+    const long nt_half = (nt_b % 2 == 0) ? nt_b / 2 : nt_b / 2 + 1;
+    const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    utils::check(nt_h == nt_half, "gather_cut_rows: PH-sym tau half grid mismatch ({} vs {}).", nt_h, nt_half);
+    auto Twt = _ft->Twt_bb();                                   // (nw_b, nt_b)
+    nda::array<ComplexType, 2> Tpos(nw_half, nt_half);
+    for (long n = 0; n < nw_half; ++n) {
+      const long iw = nw_b / 2 + n;
+      for (long it = 0; it < nt_half; ++it) {
+        const long imt = nt_b - it - 1;
+        Tpos(n, it) = (it == imt) ? Twt(iw, it) : Twt(iw, it) + Twt(iw, imt);
+      }
+    }
+    std::vector<long> sel_of(size_t(nq), -1);
+    for (long s = 0; s < nsel; ++s) sel_of[size_t(_pol_cut_q[size_t(s)])] = s;
+    auto t_rng = dPi_tqPQ.local_range(0);
+    auto q_rng = dPi_tqPQ.local_range(1);
+    auto P_rng = dPi_tqPQ.local_range(2);
+    auto Q_rng = dPi_tqPQ.local_range(3);
+    auto Pi_loc = dPi_tqPQ.local();
+    nda::array<ComplexType, 4> out(nsel, nw_half, Np, Nq2);
+    out() = ComplexType(0.0);
+    for (long iq = 0; iq < long(q_rng.size()); ++iq) {
+      const long s = sel_of[size_t(q_rng.first() + iq)];
+      if (s < 0) continue;
+      for (long it = 0; it < long(t_rng.size()); ++it)
+        for (long n = 0; n < nw_half; ++n) {
+          const ComplexType r = Tpos(n, t_rng.first() + it);
+          for (long iP = 0; iP < long(P_rng.size()); ++iP)
+            for (long iQ = 0; iQ < long(Q_rng.size()); ++iQ)
+              out(s, n, P_rng.first() + iP, Q_rng.first() + iQ) += r * Pi_loc(it, iq, iP, iQ);
+        }
+    }
+    dPi_tqPQ.communicator()->reduce_in_place_n(out.data(), out.size(), std::plus<>{}, 0);
+    if (dPi_tqPQ.communicator()->rank() == 0) {
+      app_log(2, "  [eps-cut] RPA rows gathered on rank 0: {} q x {} nu nodes x {}^2 ({:.3f} GB)", nsel, nw_half, Np,
+              double(out.size()) * 16.0 / 1.0e9);
+      _pol_pi_cut.emplace(std::move(out));
+    } else {
+      _pol_pi_cut.reset();
+    }
+  }
+
+  /**
+   * The LADDER half of the bosonic double counting (THC-adjoint form),
+   *
+   *   P^lad_loc(i.nu)_abcd = (1/N_q) sum_q [ B(q)^dag (t(q)^dag Pl(i.nu, q) t(q)) B(q) ]_abcd,
+   *
+   * i.e. the exact downfold ADJOINT of the upfold chain the EDMFT correction uses
+   * (upfold_pi_local: Pi_up(P,Q) = B(P;ab) Pi_ab,cd conj(B(Q;cd));
+   * its adjoint is D_ab,cd = conj(B(P;ab)) X_PQ B(Q;cd)). Unlike the bubble part of P_dc
+   * there is no impurity-side counterpart object, so "what the lattice already
+   * contains" is the definition.
+   *
+   * CONVENTION CAVEAT -- NOT A DC-READY OBJECT: the ADJOINT of the upfold is not its INVERSE --
+   * upfold_pi_local has gain ||B||^2 (a local Pi of O(1) upfolds onto the much larger scale the
+   * THC-basis Pi lives on), so the adjoint carries that same gain instead of its reciprocal
+   * and this object lands orders of magnitude above bubble[G_loc]. Neither the THC adjoint
+   * nor the s^-1 = (B^dag B)^-1 dual belongs in the bosonic double counting; the DC-ready
+   * object is the orbital/chi-convention MLWF U-leg projection of the pair-space ladder
+   * (accumulate_pi_lad_loc_orb). This one is kept as an INTERFACE DIAGNOSTIC: the ratio meter
+   * logged below, and an opt-in consumer that is off by default
+   * (downfold_edmft_impl's pi_lad_dc = "thc_adjoint_diag").
+   *
+   * q-WEIGHTS: B carries the FULL BZ q axis (and its own 1/N_q from
+   * calc_bosonic_projector), Pl and t carry the IBZ axis. The star multiplicities are
+   * therefore taken exactly as downfold_W does (embed_eri_t.cpp): loop the FULL
+   * q mesh, map each q to its IBZ parent, conjugate the parent's matrix when qp_trev, and
+   * divide by nqpts once at the end.
+   *
+   * COST: the Np x Np upfold is never formed. With Y(q) = t(q) B(q) (N_m x nImpOrbs^2, one
+   * gemm per q) the whole object is Y^dag Pl Y -- exactly the same number by associativity,
+   * at readout scale. Under time reversal the same expression holds with t -> conj(t) and
+   * Pl -> conj(Pl) (both conjugations follow from conj(t^dag Pl t)).
+   */
+  void scr_coulomb_t::accumulate_pi_lad_loc(MBState &mb_state, THC_ERI auto &thc,
+                                            nda::array<ComplexType, 4> const &Pl,
+                                            nda::array<ComplexType, 3> const &tmap) {
+    decltype(nda::range::all) all;
+    auto &proj_boson = mb_state.proj_boson.value();
+    utils::check(proj_boson.nImps() == 1,
+                 "scr_coulomb_t::accumulate_pi_lad_loc: P^lad_loc is implemented for a "
+                 "SINGLE impurity only (nImps = {}); the upfold it is the adjoint of is "
+                 "single-impurity too (edmft_pi.icc).", proj_boson.nImps());
+    mf::MF &mf = *thc.MF();
+    const long nw_h = Pl.shape(0), Nm = Pl.shape(2);
+    const long nImpOrbs = proj_boson.nImpOrbs(), nab = nImpOrbs * nImpOrbs;
+    const long nqpts = mf.nqpts(), Np = tmap.shape(2);
+    const long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+    utils::check(nw_h == nw_half,
+                 "scr_coulomb_t::accumulate_pi_lad_loc: the ladder's PH-sym half grid ({}) "
+                 "does not match the local-polarizability one ({}).", nw_h, nw_half);
+
+    auto sB_qIPab = (mf.nqpts_ibz() == mf.nqpts()) ?
+                    proj_boson.calc_bosonic_projector(thc) :
+                    proj_boson.calc_bosonic_projector_symm(thc);
+    utils::check(sB_qIPab.shape()[0] == nqpts and sB_qIPab.shape()[2] == Np,
+                 "scr_coulomb_t::accumulate_pi_lad_loc: bosonic projector shape mismatch "
+                 "({} x {} vs nqpts = {}, Np = {}).",
+                 sB_qIPab.shape()[0], sB_qIPab.shape()[2], nqpts, Np);
+
+    if (not mb_state.sPi_lad_loc_wabcd or
+        mb_state.sPi_lad_loc_wabcd.value().shape()[0] != nw_h)
+      mb_state.sPi_lad_loc_wabcd.emplace(
+          math::shm::make_shared_array<Array_view_5D_t>(
+              *thc.mpi(), {nw_h, nImpOrbs, nImpOrbs, nImpOrbs, nImpOrbs}));
+
+    auto B_loc = nda::reshape(sB_qIPab.local(), shape_t<3>{nqpts, Np, nab});
+    double lmax = 0.0;
+    mb_state.sPi_lad_loc_wabcd.value().win().fence();
+    if (thc.mpi()->node_comm.root()) {
+      auto D = nda::reshape(mb_state.sPi_lad_loc_wabcd.value().local(),
+                            shape_t<3>{nw_h, nab, nab});
+      D() = ComplexType(0.0);
+      nda::matrix<ComplexType> T(Nm, Np), Bq(Np, nab), Y(Nm, nab), core(Nm, Nm);
+      nda::matrix<ComplexType> CY(Nm, nab), acc(nab, nab);
+      for (long iq = 0; iq < nqpts; ++iq) {
+        const long iq_ibz = mf.qp_to_ibz(iq);
+        const bool trev = mf.qp_trev(iq);
+        T = trev ? nda::matrix<ComplexType>(nda::conj(tmap(iq_ibz, all, all)))
+                 : nda::matrix<ComplexType>(tmap(iq_ibz, all, all));
+        Bq = B_loc(iq, all, all);
+        nda::blas::gemm(T, Bq, Y);                        // Y = t(q) B(q)
+        for (long j = 0; j < nw_h; ++j) {
+          core = trev ? nda::matrix<ComplexType>(nda::conj(Pl(j, iq_ibz, all, all)))
+                      : nda::matrix<ComplexType>(Pl(j, iq_ibz, all, all));
+          nda::blas::gemm(core, Y, CY);
+          nda::blas::gemm(ComplexType(1.0), nda::dagger(Y), CY, ComplexType(0.0), acc);
+          D(j, all, all) += acc;
+        }
+      }
+      D() /= double(nqpts);
+      for (auto const &v : D) lmax = std::max(lmax, std::abs(v));
+    }
+    mb_state.sPi_lad_loc_wabcd.value().win().fence();
+    thc.mpi()->comm.barrier();
+    _pol_lad_loc_max = thc.mpi()->comm.all_reduce_value(lmax, boost::mpi3::max<>{});
+
+    // cancellation-load meter, ladder column: ||P^lad_loc|| against the bubble part of
+    // P_dc when the latter is present (it is absent in the C = empty case, where there is
+    // nothing to compare against).
+    _pol_lad_loc_ratio = -1.0;
+    if (mb_state.sPi_dc_wabcd) {
+      double dmax = 0.0;
+      for (auto const &v : mb_state.sPi_dc_wabcd.value().local())
+        dmax = std::max(dmax, std::abs(v));
+      _pol_dc_bubble_max = thc.mpi()->comm.all_reduce_value(dmax, boost::mpi3::max<>{});
+      if (_pol_dc_bubble_max > 0.0)
+        _pol_lad_loc_ratio = _pol_lad_loc_max / _pol_dc_bubble_max;
+      app_log(1, "  [orbital ladder] ||P^lad_loc||_max = {:.4e} vs ||P_dc,bubble||_max = {:.4e} "
+                 "(ratio {:.3e})", _pol_lad_loc_max, _pol_dc_bubble_max, _pol_lad_loc_ratio);
+    } else {
+      _pol_dc_bubble_max = -1.0;
+      app_log(1, "  [orbital ladder] ||P^lad_loc||_max = {:.4e} (no bubble P_dc present to "
+                 "compare against)", _pol_lad_loc_max);
+    }
+  }
+
+  /**
+   * The ladder half of the bosonic double counting PROPER (orbital convention),
+   *
+   *   P^lad_loc,orb(i.nu)_abcd = (1/N_q) sum_q [ E(q)^dag ((1-XK)^-1 XKX)(q, i.nu) E(q) ],
+   *   E(k; q)_{(a nc + b),(m norb + n)} = U_{m a}(k) conj(U_{n b}(k + q)),
+   *
+   * i.e. the SAME pair-space sandwich the lattice ladder is, contracted with the MLWF pair
+   * legs instead of the THC density collapse -- an ORBITAL/chi-convention object on the
+   * scale of bubble[G_loc], with no metric inverse anywhere (the THC adjoint of
+   * accumulate_pi_lad_loc carries the upfold's ||B||^2 gain, this does not). Leg
+   * derivation + the chi-convention statement: vertex_ladder.icc header; checked by
+   * vertex_t::ladder_loc_gate.
+   *
+   * THE LEGS: the ONE fermionic projector, proj_boson.proj_fermi()'s C_skIai on the FULL BZ
+   * k axis, placed on the LADDER window's columns. The projector's band window must lie
+   * INSIDE the ladder window -- otherwise the projector has weight on bands the ladder
+   * never resummed and the object would silently drop it. Both windows are logged.
+   *
+   * WHERE THAT REQUIREMENT ABORTS: this accumulator is OPPORTUNISTIC (it runs on every
+   * injection that has a bosonic projector, whether or not anyone asked for the ladder DC),
+   * so an incompatible pair of windows here is a SKIP with a loud warning, not a fatal --
+   * runs whose projector window is not inside the ladder window must keep working. The FATAL
+   * lives where the object is actually demanded: downfold_edmft_impl's pi_lad_dc = "orbital"
+   * aborts when no P^lad_loc,orb is found rather than silently downgrading the DC.
+   *
+   * q-WEIGHTS: identical to accumulate_pi_lad_loc -- loop the FULL q mesh, map to the IBZ
+   * parent, conjugate on qp_trev, divide by nqpts once. (P^orb(-q) = conj(P^orb(q)) follows
+   * from the trev relations of U and G, exactly as conj(t^dag Pl t) does there. The trev
+   * branch is not covered by the tests, which use unsymmetrized meshes.)
+   */
+  void scr_coulomb_t::accumulate_pi_lad_loc_orb(MBState &mb_state, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    auto &proj_boson = mb_state.proj_boson.value();
+    utils::check(proj_boson.nImps() == 1,
+                 "scr_coulomb_t::accumulate_pi_lad_loc_orb: implemented for a SINGLE "
+                 "impurity only (nImps = {}).", proj_boson.nImps());
+    utils::check(_pol_vtx != nullptr,
+                 "scr_coulomb_t::accumulate_pi_lad_loc_orb: the ladder instance is absent.");
+    mf::MF &mf = *thc.MF();
+    auto C_skIai = proj_boson.proj_fermi().C_skIai();      // (ns, nk, nImps, norb, nOrbs_W)
+    auto const &W_rng = proj_boson.W_rng()[0];
+    auto bw = _pol_vtx->band_window();
+    if (W_rng.first() < bw.first() or W_rng.last() > bw.last()) {
+      app_log(1, "\n  [WARNING] [orbital ladder] the local ladder double-counting term (orbital convention) was NOT "
+                 "produced.\n            The bosonic projector's band window [{}, {}) is "
+                 "not contained in the\n            ladder (C) window [{}, {}), so the "
+                 "local projection would drop bands the\n            ladder never "
+                 "resummed. Widen pol_vertex's window (or narrow the\n            "
+                 "projector) if you intend to consume pi_lad_dc = \"orbital\".",
+              W_rng.first(), W_rng.last(), bw.first(), bw.last());
+      mb_state.sPi_lad_loc_orb_wabcd.reset();
+      _pol_lad_loc_orb_max = -1.0;
+      _pol_lad_loc_orb_ratio = -1.0;
+      return;
+    }
+
+    const long ns = C_skIai.shape(0), nk = C_skIai.shape(1);
+    const long norb = proj_boson.nImpOrbs(), nab = norb * norb, nc = bw.size();
+    utils::check(nk == mf.nkpts() and ns == mf.nspin(),
+                 "scr_coulomb_t::accumulate_pi_lad_loc_orb: projector axes ({} spins, {} "
+                 "k-points) do not match the mean field ({}, {}).", ns, nk, mf.nspin(),
+                 mf.nkpts());
+    utils::check(C_skIai.shape(4) == W_rng.size(),
+                 "scr_coulomb_t::accumulate_pi_lad_loc_orb: projector column count {} != "
+                 "band window size {}.", C_skIai.shape(4), W_rng.size());
+
+    // U on the LADDER window's columns: zero on the bands the projector does not span
+    nda::array<ComplexType, 4> U_skia(ns, nk, norb, nc);
+    U_skia() = ComplexType(0.0);
+    const long off = W_rng.first() - bw.first();
+    for (long is = 0; is < ns; ++is)
+      for (long ik = 0; ik < nk; ++ik)
+        for (long m = 0; m < norb; ++m)
+          for (long j = 0; j < W_rng.size(); ++j)
+            U_skia(is, ik, m, off + j) = C_skIai(is, ik, 0, m, j);
+    app_log(2, "  [orbital ladder] MLWF ladder legs: projector window [{}, {}) inside the "
+               "ladder window [{}, {}) (offset {}), {} impurity orbitals.",
+            W_rng.first(), W_rng.last(), bw.first(), bw.last(), off, norb);
+
+    auto Ploc = _pol_vtx->eval_pol_ladder_loc_whalf(mb_state, thc, U_skia);
+    const long nw_h = Ploc.shape(0), nq_ibz = Ploc.shape(1), nqpts = mf.nqpts();
+    const long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+    utils::check(nw_h == nw_half and Ploc.shape(2) == nab,
+                 "scr_coulomb_t::accumulate_pi_lad_loc_orb: evaluator returned {} x {} x "
+                 "{} rows, expected {} x {} x {}.", nw_h, nq_ibz, Ploc.shape(2), nw_half,
+                 mf.nqpts_ibz(), nab);
+
+    if (not mb_state.sPi_lad_loc_orb_wabcd or
+        mb_state.sPi_lad_loc_orb_wabcd.value().shape()[0] != nw_h)
+      mb_state.sPi_lad_loc_orb_wabcd.emplace(
+          math::shm::make_shared_array<Array_view_5D_t>(
+              *thc.mpi(), {nw_h, norb, norb, norb, norb}));
+
+    double lmax = 0.0;
+    mb_state.sPi_lad_loc_orb_wabcd.value().win().fence();
+    if (thc.mpi()->node_comm.root()) {
+      auto D = nda::reshape(mb_state.sPi_lad_loc_orb_wabcd.value().local(),
+                            shape_t<3>{nw_h, nab, nab});
+      D() = ComplexType(0.0);
+      for (long iq = 0; iq < nqpts; ++iq) {
+        const long iq_ibz = mf.qp_to_ibz(iq);
+        const bool trev = mf.qp_trev(iq);
+        for (long j = 0; j < nw_h; ++j) {
+          auto Pq = Ploc(j, iq_ibz, all, all);
+          if (trev)
+            D(j, all, all) += nda::conj(Pq);
+          else
+            D(j, all, all) += Pq;
+        }
+      }
+      D() /= double(nqpts);
+      for (auto const &v : D) lmax = std::max(lmax, std::abs(v));
+    }
+    mb_state.sPi_lad_loc_orb_wabcd.value().win().fence();
+    thc.mpi()->comm.barrier();
+    _pol_lad_loc_orb_max = thc.mpi()->comm.all_reduce_value(lmax, boost::mpi3::max<>{});
+
+    // scale meter: this object should sit ON the scale of bubble[G_loc] (the THC adjoint
+    // of accumulate_pi_lad_loc sits orders of magnitude above it).
+    _pol_lad_loc_orb_ratio = -1.0;
+    if (mb_state.sPi_dc_wabcd and _pol_dc_bubble_max > 0.0) {
+      _pol_lad_loc_orb_ratio = _pol_lad_loc_orb_max / _pol_dc_bubble_max;
+      app_log(1, "  [orbital ladder] ||P^lad_loc,orb||_max = {:.4e} vs ||P_dc,bubble||_max = "
+                 "{:.4e} (ratio {:.3e})", _pol_lad_loc_orb_max, _pol_dc_bubble_max,
+              _pol_lad_loc_orb_ratio);
+    } else {
+      app_log(1, "  [orbital ladder] ||P^lad_loc,orb||_max = {:.4e} (no bubble P_dc present "
+                 "to compare against)", _pol_lad_loc_orb_max);
+    }
+  }
+
+  /**
+   * The ladder (BSE) injection into the polarizability:
+   *
+   *   P_latt(q, i.nu) = P^RPA(q, i.nu) + P^lad(q, i.nu),   P^lad = [.]_{n >= 2}
+   *
+   * The implemented pair-space ladder resums rungs >= 1, i.e. chi0-FACTOR counts >= 2, so
+   * it IS the n >= 2 object as-is: only the bare bubble is excluded, and it never enters the
+   * kernel. NO subtraction is performed anywhere.
+   *
+   * MEMORY: the ladder lives in the secondary aux basis, (n_nu_half, nq, N_m, N_m)
+   * replicated. It is upfolded to the primary basis and transformed to tau ON THE LOCAL
+   * (P, Q) BLOCK ONLY -- the replicated (nu | t, q, Np, Np) object would be prohibitively
+   * large at production scale and is never formed. Per-rank cost is the class of the local
+   * dPi block itself.
+   *
+   * The three logged meters are the acceptance instruments:
+   *   - ||P^lad||_max / ||P^RPA||_max (+ the per-q breakdown, as in add_vertex_Pi_C):
+   *     a correction comparable to what it corrects means the ladder is out of
+   *     its regime, and eps = I - Z.P is then at risk of losing positivity;
+   *   - lambda_max = rho(Xh Kt): the resolvent's margin to the
+   *     particle-hole instability at 1;
+   *   - r_rt: the nu -> tau -> nu round trip of P^lad through the IAFT PH-sym pair. The
+   *     injection ASSUMES P^lad is PH-symmetric and representable on this grid; r_rt
+   *     checks that assumption every update_w. It is a NU-space round trip, not a
+   *     tau-space fit error (which must never be gated on).
+   */
+  template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+  void scr_coulomb_t::inject_pol_ladder(MBState &mb_state, THC_ERI auto &thc,
+                                        memory::darray_t<Array_t, communicator_t> &dPi_tqPQ) {
+    decltype(nda::range::all) all;
+    utils::check(_pol_vtx != nullptr,
+                 "inject_pol_ladder: the ladder instance is absent (ensure_pol_vertex).");
+    utils::check(_vertex != nullptr and not _vertex->active(),
+                 "inject_pol_ladder: an ACTIVE vertex_type injects its own Pi^C -- the "
+                 "combination double counts; use either the active vertex_type or the ladder injection, not both.");
+    auto [nt_h, nq_g, Np, NQ_g] = dPi_tqPQ.global_shape();
+
+    ladder_meter::watch lwatch, ltot;
+    const double rss_in = ladder_meter::rss_gb();
+    nda::array<double, 1> lam;
+    // with legs = "ward" the whalf pass also returns Delta P^Lambda (its inu = 0
+    // row feeds the readout's "+DeltaLambda" column); Pl then already contains it.
+    const bool ward_legs = _pol_vtx->ladder_ward_legs();
+    nda::array<ComplexType, 4> Pd;
+    nda::array<ComplexType, 4> Pl;
+    ++_pol_inj_calls;
+    auto MF = thc.MF();
+    auto lat = MF->lattv();
+    auto Q = MF->Qpts();
+    auto q_crys = [&](long iq, double *qc) {
+      for (long i = 0; i < 3; ++i) { double v = 0.0; for (long j = 0; j < 3; ++j) v += lat(i, j) * Q(iq, j); qc[i] = v / (2.0 * M_PI); }
+    };
+    const long nw_h_ft = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+    nda::array<long, 1> nu_half(nw_h_ft);
+    { auto wb = _ft->wn_mesh_b(); for (long j = 0; j < nw_h_ft; ++j) nu_half(j) = long(wb(_ft->nw_b() / 2 + j)); }
+    const bool from_file = not _pol_vtx->pol_interp_file().empty();
+    const bool from_store = _pol_sc.cfg.enabled();
+    if (from_store) {
+      // pol_vertex_sc: the mixed vertex polarization of the last refresh (the secondary frame of THIS run's points)
+      if (not _pol_sc.has() and not _pol_sc.cfg.restart_file.empty()) {
+        nda::array<double, 2> qc(nq_g, 3);
+        for (long iq = 0; iq < nq_g; ++iq) { double v[3]; q_crys(iq, v); for (long i = 0; i < 3; ++i) qc(iq, i) = v[i]; }
+        _pol_sc.read(*thc.mpi(), _pol_sc.cfg.restart_file, qc, nu_half, _ft->beta(), _pol_vtx->secondary_rank());
+        app_log(1, "  [vertex self-consistency] restart: the vertex polarization of {} (refresh {}) is injected.",
+                _pol_sc.cfg.restart_file, _pol_sc.n_refresh);
+      }
+      if (not _pol_sc.has()) {
+        app_log(1, "  [vertex self-consistency] no vertex polarization yet (the first refresh follows this update's W): the W "
+                   "Dyson equation of this update is the RPA one.");
+        return;
+      }
+      lam = nda::array<double, 1>(nw_h_ft); lam() = 0.0;
+      app_log(1, "  [vertex self-consistency] W-Dyson injection consumes the stored vertex polarization (refresh {}, column {}, "
+                 "{} half nodes x {} q, N_m = {}).", _pol_sc.n_refresh, _pol_sc.cfg.col, nw_h_ft, nq_g, _pol_vtx->secondary_rank());
+    } else if (from_file) {
+      // The FULL-FREQUENCY consumer. P^{C,L}(q, i nu_j) on this mesh's
+      // q list at ALL PH-sym half nodes comes from the file (a coarse run's <prefix>.pol_wh.g<n>.h5, or an offline
+      // interpolant in the same layout) in the frozen-point secondary frame, instead of the ladder solve; the
+      // upfold + nu -> tau + the += into the RPA polarization below run unchanged, so the W-Dyson, W and Sigma of the
+      // fine loop all see the interpolated vertex. Requires the same imaginary-axis grid (checked on the node list).
+      utils::check(not ward_legs, "inject_pol_ladder: pol_vertex_interp_file with legs = \"ward\" is not supported.");
+      utils::check(not _pol_vtx->isdf_points_file().empty(),
+                   "inject_pol_ladder: pol_vertex_interp_file needs pol_vertex_isdf_points_file (the file's secondary "
+                   "frame is the coarse run's point set).");
+      const std::string col = "Pi_" + _pol_vtx->pol_interp_col();
+      Pl = read_pol_interp_column(_pol_vtx->pol_interp_col(), nq_g, nw_h_ft, nu_half, thc);   // the read shared with the Sigma vertex
+      lam = nda::array<double, 1>(nw_h_ft); lam() = 0.0;
+      app_log(1, "  [vertex Wannier] W-Dyson injection consumes {} from {} ({} half nodes x {} q matched; frozen points, N_m = {}).",
+              col, _pol_vtx->pol_interp_file(), nw_h_ft, nq_g, _pol_vtx->secondary_rank());
+    } else {
+      Pl = _pol_vtx->eval_pol_ladder_whalf(mb_state, thc, &lam, ward_legs ? std::addressof(Pd) : nullptr);
+    }
+    const double t_eval = lwatch.lap();
+    const double rss_eval = ladder_meter::rss_gb();
+    auto const &tmap = _pol_vtx->secondary_transfer();               // (nq, Nm, Np)
+    // the consumed object: the node-shared store (pol_vertex_sc) or the array filled above
+    nda::array_view<ComplexType, 4> Plv = from_store ? _pol_sc.view() : nda::array_view<ComplexType, 4>(Pl);
+    const long nw_h = Plv.shape(0), Nm = Plv.shape(2);
+    if (_pol_vtx->ladder_dyn_dump() and not from_file and not from_store and thc.mpi()->comm.root()) {
+      // the coarse run's FULL-FREQUENCY injection object (the resummed static-rung ladder at every PH-sym
+      // half node) in the frozen-able secondary frame -- the input of an offline interpolation, and the fine
+      // consumer's format (pol_vertex_interp_file, col "ladder").
+      const std::string fn = mb_state.coqui_prefix + ".pol_wh.g" + std::to_string(_pol_inj_calls) + ".h5";
+      nda::array<double, 2> qc(nq_g, 3);
+      for (long iq = 0; iq < nq_g; ++iq) { double v[3]; q_crys(iq, v); for (long i = 0; i < 3; ++i) qc(iq, i) = v[i]; }
+      h5::file f(fn, 'w');
+      h5::group g(f);
+      nda::h5_write(g, "q", qc);
+      nda::h5_write(g, "nu_half", nu_half);
+      h5::h5_write(g, "beta", _ft->beta());
+      h5::h5_write(g, "nw_b", long(_ft->nw_b()));
+      nda::h5_write(g, "Pi_ladder", nda::array<ComplexType, 4>(Plv));
+      h5::h5_write(g, "nout", Nm);
+      h5::h5_write(g, "frame", std::string("aux"));
+      h5::h5_write(g, "wannier", long(_pol_vtx->wannier() ? 1 : 0));
+      h5::h5_write(g, "nm", Nm);
+      h5::h5_write(g, "window_first", long(_pol_vtx->pol_band_window().first()));
+      h5::h5_write(g, "window_size", long(_pol_vtx->pol_band_window().size()));
+      if (_pol_vtx->secondary_points().size() > 0) nda::h5_write(g, "ipts", _pol_vtx->secondary_points());
+      app_log(1, "  [vertex Wannier] full-frequency ladder injection object written to {} ({} half nodes x {} q x {} x {}).",
+              fn, nw_h, nq_g, Nm, Nm);
+    }
+    utils::check(Plv.shape(1) == nq_g and tmap.shape(0) == nq_g and tmap.shape(1) == Nm
+                 and tmap.shape(2) == Np,
+                 "inject_pol_ladder: shape mismatch (ladder {}x{}x{}, t {}x{}x{}, Pi q = "
+                 "{}, Np = {}).", Plv.shape(0), Plv.shape(1), Nm, tmap.shape(0),
+                 tmap.shape(1), tmap.shape(2), nq_g, Np);
+
+    // stash the inu = 0 row for the eps_M readout of THIS update_w. Half node 0 IS the nw_b/2
+    // node eval_pol_ladder_nu0 evaluates, and the whalf return is already all_reduced/replicated,
+    // so the readout consumes it verbatim -- identical to a second, independent pair-space
+    // ladder pass, which is therefore skipped.
+    _pol_nu0_row.emplace(nda::array<ComplexType, 3>(Plv(0, nda::ellipsis{})));
+    if (ward_legs) _pol_nu0_dlam.emplace(nda::array<ComplexType, 3>(Pd(0, nda::ellipsis{})));
+    else _pol_nu0_dlam.reset();
+
+    auto t_rng = dPi_tqPQ.local_range(0);
+    auto q_rng = dPi_tqPQ.local_range(1);
+    auto P_rng = dPi_tqPQ.local_range(2);
+    auto Q_rng = dPi_tqPQ.local_range(3);
+    const long ntl = long(t_rng.size()), nql = long(q_rng.size());
+    const long nPl = long(P_rng.size()), nQl = long(Q_rng.size());
+    auto Pi_loc = dPi_tqPQ.local();
+    // Pi may be the DEVICE darray itself (eval_Pi_qdep's device hooks): the upfold result is then
+    // added on the device and nothing of Pi crosses to the host (no mirror, no copy back)
+    constexpr bool pi_dev = not nda::mem::on_host<Array_t>;
+#if !defined(ENABLE_CUDA)
+    if constexpr (pi_dev) utils::check(false, "inject_pol_ladder: a device Pi needs the CUDA helpers (ENABLE_CUDA).");
+#endif
+
+    // ||P^RPA||_max BEFORE the +=, on the same grid (the comparison the ratio reports)
+    double nR = 0.0;
+    if constexpr (pi_dev) {
+#if defined(ENABLE_CUDA)
+      nR = methods::solvers::dynbse_cuda::dev_maxabs(Pi_loc.data(), long(Pi_loc.size()));
+#endif
+    } else {                                            // a max over the local block: threaded, order-independent
+      ComplexType const *pl = Pi_loc.data();
+      const long npl = long(Pi_loc.size());
+#pragma omp parallel for reduction(max:nR) num_threads(utils::omp_threads())
+      for (long e = 0; e < npl; ++e) nR = std::max(nR, std::abs(pl[e]));
+    }
+
+    nda::array<ComplexType, 3> A(pi_dev ? 0 : nw_h, nPl, nQl), B(pi_dev ? 0 : nt_h, nPl, nQl);   // host blocks (host Pi)
+    nda::array<ComplexType, 2> tq_Q(Nm, nQl), td_P(nPl, Nm), tmp(Nm, nQl);
+    double nC = 0.0;
+    std::vector<double> qmax(size_t(nq_g), 0.0);
+    // ---- the (q, nu) decomposition meter (ladder_qnu_meter) --------------------------------
+    // PURE OBSERVER. Accumulates, in the GLOBAL THC aux basis (i.e. AFTER the upfold, which
+    // is what the Dyson actually sees), the squared Frobenius norm of the injected P^lad
+    // per (q, i.nu) and -- alongside the RPA polarization it corrects -- per (q, tau). Every
+    // physics write below is untouched, and with the knob off no accumulator is even sized.
+    const bool qnu_meter = (_vertex != nullptr and _vertex->ladder_qnu_meter());
+    std::vector<double> lad_qw, lad_qt, rpa_qt;
+    if (qnu_meter) {
+      lad_qw.assign(size_t(nq_g * nw_h), 0.0);
+      lad_qt.assign(size_t(nq_g * nt_h), 0.0);
+      rpa_qt.assign(size_t(nq_g * nt_h), 0.0);
+    }
+    // a rank with an empty local block still joins the reductions below
+    const long nq_own = (nPl > 0 and nQl > 0 and ntl > 0) ? nql : 0;
+    // Under DEVICE the upfold and the nu -> tau transform run on the device (the same gemms through cuBLAS); only the
+    // tau block comes down for the += into the (host-mirror) Pi. vertex_debug inject_device = 0 keeps the host gemms.
+    // The q-nu meter needs the frequency block on the host: it keeps the host path.
+#if defined(ENABLE_DEVICE)
+    utils::check(not (pi_dev and qnu_meter), "inject_pol_ladder: the q-nu meter needs the host Pi (the caller mirrors it).");
+    const bool up_dev = (nq_own > 0) and not qnu_meter and
+                        (pi_dev or methods::vertex_debug::number("inject_device", 1.0) != 0.0);   // vertex_debug: inject_device
+    std::optional<memory::array<DEVICE_MEMORY, ComplexType, 3>> tmp_d, A_d, B_d;
+    if (up_dev) {
+      tmp_d.emplace(nw_h, Nm, nQl); A_d.emplace(nw_h, nPl, nQl); B_d.emplace(nt_h, nPl, nQl);
+    }
+#else
+    const bool up_dev = false;
+#endif
+    double t_up_gemm = 0.0, t_up_add = 0.0;               // the split of t_upfold: transform (host or device) / the += loop
+    auto up_now = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    for (long iql = 0; iql < nq_own; ++iql) {
+      const long iq = q_rng.first() + iql;
+      const double tu0 = up_now();
+      auto tq = tmap(iq, all, all);
+      for (long m = 0; m < Nm; ++m) {
+        for (long j = 0; j < nQl; ++j) tq_Q(m, j) = tq(m, Q_rng.first() + j);
+        for (long i = 0; i < nPl; ++i) td_P(i, m) = std::conj(tq(m, P_rng.first() + i));
+      }
+      if (up_dev) {
+#if defined(ENABLE_DEVICE)
+        nda::array<ComplexType, 3> Plq(Plv(all, iq, all, all));
+        auto Pl_d = memory::to_memory_space<DEVICE_MEMORY>(Plq);
+        auto tqQ_d = memory::to_memory_space<DEVICE_MEMORY>(tq_Q);
+        auto tdP_d = memory::to_memory_space<DEVICE_MEMORY>(td_P);
+        for (long j = 0; j < nw_h; ++j) {
+          nda::blas::gemm(Pl_d(j, all, all), tqQ_d, (*tmp_d)(j, all, all));
+          nda::blas::gemm(tdP_d, (*tmp_d)(j, all, all), (*A_d)(j, all, all));
+        }
+        auto A2d = nda::reshape(*A_d, shape_t<2>{nw_h, nPl * nQl});
+        auto B2d = nda::reshape(*B_d, shape_t<2>{nt_h, nPl * nQl});
+        _ft->w_to_tau_PHsym(A2d, B2d);
+        if constexpr (not pi_dev) B = nda::array<ComplexType, 3>(memory::to_memory_space<HOST_MEMORY>(*B_d));
+#endif
+      } else {
+      // upfold ONLY the local block: dP(P, Q) = sum_MN conj(t_MP) Pl_MN t_NQ (the
+      // adjoint/no-leak map -- two thin gemms, never the full Np x Np)
+      for (long j = 0; j < nw_h; ++j) {
+        nda::blas::gemm(Plv(j, iq, all, all), tq_Q, tmp);
+        nda::blas::gemm(td_P, tmp, A(j, all, all));
+      }
+      if (qnu_meter)
+        for (long j = 0; j < nw_h; ++j) {
+          double s = 0.0;
+          for (long i = 0; i < nPl; ++i)
+            for (long jj = 0; jj < nQl; ++jj) s += std::norm(A(j, i, jj));
+          lad_qw[size_t(iq * nw_h + j)] += s;
+        }
+      // nu -> tau on the flattened local block through the PUBLIC PH-sym transform
+      auto A2 = nda::reshape(A, shape_t<2>{nw_h, nPl * nQl});
+      auto B2 = nda::reshape(B, shape_t<2>{nt_h, nPl * nQl});
+      _ft->w_to_tau_PHsym(A2, B2);
+      }
+      const double tu1 = up_now();
+      t_up_gemm += tu1 - tu0;
+      if constexpr (pi_dev) {
+#if defined(ENABLE_CUDA)
+        // this rank's tau rows of the transformed block, straight into the device Pi (rows it, stride nql nPl nQl)
+        const long blk = nPl * nQl;
+        ComplexType const *Bt = (*B_d).data() + t_rng.first() * blk;
+        const double mloc = methods::solvers::dynbse_cuda::dev_maxabs(Bt, ntl * blk);
+        methods::solvers::dynbse_cuda::dev_add_rows(Pi_loc.data() + iql * blk, nql * blk, Bt, blk, ntl, blk);
+        nC = std::max(nC, mloc);
+        qmax[size_t(iq)] = std::max(qmax[size_t(iq)], mloc);
+#endif
+        t_up_add += up_now() - tu1;
+        continue;
+      } else {
+      if (not qnu_meter) {
+        // the += into the host mirror of Pi and the max meters, threaded (elementwise adds and max reductions: the
+        // same values as the serial loop)
+        double mloc = 0.0;
+        const long t0r = t_rng.first();
+#pragma omp parallel for collapse(2) reduction(max:mloc) num_threads(utils::omp_threads())
+        for (long it = 0; it < ntl; ++it)
+          for (long i = 0; i < nPl; ++i)
+            for (long j = 0; j < nQl; ++j) {
+              const ComplexType v = B(t0r + it, i, j);
+              mloc = std::max(mloc, std::abs(v));
+              Pi_loc(it, iql, i, j) += v;
+            }
+        nC = std::max(nC, mloc);
+        qmax[size_t(iq)] = std::max(qmax[size_t(iq)], mloc);
+        t_up_add += up_now() - tu1;
+        continue;
+      }
+      for (long it = 0; it < ntl; ++it)
+        for (long i = 0; i < nPl; ++i)
+          for (long j = 0; j < nQl; ++j) {
+            const ComplexType v = B(t_rng.first() + it, i, j);
+            const double a = std::abs(v);
+            nC = std::max(nC, a);
+            qmax[size_t(iq)] = std::max(qmax[size_t(iq)], a);
+            if (qnu_meter) {
+              const size_t o = size_t(iq * nt_h + t_rng.first() + it);
+              lad_qt[o] += a * a;
+              rpa_qt[o] += std::norm(Pi_loc(it, iql, i, j));   // BEFORE the +=
+            }
+            Pi_loc(it, iql, i, j) += v;
+          }
+      t_up_add += up_now() - tu1;
+      }   // host Pi
+    }
+    const double t_upfold = lwatch.lap();
+    auto &comm = *dPi_tqPQ.communicator();
+    nC = comm.all_reduce_value(nC, boost::mpi3::max<>{});
+    nR = comm.all_reduce_value(nR, boost::mpi3::max<>{});
+    comm.all_reduce_in_place_n(qmax.data(), qmax.size(), boost::mpi3::max<>{});
+    _pol_lad_ratio = nC / std::max(nR, 1e-300);
+
+    // r_rt on a sampled q (Gamma + the last IBZ transfer): replicated N_m-class algebra
+    {
+      nda::array<ComplexType, 3> R(nw_h, Nm, Nm), S(nt_h, Nm, Nm);
+      double num = 0.0, den = 0.0;
+      for (long iq : {0l, nq_g - 1}) {
+        R = Plv(all, iq, all, all);
+        auto R2 = nda::reshape(R, shape_t<2>{nw_h, Nm * Nm});
+        auto S2 = nda::reshape(S, shape_t<2>{nt_h, Nm * Nm});
+        _ft->w_to_tau_PHsym(R2, S2);
+        _ft->tau_to_w_PHsym(S2, R2);
+        for (long j = 0; j < nw_h; ++j)
+          for (long M = 0; M < Nm; ++M)
+            for (long N = 0; N < Nm; ++N) {
+              num += std::norm(R(j, M, N) - Plv(j, iq, M, N));
+              den += std::norm(Plv(j, iq, M, N));
+            }
+        if (nq_g == 1) break;
+      }
+      _pol_r_rt = std::sqrt(num / std::max(den, 1e-300));
+    }
+
+    _pol_lam_nu0 = lam(0);
+    _pol_lam_max = 0.0;
+    for (long j = 0; j < nw_h; ++j) _pol_lam_max = std::max(_pol_lam_max, lam(j));
+
+    // --- profiling meters: the ladder wall of THIS outer iteration + the RSS trace.
+    // t_meters is charged to the r_rt / q-max diagnostics between the two laps above.
+    {
+      const double t_diag = lwatch.lap();
+      const double t_tot = ltot.lap();
+      const double rss_out = ladder_meter::rss_gb();
+      ladder_meter::cum_eval += t_eval;
+      ladder_meter::cum_inject += t_tot;
+      ++ladder_meter::ncalls;
+      double rss_mx = comm.all_reduce_value(rss_out, boost::mpi3::max<>{});
+      double rss_ev = comm.all_reduce_value(rss_eval, boost::mpi3::max<>{});
+      double rss_e0 = comm.all_reduce_value(rss_in, boost::mpi3::max<>{});
+      app_log(1, "  [ladder-prof inject] iteration {}: ladder eval = {:.2f} s of {:.2f} s "
+                 "injection ({:.1f}%); upfold+nu->tau = {:.2f} s{} [transform {:.2f} s, += into Pi {:.2f} s], meters = {:.2f} s; "
+                 "cumulative ladder eval = {:.2f} s over {} iterations",
+              ladder_meter::ncalls, t_eval, t_tot,
+              100.0 * t_eval / std::max(t_tot, 1e-300), t_upfold, up_dev ? " (on the device)" : "", t_up_gemm, t_up_add, t_diag,
+              ladder_meter::cum_eval, ladder_meter::ncalls);
+      app_log(1, "  [ladder-prof inject] MaxRSS GB (max over ranks): entry {:.2f} -> "
+                 "after ladder eval {:.2f} -> exit {:.2f}", rss_e0, rss_ev, rss_mx);
+    }
+    app_log(1, "  [ladder injection] ladder injected into P ({} PH-sym nu nodes, N_m = {}): "
+               "||P^lad||_max = {:.4e} vs ||P^RPA||_max = {:.4e} (ratio {:.3e}); "
+               "transform round trip r_rt = {:.3e}",
+            nw_h, Nm, nC, nR, _pol_lad_ratio, _pol_r_rt);
+    {
+      std::ostringstream oss;
+      oss << std::scientific << std::setprecision(2);
+      for (long q = 0; q < nq_g; ++q) oss << (q ? " " : "") << qmax[size_t(q)];
+      app_log(1, "  [ladder injection] ||P^lad||_max by transfer q (q=0 is Gamma): {}", oss.str());
+    }
+    // ---- (q, nu) meter report: WHERE IN (q, nu) THE INJECTED CORRECTION LIVES ----------
+    if (qnu_meter) {
+      comm.all_reduce_in_place_n(lad_qw.data(), lad_qw.size(), std::plus<>{});
+      comm.all_reduce_in_place_n(lad_qt.data(), lad_qt.size(), std::plus<>{});
+      comm.all_reduce_in_place_n(rpa_qt.data(), rpa_qt.size(), std::plus<>{});
+      auto MF = thc.MF();
+      // star multiplicity of each IBZ transfer (the weight its cell carries in any q sum)
+      std::vector<long> mult(size_t(nq_g), 0);
+      {
+        auto q2i = MF->qp_to_ibz();
+        for (long i = 0; i < q2i.shape(0); ++i) {
+          const long ib = q2i(i);
+          if (ib >= 0 and ib < nq_g) ++mult[size_t(ib)];
+        }
+      }
+      double tot_w = 0.0;
+      for (auto v : lad_qw) tot_w += v;
+      app_log(1, "\n  [ladder q-nu meter] (q, nu) DECOMPOSITION of the injected P^lad "
+                 "(global THC aux basis, Frobenius norms).");
+      app_log(1, "  [ladder q-nu meter]   q-marginal (sum over the {} PH-sym nu nodes), and the "
+                 "tau-summed strength relative to P^RPA:", nw_h);
+      app_log(1, "  [ladder q-nu meter]   {:>4} {:>12} {:>6} {:>14} {:>10} {:>14} {:>14} {:>10}",
+              "iq", "|q|^2", "mult", "||P^lad(q)||", "share", "||P^lad(q)||_t",
+              "||P^RPA(q)||_t", "ratio");
+      for (long q = 0; q < nq_g; ++q) {
+        double sw = 0.0, st = 0.0, sr = 0.0;
+        for (long j = 0; j < nw_h; ++j) sw += lad_qw[size_t(q * nw_h + j)];
+        for (long it = 0; it < nt_h; ++it) {
+          st += lad_qt[size_t(q * nt_h + it)];
+          sr += rpa_qt[size_t(q * nt_h + it)];
+        }
+        auto qp = MF->Qpts_ibz(q);
+        const double q2 = qp(0) * qp(0) + qp(1) * qp(1) + qp(2) * qp(2);
+        app_log(1, "  [ladder q-nu meter]   {:>4} {:>12.5e} {:>6} {:>14.6e} {:>10.4f} {:>14.6e} "
+                   "{:>14.6e} {:>10.4e}",
+                q, q2, mult[size_t(q)], std::sqrt(sw),
+                (tot_w > 0.0 ? sw / tot_w : 0.0), std::sqrt(st), std::sqrt(sr),
+                std::sqrt(st) / std::max(std::sqrt(sr), 1e-300));
+      }
+      {
+        std::ostringstream o2;
+        o2 << std::scientific << std::setprecision(3);
+        for (long j = 0; j < nw_h; ++j) {
+          double s = 0.0;
+          for (long q = 0; q < nq_g; ++q) s += lad_qw[size_t(q * nw_h + j)];
+          o2 << (j ? " " : "") << std::sqrt(s);
+        }
+        app_log(1, "  [ladder q-nu meter]   nu-marginal ||P^lad(nu)|| (PH-sym half grid, node 0 = "
+                   "i.nu = 0): {}", o2.str());
+      }
+      for (long q = 0; q < nq_g; ++q) {
+        std::ostringstream o3;
+        o3 << std::scientific << std::setprecision(3);
+        for (long j = 0; j < nw_h; ++j)
+          o3 << (j ? " " : "") << std::sqrt(lad_qw[size_t(q * nw_h + j)]);
+        app_log(1, "  [ladder q-nu meter]   ||P^lad(q = {}, nu)||: {}", q, o3.str());
+      }
+      app_log(1, "");
+    }
+    app_log(1, "  [ladder injection] ladder resolvent margin: lambda_max(inu = 0) = {:.6f}, "
+               "max over nu = {:.6f}{}", _pol_lam_nu0, _pol_lam_max,
+            (_pol_lam_max > 0.9) ? "   [WARNING: approaching the particle-hole "
+                                   "instability -- the resolvent is losing margin]" : "");
+    utils::check(std::isfinite(_pol_lam_max) and _pol_lam_max < 1.0,
+                 "inject_pol_ladder: the ladder kernel's spectral radius rho(Xh Kt) = {} "
+                 "has reached 1 -- the ladder resolvent (1 - chi0 Xi)^-1 is singular "
+                 "(particle-hole instability). The static-ladder (BSE) approximation is outside its regime here; "
+                 "reduce the ladder C window.", _pol_lam_max);
+    if (nC > nR)
+      app_log(1, "  [WARNING] the ladder polarization EXCEEDS the RPA polarization it "
+                 "corrects.\n"
+                 "            Expect eps = I - Z.P to lose conditioning (see the "
+                 "dielectric conditioning below).");
+
+    // With a bosonic projector attached, the SAME ladder is also downfolded to the
+    // impurity's local product basis -- the bosonic P_dc gains P^lad_loc. Nothing here
+    // feeds back into the lattice P above; the local object is a DC ingredient only.
+    if (mb_state.proj_boson.has_value()) {
+      accumulate_pi_lad_loc(mb_state, thc, Pl, tmap);
+      // ... and the DC-READY object next to it (the diagnostic above stays as-is).
+      // COST NOTE: this re-runs the pair-space kernel with the E legs -- the K blocks are
+      // rebuilt, so the ladder cost of an injection with a bosonic projector roughly
+      // doubles. The kernel already accepts both RHS blocks in ONE pass (pair_space_ladder
+      // takes Pi_ladder and Pi_lad_loc together), so the two calls could be fused; they
+      // are kept separate so the injection path is independent of the projector.
+      accumulate_pi_lad_loc_orb(mb_state, thc);
+    }
+  }
+
+
+  /** the pair-resolved Sigma vertex's options from the user's vertex object */
+  static vertex_t::sigma_pair_opts sigma_pair_opts_of(vertex_t const &v, MBState const &mb_state) {
+    vertex_t::sigma_pair_opts o;
+    o.col = v.sigma_pair_col();
+    o.outer = v.sigma_pair_outer();
+    o.scale = v.sigma_pair_scale();
+    o.hermitize = v.sigma_pair_herm();
+    o.nu_diag = v.sigma_pair_diag();
+    o.sign_ks = v.ladder_dyn_sign();
+    o.side = v.sigma_pair_side();
+    o.ibz = v.sigma_pair_ibz();
+    o.dyn_ckpt_minutes = v.sigma_dyn_ckpt_minutes();
+    o.dyn_refit = v.sigma_dyn_refit(); o.dyn_refit_rtol = v.sigma_dyn_refit_rtol();
+    o.dyn_acc = v.sigma_dyn_acc();
+    o.dyn_dump = v.sigma_dyn_dump(); o.dyn_nodes = v.sigma_dyn_nodes();
+    o.dyn_fit_file = v.sigma_dyn_fit_file(); o.dyn_fit_rank = v.sigma_dyn_fit_rank();
+    o.dyn_auto_nodes = v.sigma_dyn_auto_nodes();
+    o.dyn_fit_cut_cst = v.sigma_dyn_fit_cut_cst(); o.dyn_fit_cut_t = v.sigma_dyn_fit_cut_t();
+    o.dump_prefix = mb_state.coqui_prefix;
+    return o;
+  }
+
+  // Coarse side of the interpolation chain: the dynamic-rung ladder on ALL transfers x ALL PH-sym half nodes, written as the full-frequency
+  // vertex object <prefix>.pol_wh_dyn.g<n>.h5 (four columns; the fine W-Dyson feed reads one of them by name).
+  void scr_coulomb_t::refresh_pol_sc(MBState &mb_state, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    namespace vsc = solvers::vertex_sc;
+    namespace vvw = solvers::vertex_view;
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    const auto t0 = std::chrono::steady_clock::now();
+    const double rss0 = ladder_meter::rss_gb();
+    auto const &sc = _pol_sc.cfg;
+    const long nw_b = _ft->nw_b();
+    const long nw_h = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    const long nq_ibz = MF->nqpts_ibz(), nq_full = MF->nqpts();
+    std::vector<long> nodes(static_cast<size_t>(nw_h));
+    for (long j = 0; j < nw_h; ++j) nodes[size_t(j)] = j;
+    // crystal coordinates of the k mesh and of the full transfer mesh (q = k_0 - k_2(q, 0), as the symmetry context)
+    const nda::array<double, 2> kc(MF->kpts_crystal());
+    nda::array<double, 2> qc(nq_full, 3);
+    for (long iq = 0; iq < nq_full; ++iq) {
+      const long k2 = MF->qk_to_k2(int(iq), 0);
+      for (int i = 0; i < 3; ++i) qc(iq, i) = vsc::fold(kc(0, i) - kc(k2, i));
+    }
+    const int icol = (sc.col == "static") ? 0 : (sc.col == "gam1") ? 2 : 3;
+    // ---- nu-SAMPLED refresh (pol_vertex_sc_nu_nodes = K): the ladder on K half nodes chosen from the nu-modes of the STORED
+    // Pi-bar, every node reconstructed in that basis, Pi(:, col) = R Pi_S(:, col) with R (nw_h x K) = nusamp::reconstruction
+    // (nu_sampling.hpp). A refresh with no stored Pi-bar, and every pol_vertex_sc_nu_ref_period-th refresh, solves all nodes.
+    nda::array<ComplexType, 2> Rnu;                    // (nw_h, NS); empty = all nodes solved
+    const bool nu_full = not _pol_sc.has() or (sc.nu_ref_period > 0 and _pol_sc.n_refresh % sc.nu_ref_period == 0);
+    if (sc.nu_nodes > 0 and sc.nu_nodes < nw_h and not nu_full) {
+      std::vector<long> chosen;
+      nda::array<ComplexType, 2> G(nw_h, nw_h);
+      std::string glog;
+      if (mpi->comm.root()) {
+        auto P = _pol_sc.view();                         // (nw_h, nq_ibz, Nm, Nm), node-shared: the Gram on a 2-d view, no copy
+        const long ncol = long(P.size()) / nw_h;
+        nda::array_view<ComplexType, 2> T2(std::array<long, 2>{nw_h, ncol}, P.data());
+        nda::blas::gemm(T2, nda::dagger(T2), G);
+        for (long a = 0; a < nw_h; ++a)
+          for (long b2 = 0; b2 < a; ++b2) { G(a, b2) = 0.5 * (G(a, b2) + std::conj(G(b2, a))); G(b2, a) = std::conj(G(a, b2)); }
+        chosen = nusamp::pivot_nodes(G, sc.nu_nodes, std::vector<long>{0L, nw_h - 1});
+        std::sort(chosen.begin(), chosen.end());
+        chosen.erase(std::unique(chosen.begin(), chosen.end()), chosen.end());
+      }
+      long nch = long(chosen.size());
+      mpi->comm.broadcast_value(nch, 0);
+      chosen.resize(size_t(nch));
+      mpi->comm.broadcast_n(chosen.data(), nch, 0);
+      mpi->comm.broadcast_n(G.data(), G.size(), 0);
+      const long Kfit = (sc.nu_rank > 0) ? std::min(sc.nu_rank, nch) : nch;
+      Rnu = nusamp::reconstruction(G, chosen, Kfit, sc.nu_mode);
+      double kept = 0.0;
+      const long n4 = nusamp::modes_to(G, 1e-4, Kfit, &kept);
+      std::string lst;
+      { auto wb = _ft->wn_mesh_b(); for (long j : chosen) lst += std::to_string(long(wb(nw_b / 2 + j))) + " "; }
+      app_log(1, "  [vertex self-consistency] nu-SAMPLED refresh: {} of {} half nodes (Matsubara n = {}) chosen from the stored Pi-bar's "
+                 "nu-modes; reconstruction rank {} ({}), modes to 1e-4: {}, kept weight {:.8f}.",
+              nch, nw_h, lst, Kfit, sc.nu_mode, n4, kept);
+      nodes = chosen;
+    } else if (sc.nu_nodes > 0) {
+      app_log(1, "  [vertex self-consistency] nu-sampling: this refresh solves all {} half nodes ({}).", nw_h,
+              not _pol_sc.has() ? "no stored Pi-bar yet: the basis" : "the periodic renewal of the basis");
+    }
+    long n_units = 0;
+    double t_solve = 0.0;
+    bool all_conv = true, started = false;
+    auto make = [&](std::vector<long> const &k_int, std::vector<long> const &q_ext) { return vvw::make_view(*MF, k_int, q_ext); };
+    auto solve = [&](vvw::k_view const &view) {
+      ++_pol_dyn_calls;
+      auto r = _pol_vtx->eval_pol_dynbse_cut(mb_state, thc, nodes, std::vector<long>{}, _pol_dyn_calls, false, std::addressof(view), icol);
+      _pol_dyn_ritz = std::max(_pol_dyn_ritz, r.ritz_max);
+      n_units += r.nunits; t_solve += r.t_total; all_conv = all_conv and r.all_converged;
+      if (Rnu.size() > 0) {                              // the sampled nodes -> every half node
+        auto &PS = r.Pi_col;
+        const long NS = PS.shape(0), rest = long(PS.size()) / std::max(1L, NS);
+        utils::check(NS == Rnu.shape(1), "refresh_pol_sc: the ladder returned {} nodes, the reconstruction expects {}.", NS, Rnu.shape(1));
+        nda::array<ComplexType, 4> Pf(nw_h, PS.shape(1), PS.shape(2), PS.shape(3));
+        nda::array_view<ComplexType, 2> S2(std::array<long, 2>{NS, rest}, PS.data()), F2(std::array<long, 2>{nw_h, rest}, Pf.data());
+        nda::blas::gemm(Rnu, S2, F2);
+        PS = std::move(Pf);
+      }
+      if (not started) { _pol_sc.begin(*mpi, nw_h, nq_ibz, r.Pi_col.shape(2)); started = true; }
+      return std::move(r.Pi_col);
+    };
+    auto add = [&](long q, ComplexType w, bool cj, auto const &P) { _pol_sc.add(q, w, cj, P); };
+    // the IBZ symmetry of the interpolation mode (vertex_t::unfold_fit_matrix): the star representative of a transfer and the
+    // operation / time reversal that produce the transfer from it (sought among the mesh's operations by their action on q)
+    const bool sym_mesh = (MF->nkpts() != MF->nkpts_ibz());
+    if (sym_mesh and (sc.mode == "interp" or sc.mode == "hybrid") and sc.unfold == "fit") _pol_vtx->ensure_secondary_sym_ctx(thc);
+    auto star = [&](long q_full, long &q_ibz, long &js, bool &tr) {
+      q_ibz = -1; js = 0; tr = false;
+      if (not sym_mesh) return;
+      _pol_vtx->secondary_star(q_full, q_ibz, js, tr);
+    };
+    auto unfold = [&](long q_img, long js, bool tr, std::vector<long> const &k_int, auto const &P, double *resid) {
+      const long is = 0;   // one polarization per transfer (the legs of spin 0; spin-summed objects)
+      auto U = _pol_vtx->unfold_fit_matrix(*MF, is, q_img, js, k_int, resid);
+      return vertex_t::unfold_pol(U, P, tr);
+    };
+    const long n_solve = vsc::evaluate(sc, MF->lattv(), kc, qc, nq_ibz, make, solve, add, star, unfold);
+    const double change = _pol_sc.commit(*mpi);
+    const double nrm = _pol_sc.last_norm;
+    const long Nm = _pol_sc.view().shape(2);
+    std::string change_str = "n/a (first)";
+    if (change >= 0.0) { char buf[32]; std::snprintf(buf, sizeof(buf), "%.3e", change); change_str = buf; }
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    _pol_sc.t_last = wall; _pol_sc.t_total += wall;
+    app_log(1, "  [vertex self-consistency] refresh {} ({}): {} ladder pass(es), {} (s, q, nu) units, all converged {}; "
+               "|Pi_new|_F = {:.10e}, relative change to the stored one {}; wall {:.1f} s (ladder {:.1f} s), cumulative {:.1f} s; "
+               "store {:.2f} GB per NODE (N_m = {}), RSS {:.2f} -> {:.2f} GB",
+            _pol_sc.n_refresh, sc.mode, n_solve, n_units, all_conv, nrm, change_str, wall, t_solve, _pol_sc.t_total,
+            _pol_sc.bytes() / 1.0e9, Nm, rss0, ladder_meter::rss_gb());
+    if (not all_conv)
+      app_log(1, "  [vertex self-consistency] WARNING: not every ladder unit of this refresh converged.");
+    if (mpi->comm.root()) {
+      nda::array<double, 2> qi(nq_ibz, 3);
+      for (long iq = 0; iq < nq_ibz; ++iq) qi(iq, all) = qc(iq, all);
+      nda::array<long, 1> nu_half(nw_h);
+      { auto wb = _ft->wn_mesh_b(); for (long j = 0; j < nw_h; ++j) nu_half(j) = long(wb(nw_b / 2 + j)); }
+      const std::string fn = mb_state.coqui_prefix + ".pol_sc.h5";
+      _pol_sc.write(fn, qi, nu_half, _ft->beta());
+      app_log(1, "  [vertex self-consistency] checkpoint written to {} (restart with pol_vertex_sc_restart_file).", fn);
+    }
+    mpi->comm.barrier();
+  }
+
+  void scr_coulomb_t::dump_pol_dyn_all_nu(MBState &mb_state, THC_ERI auto &thc, long gen) {
+    decltype(nda::range::all) all;
+    auto MF = thc.MF();
+    const long nw_b = _ft->nw_b();
+    const long nw_h = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    const long nq = MF->nqpts_ibz();
+    std::vector<long> nodes_all(static_cast<size_t>(nw_h));
+    std::vector<long> qs(static_cast<size_t>(nq));
+    for (long j = 0; j < nw_h; ++j) nodes_all[size_t(j)] = j;
+    for (long iq = 0; iq < nq; ++iq) qs[size_t(iq)] = iq;
+    // the dynamic columns on the SAMPLED half nodes (pol_vertex_dyn_all_nu_nodes;
+    // all nodes when empty), the window bubble Pi_bub on ALL nodes; bubble_only skips the dynamic columns altogether.
+    const bool bub_only = _pol_vtx->ladder_dyn_bubble_only();
+    std::vector<long> nodes = _pol_vtx->ladder_dyn_all_nu_nodes();
+    // pol_vertex_dyn_fit_auto_nodes = K -> the K sampled half nodes chosen from the fit file's Gamma_1 (else static) column:
+    // nu = 0 and the highest node forced, the rest the row pivots of the top-K nu-modes (nu_sampling.hpp)
+    if (nodes.empty() and _pol_vtx->ladder_dyn_fit_auto_nodes() > 0 and not _pol_vtx->ladder_dyn_fit_file().empty()) {
+      const long Kn = _pol_vtx->ladder_dyn_fit_auto_nodes();
+      std::vector<long> chosen;
+      if (thc.mpi()->comm.root()) {
+        h5::file ff(_pol_vtx->ladder_dyn_fit_file(), 'r');
+        h5::group gf(ff);
+        const char *pref[3] = {"Pi_gam1", "Pi_dyn", "Pi_static"};
+        std::string col;
+        for (auto *c : pref) if (gf.has_dataset(c)) { col = c; break; }
+        utils::check(not col.empty(), "dump_pol_dyn_all_nu: the fit file {} has no Pi_gam1 / Pi_dyn / Pi_static column for the automatic node choice.",
+                     _pol_vtx->ladder_dyn_fit_file());
+        nda::array<ComplexType, 4> T;
+        nda::h5_read(gf, col, T);
+        utils::check(T.shape(0) == nw_h, "dump_pol_dyn_all_nu: the fit file's {} has {} half nodes, this run {}.", col, T.shape(0), nw_h);
+        auto T2 = nda::reshape(T, std::array<long, 2>{nw_h, long(T.size()) / nw_h});
+        auto G = nusamp::gram(T2);
+        chosen = nusamp::pivot_nodes(G, Kn, std::vector<long>{0L, nw_h - 1});
+        std::string lst;
+        for (long n : chosen) lst += std::to_string(n) + " ";
+        app_log(1, "  [Sigma vertex] automatic sampled nodes ({} of {}, from the {} column of {}): {}", chosen.size(), nw_h, col,
+                _pol_vtx->ladder_dyn_fit_file(), lst);
+      }
+      long nch = long(chosen.size());
+      thc.mpi()->comm.broadcast_value(nch, 0);
+      chosen.resize(size_t(nch));
+      thc.mpi()->comm.broadcast_n(chosen.data(), nch, 0);
+      nodes = chosen;
+    }
+    if (nodes.empty()) nodes = nodes_all;
+    std::sort(nodes.begin(), nodes.end());
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+    for (long j : nodes)
+      utils::check(j >= 0 and j < nw_h, "dump_pol_dyn_all_nu: pol_vertex_dyn_all_nu_nodes entry {} outside [0, {}).", j, nw_h);
+    const bool subset = (long(nodes.size()) != nw_h);
+    app_log(1, "  [vertex Wannier] all-nu dynamic-rung dump: {} of {} half nodes x {} transfers (Gamma_1-only = {}, bubble_only = {}).",
+            nodes.size(), nw_h, nq, _pol_vtx->ladder_dyn_gamma1_only(), bub_only);
+    std::optional<vertex_t::dynbse_cut_result> rd;   // the dynamic columns on the sampled nodes
+    // DIAGNOSTIC (vertex_debug dyn_view_sub = n): the same transfers evaluated through a restricted k view whose internal
+    // points are the n x n x n sublattice of the mesh (n = the mesh size reproduces the full-mesh result; a smaller n
+    // restricts the internal k sums to the sublattice)
+    std::optional<vertex_view::k_view> dbg_view;
+    if (const long nsub = long(vertex_debug::number("dyn_view_sub", 0.0)); nsub > 0) {
+      const nda::array<double, 2> kc(MF->kpts_crystal());
+      dbg_view.emplace(vertex_view::make_view(*MF, vertex_view::sublattice(kc, {nsub, nsub, nsub}), qs));
+      app_log(1, "  [WARNING] vertex_debug dyn_view_sub = {}: the all-nu dynamic-rung columns are evaluated through a restricted k "
+                 "view ({} internal k points of {}). DIAGNOSTIC switch.", nsub, dbg_view->nk_int, MF->nkpts());
+    }
+    const vertex_view::k_view *vw = dbg_view.has_value() ? std::addressof(dbg_view.value()) : nullptr;
+    const std::vector<long> qs_call = (vw != nullptr) ? std::vector<long>{} : qs;
+    if (not bub_only) {
+      // with pol_vertex_sigma_share the Sigma hook of the dynamic pair vertex rides THIS solve for
+      // the P nodes that belong to the Sigma node set (the same units on the same W-bar cache); build_sigma_pair, later in
+      // this update, solves only the remaining nodes
+      if (_vertex != nullptr and _vertex->sigma_share() and _vertex->sigma_pair_enabled() and _vertex->sigma_pair_dynamic()
+          and long(qs.size()) == nq and not _pol_vtx->wannier() and vw == nullptr) {
+        const long m0 = _ft->nw_b() / 2;
+        std::vector<long> p_full;
+        for (long j : nodes) p_full.push_back(m0 + j);
+        _pol_vtx->arm_shared_sigma_hook(mb_state, thc, sigma_pair_opts_of(*_vertex, mb_state), p_full);
+      }
+      rd.emplace(_pol_vtx->eval_pol_dynbse_cut(mb_state, thc, nodes, qs_call, gen, false, vw));
+      _pol_dyn_ritz = std::max(_pol_dyn_ritz, rd->ritz_max);
+    }
+    // the bubble at ALL nodes: the dynamic call's own column when it covered every node, else a bubble-only pass
+    nda::array<ComplexType, 4> Pb;
+    if (rd.has_value() and not subset) {
+      Pb = std::move(rd->Pi_bub);
+    } else {
+      auto rb = _pol_vtx->eval_pol_dynbse_cut(mb_state, thc, nodes_all, qs_call, gen, true, vw);
+      Pb = std::move(rb.Pi_bub);
+    }
+    if (thc.mpi()->comm.root()) {
+      auto lat = MF->lattv();
+      auto Q = MF->Qpts();
+      nda::array<double, 2> qc(nq, 3);
+      for (long iq = 0; iq < nq; ++iq)
+        for (long i = 0; i < 3; ++i) { double v = 0.0; for (long j = 0; j < 3; ++j) v += lat(i, j) * Q(iq, j); qc(iq, i) = v / (2.0 * M_PI); }
+      nda::array<long, 1> nu_half(nw_h);
+      { auto wb = _ft->wn_mesh_b(); for (long j = 0; j < nw_h; ++j) nu_half(j) = long(wb(nw_b / 2 + j)); }
+      nda::array<long, 1> nu_sampled(long(nodes.size()));
+      for (long j = 0; j < long(nodes.size()); ++j) nu_sampled(j) = nodes[size_t(j)];
+      const long Nm = Pb.shape(2);
+      const std::string fn = mb_state.coqui_prefix + ".pol_wh_dyn.g" + std::to_string(gen) + ".h5";
+      h5::file f(fn, 'w');
+      h5::group g(f);
+      nda::h5_write(g, "q", qc);
+      nda::h5_write(g, "nu_half", nu_half);
+      nda::h5_write(g, "nu_sampled", nu_sampled);
+      h5::h5_write(g, "beta", _ft->beta());
+      h5::h5_write(g, "nw_b", nw_b);
+      if (rd.has_value()) {
+        const char *names[4] = {"Pi_static", "Pi_dyn1", "Pi_gam1", "Pi_dyn"};
+        // the on-demand fit. With a sampled-node dump and pol_vertex_dyn_fit_file, each column is refit at ALL
+        // nodes in the nu-basis learned from the file's matching column (its top-K nu-modes; K = fit_rank or the number of
+        // sampled nodes), by least squares on the sampled rows; the fit is exact at the sampled nodes when K = |nodes|.
+        const std::string fit_file = _pol_vtx->ladder_dyn_fit_file();
+        const bool do_fit = subset and not fit_file.empty();
+        const long Kfit = (_pol_vtx->ladder_dyn_fit_rank() > 0) ? std::min<long>(_pol_vtx->ladder_dyn_fit_rank(), long(nodes.size()))
+                                                               : long(nodes.size());
+        std::optional<h5::file> ff;
+        if (do_fit) {
+          ff.emplace(fit_file, 'r');
+          h5::group gf(ff.value());
+          nda::array<long, 1> nu_f;
+          nda::h5_read(gf, "nu_half", nu_f);
+          utils::check(nu_f.size() == nw_h, "dump_pol_dyn_all_nu: the fit file {} has {} half nodes, this run {}.", fit_file, nu_f.size(), nw_h);
+          for (long j = 0; j < nw_h; ++j)
+            utils::check(nu_f(j) == nu_half(j), "dump_pol_dyn_all_nu: the fit file's half node {} is Matsubara index {}, {} here.", j, nu_f(j), nu_half(j));
+          app_log(1, "  [Sigma vertex] on-demand fit: {} sampled nodes -> all {} nodes in the nu-basis of {} ({} modes per column).",
+                  nodes.size(), nw_h, fit_file, Kfit);
+        }
+        const long NS = long(nodes.size()), ncol = nq * Nm * Nm;
+        // the Gamma_1 -> resummed factor mu(nu_j) (pol_vertex_dyn_resum_mu_file): Pi_dyn = mu Pi_gam1
+        std::vector<double> mu_tab;
+        const std::string mu_file = _pol_vtx->ladder_dyn_resum_mu_file();
+        if (not mu_file.empty()) {
+          std::ifstream fin(mu_file);
+          utils::check(fin.good(), "dump_pol_dyn_all_nu: cannot open pol_vertex_dyn_resum_mu_file {}.", mu_file);
+          std::string line;
+          while (std::getline(fin, line)) {
+            const auto h = line.find('#');
+            if (h != std::string::npos) line = line.substr(0, h);
+            std::istringstream ls(line);
+            std::vector<double> v; double x;
+            while (ls >> x) v.push_back(x);
+            if (v.empty()) continue;
+            mu_tab.push_back(v.back());   // "mu" or "j nu mu": the last number of the line
+          }
+          utils::check(long(mu_tab.size()) == nw_h, "dump_pol_dyn_all_nu: {} has {} mu values, this run has {} half nodes.",
+                       mu_file, mu_tab.size(), nw_h);
+          app_log(1, "  [Sigma vertex, mu] resummation factor from {}: Pi_dyn = mu(nu) Pi_gam1 with mu(0) = {:.4f}, mu(nu_max) = {:.4f}.",
+                  mu_file, mu_tab.front(), mu_tab.back());
+        }
+        nda::array<ComplexType, 4> P_gam1;   // the written Gamma_1 column (kept for the mu-scaled Pi_dyn)
+        for (int c = 0; c < 4; ++c) {
+          nda::array<ComplexType, 4> P(nw_h, nq, Nm, Nm);
+          P() = ComplexType(0.0);
+          for (long j = 0; j < NS; ++j) P(nodes[size_t(j)], all, all, all) = rd->Pi(c, j, all, all, all);
+          bool fitted = false;
+          if (do_fit) {
+            h5::group gf(ff.value());
+            if (gf.has_dataset(names[c])) {
+              nda::array<ComplexType, 4> T;
+              nda::h5_read(gf, names[c], T);
+              utils::check(T.shape(0) == nw_h and T.shape(1) == nq and T.shape(2) == Nm and T.shape(3) == Nm,
+                           "dump_pol_dyn_all_nu: the fit file's {} is {} x {} x {} x {}, expected {} x {} x {} x {}.", names[c],
+                           T.shape(0), T.shape(1), T.shape(2), T.shape(3), nw_h, nq, Nm, Nm);
+              auto T2 = nda::reshape(T, std::array<long, 2>{nw_h, ncol});
+              // the nu-modes of the basis column (its Gram over the nodes) and the reconstruction R (nw_h x NS) of all nodes
+              // from the sampled ones (nu_sampling.hpp): "modes" = least squares on the top-K modes (exact at the
+              // sampled nodes when K = NS), "regression" = G(:,S) G(S,S)^-1_K
+              const std::string fmode = _pol_vtx->ladder_dyn_fit_mode();
+              auto G = nusamp::gram(T2);
+              double lkept = 0.0;
+              const long nto = nusamp::modes_to(G, 1e-4, Kfit, &lkept);
+              (void)nto;
+              auto R = nusamp::reconstruction(G, nodes, Kfit, fmode);
+              nda::matrix<ComplexType> PS(NS, ncol), Pfull(nw_h, ncol);
+              for (long j = 0; j < NS; ++j) { auto row = nda::reshape(rd->Pi(c, j, all, all, all), std::array<long, 1>{ncol}); PS(j, all) = row; }
+              nda::blas::gemm(R, PS, Pfull);
+              // the residual at the sampled rows (exact when Kfit = NS) and the Hermitized full object
+              double rs = 0.0, ns = 0.0;
+              for (long j = 0; j < NS; ++j)
+                for (long i = 0; i < ncol; ++i) {
+                  const ComplexType f = Pfull(nodes[size_t(j)], i);
+                  rs += std::norm(f - PS(j, i)); ns += std::norm(PS(j, i));
+                }
+              for (long j = 0; j < nw_h; ++j)
+                for (long iq = 0; iq < nq; ++iq)
+                  for (long M = 0; M < Nm; ++M)
+                    for (long Nn = 0; Nn < Nm; ++Nn)
+                      P(j, iq, M, Nn) = 0.5 * (Pfull(j, (iq * Nm + M) * Nm + Nn) + std::conj(Pfull(j, (iq * Nm + Nn) * Nm + M)));
+              fitted = true;
+              double pmax = 0.0;
+              for (auto const &v : P) pmax = std::max(pmax, std::abs(v));
+              app_log(1, "  [Sigma vertex]   {}: {} modes carry {:.6f} of the basis column's |.|^2 ({} form); residual at the sampled nodes {:.2e}; "
+                         "max |P| {:.3e}", names[c], Kfit, lkept, fmode, (ns > 0.0) ? std::sqrt(rs / ns) : 0.0, pmax);
+            } else {
+              app_log(1, "  [Sigma vertex]   {}: not in the fit file -- written at the sampled nodes only.", names[c]);
+            }
+          }
+          if (c == 2 and not mu_tab.empty()) P_gam1 = P;
+          if (c == 3 and not mu_tab.empty()) {
+            for (long j = 0; j < nw_h; ++j) P(j, all, all, all) = ComplexType(mu_tab[size_t(j)]) * P_gam1(j, all, all, all);
+            app_log(1, "  [Sigma vertex, mu]   Pi_dyn written as mu(nu) x Pi_gam1 ({} nodes).", nw_h);
+          }
+          nda::h5_write(g, names[c], P);
+          (void)fitted;
+        }
+        if (do_fit) { h5::h5_write(g, "lff_fit_file", fit_file); h5::h5_write(g, "lff_fit_rank", Kfit); }
+        if (not mu_tab.empty()) {
+          nda::array<double, 1> mu_a(nw_h);
+          for (long j = 0; j < nw_h; ++j) mu_a(j) = mu_tab[size_t(j)];
+          nda::h5_write(g, "lff_mu", mu_a);
+        }
+      }
+      nda::h5_write(g, "Pi_bub", Pb);
+      h5::h5_write(g, "nout", Nm);
+      h5::h5_write(g, "frame", std::string("aux"));
+      h5::h5_write(g, "wannier", long(_pol_vtx->wannier() ? 1 : 0));
+      h5::h5_write(g, "nm", Nm);
+      h5::h5_write(g, "window_first", long(_pol_vtx->pol_band_window().first()));
+      h5::h5_write(g, "window_size", long(_pol_vtx->pol_band_window().size()));
+      if (_pol_vtx->secondary_points().size() > 0) nda::h5_write(g, "ipts", _pol_vtx->secondary_points());
+      if (rd.has_value())
+        app_log(1, "  [vertex Wannier] all-nu dynamic-rung columns written to {} ({} half nodes ({} sampled) x {} q x {} x {} + the window "
+                   "bubble Pi_bub; watchdog max |Ritz| {:.3f}, all converged {}).", fn, nw_h, nodes.size(), nq, Nm, Nm,
+                rd->ritz_max, rd->all_converged);
+      else
+        app_log(1, "  [vertex Wannier] bubble_only: the window bubble column Pi_bub written to {} ({} half nodes x {} q x {} x {}; no "
+                   "dynamic columns).", fn, nw_h, nq, Nm, Nm);
+    }
+  }
+
+  /**
+   * The ladder eps_M readout (report-only): per q at inu = 0,
+   *   dP_ladder(q) = t(q)^dag Pi_ladder(q) t(q)          (upfold, adjoint-t/no-leak),
+   *   dW[P](q)     = ([I - Z(q) P(q)]^{-1} - I) Z(q)     (single-frequency THC Dyson),
+   *   eps^-1(q)-1  = (q^2 V / 4 pi) chi_bar(q) . dW(q) . chi_bar(q)*   (div_utils
+   *                  eval_eps_inv_q convention),
+   * evaluated for P = Pi0_RPA and P = Pi0_RPA + dP_ladder; eps_M(q) = 1/(1 + Re[.])
+   * reported at the smallest nonzero |q| (the comparison shows the DIRECTION of the
+   * ladder correction). Replicated Np x Np algebra: readout-scale only.
+   */
+  void scr_coulomb_t::pol_ladder_eps_readout(MBState &mb_state, THC_ERI auto &thc,
+                                             nda::array<ComplexType, 3> const &Pi0_qPQ,
+                                             nda::array<ComplexType, 2> const *eps_inv_head_q) {
+    decltype(nda::range::all) all;
+    auto MF = thc.MF();
+    const long nq = Pi0_qPQ.shape(0), Np = Pi0_qPQ.shape(1);
+    if (MF->nqpts_ibz() == 1) {
+      app_log(1, "  [vertex ladder] ladder readout skipped: nqpts_ibz == 1 (no finite "
+                 "q for the eps_M head).");
+      return;
+    }
+
+    // the WANNIER-vertex DUMP path. In Wannier mode the vertex polarization is the MLWF-pair
+    // Pi_loc (mesh-independent, for coarse->fine interpolation), which the aux eps readout below cannot
+    // consume (and eval_pol_ladder_nu0 is window-only). So run ONLY the dynamic vertex, which dumps
+    // Pi_loc(q) when pol_vertex_dyn_dump is set, and return -- bypassing the aux static ladder + eps.
+    if (_pol_vtx->wannier() and _pol_vtx->ladder_dynamic_rung()) {
+      ++_pol_dyn_calls;
+      auto dres = _pol_vtx->eval_pol_dynbse_nu0(mb_state, thc, _pol_dyn_calls);
+      _pol_dyn_ritz = dres.ritz_max;
+      if (_pol_vtx->ladder_dyn_all_nu()) dump_pol_dyn_all_nu(mb_state, thc, _pol_dyn_calls);
+      app_log(1, "  [dynamic vertex] Wannier-vertex DUMP: Pi_loc(q) produced in the MLWF-pair frame "
+                 "({} q x {} x {}) -- dumped for coarse->fine interpolation; the aux eps readout is bypassed.",
+              dres.Pi_gam1.shape(0), dres.Pi_gam1.shape(1), dres.Pi_gam1.shape(2));
+      return;
+    }
+
+    // the ladder at inu = 0 in the readout vertex's secondary basis + upfold.
+    // When the injection already ran in THIS update_w it produced exactly this row as
+    // half node 0 of its whalf pass, so consume that instead of re-solving the pair-space
+    // ladder from scratch (the injection's row is the SAME iteration's G and W0bar -- the
+    // readout's invariant). Consume-once: reset so no later call can read a stale row.
+    // With the injection disabled (or any standalone caller) the row is absent and the
+    // self-contained evaluation runs.
+    nda::array<ComplexType, 3> Pl_qmm;
+    // the "+DeltaLambda" column = RPA + the zero-rung Lambda term alone
+    const bool ward_legs = _pol_vtx->ladder_ward_legs();
+    nda::array<ComplexType, 3> Pd_qmm;
+    if (_pol_nu0_row.has_value()) {
+      Pl_qmm = std::move(_pol_nu0_row.value());
+      _pol_nu0_row.reset();
+      if (ward_legs) {
+        utils::check(_pol_nu0_dlam.has_value(),
+                     "pol_ladder_eps_readout: legs = \"ward\" but the injection cached no "
+                     "Delta P^Lambda row.");
+        Pd_qmm = std::move(_pol_nu0_dlam.value());
+        _pol_nu0_dlam.reset();
+      }
+      utils::check(Pl_qmm.shape(0) == nq,
+                   "pol_ladder_eps_readout: cached inu = 0 ladder row has {} q rows, "
+                   "expected {}.", Pl_qmm.shape(0), nq);
+      app_log(2, "  [vertex ladder] eps_M readout: reusing the injection's inu = 0 ladder "
+                 "row (no second pair-space ladder pass).");
+    } else if (not _pol_vtx->pol_interp_file().empty()) {
+      // the fine-mesh CONSUMER. Pi(q)_{MN} on THIS mesh's q list
+      // in the frozen-point secondary frame comes from the file (a coarse run's <prefix>.pol_nu0.g<n>.h5
+      // or an offline interpolant written in the same layout) instead of the ladder solve;
+      // the upfold + eps readout below run unchanged. Requires pol_vertex_isdf_points_file = the coarse points.
+      utils::check(not ward_legs, "pol_ladder_eps_readout: pol_vertex_interp_file with legs = \"ward\" is not supported.");
+      utils::check(not _pol_vtx->isdf_points_file().empty(),
+                   "pol_ladder_eps_readout: pol_vertex_interp_file needs pol_vertex_isdf_points_file (the secondary "
+                   "frame of the file is the coarse run's point set).");
+      const std::string col = "Pi_" + _pol_vtx->pol_interp_col();
+      nda::array<double, 2> qf;
+      nda::array<ComplexType, 3> Pf;
+      {
+        h5::file f(_pol_vtx->pol_interp_file(), 'r');
+        h5::group g(f);
+        nda::h5_read(g, "q", qf);
+        if (g.has_dataset("nu_half")) {   // an all-nu file: its half node 0 IS the inu = 0 node
+          nda::array<ComplexType, 4> P4; nda::h5_read(g, col, P4);
+          Pf = nda::array<ComplexType, 3>(P4.shape(1), P4.shape(2), P4.shape(3)); Pf = P4(0, all, all, all);
+        } else {
+          nda::h5_read(g, col, Pf);
+        }
+      }
+      const long Nm_v = _pol_vtx->secondary_rank();
+      utils::check(Pf.shape(1) == Nm_v and Pf.shape(2) == Nm_v and Pf.shape(0) == qf.shape(0),
+                   "pol_ladder_eps_readout: {} in {} is {} x {} x {}, expected nq x {} x {} (the frozen-point rank).",
+                   col, _pol_vtx->pol_interp_file(), Pf.shape(0), Pf.shape(1), Pf.shape(2), Nm_v, Nm_v);
+      auto lat = MF->lattv();
+      auto Q = MF->Qpts();
+      Pl_qmm = nda::array<ComplexType, 3>(nq, Nm_v, Nm_v);
+      for (long iq = 0; iq < nq; ++iq) {
+        double qc[3];
+        for (long i = 0; i < 3; ++i) { double v = 0.0; for (long j = 0; j < 3; ++j) v += lat(i, j) * Q(iq, j); qc[i] = v / (2.0 * M_PI); }
+        long hit = -1;
+        for (long jq = 0; jq < qf.shape(0) and hit < 0; ++jq) {
+          bool same = true;
+          for (long i = 0; i < 3 and same; ++i) { const double d = qf(jq, i) - qc[i]; same = std::abs(d - std::round(d)) < 1e-5; }
+          if (same) hit = jq;
+        }
+        utils::check(hit >= 0, "pol_ladder_eps_readout: q = ({:.6f}, {:.6f}, {:.6f}) (crystal) of this mesh is absent "
+                               "from {} (interpolate onto the full fine mesh).", qc[0], qc[1], qc[2], _pol_vtx->pol_interp_file());
+        Pl_qmm(iq, all, all) = Pf(hit, all, all);
+      }
+      app_log(1, "  [vertex Wannier] eps readout consumes {} from {} ({} q matched on this mesh's q list; frozen points, "
+                 "N_m = {}).", col, _pol_vtx->pol_interp_file(), nq, Nm_v);
+    } else {
+      Pl_qmm = _pol_vtx->eval_pol_ladder_nu0(mb_state, thc,
+                                             ward_legs ? std::addressof(Pd_qmm) : nullptr);
+    }
+    auto const &tmap = _pol_vtx->secondary_transfer();            // (nq, Nm, Np)
+    const long Nm = Pl_qmm.shape(1);
+    utils::check(tmap.shape(0) == nq and tmap.shape(1) == Nm and tmap.shape(2) == Np,
+                 "pol_ladder_eps_readout: transfer map shape mismatch.");
+    // the dynamic-rung columns at inu = 0
+    const bool dyn_rung = _pol_vtx->ladder_dynamic_rung();
+    std::optional<vertex_t::dynbse_nu0_result> dres;
+    if (dyn_rung) {
+      ++_pol_dyn_calls;
+      dres.emplace(_pol_vtx->eval_pol_dynbse_nu0(mb_state, thc, _pol_dyn_calls));
+      if (_pol_vtx->ladder_dyn_all_nu()) dump_pol_dyn_all_nu(mb_state, thc, _pol_dyn_calls);
+      // in Wannier mode eval_pol_dynbse_nu0 dumped Pi_loc(q) in the MLWF-pair basis (nab != Nm);
+      // consumed OFFLINE for coarse->fine interpolation, not by this aux eps readout -- skip the aux shape
+      // check + the dynamic-column upfold below. The static ladder eps columns are unaffected.
+      if (not _pol_vtx->wannier())
+        utils::check(dres->Pi_dyn.shape(0) == nq and dres->Pi_dyn.shape(1) == Nm,
+                     "pol_ladder_eps_readout: dynamic-rung block shape mismatch.");
+      else
+        app_log(1, "  [dynamic vertex] Wannier mode: dynamic-rung eps columns SKIPPED (Pi_loc dumped for interpolation).");
+      _pol_dyn_ritz = dres->ritz_max;
+    }
+
+    // replicated Z(q, P, Q) (same gather pattern as gather_nu0_row)
+    nda::array<ComplexType, 3> Z_qPQ(nq, Np, Np);
+    {
+      const long np_ranks = thc.mpi()->comm.size();
+      std::array<long, 3> zp = {1, 1, 1};
+      zp[1] = utils::find_proc_grid_min_diff(np_ranks, Np, Np);
+      zp[2] = np_ranks / zp[1];
+      std::array<long, 3> zb = {1, 1, 1};
+      zb[1] = std::min({static_cast<long>(1024), std::max(1l, Np / zp[1]),
+                        std::max(1l, Np / zp[2])});
+      zb[2] = zb[1];
+      auto dZ = thc.dZ(zp, zb);
+      auto q_rng = dZ.local_range(0);
+      auto P_rng = dZ.local_range(1);
+      auto Q_rng = dZ.local_range(2);
+      auto Z_loc = dZ.local();
+      Z_qPQ() = ComplexType(0.0);
+      for (long iq = 0; iq < long(q_rng.size()); ++iq)
+        for (long iP = 0; iP < long(P_rng.size()); ++iP)
+          for (long iQ = 0; iQ < long(Q_rng.size()); ++iQ)
+            Z_qPQ(q_rng.first() + iq, P_rng.first() + iP, Q_rng.first() + iQ) =
+                Z_loc(iq, iP, iQ);
+      thc.mpi()->comm.all_reduce_in_place_n(Z_qPQ.data(), Z_qPQ.size(), std::plus<>{});
+    }
+
+    // per q: upfold, two single-frequency Dysons, the chi_bar head contraction
+    auto Chi_bar = thc.basis_bar_head();                          // (nq, Np)
+    const double fpi = 4.0 * 3.14159265358979323846;
+    nda::array<ComplexType, 2> dP(Np, Np), tmpM(Nm, Np), A(Np, Np);
+    nda::array<ComplexType, 2> dPd(ward_legs ? Np : 0, ward_legs ? Np : 0);
+    const long Nd = dyn_rung ? Np : 0;
+    nda::array<ComplexType, 2> dPs(Nd, Nd), dP1(Nd, Nd), dPg(Nd, Nd), dPy(Nd, Nd);
+    double eps_ds_qmin = -1.0, eps_dp_qmin = -1.0, eps_dg_qmin = -1.0, eps_dy_qmin = -1.0;
+    nda::matrix<ComplexType> Am(Np, Np);
+    nda::array<ComplexType, 1> chi_c(Np), buf(Np);
+    // eps(q_i, i nu) cut state: the per-transfer captures of its eps lambda
+    long iq_cut = -1;
+    double factor_cut = 0.0;
+    nda::array<ComplexType, 2> Z_qPQ_cut;
+    double eps_rpa_qmin = -1.0, eps_lad_qmin = -1.0, eps_dlm_qmin = -1.0, qmin_abs2 = 1e300;
+    long iq_min = -1;
+    // ---- (q, nu) meter: the per-q Dyson-W change driven by P^lad -----------------------
+    // PURE OBSERVER, showing whether the ladder acts at small q: for every
+    // IBZ transfer (INCLUDING Gamma, which the eps_M head loop must skip) compare the
+    // single-frequency i.nu = 0 dW built from P^RPA against the one built from
+    // P^RPA + P^lad. ||dW_lad(q)||_F / ||dW_RPA(q)||_F is the relative screening change
+    // that q's cell contributes; Delta eps_M(q) is the same statement in the head channel.
+    const bool qnu_meter = (_vertex != nullptr and _vertex->ladder_qnu_meter());
+    std::vector<double> dw_rel(size_t(nq), 0.0), dw_abs(size_t(nq), 0.0);
+    std::vector<double> deps(size_t(nq), 0.0), eps_r(size_t(nq), -1.0);
+    // hoisted out of the q loop: at production Np these are large (Np^2 per rank), and the
+    // readout is already replicated-Np^2-heavy (Z_qPQ)
+    nda::array<ComplexType, 2> W_rpa(qnu_meter ? Np : 0, qnu_meter ? Np : 0);
+    nda::array<ComplexType, 2> W_lad(qnu_meter ? Np : 0, qnu_meter ? Np : 0);
+    // The single-frequency Dysons of this readout on the device: up to seven (Np^3 gemm + inverse + gemm) per q,
+    // replicated on every rank. The head contraction reads only (A^-1 - I) Z c, so the device solves A x = Z c
+    // (getrf + one-column getrs; A = I - Z (P0 + add)) instead of forming A^-1: the same quantity in another rounding.
+    // vertex_debug eps_readout_device = 0 keeps the host path; the q-nu meter (which needs the full dW) keeps it too.
+#if defined(ENABLE_DEVICE)
+    const bool eps_dev = not qnu_meter and methods::vertex_debug::number("eps_readout_device", 1.0) != 0.0;   // vertex_debug: eps_readout_device
+    using eps_dmat_t = memory::array<DEVICE_MEMORY, ComplexType, 2>;
+    std::optional<eps_dmat_t> eZd, eAd, eMd, eId;
+    std::optional<memory::array<DEVICE_MEMORY, int, 1>> eipd;
+    nda::array<ComplexType, 1> eyZc(eps_dev ? Np : 0);
+    if (eps_dev) {
+      nda::array<ComplexType, 2> Ih(Np, Np);
+      Ih() = ComplexType(0.0);
+      for (long P = 0; P < Np; ++P) Ih(P, P) = ComplexType(1.0);
+      eId.emplace(memory::to_memory_space<DEVICE_MEMORY>(Ih));
+      eMd.emplace(Np, Np);
+      eipd.emplace(Np);
+    }
+#endif
+    for (long iq = 0; iq < nq; ++iq) {
+      auto qpts = MF->Qpts_ibz(iq);
+      const double q_abs2 = qpts(0) * qpts(0) + qpts(1) * qpts(1) + qpts(2) * qpts(2);
+      const bool is_gamma = (q_abs2 < 1e-12);
+      if (is_gamma and not qnu_meter) continue;                   // Gamma: no head here
+      // upfold: dP = t^dag Pl t
+      auto tq = tmap(iq, all, all);
+      nda::blas::gemm(Pl_qmm(iq, all, all), tq, tmpM);            // Pl . t   (Nm x Np)
+      nda::array<ComplexType, 2> td(Np, Nm);
+      for (long m = 0; m < Nm; ++m)
+        for (long P = 0; P < Np; ++P) td(P, m) = std::conj(tq(m, P));
+      nda::blas::gemm(td, tmpM, dP);                              // t^dag Pl t
+      if (ward_legs) {                                            // t^dag Pd t
+        nda::blas::gemm(Pd_qmm(iq, all, all), tq, tmpM);
+        nda::blas::gemm(td, tmpM, dPd);
+      }
+      if (dyn_rung and not _pol_vtx->wannier()) {                // the four dynamic-rung blocks (aux; skipped in Wannier mode)
+        auto up = [&](nda::array<ComplexType, 3> const &B, nda::array<ComplexType, 2> &out) {
+          nda::blas::gemm(B(iq, all, all), tq, tmpM);
+          nda::blas::gemm(td, tmpM, out);
+        };
+        up(dres->Pi_static, dPs);
+        up(dres->Pi_dyn1, dP1);
+        up(dres->Pi_gam1, dPg);
+        up(dres->Pi_dyn, dPy);
+        dP1 += dPs;                                               // static + one dynamic rung
+      }
+      const double factor = (q_abs2 / fpi) * MF->volume();
+      chi_c = nda::conj(Chi_bar(iq, all));
+#if defined(ENABLE_DEVICE)
+      if (eps_dev and iq == (nq > 1 ? 1 : 0))
+        app_log(2, "  [vertex ladder] eps readout: the single-frequency Dysons run on the device (solve A x = Z c).");
+      if (eps_dev) {                                             // this q's Z on the device, y = Z c on the host
+        nda::array<ComplexType, 2> Zq(Z_qPQ(iq, all, all));
+        eZd.emplace(memory::to_memory_space<DEVICE_MEMORY>(Zq));
+        nda::blas::gemv(Zq, chi_c, eyZc);
+      }
+#endif
+      auto eps_of = [&](nda::array<ComplexType, 2> const *add, nda::array<ComplexType, 2> *dW_out) {
+#if defined(ENABLE_DEVICE)
+        if (eps_dev and dW_out == nullptr) {
+          nda::array<ComplexType, 2> Ah(Pi0_qPQ(iq, all, all));
+          if (add != nullptr) Ah += *add;
+          eAd.emplace(memory::to_memory_space<DEVICE_MEMORY>(Ah));
+          (*eMd)() = *eId;
+          nda::blas::gemm(ComplexType(-1.0), *eZd, *eAd, ComplexType(1.0), *eMd);   // M = I - Z (P0 + add)
+          int info = nda::lapack::getrf(*eMd, *eipd);
+          utils::check(info == 0, "pol_ladder_eps_readout: device getrf of I - Z P failed (info {}).", info);
+          nda::matrix<ComplexType, nda::F_layout> yh(Np, 1);
+          for (long P = 0; P < Np; ++P) yh(P, 0) = eyZc(P);
+          auto xd = memory::to_memory_space<DEVICE_MEMORY>(yh);
+          info = nda::lapack::getrs(*eMd, xd, *eipd);
+          utils::check(info == 0, "pol_ladder_eps_readout: device getrs failed (info {}).", info);
+          auto xh = memory::to_memory_space<HOST_MEMORY>(xd);
+          for (long P = 0; P < Np; ++P) buf(P) = xh(P, 0) - eyZc(P);   // (A^-1 - I) Z c
+          const ComplexType eih = factor * nda::blas::dot(Chi_bar(iq, all), buf);
+          return 1.0 / (1.0 + eih.real());
+        }
+#endif
+        // A = I - Z (P0 [+ add]);  dW = (A^{-1} - I) Z;  head contraction
+        A() = Pi0_qPQ(iq, all, all);
+        if (add != nullptr) A += *add;
+        nda::array<ComplexType, 2> ZP(Np, Np);
+        nda::blas::gemm(Z_qPQ(iq, all, all), A, ZP);
+        Am() = ZP;
+        Am() *= ComplexType(-1.0);
+        for (long P = 0; P < Np; ++P) Am(P, P) += ComplexType(1.0);
+        nda::inverse_in_place(Am);
+        for (long P = 0; P < Np; ++P) Am(P, P) -= ComplexType(1.0);
+        nda::blas::gemm(Am, Z_qPQ(iq, all, all), ZP);
+        if (dW_out != nullptr) (*dW_out)() = ZP;
+        nda::blas::gemv(ZP, chi_c, buf);
+        const ComplexType eih = factor * nda::blas::dot(Chi_bar(iq, all), buf);
+        return 1.0 / (1.0 + eih.real());
+      };
+      const double e_rpa = eps_of(nullptr, qnu_meter ? std::addressof(W_rpa) : nullptr);
+      // The +ladder leg is evaluated by the SAME call in both modes -- the meter only asks
+      // it to also hand back dW, so eps_lad does not depend on whether the meter is on.
+      const double e_lad = eps_of(std::addressof(dP), qnu_meter ? std::addressof(W_lad) : nullptr);
+      // chi0_Lambda alone (the zero-rung Lambda term on top of RPA)
+      const double e_dlm = ward_legs ? eps_of(std::addressof(dPd), nullptr) : -1.0;
+      // the dynamic-rung columns (all rungs >= 1 on top of RPA)
+      const double e_ds = dyn_rung ? eps_of(std::addressof(dPs), nullptr) : -1.0;
+      const double e_dp = dyn_rung ? eps_of(std::addressof(dP1), nullptr) : -1.0;
+      const double e_dg = dyn_rung ? eps_of(std::addressof(dPg), nullptr) : -1.0;
+      const double e_dy = dyn_rung ? eps_of(std::addressof(dPy), nullptr) : -1.0;
+      if (qnu_meter) {
+        double dn = 0.0, rn = 0.0;
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            dn += std::norm(W_lad(P, Q) - W_rpa(P, Q));
+            rn += std::norm(W_rpa(P, Q));
+          }
+        dw_abs[size_t(iq)] = std::sqrt(dn);
+        dw_rel[size_t(iq)] = std::sqrt(dn) / std::max(std::sqrt(rn), 1e-300);
+        deps[size_t(iq)] = is_gamma ? 0.0 : (e_lad - e_rpa);
+        eps_r[size_t(iq)] = is_gamma ? -1.0 : e_rpa;
+        if (is_gamma) continue;                                   // no head at Gamma
+      }
+      if (ward_legs)
+        app_log(2, "  [vertex ladder]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
+                   "+DeltaLambda = {:.6f}, +ladder(Lambda legs) = {:.6f}", iq, q_abs2, e_rpa,
+                e_dlm, e_lad);
+      else if (dyn_rung)
+        app_log(2, "  [vertex ladder]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, +ladder(static) = {:.6f}, "
+                   "+static(dynbse driver) = {:.6f}, +static+Pi^C_dyn = {:.6f}, +Gamma1 = {:.6f}, +resummed = {:.6f}",
+                iq, q_abs2, e_rpa, e_lad, e_ds, e_dp, e_dg, e_dy);
+      else
+        app_log(2, "  [vertex ladder]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
+                   "+ladder = {:.6f}", iq, q_abs2, e_rpa, e_lad);
+      if (q_abs2 < qmin_abs2) {
+        qmin_abs2 = q_abs2;
+        eps_rpa_qmin = e_rpa;
+        eps_lad_qmin = e_lad;
+        eps_dlm_qmin = e_dlm;
+        eps_ds_qmin = e_ds; eps_dp_qmin = e_dp; eps_dg_qmin = e_dg; eps_dy_qmin = e_dy;
+        iq_min = iq;
+      }
+    }
+    if (qnu_meter) {
+      app_log(1, "\n  [ladder q-nu meter] per-q DYSON-W CHANGE driven by P^lad (i.nu = 0). "
+                 "dW = (eps^-1 - I) Z; the\n"
+                 "  [ladder q-nu meter] Gamma row carries no eps_M head by construction (marked -).");
+      app_log(1, "  [ladder q-nu meter]   {:>4} {:>12} {:>14} {:>12} {:>12} {:>12}",
+              "iq", "|q|^2", "||dW_lad||_F", "rel to dW", "eps_M(RPA)", "D eps_M");
+      for (long iq = 0; iq < nq; ++iq) {
+        auto qp2 = MF->Qpts_ibz(iq);
+        const double q2 = qp2(0) * qp2(0) + qp2(1) * qp2(1) + qp2(2) * qp2(2);
+        if (eps_r[size_t(iq)] < 0.0)
+          app_log(1, "  [ladder q-nu meter]   {:>4} {:>12.5e} {:>14.6e} {:>12.5e} {:>12} {:>12}",
+                  iq, q2, dw_abs[size_t(iq)], dw_rel[size_t(iq)], "-", "-");
+        else
+          app_log(1, "  [ladder q-nu meter]   {:>4} {:>12.5e} {:>14.6e} {:>12.5e} {:>12.6f} "
+                     "{:>+12.6f}", iq, q2, dw_abs[size_t(iq)], dw_rel[size_t(iq)],
+                  eps_r[size_t(iq)], deps[size_t(iq)]);
+      }
+      app_log(1, "");
+    }
+    if (iq_min >= 0) {
+      app_log(1, "  [vertex ladder] ladder eps_M readout (inu = 0, q_min = {}): "
+                 "RPA = {:.6f}, +ladder = {:.6f} (Delta = {:+.6f}; the sign of Delta is "
+                 "the direction of the ladder correction)", iq_min, eps_rpa_qmin, eps_lad_qmin,
+              eps_lad_qmin - eps_rpa_qmin);
+      _pol_eps_rpa = eps_rpa_qmin;
+      _pol_eps_ladder = eps_lad_qmin;
+      _pol_eps_dlam = eps_dlm_qmin;
+      if (ward_legs)
+        app_log(1, "  [Ward legs] eps_M readout with the Ward (Lambda) legs (inu = 0, q_min = {}): RPA = "
+                   "{:.6f}, +DeltaLambda (chi0_Lambda alone) = {:.6f}, +ladder on Lambda legs "
+                   "= {:.6f}",
+                iq_min, eps_rpa_qmin, eps_dlm_qmin, eps_lad_qmin);
+      if (dyn_rung) {
+        _pol_eps_dyn_static = eps_ds_qmin; _pol_eps_dyn_pc = eps_dp_qmin;
+        _pol_eps_dyn_gam1 = eps_dg_qmin; _pol_eps_dyn = eps_dy_qmin;
+        app_log(1, "  [dynamic vertex] dynamic-rung eps_M readout (inu = 0, q_min = {}): RPA = {:.6f}, "
+                   "+ladder(static, resolvent 1 + Xh Kt) = {:.6f}, +static ladder (dynbse driver; must equal the previous column) = {:.6f}, "
+                   "+static+Pi^C_dyn (one dynamic rung) = {:.6f}, +Gamma_1 (static-dressed one dynamic rung) "
+                   "= {:.6f}, +RESUMMED dynamic-rung ladder = {:.6f}; watchdog max "
+                   "|Ritz(K_d L_s)| = {:.3f}, converged {}",
+                iq_min, eps_rpa_qmin, eps_lad_qmin, eps_ds_qmin, eps_dp_qmin, eps_dg_qmin, eps_dy_qmin,
+                dres->ritz_max, dres->all_converged);
+      }
+    }
+    // ---- eps(q_i, i nu) cuts (pol_eps_cut > 0; report-only) ------------------------------
+    // Every column the readout evaluates, on EVERY PH-sym bosonic half node, at the selected
+    // transfers: RPA (the gathered rows), +ladder (eval_pol_ladder_whalf: the same pair-space
+    // ladder at all nodes), +DeltaLambda (legs = ward), and the loop's OWN eps^-1 head
+    // (eps_inv_head_q -> i nu), which is the in-loop eps_M (RPA scGW, or RPA + ladder with
+    // the injection on). Node j <-> iw = nw_b/2 + j, nu_j = wn_b(iw) pi / beta (>= 0).
+    if (_vertex != nullptr and _vertex->eps_cut_nq() > 0 and not _pol_cut_q.empty()) {
+      ++_pol_cut_calls;
+      const long nsel = long(_pol_cut_q.size());
+      nda::array<ComplexType, 4> Pd_all;
+      auto Pl_all = _pol_vtx->eval_pol_ladder_whalf(mb_state, thc, nullptr,
+                                                    ward_legs ? std::addressof(Pd_all) : nullptr);
+      const long nw_half = Pl_all.shape(0);
+      utils::check(Pl_all.shape(1) == nq and Pl_all.shape(2) == Nm, "eps-cut: whalf ladder shape mismatch.");
+      const bool have_loop = (eps_inv_head_q != nullptr);
+      nda::array<ComplexType, 2> eloop_w(nw_half, std::max(nsel, 1l));
+      if (have_loop) {
+        const long nt_h = eps_inv_head_q->shape(0);
+        nda::array<ComplexType, 2> et(nt_h, nsel);
+        for (long s = 0; s < nsel; ++s)
+          for (long it = 0; it < nt_h; ++it) et(it, s) = (*eps_inv_head_q)(it, _pol_cut_q[size_t(s)]);
+        _ft->tau_to_w_PHsym(et, eloop_w);
+      }
+      const double beta = _ft->beta();
+      auto wn_b = _ft->wn_mesh_b();
+      const long nw_b = _ft->nw_b();
+      // the dynamic-rung columns on every half node at the selected transfers (collective)
+      std::optional<vertex_t::dynbse_cut_result> dcut;
+      long n_dyn_nodes = 0;
+      if (dyn_rung) {
+        const long nn = (_vertex->eps_cut_dyn_nnu() > 0) ? std::min(_vertex->eps_cut_dyn_nnu(), nw_half) : nw_half;
+        std::vector<long> hn(static_cast<size_t>(nn), 0l);
+        for (long j = 0; j < nn; ++j) hn[size_t(j)] = j;
+        dcut.emplace(_pol_vtx->eval_pol_dynbse_cut(mb_state, thc, hn, _pol_cut_q, _pol_cut_calls));
+        n_dyn_nodes = nn;
+      }
+      if (thc.mpi()->comm.rank() == 0) {
+        utils::check(_pol_pi_cut.has_value(), "eps-cut: rank 0 holds no gathered RPA rows.");
+        auto const &Pc = _pol_pi_cut.value();
+        utils::check(Pc.shape(0) == nsel and Pc.shape(1) == nw_half and Pc.shape(2) == Np,
+                     "eps-cut: gathered rows shape mismatch.");
+        _pol_eps_cut_qmin = nda::array<double, 2>(nw_half, 8);
+        _pol_eps_cut_qmin() = -1.0;
+        nda::array<ComplexType, 2> dPc[4];
+        for (auto &A : dPc) A = nda::array<ComplexType, 2>(dyn_rung ? Np : 0, dyn_rung ? Np : 0);
+        nda::array<ComplexType, 2> Arow(Np, Np), ZPc(Np, Np);
+        auto eps_row = [&](nda::array<ComplexType, 2> const &Pi0, nda::array<ComplexType, 2> const *add) {
+          Arow() = Pi0;
+          if (add != nullptr) Arow += *add;
+          nda::blas::gemm(Z_qPQ_cut, Arow, ZPc);
+          Am() = ZPc;
+          Am() *= ComplexType(-1.0);
+          for (long P = 0; P < Np; ++P) Am(P, P) += ComplexType(1.0);
+          nda::inverse_in_place(Am);
+          for (long P = 0; P < Np; ++P) Am(P, P) -= ComplexType(1.0);
+          nda::blas::gemm(Am, Z_qPQ_cut, ZPc);
+          nda::blas::gemv(ZPc, chi_c, buf);
+          const ComplexType eih = factor_cut * nda::blas::dot(Chi_bar(iq_cut, all), buf);
+          return 1.0 / (1.0 + eih.real());
+        };
+        app_log(1, "\n  [eps-cut] call {}: eps_M(q_i, i nu_j) on the PH-sym bosonic half grid; columns: RPA, "
+                   "+ladder (static, resolvent 1 + Xh Kt){}, loop-side (the loop's own eps^-1 head{}){}",
+                _pol_cut_calls, ward_legs ? ", +DeltaLambda (chi0_Lambda alone)" : "",
+                have_loop ? "" : ": absent",
+                dyn_rung ? ", then the dynamic-rung columns: +static (dynbse driver), +static+Pi^C_dyn, +Gamma_1, +resummed" : "");
+        app_log(1, "  [eps-cut]   {:>4} {:>4} {:>10} {:>3} {:>6} {:>12} {:>12} {:>12}{} {:>12}{}", "call", "iq", "|q|",
+                "j", "wn", "nu(Ha)", "eps_rpa", "eps_lad", ward_legs ? "      eps_dlm" : "", "eps_loop",
+                dyn_rung ? "      eps_dst      eps_dp1      eps_dg1      eps_dyn" : "");
+        for (long s = 0; s < nsel; ++s) {
+          iq_cut = _pol_cut_q[size_t(s)];
+          auto qpc = MF->Qpts_ibz(iq_cut);
+          const double q2c = qpc(0) * qpc(0) + qpc(1) * qpc(1) + qpc(2) * qpc(2);
+          factor_cut = (q2c / fpi) * MF->volume();
+          chi_c = nda::conj(Chi_bar(iq_cut, all));
+          Z_qPQ_cut = Z_qPQ(iq_cut, all, all);
+          auto tqc = tmap(iq_cut, all, all);
+          nda::array<ComplexType, 2> tdc(Np, Nm);
+          for (long m = 0; m < Nm; ++m)
+            for (long P = 0; P < Np; ++P) tdc(P, m) = std::conj(tqc(m, P));
+          for (long j = 0; j < nw_half; ++j) {
+            nda::blas::gemm(Pl_all(j, iq_cut, all, all), tqc, tmpM);
+            nda::blas::gemm(tdc, tmpM, dP);
+            if (ward_legs) {
+              nda::blas::gemm(Pd_all(j, iq_cut, all, all), tqc, tmpM);
+              nda::blas::gemm(tdc, tmpM, dPd);
+            }
+            auto Pi0 = nda::array<ComplexType, 2>(Pc(s, j, all, all));
+            const double e_rpa = eps_row(Pi0, nullptr);
+            const double e_lad = eps_row(Pi0, std::addressof(dP));
+            const double e_dlm = ward_legs ? eps_row(Pi0, std::addressof(dPd)) : -1.0;
+            const double e_loop = have_loop ? 1.0 / (1.0 + eloop_w(j, s).real()) : -1.0;
+            double e_d[4] = {-1.0, -1.0, -1.0, -1.0};
+            if (dyn_rung and j < n_dyn_nodes) {
+              for (int c = 0; c < 4; ++c) {
+                nda::blas::gemm(dcut->Pi(c, j, iq_cut, all, all), tqc, tmpM);
+                nda::blas::gemm(tdc, tmpM, dPc[c]);
+                e_d[c] = eps_row(Pi0, std::addressof(dPc[c]));
+              }
+            }
+            if (s == 0) {
+              _pol_eps_cut_qmin(j, 0) = e_rpa; _pol_eps_cut_qmin(j, 1) = e_lad;
+              _pol_eps_cut_qmin(j, 2) = e_dlm; _pol_eps_cut_qmin(j, 3) = e_loop;
+              for (int c = 0; c < 4; ++c) _pol_eps_cut_qmin(j, 4 + c) = e_d[c];
+            }
+            const long wn = wn_b(nw_b / 2 + j);
+            std::string dyn_cols;
+            if (dyn_rung)
+            {
+              char buf[96];
+              std::snprintf(buf, sizeof(buf), " %12.6f %12.6f %12.6f %12.6f", e_d[0], e_d[1], e_d[2], e_d[3]);
+              dyn_cols = buf;
+            }
+            if (ward_legs)
+              app_log(1, "  [eps-cut]   {:>4} {:>4} {:>10.6f} {:>3} {:>6} {:>12.6e} {:>12.6f} {:>12.6f} {:>12.6f} {:>12.6f}{}",
+                      _pol_cut_calls, iq_cut, std::sqrt(q2c), j, wn, double(wn) * M_PI / beta, e_rpa, e_lad, e_dlm, e_loop,
+                      dyn_cols);
+            else
+              app_log(1, "  [eps-cut]   {:>4} {:>4} {:>10.6f} {:>3} {:>6} {:>12.6e} {:>12.6f} {:>12.6f} {:>12.6f}{}",
+                      _pol_cut_calls, iq_cut, std::sqrt(q2c), j, wn, double(wn) * M_PI / beta, e_rpa, e_lad, e_loop,
+                      dyn_cols);
+          }
+        }
+        app_log(1, "");
+      }
+      _pol_pi_cut.reset();
+    }
+
+    // Consistency check: the SAME q_min read off the loop's own screening. Same G, same kernel, two
+    // evaluation routes -- the tau-space Dyson of the (injected) Pi against the readout's
+    // single-frequency inu = 0 Dyson above. With the injection ON the two must agree to
+    // the transform class (r_rt); with it OFF this is the RPA leg of the same identity.
+    if (eps_inv_head_q != nullptr and iq_min >= 0) {
+      const long nt_h = eps_inv_head_q->shape(0);
+      utils::check(eps_inv_head_q->shape(1) == nq,
+                   "pol_ladder_eps_readout: eps_inv_head_q has {} q rows, expected {}.",
+                   eps_inv_head_q->shape(1), nq);
+      long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+      nda::array<ComplexType, 2> et(nt_h, 1), ew(nw_half, 1);
+      for (long it = 0; it < nt_h; ++it) et(it, 0) = (*eps_inv_head_q)(it, iq_min);
+      _ft->tau_to_w_PHsym(et, ew);            // inu = 0 = index 0 of the PH-sym half grid
+      _pol_eps_loop = 1.0 / (1.0 + ew(0, 0).real());
+      app_log(1, "  [ladder injection] loop-side eps_M(q_min = {}, inu = 0) from the tau Dyson = "
+                 "{:.9f}; readout route (+ladder) = {:.9f} (deviation = {:.3e})",
+              iq_min, _pol_eps_loop, eps_lad_qmin,
+              std::abs(_pol_eps_loop - eps_lad_qmin));
+    }
+    _Timer.stop("TEMP_UW_dump_eps_inv_head");
+    utils::device_sync();
+    _Timer.stop("TEMP_UW_TOTAL");
+
+    // Phase-by-phase update_w timers (TEMP_* timer keys). Accumulated across SCF
+    // iterations; divide by the call count (number_of_calls()) to get
+    // per-iteration values.
+    app_log(2, "\n  update_w phase timers (accumulated):");
+    app_log(2, "    Total:                            {0:.3f} sec  ({1} calls)",
+            _Timer.elapsed("TEMP_UW_TOTAL"), _Timer.number_of_calls("TEMP_UW_TOTAL"));
+    app_log(2, "      eval_Pi_qdep:                   {0:.3f} sec",
+            _Timer.elapsed("TEMP_UW_eval_Pi_qdep"));
+    app_log(2, "      dyson_W_from_Pi_tau:            {0:.3f} sec",
+            _Timer.elapsed("TEMP_UW_dyson_W_from_Pi"));
+    if (_Timer.elapsed("TEMP_DWFP_tau_to_w") > 0.0) {
+      app_log(2, "        - tau_to_w:                   {0:.3f} sec",
+              _Timer.elapsed("TEMP_DWFP_tau_to_w"));
+      app_log(2, "        - dyson_W_in_place:           {0:.3f} sec",
+              _Timer.elapsed("TEMP_DWFP_dyson_W_in_place"));
+      app_log(2, "        - w_to_tau:                   {0:.3f} sec",
+              _Timer.elapsed("TEMP_DWFP_w_to_tau"));
+      if (_Timer.elapsed("TEMP_FT_alloc") > 0.0) {
+        // tau_to_w + w_to_tau inner sections, both directions together.
+        app_log(2, "          FT inner (both directions, accumulated):");
+        app_log(2, "            darray alloc+zero:      {0:.3f} sec  ({1} calls)",
+                _Timer.elapsed("TEMP_FT_alloc"), _Timer.number_of_calls("TEMP_FT_alloc"));
+        app_log(2, "            redistribute:           {0:.3f} sec  ({1} calls)",
+                _Timer.elapsed("TEMP_FT_redist"), _Timer.number_of_calls("TEMP_FT_redist"));
+        app_log(2, "            FT gemm (PHsym):        {0:.3f} sec",
+                _Timer.elapsed("TEMP_FT_gemm"));
+        app_log(2, "            check_leakage:          {0:.3f} sec",
+                _Timer.elapsed("TEMP_FT_leakage"));
+        app_log(2, "            darray reset (free):    {0:.3f} sec  ({1} calls)",
+                _Timer.elapsed("TEMP_FT_reset"), _Timer.number_of_calls("TEMP_FT_reset"));
+        app_log(2, "            barriers:               {0:.3f} sec",
+                _Timer.elapsed("TEMP_FT_barrier"));
+      }
+      if (_Timer.elapsed("TEMP_DWiP_inverse") > 0.0) {
+        app_log(2, "          dyson_W_in_place inner (accumulated):");
+        app_log(2, "            alloc dPi/dZ/dA:        {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_alloc"));
+        app_log(2, "            Z load (per-q):         {0:.3f} sec  ({1} calls)",
+                _Timer.elapsed("TEMP_DWiP_Z_load"),
+                _Timer.number_of_calls("TEMP_DWiP_Z_load"));
+        app_log(2, "            Pi load (per-w):        {0:.3f} sec  ({1} calls)",
+                _Timer.elapsed("TEMP_DWiP_Pi_load"),
+                _Timer.number_of_calls("TEMP_DWiP_Pi_load"));
+        app_log(2, "            gemm Z*Pi -> A:         {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_gemm_ZPi"));
+        app_log(2, "            A = I - A:              {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_diag_I_minus_A"));
+        app_log(2, "            inverse(A) [SLATE LU]:  {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_inverse"));
+        app_log(2, "            A = A - I:              {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_diag_A_minus_I"));
+        app_log(2, "            gemm A*Z -> W:          {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_gemm_AZ"));
+        app_log(2, "            writeback to Pi_wqPQ:   {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_writeback"));
+      }
+    }
+    app_log(2, "      eps_inv_head_t:                 {0:.3f} sec",
+            _Timer.elapsed("TEMP_UW_eps_inv_head"));
+    app_log(2, "      dW_qtPQ_alloc:                  {0:.3f} sec",
+            _Timer.elapsed("TEMP_UW_dW_qtPQ_alloc"));
+    app_log(2, "      dW_transpose_and_mirror:        {0:.3f} sec",
+            _Timer.elapsed("TEMP_UW_dW_transpose_and_mirror"));
+    if (_Timer.elapsed("TEMP_UW_dW_qtPQ_dev_alloc") > 0.0) {
+      app_log(2, "        - dW_qtPQ_dev alloc:          {0:.3f} sec",
+              _Timer.elapsed("TEMP_UW_dW_qtPQ_dev_alloc"));
+      app_log(2, "        - on-device (t,q)->(q,t):     {0:.3f} sec",
+              _Timer.elapsed("TEMP_UW_dW_dev_transpose"));
+      app_log(2, "        - bulk D->H mirror:           {0:.3f} sec",
+              _Timer.elapsed("TEMP_UW_dW_d2h_mirror"));
+    }
+    app_log(2, "      dump_eps_inv_head:              {0:.3f} sec\n",
+            _Timer.elapsed("TEMP_UW_dump_eps_inv_head"));
   }
 
   template<bool w_out, nda::MemoryArrayOfRank<4> local_Array_t, typename communicator_t>
@@ -145,12 +2651,27 @@ namespace solvers {
 
     auto t_pgrid = dPi_tqPQ_pos.grid();
     auto t_bsize = dPi_tqPQ_pos.block_size();
+
+    // Split dyson_W_from_Pi_tau into its three phases (tau -> w, Dyson, w -> tau)
+    // for the update_w phase-timer breakdown.
+    _Timer.start("TEMP_DWFP_tau_to_w");
     auto dPi_wqPQ = tau_to_w(dPi_tqPQ_pos, w_pgrid, w_bsize, reset_input);
+    utils::device_sync();
+    _Timer.stop("TEMP_DWFP_tau_to_w");
+
+    _Timer.start("TEMP_DWFP_dyson_W_in_place");
     dyson_W_in_place(dPi_wqPQ, thc);
+    utils::device_sync();
+    _Timer.stop("TEMP_DWFP_dyson_W_in_place");
+
     if constexpr (w_out) {
       return dPi_wqPQ;
     } else {
-      return w_to_tau(dPi_wqPQ, t_pgrid, t_bsize, true);
+      _Timer.start("TEMP_DWFP_w_to_tau");
+      auto dPi_tqPQ = w_to_tau(dPi_wqPQ, t_pgrid, t_bsize, true);
+      utils::device_sync();
+      _Timer.stop("TEMP_DWFP_w_to_tau");
+      return dPi_tqPQ;
     }
   }
 
@@ -183,11 +2704,19 @@ namespace solvers {
     mpi3::communicator q_intra_comm = thc.mpi()->comm.split(q_origin, thc.mpi()->comm.rank());
     utils::check(q_intra_comm.size() == pgrid[0]*pgrid[2]*pgrid[3], "q_intra_comm.size() != pgrid[0]*pgrid[2]*pgrid[3]");
 
-    using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+    // MEM is inferred from the input darray; the local slate work
+    // arrays (dPi_PQ / dZ_PQ / dA_PQ) live in the same memory space.
+    constexpr MEMORY_SPACE MEM =
+        ::nda::mem::on_host<Array_4D_t> ? HOST_MEMORY : DEVICE_MEMORY;
+    using Array_2D_t = memory::array<MEM, ComplexType, 2>;
     using math::nda::make_distributed_array;
+    // inner-loop timer breakdown of dyson_W_in_place
+    _Timer.start("TEMP_DWiP_alloc");
     auto dPi_PQ = make_distributed_array<Array_2D_t>(wq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]}, true);
     auto dZ_PQ  = make_distributed_array<Array_2D_t>(wq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]}, true);
     auto dA_PQ  = make_distributed_array<Array_2D_t>(wq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]}, true);
+    utils::device_sync();
+    _Timer.stop("TEMP_DWiP_alloc");
     utils::check(dPi_PQ.local_range(0) == P_rng, "Error: local range mismatches!" );
     utils::check(dPi_PQ.local_range(1) == Q_rng, "Error: local range mismatches!");
     utils::check(dPi_PQ.local_shape()[0] == NP_loc and dPi_PQ.local_shape()[1] == NQ_loc, "Error: local shape mismatched!");
@@ -201,42 +2730,138 @@ namespace solvers {
       }
     }
 
+    // Precompute the local-block identity matrix once, in MEM, so the
+    // per-element diagonal updates become a single tensor::elementwise
+    // call instead of a host loop (lazy on-device assignment is illegal).
+    [[maybe_unused]] memory::array<MEM, ComplexType, 2> Id_PQ_mem;
+    if constexpr (MEM != HOST_MEMORY) {
+      nda::array<ComplexType, 2> Id_PQ_host(NP_loc, NQ_loc);
+      Id_PQ_host() = ComplexType(0.0);
+      for (auto idx: diag_idx) Id_PQ_host(idx.first, idx.second) = ComplexType(1.0);
+      Id_PQ_mem = memory::to_memory_space<MEM>(Id_PQ_host);
+    }
+
     auto Pi_wqPQ = dPi_wqPQ.local();
     auto Pi_PQ = dPi_PQ.local();
     auto Z_PQ = dZ_PQ.local();
     auto A_PQ = dA_PQ.local();
+    // ---- DIELECTRIC POSITIVITY MONITOR (vertex corrections) --------------------------
+    // On the imaginary axis the RPA polarization is negative semi-definite, so
+    // eps = I - Z.Pi is positive definite and ||eps^{-1}|| = O(1). A vertex correction
+    // P^C = -2 dPhi_2^C/dW carries NO such sign guarantee: once Pi is large enough that
+    // eps loses positivity at some (q, i.nu), the inverse below silently returns garbage
+    // and W acquires a spurious pole. In a self-consistent run this shows up as several
+    // smoothly converging iterations followed by a single step with a huge max |d.Sigma|.
+    // Track ||eps^{-1}||_max over all
+    // (q, i.nu) so the failure is DIAGNOSED instead of silently propagating.
+    double epsinv_max = 0.0;
+    long epsinv_q = -1, epsinv_w = -1;
     for (size_t iq_loc = 0; iq_loc < nq_loc; ++iq_loc) {
       long iq = q_origin + iq_loc;
-      Z_PQ = thc.Z(iq, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
+      _Timer.start("TEMP_DWiP_Z_load");
+      Z_PQ = thc.template Z<MEM>(iq, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
+      utils::device_sync();
+      _Timer.stop("TEMP_DWiP_Z_load");
 
       // W(w) = [ I - Z * Pi(w)]^{-1} * Z - Z
       for (size_t n = 0; n < nw_loc; ++n) {
+        _Timer.start("TEMP_DWiP_Pi_load");
         Pi_PQ = Pi_wqPQ(n, iq_loc, nda::ellipsis{});
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_Pi_load");
 
         // A = Z * Pi(w)
+        _Timer.start("TEMP_DWiP_gemm_ZPi");
         math::nda::slate_ops::multiply(dZ_PQ, dPi_PQ, dA_PQ);
-        // A = I - Z * Pi(w)
-        for (auto idx: diag_idx) {
-          A_PQ(idx.first, idx.second) -= ComplexType(1.0);
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_gemm_ZPi");
+        // A = I - Z * Pi(w) (i.e. A := -A; A_diag += 1)
+        _Timer.start("TEMP_DWiP_diag_I_minus_A");
+        if constexpr (MEM == HOST_MEMORY) {
+          for (auto idx: diag_idx) {
+            A_PQ(idx.first, idx.second) -= ComplexType(1.0);
+          }
+          A_PQ *= -1.0;
+        } else {
+          nda::tensor::scale(ComplexType(-1.0), A_PQ);
+          nda::tensor::elementwise(ComplexType(1.0), Id_PQ_mem, "PQ",
+                                   ComplexType(1.0), A_PQ,     "PQ",
+                                   nda::tensor::op::SUM);
         }
-        A_PQ *= -1.0;
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_diag_I_minus_A");
 
         // A = [I - Z*Pi(w)]^{-1}
+        _Timer.start("TEMP_DWiP_inverse");
         math::nda::slate_ops::inverse(dA_PQ);
-
-        // A = [I - Z*Pi(w)]^{-1} - I
-        for (auto idx: diag_idx) {
-          A_PQ(idx.first, idx.second) -= ComplexType(1.0);
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_inverse");
+        // Dielectric-conditioning meter: a host element loop over the inverted tile;
+        // skipped on the device path (report-only; the log line then shows no maximum).
+        if constexpr (MEM == HOST_MEMORY) {
+        for (auto const &v : A_PQ)
+          if (std::abs(v) > epsinv_max) {
+            epsinv_max = std::abs(v);
+            epsinv_q = iq;                      // WHERE it is worst: transfer q ...
+            epsinv_w = long(n) + long(w_origin);// ... and bosonic Matsubara index
+          }
         }
 
+        // A = [I - Z*Pi(w)]^{-1} - I (diag -= 1)
+        _Timer.start("TEMP_DWiP_diag_A_minus_I");
+        if constexpr (MEM == HOST_MEMORY) {
+          for (auto idx: diag_idx) {
+            A_PQ(idx.first, idx.second) -= ComplexType(1.0);
+          }
+        } else {
+          nda::tensor::elementwise(ComplexType(-1.0), Id_PQ_mem, "PQ",
+                                   ComplexType(1.0), A_PQ,     "PQ",
+                                   nda::tensor::op::SUM);
+        }
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_diag_A_minus_I");
+
         // W = ([I - Z*Pi(w)]^{-1} - I) * Z
+        _Timer.start("TEMP_DWiP_gemm_AZ");
         math::nda::slate_ops::multiply(dA_PQ, dZ_PQ, dPi_PQ);
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_gemm_AZ");
+        _Timer.start("TEMP_DWiP_writeback");
         Pi_wqPQ(n, iq_loc, nda::ellipsis{}) = Pi_PQ;
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_writeback");
       }
     }
     // prevent dead block in thc.Z() in case nq_loc is not the same for all processors
     for (long iq_loc = nq_loc; iq_loc < nq_loc_max; ++iq_loc)
-      Z_PQ = thc.Z(0, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
+      Z_PQ = thc.template Z<MEM>(0, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
+
+    {
+      // reduce the VALUE and carry its (q, i.nu) location along, so the worst cell is
+      // identifiable: the Gamma head, a specific transfer, or a high-frequency tail all
+      // mean different things about where a vertex-corrected Pi goes wrong.
+      double gmax = dPi_wqPQ.communicator()->all_reduce_value(epsinv_max,
+                                                              boost::mpi3::max<>{});
+      long q_of_max = (epsinv_max == gmax) ? epsinv_q : -1;
+      long w_of_max = (epsinv_max == gmax) ? epsinv_w : -1;
+      q_of_max = dPi_wqPQ.communicator()->all_reduce_value(q_of_max, boost::mpi3::max<>{});
+      w_of_max = dPi_wqPQ.communicator()->all_reduce_value(w_of_max, boost::mpi3::max<>{});
+      epsinv_max = gmax;
+      app_log(1, "    - dielectric conditioning: max_(q, i.nu) || [I - Z.Pi]^-1 ||_max = "
+                 "{:.4e}   (worst cell: q = {}, i.nu index = {} of {})",
+              epsinv_max, q_of_max, w_of_max, nw);
+    }
+    if (epsinv_max > 1e3)
+      app_log(1, "    [WARNING] I - Z.Pi is close to SINGULAR. On the imaginary axis the RPA\n"
+                 "              polarization is negative semi-definite, so this cannot happen "
+                 "for plain\n"
+                 "              RPA/scGW; a vertex-corrected Pi carries no such sign guarantee. "
+                 "The\n"
+                 "              inverse above is then numerically meaningless and W acquires a "
+                 "spurious\n"
+                 "              pole -- the self-energy will blow up on the NEXT iteration. "
+                 "Reduce the\n"
+                 "              correlated window C, or ramp the vertex in more slowly.");
 
     _Timer.stop("EVALUATE_W");
 
@@ -297,8 +2922,9 @@ namespace solvers {
     return dPi_tqPQ;
   }
 
+  template<MEMORY_SPACE MEM>
   auto scr_coulomb_t::eval_Pi_qdep(MBState &mb_state, THC_ERI auto &thc)
-  -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
+  -> memory::darray_t<memory::array<MEM, ComplexType, 4>, mpi3::communicator>
   {
 
     if (_screen_type.find("edmft") == std::string::npos
@@ -313,67 +2939,336 @@ namespace solvers {
     }
     utils::check(mb_state.sG_tskij.has_value(),
                  "scr_coulomb_t::eval_Pi_qdep: G_tskij is not set in MBState.");
+    if constexpr (MEM != HOST_MEMORY) {
+      utils::check(_screen_type != "rpa_k" and
+                   _screen_type.find("crpa") == std::string::npos and
+                   _screen_type.find("edmft") == std::string::npos,
+                   "scr_coulomb_t::eval_Pi_qdep: device path only supports the "
+                   "pure RPA (R-space) algorithm; got screen_type='{}'.",
+                   _screen_type);
+    }
 
     auto G_tskij = mb_state.sG_tskij.value().local();
 
-    if (_screen_type == "rpa_k")
-      return eval_Pi_rpa_kspace(G_tskij, thc);
+    // The STATIC rung W0[G] = [1 - v P^0_RPA[G]]^{-1} v at i.nu = 0 is a
+    // functional of the RPA polarizability ONLY, so it must be built at exactly this
+    // point -- right after Pi_RPA(q, tau) is assembled and BEFORE any vertex/cRPA/EDMFT
+    // correction is added. Called immediately after every
+    // eval_Pi_rpa_* below and NOWHERE else, so no other Pi contribution can leak into it.
+    // No-op unless the attached vertex is active AND its rung mode is static/linear:
+    // the dynamic rung has no W0, and this path then executes no arithmetic and
+    // allocates nothing.
+    auto build_vertex_W0 = [&](auto &dPi_rpa) {
+      if (_vertex != nullptr and _vertex->needs_w0())
+        _vertex->build_w0(mb_state, thc, dPi_rpa);
+    };
 
-    // RPA polarizability
-    auto dPi_tqPQ = eval_Pi_rpa_Rspace(G_tskij, thc);
-    if (_screen_type.find("gw_edmft_rpa")!=std::string::npos or _screen_type=="rpa")
-      return dPi_tqPQ;
-
-    // cRPA corrections: Pi_cRPA = Pi_RPA - Pi_active
-    if (_screen_type.find("crpa") != std::string::npos) {
-
-      utils::check(mb_state.proj_boson.has_value(),
-                   "scr_coulomb_t::eval_Pi_qdep: projector is missing in the crpa mode.");
-      int crpa_scheme = (_screen_type.find("crpa_vasp")!=std::string::npos)? 2 :
-                        (_screen_type.find("crpa_ks")!=std::string::npos)? 1 : 0;
-      // Pi_dc and Pi are distributed in the same way among the processors since "eval_Pi_rpa_active" call "eval_Pi_qdep" under the hood.
-      auto& proj_boson = mb_state.proj_boson.value();
-      auto dPi_tqPQ_dc = eval_Pi_rpa_active(G_tskij, thc, proj_boson.proj_fermi(), crpa_scheme);
-      dPi_tqPQ.local() -= dPi_tqPQ_dc.local();
-
-    }
-
-    // EDMFT corrections: Pi_edmft = Pi_RPA + (Pi_imp - Pi_dc)
-    if (_screen_type.find("edmft") != std::string::npos) {
-
-      utils::check(mb_state.proj_boson.has_value(), "scr_coulomb_t::eval_Pi_qdep: projector is missing in edmft mode.");
-
-      if (!mb_state.sPi_imp_wabcd or !mb_state.sPi_dc_wabcd) {
-        app_log(1, "");
-        app_log(1, "╔══════════════════════════════════════════════════════╗");
-        app_log(1, "║ [ NOTE ]                                             ║");
-        app_log(1, "║ Screening type is set to \"edmft\", but local        ║");
-        app_log(1, "║ polarization corrections were not found or provided. ║");
-        app_log(1, "║ CoQui will proceed assuming zero correction.         ║");
-        app_log(1, "╚══════════════════════════════════════════════════════╝\n");
-
-      } else {
-        auto &proj_boson = mb_state.proj_boson.value();
-        auto nImpOrbs = proj_boson.nImpOrbs();
-        auto Pi_imp_iw = mb_state.sPi_imp_wabcd.value().local();
-        auto Pi_dc_iw = mb_state.sPi_dc_wabcd.value().local();
-        auto sPi_t_correction = math::shm::make_shared_array<Array_view_5D_t>(
-            *thc.mpi(), {dPi_tqPQ.global_shape()[0], nImpOrbs, nImpOrbs, nImpOrbs, nImpOrbs});
-        if (thc.mpi()->node_comm.root()) {
-          _ft->w_to_tau_PHsym(Pi_imp_iw, sPi_t_correction.local());
-
-          nda::array<ComplexType, 5> pi_t_buffer(sPi_t_correction.shape());
-          _ft->w_to_tau_PHsym(Pi_dc_iw, pi_t_buffer);
-          sPi_t_correction.local() -= pi_t_buffer;
+    // Vertex: additive second-order-exchange polarization cut Pi^C on the
+    // same distributed grid as the RPA polarizability (as the EDMFT "+=" below).
+    // When no active vertex is attached this is a strict no-op -- no allocation,
+    // no arithmetic -- so the disabled path is identical to plain RPA/scGW.
+    auto add_vertex_Pi_C = [&](auto &dPi) {
+      // The static rung (vertex_rung = "static") has NO polarization injection at all: P = RPA
+      // by construction, and the ONE vertex_t drives every cut of the selected mode, so the
+      // inconsistent hybrid "static Sigma^C with a Pi^C injection" is unrepresentable.
+      // The linear rung injects its P^{C,L} here.
+      if (_vertex != nullptr and _vertex->rung() == static_rung) return;
+      if (_vertex != nullptr and _vertex->active() and _vertex->skip_pi_c()) {
+        app_log(1, "  [vertex] TEST switch set_skip_pi_c: the Pi^C cut is OMITTED (P = RPA); Sigma^C alone (a test reference, not a conserving theory).");
+        return;
+      }
+      if (_vertex != nullptr and _vertex->active()) {
+        auto dPi_C_tqPQ = _vertex->eval_Pi_C(mb_state, thc, dPi.grid(),
+                                             dPi.block_size(), dPi.global_shape());
+        // SIZE OF THE CORRECTION. Pi^C is meant to be a correction to Pi_RPA; if it is
+        // comparable to or larger than what it corrects, the second-order-exchange
+        // truncation is outside its regime and eps = I - Z.Pi is at risk of losing
+        // positivity. Report the ratio
+        // so "large but controlled" is distinguishable from "runaway" at a glance.
+        double nC = 0.0, nR = 0.0;
+        for (auto const &v : dPi_C_tqPQ.local()) nC = std::max(nC, std::abs(v));
+        for (auto const &v : dPi.local()) nR = std::max(nR, std::abs(v));
+        nC = thc.mpi()->comm.all_reduce_value(nC, boost::mpi3::max<>{});
+        nR = thc.mpi()->comm.all_reduce_value(nR, boost::mpi3::max<>{});
+        app_log(1, "  [vertex] ||Pi^C||_max = {:.4e} vs ||Pi_RPA||_max = {:.4e} "
+                   "(ratio {:.3e})", nC, nR, nC / std::max(nR, 1e-300));
+        // PER-q BREAKDOWN. The analytic q->0 head is inserted ONLY at Gamma, yet the worst
+        // dielectric cell can be a NON-Gamma transfer: Pi^C's INTERNAL rung sum runs
+        // over all transfers, so the Gamma rung -- the one carrying the head -- feeds EVERY
+        // external q. Resolving ||Pi^C||_max by external transfer says whether a head-on run
+        // deviates from head-off uniformly in q (the head entering through the internal sum,
+        // as the construction intends) or concentrates on particular cells (which would point
+        // at the Gamma insertion itself). Cheap: nq_ibz values, once per update_w.
+        {
+          auto Pi_C_loc = dPi_C_tqPQ.local();
+          auto ls = Pi_C_loc.shape();
+          long nq_g = dPi_C_tqPQ.global_shape()[1];
+          std::vector<double> qmax(size_t(nq_g), 0.0);
+          long iq_loc = 0;
+          for (auto gq : dPi_C_tqPQ.local_range(1)) {
+            double m = 0.0;
+            for (long it = 0; it < ls[0]; ++it)
+              for (long P = 0; P < ls[2]; ++P)
+                for (long Q = 0; Q < ls[3]; ++Q)
+                  m = std::max(m, std::abs(Pi_C_loc(it, iq_loc, P, Q)));
+            qmax[size_t(gq)] = std::max(qmax[size_t(gq)], m);
+            ++iq_loc;
+          }
+          thc.mpi()->comm.all_reduce_in_place_n(qmax.data(), qmax.size(),
+                                                boost::mpi3::max<>{});
+          std::ostringstream oss;
+          oss << std::scientific << std::setprecision(2);
+          for (long q = 0; q < nq_g; ++q) oss << (q ? " " : "") << qmax[size_t(q)];
+          app_log(1, "  [vertex] ||Pi^C||_max by transfer q (q=0 is Gamma): {}",
+                  oss.str());
         }
-        thc.mpi()->comm.barrier();
-
-        auto dPi_tqPQ_correction = upfold_pi_local(sPi_t_correction.local(), thc, proj_boson,
-                                                   dPi_tqPQ.grid(), dPi_tqPQ.block_size());
-        dPi_tqPQ.local() += dPi_tqPQ_correction.local();
+        if (nC > nR)
+          app_log(1, "  [WARNING] the vertex polarization EXCEEDS the RPA polarization it "
+                     "corrects.\n"
+                     "            The second-order-exchange truncation is outside its "
+                     "regime here; expect\n"
+                     "            eps = I - Z.Pi to lose positivity (see the dielectric "
+                     "conditioning below).");
+        dPi.local() += dPi_C_tqPQ.local();
         thc.mpi()->comm.barrier();
       }
+    };
+
+    // The pol-vertex ladder (kernel build and injection) lives HERE, not in update_w, for two
+    // structural reasons: (i) in edmft mode update_w would hand the kernel builder the
+    // IMPURITY-CORRECTED Pi, while the kernel must see the pure RPA Pi; (ii) the bosonic
+    // closure reaches eval_Pi_qdep + its own Dyson directly and never through update_w, so
+    // W_loc must get its ladder from this point. The ORDER is the contract:
+    // RPA Pi -> build_vertex_W0 -> build_pol_ladder_kernel (the PURE-RPA point)
+    // -> crpa/edmft corrections -> add_vertex_Pi_C -> inject_pol_ladder (last), and every
+    // return path below runs the same two hooks -- including the "rpa"/gw_edmft_rpa early
+    // return, which must keep injecting.
+    // The readout requires an INACTIVE _vertex, and add_vertex_Pi_C is a strict no-op for an
+    // inactive vertex, so the two never act in the same run.
+    const bool pol_readout = (_vertex != nullptr and _vertex->pol_vertex_active()
+                              and not _vertex->active());
+    auto build_pol_ladder_kernel = [&](auto &dPi_rpa) {
+      if (not pol_readout) return;
+      ensure_pol_vertex(thc);
+      _pol_vtx->build_w0(mb_state, thc, dPi_rpa);   // build_w0 only READS dPi
+      _pol_pi0_qPQ = gather_nu0_row(dPi_rpa);       // the readout's RPA baseline
+      // Sigma vertex, pol_vertex_sigma_bub = "full": the vertex's Pi_0 = THIS RPA Pi folded to the frozen frame
+      if (_vertex->sigma_lff_enabled() and _vertex->sigma_lff_bub() == "full") fold_rpa_pi_secondary(dPi_rpa, thc);
+      if (_vertex->eps_cut_nq() > 0) gather_cut_rows(thc, dPi_rpa);   // eps(q_i, i nu) cuts (report-only)
+    };
+    auto inject_pol_tier = [&](auto &dPi) {
+      if (pol_readout and _vertex->pol_vertex_inject_enabled())
+        inject_pol_ladder(mb_state, thc, dPi);
+    };
+
+    // The hooks are host code on host darrays. Under DEVICE (the host bridge) they run on a
+    // HOST MIRROR of Pi: one D2H copy before the
+    // hooks, one H2D copy back after the hooks that modify Pi; the mirror is built only when a hook
+    // has something to do. The same (grid, global shape, block size) reproduces the same local
+    // block on every rank, which the check below pins.
+    const bool vertex_hooks_needed = pol_readout or
+        (_vertex != nullptr and (_vertex->active() or _vertex->needs_w0()));
+    [[maybe_unused]] auto host_mirror_of = [&](auto &dPi) {
+      using math::nda::make_distributed_array;
+      auto h = make_distributed_array<nda::array<ComplexType, 4>>(*dPi.communicator(), dPi.grid(),
+                                                                  dPi.global_shape(), dPi.block_size());
+      utils::check(h.local_shape() == dPi.local_shape() and h.origin() == dPi.origin(),
+                   "eval_Pi_qdep: the host mirror of Pi does not reproduce the device block layout.");
+      h.local() = nda::to_host(dPi.local());
+      return h;
+    };
+    // wall clock of the Pi hooks
+    auto hk_wall = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    // The hooks on the DEVICE Pi (avoids the large host mirrors). The RPA hooks read Pi only through its i.nu = 0 row
+    // (both build_w0s, the readout baseline):
+    // each rank forms its tau-group partial of the row on the device (one gemm, nq Np^2 / nt_procs comes down) and the
+    // row is finished from it (vertex_w0_detail::finish_nu0_row; build_w0 then runs its Dysons on the device too). The
+    // post hook's injection adds the upfolded ladder into the device Pi. The rounding of the tau sum is cuBLAS's instead
+    // of the host loop's. Hooks without a device form keep the mirror: the eps cuts (report-only), the Sigma-vertex
+    // bubble "full", an ACTIVE vertex's Pi^C, the q-nu meter. vertex_debug pi_hooks_device = 0 forces the mirrors.
+#if defined(ENABLE_CUDA)
+    const bool hooks_dev = methods::vertex_debug::number("pi_hooks_device", 1.0) != 0.0;   // vertex_debug: pi_hooks_device
+#else
+    const bool hooks_dev = false;
+#endif
+    const bool rpa_hooks_dev = hooks_dev and
+        not (pol_readout and (_vertex->eps_cut_nq() > 0 or
+                              (_vertex->sigma_lff_enabled() and _vertex->sigma_lff_bub() == "full")));
+    // (add_vertex_Pi_C does something only for an ACTIVE non-static vertex; that one keeps the mirror)
+    const bool post_hooks_dev = hooks_dev and
+                                not (_vertex != nullptr and _vertex->active() and _vertex->rung() != static_rung) and
+                                not (_vertex != nullptr and _vertex->ladder_qnu_meter());
+    // this rank's tau-group partial of the i.nu = 0 row, formed on the device (vertex_w0_detail::nu0_row_partial's layout)
+    [[maybe_unused]] auto nu0_partial_device = [&](auto &dPi) {
+      using math::nda::make_distributed_array;
+      auto R = solvers::vertex_w0_detail::nu0_transform_row(*_ft);
+      auto gs = dPi.global_shape();
+      auto grd = dPi.grid();
+      auto bsz = dPi.block_size();
+      utils::check(R.shape(0) == gs[0], "eval_Pi_qdep: the nu = 0 row has {} tau nodes, Pi {}.", R.shape(0), gs[0]);
+      auto part = make_distributed_array<nda::array<ComplexType, 4>>(*dPi.communicator(), grd, {grd[0], gs[1], gs[2], gs[3]},
+                                                                     {1, bsz[1], bsz[2], bsz[3]});
+      auto ls = dPi.local_shape();
+      auto pls = part.local_shape();
+      utils::check(pls[0] == 1 and pls[1] == ls[1] and pls[2] == ls[2] and pls[3] == ls[3],
+                   "eval_Pi_qdep: the nu = 0 partial does not mirror the device block of Pi.");
+      const long t0 = dPi.origin()[0], ntl = ls[0], rest = ls[1] * ls[2] * ls[3];
+      auto pl = part.local();
+      if (ntl > 0 and rest > 0) {
+        nda::array<ComplexType, 2> Rl(1, ntl);
+        for (long it = 0; it < ntl; ++it) Rl(0, it) = R(t0 + it);
+        auto Rd = memory::to_memory_space<MEM>(Rl);
+        memory::array<MEM, ComplexType, 2> yd(1, rest);
+        auto A2 = nda::reshape(dPi.local(), shape_t<2>{ntl, rest});
+        nda::blas::gemm(Rd, A2, yd);                                    // sum_t R(t) Pi(t, q, P, Q)
+        auto yh = memory::to_memory_space<HOST_MEMORY>(yd);
+        std::copy_n(yh.data(), rest, pl.data());
+      } else {
+        pl() = ComplexType(0.0);
+      }
+      return part;
+    };
+    // the replicated i.nu = 0 row (gather_nu0_row's result) from those partials
+    [[maybe_unused]] auto nu0_row_from_partial = [&](auto &part) {
+      auto gs = part.global_shape();
+      nda::array<ComplexType, 3> out(gs[1], gs[2], gs[3]);
+      out() = ComplexType(0.0);
+      auto q_rng = part.local_range(1);
+      auto P_rng = part.local_range(2);
+      auto Q_rng = part.local_range(3);
+      auto pl = part.local();
+      for (long iq = 0; iq < long(q_rng.size()); ++iq)
+        for (long iP = 0; iP < long(P_rng.size()); ++iP)
+          for (long iQ = 0; iQ < long(Q_rng.size()); ++iQ)
+            out(q_rng.first() + iq, P_rng.first() + iP, Q_rng.first() + iQ) = pl(0, iq, iP, iQ);
+      part.communicator()->all_reduce_in_place_n(out.data(), out.size(), std::plus<>{});
+      return out;
+    };
+    auto vertex_hooks_rpa = [&](auto &dPi_rpa) {      // RPA-only Pi: before ANY correction (read-only hooks)
+      if constexpr (MEM == HOST_MEMORY) { build_vertex_W0(dPi_rpa); build_pol_ladder_kernel(dPi_rpa); }
+      else if (vertex_hooks_needed and rpa_hooks_dev) {
+        const double w0 = hk_wall();
+        auto part = nu0_partial_device(dPi_rpa);
+        const double w1 = hk_wall();
+        if (_vertex != nullptr and _vertex->needs_w0()) _vertex->build_w0(mb_state, thc, part, true);
+        const double w2 = hk_wall();
+        if (pol_readout) {
+          ensure_pol_vertex(thc);
+          _pol_vtx->build_w0(mb_state, thc, part, true);
+          _pol_pi0_qPQ = nu0_row_from_partial(part);    // the readout's RPA baseline
+        }
+        app_log(1, "  [eval_Pi wall] RPA hooks on the DEVICE Pi: the i.nu = 0 row partial {:.1f} s, build_vertex_W0 {:.1f} s, "
+                   "the ladder kernel (build_w0 + nu0 row) {:.1f} s", w1 - w0, w2 - w1, hk_wall() - w2);
+      }
+      else if (vertex_hooks_needed) {
+        const double w0 = hk_wall();
+        auto h = host_mirror_of(dPi_rpa);
+        const double w1 = hk_wall();
+        build_vertex_W0(h);
+        const double w2 = hk_wall();
+        build_pol_ladder_kernel(h);
+        app_log(1, "  [eval_Pi wall] RPA hooks: host mirror of Pi {:.1f} s, build_vertex_W0 {:.1f} s, the ladder kernel "
+                   "(build_w0 + nu0 row + folds + cuts) {:.1f} s", w1 - w0, w2 - w1, hk_wall() - w2);
+      }
+    };
+    auto vertex_hooks_post = [&](auto &dPi) {         // Pi = Pi_RPA (+ corrections) + Pi^C; injection last
+      if constexpr (MEM == HOST_MEMORY) { add_vertex_Pi_C(dPi); inject_pol_tier(dPi); }
+      else if (vertex_hooks_needed and post_hooks_dev) {
+        // add_vertex_Pi_C is a no-op here (no active non-static vertex: post_hooks_dev); the injection adds into the device Pi
+        const double w0 = hk_wall();
+        inject_pol_tier(dPi);
+        app_log(1, "  [eval_Pi wall] post hooks on the DEVICE Pi: the injection {:.1f} s", hk_wall() - w0);
+      }
+      else if (vertex_hooks_needed) {
+        const double w0 = hk_wall();
+        auto h = host_mirror_of(dPi);
+        const double w1 = hk_wall();
+        add_vertex_Pi_C(h);
+        const double w2 = hk_wall();
+        inject_pol_tier(h);
+        const double w3 = hk_wall();
+        dPi.local() = memory::to_memory_space<MEM>(h.local());
+        utils::device_sync();
+        app_log(1, "  [eval_Pi wall] post hooks: host mirror of Pi {:.1f} s, add_vertex_Pi_C {:.1f} s, the injection {:.1f} s, "
+                   "the copy back {:.1f} s", w1 - w0, w2 - w1, w3 - w2, hk_wall() - w3);
+      }
+    };
+
+    if constexpr (MEM == HOST_MEMORY) {
+      // k-space algorithm is HOST-only (eval_Pi_rpa_kspace has a
+      // static_assert against DEVICE_MEMORY); only instantiate the
+      // call here on the host path.
+      if (_screen_type == "rpa_k") {
+        auto dPi_tqPQ = eval_Pi_rpa_kspace<MEM>(G_tskij, thc);
+        vertex_hooks_rpa(dPi_tqPQ);
+        vertex_hooks_post(dPi_tqPQ);
+        return dPi_tqPQ;
+      }
     }
+
+    // RPA polarizability (R-space; works for both HOST and DEVICE).
+    auto dPi_tqPQ = eval_Pi_rpa_Rspace<MEM>(G_tskij, thc);
+    vertex_hooks_rpa(dPi_tqPQ);
+    if (_screen_type.find("gw_edmft_rpa")!=std::string::npos or _screen_type=="rpa") {
+      vertex_hooks_post(dPi_tqPQ);
+      return dPi_tqPQ;
+    }
+
+    if constexpr (MEM == HOST_MEMORY) {
+      // cRPA corrections: Pi_cRPA = Pi_RPA - Pi_active
+      if (_screen_type.find("crpa") != std::string::npos) {
+
+        utils::check(mb_state.proj_boson.has_value(),
+                     "scr_coulomb_t::eval_Pi_qdep: projector is missing in the crpa mode.");
+        int crpa_scheme = (_screen_type.find("crpa_vasp")!=std::string::npos)? 2 :
+                          (_screen_type.find("crpa_ks")!=std::string::npos)? 1 : 0;
+        // Pi_dc and Pi are distributed in the same way among the processors since "eval_Pi_rpa_active" call "eval_Pi_qdep" under the hood.
+        auto& proj_boson = mb_state.proj_boson.value();
+        auto dPi_tqPQ_dc = eval_Pi_rpa_active(G_tskij, thc, proj_boson.proj_fermi(), crpa_scheme);
+        dPi_tqPQ.local() -= dPi_tqPQ_dc.local();
+
+      }
+
+      // EDMFT corrections: Pi_edmft = Pi_RPA + (Pi_imp - Pi_dc)
+      if (_screen_type.find("edmft") != std::string::npos) {
+
+        utils::check(mb_state.proj_boson.has_value(), "scr_coulomb_t::eval_Pi_qdep: projector is missing in edmft mode.");
+
+        if (!mb_state.sPi_imp_wabcd or !mb_state.sPi_dc_wabcd) {
+          app_log(1, "");
+          app_log(1, "╔══════════════════════════════════════════════════════╗");
+          app_log(1, "║ [ NOTE ]                                             ║");
+          app_log(1, "║ Screening type is set to \"edmft\", but local        ║");
+          app_log(1, "║ polarization corrections were not found or provided. ║");
+          app_log(1, "║ CoQui will proceed assuming zero correction.         ║");
+          app_log(1, "╚══════════════════════════════════════════════════╝\n");
+
+        } else {
+          auto &proj_boson = mb_state.proj_boson.value();
+          auto nImpOrbs = proj_boson.nImpOrbs();
+          auto Pi_imp_iw = mb_state.sPi_imp_wabcd.value().local();
+          auto Pi_dc_iw = mb_state.sPi_dc_wabcd.value().local();
+          auto sPi_t_correction = math::shm::make_shared_array<Array_view_5D_t>(
+              *thc.mpi(), {dPi_tqPQ.global_shape()[0], nImpOrbs, nImpOrbs, nImpOrbs, nImpOrbs});
+          if (thc.mpi()->node_comm.root()) {
+            _ft->w_to_tau_PHsym(Pi_imp_iw, sPi_t_correction.local());
+
+            nda::array<ComplexType, 5> pi_t_buffer(sPi_t_correction.shape());
+            _ft->w_to_tau_PHsym(Pi_dc_iw, pi_t_buffer);
+            sPi_t_correction.local() -= pi_t_buffer;
+          }
+          thc.mpi()->comm.barrier();
+
+          auto dPi_tqPQ_correction = upfold_pi_local(sPi_t_correction.local(), thc, proj_boson,
+                                                     dPi_tqPQ.grid(), dPi_tqPQ.block_size());
+          dPi_tqPQ.local() += dPi_tqPQ_correction.local();
+          thc.mpi()->comm.barrier();
+        }
+      }
+    }
+
+    // Vertex: Pi = Pi_RPA (+ corrections) + Pi^C, ladder injection last (see the hooks above)
+    vertex_hooks_post(dPi_tqPQ);
 
     return dPi_tqPQ;
   }
@@ -418,33 +3313,66 @@ namespace solvers {
         APP_ABORT("scr_coulomb_t::tau_to_w: Error finding proper pgrid: gshape[2]*gshape[3] < np.");
       }
     }
+    // The redistributes are only part of this phase: each call also creates
+    // three tensor-sized distributed arrays and frees two. Every section is
+    // timed separately.
+    _Timer.start("TEMP_FT_alloc");
     auto buffer_ti  = make_distributed_array<local_Array_t>(
         *comm, b_pgrid, t_gshape, dPi_tqPQ_pos.block_size());
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
     _Timer.start("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_redist");
     math::nda::redistribute(dPi_tqPQ_pos, buffer_ti);
+    _Timer.stop("TEMP_FT_redist");
     _Timer.stop("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_reset");
     if (reset_input) dPi_tqPQ_pos.reset();
+    _Timer.stop("TEMP_FT_reset");
+    _Timer.start("TEMP_FT_leakage");
     _ft->check_leakage(buffer_ti, imag_axes_ft::boson, "polarizability", true);
+    _Timer.stop("TEMP_FT_leakage");
+    _Timer.start("TEMP_FT_barrier");
     buffer_ti.communicator()->barrier();
+    _Timer.stop("TEMP_FT_barrier");
 
+    _Timer.start("TEMP_FT_alloc");
     auto buffer_wi  = make_distributed_array<local_Array_t>(
         *comm, b_pgrid, w_gshape, buffer_ti.block_size());
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
+    _Timer.start("TEMP_FT_gemm");
     {
       auto buf_ti_loc = buffer_ti.local();
       auto buf_wi_loc = buffer_wi.local();
       _ft->tau_to_w_PHsym(buf_ti_loc, buf_wi_loc);
     }
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_gemm");
+    _Timer.start("TEMP_FT_reset");
     buffer_ti.reset();
+    _Timer.stop("TEMP_FT_reset");
+    _Timer.start("TEMP_FT_barrier");
     buffer_wi.communicator()->barrier();
+    _Timer.stop("TEMP_FT_barrier");
 
+    _Timer.start("TEMP_FT_alloc");
     auto dPi_wqPQ = make_distributed_array<local_Array_t>(
         *comm, w_pgrid_out, w_gshape, w_bsize_out);
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
 
     _Timer.start("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_redist");
     math::nda::redistribute(buffer_wi, dPi_wqPQ);
+    _Timer.stop("TEMP_FT_redist");
     _Timer.stop("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_reset");
     buffer_wi.reset();
+    _Timer.stop("TEMP_FT_reset");
+    _Timer.start("TEMP_FT_barrier");
     dPi_wqPQ.communicator()->barrier();
+    _Timer.stop("TEMP_FT_barrier");
 
     _Timer.stop("IMAG_FT_TtoW");
     return dPi_wqPQ;
@@ -491,30 +3419,54 @@ namespace solvers {
         APP_ABORT("scr_coulomb_t::W_w_to_tau: Error finding proper pgrid: gshape[2]*gshape[3] < np.");
       }
     }
+    _Timer.start("TEMP_FT_alloc");
     auto buffer_wi  = make_distributed_array<local_Array_t>(
         *comm, b_pgrid, w_gshape, dW_wqPQ_pos.block_size());
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
     _Timer.start("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_redist");
     math::nda::redistribute(dW_wqPQ_pos, buffer_wi);
+    _Timer.stop("TEMP_FT_redist");
     _Timer.stop("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_reset");
     if (reset_input) dW_wqPQ_pos.reset();
+    _Timer.stop("TEMP_FT_reset");
 
+    _Timer.start("TEMP_FT_alloc");
     auto buffer_ti  = make_distributed_array<local_Array_t>(
         *comm, b_pgrid, t_gshape, buffer_wi.block_size());
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
+    _Timer.start("TEMP_FT_gemm");
     {
       auto buf_ti_loc = buffer_ti.local();
       auto buf_wi_loc = buffer_wi.local();
       _ft->w_to_tau_PHsym(buf_wi_loc, buf_ti_loc);
     }
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_gemm");
+    _Timer.start("TEMP_FT_reset");
     buffer_wi.reset();
+    _Timer.stop("TEMP_FT_reset");
+    _Timer.start("TEMP_FT_leakage");
     _ft->check_leakage(buffer_ti, imag_axes_ft::boson, "screened interaction", true);
+    _Timer.stop("TEMP_FT_leakage");
 
+    _Timer.start("TEMP_FT_alloc");
     auto dW_tqPQ = make_distributed_array<local_Array_t>(
         *comm, t_pgrid_out, t_gshape, t_bsize_out);
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
 
     _Timer.start("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_redist");
     math::nda::redistribute(buffer_ti, dW_tqPQ);
+    _Timer.stop("TEMP_FT_redist");
     _Timer.stop("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_reset");
     buffer_ti.reset();
+    _Timer.stop("TEMP_FT_reset");
 
     _Timer.stop("IMAG_FT_WtoT");
     return dW_tqPQ;
@@ -524,7 +3476,8 @@ namespace solvers {
   void scr_coulomb_t::dump_eps_inv_head(const nda::ArrayOfRank<2> auto &eps_inv_head_tq,
                                         const nda::ArrayOfRank<1> auto &eps_inv_head_t,
                                         std::string coqui_h5_prefix, long iter,
-                                        comm_t &comm, mf::MF &mf) {
+                                        comm_t &comm, mf::MF &mf,
+                                        eps_fit::eps_inf_fit_t const *fit) {
     if (comm.root()) {
       long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
       nda::array<ComplexType, 2> eps_inv_head_wq(nw_half, mf.nqpts_ibz());
@@ -537,6 +3490,7 @@ namespace solvers {
 
       std::string filename = coqui_h5_prefix + ".mbpt.h5";
       std::string grp_name = "iter" + std::to_string(iter);
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(filename, 'a');
       h5::group grp(file);
       auto scf_grp = (grp.has_subgroup("scf")) ? grp.open_group("scf") : grp.create_group("scf");
@@ -547,8 +3501,55 @@ namespace solvers {
       nda::h5_write(iter_grp, "eps_inv_head_tq", eps_inv_head_tq, false);
       nda::h5_write(iter_grp, "eps_inv_head_w", eps_inv_head_w, false);
       nda::h5_write(iter_grp, "eps_inv_head_t", eps_inv_head_t, false);
+
+      // Macroscopic dielectric head eps_head(inu) = 1/eps^{-1}_head(q->0, inu)
+      // and the static macroscopic dielectric constant epsilon_inf.
+      // eps_inv_head_w stores (eps^{-1}_head - 1) on the bosonic Matsubara half-grid
+      // (index 0 = inu=0), so the physical eps^{-1}_head = 1 + eps_inv_head_w. With an
+      // active vertex this is P^C-corrected.
+      nda::array<ComplexType, 1> eps_head_w(nw_half);
+      for (long iw = 0; iw < nw_half; ++iw)
+        eps_head_w(iw) = ComplexType(1.0) / (ComplexType(1.0) + eps_inv_head_w(iw));
+      double epsilon_inf = 1.0 / (1.0 + eps_inv_head_w(0).real());
+      nda::h5_write(iter_grp, "eps_head_w", eps_head_w, false);
+      h5::h5_write(iter_grp, "epsilon_inf", epsilon_inf);
+      // eps_inf_fit = true: the small-q fit next to the stored head -- the constant term,
+      // the coefficients c_k of eps_M(q) = sum_k c_k |q|^{2k}, the |q| and eps_M(q) used, the RMS misfit.
+      if (fit != nullptr and fit->ok) {
+        const long ncf = static_cast<long>(fit->coeffs.size()), nqa = static_cast<long>(fit->q_used.size());
+        nda::array<double, 1> cf(ncf), qa(nqa), eu(nqa);
+        for (long i = 0; i < cf.shape(0); ++i) cf(i) = fit->coeffs[size_t(i)];
+        for (long i = 0; i < qa.shape(0); ++i) qa(i) = fit->q_used[size_t(i)];
+        for (long i = 0; i < eu.shape(0); ++i) eu(i) = fit->eps_used[size_t(i)];
+        h5::h5_write(iter_grp, "epsilon_inf_fit", fit->eps_inf);
+        h5::h5_write(iter_grp, "epsilon_inf_fit_residual", fit->residual);
+        nda::h5_write(iter_grp, "epsilon_inf_fit_coeffs", cf, false);
+        nda::h5_write(iter_grp, "epsilon_inf_fit_qabs", qa, false);
+        nda::h5_write(iter_grp, "epsilon_inf_fit_eps", eu, false);
+      }
     }
     comm.barrier();
+  }
+
+  // eps_M(q) = 1 / (1 + Re[eps^-1_{00}(q, i nu = 0) - 1]) at every IBZ transfer from the
+  // q-resolved tau head, then eps_fit::fit_eps_inf on the smallest nonzero Cartesian |q|. The |q|-only
+  // fit is exact for a cubic cell; for a lower symmetry eps(q -> 0) is direction-dependent and the fit
+  // averages over the directions the smallest IBZ transfers happen to sample.
+  eps_fit::eps_inf_fit_t scr_coulomb_t::eval_eps_inf_fit(const nda::ArrayOfRank<2> auto &eps_inv_head_tq,
+                                                          mf::MF &mf) const {
+    const long nq = eps_inv_head_tq.shape(1);
+    utils::check(nq == mf.nqpts_ibz(), "eval_eps_inf_fit: eps_inv_head_tq has {} q rows, expected nqpts_ibz = {}.",
+                 nq, mf.nqpts_ibz());
+    long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+    nda::array<ComplexType, 2> eih_wq(nw_half, nq);
+    _ft->tau_to_w_PHsym(eps_inv_head_tq, eih_wq);   // i nu = 0 = index 0 of the PH-sym bosonic half grid
+    std::vector<double> q_abs(static_cast<size_t>(nq)), eps_q(static_cast<size_t>(nq));
+    for (long iq = 0; iq < nq; ++iq) {
+      auto qp = mf.Qpts_ibz(iq);                     // Cartesian, bohr^-1, 2 pi included (bz_symmetry.hpp)
+      q_abs[size_t(iq)] = std::sqrt(qp(0) * qp(0) + qp(1) * qp(1) + qp(2) * qp(2));
+      eps_q[size_t(iq)] = 1.0 / (1.0 + eih_wq(0, iq).real());
+    }
+    return eps_fit::fit_eps_inf(q_abs, eps_q, _eps_inf_fit_npts);
   }
 
 
@@ -558,7 +3559,587 @@ namespace solvers {
   using Arrv = nda::array_view<ComplexType, 5>;
   using Arrv2 = nda::array_view<ComplexType, 5, nda::C_layout>;
 
-  template void scr_coulomb_t::update_w(MBState&, thc_reader_t&, long);
+  // The interp file's column "Pi_<col>" on this mesh's q list at the PH-sym half nodes, in the
+  // frozen-point secondary frame -- ONE read shared by the W-Dyson injection (inject_pol_ladder) and the Sigma vertex
+  // (build_sigma_lff); every consistency check of the consumer (node list, beta, N_m, q matching) lives here.
+  nda::array<ComplexType, 4> scr_coulomb_t::read_pol_interp_column(std::string const &colname, long nq_g, long nw_h_ft,
+                                                                    nda::array<long, 1> const &nu_half, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    utils::check(_pol_vtx != nullptr and not _pol_vtx->pol_interp_file().empty(),
+                 "read_pol_interp_column: no pol_vertex_interp_file.");
+    auto MF = thc.MF();
+    auto lat = MF->lattv();
+    auto Q = MF->Qpts();
+    auto q_crys = [&](long iq, double *qc) {
+      for (long i = 0; i < 3; ++i) { double v = 0.0; for (long j = 0; j < 3; ++j) v += lat(i, j) * Q(iq, j); qc[i] = v / (2.0 * M_PI); }
+    };
+    const std::string col = "Pi_" + colname;
+    // The column can be GB-sized: the root reads it, the others receive a broadcast, and the q-matched result is cached
+    // for the run (the file is an input: fixed content).
+    const std::string ckey = _pol_vtx->pol_interp_file() + "|" + col + "|" + std::to_string(nq_g);
+    const bool use_cache = (methods::vertex_debug::number("interp_cache", 1.0) != 0.0);   // vertex_debug: interp_cache
+    if (use_cache) {
+      auto it = _interp_col_cache.find(ckey);
+      if (it != _interp_col_cache.end()) return it->second;
+    }
+    auto &comm = thc.mpi()->comm;
+    nda::array<double, 2> qf;
+    nda::array<ComplexType, 4> Pf;
+    nda::array<long, 1> nu_f;
+    double beta_f = -1.0;
+    {
+      std::array<long, 7> shp{0, 0, 0, 0, 0, 0, 0};    // qf (2), Pf (4), nu_f (1)
+      int has_nu = 1;
+      if (comm.root()) {
+        h5::file f(_pol_vtx->pol_interp_file(), 'r');
+        h5::group g(f);
+        has_nu = g.has_dataset("nu_half") ? 1 : 0;
+        if (has_nu) {
+          nda::h5_read(g, "q", qf);
+          nda::h5_read(g, col, Pf);
+          nda::h5_read(g, "nu_half", nu_f);
+          if (g.has_dataset("beta")) h5::h5_read(g, "beta", beta_f);
+          shp = {qf.shape(0), qf.shape(1), Pf.shape(0), Pf.shape(1), Pf.shape(2), Pf.shape(3), long(nu_f.size())};
+        }
+      }
+      comm.broadcast_n(&has_nu, 1, 0);
+      utils::check(has_nu == 1,
+                   "inject_pol_ladder: {} carries no nu_half axis -- an inu = 0-only dump cannot feed the W-Dyson "
+                   "(dump the coarse run's whalf / all-nu columns).", _pol_vtx->pol_interp_file());
+      comm.broadcast_n(shp.data(), 7, 0);
+      comm.broadcast_n(&beta_f, 1, 0);
+      if (not comm.root()) {
+        qf = nda::array<double, 2>(shp[0], shp[1]);
+        Pf = nda::array<ComplexType, 4>(shp[2], shp[3], shp[4], shp[5]);
+        nu_f = nda::array<long, 1>(shp[6]);
+      }
+      comm.broadcast_n(qf.data(), qf.size(), 0);
+      comm.broadcast_n(nu_f.data(), nu_f.size(), 0);
+      {                                                 // the column in chunks (MPI counts are int)
+        const size_t n = size_t(Pf.size()), chunk = size_t(1) << 26;
+        for (size_t o = 0; o < n; o += chunk) comm.broadcast_n(Pf.data() + o, std::min(chunk, n - o), 0);
+      }
+    }
+    utils::check(long(nu_f.size()) == nw_h_ft, "inject_pol_ladder: {} has {} half nodes, this run's IAFT has {} -- the "
+                 "coarse and fine runs must share beta / basis / precision.", _pol_vtx->pol_interp_file(), nu_f.size(), nw_h_ft);
+    for (long j = 0; j < nw_h_ft; ++j)
+      utils::check(nu_f(j) == nu_half(j), "inject_pol_ladder: half node {} is Matsubara index {} in the file, {} here.",
+                   j, nu_f(j), nu_half(j));
+    if (beta_f > 0.0) utils::check(std::abs(beta_f - _ft->beta()) < 1e-8, "inject_pol_ladder: beta {} (file) != {} (run).", beta_f, _ft->beta());
+    const long Nm_v = _pol_vtx->secondary_rank();
+    utils::check(Pf.shape(0) == nw_h_ft and Pf.shape(2) == Nm_v and Pf.shape(3) == Nm_v and Pf.shape(1) == qf.shape(0),
+                 "inject_pol_ladder: {} in {} is {} x {} x {} x {}, expected {} x nq x {} x {}.", col, _pol_vtx->pol_interp_file(),
+                 Pf.shape(0), Pf.shape(1), Pf.shape(2), Pf.shape(3), nw_h_ft, Nm_v, Nm_v);
+    nda::array<ComplexType, 4> Pl(nw_h_ft, nq_g, Nm_v, Nm_v);
+    for (long iq = 0; iq < nq_g; ++iq) {
+      double qc[3]; q_crys(iq, qc);
+      long hit = -1;
+      for (long jq = 0; jq < qf.shape(0) and hit < 0; ++jq) {
+        bool same = true;
+        for (long i = 0; i < 3 and same; ++i) { const double d = qf(jq, i) - qc[i]; same = std::abs(d - std::round(d)) < 1e-5; }
+        if (same) hit = jq;
+      }
+      utils::check(hit >= 0, "inject_pol_ladder: q = ({:.6f}, {:.6f}, {:.6f}) (crystal) of this mesh is absent from {}.",
+                   qc[0], qc[1], qc[2], _pol_vtx->pol_interp_file());
+      Pl(all, iq, all, all) = Pf(all, hit, all, all);
+    }
+    if (use_cache) _interp_col_cache[ckey] = Pl;
+    return Pl;
+  }
+
+  namespace sigma_lff_detail {
+    // the PH mirror of the bosonic mesh (wn(mirror(l)) = -wn(l)), the map fold_dW_distributed unfolds the half mesh with
+    inline nda::array<long, 1> bosonic_mirror(const imag_axes_ft::IAFT &ft) {
+      const long nw_b = ft.nw_b();
+      auto wb = ft.wn_mesh_b();
+      nda::array<long, 1> mirror(nw_b);
+      for (long l = 0; l < nw_b; ++l) {
+        mirror(l) = -1;
+        for (long m = 0; m < nw_b; ++m) if (wb(m) == -wb(l)) { mirror(l) = m; break; }
+        utils::check(mirror(l) >= 0, "sigma_lff: the bosonic Matsubara mesh is not PH-symmetric (no mirror of node {}).", l);
+      }
+      return mirror;
+    }
+  }
+
+  // Sigma vertex, pol_vertex_sigma_bub = "full": fold the loop's RPA Pi(tau) (the (t, q, P, Q) darray of eval_Pi_qdep,
+  // BEFORE any injection) to the frozen secondary frame at the PH-sym half nodes, with the same distributed fold the
+  // dynamic W-bar cache uses (a (q, t, P, Q) copy first: that routine's layout). Replicated (nq, nw_half, N_m, N_m).
+  template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+  void scr_coulomb_t::fold_rpa_pi_secondary(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    using math::nda::make_distributed_array;
+    auto mpi = thc.mpi();
+    auto MF = thc.MF();
+    const long nq = MF->nqpts_ibz(), Np = thc.Np(), Nm = _pol_vtx->secondary_rank();
+    const long nw_b = _ft->nw_b(), nw_h = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    auto gs = dPi_tqPQ.global_shape();
+    const long nt_h = gs[0];
+    utils::check(gs[1] == nq and gs[2] == Np and gs[3] == Np,
+                 "fold_rpa_pi_secondary: unexpected Pi global shape ({}, {}, {}, {}).", gs[0], gs[1], gs[2], gs[3]);
+    auto pg = dPi_tqPQ.grid();
+    auto bs = dPi_tqPQ.block_size();
+    auto dPi_qtPQ = make_distributed_array<nda::array<ComplexType, 4>>(
+        mpi->comm, {pg[1], pg[0], pg[2], pg[3]}, {gs[1], gs[0], gs[2], gs[3]}, {bs[1], bs[0], bs[2], bs[3]});
+    {
+      auto A = dPi_tqPQ.local();
+      auto B = dPi_qtPQ.local();
+      const long ntl = dPi_tqPQ.local_shape()[0], nql = dPi_tqPQ.local_shape()[1];
+      for (long iq = 0; iq < nql; ++iq)
+        for (long it = 0; it < ntl; ++it) B(iq, it, nda::ellipsis{}) = A(it, iq, nda::ellipsis{});
+    }
+    auto mirror = sigma_lff_detail::bosonic_mirror(*_ft);
+    nda::array<ComplexType, 4> Pb(nq, nw_b, Nm, Nm);
+    auto no_head = [](auto &&, long, nda::range const &, nda::range const &) {};
+    auto xform = [&](nda::MemoryArrayOfRank<3> auto &&Xt, nda::MemoryArrayOfRank<3> auto &&Xw) { _ft->tau_to_w_PHsym(Xt, Xw); };
+    vertex_secondary_detail::fold_dW_distributed(dPi_qtPQ, _pol_vtx->secondary_transfer(), nq, nt_h, Np, Nm, nw_b, nw_h,
+                                                 mirror, 0, false, no_head, xform, Pb, mpi->comm);
+    _sig_pi0_qwmm.emplace(nda::array<ComplexType, 4>(nq, nw_h, Nm, Nm));
+    for (long iq = 0; iq < nq; ++iq)
+      for (long j = 0; j < nw_h; ++j) _sig_pi0_qwmm.value()(iq, j, all, all) = Pb(iq, nw_b / 2 + j, all, all);
+    app_log(1, "  [Sigma vertex] pol_vertex_sigma_bub = \"full\": the loop's RPA Pi folded to the frozen secondary frame, "
+               "(nq, nw_half, N_m) = ({}, {}, {}).", nq, nw_h, Nm);
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // build_sigma_lff (pol_vertex_sigma = "lff"): the local-field-factor vertex in the SELF-ENERGY.
+  // With a vertex that acts on the aux (density) index only, Hedin's Sigma = i G W Gamma collapses to Sigma = G W~ with
+  // W~ = W Gamma_eff (Del Sole, Reining, Godby 1994); here Gamma_eff = Pi_0^-1 (Pi_0 + dPi) in the frozen secondary
+  // frame, so that P = Pi_0 Gamma_eff reproduces the injected polarization by construction:
+  //     Gamma_eff - 1 = Pi_0^-1 dPi,       dW~(q, i nu) = scale x Herm[ W-bar(q, i nu) (Gamma_eff - 1) ],
+  // W-bar = t (Z + dW) t^dag = THIS iteration's full W folded to the frame at every PH-sym half node (no Gamma-head
+  // insertion: the loop's dW(Gamma) is head-free and the correction's own q -> 0 head is extracted below exactly as the
+  // loop extracts eps_inv_head from dW). The Hermitization is a CONVENTION (W Gamma is not Hermitian, Sigma must be;
+  // the Gamma^1/2 W Gamma^1/2 split is the alternative -- neither is derived from the ladder's leg structure).
+  // dPi = the interp file's column (the injected one by default); Pi_0 = the file's window bubble ("Pi_bub",
+  // pol_vertex_sigma_bub = "window") or the loop's RPA Pi folded to the frame ("full"). The correction is upfolded to
+  // the THC frame with the injection's adjoint map, transformed nu -> tau, its head extracted with the loop's own
+  // extractor, and published as (mb_state.dWsig_qtPQ, eps_inv_head_sig) for a SECOND GW contraction in gw_t::evaluate,
+  // on top of Sigma^GW. W, the kernel caches, the readout and every other consumer of dW are untouched; scale = 0 adds
+  // a zero correction. Cost: N_m-class algebra per (q, nu) + one extra Sigma contraction.
+  // ---- build_sigma_pair (pol_vertex_sigma = "pair"): the pair-resolved static-ladder vertex in Sigma ---------------
+  // The readout instance (_pol_vtx) carries the frozen secondary frame, W-bar_0 (build_w0 at the pure-RPA point of this
+  // update) and, on demand, the W-bar cache; the knobs live on the knob carrier (_vertex). The result is the C-window
+  // block dSigma(tau) in band labels, published for gw_t::evaluate (added to Sigma after Sigma^GW).
+  void scr_coulomb_t::build_sigma_pair(MBState &mb_state, THC_ERI auto &thc) {
+    utils::check(_vertex != nullptr and _vertex->pol_vertex_active() and not _vertex->active(),
+                 "build_sigma_pair: pol_vertex_sigma = \"pair\" needs the ladder machinery (pol_vertex = \"ladder\", a non-empty "
+                 "window) and an INACTIVE vertex_type.");
+    ensure_pol_vertex(thc);
+    utils::check(_pol_vtx != nullptr, "build_sigma_pair: no readout instance.");
+    vertex_t::sigma_pair_opts o = sigma_pair_opts_of(*_vertex, mb_state);
+    const bool dyn = _vertex->sigma_pair_dynamic();
+    int self_full = -1;   // the in-run reference mode: 1 = this pass is a reference, 0 = sampled, -1 = not in that mode
+    if (dyn and _vertex->sigma_dyn_self_ref()) {
+      // pol_vertex_sigma_dyn_fit_file = "self": the IN-RUN reference -- the first pass (every pol_vertex_sigma_dyn_ref_period-th
+      // pass since the last reference, the pass after a pol_vertex_sigma_dyn_ref_adaptive trigger, and the scf's final pass with
+      // pol_vertex_sigma_dyn_final_full) solves every node and writes <prefix>.sigdyn.h5; the others run nu-sampled from that file
+      utils::check(not _vertex->sigma_share(), "build_sigma_pair: pol_vertex_sigma_dyn_fit_file = \"self\" is not available with pol_vertex_sigma_share.");
+      const long per = _vertex->sigma_dyn_ref_period();
+      const bool by_period = (per > 0 and _sigma_since_ref >= per);
+      const bool full = (_sigma_self_passes == 0) or by_period or _sigma_renew_ref or _sigma_final_req;
+      const std::string ref = mb_state.coqui_prefix + ".sigdyn.h5";
+      if (full) {
+        o.dyn_dump = true; o.dyn_nodes.clear(); o.dyn_auto_nodes = 0; o.dyn_fit_file.clear();
+        app_log(1, "  [Sigma vertex, dynamic] in-run reference (pass {}{}): every node, the per-node objects written to {}.", _sigma_self_passes,
+                (_sigma_self_passes == 0) ? "" : (_sigma_renew_ref ? ", renewed: dSigma moved past pol_vertex_sigma_dyn_ref_change"
+                                                 : (by_period ? ", renewed by the period" : ", the scf's final pass (pol_vertex_sigma_dyn_final_full)")), ref);
+      } else {
+        o.dyn_dump = false; o.dyn_fit_file = ref;
+        utils::check(not o.dyn_nodes.empty() or o.dyn_auto_nodes > 0,
+                     "build_sigma_pair: pol_vertex_sigma_dyn_fit_file = \"self\" needs pol_vertex_sigma_dyn_auto_nodes (or _nodes) for the sampled passes.");
+        app_log(1, "  [Sigma vertex, dynamic] in-run reference: pass {} nu-SAMPLED from {} ({} pass(es) after the reference).", _sigma_self_passes,
+                ref, _sigma_since_ref);
+      }
+      self_full = full ? 1 : 0;
+      _sigma_since_ref = full ? 1 : _sigma_since_ref + 1;
+      _sigma_renew_ref = false;
+      _sigma_final_req = false;
+      _sigma_last_full = full;
+      ++_sigma_self_passes;
+    }
+    nda::array<ComplexType, 4> Pchk;
+    if (_vertex->sigma_pair_diag() and not dyn) {
+      // the P side's own object from the same amplitudes: dumped with the run prefix for the test / offline check
+      const long nq = thc.MF()->nqpts_ibz(), Nm = _pol_vtx->secondary_rank(), nw_b = _ft->nw_b();
+      Pchk = nda::array<ComplexType, 4>(nw_b, nq, Nm, Nm);
+      o.Pi_check = std::addressof(Pchk);
+    }
+    nda::array<ComplexType, 5> dS;
+    vertex_t::sigma_pair_meter met;
+    const long w0 = _pol_vtx->band_window().first(), ncw = long(_pol_vtx->band_window().size());
+    nda::array<double, 1> tau_f(_ft->tau_mesh_f());
+    if (not _vertex->sigma_interp_file().empty()) {
+      // the fine consumer -- the coarse run's Wannier-frame dSigma interpolated onto this mesh's window (no solve)
+      ladder_meter::watch iw;
+      utils::check(not _vertex->sigma_interp_projector().empty(), "build_sigma_pair: pol_vertex_sigma_interp_file needs pol_vertex_sigma_interp_projector (this mesh's Wannier file).");
+      projector_t proj_f(*thc.MF(), _vertex->sigma_interp_projector());
+      vertex_sigma_interp::interp_meter imet;   // the dump is checked against this run's Sigma-vertex configuration
+      dS = vertex_sigma_interp::interpolate_sigma_pair(*thc.MF(), proj_f, _vertex->sigma_interp_file(), tau_f, _ft->beta(), w0, ncw,
+                                                       thc.mpi()->comm, vertex_sigma_interp::cfg_of(o, dyn), &imet);
+      for (auto const &v : dS) met.dsig_max = std::max(met.dsig_max, std::abs(v));
+      met.dsig_herm = imet.herm_resid; met.ks_herm = 0.0; met.t_total = iw.lap();   // the interpolation's measured residual
+    } else if (dyn) _pol_vtx->eval_sigma_pair_dyn(mb_state, thc, o, dS, &met);   // the dynamic-rung ladder in Sigma
+    else _pol_vtx->eval_sigma_pair(mb_state, thc, o, dS, &met);
+    if (self_full >= 0 and _vertex->sigma_dyn_ref_adaptive() and _vertex->sigma_interp_file().empty()) {
+      // pol_vertex_sigma_dyn_ref_adaptive: the distance of this pass's state from the reference's, measured on the vertex dSigma
+      // itself (replicated: the same number on every rank); above pol_vertex_sigma_dyn_ref_change the next pass is a reference
+      if (self_full == 1) {
+        _sigma_ref_dS = dS;
+      } else {
+        utils::check(_sigma_ref_dS.has_value() and _sigma_ref_dS->shape() == dS.shape(),
+                     "build_sigma_pair: the in-run reference's dSigma is missing or has another shape (internal).");
+        auto const &R = *_sigma_ref_dS;
+        double num = 0.0, den = 0.0;
+        for (long i = 0; i < long(dS.size()); ++i) {
+          num += std::norm(dS.data()[i] - R.data()[i]);
+          den += std::norm(R.data()[i]);
+        }
+        const double chg = (den > 0.0) ? std::sqrt(num / den) : 0.0;
+        const double x = _vertex->sigma_dyn_ref_change();
+        _sigma_renew_ref = (chg > x);
+        char tail[96] = "";
+        std::snprintf(tail, sizeof(tail), _sigma_renew_ref ? " > %.1e: the NEXT pass renews the reference" : " (renewal above %.1e)", x);
+        app_log(1, "  [Sigma vertex, dynamic] in-run reference: |dSigma - dSigma_ref| / |dSigma_ref| = {:.3e} since the reference{}.", chg,
+                std::string(tail));
+      }
+    }
+    if (not _vertex->sigma_interp_dump().empty() and _vertex->sigma_interp_file().empty()) {
+      // the coarse producer -- dSigma downfolded to the Wannier frame with its k list and R grid, for a finer mesh
+      projector_t proj_c(*thc.MF(), _vertex->sigma_interp_dump());
+      const std::string fn = mb_state.coqui_prefix + ".sigpair_wan.h5";
+      vertex_sigma_interp::dump_sigma_pair_wannier(*thc.MF(), proj_c, dS, w0, tau_f, _ft->beta(), thc.mpi()->comm, fn, vertex_sigma_interp::cfg_of(o, dyn));
+    }
+    if (_vertex->sigma_pair_diag() and thc.mpi()->comm.root()) {
+      const std::string fn = mb_state.coqui_prefix + ".sigpair.h5";
+      h5::file f(fn, 'w');
+      h5::group g(f);
+      if (not dyn) {
+        nda::h5_write(g, "Pi_check", Pchk);
+        nda::h5_write(g, "nu_spec", met.nu_spec);
+      }
+      nda::h5_write(g, "dSigma_tskab", dS);
+      h5::h5_write(g, "side", o.side);
+      h5::h5_write(g, "col", o.col);
+      h5::h5_write(g, "outer", o.outer);
+      app_log(1, "  [Sigma vertex, pair] diagnostics written to {} (Pi_check (nw_b, nq, N_m, N_m), nu_spec, dSigma_tskab)", fn);
+    }
+    mb_state.dSigma_pair_tskab.emplace(std::move(dS));
+    mb_state.sigma_pair_window = {_pol_vtx->band_window().first(), long(_pol_vtx->band_window().size())};
+    _sig_pair_meter = {met.dsig_max, met.dsig_herm, met.ks_herm, met.t_total};
+  }
+
+  void scr_coulomb_t::build_sigma_lff(MBState &mb_state, THC_ERI auto &thc, std::array<long, 4> t_pgrid, std::array<long, 4> t_bsize) {
+    decltype(nda::range::all) all;
+    using math::nda::make_distributed_array;
+    utils::check(_vertex != nullptr and _vertex->pol_vertex_active() and not _vertex->active(),
+                 "build_sigma_lff: pol_vertex_sigma needs the ladder machinery (pol_vertex = \"ladder\") and an INACTIVE vertex_type.");
+    ensure_pol_vertex(thc);
+    utils::check(not _pol_vtx->pol_interp_file().empty() and not _pol_vtx->isdf_points_file().empty(),
+                 "build_sigma_lff: pol_vertex_sigma = \"lff\" needs pol_vertex_interp_file (dPi and the window bubble) and "
+                 "pol_vertex_isdf_points_file (its frozen frame).");
+    utils::check(mb_state.dW_qtPQ.has_value(), "build_sigma_lff: dW_qtPQ is not stored (must run at the update_w tail).");
+    ladder_meter::watch sw;
+    auto mpi = thc.mpi();
+    auto MF = thc.MF();
+    const long nq = MF->nqpts_ibz(), Np = thc.Np(), Nm = _pol_vtx->secondary_rank();
+    const long nw_b = _ft->nw_b(), nw_h = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    const long nt_h = long(mb_state.dW_qtPQ.value().global_shape()[1]);
+    nda::array<long, 1> nu_half(nw_h);
+    { auto wb = _ft->wn_mesh_b(); for (long j = 0; j < nw_h; ++j) nu_half(j) = long(wb(nw_b / 2 + j)); }
+    const std::string col = _vertex->sigma_lff_col().empty() ? _pol_vtx->pol_interp_col() : _vertex->sigma_lff_col();
+    const bool full_bub = (_vertex->sigma_lff_bub() == "full");
+    const double scale = _vertex->sigma_lff_scale(), tol = _vertex->sigma_lff_pinv_tol(), hscale = _vertex->sigma_lff_head_scale();
+    auto const &tmap = _pol_vtx->secondary_transfer();               // (nq, Nm, Np)
+    utils::check(tmap.shape(0) == nq and tmap.shape(1) == Nm and tmap.shape(2) == Np,
+                 "build_sigma_lff: secondary transfer is {}x{}x{}, expected {}x{}x{}.", tmap.shape(0), tmap.shape(1), tmap.shape(2), nq, Nm, Np);
+
+    // ---- 1. dPi and Pi_0 in the frozen frame at the half nodes: (nw_h, nq, Nm, Nm), replicated ---------------------
+    auto dP = read_pol_interp_column(col, nq, nw_h, nu_half, thc);
+    nda::array<ComplexType, 4> P0;
+    if (full_bub) {
+      utils::check(_sig_pi0_qwmm.has_value(), "build_sigma_lff: the folded RPA bubble is missing (eval_Pi_qdep stash).");
+      P0 = nda::array<ComplexType, 4>(nw_h, nq, Nm, Nm);
+      for (long j = 0; j < nw_h; ++j)
+        for (long iq = 0; iq < nq; ++iq) P0(j, iq, all, all) = _sig_pi0_qwmm.value()(iq, j, all, all);
+    }
+    auto Bd = read_pol_interp_column("bub", nq, nw_h, nu_half, thc);   // the dump's window bubble (always written)
+    if (not full_bub) P0 = Bd;
+    // normalization / sign diagnostics of the local vertex at (q_1, nu_0) and (Gamma, nu_0): the strong-subspace scalar
+    // tr(P dPi P) / tr(P B P) and, for "full", tr(Pib) / tr(B_dump) (Pib must
+    // be >= the window bubble in magnitude: more transitions; a normalization mismatch shows up here first)
+    double v_q1 = 0.0, v_q0 = 0.0, pb_q1 = 0.0, pb_q0 = 0.0, v_tail = 0.0;
+    {
+      for (long iq : {std::min(1l, nq - 1), 0l, -1l}) {
+        const long jn = (iq < 0) ? nw_h - 1 : 0;            // -1: the tail node at q_1
+        if (iq < 0) iq = std::min(1l, nq - 1);
+        nda::matrix<ComplexType> Bm(Nm, Nm);
+        for (long a = 0; a < Nm; ++a)
+          for (long b = 0; b < Nm; ++b) Bm(a, b) = 0.5 * (P0(jn, iq, a, b) + std::conj(P0(jn, iq, b, a)));
+        auto [lam, V] = nda::linalg::eigenelements(Bm);
+        double lmax = 0.0;
+        for (long a = 0; a < Nm; ++a) lmax = std::max(lmax, std::abs(lam(a)));
+        double num = 0.0, den = 0.0, trb = 0.0, trd = 0.0;
+        for (long b = 0; b < Nm; ++b) {
+          if (std::abs(lam(b)) <= tol * lmax) continue;
+          // <v_b| dPi |v_b> and lam_b on the strong subspace
+          ComplexType d = 0.0;
+          for (long a = 0; a < Nm; ++a)
+            for (long c = 0; c < Nm; ++c) d += std::conj(V(a, b)) * dP(jn, iq, a, c) * V(c, b);
+          num += d.real(); den += lam(b);
+        }
+        for (long a = 0; a < Nm; ++a) { trb += Bd(jn, iq, a, a).real(); trd += P0(jn, iq, a, a).real(); }
+        const double v = num / (std::abs(den) > 1e-300 ? den : 1e-300), pb = trd / (std::abs(trb) > 1e-300 ? trb : 1e-300);
+        if (jn > 0) v_tail = v; else if (iq == 0) { v_q0 = v; pb_q0 = pb; } else { v_q1 = v; pb_q1 = pb; }
+      }
+    }
+    const double t_read = sw.lap();
+
+    // ---- 2. the frame metric M(q) = t t^dag (t is NOT an isometry), its inverse, and Z t^dag (replicated per q) -----------
+    // Derivation: with the code's maps -- kernels fold as W-bar = t W t^dag, polarizations upfold as
+    // Pi = t^dag Pi_S t -- the primary-frame vertex operator that reproduces P = Pi_0 + t^dag dPi_S t on the window
+    // subspace is Gamma - 1 = t^dag G1 t with G1 = M^-1 B^-1 dPi_S (window bubble B = the dump's Pi_bub, primary
+    // t^dag B t) or G1 = Pib^-1 M dPi_S (full bubble: Pib = t Pi_0 t^dag, the projector t^dag M^-1 t on Pi_0). Folding
+    // W to W-bar and upfolding the product would insert a spurious t^dag t on the left of W (large errors in the head),
+    // so W stays in the PRIMARY frame: dW~ = scale x Herm[ (Z + dW) t^dag G1 t ], built block-wise below.
+    nda::array<ComplexType, 3> Mq(nq, Nm, Nm), Minv(nq, Nm, Nm), Zt(nq, Np, Nm);
+    double mcond_max = 0.0;
+    {
+      nda::matrix<ComplexType> Mm(Nm, Nm), VL(Nm, Nm);
+      for (long iq = 0; iq < nq; ++iq) {
+        auto t_q = tmap(iq, all, all);                                   // (Nm x Np)
+        nda::blas::gemm(t_q, nda::dagger(t_q), Mm);                     // M = t t^dag
+        Mq(iq, all, all) = Mm;
+        auto [lam, V] = nda::linalg::eigenelements(Mm);
+        double lmax = 0.0, lmin = 1e300;
+        for (long a = 0; a < Nm; ++a) { lmax = std::max(lmax, std::abs(lam(a))); lmin = std::min(lmin, std::abs(lam(a))); }
+        mcond_max = std::max(mcond_max, lmax / std::max(lmin, 1e-300));
+        for (long b = 0; b < Nm; ++b)
+          for (long a = 0; a < Nm; ++a) VL(a, b) = (std::abs(lam(b)) > 1e-12 * lmax) ? V(a, b) / lam(b) : ComplexType(0.0);
+        nda::blas::gemm(VL, nda::dagger(V), Mm);
+        Minv(iq, all, all) = Mm;
+        nda::array<ComplexType, 2> Zq = thc.Z(int(iq));                 // collective: every rank, every q
+        nda::blas::gemm(Zq, nda::dagger(t_q), Zt(iq, all, all));        // (Np x Np)(Np x Nm)
+      }
+    }
+    const double t_fold = sw.lap();
+
+    // ---- 3. G1(q, nu_j) = M^-1 B^-1 dPi (window) | Pib^-1 M dPi (full), B / Pib regularized (strong modes) -----------
+    nda::array<ComplexType, 4> G1(nw_h, nq, Nm, Nm);
+    G1() = ComplexType(0.0);
+    double g_max = 0.0, g_q1 = 0.0, g_q0 = 0.0;
+    long ncut_max = 0;
+    {
+      nda::matrix<ComplexType> Bm(Nm, Nm), VL(Nm, Nm), Binv(Nm, Nm), dPm(Nm, Nm), T1(Nm, Nm), T2(Nm, Nm);
+      for (long iq = 0; iq < nq; ++iq) {
+        if (iq % mpi->comm.size() != mpi->comm.rank()) continue;
+        for (long j = 0; j < nw_h; ++j) {
+          for (long a = 0; a < Nm; ++a)
+            for (long b = 0; b < Nm; ++b) Bm(a, b) = 0.5 * (P0(j, iq, a, b) + std::conj(P0(j, iq, b, a)));
+          auto [lam, V] = nda::linalg::eigenelements(Bm);
+          double lmax = 0.0;
+          for (long a = 0; a < Nm; ++a) lmax = std::max(lmax, std::abs(lam(a)));
+          long ncut = 0;
+          for (long b = 0; b < Nm; ++b) {
+            const bool keep = std::abs(lam(b)) > tol * lmax;
+            if (not keep) ++ncut;
+            for (long a = 0; a < Nm; ++a) VL(a, b) = keep ? V(a, b) / lam(b) : ComplexType(0.0);
+          }
+          ncut_max = std::max(ncut_max, ncut);
+          nda::blas::gemm(VL, nda::dagger(V), Binv);                     // Pi_0^-1 on the strong subspace
+          dPm = dP(j, iq, all, all);
+          if (full_bub) {
+            nda::blas::gemm(Mq(iq, all, all), dPm, T1);                  // M dPi
+            nda::blas::gemm(Binv, T1, T2);                               // Pib^-1 M dPi
+          } else {
+            nda::blas::gemm(Binv, dPm, T1);                              // B^-1 dPi
+            nda::blas::gemm(Minv(iq, all, all), T1, T2);                 // M^-1 B^-1 dPi
+          }
+          double nG = 0.0;
+          for (long a = 0; a < Nm; ++a)
+            for (long b = 0; b < Nm; ++b) { G1(j, iq, a, b) = T2(a, b); nG += std::norm(T2(a, b)); }
+          const double g = std::sqrt(nG / double(Nm));
+          g_max = std::max(g_max, g);
+          if (j == 0 and iq == std::min(1l, nq - 1)) g_q1 = g;
+          if (j == 0 and iq == 0) g_q0 = g;
+        }
+      }
+    }
+    mpi->comm.all_reduce_in_place_n(G1.data(), G1.size(), std::plus<>{});
+    g_max = mpi->comm.all_reduce_value(g_max, boost::mpi3::max<>{});
+    g_q1 = mpi->comm.all_reduce_value(g_q1, boost::mpi3::max<>{});
+    g_q0 = mpi->comm.all_reduce_value(g_q0, boost::mpi3::max<>{});
+    ncut_max = mpi->comm.all_reduce_value(ncut_max, boost::mpi3::max<>{});
+    const double t_alg = sw.lap();
+
+    // ---- 4. per q: Y(nu_j) = (Z + dW(i nu_j)) t^dag (Np x Nm, replicated), my (P, Q) block of dW~, nu -> tau -------------
+    auto dWs_tqPQ = make_distributed_array<nda::array<ComplexType, 4>>(mpi->comm, t_pgrid, {nt_h, nq, Np, Np}, t_bsize);
+    double r_num = 0.0, r_den = 0.0, r1_num = 0.0, r1_den = 0.0;
+    double sinf_num = 0.0, sinf_den = 0.0;   // |dW~_inf|_F^2 and |Z|_F^2 over my HF block
+    {
+      auto const &dW = mb_state.dW_qtPQ.value();                          // (q, t, P, Q), q NOT split
+      auto org = dW.origin();
+      auto lsh = dW.local_shape();
+      auto grd = dW.grid();
+      utils::check(grd[0] == 1, "build_sigma_lff: the q axis of dW_qtPQ must not be split (grid[0] = {}).", grd[0]);
+      const long t_org = org[1], P_org = org[2], Q_org = org[3];
+      const long t_bs = lsh[1], P_bs = lsh[2], Q_bs = lsh[3], np_Q = grd[3];
+      nda::range Ps(P_org, P_org + P_bs), Qs(Q_org, Q_org + Q_bs);
+      auto t_rng = dWs_tqPQ.local_range(0);
+      auto P_rng = dWs_tqPQ.local_range(2);
+      auto Q_rng = dWs_tqPQ.local_range(3);
+      utils::check(P_rng.first() == P_org and long(P_rng.size()) == P_bs and Q_rng.first() == Q_org and long(Q_rng.size()) == Q_bs
+                   and long(dWs_tqPQ.local_range(1).size()) == nq,
+                   "build_sigma_lff: the (t, q, P, Q) target layout does not match the (P, Q) partition of dW_qtPQ.");
+      const long ntl = long(t_rng.size());
+      boost::mpi3::communicator t_pool = mpi->comm.split(int(P_org * np_Q + Q_org), mpi->comm.rank());
+      auto W_loc = dW.local();
+      auto loc = dWs_tqPQ.local();
+      loc() = ComplexType(0.0);
+      nda::array<ComplexType, 3> W_bt(nt_h, P_bs, Q_bs), W_bw(nw_h, P_bs, Q_bs), Y(nw_h, Np, Nm), A(nw_h, P_bs, Q_bs), Bt(nt_h, P_bs, Q_bs);
+      nda::array<ComplexType, 2> tmpPm(P_bs, Nm), tmpPQ(P_bs, Q_bs), Sinf(P_bs, Q_bs);
+      // the INSTANTANEOUS part dW~_inf = Herm[Z t^dag G1(nu_last) t] (the vertex's nu -> inf limit times the bare Coulomb):
+      // a delta(tau) the bosonic tau machinery cannot carry -> subtracted from every node here (the remainder decays) and
+      // published on the HF exchange grid for the static self-energy (gw_t::evaluate), or dropped (pol_vertex_sigma_static)
+      const long np_hf_P = long(utils::find_proc_grid_min_diff(long(mpi->comm.size()), 1, 1)), np_hf_Q = long(mpi->comm.size()) / np_hf_P;
+      auto dWinf = make_distributed_array<nda::array<ComplexType, 3>>(mpi->comm, {1, np_hf_P, np_hf_Q}, {nq, Np, Np});
+      auto inf_loc = dWinf.local();
+      auto inf_P = dWinf.local_range(1);
+      auto inf_Q = dWinf.local_range(2);
+      inf_loc() = ComplexType(0.0);
+      nda::array<ComplexType, 2> Sfull(Np, Np), tmpNm(Np, Nm);
+      for (long iq = 0; iq < nq; ++iq) {
+        auto t_q = tmap(iq, all, all);
+        // (0) the instantaneous kernel of this q, replicated: Sfull = scale/2 [ (Z t^dag) G1(inf) t + h.c. ]
+        nda::blas::gemm(Zt(iq, all, all), G1(nw_h - 1, iq, all, all), tmpNm);      // (Np x Nm)(Nm x Nm)
+        nda::blas::gemm(tmpNm, t_q, Sfull);                                          // (Np x Nm)(Nm x Np)
+        for (long i = 0; i < Np; ++i)
+          for (long k = i; k < Np; ++k) {
+            const ComplexType v = 0.5 * scale * (Sfull(i, k) + std::conj(Sfull(k, i)));
+            Sfull(i, k) = v; Sfull(k, i) = std::conj(v);
+          }
+        inf_loc(iq, all, all) = Sfull(inf_P, inf_Q);
+        Sinf() = Sfull(Ps, Qs);
+        for (long i = 0; i < P_bs; ++i)
+          for (long k = 0; k < Q_bs; ++k) { sinf_num += std::norm(Sinf(i, k)); }
+        // (a) Y_dW = dW(q, i nu) t^dag: my block's full-t slab (t-pool all_reduce over the disjoint t partition), tau -> nu,
+        //     times t^dag on my Q range; the comm all_reduce sums the disjoint (P, Q) block partials -> replicated Y(q)
+        W_bt() = ComplexType(0.0);
+        if (t_bs > 0) W_bt(nda::range(t_org, t_org + t_bs), all, all) = W_loc(iq, all, all, all);
+        t_pool.all_reduce_in_place_n(W_bt.data(), W_bt.size(), std::plus<>{});
+        Y() = ComplexType(0.0);
+        _ft->tau_to_w_PHsym(W_bt, W_bw);                                   // every rank of the t-pool (its own t-range is kept below)
+        if (t_pool.rank() == 0)
+          for (long j = 0; j < nw_h; ++j) {
+            nda::blas::gemm(W_bw(j, all, all), nda::dagger(t_q(all, Qs)), tmpPm);   // (P_bs x Q_bs)(Q_bs x Nm)
+            for (long i = 0; i < P_bs; ++i)
+              for (long m = 0; m < Nm; ++m) Y(j, P_org + i, m) += tmpPm(i, m);
+          }
+        mpi->comm.all_reduce_in_place_n(Y.data(), Y.size(), std::plus<>{});
+        for (long j = 0; j < nw_h; ++j)                                      // (b) + Z t^dag
+          for (long i = 0; i < Np; ++i)
+            for (long m = 0; m < Nm; ++m) Y(j, i, m) += Zt(iq, i, m);
+        // (c) my block of dW~ = scale/2 [ Y G1 t + t^dag G1^dag Y^dag ]
+        double nW = 0.0, nD = 0.0;
+        for (long j = 0; j < nw_h; ++j) {
+          nda::blas::gemm(Y(j, Ps, all), G1(j, iq, all, all), tmpPm);        // (P_bs x Nm)(Nm x Nm)
+          nda::blas::gemm(tmpPm, t_q(all, Qs), tmpPQ);                        // (P_bs x Nm)(Nm x Q_bs)
+          A(j, all, all) = tmpPQ;
+          nda::blas::gemm(nda::dagger(t_q(all, Ps)), nda::dagger(G1(j, iq, all, all)), tmpPm);   // t_P^dag G1^dag
+          nda::blas::gemm(tmpPm, nda::dagger(Y(j, Qs, all)), tmpPQ);                             // (P_bs x Nm)(Nm x Q_bs)
+          for (long i = 0; i < P_bs; ++i)
+            for (long k = 0; k < Q_bs; ++k) {
+              A(j, i, k) = 0.5 * scale * (A(j, i, k) + tmpPQ(i, k)) - Sinf(i, k);   // the dynamic remainder (-> 0 as nu -> inf)
+              nD += std::norm(A(j, i, k)); nW += std::norm(W_bw(j, i, k));
+            }
+          if (j == 0 and iq == std::min(1l, nq - 1) and t_pool.rank() == 0) {
+            for (long i = 0; i < P_bs; ++i)
+              for (long k = 0; k < Q_bs; ++k) { r1_num += std::norm(A(j, i, k)); r1_den += std::norm(W_bw(j, i, k)); }
+          }
+        }
+        if (t_pool.rank() == 0) { r_num += nD; r_den += nW; }
+        // (d) nu -> tau on my block; keep my t-range
+        auto A2 = nda::reshape(A, shape_t<2>{nw_h, P_bs * Q_bs});
+        auto B2 = nda::reshape(Bt, shape_t<2>{nt_h, P_bs * Q_bs});
+        _ft->w_to_tau_PHsym(A2, B2);
+        for (long it = 0; it < ntl; ++it) loc(it, iq, all, all) = Bt(t_rng.first() + it, all, all);
+      }
+      // |dW~_inf|_F over my HF block vs |Z|_F (the size of the instantaneous piece relative to the bare Coulomb)
+      for (long iq = 0; iq < nq; ++iq) {
+        nda::array<ComplexType, 2> Zq = thc.Z(int(iq));                    // collective
+        for (long i : inf_P) for (long k : inf_Q) sinf_den += std::norm(Zq(i, k));
+      }
+      sinf_num = 0.0;
+      for (long iq = 0; iq < nq; ++iq)
+        for (long i = 0; i < long(inf_P.size()); ++i)
+          for (long k = 0; k < long(inf_Q.size()); ++k) sinf_num += std::norm(inf_loc(iq, i, k));
+      if (_vertex->sigma_lff_static()) mb_state.dWsig_inf_qPQ.emplace(std::move(dWinf));
+      else mb_state.dWsig_inf_qPQ.reset();
+    }
+    sinf_num = mpi->comm.all_reduce_value(sinf_num, std::plus<>{}); sinf_den = mpi->comm.all_reduce_value(sinf_den, std::plus<>{});
+    const double r_inf = std::sqrt(sinf_num / std::max(sinf_den, 1e-300));
+    r_num = mpi->comm.all_reduce_value(r_num, std::plus<>{}); r_den = mpi->comm.all_reduce_value(r_den, std::plus<>{});
+    r1_num = mpi->comm.all_reduce_value(r1_num, std::plus<>{}); r1_den = mpi->comm.all_reduce_value(r1_den, std::plus<>{});
+    const double r_max = std::sqrt(r_num / std::max(r_den, 1e-300)), r_q1 = std::sqrt(r1_num / std::max(r1_den, 1e-300));
+    // ---- 5. the q -> 0 head of the correction, with the loop's own extractor (eps_inv_head convention) --------------
+    const bool cvv = (_div_treatment == "cvv");
+    auto [eih_q, eih] = div_utils::eps_inv_head_t(dWs_tqPQ, thc, *MF, _ft, cvv ? "ignore_g0" : _div_treatment);
+    for (auto &v : eih) v *= hscale;
+    // ---- 6. publish in the layout gw_t consumes (the same transposition update_w applies to dW) --------------------
+    {
+      auto gsh = dWs_tqPQ.global_shape();
+      mb_state.dWsig_qtPQ.emplace(make_distributed_array<nda::array<ComplexType, 4>>(
+          mpi->comm, {t_pgrid[1], t_pgrid[0], t_pgrid[2], t_pgrid[3]}, {gsh[1], gsh[0], gsh[2], gsh[3]},
+          {t_bsize[1], t_bsize[0], t_bsize[2], t_bsize[3]}));
+      auto A = dWs_tqPQ.local();
+      auto B = mb_state.dWsig_qtPQ.value().local();
+      const long ntl = dWs_tqPQ.local_shape()[0], nql = dWs_tqPQ.local_shape()[1];
+      for (long iq = 0; iq < nql; ++iq)
+        for (long it = 0; it < ntl; ++it) B(iq, it, nda::ellipsis{}) = A(it, iq, nda::ellipsis{});
+    }
+    mb_state.eps_inv_head_sig = eih;
+    const double t_up = sw.lap();
+    // the q -> 0 heads at i nu = 0 (the static limit; tau_0 is the Matsubara sum, tail-dominated): the correction vs the loop's
+    double h0_sig = 0.0, h0 = 0.0;
+    {
+      auto head_nu0 = [&](nda::array<ComplexType, 1> const &ht) {
+        nda::array<ComplexType, 1> et(ht.shape(0)), ew(nw_h);
+        et() = ht;
+        auto a2 = nda::reshape(et, shape_t<2>{long(et.shape(0)), 1});
+        auto b2 = nda::reshape(ew, shape_t<2>{nw_h, 1});
+        _ft->tau_to_w_PHsym(a2, b2);
+        return ew(0).real();
+      };
+      h0_sig = head_nu0(eih);
+      if (mb_state.eps_inv_head.has_value() and long(mb_state.eps_inv_head.value().shape(0)) == nt_h) h0 = head_nu0(mb_state.eps_inv_head.value());
+    }
+    _sig_lff_meter = {v_q1, r_max, h0_sig, h0};
+    app_log(1, "  [Sigma vertex] instantaneous part |dW~_inf|_F / |Z|_F = {:.3e} (the local vertex at the tail node: {:+.4f}; {}); "
+               "heads at i nu = 0: eps^-1 - 1 = {:+.5f} (loop), correction {:+.5f} (expected sign = that of the vertex at q_1: {:+.4f})",
+            r_inf, v_tail, _vertex->sigma_lff_static() ? "-> the static self-energy" : "DROPPED (pol_vertex_sigma_static = false)",
+            h0, h0_sig, v_q1);
+    app_log(1, "  [Sigma vertex] local vertex scalar tr(P dPi P)/tr(P Pi_0 P) at nu_0: q_1 {:+.4f}, Gamma {:+.4f}; tr(Pi_0)/tr(B_dump) at nu_0: q_1 {:.4f}, Gamma {:.4f}"
+               " (1 by definition for the window bubble)", v_q1, v_q0, pb_q1, pb_q0);
+    _sig_lff_meter[0] = v_q1;
+    app_log(1, "  [Sigma vertex] dW~ = {} x Herm[(Z + dW) t^dag G1 t], G1 = {} (column {}), N_m = {}, {} half nodes x {} q; frame metric cond(t t^dag) {:.2e}:\n"
+               "                 |G1| rms max {:.3e} (q_1, nu_0: {:.3e}; Gamma, nu_0: {:.3e}); |dW~|_F / |dW|_F all (q, nu) {:.3e} (q_1, nu_0: {:.3e});\n"
+               "                 Pi_0^-1 cut {} of {} modes at most (tol {:.1e}); heads at i nu = 0: correction {:+.5f} vs the loop's {:+.5f} "
+               "(ratio {:.3f}, head scale {}); wall read {:.1f} s, metric+Z {:.1f} s, G1 {:.1f} s, blocks+head {:.1f} s",
+            scale, full_bub ? "Pib^-1 M dPi (full RPA bubble folded)" : "M^-1 B^-1 dPi (window bubble)", col, Nm, nw_h, nq, mcond_max,
+            g_max, g_q1, g_q0, r_max, r_q1, ncut_max, Nm, tol, h0_sig, h0,
+            (std::abs(h0) > 1e-300 ? h0_sig / h0 : 0.0), hscale, t_read, t_fold, t_alg, t_up);
+  }
+
+  template void scr_coulomb_t::build_sigma_lff(MBState&, thc_reader_t&, std::array<long, 4>, std::array<long, 4>);
+  template void scr_coulomb_t::build_sigma_pair(MBState&, thc_reader_t&);
+  template nda::array<ComplexType, 4> scr_coulomb_t::read_pol_interp_column(std::string const&, long, long,
+                                                                            nda::array<long, 1> const&, thc_reader_t&);
+  template void scr_coulomb_t::fold_rpa_pi_secondary(
+      memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>&, thc_reader_t&);
+  template void scr_coulomb_t::update_w<HOST_MEMORY>(MBState&, thc_reader_t&, long);
+#if defined(ENABLE_DEVICE)
+  template void scr_coulomb_t::update_w<DEVICE_MEMORY>(MBState&, thc_reader_t&, long);
+#endif
 
   template memory::darray_t<Arr4D, mpi3::communicator>
   scr_coulomb_t::dyson_W_from_Pi_tau<true>(memory::darray_t<Arr4D, mpi3::communicator> &, thc_reader_t&, bool,
@@ -578,7 +4159,11 @@ namespace solvers {
                               const Arrv*, const Arrv*);
 
   template memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
-  scr_coulomb_t::eval_Pi_qdep(MBState&, thc_reader_t&g);
+  scr_coulomb_t::eval_Pi_qdep<HOST_MEMORY>(MBState&, thc_reader_t&);
+#if defined(ENABLE_DEVICE)
+  template memory::darray_t<memory::array<DEVICE_MEMORY, ComplexType, 4>, mpi3::communicator>
+  scr_coulomb_t::eval_Pi_qdep<DEVICE_MEMORY>(MBState&, thc_reader_t&);
+#endif
 
 
   template memory::darray_t<Arr4D, mpi3::communicator>
@@ -592,7 +4177,7 @@ namespace solvers {
   // instantiate templates
   template void scr_coulomb_t::dump_eps_inv_head(
       const nda::array<ComplexType,2> &, const nda::array<ComplexType,1> &,
-      std::string, long, mpi3::communicator &, mf::MF &);
+      std::string, long, mpi3::communicator &, mf::MF &, eps_fit::eps_inf_fit_t const *);
 
 
 }  // solvers

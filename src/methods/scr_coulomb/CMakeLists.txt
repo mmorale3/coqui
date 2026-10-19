@@ -4,6 +4,7 @@
 SET(SRCS
   scr_coulomb_t.cpp
   scr_coulomb_chol.cpp
+  cvv_head.cpp
   )
 
 if(USE_DEVICE_COMPILER)
@@ -19,7 +20,7 @@ endif()
 endif()
 
 add_library(scr_coulomb_lib ${SRCS})
-target_link_libraries(scr_coulomb_lib PUBLIC meanfield eri_lib embed_lib)
+target_link_libraries(scr_coulomb_lib PUBLIC meanfield eri_lib embed_lib vertex_lib)
 install(TARGETS scr_coulomb_lib
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 

@@ -20,21 +20,37 @@
 
 
 
+#include "methods/vertex/vertex_debug.hpp"
+#include <cstdlib>
+#include <filesystem>
+#include <cstdlib>
+#include <optional>
+#include <map>
+#include <format>
+
 #include "nda/nda.hpp"
+#include "nda/linalg.hpp"
+#include "nda/h5.hpp"
 #include "numerics/distributed_array/nda.hpp"
 #include "numerics/shared_array/nda.hpp"
 
 #include "IO/app_loggers.h"
+#include "utilities/device_pool.h"
+#include "utilities/h5_background_writer.hpp"
+#include "utilities/freemem.h"
 
 #include "methods/ERI/mb_eri_context.h"
 #include "methods/tools/chkpt_utils.h"
+#include "methods/SCF/qp_modea.hpp"   // qp_modea::last_run(), read-only
+#include "methods/SCF/sigma_causal_projection.hpp"
 #include "simple_dyson.h"
 #include "dca_dyson.h"
 #include "scf_driver.hpp"
 
 namespace methods {
 
-template<typename dyson_type, typename eri_t, typename corr_solver_t>
+template<MEMORY_SPACE MEM,
+         typename dyson_type, typename eri_t, typename corr_solver_t>
 auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_axes_ft::IAFT& FT,
               solvers::mb_solver_t<corr_solver_t> mb_solver, iter_scf::iter_scf_t *iter_solver,
               int niter, bool restart, double conv_tol, bool const_mu,
@@ -47,7 +63,10 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
                "SCF loop: mpi context of mb_state and mb_eri should be the same!");
   utils::check(&FT == mb_state.ft,
                "SCF loop: imag_axes_ft of mb_state and scf_loop should be the same!");
-  for( auto& v: {"SCF_TOTAL", "DYSON", "MBPT_SOLVERS", "ITERATIVE", "WRITE"} ) {
+  // HERMITIZE and ENERGY exist so the children sum to SCF_TOTAL: without them
+  // part of the loop falls in the gap between the four phase timers.
+  for( auto& v: {"SCF_TOTAL", "DYSON", "MBPT_SOLVERS", "ITERATIVE", "WRITE",
+                 "HERMITIZE", "ENERGY", "CAUSAL_PROJ"} ) {
     Timer.add(v);
   }
   // http://patorjk.com/software/taag/#p=display&f=Calvin%20S&t=COQUI%20dyson-scf
@@ -98,7 +117,10 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   Timer.start("WRITE");
   if (!restart) { // write metadata and the MF solution
     chkpt::write_metadata(mpi->comm, *mf, FT, dyson.sH0_skij(), dyson.sS_skij(), mb_state.coqui_prefix);
-    chkpt::dump_scf(mpi->comm, 0, sDm_skij, sG_tskij, sF_skij, sSigma_tskij, mu, mb_state.coqui_prefix);
+    // force_sync: read_input_iterations quiesces this write a few lines below, with no compute
+    // in between, so the async path would copy the whole checkpoint and overlap none of it.
+    chkpt::dump_scf(mpi->comm, 0, sDm_skij, sG_tskij, sF_skij, sSigma_tskij, mu,
+                    mb_state.coqui_prefix, "scf", -1, true);
   }
   Timer.stop("WRITE");
 
@@ -117,13 +139,91 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   // Determine output iteration
   // 1) The output h5 group is always "scf"
   // 2) The output iteration is scf/final_iter + 1
+  // Every rank reads the file here, but the iteration-0 checkpoint above may
+  // still be in flight on the writing rank, so the join has to be collective:
+  // with only a local join the other ranks could read before the write lands and
+  // fail with 'h5 group "scf" does not exist'.
+  utils::h5_quiesce_collective(mpi->comm);
   std::tie(mb_state.mbpt_iter, mb_state.df_1e_iter, mb_state.df_2e_iter, mb_state.embed_iter) =
       chkpt::read_input_iterations(mb_state.coqui_prefix+".mbpt.h5");
   long output_iter_init = mb_state.mbpt_iter+1;
   long output_iter = output_iter_init;
+
+  // Reserve the shared device pool for the duration of the SCF loop, so the
+  // scratch that recurs every iteration (the redistribute staging buffers
+  // above all) is served without a cudaMalloc/cudaFree per use. It is taken
+  // here rather than at startup because ERI/THC construction sizes its own
+  // blocking from the free device memory it observes and allocates through the
+  // raw allocator; by now that is done. Inert unless COQUI_DEVICE_POOL_GB is
+  // set, and released when the loop ends.
+  std::optional<utils::device_pool_guard> pool_guard;
+  if constexpr (MEM != HOST_MEMORY) {
+    if (std::size_t pool_bytes = utils::device_pool_size_from_env(); pool_bytes > 0)
+      pool_guard.emplace(pool_bytes, "scf");
+  }
+
+  // Snapshot of the previous iteration's F and Sigma, so simple mixing does not
+  // read them back from the checkpoint it just wrote: that serial HDF5 read can
+  // dominate the ITERATIVE phase for large Sigma_tskij. One shm copy per iteration
+  // replaces it. Skipped when node memory is tight, in which case mixing reads
+  // the previous iterate from the checkpoint. DIIS is unaffected: it needs a
+  // history, not just the previous iterate, and keeps reading the checkpoint.
+  std::optional<sArray_t<Array_view_4D_t>> sF_prev;
+  std::optional<sArray_t<Array_view_5D_t>> sSigma_prev;
+  // COQUI_NO_PREV_SNAPSHOT=1 disables the snapshot (the previous iterate is read
+  // back from the checkpoint), so the two paths can be compared directly.
+  const bool snapshot_disabled = [] {
+    const char* v = std::getenv("COQUI_NO_PREV_SNAPSHOT");
+    return v != nullptr and std::strtol(v, nullptr, 10) != 0;
+  }();
+  if (iter_solver != nullptr and iter_solver->iter_alg() == iter_scf::damping
+      and not snapshot_disabled) {
+    double need_mb = double(sSigma_tskij.local().size() + sF_skij.local().size())
+                     * sizeof(ComplexType) / (1024.0*1024.0);
+    if (double(utils::freemem()) > 3.0*need_mb) {
+      sF_prev.emplace(math::shm::make_shared_array<Array_view_4D_t>(*mpi, sF_skij.shape()));
+      sSigma_prev.emplace(math::shm::make_shared_array<Array_view_5D_t>(*mpi, sSigma_tskij.shape()));
+      app_log(2, "  keeping the previous F/Sigma in memory for mixing ({:.1f} GB/node); "
+                 "the checkpoint read is skipped.", need_mb/1024.0);
+    } else {
+      app_log(2, "  not keeping the previous F/Sigma in memory for mixing: would need "
+                 "{:.1f} GB/node with {:.1f} GB free.", need_mb/1024.0, utils::freemem()/1024.0);
+    }
+  }
+
+  // CAUSAL PROJECTION of the fresh Sigma_c (vertex_debug scf_causal_proj = 1, sigma_causal_projection.hpp):
+  // the projector (real-frequency nodes, ADMM operators) is built once per tau mesh; the ADMM state of every (s, k) this
+  // rank projects is kept across iterations as the warm start.
+  std::optional<causal_proj::projector> causal_P;
+  std::map<long, std::pair<nda::matrix<ComplexType>, nda::matrix<ComplexType>>> causal_state;
+
+  // pol_vertex_sigma_dyn_final_full (the in-run nu-sampled dynamic Sigma vertex): the loop ends on an all-node Sigma pass. The
+  // iteration niter allows last asks for one; when the convergence test passes earlier on a sampled pass, ONE more iteration
+  // runs with an all-node pass and the loop stops after it whatever its own convergence numbers.
+  const bool sigma_final_full = mb_solver.scr_eri != nullptr and mb_solver.scr_eri->sigma_dyn_final_full();
+  bool final_after_conv = false;   // this iteration is the all-node pass after a convergence on a sampled pass
+  bool stop = false;
+
   // start SCF iteration
   do {
     app_log(1, "\n** Iteration # {} **", output_iter);
+    if (sigma_final_full and (final_after_conv or output_iter == output_iter_init + niter - 1)) {
+      mb_solver.scr_eri->request_sigma_dyn_full_pass();
+      app_log(1, "  [scf] pol_vertex_sigma_dyn_final_full: the dynamic Sigma vertex of this iteration solves every node ({}).",
+              final_after_conv ? "the convergence test passed on the previous, sampled pass; the loop stops after this iteration"
+                               : "the last iteration niter allows");
+    }
+    // Take the snapshot before the solvers overwrite F and Sigma in place.
+    if (sSigma_prev.has_value()) {
+      sF_prev.value().win().fence();
+      sSigma_prev.value().win().fence();
+      if (mpi->node_comm.root()) {
+        sF_prev.value().local()     = sF_skij.local();
+        sSigma_prev.value().local() = sSigma_tskij.local();
+      }
+      sF_prev.value().win().fence();
+      sSigma_prev.value().win().fence();
+    }
     Timer.start("MBPT_SOLVERS");
     // HF
     if (mb_solver.hf != nullptr) {
@@ -151,45 +251,358 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     if (mb_solver.corr != nullptr) {
 
       if (mb_solver.scr_eri != nullptr)
-        mb_solver.scr_eri->update_w(mb_state, mb_eri.corr_eri->get(), output_iter);
+        mb_solver.scr_eri->template update_w<MEM>(
+            mb_state, mb_eri.corr_eri->get(), output_iter);
 
       mb_solver.corr->iter() = output_iter;
-      mb_solver.corr->evaluate(mb_state, mb_eri.corr_eri->get());
+      // gw_t::evaluate is MEM-templated; gf2_t::evaluate is not (its
+      // explicit instantiations below are HOST-only). Use a constexpr
+      // branch on the corr solver type so HOST-only solvers still build.
+      if constexpr (std::is_same_v<corr_solver_t, solvers::gw_t>) {
+        mb_solver.corr->template evaluate<MEM>(mb_state, mb_eri.corr_eri->get());
+      } else {
+        static_assert(MEM == HOST_MEMORY,
+                      "scf_loop: only gw_t supports DEVICE_MEMORY");
+        mb_solver.corr->evaluate(mb_state, mb_eri.corr_eri->get());
+      }
       // deallocate mb_state.dW_qtPQ after this since it's only used in the corr solver and can be very large for GW.
-      mb_state.dW_qtPQ.reset();
+      // Exception (vertex): with an active dynamic-rung vertex on the GLOBAL auxiliary basis, keep
+      // W alive across the iteration boundary so eval_Pi_qdep (which runs BEFORE this
+      // iteration's update_w) can evaluate Pi^C with the previous iteration's screened rung
+      // (one-iteration lag; converges to the same self-consistent fixed point). With the
+      // SECONDARY basis the vertex caches the DOWNFOLDED rung
+      // Wbar = t W t^dag at update_w time instead (vertex_t::cache_w),
+      // so dW is freed here -- the plain-GW memory profile (see needs_dw_retention).
+      if (mb_solver.scr_eri == nullptr or not mb_solver.scr_eri->needs_dw_retention())
+        mb_state.dW_qtPQ.reset();
       mpi->comm.barrier();
     }
 
+    Timer.start("HERMITIZE");
     if (mpi->node_comm.root()) {
       hermitize_in_tau(sF_skij.local(), "Fock matrix");
       hermitize_in_tau(sSigma_tskij.local(), "dynamic self-energy");
     }
     mpi->comm.barrier();
+    Timer.stop("HERMITIZE");
     Timer.stop("MBPT_SOLVERS");
+
+    // Remove the non-causal part of the new Sigma_c BEFORE mixing: -Sigma_c(tau, s, k) is replaced by its best fit with PSD
+    // spectral weights (sigma_causal_projection.hpp), so Dyson's G is causal and the damped mix of two causal Sigma_c stays
+    // causal. ON by default when a vertex adds to Sigma (scr_coulomb_t::sigma_vertex_active), OFF for plain GW;
+    // vertex_debug scf_causal_proj = 0 / 1 overrides either way. The (s, k) blocks are split over ALL ranks; each node's
+    // shared array receives its own ranks' blocks and the node roots sum the rest in (every block is owned by one rank).
+    const bool causal_proj_on = mb_solver.corr != nullptr and
+        (vertex_debug::get("scf_causal_proj") ? vertex_debug::flag("scf_causal_proj")      // vertex_debug: scf_causal_proj
+                                              : (mb_solver.scr_eri != nullptr and mb_solver.scr_eri->sigma_vertex_active()));
+    // Device or host projection: the device path (sigma_causal_projection.hpp::project_device, causal_proj_cuda.cu) is the
+    // default on a CUDA build when the run computes on the device (--compute gpu / unified); vertex_debug
+    // scf_causal_proj_device = 0 selects the host path, = 1 the device path also under --compute cpu. Asking for the device
+    // path on a build without CUDA aborts; a device path that cannot run aborts too (no silent host fallback).
+    const bool causal_dev_auto = causal_proj::projector::device_built() and MEM != HOST_MEMORY;
+    const bool causal_dev_set = bool(vertex_debug::get("scf_causal_proj_device"));
+    const bool causal_dev = causal_dev_set ? vertex_debug::flag("scf_causal_proj_device")    // vertex_debug: scf_causal_proj_device
+                                           : causal_dev_auto;
+    utils::check(not(causal_proj_on and causal_dev) or causal_proj::projector::device_built(),
+                 "scf_loop: vertex_debug scf_causal_proj_device = 1 asks for the device causal projection, but this build has no "
+                 "CUDA (ENABLE_CUDA off). Remove the key, or set it to 0 for the host path.");
+    if (causal_proj_on) {
+      const double t_proj0 = Timer.elapsed("CAUSAL_PROJ");
+      Timer.start("CAUSAL_PROJ");
+      if (not causal_P) {
+        causal_proj::options o;
+        o.maxit = long(vertex_debug::number("scf_causal_proj_maxit", double(o.maxit)));   // vertex_debug: scf_causal_proj_maxit
+        o.tol = vertex_debug::number("scf_causal_proj_tol", o.tol);                         // vertex_debug: scf_causal_proj_tol
+        o.rho = vertex_debug::number("scf_causal_proj_rho", o.rho);                         // vertex_debug: scf_causal_proj_rho
+        // the nodes stay inside the imaginary-axis window: spectral weight placed beyond FT.wmax() is not carried by the tau
+        // basis through the Dyson step's tau -> i w transform (a causal Sigma_c(tau) would then give a non-causal G)
+        o.wmax = vertex_debug::number("scf_causal_proj_wmax", FT.wmax());                   // vertex_debug: scf_causal_proj_wmax
+        o.wmin = vertex_debug::number("scf_causal_proj_wmin", o.wmin);                      // vertex_debug: scf_causal_proj_wmin
+        o.nw = long(vertex_debug::number("scf_causal_proj_nw", double(o.nw)));             // vertex_debug: scf_causal_proj_nw
+        o.select = vertex_debug::number("scf_causal_proj_select", o.select);                // vertex_debug: scf_causal_proj_select
+        causal_P.emplace(FT.beta(), FT.tau_mesh(), o);
+        double wlo = 1e300, whi = 0.0;
+        for (auto const &v : causal_P->nodes()) { wlo = std::min(wlo, std::abs(v)); whi = std::max(whi, std::abs(v)); }
+        app_log(1, "  [causal projection] Sigma_c is projected onto PSD spectral weights every iteration ({}): {} real-frequency "
+                   "nodes (|w| from {:.2e} to {:.2e} Ha), ADMM maxit {}, tol {:.1e}, rho {:.1e} s_max^2, Anderson memory {}; (s, k) blocks over {} ranks; "
+                   "{} path ({})",
+                vertex_debug::get("scf_causal_proj") ? "vertex_debug scf_causal_proj" : "default: a vertex adds to Sigma",
+                causal_P->n_nodes(), wlo, whi, o.maxit, o.tol, o.rho, o.aa_mem, mpi->comm.size(),
+                causal_dev ? "DEVICE" : "HOST",
+                causal_dev_set ? "vertex_debug scf_causal_proj_device"
+                               : (causal_dev ? "default: CUDA build, the run computes on the device"
+                                             : (causal_proj::projector::device_built() ? "default: --compute cpu" : "default: no CUDA in this build")));
+      }
+      auto S = sSigma_tskij.local();
+      const long ns = S.shape(1), nk = S.shape(2);
+      const long nr = mpi->comm.size(), me = mpi->comm.rank();
+      const long n_nodes = mpi->comm.size() / mpi->node_comm.size();
+      // diagnostic dump (vertex_debug scf_causal_proj_dump = <file prefix>): the projection's input (the fresh Sigma_c) and
+      // output of this iteration, with beta and the tau mesh, for offline solver studies; written by the global root
+      const auto cp_dump = vertex_debug::get("scf_causal_proj_dump");                     // vertex_debug: scf_causal_proj_dump = <file prefix>
+      auto cp_dump_write = [&](std::string const &what) {
+        if (not cp_dump or not mpi->comm.root()) return;
+        const std::string fn = *cp_dump + ".cproj_dump.h5";
+        h5::file f(fn, std::filesystem::exists(fn) ? 'a' : 'w');
+        h5::group g(f);
+        if (not g.has_dataset("beta")) {
+          h5::h5_write(g, "beta", FT.beta());
+          nda::array<double, 1> x(FT.tau_mesh());
+          nda::h5_write(g, "tau_mesh", x);
+        }
+        auto gi = g.has_subgroup("iter" + std::to_string(output_iter)) ? g.open_group("iter" + std::to_string(output_iter))
+                                                                     : g.create_group("iter" + std::to_string(output_iter));
+        nda::array<ComplexType, 5> A(S);
+        nda::h5_write(gi, what, A);
+      };
+      if (cp_dump) {
+        sSigma_tskij.win().fence();
+        cp_dump_write("Sigma_in");
+        mpi->comm.barrier();
+      }
+      double y2 = 0.0, r2 = 0.0, rel_max = 0.0, lb = 1e300, la = 1e300;
+      double fit_max = 0.0;
+      long it_max = 0, n_conv = 0, n_blk = 0, aa_rst = 0;
+      sSigma_tskij.win().fence();
+      // several nodes: every node zeroes the blocks its ranks do not own, so the node roots' sum assembles the projection
+      if (n_nodes > 1) {
+        std::vector<char> mine(size_t(ns * nk), 0);
+        for (long p = 0; p < ns * nk; ++p) {
+          const long owner = p % nr;
+          mine[size_t(p)] = char(mpi->node_comm.all_reduce_value(long(owner == me), std::plus<>{}) > 0);
+        }
+        if (mpi->node_comm.root())
+          for (long p = 0; p < ns * nk; ++p)
+            if (not mine[size_t(p)]) S(nda::range::all, p / nk, p % nk, nda::range::all, nda::range::all) = ComplexType(0.0);
+        sSigma_tskij.win().fence();
+      }
+      std::vector<long> my_p;
+      for (long p = me; p < ns * nk; p += nr) my_p.push_back(p);
+      std::vector<causal_proj::stats> my_st(my_p.size());
+      double dev_info[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // sweeps (warm / cold), clips, kept, batches, loop wall, mean sweeps
+      if (causal_dev) {
+#if defined(ENABLE_CUDA)
+        // every block this rank owns in one call (batched on the device; the warm-start states stay on the host)
+        std::vector<nda::array<ComplexType, 3>> blks;
+        blks.reserve(my_p.size());
+        std::vector<nda::array<ComplexType, 3> *> pb;
+        std::vector<nda::matrix<ComplexType> *> pc, pu;
+        for (long p : my_p) {
+          blks.emplace_back(S(nda::range::all, p / nk, p % nk, nda::range::all, nda::range::all));
+          auto &cs = causal_state[p];
+          pc.push_back(&cs.first);
+          pu.push_back(&cs.second);
+        }
+        for (auto &b : blks) pb.push_back(&b);
+        causal_proj_cuda::call_info ci;
+        my_st = causal_P->project_device(pb, pc, pu, &ci);
+        for (size_t i = 0; i < my_p.size(); ++i)
+          S(nda::range::all, my_p[i] / nk, my_p[i] % nk, nda::range::all, nda::range::all) = blks[i];
+        dev_info[0] = double(ci.sweeps_max); dev_info[1] = double(ci.sweeps_max_cold); dev_info[2] = ci.psd_calls;
+        dev_info[3] = ci.psd_kept; dev_info[4] = double(ci.nbatch); dev_info[5] = ci.t_loop; dev_info[6] = ci.sweeps_mean;
+#endif
+      } else {
+        for (size_t i = 0; i < my_p.size(); ++i) {
+          const long p = my_p[i], is = p / nk, ik = p % nk;
+          nda::array<ComplexType, 3> blk = S(nda::range::all, is, ik, nda::range::all, nda::range::all);
+          auto &cs = causal_state[p];
+          my_st[i] = causal_P->project(blk, cs.first, cs.second);
+          S(nda::range::all, is, ik, nda::range::all, nda::range::all) = blk;
+        }
+      }
+      for (auto const &st : my_st) {
+        y2 += st.y_norm * st.y_norm; r2 += st.removed * st.removed;
+        rel_max = std::max(rel_max, st.removed / std::max(st.y_norm, 1e-300));
+        lb = std::min(lb, st.lam_before); la = std::min(la, st.lam_after);
+        it_max = std::max(it_max, st.iters);
+        fit_max = std::max(fit_max, st.fit_res);
+        n_conv += st.converged ? 1 : 0; ++n_blk; aa_rst += st.aa_restarts;
+      }
+      sSigma_tskij.win().fence();
+      if (n_nodes > 1) {
+        if (mpi->node_comm.root()) mpi->internode_comm.all_reduce_in_place_n(S.data(), S.size(), std::plus<>{});
+        mpi->comm.barrier();
+        sSigma_tskij.win().fence();
+      }
+      y2 = mpi->comm.all_reduce_value(y2, std::plus<>{});
+      r2 = mpi->comm.all_reduce_value(r2, std::plus<>{});
+      rel_max = mpi->comm.all_reduce_value(rel_max, boost::mpi3::max<>{});
+      lb = -mpi->comm.all_reduce_value(-lb, boost::mpi3::max<>{});
+      la = -mpi->comm.all_reduce_value(-la, boost::mpi3::max<>{});
+      it_max = mpi->comm.all_reduce_value(it_max, boost::mpi3::max<>{});
+      fit_max = mpi->comm.all_reduce_value(fit_max, boost::mpi3::max<>{});
+      n_conv = mpi->comm.all_reduce_value(n_conv, std::plus<>{});
+      n_blk = mpi->comm.all_reduce_value(n_blk, std::plus<>{});
+      aa_rst = mpi->comm.all_reduce_value(aa_rst, std::plus<>{});
+      for (int i : {0, 1, 4, 5, 6}) dev_info[i] = mpi->comm.all_reduce_value(dev_info[i], boost::mpi3::max<>{});
+      for (int i : {2, 3}) dev_info[i] = mpi->comm.all_reduce_value(dev_info[i], std::plus<>{});
+      mpi->comm.barrier();
+      if (cp_dump) {
+        sSigma_tskij.win().fence();
+        cp_dump_write("Sigma_out");
+        mpi->comm.barrier();
+      }
+      Timer.stop("CAUSAL_PROJ");
+      app_log(1, "  [causal projection] iteration {}: removed |dSigma_c| = {:.3e} ({:.2e} of |Sigma_c|, worst (s,k) {:.2e}); "
+                 "lambda_min(-Sigma_c) {:.3e} -> {:.3e}; ADMM iterations <= {}, converged {} of {} (s, k) blocks, max fit residual {:.2e} "
+                 "of |Sigma_c|, Anderson restarts {}; {:.1f} s ({})", output_iter, std::sqrt(r2),
+              std::sqrt(r2 / std::max(y2, 1e-300)), rel_max, lb, la, it_max, n_conv, n_blk, fit_max, aa_rst,
+              Timer.elapsed("CAUSAL_PROJ") - t_proj0,
+              causal_dev ? "device" : std::format("host, omp_threads {}", utils::omp_threads()));
+      if (causal_dev)
+        app_log(2, "  [causal projection] device: ADMM loop {:.1f} s on the slowest rank, batches <= {}; Jacobi sweeps <= {} (mean <= {:.2f}) per "
+                   "warm-started PSD clip ({:.0f} clips, {:.1f} % kept by the semidefinite test), <= {} per cold eigenvalue solve",
+                dev_info[5], long(dev_info[4]), long(dev_info[0]), dev_info[6], dev_info[2], 100.0 * dev_info[3] / std::max(dev_info[2], 1.0),
+                long(dev_info[1]));
+      // a projection that removes a sizeable part of Sigma_c changes the physics, not just a non-causal seed: say so loudly
+      const double warn_rel = vertex_debug::number("scf_causal_proj_warn", 1e-2);            // vertex_debug: scf_causal_proj_warn
+      if (rel_max > warn_rel)
+        app_log(1, "  [WARNING] causal projection, iteration {}: it removed {:.2e} of Sigma_c in the worst (s, k) (> {:.0e}). The "
+                   "self-energy is strongly non-causal (lambda_min(-Sigma_c) = {:.3e}); the run continues with its causal part, "
+                   "which is NOT the requested Sigma. Check the vertex (scale, window, imaginary-axis window) before trusting it.",
+                output_iter, rel_max, warn_rel, lb);
+    }
 
 
     Timer.start("ITERATIVE");
     if (iter_solver != nullptr) {
+      // Hand the in-memory previous iterate to mixing when we kept one; it
+      // falls back to the checkpoint read when we did not.
       std::tie(F_conv, Sigma_conv) = solve_iterative(*mpi, *iter_solver, output_iter,
                                                      mb_state.coqui_prefix,
-                                                     sF_skij, sSigma_tskij, &FT);
+                                                     sF_skij, sSigma_tskij, &FT,
+                                                     {"scf", "F_skij", "Sigma_tskij"},
+                                                     sF_prev.has_value() ? &sF_prev.value() : nullptr,
+                                                     sSigma_prev.has_value() ? &sSigma_prev.value() : nullptr);
     }
     Timer.stop("ITERATIVE");
 
     Timer.start("DYSON");
     // whether to update mu depends on const_mu
     update_G(dyson, *mf, FT, sDm_skij, sG_tskij, sF_skij, sSigma_tskij, mu, const_mu);
+    Timer.start("HERMITIZE");
     if (mpi->node_comm.root()) {
       hermitize_in_tau(sDm_skij.local(), "density matrix");
       hermitize_in_tau(sG_tskij.local(), "Green's function");
     }
     mpi->comm.barrier();
+    Timer.stop("HERMITIZE");
     Timer.stop("DYSON");
+    // CAUSALITY METER: a causal G has
+    // -G_ii(tau) >= 0 and a causal Sigma has Sigma_ii(tau) <= 0 on the band diagonal at every (tau, s, k). A too-small
+    // imaginary-axis window leaves a small NON-causal residue that a Dyson loop with semicore states can amplify
+    // geometrically (drift or divergence of the scf loop). Logged every iteration (level 2), at level 1 when the
+    // residue exceeds 1e-6 or grows by more than 3x per iteration. vertex_debug = "scf_causality_meter=0" disables it.
+    // the causality guard (scf_causality_abort = t > 0) needs the meter's numbers: the meter runs when either is on (the meter
+    // switch only controls its log lines); the abort itself waits until this iteration's checkpoint is written (below)
+    const bool causality_log = (vertex_debug::number("scf_causality_meter", 1.0) != 0.0);   // vertex_debug: scf_causality_meter = 0 disables the log
+    const double causality_abort = vertex_debug::number("scf_causality_abort", 0.0);       // vertex_debug: scf_causality_abort = t (Ha)
+    std::string causality_abort_msg;
+    if (causality_log or causality_abort > 0.0) {
+      double gmin = 1e300, smax = -1e300;
+      long nviol = 0;
+      if (mpi->node_comm.root()) {
+        auto G = sG_tskij.local();
+        auto S = sSigma_tskij.local();
+        const long nt = G.shape(0), ns = G.shape(1), nk = G.shape(2), nb = G.shape(3);
+        for (long is = 0; is < ns; ++is)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long i = 0; i < nb; ++i) {
+              double gm = 1e300;
+              for (long it = 0; it < nt; ++it) {
+                gm = std::min(gm, -G(it, is, ik, i, i).real());
+                smax = std::max(smax, S(it, is, ik, i, i).real());
+              }
+              gmin = std::min(gmin, gm);
+              if (gm < -1e-6) ++nviol;
+            }
+      }
+      // MATRIX test: a causal G / Sigma_c has -X(tau) positive semidefinite at every (tau, s, k), not only non-negative
+      // diagonals: lambda_min of the Hermitian part of -X(tau, s, k), X = G and Sigma_c, with its tau node.
+      // vertex_debug scf_causality_matrix = 1 | 0 | auto (default: on while the eigenvalue work 2 nt ns nk nb^3 stays
+      // below ~2e10 operations; larger bases skip it).
+      double glam = 1e300, slam = 1e300;
+      long glam_t = -1, slam_t = -1;
+      bool mat_on = false;
+      {
+        auto G = sG_tskij.local();
+        const double nt_ = double(G.shape(0)), ns_ = double(G.shape(1)), nk_ = double(G.shape(2)), nb_ = double(G.shape(3));
+        const std::string mk = vertex_debug::text("scf_causality_matrix", "auto");
+        mat_on = (mk == "1") or (mk == "auto" and 2.0 * nt_ * ns_ * nk_ * nb_ * nb_ * nb_ < 2.0e10);
+      }
+      if (mat_on and mpi->node_comm.root()) {
+        auto G = sG_tskij.local();
+        auto S = sSigma_tskij.local();
+        const long nt = G.shape(0), ns = G.shape(1), nk = G.shape(2), nb = G.shape(3);
+        nda::matrix<ComplexType> Y(nb, nb);
+        for (long it = 0; it < nt; ++it)
+          for (long is = 0; is < ns; ++is)
+            for (long ik = 0; ik < nk; ++ik)
+              for (int which = 0; which < 2; ++which) {
+                for (long i = 0; i < nb; ++i)
+                  for (long j = 0; j < nb; ++j) {
+                    const ComplexType a = (which == 0) ? G(it, is, ik, i, j) : S(it, is, ik, i, j);
+                    const ComplexType b = (which == 0) ? G(it, is, ik, j, i) : S(it, is, ik, j, i);
+                    Y(i, j) = -0.5 * (a + std::conj(b));
+                  }
+                auto ev = nda::linalg::eigenvalues(Y);
+                double lm = 1e300;
+                for (auto const &v : ev) lm = std::min(lm, double(std::real(v)));
+                if (which == 0 and lm < glam) { glam = lm; glam_t = it; }
+                if (which == 1 and lm < slam) { slam = lm; slam_t = it; }
+              }
+      }
+      gmin = -mpi->comm.all_reduce_value(-gmin, boost::mpi3::max<>{});
+      smax = mpi->comm.all_reduce_value(smax, boost::mpi3::max<>{});
+      nviol = mpi->comm.all_reduce_value(nviol, std::plus<>{});
+      if (mat_on) {
+        glam = -mpi->comm.all_reduce_value(-glam, boost::mpi3::max<>{});
+        slam = -mpi->comm.all_reduce_value(-slam, boost::mpi3::max<>{});
+        glam_t = mpi->comm.all_reduce_value(glam_t, boost::mpi3::max<>{});   // node roots agree (the tables are node-shared)
+        slam_t = mpi->comm.all_reduce_value(slam_t, boost::mpi3::max<>{});
+      }
+      static double gmin_prev = 0.0, slam_prev = 0.0;
+      if (output_iter == output_iter_init) { gmin_prev = 0.0; slam_prev = 0.0; }   // a new scf loop in this process
+      const bool warn = (gmin < -1e-6) or (gmin_prev < 0.0 and gmin < 3.0 * gmin_prev) or
+                        (mat_on and slam < -1e-8 and (slam_prev >= 0.0 or slam < 3.0 * slam_prev));
+      if (causality_log)
+      app_log(warn ? 1 : 2, "  [causality] iteration {}: min(-G_ii(tau)) = {:.3e}, max(Sigma_ii(tau)) = {:.3e}, violators (min < -1e-6) = {}{}",
+              output_iter, gmin, smax, nviol,
+              warn ? "  <-- a non-causal residue is present or growing: check the imaginary-axis window (iaft wmax ~ 5 x the bandwidth)" : "");
+      if (mat_on and causality_log) {
+        auto tm = FT.tau_mesh();
+        // a growth factor only between two negative (non-causal) values; a sign change makes the ratio meaningless
+        auto growth = [](double v, double v_prev) {
+          if (not (v < 0.0 and v_prev < 0.0)) return std::string("n/a");
+          char buf[32];
+          std::snprintf(buf, sizeof(buf), "x%.2f", v / v_prev);
+          return std::string(buf);
+        };
+        app_log(warn ? 1 : 2, "  [causality] iteration {}: matrix test lambda_min(-G(tau,k)) = {:.3e} (tau node {}, mesh value {:+.4f}), "
+                              "lambda_min(-Sigma_c(tau,k)) = {:.3e} (tau node {}, {:+.4f}); growth vs the previous iteration: G {}, "
+                              "Sigma_c {}", output_iter, glam, glam_t, glam_t >= 0 ? double(tm(glam_t)) : 0.0, slam, slam_t,
+                slam_t >= 0 ? double(tm(slam_t)) : 0.0, growth(gmin, gmin_prev), growth(slam, slam_prev));
+      }
+      // Abort guard: vertex_debug scf_causality_abort = t > 0 stops the run when the non-causal residue of G (diagonal or
+      // matrix test) passes -t, instead of iterating a non-causal G that a Dyson loop can amplify into divergence.
+      if (causality_abort > 0.0) {
+        const double worst = mat_on ? std::min(gmin, glam) : gmin;
+        if (worst < -causality_abort)
+          causality_abort_msg = std::format("scf_loop: CAUSALITY GUARD (scf_causality_abort = {:.1e}) -- iteration {}: the non-causal "
+                                            "residue of G reached {:.3e} (Sigma_c matrix test {:.3e}); this iteration's checkpoint was "
+                                            "written. The imaginary-axis window is likely too small for the self-energy in use.",
+                                            causality_abort, output_iter, worst, mat_on ? slam : 0.0);
+      }
+      gmin_prev = gmin;
+      if (mat_on) slam_prev = slam;
+    }
 
 
+    Timer.start("ENERGY");
     auto k_weight = mf->k_weight();
     auto [e_1e, e_hf] = eval_hf_energy(sDm_skij, sF_skij, dyson.sH0_skij(), k_weight, false);
     double e_corr = (mb_solver.corr != nullptr)? eval_corr_energy(mpi->comm, FT, sG_tskij, sSigma_tskij, k_weight) : 0.0;
+    Timer.stop("ENERGY");
     energies_diff = {e_1e - energies[0], e_hf - energies[1], e_corr - energies[2]};
     energies = {e_1e, e_hf, e_corr, e_1e+e_hf+e_corr};
 
@@ -215,8 +628,27 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
                     sSigma_tskij, mu, mb_state.coqui_prefix,
                     input_grp, input_iter);
     Timer.stop("WRITE");
+    utils::check(causality_abort_msg.empty(), "{}", causality_abort_msg);
     output_iter++;
-  } while (output_iter<output_iter_init+niter and not converged());
+    if (final_after_conv) {
+      stop = true;
+    } else {
+      stop = (output_iter >= output_iter_init+niter) or converged();
+      if (stop and sigma_final_full and output_iter < output_iter_init+niter and not mb_solver.scr_eri->sigma_dyn_last_pass_full()) {
+        app_log(1, "  [scf] converged on a nu-SAMPLED dynamic Sigma pass: one more iteration with an all-node pass "
+                   "(pol_vertex_sigma_dyn_final_full); the loop stops after it.");
+        final_after_conv = true;
+        stop = false;
+      }
+    }
+  } while (not stop);
+  // The last checkpoint may still be in flight. Everything downstream --
+  // post-processing, embedding, the next driver -- reads this file, and with a
+  // non-threadsafe HDF5 none of it may run concurrently with the writer.
+  Timer.start("WRITE");
+  utils::h5_quiesce_collective(mpi->comm);
+  Timer.stop("WRITE");
+  pool_guard.reset();
   Timer.stop("SCF_TOTAL");
 
   app_log(2, "\n  Dyson-SCF timers");
@@ -225,7 +657,13 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   app_log(2, "    Dyson:                {0:.3f} sec", Timer.elapsed("DYSON"));
   app_log(2, "    MBPT solvers:         {0:.3f} sec", Timer.elapsed("MBPT_SOLVERS"));
   app_log(2, "    Iterative alg:        {0:.3f} sec", Timer.elapsed("ITERATIVE"));
-  app_log(2, "    Write:                {0:.3f} sec\n", Timer.elapsed("WRITE"));
+  app_log(2, "    Write:                {0:.3f} sec", Timer.elapsed("WRITE"));
+  app_log(2, "    Energies:             {0:.3f} sec", Timer.elapsed("ENERGY"));
+  // Nested inside DYSON / MBPT_SOLVERS, so not part of the residual below.
+  app_log(2, "    (of which hermitize:  {0:.3f} sec)", Timer.elapsed("HERMITIZE"));
+  app_log(2, "    (unaccounted):        {0:.3f} sec\n",
+          Timer.elapsed("SCF_TOTAL") - Timer.elapsed("DYSON") - Timer.elapsed("MBPT_SOLVERS")
+          - Timer.elapsed("ITERATIVE") - Timer.elapsed("WRITE") - Timer.elapsed("ENERGY"));
 
   app_log(1, "####### SCF routines end #######\n");
   return std::make_tuple(energies[0]+energies[1], energies[2]);
@@ -240,9 +678,11 @@ double qp_scf_loop(
   qp_params_t& qp_params, 
   solvers::mb_solver_t<corr_solver_t> mb_solver,
   iter_scf::iter_scf_t *iter_solver,
-  int niter, 
-  bool restart, 
-  double conv_tol) {
+  int niter,
+  bool restart,
+  double conv_tol,
+  std::string gf_grp,
+  long gf_iter) {
 
   using math::shm::make_shared_array;
   utils::TimerManager Timer;
@@ -254,17 +694,35 @@ double qp_scf_loop(
   utils::check(qp_params.qp_type=="sc" or qp_params.qp_type=="sc_newton" or
                qp_params.qp_type=="sc_bisection" or qp_params.qp_type=="linearized" or qp_params.qp_type=="spectral",
                "qp_scf_loop: unknown qp_type {}: sc or linearized.", qp_params.qp_type);
+  // Re-quasiparticle-ization of an external Green's function. gf_grp empty (the default):
+  // iteration 1 builds its own analytic QP G. When set ("scf"/"embed"), iteration 1 consumes
+  // the EXTERNAL G of that checkpoint group for the HF density matrix (the Hartree term of
+  // the lattice density) and for the Sigma^GW/W build; iterations >= 2 revert to the loop's
+  // own QP G.
+  const bool ext_gf = not gf_grp.empty();
+  utils::check(not ext_gf or gf_grp == "scf" or gf_grp == "embed",
+               "qp_scf_loop: greens_func_source = \"{}\" is not supported. Valid options: "
+               "\"\" (inert, the loop's own analytic QP G), \"scf\", \"embed\".", gf_grp);
+  utils::check(not ext_gf or qp_params.qp_scf_mode != "evscf",
+               "qp_scf_loop: the external Green's function injection (greens_func_source = "
+               "\"{}\") is not implemented for qp_scf_mode = \"evscf\" -- use qp_scf_mode = "
+               "\"qpscf\" or leave greens_func_source empty.", gf_grp);
   // http://patorjk.com/software/taag/#p=display&f=Calvin%20S&t=COQUI%20qp-scf
   app_log(1, "\n"
              "╔═╗╔═╗╔═╗ ╦ ╦╦  ┌─┐ ┌─┐   ┌─┐┌─┐┌─┐\n"
              "║  ║ ║║═╬╗║ ║║  │─┼┐├─┘───└─┐│  ├┤ \n"
              "╚═╝╚═╝╚═╝╚╚═╝╩  └─┘└┴     └─┘└─┘└  \n");
   app_log(1, "  Maximum iteration number    = {}", niter);
+  utils::check(mb_solver.scr_eri == nullptr or not mb_solver.scr_eri->sigma_dyn_final_full(),
+               "qp_scf_loop: pol_vertex_sigma_dyn_final_full is implemented for the Dyson scf loop only.");
   app_log(1, "  Eigenvalue scf only         = {}", qp_params.qp_scf_mode == "evscf");
   app_log(1, "  Keep screened Coulomb fixed = {}", qp_params.keep_scr_coulomb_fixed);
   app_log(1, "  Convergence tolerance       = {}", conv_tol);
   app_log(1, "  Checkpoint HDF5             = {}", mb_state.coqui_prefix+".mbpt.h5");
   app_log(1, "  Restart                     = {}", (restart)? "yes" : "no");
+  if (ext_gf) {
+    app_log(1, "  External G (iteration 1)    = {}/iter{}", gf_grp, gf_iter);
+  }
   app_log(1, "  Number of processors        = {} cores per node, {} nodes\n",
           mpi->node_comm.size(), mpi->internode_comm.size());
   FT.metadata_log();
@@ -300,6 +758,43 @@ double qp_scf_loop(
   mu = update_mu(mu, *mf, sE_ska, FT.beta(), qp_params.mu_tolerance, qp_params.mu_update_alg);
   update_Dm(sDm_skij, sMO_skia, sE_ska, mu, FT.beta());
   Timer.stop("CANONICALIZATION");
+
+  // ITERATION 1 consumes an EXTERNAL G instead of the restart-H_eff's analytic QP G. Two
+  // consumers, one object:
+  //   (a) sDm_skij <- Dm[G_ext] here, for the HF stage (Hartree term of the lattice density);
+  //   (b) sG_ext handed to add_qpscf_vcorr below, so update_w AND the Sigma^GW build screen
+  //       with the SAME G (W_corr = W[P^RPA[G_ext] + P^lad + P_C(P_imp-P_dc)P_C^dag]).
+  // Dm-from-G follows the Dyson convention verbatim (simple_dyson.cpp, dca_dyson.cpp):
+  // Dm = -G(tau -> beta). NOTE: mu is NOT taken from the external checkpoint -- the qp/map
+  // stage keeps the loop's OWN spectrum and chemical potential (the CD kernel evaluates
+  // Sigma at the MAP stage from the loop's spectrum).
+  std::optional<sArray_t<Array_view_5D_t> > sG_ext;
+  if (ext_gf) {
+    const std::string filename = mb_state.coqui_prefix + ".mbpt.h5";
+    utils::check(std::filesystem::exists(filename),
+                 "qp_scf_loop: greens_func_source = \"{}\" while the CoQui checkpoint {} does "
+                 "not exist.", gf_grp, filename);
+    if (gf_iter < 0) {
+      auto [scf_it, df1e_it, df2e_it, embed_it] = chkpt::read_input_iterations(filename);
+      (void) df1e_it; (void) df2e_it;
+      gf_iter = (gf_grp == "embed")? embed_it : scf_it;
+      utils::check(gf_iter >= 0,
+                   "qp_scf_loop: greens_func_iteration = -1 with greens_func_source = \"{}\", "
+                   "but {} carries no \"{}/final_iter\".", gf_grp, filename, gf_grp);
+    }
+    app_log(1, "\n  External-G re-QP-ization: iteration {} consumes the external Green's "
+               "function {}/iter{} of {}.\n", init_it+1, gf_grp, gf_iter, filename);
+    sG_ext.emplace(read_greens_function(*mpi, mf.get(), filename, gf_iter, gf_grp));
+    FT.check_leakage(sG_ext.value(), imag_axes_ft::fermion, "external Green's function");
+    sDm_skij.win().fence();
+    if (mpi->node_comm.root()) {
+      auto Dm = sDm_skij.local();
+      FT.tau_to_beta(sG_ext.value().local(), Dm);
+      Dm *= -1;
+    }
+    sDm_skij.win().fence();
+    mpi->comm.barrier();
+  }
 
   Timer.start("WRITE");
   if (!restart) {
@@ -344,6 +839,11 @@ double qp_scf_loop(
       sHeff_skij.win().fence();
       mpi->comm.barrier();
     }
+    // The lineshape meter is populated by qp_approx, i.e. by the qpscf MAP stage. Reset it
+    // here so an iteration that never reaches that stage (evscf mode, or no corr solver at
+    // all) reports the MISSING sentinel in the summary line below instead of a stale value
+    // left by an earlier loop in the same process.
+    q6_lineshape() = q6_lineshape_t{};
     if (mb_solver.corr != nullptr) { // GW
       mb_solver.corr->iter() = it;
       if (qp_params.qp_scf_mode == "evscf") {
@@ -352,8 +852,12 @@ double qp_scf_loop(
         // 2. sHeff_skij with the updated QP energies while keeping sMO_skia the same.
         add_evscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params, qp_params.keep_scr_coulomb_fixed);
       } else {
-        // add_qpscf_vcorr only updates sHeff_skij. MO_skia and E_ska are updated later. 
-        add_qpscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params);
+        // add_qpscf_vcorr only updates sHeff_skij. MO_skia and E_ska are updated later.
+        // sG_ext is non-null in ITERATION 1 ONLY -- it is released right after, so
+        // iterations >= 2 fall back to the loop's own analytic QP G.
+        add_qpscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params,
+                        sG_ext? std::addressof(sG_ext.value()) : nullptr);
+        sG_ext.reset();
       }
     }
     Timer.stop("MBPT_SOLVERS");
@@ -386,6 +890,38 @@ double qp_scf_loop(
     app_log(1, "energy difference:                {} a.u.", e_diff);
     app_log(1, "abs max diff of QP Hamiltonian:    {} a.u.\n", Heff_conv);
 
+    // ---- qpGW iteration summary --------
+    // ONE consolidated summary line per qp iteration. Strictly a READ of meters that already
+    // exist: Heff_conv (this loop), qp_modea::last_run() (the mode-A inner loop + the strip
+    // census; -1/0 for every other map), q6_lineshape() (the map-stage meter, which
+    // qp_approx populates for EVERY map), and the scr_coulomb_t ladder-injection meters.
+    // Nothing here is computed.
+    // NOT AVAILABLE IN C++: the band-reordering count is a PYTHON-side meter
+    // (dmft/outer_loop.py::count_band_reorderings); it is reported as the -1 MISSING
+    // sentinel rather than duplicated here.
+    {
+      auto const &LR = qp_modea::last_run();
+      auto const &LS = q6_lineshape();
+      const bool has_scr = (mb_solver.scr_eri != nullptr);
+      const double lam_max   = has_scr ? mb_solver.scr_eri->pol_lambda_max()   : -1.0;
+      const double lad_ratio = has_scr ? mb_solver.scr_eri->pol_ladder_ratio() : -1.0;
+      const double r_rt      = has_scr ? mb_solver.scr_eri->pol_round_trip()   : -1.0;
+      app_log(1, "[qpGW summary] iteration {}: dmax(H_eff) = {:.3e} a.u., "
+                 "dmax(map inner) = {:.3e}, inner-consist iters = {}, band-reorder = {} "
+                 "(python-side meter), strip census in-strip/eta-far/clamped = {}/{}/{}, "
+                 "wgrid_aud = {:.4g}/{:.4g} meV (worst q = {}, Re z = {:+.6g}), "
+                 "lambda_max = {:.6f}, ||P^lad||/||P^RPA|| = {:.6e}, r_rt = {:.3e}, "
+                 "lineshape max |Sigma^c - V^xc|/|Sigma^c| iw_0/iw_top = {:.6e}/{:.6e} "
+                 "(mean {:.6e}/{:.6e}, {} states; ABS discard max iw_0/iw_top = "
+                 "{:.6e}/{:.6e} a.u.)",
+              it, Heff_conv, LR.dmax, LR.iters, -1,
+              LR.n_eval - LR.n_clamp, LR.n_eta, LR.n_clamp - LR.n_eta,
+              LR.wgrid_meas_mev, LR.wgrid_pred_mev, LR.wgrid_worst_q, LR.wgrid_worst_z,
+              lam_max, lad_ratio, r_rt,
+              LS.frac_w0_max, LS.frac_top_max, LS.frac_w0_mean, LS.frac_top_mean,
+              LS.n_states, LS.abs_w0_max, LS.abs_top_max);
+    }
+
     Timer.start("WRITE");
     chkpt::dump_scf(mpi->comm, it, sDm_skij, sHeff_skij, sMO_skia, sE_ska, mu, mb_state.coqui_prefix);
     Timer.stop("WRITE");
@@ -408,16 +944,29 @@ double qp_scf_loop(
 
 /** Instantiation of public templates **/
 // standard dyson for gw/hf
-#define GW_SCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
+#define GW_SCF_LOOP_INST_MEM(MEM, HF, HARTREE, EXCHANGE, CORR) \
 template std::tuple<double, double> \
-scf_loop(MBState&, simple_dyson&, \
+scf_loop<MEM>(MBState&, simple_dyson&, \
          mb_eri_t<HF, HARTREE, EXCHANGE, CORR>&, \
          const imag_axes_ft::IAFT&, \
          solvers::mb_solver_t<solvers::gw_t>, \
          iter_scf::iter_scf_t*, \
          int, bool, double, bool, std::string, int);
 
-// All combinations of thc/chol for 4 eri slots
+#define GW_SCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
+   GW_SCF_LOOP_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+
+// DEVICE_MEMORY instantiation only when the corr ERI is THC (the only
+// ERI type whose gw_t::evaluate / scr_coulomb_t::update_w currently has
+// a real device path; the Cholesky overload static_asserts HOST).
+#if defined(ENABLE_DEVICE)
+#  define GW_SCF_LOOP_INST_DEV_THC(HF, HARTREE, EXCHANGE) \
+   GW_SCF_LOOP_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, thc_reader_t)
+#else
+#  define GW_SCF_LOOP_INST_DEV_THC(HF, HARTREE, EXCHANGE)
+#endif
+
+// All combinations of thc/chol for 4 eri slots (HOST)
 GW_SCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, thc_reader_t)
 GW_SCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, chol_reader_t)
 GW_SCF_LOOP_INST(thc_reader_t, thc_reader_t, chol_reader_t, thc_reader_t)
@@ -435,7 +984,19 @@ GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, chol_reader_t)
 GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
 GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
 
+// DEVICE instantiations only for CORR=thc_reader_t
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, thc_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, thc_reader_t, chol_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, chol_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, chol_reader_t, chol_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, thc_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, thc_reader_t, chol_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, chol_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, chol_reader_t, chol_reader_t)
+
 #undef GW_SCF_LOOP_INST
+#undef GW_SCF_LOOP_INST_DEV_THC
+#undef GW_SCF_LOOP_INST_MEM
 
 
 // standard dyson for gf2
@@ -477,7 +1038,7 @@ qp_scf_loop(MBState&,                         \
             qp_params_t&, \
             solvers::mb_solver_t<solvers::gw_t>,       \
             iter_scf::iter_scf_t*, \
-            int, bool, double);
+            int, bool, double, std::string, long);
 
 // All combinations of thc/chol for 4 eri slots
 QPSCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, thc_reader_t)

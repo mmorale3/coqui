@@ -1,6 +1,65 @@
 
 # Changelog
 
+## Unreleased — dynamic vertex
+
+### Added
+
+- Dressed-leg Γ₁ readout of the dynamic-rung ladder: the dynamic rung is contracted with legs dressed by the static
+  resolvent through closed-form Matsubara Grams of the pole families, exact to round-off and without an L0 application on
+  the frequency-dependent intermediate. Used for the polarization (Γ₁ and the one-bare-rung column) and for the Σ-side
+  deposits; host and device paths. Input `pol_vertex_dyn_dressed = "auto" | "on" | "off"`.
+- Device engine for the dynamic vertex (CUDA): the unit (static resolvent LU, L0, dense τ rungs, DLR refit) is resident on
+  the GPU; mirror-paired τ rungs share one gemm; optional two-input rung pass; streaming THC rung and frequency-factorized
+  rung variants; device Σ deposits.
+- Partial rung residency: when the dense τ rungs do not fit on the device, the remaining ones are rebuilt on the device or
+  copied from pinned host memory per application; the split is chosen at run time by timing the candidate splits
+  (no per-device tuning). Input `pol_vertex_dyn_device_memory = "auto" | "rebuild" | "host" | "resident"`.
+- Hybrid / frequency-factorized dynamic rung builds, threaded serial sections of the rung application, the static
+  resolvent and the static-ladder readout.
+- Dynamic pair Σ vertex in Wannier mode; host parking of W during the vertex drivers to free device memory.
+- In-run self-consistency of the polarization vertex on a coarse k sublattice (`pol_vertex_sc = "hybrid" | "direct" |
+  "interp"`, `pol_vertex_sc_mesh`, `pol_vertex_sc_mix`, restart through `pol_vertex_sc_restart_file`): the vertex
+  polarization is solved on the sublattice transfers and interpolated in the Wannier frame elsewhere, on IBZ meshes.
+  Frequency sampling of the vertex polarization (`pol_vertex_sc_nu_nodes`) and of the dynamic Σ vertex against an in-run
+  reference pass (`pol_vertex_sigma_dyn_fit_file = "self"`, `pol_vertex_sigma_dyn_auto_nodes`, `_fit_rank`), with optional
+  reference renewal (`pol_vertex_sigma_dyn_ref_period`, `_ref_adaptive`) and a full final pass
+  (`pol_vertex_sigma_dyn_final_full`).
+- Causal projection of Σ_c onto positive-semidefinite spectral weights on every SCF iteration (host and CUDA paths;
+  `vertex_debug scf_causal_proj*` keys), with causality meters for G and Σ_c.
+- Frequency-factorized dynamic rung: the per-τ rungs are replaced by R time functions K_r (`pol_vertex_dyn_rung_rank` or
+  `pol_vertex_dyn_rung_tol`), applied either reconstructed per particle-hole representative (default) or factorized
+  (`pol_vertex_dyn_rung_apply`), cutting the rung memory from 46 per-τ matrices to R.
+- Node-shared W̄ cache for the vertex (`pol_vertex_wcache = "shared"`) and a ladder conditioning meter.
+- Projected Wannier functions with a frozen energy window (`frozen_energy_max`): every band below the given energy is kept
+  exactly at each k, on top of `frozen_range`; per-k Gram diagnostics.
+- Tie-robust ISDF pivot selection (`chol_tie_rtol`, default 1e-6): the interpolating points no longer depend on the
+  reduction order, i.e. on the rank count or the GPU model; 0 restores the previous selection.
+- Small Si unit-test fixtures (2×2×2, 3×3×3, 4×4×4; symmetric, time-reversal-only and unreduced meshes) for the IBZ and
+  dynamic-vertex symmetry tests.
+
+### Improved
+
+- Si kp444, 12-band window, ν = 0 dressed Γ₁ (2 ranks): CPU 1776 s → 1308 s (hybrid rung build: 937 s); A100
+  552 s → 349 s; H100 108 s; dynamic Σ vertex on H100 975 s → 352 s. Results unchanged to ≤ 1e-13 relative.
+
+### Changed (robustness — no silent workflow changes)
+
+- A device stage that does not fit aborts with the reason; `pol_vertex_dyn_device_fallback = true` (default false) allows
+  moving it to the CPU with a WARNING.
+- New inputs, all default false, each re-allowing a behaviour that can change the answer and is otherwise an abort:
+  `vertex_allow_missing_head`, `pol_vertex_allow_bare_rung`, `pol_vertex_allow_unprojected`,
+  `vertex_allow_unchecked_reflection`.
+- `vertex_debug` keys are validated against a known-key list (an unknown key aborts) and parsed strictly.
+- A Σ^C rung that violates the pair symmetry W_PQ(q) = W_QP(−q) is reported with a prominent warning.
+
+### Known limitations
+
+- The auxiliary DLR pole fit of the vertex kernels is a regularized least-squares map (stable in scGW + vertex); it
+  satisfies the Φ-derivability identity Tr[Σ^C G] + Tr[P^C W] = 0 only approximately (relative 2–5e-4 on LiH 2×2×2,
+  2–4e-2 with the gygi q → 0 head).
+- The vertex supports collinear spin only (`npol = 1`).
+
 ## CoQui v0.3.0 [2026-06-03]
 
 ### Added

@@ -20,6 +20,8 @@
 
 
 #include "scf_common.hpp"
+#include "utilities/h5_background_writer.hpp"
+#include "dca_dyson.h"
 #include "hamiltonian/one_body_hamiltonian.hpp"
 #include "mean_field/MF.hpp"
 #include "utilities/mpi_context.h"
@@ -169,6 +171,12 @@ double update_mu_bisection(double old_mu, dyson_type& dyson, const mf::MF &mf,
                            const X_t&F, const Xt_t&Sigma) {
   double nel_target = mf.nelec();
   double delta = 0.2;
+  // A wrong Sigma makes N(mu) monotone-but-never-crossing, or NaN. Both used to spin here:
+  // the bracketing walks and the bisection had no limit, and a NaN falls through every
+  // comparison below, so the search returned a NaN mu without a word. Cap both, and say
+  // which one gave up -- the bracket width is what names the bad input.
+  constexpr int max_bracket_steps = 200;   // 200 * 0.2 = 40 a.u., far beyond any real band
+  constexpr int max_bisect_steps  = 200;   // 40 a.u. / 2^200; tol is never this small
   nda::array<ComplexType, 4> FpSigma_spectra(FT.nw_f(), mf.nspin(), mf.nkpts_ibz(), mf.nbnd());
   dyson.compute_eigenspectra(F, Sigma, FpSigma_spectra);
   auto eval_f = [&](double mu) {
@@ -235,6 +243,7 @@ auto diis_init(iter_scf::iter_scf_t& iter_solver,
                long iteration, std::string output,
                X_t &sF_skij, Xt_t &sSigma_tskij, const imag_axes_ft::IAFT *FT) {
   utils::check(iter_solver.iter_alg() == iter_scf::DIIS, "diis_init: iter_solver is not DIIS type.");
+  utils::h5_quiesce();  // see h5_background_writer.hpp
   h5::file file(output+".mbpt.h5", 'r');
   h5::group grp(file);
   utils::check(grp.has_subgroup("scf"), "Simulation HDF5 file does not have an scf group");
@@ -256,14 +265,30 @@ template<typename MPI_Context_t, typename X_t, typename Xt_t>
 auto damping_impl(MPI_Context_t &context, iter_scf::iter_scf_t& iter_solver,
                   long iteration, std::string h5_prefix,
                   X_t &sF_skij, Xt_t &sSigma_tskij,
-                  std::array<std::string,3> datasets)
+                  std::array<std::string,3> datasets,
+                  X_t const* sF_prev, Xt_t const* sSigma_prev)
   -> std::tuple<double, double> {
   double conv_F = 0;
   double conv_Sigma = 0;
   if (iteration == 1) {
     utils::check(false, "damping_impl: it = 1 is not allowed.");
+  } else if (sF_prev != nullptr and sSigma_prev != nullptr) {
+    // Previous iterate handed in from memory: no checkpoint read at all. The
+    // read it replaces is 4.4 GB of serial HDF5 at Si 2x2x2/500b and was ~40 s
+    // of the 43 s ITERATIVE phase, for data this process wrote itself.
+    iter_solver.metadata_log();
+    if (context.node_comm.root()) {
+      conv_F     = iter_solver.solve(sF_skij.local(), sF_prev->local());
+      conv_Sigma = iter_solver.solve(sSigma_tskij.local(), sSigma_prev->local());
+    }
+    context.node_comm.broadcast_n(&conv_F, 1, 0);
+    context.node_comm.broadcast_n(&conv_Sigma, 1, 0);
   } else {
     iter_solver.metadata_log();
+    // This reads the checkpoint on every node root, not just the rank that
+    // writes it, so the local join is not enough -- the other node roots have
+    // no writer thread to wait on and would race a checkpoint still in flight.
+    utils::h5_quiesce_collective(context.comm);
     if (context.node_comm.root()) {
       std::string filename = h5_prefix + ".mbpt.h5";
       h5::file file(filename, 'r');
@@ -303,6 +328,7 @@ auto diis_impl(MPI_Context_t &context, iter_scf::iter_scf_t& iter_solver,
       }
 
       std::string filename = h5_prefix + ".mbpt.h5";
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(filename, 'r');
       h5::group grp(file);
       std::string grp_name = datasets[0]+"/iter"+std::to_string(iteration-1);
@@ -332,7 +358,8 @@ template<typename comm_t, typename X_t, typename Xt_t>
 auto solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t& iter_solver,
                      long iteration, std::string h5_prefix,
                      X_t &sF_skij, Xt_t &sSigma_tskij, const imag_axes_ft::IAFT *FT,
-                     std::array<std::string,3> datasets)
+                     std::array<std::string,3> datasets,
+                     X_t const* sF_prev, Xt_t const* sSigma_prev)
   -> std::tuple<double, double> {
   double conv_F = 0;
   double conv_Sigma = 0;
@@ -340,6 +367,7 @@ auto solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t
     // Just check changes w.r.t. mf
     if (context.node_comm.root()) {
       auto F_mf = nda::make_regular(sF_skij.local());
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(h5_prefix+".mbpt.h5", 'r');
       h5::group grp(file);
       if (grp.has_subgroup("scf/iter0")) {
@@ -373,7 +401,7 @@ auto solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t
 
     if (iter_solver.iter_alg() == iter_scf::damping) {
       std::tie(conv_F, conv_Sigma) = damping_impl(context, iter_solver, iteration, h5_prefix,
-                                                  sF_skij, sSigma_tskij, datasets);
+                                                  sF_skij, sSigma_tskij, datasets, sF_prev, sSigma_prev);
     } else if (iter_solver.iter_alg() == iter_scf::DIIS) {
       std::tie(conv_F, conv_Sigma) = diis_impl(context, iter_solver, iteration, h5_prefix,
                                                sF_skij, sSigma_tskij, FT, datasets);
@@ -404,7 +432,9 @@ void write_mf_data(mf::MF &mf,
   update_G(dyson, mf, ft, sDm_skij, G_shm, sF_skij, Sigma_shm, mu, false);
 
   chkpt::write_metadata(mpi->comm, mf, ft, dyson.sH0_skij(), dyson.sS_skij(), output);
-  chkpt::dump_scf(mpi->comm, 0, sDm_skij, G_shm, sF_skij, Sigma_shm, mu, output);
+  // force_sync: this is the iteration-0 seed and the caller reads it back, so there is nothing
+  // to overlap -- the async path would only add an ~8.9 GB snapshot.
+  chkpt::dump_scf(mpi->comm, 0, sDm_skij, G_shm, sF_skij, Sigma_shm, mu, output, "scf", -1, true);
 }
 
 template<typename MPI_Context_t>
@@ -413,6 +443,7 @@ auto read_greens_function(MPI_Context_t &context, mf::MF *mf,
 -> sArray_t<Array_view_5D_t> {
   using math::shm::make_shared_array;
 
+  utils::h5_quiesce();  // see h5_background_writer.hpp
   h5::file file(filename, 'r');
   h5::group grp(file);
 
@@ -481,7 +512,8 @@ template double update_mu(double, simple_dyson&, const mf::MF &, const imag_axes
 
 template auto solve_iterative(utils::mpi_context_t<mpi3::communicator>&, iter_scf::iter_scf_t&, long, std::string,
                               sArray_t<Array_view_4D_t>&, sArray_t<Array_view_5D_t>&, const imag_axes_ft::IAFT*,
-                              std::array<std::string,3>)
+                              std::array<std::string,3>,
+                              sArray_t<Array_view_4D_t> const*, sArray_t<Array_view_5D_t> const*)
          -> std::tuple<double, double>;
 
 template void write_mf_data(mf::MF&, const imag_axes_ft::IAFT&, simple_dyson&,

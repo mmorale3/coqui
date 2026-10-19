@@ -40,6 +40,8 @@ namespace methods {
   namespace solvers {
     using namespace memory;
 
+    class vertex_t;
+
     /**
      * Solver for computing GW self-energy matrix.
      * One-body Hamiltonian is provided from mf::MF while Green's function
@@ -67,11 +69,15 @@ namespace methods {
 
       // external functions of THC-GW/THC-RPA
       /**
-       * Evalaute THC-GW self-energy
+       * Evalaute THC-GW self-energy.
+       * MEM controls whether the Sigma compute runs on host or device.
+       * State arrays remain on host; device-side intermediates are
+       * staged back to host once at the end.
        * @param G_tskij      - [INPUT] Green's function in primary basis: (nts, ns, nkpts_ibz, nbnd, nbnd)
        * @param sSigma_tskij - [OUTPUT] Self-energy in primary basis: (nts, ns, nkpts_ibz, nbnd, nbnd)
        * @param thc          - [INPUT] THC ERI object
        */
+      template<MEMORY_SPACE MEM = HOST_MEMORY>
       void evaluate(MBState &mb_state, THC_ERI auto const& thc, bool verbose=true);
 
       /**
@@ -102,7 +108,8 @@ namespace methods {
        * @param thc          - [INPUT] THC ERI object
        * @param alg          - "R": convolution on R space; "k": convolution on k space
        */
-      template<nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
+      template<MEMORY_SPACE MEM = HOST_MEMORY,
+               nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
       void eval_Sigma_all(const nda::MemoryArrayOfRank<5> auto &G_tskij,
                           memory::darray_t<Array_4D_t, communicator_t> &dW_qtPQ,
                           sArray_t<Array_5D_t> &sSigma_tskij,
@@ -110,7 +117,10 @@ namespace methods {
                           std::string alg = "R");
 
 
-      // external functions of Chol-GW
+      // external functions of Chol-GW (HOST-only; MEM accepted for
+      // symmetry with the THC overload so scf_loop's template evaluate
+      // <MEM>(...) call resolves uniformly).
+      template<MEMORY_SPACE MEM = HOST_MEMORY>
       void evaluate(MBState &mb_state, Cholesky_ERI auto &chol, bool verbose=true);
 
       /**
@@ -157,12 +167,19 @@ namespace methods {
       void print_chol_gw_timers(); 
 
       void print_rpa_gw_timers(); 
+      // Sigma vertex: {max |dSigma|, max |Sigma^GW|, max |dF|} of the last vertex contraction (checks + logs)
+      std::array<double, 3> sigma_lff_dsigma() const { return {_sigma_lff_dmax, _sigma_lff_smax, _sigma_lff_dfmax}; }
+      // Sigma vertex, pair-resolved: {max |dSigma_pair|, max |Sigma^GW| on the C block} of the last accumulation
+      std::array<double, 2> sigma_pair_dsigma() const { return {_sigma_pair_dmax, _sigma_pair_smax}; }
 
       //void set_MF(mf::MF *MF) { _MF = MF; }
 
     private:
+      double _sigma_lff_dmax = 0.0, _sigma_lff_smax = 0.0, _sigma_lff_dfmax = 0.0;   // Sigma-vertex meters (dynamic, Sigma^GW, static)
+      double _sigma_pair_dmax = 0.0, _sigma_pair_smax = 0.0;   // pair-resolved Sigma-vertex meters
       /*** THC implementation details ***/
-      template<nda::MemoryArray Array_view_5D_t, typename dArray_4D_t>
+      template<MEMORY_SPACE MEM = HOST_MEMORY,
+               nda::MemoryArray Array_view_5D_t, typename dArray_4D_t>
       void thc_gw_Xqindep(const nda::MemoryArrayOfRank<5> auto &G_tskij,
                           sArray_t<Array_view_5D_t> &sSigma_tskij,
                           THC_ERI auto &thc, dArray_4D_t &dW_qtPQ,
@@ -190,7 +207,7 @@ namespace methods {
        * @tparam Wout_in_Rspace - whether the output W should be in the R space
        * @param minus_t         - false: compute self-energy at tau=(0,beta/2); true: compute self-energy at tau=(0,-beta/2)
        */
-      template<bool Winp_in_Rspace, bool Wout_in_Rspace,
+      template<MEMORY_SPACE MEM = HOST_MEMORY, bool Winp_in_Rspace = false, bool Wout_in_Rspace = false,
           nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t,
           typename communicator_t>
       void eval_Sigma_all_Rspace(const nda::MemoryArrayOfRank<5> auto &G_tskij,
@@ -203,7 +220,7 @@ namespace methods {
        * Evaluate GW self-energy by computing the convolution on the k space
        * @param minus_t - false: compute self-energy at tau=(0,beta/2); true: compute self-energy at tau=(0,-beta/2)
        */
-      template<nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
+      template<MEMORY_SPACE MEM = HOST_MEMORY, nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
       void eval_Sigma_all_kspace(const nda::MemoryArrayOfRank<5> auto &G_tskij,
                                  const memory::darray_t<Array_4D_t, communicator_t> &dW_qtPQ,
                                  sArray_t<Array_5D_t> &sSigma_tskij,
@@ -247,6 +264,10 @@ namespace methods {
 
       std::string _div_treatment = "ignore_g0";
 
+      // optional second-order-exchange vertex correction (vertex_t, not owned).
+      // nullptr or an inactive vertex leaves the GW self-energy untouched.
+      vertex_t* _vertex = nullptr;
+
       // current iteration in SCF. Modified externally.
       long _iter = 0;
       std::string _output = "coqui";
@@ -256,6 +277,10 @@ namespace methods {
       long& iter() { return _iter; }
       std::string& output() { return _output; }
       std::string& div_treatment() { return _div_treatment; }
+      utils::TimerManager& timer() { return _Timer; }
+
+      void set_vertex(vertex_t* vertex) { _vertex = vertex; }
+      const vertex_t* vertex() const { return _vertex; }
 
     };
   } // solvers

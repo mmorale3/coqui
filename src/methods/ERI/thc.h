@@ -22,6 +22,7 @@
 #ifndef METHODS_ERI_THC_THC_H
 #define METHODS_ERI_THC_THC_H
 
+#include <cstdlib>
 #include <tuple>
 #include <iomanip>
 #include <optional>
@@ -43,6 +44,9 @@
 #include "nda/nda.hpp"
 #include "numerics/fft/nda.hpp"
 #include "numerics/distributed_array/nda.hpp"
+#include "numerics/distributed_array/matrix_array.hpp"
+#include "numerics/distributed_array/slate_ops_matrix_array.hpp"
+#include "numerics/distributed_array/matrix_array_redistribute.hpp"
 #include "numerics/distributed_array/h5.hpp"
 #include "numerics/shared_array/nda.hpp"
 
@@ -72,6 +76,27 @@ class thc
    *  - ecut: "1.4 * ecutwfc" (falls back to "0.4 * ecutrho" when no wfc grid is available),
    *          Plane wave cutoff used for the evaluation of coulomb matrix elements.
    *  - thresh: "1e-5", Threshold in cholesky decomposition.
+   *  - nIpts: number of interpolating points to select, instead of letting `thresh` decide.
+   *
+   *  Reproducibility, threshold vs. fixed count.
+   *  With `thresh` driving the truncation, the *number* of interpolating points depends on the
+   *  processor grid, hence on the rank count: the pivoted-Cholesky residual at the margin varies
+   *  at roundoff and crosses `thresh` at a different pivot for a different decomposition. The
+   *  resulting spread in the total energy is of the order of the ISDF truncation error at that
+   *  threshold, not a defect. With a fixed `nIpts` the pivot *sequence* is reproducible across
+   *  decompositions to roundoff, and so are the results.
+   *  => Set `nIpts` explicitly for any number that will be compared across rank counts (scaling
+   *     studies, benchmarks, published values). `thresh` is fine for exploratory work.
+   *  The two routes are not interchangeable at equal Np: exhausting a threshold part-way through
+   *  a `chol_block_size` block selects a different point set than taking exactly Np pivots.
+   *  - chol_tie_rtol: "1e-6". > 0 makes the pivot choice tie-robust: among the residuals within
+   *    chol_tie_rtol (relative) of the current maximum, the point with the smallest grid index
+   *    is taken. Residuals that are equal in exact arithmetic (points related by a crystal
+   *    symmetry outside the k-point group) differ only by roundoff, which changes with the rank
+   *    count and the GPU model; the legacy argmax (0.0) resolves those ties by roundoff, so the
+   *    selected points change with the decomposition and the hardware. 0.0 restores the legacy
+   *    selection (needed to reproduce a point set selected by the plain argmax).
+   *
    *  Performance related options:
    *  - matrix_block_size: 1024, Block size used in distributed arrays.
    *  - chol_block_size: "8", Block size in cholesky decomposition.
@@ -79,6 +104,9 @@ class thc
    *  - distr_tol: "0.2". Controls the processor grid. Larger values lead to more processors in k/Q grid axis.
    *  - memory_frac: "0.75". fraction of available memory in a node used to estimate memory requirements/utilization. 
    */
+  // pivot tie tolerance of this builder (chol_tie_rtol)
+  double tie_rtol() const { return chol_tie_rtol; }
+
   thc(mf::MF *mf_,
       mpi_context_t& mpi_,
       ptree const& pt,
@@ -122,18 +150,30 @@ class thc
    *         - distributed array for phi^{k}_a on interpolating points: (ns, nkpts, nbnd_a, Np)
    *         - distributed array for phi^{k-q}_b on interpolating points: (ns, nkpts, nbnd_b, Np)
    */
+  // eff_thresh (optional): on return, receives the ACHIEVED residual of the underlying
+  // pivoted-Cholesky point selection (the basis's effective threshold). nullptr = ignored.
   template<MEMORY_SPACE MEM = HOST_MEMORY>
   auto interpolating_points(int iq = 0, int max = -1,
               nda::range a_range = nda::range(-1,-1),
-              nda::range b_range = nda::range(-1,-1))
+              nda::range b_range = nda::range(-1,-1),
+              double* eff_thresh = nullptr)
        -> std::tuple<memory::array<MEM,long,1>,
-                     _darray_t_<MEM,4>, 
+                     _darray_t_<MEM,4>,
                      std::optional<_darray_t_<MEM,4>>
-                    >; 
+                    >;
 
+  /**
+   * Coarse->fine vertex interpolation support: the collocation
+   * of the orbitals a_rg at a GIVEN point list IPts (density-FFT-grid indices), for all k in kp_rg, in the
+   * interpolating_points output convention X(s, k, a, u) = u_{a k}(r_u) e^{i k.r_u}. Lets a fine-mesh
+   * run FREEZE the ISDF points selected on a coarse mesh. Replicated host array (ns, nk, na, Np).
+   * (The convention is psi_{a k}(r_u) = u_{a k}(r_u) e^{i k.r_u}, identical to interpolating_points.)
+   */
+  nda::array<ComplexType,4> collocation_at_points(nda::array<long,1> const& IPts, nda::range kp_rg, nda::range a_rg);
+  nda::array<long,1> rho_mesh() const { return nda::array<long,1>{long(rho_g.mesh(0)), long(rho_g.mesh(1)), long(rho_g.mesh(2))}; }
   template<MEMORY_SPACE MEM = HOST_MEMORY>
-  auto interpolating_points(nda::MemoryArrayOfRank<4> auto const& C_skai, 
-              int iq = 0, int max = -1)
+  auto interpolating_points(nda::MemoryArrayOfRank<4> auto const& C_skai,
+              int iq = 0, int max = -1, double* eff_thresh = nullptr)
        -> std::tuple<memory::array<MEM,long,1>,
                      _darray_t_<MEM,4>,
                      std::optional<_darray_t_<MEM,4>>
@@ -329,6 +369,7 @@ class thc
   long default_block_size;
   long default_cholesky_block_size;
   double thresh=1e-5;
+  double chol_tie_rtol = 1e-6;
   int nnr_blk = 1;
   double distr_tol = 0.2;
   double memory_frac = 0.75;
@@ -565,9 +606,12 @@ class thc
                      std::array<long, 3> pgrid,
                      std::array<long, 3> block_size);
 
+  // eff_thresh (optional): on return, receives the ACHIEVED residual at pivoted-Cholesky
+  // exit (the effective threshold of the selected basis, which differs from the requested
+  // thresh whenever the nIpts/nmax cap stopped the loop first). nullptr = not requested.
   template<MEMORY_SPACE MEM = HOST_MEMORY, bool Ipts_only, bool return_Ruv, typename Tensor_t>
-  auto chol_metric_impl(int iq, int nmax, nda::range a_range, nda::range b_range, int block_size, 
-                        Tensor_t const* C_skai);
+  auto chol_metric_impl(int iq, int nmax, nda::range a_range, nda::range b_range, int block_size,
+                        Tensor_t const* C_skai, double* eff_thresh = nullptr);
 
   /**
    * [symmetry-adapted version]
@@ -600,8 +644,16 @@ class thc
    *             - distributed array for phi^{k}_a on interpolating points: (ns, nkpts, nbnd_a, Np)
    *             - distributed array for phi^{k-q}_b on interpolating points: (ns, nkpts, nbnd_b, Np)
    */
+  // eff_thresh (optional): see chol_metric_impl -- receives the ACHIEVED residual at exit.
+  // C_skai (optional): ROTATED orbitals w_a = sum_i conj(C(s,k,a,i)) psi_i on the IBZ k-points (shape (ns, >= nkpts_ibz, M, nbnd),
+  // the IBZ points first), as the rotated interpolating_points overload: the point selection then resolves the (w x w) pair
+  // densities of those M orbitals. The image k-points enter through the rotated points exactly as for bands, which is
+  // correct when the rotated set is symmetry covariant (a unitary mixing of the M orbitals at every image). Only the
+  // POINTS are meaningful to a caller then: the returned collocation at an image k is in the IBZ orbital's gauge, not in
+  // the caller's U(Sk) gauge (gather it with collocation_at_points and rotate by U(Sk) instead).
   template<MEMORY_SPACE MEM = HOST_MEMORY, bool Ipts_only, bool return_Ruv>
-  auto chol_metric_impl_ibz(int iq, int nmax, nda::range a_range, nda::range b_range, int block_size);
+  auto chol_metric_impl_ibz(int iq, int nmax, nda::range a_range, nda::range b_range, int block_size,
+                            double* eff_thresh = nullptr, nda::array<ComplexType, 4> const *C_skai = nullptr);
   //auto chol_metric_impl(int iq, int nmax, nda::range a_range, nda::range b_range, int block_size);
 
 

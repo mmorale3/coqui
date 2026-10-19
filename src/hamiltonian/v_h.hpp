@@ -25,6 +25,7 @@
 #include <cmath>
 #include "configuration.hpp"
 #include "nda/nda.hpp"
+#include "nda/tensor.hpp"
 #include "utilities/mpi_context.h"
 #include "utilities/Timer.hpp"
 #include "numerics/nda_functions.hpp"
@@ -444,7 +445,16 @@ void v_h(mpi_context_t<communicator,shared_communicator> &mpi,
 
             // make psi_r = conj(psi_r) if kp_trev(k) is true,
             // such that no conjugation is needed for nij in the next step
-            if (kp_trev(k)) psi_r() = nda::conj(psi_r);
+            if (kp_trev(k)) {
+              if constexpr (MEM == HOST_MEMORY) {
+                psi_r() = nda::conj(psi_r);
+              } else {
+                // lazy nda::conj on device arrays is forbidden by nda's
+                // static_assert; use tensor::scale(op::CONJ) instead.
+                nda::tensor::scale(ComplexType(1.0), psi_r,
+                                   nda::tensor::op::CONJ);
+              }
+            }
 
             //accumulate density: Only diagonal components in polarization
             nda::blas::gemm(nij(s, k_sym, all, all), psi_r, T);

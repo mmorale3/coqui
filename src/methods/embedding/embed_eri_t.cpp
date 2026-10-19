@@ -63,7 +63,6 @@ namespace methods {
     nda::array<ComplexType, 2> Cfull_jb(_MF->nbnd(), nImpOrbs);
     nda::array<ComplexType, 2> tmp_ib(_MF->nbnd(), nImpOrbs);
 
-    using math::sparse::T;
     using math::sparse::csrmm;
     for (size_t isym=0; isym<nsym; ++isym) {
       for (size_t isk=0; isk<ns*nkpts; ++isk) {
@@ -81,10 +80,10 @@ namespace methods {
             Cfull_jb() = 0.0;
             if(not cjg) {
               Cfull_jb(W_rng[I], all) = nda::conj(nda::transpose(C_skIai(is, ik, I, nda::ellipsis{})));
-              csrmm(ComplexType(1.0), *D_ij, Cfull_jb, ComplexType(0.0), tmp_ib);
+              csrmm<'N'>(ComplexType(1.0), *D_ij, Cfull_jb, ComplexType(0.0), tmp_ib);
             } else {
               Cfull_jb(W_rng[I], all) = nda::transpose(C_skIai(is, ik, I, nda::ellipsis{}));
-              csrmm(ComplexType(1.0), *D_ij, Cfull_jb, ComplexType(0.0), tmp_ib);
+              csrmm<'N'>(ComplexType(1.0), *D_ij, Cfull_jb, ComplexType(0.0), tmp_ib);
               tmp_ib = nda::conj(tmp_ib);
             }
             // X_Pi * tmp_ib = TskI_aP
@@ -398,12 +397,28 @@ namespace methods {
     std::array<double, 2> mixing{io::get_value_with_default<double>(pt,"dc_pi_mixing",1.0),
                                  io::get_value_with_default<double>(pt,"u_weiss_mixing",1.0)};
 
+    // pi_lad_dc: whether the local part of the lattice ladder polarizability joins the
+    // bosonic double counting. Opt-in, off by default ("none").
+    //   "orbital"          -- the orbital/chi-convention 4-leg projection of the lattice
+    //                         ladder; this is the object valid as a DC contribution.
+    //   "thc_adjoint_diag" -- the THC-adjoint projection of the same ladder. Its convention
+    //                         is not valid as a DC contribution; diagnostics only.
+    auto pi_lad_dc = io::tolower_copy(
+        io::get_value_with_default<std::string>(pt,"pi_lad_dc","none"));
+    utils::check(pi_lad_dc == "none" or pi_lad_dc == "thc_adjoint_diag" or
+                 pi_lad_dc == "orbital",
+                 "downfolding_edmft: unknown pi_lad_dc = \"{}\". Valid options: \"none\" "
+                 "(default), \"orbital\" (orbital/chi-convention local ladder DC), "
+                 "\"thc_adjoint_diag\" (THC-adjoint ladder DC; DIAGNOSTIC convention, "
+                 "not a valid DC contribution).", pi_lad_dc);
+
     _Timer.stop("DF_READ");
 
     utils::check(_output_type == "default",
                  "Error in eri::downfolding: edmft_downfolding is only available with output_type=default.");
 
-    downfold_edmft_impl(eri, mb_state, screen_type, permut_symm, g_grp, g_iter, mixing);
+    downfold_edmft_impl(eri, mb_state, screen_type, permut_symm, g_grp, g_iter, mixing,
+                        pi_lad_dc);
   }
 
   template<THC_ERI thc_t>
@@ -693,7 +708,8 @@ namespace methods {
       std::string permut_symm,
       std::array<std::string, 2> g_grp,
       std::array<long, 2> g_iter,
-      std::array<double, 2> mixing) {
+      std::array<double, 2> mixing,
+      std::string pi_lad_dc) {
 
     using math::shm::make_shared_array;
 
@@ -826,6 +842,97 @@ namespace methods {
         proj_boson.proj_fermi().downfold_loc<true>(sG_tskij_dc, "Gloc for DC polarizability") :
         proj_boson.proj_fermi().downfold_loc<false>(sG_tskij_dc, "Gloc for DC polarizability");
     auto sPi_dc_wabcd_new = eval_Pi_rpa_dc<true>(*mpi, G_tsIab, ft, density_only);
+
+    // Bosonic double counting with the lattice ladder: P_dc = bubble[G_loc] + P^lad_loc.
+    // The bubble is the line above (it is what makes the clean limit exact); the ladder
+    // half is the local part of what the lattice BSE already contains.
+    //
+    // Opt-in, default off. "orbital" adds the orbital/chi-convention 4-leg projection,
+    // the object valid as a DC contribution. "thc_adjoint_diag" adds the THC-adjoint
+    // projection, which carries the upfold's ||B||^2 gain instead of its reciprocal (many
+    // orders of magnitude above bubble[G_loc]); it is a diagnostic only. With
+    // pi_lad_dc = "none" this block does not execute (no h5 read, no accumulation).
+    // Source when enabled: MBState if the lattice stage ran in this process, else the
+    // checkpoint group that produced the RPA polarizability (g_grp[0]/g_iter[0] --
+    // P^lad_loc belongs to that lattice screening step, not to the Gloc used for the
+    // bubble).
+    if (pi_lad_dc != "none") {
+      const bool orb_dc = (pi_lad_dc == "orbital");
+      // "orbital" selects the DC-ready object (same read pattern, dataset and MBState slot
+      // swapped); the diagnostic warning belongs to "thc_adjoint_diag" only.
+      const std::string lad_dset = orb_dc ? "pi_lad_loc_orb_wabcd" : "pi_lad_loc_wabcd";
+      if (orb_dc)
+        app_log(1, "\n  - pi_lad_dc = \"orbital\": P_dc = bubble[Gloc] + P^lad_loc "
+                   "with the orbital/chi-convention\n    local ladder polarizability "
+                   "(dataset {}).", lad_dset);
+      else
+        app_log(1, "\n  [WARNING] pi_lad_dc = \"{}\": the ladder double counting is ON with "
+                   "the\n            DIAGNOSTIC (THC-adjoint) convention, which is not "
+                   "valid\n            as a DC contribution. U(i.nu) from this "
+                   "run is a diagnostic, not a result.", pi_lad_dc);
+      nda::array<ComplexType, 5> Pi_lad_loc;
+      bool have_lad = false;
+      if (orb_dc and mb_state.sPi_lad_loc_orb_wabcd) {
+        Pi_lad_loc = mb_state.sPi_lad_loc_orb_wabcd.value().local();
+        have_lad = true;
+      } else if (not orb_dc and mb_state.sPi_lad_loc_wabcd) {
+        Pi_lad_loc = mb_state.sPi_lad_loc_wabcd.value().local();
+        have_lad = true;
+      } else if (mpi->node_comm.root()) {
+        h5::file file(filename, 'r');
+        auto root_grp = h5::group(file);
+        std::string gname = "iter" + std::to_string(g_iter[0]);
+        if (root_grp.has_subgroup(g_grp[0])) {
+          auto g = root_grp.open_group(g_grp[0]);
+          if (g.has_subgroup(gname)) {
+            auto ig = g.open_group(gname);
+            if (ig.has_dataset(lad_dset)) {
+              nda::h5_read(ig, lad_dset, Pi_lad_loc);
+              have_lad = true;
+            }
+          }
+        }
+      }
+      mpi->node_comm.broadcast_n(&have_lad, 1, 0);
+      // "orbital" is a demand: if the object is missing the run would silently fall back
+      // to a bubble-only P_dc, so it is fatal here (the producer's window-compatibility
+      // skip logs the usual cause).
+      if (orb_dc)
+        utils::check(have_lad,
+                     "downfold_edmft_impl: pi_lad_dc = \"orbital\" but no P^lad_loc,orb is "
+                     "available -- neither MBState nor {}/iter{} of {} carries "
+                     "\"pi_lad_loc_orb_wabcd\". The lattice stage must have run with an "
+                     "injecting ladder AND a bosonic projector whose band window lies "
+                     "inside the ladder window (see the orbital ladder warning in its log).",
+                     g_grp[0], g_iter[0], filename);
+      if (have_lad) {
+        sPi_dc_wabcd_new.win().fence();
+        if (mpi->node_comm.root()) {
+          // element-wise dims: some bundled fmt versions have no std::array formatter
+          utils::check(Pi_lad_loc.shape() == sPi_dc_wabcd_new.shape(),
+                       "downfold_edmft_impl: P^lad_loc shape ({},{},{},{},{}) does not "
+                       "match P_dc ({},{},{},{},{}).",
+                       Pi_lad_loc.shape()[0], Pi_lad_loc.shape()[1], Pi_lad_loc.shape()[2],
+                       Pi_lad_loc.shape()[3], Pi_lad_loc.shape()[4],
+                       sPi_dc_wabcd_new.shape()[0], sPi_dc_wabcd_new.shape()[1],
+                       sPi_dc_wabcd_new.shape()[2], sPi_dc_wabcd_new.shape()[3],
+                       sPi_dc_wabcd_new.shape()[4]);
+          double lmax = 0.0, dmax = 0.0;
+          for (auto const &v : Pi_lad_loc) lmax = std::max(lmax, std::abs(v));
+          for (auto const &v : sPi_dc_wabcd_new.local()) dmax = std::max(dmax, std::abs(v));
+          app_log(1, "  - ladder DC: ||P^lad_loc||_max = {:.4e} added to "
+                     "||bubble[Gloc]||_max = {:.4e} (ratio {:.3e}){}",
+                  lmax, dmax, lmax / std::max(dmax, 1e-300),
+                  (lmax > dmax) ? "\n    [WARNING] the ladder half of P_dc EXCEEDS the "
+                                  "bubble half: P_dc is then dominated by a term "
+                                  "intended as a correction. Check the local projection's "
+                                  "normalization before trusting U(i.nu)." : "");
+          sPi_dc_wabcd_new.local() += Pi_lad_loc;
+        }
+        sPi_dc_wabcd_new.win().fence();
+      }
+      mpi->comm.barrier();
+    }
 
     // mixing pi_dc with the previous value
     if (mb_state.sPi_dc_wabcd and mixing[0] < 1.0) {

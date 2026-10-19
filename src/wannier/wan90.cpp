@@ -42,6 +42,7 @@
 #include "wannier/scdm.hpp"
 #include "wannier/wan90.h"
 #include "wannier/wan90_aux.hpp"
+#include "wannier/projected_wannier.hpp"
 
 /** Utilities for Brillioun zone unfolding **/
 
@@ -285,6 +286,23 @@ void append_wannier90_win(mf::MF &mf, ptree &pt)
   app_log(1, "");
   app_log(1, "*************************************************");
   app_log(1, "      Done appending Wannier90's *.win file      ");
+  app_log(1, "*************************************************");
+}
+
+/**
+ * Projection-only Wannier functions from a set of trial orbitals (no wannier90 library needed)
+ */
+void projected_wannier(mf::MF &mf, ptree &pt)
+{
+  app_log(1, "*************************************************");
+  app_log(1, "        Projection-only Wannier functions        ");
+  app_log(1, "*************************************************\n");
+
+  auto &mpi = *(mf.mpi());
+  detail::projected_wannier_impl(mpi, mf, pt);
+
+  app_log(1, "*************************************************");
+  app_log(1, "     Done with projection-only Wannier functions ");
   app_log(1, "*************************************************");
 }
 

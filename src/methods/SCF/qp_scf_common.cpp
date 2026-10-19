@@ -19,10 +19,17 @@
  */
 
 
+#include <cstdlib>
+#include <algorithm>
+#include <functional>
+#include <utility>
+#include <vector>
+
 #include "nda/linalg.hpp"
 #include "nda/linalg/det_and_inverse.hpp"
 #include "numerics/nda_functions.hpp"
 #include "numerics/ac/AC_t.hpp"
+#include "utilities/omp_threads.hpp"
 
 #include "hamiltonian/one_body_hamiltonian.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
@@ -33,8 +40,973 @@
 #include "methods/SCF/mb_solver_t.h"
 #include "methods/SCF/scf_common.hpp"
 #include "methods/SCF/qp_solvers.hpp"
+#include "methods/SCF/qp_maps_matsubara.hpp"
+#include "methods/SCF/qp_modea.hpp"
+#include "methods/SCF/wc_band_elements.hpp"
 
 namespace methods {
+
+namespace {
+  // The Matsubara-native maps (qp_map != "ac_pade") consume Sigma(iw) on the
+  // POSITIVE fermionic nodes in ascending order; the sampling mesh interleaves
+  // signs, so select and sort once. Returns (w_n values, row indices into the
+  // wn_mesh-ordered frequency axis).
+  auto positive_wn_nodes(nda::array<ComplexType, 1> const &iw_mesh) {
+    std::vector<std::pair<double, long>> pw;
+    for (long n = 0; n < iw_mesh.shape(0); ++n)
+      if (iw_mesh(n).imag() > 0.0) pw.emplace_back(iw_mesh(n).imag(), n);
+    std::sort(pw.begin(), pw.end());
+    utils::check(pw.size() >= 2, "qp_map matsubara: found {} positive fermionic nodes, need >= 2.", pw.size());
+    nda::array<double, 1> wp(pw.size());
+    std::vector<long> idx(pw.size());
+    for (size_t m = 0; m < pw.size(); ++m) {
+      wp(m) = pw[m].first;
+      idx[m] = pw[m].second;
+    }
+    return std::make_pair(std::move(wp), std::move(idx));
+  }
+
+  /**
+   * Build the mode-A evaluator context, if and only if the map asks
+   * for it. MUST be called inside the live-W window of the caller (mb_state.dW_qtPQ alive).
+   * `need_diag` also produces the replicated DIAGONAL residues, which the evGW leg needs
+   * because solve_qp_eqn distributes (s,k,a) on a processor grid of its own.
+   */
+  template<typename eri_t, typename corr_solver_t>
+  void build_modea_ctx_if_needed(qp_modea::modea_ctx &ctx, MBState &mb_state,
+                                 solvers::mb_solver_t<corr_solver_t> &mb_solver, eri_t &eri,
+                                 const sArray_t<Array_view_4D_t> &sMO_skia,
+                                 const sArray_t<Array_view_3D_t> &sE_ska,
+                                 double mu, const imag_axes_ft::IAFT &FT,
+                                 qp_params_t &qp_params, bool need_diag) {
+    if (qp_params.qp_map != "mode_a" and qp_params.qp_map != "mode_b") return;
+    qp_modea::modea_opts opts;
+    opts.route = qp_params.qp_modea_route;
+    opts.nconsist = qp_params.qp_modea_nconsist;
+    opts.consist_tol = qp_params.qp_modea_consist_tol;
+    opts.eta = qp_params.qp_modea_eta;
+    opts.eta_far = qp_params.qp_modea_eta_far;
+    opts.wsupp = qp_params.qp_modea_wsupp;
+    opts.wfit = qp_params.qp_modea_wfit;
+    opts.spectral_eta = qp_params.qp_modea_spectral_eta;
+    opts.spectral_npole = qp_params.qp_modea_spectral_npole;
+    opts.spectral_gamma = qp_params.qp_modea_spectral_gamma;
+    opts.wrtol = qp_params.qp_modea_wrtol;
+    opts.wrank = qp_params.qp_modea_wrank;
+    opts.wsketch = qp_params.qp_modea_wsketch;
+    opts.wunion = qp_params.qp_modea_wunion;
+    // The tilted-contour route's knob family.
+    opts.tc_eps = qp_params.qp_tc_eps;
+    opts.tc_delta = qp_params.qp_tc_delta;
+    opts.tc_rho = qp_params.qp_tc_rho;
+    opts.tc_profile = qp_params.qp_tc_profile;
+    opts.tc_trunc = qp_params.qp_tc_trunc;
+    opts.tc_krylov = qp_params.qp_tc_krylov;
+    opts.tc_krylov_tol = qp_params.qp_tc_krylov_tol;
+    opts.cd_bstore_cap_gb = qp_params.qp_tc_bstore_gb;
+    opts.cd_bfactor = qp_params.qp_tc_bfactor;
+    opts.cd_batch_mb = qp_params.qp_tc_batch_mb;
+    opts.strip_lo = qp_params.qp_modea_strip_lo;
+    opts.strip_hi = qp_params.qp_modea_strip_hi;
+    opts.wgrid_mev = qp_params.qp_tc_wgrid_mev;
+    opts.wgrid_h = qp_params.qp_tc_wgrid_h;
+    opts.wgrid_audit = qp_params.qp_tc_wgrid_audit;
+    opts.wgrid_audit_hard = qp_params.qp_tc_wgrid_audit_hard;
+    opts.iter = 1;
+    std::string div = "ignore_g0";
+    if constexpr (requires { mb_solver.corr->iter(); })
+      if (mb_solver.corr != nullptr) opts.iter = mb_solver.corr->iter();
+    if constexpr (requires { mb_solver.corr->div_treatment(); })
+      if (mb_solver.corr != nullptr) div = mb_solver.corr->div_treatment();
+    utils::check(opts.route == "cd" or opts.route == "expansion",
+                 "qp_modea: unknown qp_modea_route = {}. Valid: \"cd\", \"expansion\".",
+                 opts.route);
+    utils::check(opts.wfit == "tau" or opts.wfit == "nu" or opts.wfit == "spectral"
+                 or opts.wfit == "contour",
+                 "qp_modea: unknown qp_modea_wfit = {}. Valid: \"tau\", \"nu\", "
+                 "\"spectral\", \"contour\".", opts.wfit);
+#ifndef ENABLE_FINUFFT
+    utils::check(opts.wfit != "spectral",
+                 "qp_modea: qp_modea_wfit = \"spectral\" (the spectral-quadrature W^c "
+                 "representation) needs the real-axis W chain, which is only compiled with "
+                 "-DENABLE_FINUFFT=ON. This binary was built without it. Rebuild with the "
+                 "flag, or use qp_modea_wfit = \"tau\" / \"nu\".");
+#endif
+    utils::check(opts.spectral_eta > 0.0,
+                 "qp_modea: qp_modea_spectral_eta = {} must be > 0.", opts.spectral_eta);
+    utils::check(opts.spectral_gamma == "ls" or opts.spectral_gamma == "spectral",
+                 "qp_modea: unknown qp_modea_spectral_gamma = {}. Valid: \"ls\", "
+                 "\"spectral\".", opts.spectral_gamma);
+    utils::check(opts.eta_far >= 0.0,
+                 "qp_modea: qp_modea_eta_far = {} must be >= 0 (0 = out-of-strip states at mu).",
+                 opts.eta_far);
+    // The tilted-contour knobs. Validated unconditionally so a typo is caught at
+    // parse time on every route, but they steer nothing unless wfit == "contour".
+    utils::check(opts.tc_eps > 0.0 and opts.tc_eps < 1.0,
+                 "qp_modea: qp_tc_eps = {} must be in (0, 1).", opts.tc_eps);
+    utils::check(opts.tc_delta >= 0.0,
+                 "qp_modea: qp_tc_delta = {} must be >= 0 (0 selects the default recipe).",
+                 opts.tc_delta);
+    utils::check(opts.tc_rho >= 0.0 and opts.tc_rho < 1.0,
+                 "qp_modea: qp_tc_rho = {} must be in [0, 1).", opts.tc_rho);
+    utils::check(opts.tc_profile == "flat" or opts.tc_profile == "growing",
+                 "qp_modea: unknown qp_tc_profile = {}. Valid: \"flat\", \"growing\".",
+                 opts.tc_profile);
+    utils::check(opts.tc_krylov_tol > 0.0 and opts.tc_krylov_tol < 1.0,
+                 "qp_modea: qp_tc_krylov_tol = {} must be in (0, 1).", opts.tc_krylov_tol);
+    utils::check(opts.cd_bstore_cap_gb >= 0.0,
+                 "qp_modea: qp_tc_bstore_gb = {} must be >= 0.", opts.cd_bstore_cap_gb);
+    utils::check(opts.cd_bfactor == "auto" or opts.cd_bfactor == "store"
+                 or opts.cd_bfactor == "recompute",
+                 "qp_modea: unknown qp_tc_bfactor = {}. Valid: \"auto\", \"store\", "
+                 "\"recompute\".", opts.cd_bfactor);
+    utils::check(opts.cd_batch_mb > 0.0,
+                 "qp_modea: qp_tc_batch_mb = {} must be > 0.", opts.cd_batch_mb);
+    utils::check(opts.wgrid_mev >= 0.0,
+                 "qp_modea: qp_tc_wgrid_mev = {} must be >= 0 (0 = cache off).",
+                 opts.wgrid_mev);
+    utils::check(opts.wgrid_h >= 0.0,
+                 "qp_modea: qp_tc_wgrid_h = {} must be >= 0 (0 = derive from the law).",
+                 opts.wgrid_h);
+    utils::check(opts.wgrid_audit >= 0,
+                 "qp_modea: qp_tc_wgrid_audit = {} must be >= 0.", opts.wgrid_audit);
+    // The explicit strip window. Both or neither -- a one-sided window silently
+    // paired with an E_PH bound is exactly the kind of mis-set that reads as physics.
+    utils::check(opts.strip_lo >= 0.0 and opts.strip_hi >= 0.0,
+                 "qp_modea: qp_modea_strip_lo = {} / qp_modea_strip_hi = {} are HALF-WIDTHS "
+                 "below and above mu and must be >= 0 (0 = unset = the E_PH strip).",
+                 opts.strip_lo, opts.strip_hi);
+    utils::check((opts.strip_lo > 0.0) == (opts.strip_hi > 0.0),
+                 "qp_modea: qp_modea_strip_lo = {} and qp_modea_strip_hi = {} must be set "
+                 "TOGETHER (both > 0 for an explicit window, both 0 for the E_PH-derived "
+                 "strip). A one-sided window is never intended.",
+                 opts.strip_lo, opts.strip_hi);
+
+    app_log(2, "\n* {} quasiparticle map: building the "
+               "evaluator context", qp_params.qp_map);
+    if (opts.eta_far > 0.0)
+      app_log(2, "  - FAR-STATE EVALUATION: states outside (VBM - 0.95 E_PH, "
+                 "CBM + 0.95 E_PH) are evaluated at z = eps + i eta_far with eta_far = "
+                 "{:.4e} a.u. ({:.4g} eV); in-strip states stay exact (eta = 0). Census and "
+                 "the pole-spacing validity floor are logged below.",
+              opts.eta_far, opts.eta_far * 27.211386245988);
+    else if (qp_params.qp_map == "mode_a")
+      app_log(2, "  - evaluation energies are STRIP-CLAMPED TO mu: "
+                 "states inside (VBM - 0.95 E_PH, CBM + 0.95 E_PH) are exact mode A, "
+                 "states outside it are evaluated at mu; census logged below.");
+    if (opts.route == "expansion") {
+      // pure diagnostic: the whole map is solved from the route-A z0 = 0 re-expansion of the
+      // stored Sigma(iw), so no W data (and no THC contraction) is needed at all.
+      ctx = qp_modea::modea_ctx{};
+      ctx.opts = opts;
+      ctx.active = true;
+      ctx.have_cd = false;
+      ctx.beta = FT.beta();
+      ctx.mu = mu;
+      ctx.eta = opts.eta;
+      ctx.eta_far = opts.eta_far;
+      ctx.ns = sE_ska.shape()[0];
+      ctx.nk = sE_ska.shape()[1];
+      ctx.nbnd = sE_ska.shape()[2];
+      app_log(2, "  - route:                       expansion (DIAGNOSTIC -- Sigma^c comes "
+                 "from the route-A z0 = 0 fit, no W^c contraction)");
+      return;
+    }
+    if constexpr (std::is_same_v<std::decay_t<eri_t>, thc_reader_t>) {
+      qp_modea::build_modea_context(ctx, mb_state, eri, sMO_skia, sE_ska, mu, FT, opts, div,
+                                    need_diag);
+    } else {
+      utils::check(false, "qp_modea: qp_map = \"mode_a\" with qp_modea_route = \"cd\" needs a "
+                          "THC ERI (the W^c band elements are collocation pair vectors). Use "
+                          "a thc eri, or qp_modea_route = \"expansion\".");
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // The mode-A driver.
+  //
+  // Runs, per external (s,k) block owned by this rank:
+  //   (1) the inner QP-consistency loop at FIXED Sigma data -> the LAST V^xc;
+  //   (2) THE ANCHOR: route-B Sigma^c_ab at the first few FERMIONIC nodes
+  //       vs the gathered solver Sigma(i w_n). Pins prefactor, spin, q-star/trev rule, the
+  //       MO rotation and the head in one number;
+  //   (3) the route-A / route-B cross-validation harness: delta_i = |Sigma^A_ii(eps_i) -
+  //       Sigma^B_ii(eps_i)| against the A-side TRUNCATION CLASS |Sigma^A_(p+1) - Sigma^A_(p)|,
+  //       plus one off-diagonal spot check.
+  // Everything here is LOGGED; the only hard failure is a route/knob misuse.
+  // ---------------------------------------------------------------------------------------
+  template<typename comm_t>
+  void modea_run(sArray_t<Array_view_4D_t> &sVcorr_skij,
+                 const sArray_t<Array_view_5D_t> &sSigma_wskab,
+                 const sArray_t<Array_view_5D_t> &sSigma_tskab,
+                 const sArray_t<Array_view_4D_t> &sMO_skia,
+                 const sArray_t<Array_view_3D_t> &sE_ska,
+                 const sArray_t<Array_view_4D_t> &sHstat_skij,
+                 nda::array<double, 1> const &wp, std::vector<long> const &widx,
+                 double mu, const imag_axes_ft::IAFT &FT, std::string const &map_name,
+                 const qp_modea::modea_ctx *ctx, comm_t &comm) {
+    using namespace qp_modea;
+    decltype(nda::range::all) all;
+    constexpr double HA2EV = 27.211386245988;
+    auto [ns, nkpts, nbnd] = sE_ska.shape();
+    const long npos = wp.shape(0);
+    const int lvl = 2;
+
+    utils::check(ctx != nullptr and ctx->active,
+                 "qp_approx: qp_map = \"mode_a\" reached the map without an evaluator "
+                 "context. The context is built in the live W window of add_qpscf_vcorr / "
+                 "add_evscf_vcorr and requires a THC ERI.");
+    const bool cd = ctx->have_cd;
+    const bool mode_b = (map_name == "mode_b");
+
+    // owned blocks: the cd route inherits the context's partition, the diagnostic
+    // "expansion" route round-robins the same way.
+    std::vector<std::pair<long, long>> mine;
+    if (cd) {
+      for (auto const &b : ctx->blocks) mine.emplace_back(b.is, b.ik);
+    } else {
+      for (long sk = comm.rank(); sk < long(ns * nkpts); sk += comm.size())
+        mine.emplace_back(sk / nkpts, sk % nkpts);
+    }
+
+    // the A-side window: order p and p+1 on the SAME node window
+    sigma_real_axis::fit_opts optA, optA1;
+    optA.p = 2;
+    optA1.p = 3;
+    optA.m = optA1.m = std::min<long>(3 * (optA1.p), npos);
+    utils::check(optA.m >= optA1.p + 1,
+                 "qp_approx (mode_a): only {} positive fermionic nodes; the A-side "
+                 "truncation-class fit needs at least {}.", npos, optA1.p + 1);
+
+    double anchor_worst = 0.0, anchor_expect = ctx->diag.rec_rel_worst;
+    double dmax_worst = 0.0, min_den_worst = 1e300, anti_worst = 0.0;
+    double ratio_worst = 0.0, dev_off_worst = 0.0;
+    double ratio_in_worst = 0.0, delta_in_worst = 0.0, class_in_worst = 0.0;
+    double tau_dev_worst = 0.0;
+    // WHERE the gate quantity is attained: the (s,k) block and the element of the probed set
+    // that carries max|Sigma_B - Sigma^GW|. Reduced together with the value (see below) so
+    // the abort names its own element: app_log is root-only while the gate maxes over every
+    // rank's blocks, so the offending block may be owned by a rank whose rows are not logged.
+    long tau_dev_is = -1, tau_dev_ik = -1, tau_dev_a = -1, tau_dev_b = -1;
+    // the per-isym anchor breakdown, kept for the gate message (see the TAU ISYM block)
+    double isym_ratio_worst = 0.0;
+    long isym_class_worst = -1;
+    long iters_worst = 0, n_noconv = 0, n_flag = 0, n_flag_in = 0;
+    long n_fallback = 0, n_fallback_win = 0, n_sanity_trip = 0;
+    long n_homo_fb = 0, n_lumo_fb = 0, n_blocks = 0;
+    // mode_a STRIP CLAMP census
+    long n_clamp = 0, n_clamp_win = 0, n_eval = 0, n_homo_cl = 0, n_lumo_cl = 0;
+    double exc_lo_worst = 0.0, exc_hi_worst = 0.0;
+    // the graded-eta far-state census
+    long n_eta = 0, n_anti_in = 0;
+    double im_off_worst = 0.0, anti_in_worst = 0.0, spacing_worst = 0.0;
+    const qp_modea::strip_t strip = qp_modea::strip_of(*ctx);
+    const double eta_far = ctx->eta_far;
+
+    nda::array<ComplexType, 2> tmp(nbnd, nbnd), Hstat_ab(nbnd, nbnd), V(nbnd, nbnd);
+    nda::array<ComplexType, 3> Sw(optA.m, nbnd, nbnd);
+    nda::array<ComplexType, 2> Sanch(nbnd, nbnd);
+    nda::array<double, 1> eps(nbnd), eps_rel(nbnd);
+
+    for (auto const &[is, ik] : mine) {
+      auto MO = sMO_skia.local()(is, ik, all, all);
+      nda::blas::gemm(ComplexType(1.0), sHstat_skij.local()(is, ik, nda::ellipsis{}), MO,
+                      ComplexType(0.0), tmp);
+      nda::blas::gemm(ComplexType(1.0), nda::dagger(MO), tmp, ComplexType(0.0), Hstat_ab);
+
+      for (long m = 0; m < optA.m; ++m)
+        Sw(m, all, all) = sSigma_wskab.local()(widx[m], is, ik, all, all);
+      auto XA = sigma_real_axis::fit_matsubara(Sw, wp, optA);
+      auto XA1 = sigma_real_axis::fit_matsubara(Sw, wp, optA1);
+
+      // The RAW incoming QP spectrum. Everything DIAGNOSTIC below is read here: it is the
+      // physical band structure of the current outer iteration, and it is what "gap window"
+      // means. The inner loop also starts from it.
+      for (long a = 0; a < nbnd; ++a) eps(a) = sE_ska.local()(is, ik, a).real();
+
+      const sk_block *blk = nullptr;
+      if (cd) blk = std::addressof(ctx->blocks[ctx->block_index(is, ik)]);
+
+      // ------- the gap window: two occupied + two empty states straddling mu -----------
+      // Built from the INCOMING spectrum, i.e. before the inner loop can
+      // move anything: it is the physically meaningful window, and it must not depend on the
+      // outcome of the loop it is used to diagnose.
+      std::vector<long> win;
+      {
+        std::vector<long> occ, emp;
+        for (long a = 0; a < nbnd; ++a) (eps(a) < mu ? occ : emp).push_back(a);
+        std::sort(occ.begin(), occ.end(), [&](long x, long y) { return eps(x) > eps(y); });
+        std::sort(emp.begin(), emp.end(), [&](long x, long y) { return eps(x) < eps(y); });
+        for (size_t t = 0; t < std::min<size_t>(2, occ.size()); ++t) win.push_back(occ[t]);
+        for (size_t t = 0; t < std::min<size_t>(2, emp.size()); ++t) win.push_back(emp[t]);
+        std::sort(win.begin(), win.end());
+      }
+
+      // ------- THE ANCHOR -------------------------------------------------------------
+      // Evaluated at FERMIONIC nodes, so it is independent of eps; only the window is not.
+      if (cd) {
+        double num = 0.0, den = 0.0;
+        const long nanch = std::min<long>(4, npos);
+        for (long m = 0; m < nanch; ++m) {
+          modea_sigma_at(*ctx, *blk, ComplexType(mu, wp(m)), Sanch);
+          auto Sgw = sSigma_wskab.local()(widx[m], is, ik, all, all);
+          for (long a : win)
+            for (long b : win) {
+              num = std::max(num, std::abs(Sanch(a, b) - Sgw(a, b)));
+              den = std::max(den, std::abs(Sgw(a, b)));
+            }
+        }
+        const double dev = (den > 0.0) ? num / den : 0.0;
+        anchor_worst = std::max(anchor_worst, dev);
+        app_log(lvl, "  mode_a ANCHOR (s,k) = ({},{}): max rel dev over {} nodes x the "
+                     "gap window = {:.4e}  (max|Sigma^GW| = {:.4e}, W-fit reconstruction "
+                     "class {:.4e})", is, ik, nanch, dev, den, ctx->diag.rec_rel_worst);
+      }
+
+      // ------- the route-A / route-B harness AT THE INCOMING ENERGIES -------------------
+      // This is the near-gap real-axis accuracy of route B: close to mu the A-side
+      // truncation class is tight, so delta_i there IS the B-side error scale. It must be
+      // read BEFORE the inner loop, whose divergence would otherwise evaluate both sides at
+      // meaningless energies.
+      {
+        // Both sides are read AT THE ACTUAL EVALUATION POINT of the map, i.e. at the strip
+        // evaluation point: comparing an out-of-strip A-side
+        // extrapolation against a B side evaluated at mu would compare two different
+        // arguments. The A side can only be evaluated at REAL energies, so with eta_far > 0
+        // it is read at Re z (the same eps_i) while the B side carries the i eta_far.
+        // Out-of-strip rows are marked "*"; eps_i - mu is printed RAW.
+        app_log(lvl, "  mode_a delta_i [IN] (s,k) = ({},{}):  {:>4} {:>14} {:>12} {:>12} "
+                     "{:>10}", is, ik, "i", "eps_i-mu (eV)", "delta_i", "class_i", "ratio");
+        for (long i = 0; i < nbnd; ++i) {
+          const bool in_win = std::find(win.begin(), win.end(), i) != win.end();
+          const double er = eps(i) - mu;
+          bool hit = false;
+          const ComplexType zc = (mode_b or not cd) ? ComplexType(eps(i), ctx->eta)
+                                                    : strip.zeval(eps(i), &hit);
+          const ComplexType SA = XA.eval(i, i, zc.real() - mu);
+          const ComplexType SA1 = XA1.eval(i, i, zc.real() - mu);
+          const ComplexType SB = cd ? modea_sigma_diag(*ctx, *blk, i, zc) : SA;
+          const double d = std::abs(SB - SA), cl = std::abs(SA1 - SA);
+          const double ratio = (cl > 0.0) ? d / cl : 0.0;
+          if (in_win) {
+            ratio_in_worst = std::max(ratio_in_worst, ratio);
+            delta_in_worst = std::max(delta_in_worst, d);
+            class_in_worst = std::max(class_in_worst, cl);
+            if (ratio > 10.0) ++n_flag_in;
+          }
+          app_log(in_win ? lvl : lvl + 1, "  mode_a delta_i [IN]   ({},{}):  {:>4} {:>14.4f} "
+                                          "{:>12.4e} {:>12.4e} {:>10.3g}{}",
+                  is, ik, i, er * HA2EV, d, cl, ratio,
+                  hit ? (eta_far > 0.0 ? "  * eta_far" : "  * clamped") : "");
+        }
+      }
+
+      // ---- THE CANCELLATION METER -----------------------------------------------------
+      // Env-gated on QPGW_SABS_PROBE, so with the variable unset NOTHING changes -- no code
+      // path, no output. Reports, per gap-window state and per evaluation offset eta:
+      //   Sabs = sum_{J,p} |M_ii,Jp| |n_B(om_p) + f(eps_J)| / |z - (eps_J - om_p)|
+      // against the actual |Sigma^c_ii(z)| from the SAME pole slab. Sabs/|Sigma| is the
+      // number of digits of cancellation the representation demands: the LS routes can need
+      // several digits on a metal, the spectral quadrature is expected O(1-10) because its
+      // numerators are sign-definite (wc_spectral.hpp section 5). The head sector is split
+      // out because it is the one part of the spectral rep that is still a least-squares
+      // object (poles p >= 2*nbin, i.e. |om_p| on the DLR auxiliary grid at q = Gamma).
+      if (cd and std::getenv("QPGW_SABS_PROBE") != nullptr) {
+        const double pi_b = M_PI / ctx->beta;
+        const double om_cut = 3.0 * pi_b;
+        const long offJ = (is * ctx->nk + ik) * ctx->nJ;
+        const long nbody = 2 * ctx->diag.sp_nbin;      // 0 on the tau/nu routes
+        {
+          long nlow = 0; double nB_low = 0.0, nB_tot = 0.0, om_min = 1e300, om_max = -1e300;
+          for (long p = 0; p < ctx->npk; ++p) {
+            const double o = ctx->om(p);
+            om_min = std::min(om_min, std::abs(o)); om_max = std::max(om_max, std::abs(o));
+            nB_tot += std::abs(ctx->nB(p));
+            if (std::abs(o) < om_cut) { ++nlow; nB_low += std::abs(ctx->nB(p)); }
+          }
+          app_log(lvl, "  Sabs probe W poles (s,k) = ({},{}): npk = {}, |om_p| in [{:.4e}, {:.4e}] a.u.; "
+                       "3 pi/beta = {:.4e} a.u.; {} poles below it carry sum|n_B| = {:.4e} of "
+                       "{:.4e} ({:.2f} %)", is, ik, ctx->npk, om_min, om_max, om_cut, nlow,
+                  nB_low, nB_tot, (nB_tot > 0.0 ? 100.0 * nB_low / nB_tot : 0.0));
+        }
+        const double etas[4] = {0.0, pi_b, 2.0 * pi_b, 10.0 * pi_b};
+        for (long i : win) {
+          const ComplexType SA = XA.eval(i, i, eps(i) - mu);
+          for (int e = 0; e < 4; ++e) {
+            const ComplexType z(eps(i), etas[e]);
+            const ComplexType SB = modea_sigma_diag(*ctx, *blk, i, z);
+            double sabs = 0.0, sabs_low = 0.0, sabs_head = 0.0, wmax = 0.0, dmin = 1e300;
+            double npos_num = 0.0, nneg_num = 0.0;
+            for (long J = 0; J < ctx->nJ; ++J) {
+              const double eJ = ctx->epsJ(offJ + J), fJ = ctx->fJ(offJ + J);
+              for (long p = 0; p < ctx->npk; ++p) {
+                const ComplexType Mii = blk->pole_diag(i, J * ctx->npk + p);  // LOCAL read
+                const double w = ctx->nB(p) + fJ;
+                const double num = std::abs(Mii) * std::abs(w);
+                const double den = std::abs(z - ComplexType(eJ - ctx->om(p), 0.0));
+                dmin = std::min(dmin, den);
+                const double t = (den > 0.0) ? num / den : 0.0;
+                sabs += t; wmax = std::max(wmax, t);
+                if (std::abs(ctx->om(p)) < om_cut) sabs_low += t;
+                if (nbody > 0 and p >= nbody) sabs_head += t;
+                // the SIGN AUDIT of wc_spectral.hpp section 5: Re[M_ii] * (n_B + f) should
+                // be >= 0 for every (J, p) in the spectral body sector.
+                const double sgn = Mii.real() * w;
+                if (sgn >= 0.0) npos_num += std::abs(sgn); else nneg_num += std::abs(sgn);
+              }
+            }
+            app_log(lvl, "  Sabs probe SIGMA  ({},{}): i = {:>3}  eps-mu = {:+9.4f} eV  eta = "
+                         "{:.4e}  |Sigma_B| = {:.6e}  Sabs = {:.6e}  Sabs/|Sigma| = {:.4e}  "
+                         "low-om share = {:6.2f} %  head share = {:6.2f} %  neg-numerator "
+                         "share = {:6.2f} %  max term = {:.6e}  min|den| = {:.4e}  "
+                         "|Sigma_A(AC)| = {:.6e}",
+                    is, ik, i, (eps(i) - mu) * HA2EV, etas[e], std::abs(SB), sabs,
+                    (std::abs(SB) > 0.0 ? sabs / std::abs(SB) : 0.0),
+                    (sabs > 0.0 ? 100.0 * sabs_low / sabs : 0.0),
+                    (sabs > 0.0 ? 100.0 * sabs_head / sabs : 0.0),
+                    (npos_num + nneg_num > 0.0 ? 100.0 * nneg_num / (npos_num + nneg_num) : 0.0),
+                    wmax, dmin, std::abs(SA));
+          }
+        }
+      }
+
+      // The inner loop starts from the raw incoming sE_ska (see the note at the end of
+      // qp_modea.hpp on why the z0 = 0 start refinement is not used).
+      // ------- THE TAU-DOMAIN ORACLE ---------------------------------------------------
+      // Same elements, two domains: tau (no transform on either side) vs the first fermionic
+      // nodes (the anchor). Runs on EVERY block this rank owns; only the root rank's rows
+      // reach the log (app_log), while the gate below maxes over all ranks -- which is why
+      // the gate quantity carries its argmax (s,k,a,b) with it.
+      //
+      // NORMALIZATION (see "THE GATE'S NORMALIZATION" in wc_band_elements.hpp). The GATE
+      // quantity is normalized ONCE PER BLOCK, by the largest |Sigma^GW| of the probed set,
+      // exactly like the i w anchor above. The per-element ratios below are kept as log lines,
+      // but they are diagnostics, not the gate: dividing each element by ITS OWN magnitude
+      // lets a symmetry-suppressed off-diagonal (orders of magnitude below the diagonal) turn
+      // a uniform, tiny absolute deviation into a large "relative" one, and the gate would
+      // fire on the smallness of the element rather than on any error.
+      if (cd) {
+        nda::array<double, 1> tau_ph(FT.nt_f());
+        {
+          auto xm = FT.tau_mesh();
+          for (long i = 0; i < FT.nt_f(); ++i) tau_ph(i) = (xm(i) + 1.0) * FT.beta() / 2.0;
+        }
+        nda::array<ComplexType, 1> Stau(FT.nt_f());
+        // the gap-window diagonals, plus the largest off-diagonal of the raw map
+        std::vector<std::pair<long, long>> elems;
+        for (long i : win) elems.emplace_back(i, i);
+        {
+          long ba = 0, bb = 1;
+          double vm = -1.0;
+          for (long a : win)
+            for (long b : win)
+              if (a != b) {
+                double m = 0.0;
+                for (long i = 0; i < FT.nt_f(); ++i)
+                  m = std::max(m, std::abs(sSigma_tskab.local()(i, is, ik, a, b)));
+                if (m > vm) { vm = m; ba = a; bb = b; }
+              }
+          elems.emplace_back(ba, bb);
+        }
+        app_log(lvl, "  mode_a TAU ORACLE (s,k) = ({},{}): {:>6} {:>14} {:>14} {:>10}",
+                is, ik, "(a,b)", "tau rel dev", "iw rel dev", "ratio");
+        double worst_tn = -1.0, worst_td = 0.0, blk_den = 0.0;
+        std::pair<long, long> worst_ab{0, 0};
+        for (auto const &[a, b] : elems) {
+          modea_sigma_tau(*ctx, *blk, a, b, tau_ph, Stau);
+          double tn = 0.0, td = 0.0;
+          for (long i = 0; i < FT.nt_f(); ++i) {
+            const ComplexType ref = sSigma_tskab.local()(i, is, ik, a, b);
+            tn = std::max(tn, std::abs(Stau(i) - ref));
+            td = std::max(td, std::abs(ref));
+          }
+          double wn_ = 0.0, wd = 0.0;
+          const long nanch = std::min<long>(4, npos);
+          for (long m = 0; m < nanch; ++m) {
+            modea_sigma_at(*ctx, *blk, ComplexType(mu, wp(m)), Sanch);
+            const ComplexType ref = sSigma_wskab.local()(widx[m], is, ik, a, b);
+            wn_ = std::max(wn_, std::abs(Sanch(a, b) - ref));
+            wd = std::max(wd, std::abs(ref));
+          }
+          const double dtau = (td > 0.0) ? tn / td : 0.0;
+          const double diw = (wd > 0.0) ? wn_ / wd : 0.0;
+          if (tn > worst_tn) { worst_tn = tn; worst_ab = {a, b}; }
+          blk_den = std::max(blk_den, td);
+          app_log(lvl, "  mode_a TAU ORACLE     ({},{}): ({:>2},{:>2}) {:>14.4e} {:>14.4e} "
+                       "{:>10.3g}{}", is, ik, a, b, dtau, diw,
+                  (dtau > 0.0 ? diw / dtau : 0.0), (a == b) ? "" : "   <- off-diagonal");
+        }
+        // THE GATE QUANTITY of this block: ONE denominator for the probed set (above).
+        const double dtau_blk = (blk_den > 0.0 and worst_tn > 0.0) ? worst_tn / blk_den : 0.0;
+        worst_td = blk_den;
+        app_log(lvl, "  mode_a TAU ORACLE     ({},{}): BLOCK = {:.4e}  [= max|Sigma_B - "
+                     "Sigma^GW| {:.4e} over the probed set, at element ({},{}), / max|Sigma^GW| "
+                     "{:.4e} of the SAME set -- THE GATE QUANTITY, normalized once per block "
+                     "like the i w anchor. The per-element rows above divide by each element's "
+                     "own magnitude and are diagnostics only.]",
+                is, ik, dtau_blk, worst_tn, worst_ab.first, worst_ab.second, blk_den);
+        if (dtau_blk > tau_dev_worst) {
+          tau_dev_worst = dtau_blk;
+          tau_dev_is = is; tau_dev_ik = ik;
+          tau_dev_a = worst_ab.first; tau_dev_b = worst_ab.second;
+        }
+        // ---- THE PER-ISYM BREAKDOWN (level 2) -------------------------------------------
+        // The route-B side of the element with the largest ABSOLUTE deviation, split over the
+        // symmetry classes of the star loop (ctx->q_isym; the classes partition the full
+        // transfer mesh, so the rows sum back to the total -- printed as the bookkeeping
+        // check), against that same absolute deviation. Under the block normalization that
+        // element IS the one that sets the gate (numerator and gate share the same max), so
+        // the breakdown and the gate describe the same thing. The reference cannot be split
+        // (the solver sums the isym loop internally), so there is no per-class deviation;
+        // what discriminates is each class's own MAGNITUDE:
+        //   share       = max_tau |Sigma_B^(isym)| / max_tau |Sigma^GW|
+        //   dev/|class| = how wrong THAT CLASS ALONE would have to be, relatively, to carry
+        //                 the entire deviation.
+        // A structurally wrong class -- wrong rotation, wrong fractional-translation phase,
+        // wrong trev branch -- is wrong by O(1), so exactly one row would read ~1. Rows that
+        // all read << 1 EXCLUDE a per-class convention error, and by the symmetry derivation
+        // in wc_band_elements.hpp the only object the two sides then still differ in is the W
+        // representation (fit + stage-1b/1c truncation).
+        if (ctx->nsym > 1 and ctx->q_isym.size() > 0 and worst_td > 0.0) {
+          const long a = worst_ab.first, b = worst_ab.second;
+          nda::array<ComplexType, 2> Scls(ctx->nsym, FT.nt_f());
+          modea_sigma_tau_by_class(*ctx, *blk, a, b, tau_ph, Scls);
+          modea_sigma_tau(*ctx, *blk, a, b, tau_ph, Stau);
+          double chk = 0.0, worst_ratio = 0.0;
+          long worst_s = -1;
+          for (long i = 0; i < FT.nt_f(); ++i) {
+            ComplexType tot(0.0);
+            for (long s = 0; s < ctx->nsym; ++s) tot += Scls(s, i);
+            chk = std::max(chk, std::abs(tot - Stau(i)));
+          }
+          app_log(lvl, "  mode_a TAU ISYM (s,k) = ({},{}): worst element ({},{}), absolute "
+                       "deviation {:.4e} of max|Sigma^GW| {:.4e}; {:>5} {:>8} {:>14} {:>11} "
+                       "{:>13}", is, ik, a, b, worst_tn, worst_td, "isym", "nq", "max|Sigma_B|",
+                  "share", "dev/|class|");
+          for (long s = 0; s < ctx->nsym; ++s) {
+            double m = 0.0;
+            for (long i = 0; i < FT.nt_f(); ++i) m = std::max(m, std::abs(Scls(s, i)));
+            long nq_s = 0;
+            for (long qp = 0; qp < ctx->q_isym.size(); ++qp) if (ctx->q_isym(qp) == s) ++nq_s;
+            if (nq_s == 0) continue;      // a qsymms entry the star loop never uses
+            const double ratio = (m > 0.0) ? worst_tn / m : -1.0;
+            if (ratio > worst_ratio) { worst_ratio = ratio; worst_s = s; }
+            app_log(lvl, "  mode_a TAU ISYM       ({},{}): {:>27} {:>5} {:>8} {:>14.4e} "
+                         "{:>11.3e} {:>13.3g}", is, ik, "", s, nq_s, m,
+                    (worst_td > 0.0 ? m / worst_td : 0.0), ratio);
+          }
+          app_log(lvl, "  mode_a TAU ISYM       ({},{}): worst dev/|class| = {:.3g} at class "
+                       "{} -- O(1) there means THAT symmetry class is structurally wrong, "
+                       "<< 1 for every class means the deviation is diffuse (the W "
+                       "representation). Class sum vs total = {:.2e} (bookkeeping).",
+                  is, ik, worst_ratio, worst_s, chk);
+          if (worst_ratio > isym_ratio_worst) {
+            isym_ratio_worst = worst_ratio;
+            isym_class_worst = worst_s;
+          }
+        }
+      }
+
+      if (mode_b) {
+        // ---- MODE B: no inner-consistency loop ----
+        auto br = modeb_vxc(*ctx, *blk, eps, win, V);
+        sVcorr_skij.local()(is, ik, all, all) = V;
+        n_fallback += br.n_fallback;
+        n_fallback_win += br.n_fallback_win;
+        n_sanity_trip += br.n_sanity_trip;
+        if (br.homo_fallback) ++n_homo_fb;
+        if (br.lumo_fallback) ++n_lumo_fb;
+        ++n_blocks;
+        min_den_worst = std::min(min_den_worst, br.min_den);
+        anti_worst = std::max(anti_worst, br.anti_herm);
+        n_eta += br.n_eta;
+        im_off_worst = std::max(im_off_worst, br.im_off);
+        spacing_worst = std::max(spacing_worst, br.spacing);
+        app_log(lvl, "  mode_b (s,k) = ({},{}): max|V| = {:.4e}, min_den = {:.4e} a.u., "
+                     "out-of-strip diagonals: {} of {} ({} in the gap window, {} evaluated at "
+                     "eps + i eta_far, the rest at z = mu); per-k HOMO {}, LUMO {}",
+                is, ik, br.vmax, br.min_den, br.n_fallback, nbnd, br.n_fallback_win, br.n_eta,
+                br.homo_fallback ? "OUT OF STRIP" : "strip-exact",
+                br.lumo_fallback ? "OUT OF STRIP" : "strip-exact");
+        continue;
+      }
+
+      consist_result cr;
+      qp_modea::clamp_census cc;   // the LAST sweep's census (the map that is returned)
+      if (cd) {
+        cr = inner_consistency(
+            [&](nda::array<double, 1> const &e, nda::array<ComplexType, 2> &Vout, long *am) {
+              return modea_vxc_cd(*ctx, *blk, e, Vout, am, std::addressof(cc),
+                                  std::addressof(win));
+            }, Hstat_ab, eps, V, ctx->opts.nconsist, ctx->opts.consist_tol);
+      } else {
+        cr = inner_consistency(
+            [&](nda::array<double, 1> const &e, nda::array<ComplexType, 2> &Vout, long *am) {
+              (void)am;
+              nda::array<double, 1> er(e.shape(0));
+              for (long a = 0; a < e.shape(0); ++a) er(a) = e(a) - mu;
+              Vout = sigma_real_axis::assemble_vxc(XA, er);
+              return 1e300;
+            }, Hstat_ab, eps, V, ctx->opts.nconsist, ctx->opts.consist_tol);
+      }
+      sVcorr_skij.local()(is, ik, all, all) = V;
+      app_log(lvl, "  mode_a inner consistency (s,k) = ({},{}): {} sweeps, max|d eps| = "
+                       "{:.4e}, max|V| = {:.4e}, min_den = {:.4e} at state {} (eps - mu = "
+                       "{:+.6f} a.u.)", is, ik, cr.iters, cr.dmax, cr.vmax, cr.min_den,
+              cr.min_den_a, cr.min_den_ea - mu);
+      iters_worst = std::max(iters_worst, cr.iters);
+      dmax_worst = std::max(dmax_worst, cr.dmax);
+      min_den_worst = std::min(min_den_worst, cr.min_den);
+      anti_worst = std::max(anti_worst, cr.anti_herm);
+      if (not cr.converged) ++n_noconv;
+
+      // ------- THE STRIP CLAMP CENSUS -------------------------------------------------
+      // Read off the LAST inner sweep, i.e. the map actually returned to the caller.
+      if (cd) {
+        n_clamp += cc.n_clamp;
+        n_clamp_win += cc.n_clamp_win;
+        n_eval += cc.n_eval;
+        if (cc.homo_clamp) ++n_homo_cl;
+        if (cc.lumo_clamp) ++n_lumo_cl;
+        exc_lo_worst = std::max(exc_lo_worst, cc.exc_lo);
+        exc_hi_worst = std::max(exc_hi_worst, cc.exc_hi);
+        n_eta += cc.n_eta;
+        im_off_worst = std::max(im_off_worst, cc.im_off);
+        spacing_worst = std::max(spacing_worst, cc.spacing);
+        if (cc.anti_in >= 0.0) { anti_in_worst = std::max(anti_in_worst, cc.anti_in); ++n_anti_in; }
+        ++n_blocks;
+        app_log(lvl, "  mode_a STRIP CENSUS (s,k) = ({},{}): {} of {} evaluation energies "
+                     "out of strip ({} in the gap window, {} evaluated at eps + i eta_far, "
+                     "the rest at mu); per-k HOMO {}, LUMO {}; worst excursion below the "
+                     "lower bound {:.4f} a.u., above the upper bound {:.4f} a.u.",
+                is, ik, cc.n_clamp, cc.n_eval, cc.n_clamp_win, cc.n_eta,
+                cc.homo_clamp ? "OUT OF STRIP" : "in strip",
+                cc.lumo_clamp ? "OUT OF STRIP" : "in strip", cc.exc_lo, cc.exc_hi);
+      }
+
+      // ------- the same harness AT THE EXIT ENERGIES (reported, interpretable only if
+      //         the inner loop converged) -------------------------------------------------
+      {
+        app_log(lvl + 1, "  mode_a delta_i [OUT] (s,k) = ({},{}):  {:>4} {:>14} {:>12} {:>12} "
+                         "{:>10}", is, ik, "i", "eps_i-mu (eV)", "delta_i", "class_i", "ratio");
+        for (long i = 0; i < nbnd; ++i) {
+          const bool in_win = std::find(win.begin(), win.end(), i) != win.end();
+          const double er = eps(i) - mu;
+          bool hit = false;
+          const ComplexType zc = cd ? strip.zeval(eps(i), &hit)
+                                    : ComplexType(eps(i), ctx->eta);
+          const ComplexType SA = XA.eval(i, i, zc.real() - mu);
+          const ComplexType SA1 = XA1.eval(i, i, zc.real() - mu);
+          const ComplexType SB = cd ? modea_sigma_diag(*ctx, *blk, i, zc) : SA;
+          const double d = std::abs(SB - SA), cl = std::abs(SA1 - SA);
+          const double ratio = (cl > 0.0) ? d / cl : 0.0;
+          if (in_win) ratio_worst = std::max(ratio_worst, ratio);
+          if (in_win and ratio > 10.0) ++n_flag;
+          app_log(lvl + 1, "  mode_a delta_i [OUT]  ({},{}):  {:>4} {:>14.4f} "
+                           "{:>12.4e} {:>12.4e} {:>10.3g}{}",
+                  is, ik, i, er * HA2EV, d, cl, ratio,
+                  hit ? (eta_far > 0.0 ? "  * eta_far" : "  * clamped") : "");
+        }
+        // one off-diagonal spot check: the largest |V^xc_ab|, a != b. The A side is built at
+        // the SAME (clamped) energies the B side used, for the same reason as the table above.
+        long ba = 0, bb = 0;
+        double vmax = -1.0;
+        for (long a = 0; a < nbnd; ++a)
+          for (long b = 0; b < nbnd; ++b)
+            if (a != b and std::abs(V(a, b)) > vmax) { vmax = std::abs(V(a, b)); ba = a; bb = b; }
+        for (long a = 0; a < nbnd; ++a)
+          eps_rel(a) = (cd ? strip.zeval(eps(a)).real() : eps(a)) - mu;
+        auto VA = sigma_real_axis::assemble_vxc(XA, eps_rel);
+        const double doff = std::abs(V(ba, bb) - VA(ba, bb)) / std::max(vmax, 1e-30);
+        dev_off_worst = std::max(dev_off_worst, doff);
+        app_log(lvl + 1, "  mode_a off-diagonal spot check (s,k) = ({},{}): largest |V_ab| at "
+                         "({},{}) = {:.4e}; A-vs-B rel dev = {:.4e}", is, ik, ba, bb, vmax, doff);
+      }
+    }
+
+    anchor_worst = comm.all_reduce_value(anchor_worst, boost::mpi3::max<>{});
+    dmax_worst = comm.all_reduce_value(dmax_worst, boost::mpi3::max<>{});
+    min_den_worst = comm.all_reduce_value(min_den_worst, boost::mpi3::min<>{});
+    anti_worst = comm.all_reduce_value(anti_worst, boost::mpi3::max<>{});
+    ratio_worst = comm.all_reduce_value(ratio_worst, boost::mpi3::max<>{});
+    dev_off_worst = comm.all_reduce_value(dev_off_worst, boost::mpi3::max<>{});
+    iters_worst = comm.all_reduce_value(iters_worst, boost::mpi3::max<>{});
+    n_noconv = comm.all_reduce_value(n_noconv, std::plus<>{});
+    n_flag = comm.all_reduce_value(n_flag, std::plus<>{});
+    ratio_in_worst = comm.all_reduce_value(ratio_in_worst, boost::mpi3::max<>{});
+    delta_in_worst = comm.all_reduce_value(delta_in_worst, boost::mpi3::max<>{});
+    class_in_worst = comm.all_reduce_value(class_in_worst, boost::mpi3::max<>{});
+    n_flag_in = comm.all_reduce_value(n_flag_in, std::plus<>{});
+
+    // The far-state census travels with the anti-Hermitian rescope below.
+    n_eta = comm.all_reduce_value(n_eta, std::plus<>{});
+    im_off_worst = comm.all_reduce_value(im_off_worst, boost::mpi3::max<>{});
+    spacing_worst = comm.all_reduce_value(spacing_worst, boost::mpi3::max<>{});
+    anti_in_worst = comm.all_reduce_value(anti_in_worst, boost::mpi3::max<>{});
+    n_anti_in = comm.all_reduce_value(n_anti_in, std::plus<>{});
+    // THE TRIPWIRE quantity. With eta_far > 0 the off-strip evaluations are complex BY
+    // CONSTRUCTION (Im Sigma(eps + i eta) is eta times the smoothed spectral density), so an
+    // O(1) anti-Hermitian residual there is physics, not a routing error; the tripwire is
+    // rescoped to the elements both of whose evaluation points are real. mode_b needs no
+    // rescope: its off-diagonals are all at z = mu and its diagonal takes Re explicitly.
+    // n_anti_in = 0 means NO block had an in-strip pair at all (every state out of strip); the
+    // rescoped number would then be vacuous, so the full-matrix one is reported instead.
+    const bool anti_rescoped = (eta_far > 0.0 and not mode_b and cd and n_anti_in > 0);
+    const double anti_gate = anti_rescoped ? anti_in_worst : anti_worst;
+
+    app_log(lvl, "  - inner QP consistency:       worst count {} of {} (cap), max|d eps| at "
+                 "exit = {:.3e} a.u., min_den = {:.4e} a.u.",
+            iters_worst, ctx->opts.nconsist, dmax_worst, min_den_worst);
+    app_log(lvl, "  - anti-Hermitian residual:    max|V - V^dag|/max|V| = {:.3e} over {} "
+                 "(expected at the W-fit class {:.3e}; O(1) would be a routing error)",
+            anti_gate, anti_rescoped ? "the IN-STRIP elements (rescoped; the full-matrix "
+                                       "value below is dominated by the eta-broadened far "
+                                       "states and is NOT an error)" : "all elements",
+            ctx->diag.rec_rel_worst);
+    if (eta_far > 0.0)
+      app_log(lvl, "  - far-state physics:          {} out-of-strip evaluations at eps + i "
+                   "eta_far ({:.4e} a.u. = {:.4g} eV); max|Im Sigma^c| there = {:.4e} a.u. "
+                   "({:.4g} eV) [= eta x the smoothed spectral density, a DIAGNOSTIC]; "
+                   "full-matrix anti-Hermitian residual = {:.3e}; worst local fitted-pole "
+                   "spacing at those points = {:.4e} a.u. (eta_far / spacing = {:.3g}, "
+                   "floor {:.1f})",
+              n_eta, eta_far, eta_far * HA2EV, im_off_worst, im_off_worst * HA2EV, anti_worst,
+              spacing_worst, (spacing_worst > 0.0 ? eta_far / spacing_worst : 0.0),
+              qp_modea::modea_eta_far_mult);
+    if (eta_far > 0.0 and n_eta > 0 and spacing_worst > 0.0 and
+        eta_far < qp_modea::modea_eta_far_mult * spacing_worst)
+      app_warning("qp_approx ({}): qp_modea_eta_far = {:.4e} a.u. is BELOW {:.1f} x the "
+                  "measured local fitted-pole spacing ({:.4e} a.u.) at the out-of-strip "
+                  "evaluation points. Sigma^c(eps + i eta_far) is then dominated by individual "
+                  "poles of the FIT rather than by the eta-smoothed spectral density, i.e. the "
+                  "far-state values are representation artefacts. Raise eta_far above {:.4e} "
+                  "a.u. ({:.4g} eV) or sharpen the W^c fit.",
+                  map_name, eta_far, qp_modea::modea_eta_far_mult, spacing_worst,
+                  qp_modea::modea_eta_far_mult * spacing_worst,
+                  qp_modea::modea_eta_far_mult * spacing_worst * HA2EV);
+    if (cd)
+      app_log(lvl, "  - i w comparison (DIAGNOSTIC, never a gate): route-B Sigma^c vs the "
+                   "solver Sigma(i w_n) over the gap window = {:.4e} [W-fit class {:.4e}]. "
+                   "This number is dominated by the REFERENCE's tau -> i w transform of the "
+                   "G.W product, whose spectral support exceeds the grid: it halves with "
+                   "every DLR prec notch while the tau deviation does not. The gate is the "
+                   "TAU anchor above.", anchor_worst, anchor_expect);
+    {   // MAXLOC: reduce the gate quantity together with WHERE it was attained. Only the
+        // root rank's oracle rows reach the log, so without this the offending block of a
+        // multi-rank run is unnameable.
+      const double local = tau_dev_worst;
+      tau_dev_worst = comm.all_reduce_value(tau_dev_worst, boost::mpi3::max<>{});
+      if (local < tau_dev_worst) { tau_dev_is = tau_dev_ik = tau_dev_a = tau_dev_b = -1; }
+      tau_dev_is = comm.all_reduce_value(tau_dev_is, boost::mpi3::max<>{});
+      tau_dev_ik = comm.all_reduce_value(tau_dev_ik, boost::mpi3::max<>{});
+      tau_dev_a = comm.all_reduce_value(tau_dev_a, boost::mpi3::max<>{});
+      tau_dev_b = comm.all_reduce_value(tau_dev_b, boost::mpi3::max<>{});
+      const double li = isym_ratio_worst;
+      isym_ratio_worst = comm.all_reduce_value(isym_ratio_worst, boost::mpi3::max<>{});
+      if (li < isym_ratio_worst) isym_class_worst = -1;
+      isym_class_worst = comm.all_reduce_value(isym_class_worst, boost::mpi3::max<>{});
+    }
+    app_log(lvl, "  - TAU ORACLE:                 max BLOCK-normalized dev of Sigma_B(tau) vs "
+                 "the solver's Sigma^c(tau) (no transform on either side) = {:.4e}, attained "
+                 "on block (s,k) = ({},{}) at element ({},{}); the same elements at the first "
+                 "fermionic nodes deviate by {:.4e} (the anchor). [Both are normalized by the "
+                 "largest |Sigma^GW| of the probed set, see wc_band_elements.hpp.]",
+            tau_dev_worst, tau_dev_is, tau_dev_ik, tau_dev_a, tau_dev_b, anchor_worst);
+    app_log(lvl, "  - A/B harness [IN, gap window]: max delta_i = {:.4e} a.u. ({:.4g} meV), "
+                 "max class_i = {:.4e} a.u. ({:.4g} meV), worst ratio = {:.3g} ({} states "
+                 "above 10x)",
+            delta_in_worst, delta_in_worst * 27211.386, class_in_worst,
+            class_in_worst * 27211.386, ratio_in_worst, n_flag_in);
+    app_log(lvl, "  - A/B harness [OUT]:          worst delta_i/class_i over gap-window "
+                 "states = {:.3g} ({} states above 10x); off-diagonal spot check rel dev = "
+                 "{:.3e}", ratio_worst, n_flag, dev_off_worst);
+    // ONE machine-greppable line per outer iteration, for scripted parameter scans.
+    app_log(1, "@@MODEA_CELL wfit={} wrtol={:.1e} eta={:.4e} | ratio={:.4e} rec={:.4e} "
+               "gapedge={:.6g} npk={} | dmax={:.4e} iters={} minden={:.4e} anchor={:.4e} "
+               "antiherm={:.4e} taudev={:.4e} | dIN={:.4e} clIN={:.4e} rIN={:.4e} | "
+               "wrank={:.1e} Np={} rmax={} rmean={:.2f} wtrunc={:.3e} "
+               "tfit={:.2f} tfac={:.2f} tsand={:.2f} | etafar={:.4e} neta={} imoff={:.4e} "
+               "spacing={:.4e} antiin={:.4e} | speta={:.4e} spNO={} spnbin={} sphead={} "
+               "spwidth={:.3e} spsym={:.3e} sppsd={:.3e} sphrec={:.3e} spwall={:.2f}",
+            ctx->opts.wfit, ctx->diag.gap_edge > -1 ? qp_modea::last_run().wrtol : -1.0,
+            ctx->eta, ctx->diag.res_ratio_worst, ctx->diag.rec_rel_worst,
+            ctx->diag.gap_edge, ctx->npk, dmax_worst, iters_worst, min_den_worst,
+            anchor_worst, anti_gate, tau_dev_worst, delta_in_worst, class_in_worst,
+            ratio_in_worst, ctx->opts.wrank, qp_modea::last_run().Np,
+            ctx->diag.wrank_max, ctx->diag.wrank_mean, ctx->diag.wtrunc_worst,
+            ctx->diag.t_fit, ctx->diag.t_fac, ctx->diag.t_sand,
+            eta_far, n_eta, im_off_worst, spacing_worst, anti_in_worst,
+            ctx->diag.sp_eta, ctx->diag.sp_NO, ctx->diag.sp_nbin, ctx->diag.sp_nhead,
+            ctx->diag.sp_width, ctx->diag.sp_sym, ctx->diag.sp_psdneg,
+            ctx->diag.sp_headrec, ctx->diag.sp_wall);
+    if (n_noconv > 0)
+      app_warning("qp_approx (mode_a): the inner QP-consistency loop hit the cap ({}) on {} "
+                  "(s,k) blocks with max|d eps| = {:.3e}. This flags physical "
+                  "multiple quasiparticle solutions, not an error.",
+                  ctx->opts.nconsist, n_noconv, dmax_worst);
+
+    // ---- THE STRIP CLAMP CENSUS, summary ----
+    // n_blocks is shared with the mode_b census below and is reduced HERE, once.
+    n_blocks = comm.all_reduce_value(n_blocks, std::plus<>{});
+    n_clamp = comm.all_reduce_value(n_clamp, std::plus<>{});
+    n_clamp_win = comm.all_reduce_value(n_clamp_win, std::plus<>{});
+    n_eval = comm.all_reduce_value(n_eval, std::plus<>{});
+    n_homo_cl = comm.all_reduce_value(n_homo_cl, std::plus<>{});
+    n_lumo_cl = comm.all_reduce_value(n_lumo_cl, std::plus<>{});
+    exc_lo_worst = comm.all_reduce_value(exc_lo_worst, boost::mpi3::max<>{});
+    exc_hi_worst = comm.all_reduce_value(exc_hi_worst, boost::mpi3::max<>{});
+    if (cd and not mode_b) {
+      const bool swin = qp_modea::strip_window_set(ctx->opts);
+      app_log(lvl, "  - mode_a STRIP CLAMP:         strip = {} = ({:+.6f}, {:+.6f}) a.u. = "
+                   "({:+.4f}, {:+.4f}) eV, i.e. mu {:+.4f} eV {:+.4f} / {:+.4f} eV; with "
+                   "VBM {:+.6f}, CBM {:+.6f}, E_PH {:.6f} ({})",
+              swin ? "EXPLICIT WINDOW [mu - qp_modea_strip_lo, mu + qp_modea_strip_hi]"
+                   : "(VBM - 0.95 E_PH, CBM + 0.95 E_PH)",
+              strip.lo, strip.hi, strip.lo * HA2EV, strip.hi * HA2EV, ctx->mu * HA2EV,
+              (strip.lo - ctx->mu) * HA2EV, (strip.hi - ctx->mu) * HA2EV,
+              ctx->vbm, ctx->cbm, ctx->diag.gap_edge,
+              strip.active ? "ACTIVE" : "INACTIVE (no support constraint this iteration)");
+      if (swin)
+        app_log(lvl, "  - mode_a STRIP WINDOW:        EXPLICIT: strip_lo = {:.6f} a.u. "
+                     "({:.4f} eV) below mu, strip_hi = {:.6f} a.u. ({:.4f} eV) above mu. The "
+                     "E_PH strip it REPLACES would have been ({:+.6f}, {:+.6f}) a.u. -- "
+                     "{:.4f} eV wide against {:.4f} eV now. gap_edge and the W^c support "
+                     "constraint are UNCHANGED by this knob; check the census below, because "
+                     "a mis-sized window fails as a clamp artefact, not as an error.",
+                ctx->opts.strip_lo, ctx->opts.strip_lo * HA2EV,
+                ctx->opts.strip_hi, ctx->opts.strip_hi * HA2EV,
+                ctx->vbm - 0.95 * ctx->diag.gap_edge, ctx->cbm + 0.95 * ctx->diag.gap_edge,
+                (ctx->cbm + 0.95 * ctx->diag.gap_edge
+                 - (ctx->vbm - 0.95 * ctx->diag.gap_edge)) * HA2EV,
+                (strip.hi - strip.lo) * HA2EV);
+      app_log(lvl, "  - mode_a strip census:        IN-STRIP {} / eta-far {} / CLAMPED {} of "
+                   "{} evaluation energies; out of strip {} "
+                   "({} in the gap window; {} evaluated at eps + i eta_far, {} clamped to mu) "
+                   "over {} (s,k) blocks; BAND-EDGE STATES: per-k HOMO out of strip in {} of "
+                   "{} blocks, LUMO in {} of {}; worst excursion {:.4f} a.u. below / {:.4f} "
+                   "a.u. above",
+              n_eval - n_clamp, n_eta, n_clamp - n_eta, n_eval,
+              n_clamp, n_clamp_win, n_eta, n_clamp - n_eta, n_blocks, n_homo_cl,
+              n_blocks, n_lumo_cl, n_blocks, exc_lo_worst, exc_hi_worst);
+      if (n_clamp_win > 0)
+        app_warning("qp_approx (mode_a): {} GAP-WINDOW evaluation energies were OUT OF STRIP "
+                    "(evaluated at {}). Near mu the particle-hole edge should guarantee a "
+                    "clearance of E_PH = {:.4g} a.u., so this means the QP spectrum has moved "
+                    "a band-edge state outside the analyticity strip -- the band-edge states are "
+                    "then NOT exact mode A. Check the gap and the inner-consistency numbers "
+                    "above.", n_clamp_win,
+                    eta_far > 0.0 ? "eps + i eta_far" : "mu", ctx->diag.gap_edge);
+    }
+
+    auto &LR = qp_modea::last_run();
+    LR.anchor = cd ? anchor_worst : -1.0;
+    LR.n_clamp = n_clamp;
+    LR.n_clamp_win = n_clamp_win;
+    LR.n_eval = n_eval;
+    LR.n_homo_clamp = n_homo_cl;
+    LR.n_lumo_clamp = n_lumo_cl;
+    LR.n_blocks = n_blocks;
+    LR.converged_inner = (n_noconv == 0);
+    LR.anchor_expect = anchor_expect;
+    LR.ratio_worst = ratio_worst;
+    LR.anti_herm = anti_gate;      // IN-STRIP only once eta_far > 0 (see above)
+    LR.eta_far = eta_far;
+    LR.n_eta = n_eta;
+    LR.im_off = im_off_worst;
+    LR.anti_in = anti_in_worst;
+    LR.spacing = spacing_worst;
+    LR.dmax = dmax_worst;
+    LR.min_den = min_den_worst;
+    LR.iters = iters_worst;
+    LR.tau_dev = tau_dev_worst;
+    LR.n_fallback = n_fallback;
+    LR.delta_in = delta_in_worst;
+    LR.class_in = class_in_worst;
+    LR.ratio_in = ratio_in_worst;
+
+    n_fallback = comm.all_reduce_value(n_fallback, std::plus<>{});
+    n_fallback_win = comm.all_reduce_value(n_fallback_win, std::plus<>{});
+    n_sanity_trip = comm.all_reduce_value(n_sanity_trip, std::plus<>{});
+    n_homo_fb = comm.all_reduce_value(n_homo_fb, std::plus<>{});
+    n_lumo_fb = comm.all_reduce_value(n_lumo_fb, std::plus<>{});
+    if (mode_b) {
+      app_log(lvl, "  - mode_b STRIP TEST census:   strip = (VBM - 0.95 E_PH, CBM + 0.95 "
+                   "E_PH) = ({:+.6f}, {:+.6f}) a.u. with VBM {:+.6f}, CBM {:+.6f}, E_PH "
+                   "{:.6f}", ctx->vbm - 0.95 * ctx->diag.gap_edge,
+              ctx->cbm + 0.95 * ctx->diag.gap_edge, ctx->vbm, ctx->cbm, ctx->diag.gap_edge);
+      app_log(lvl, "  - mode_b out-of-strip diag:   {} states ({} in the gap window; {} "
+                   "evaluated at eps + i eta_far, {} demoted to z = mu); BAND-EDGE STATES: "
+                   "per-k HOMO out of strip in {} of {} blocks, LUMO in {} of {}",
+              n_fallback, n_fallback_win, n_eta, n_fallback - n_eta, n_homo_fb, n_blocks,
+              n_lumo_fb, n_blocks);
+      app_log(lvl, "  - mode_b strip-interior |ReSigma| trips: {} (expected 0 -- a nonzero "
+                   "count FALSIFIES the strip criterion)", n_sanity_trip);
+      if (n_fallback_win > 0)
+        app_warning("qp_approx (mode_b): {} GAP-WINDOW diagonal states fell back to the "
+                    "Fermi-static value because Sigma^c could not be resolved at their "
+                    "quasiparticle energy. Near mu the support constraint should guarantee a "
+                    "clearance of gap_edge; check min_den = {:.4e} a.u. and the W^c fit.",
+                    n_fallback_win, min_den_worst);
+    }
+
+    // THE GATE: the TAU-DOMAIN anchor. The tau image of the route-B pole rep is compared
+    // against the solver's Sigma^c(tau) with NO transform on either side, so it isolates the
+    // contraction from the reference's tau -> i w aliasing. The tau agreement sits well below
+    // the W-fit class, while the i w deviation on the SAME elements is dominated by the
+    // reference's transform and shrinks with every DLR precision step. The i w comparison is
+    // therefore a LOGGED DIAGNOSTIC ONLY -- never a gate.
+    //
+    // NORMALIZED PER BLOCK: one denominator for the probed set, exactly as the i w anchor.
+    // See the oracle above.
+    if (cd) {
+      utils::check(tau_dev_worst < qp_modea::modea_tau_anchor_mult * ctx->diag.rec_rel_worst,
+                   "qp_approx ({}): THE TAU ANCHOR FAILED -- the analytic tau image of the "
+                   "route-B Sigma^c deviates from the solver's Sigma^c(tau) by {:.4e} on block "
+                   "(s,k) = ({},{}) at element ({},{}) [block-normalized: max|Sigma_B - "
+                   "Sigma^GW| over the gap window and the largest off-diagonal, divided by "
+                   "max|Sigma^GW| of that same set], against a gate of {:.1f} x the "
+                   "W-fit reconstruction class ({:.4e}). Neither side applies a Fourier "
+                   "transform here, so the two sides differ ONLY in (a) the contraction "
+                   "(prefactor, spin, q-star/trev rule, MO rotation, the Gamma head) and "
+                   "(b) the W REPRESENTATION -- the support-constrained pole fit and the "
+                   "stage-1b/1c truncations. Read them apart from the numbers this run "
+                   "already printed:\n"
+                   "  * per-isym breakdown (TAU ISYM lines): worst dev/|class| = {:.3g} at "
+                   "class {}. A structurally wrong symmetry class is wrong by O(1), so a "
+                   "value << 1 for EVERY class rules the symmetry path out -- and the "
+                   "contraction is identical to the GW assembly term by term for any D, see "
+                   "\"THE SYMMETRY PATH\" in wc_band_elements.hpp.\n"
+                   "  * the head: checked by the unit test "
+                   "\"qp_map_modeb_head_anchor\" against Sigma_div_correction.\n"
+                   "  * the W representation: its own ERROR BUDGET sum_q |dW_q| / sum_q "
+                   "max|W_q| = {:.3e} is the anchor scale it predicts on its own -- compare "
+                   "it with the {:.4e} above BEFORE reading this as a routing error. Backing "
+                   "numbers: tau-domain fit residual {:.3e}, worst slab truncation {:.3e} "
+                   "(Frobenius {:.3e}), union projection tail {:.3e}. The gate's yardstick is "
+                   "the per-q RELATIVE bosonic-mesh class, which is a different object from "
+                   "the budget.",
+                   map_name, tau_dev_worst, tau_dev_is, tau_dev_ik, tau_dev_a, tau_dev_b,
+                   qp_modea::modea_tau_anchor_mult,
+                   ctx->diag.rec_rel_worst, isym_ratio_worst, isym_class_worst,
+                   ctx->diag.rec_budget, tau_dev_worst,
+                   ctx->diag.fit_err_worst, ctx->diag.wtrunc_worst,
+                   ctx->diag.wtrunc_frob_worst, ctx->diag.union_tail_worst);
+    }
+    if (false)
+      utils::check(anchor_worst < qp_modea::modea_anchor_gate,
+                   "qp_approx (mode_a): THE ANCHOR FAILED -- route-B Sigma^c deviates from the "
+                   "solver Sigma(i w_n) by {:.4e} (gate {:.1g}) over the gap window, against a "
+                   "W-fit reconstruction class of {:.4e}.\nIf the class is itself O(1) the W "
+                   "pole representation collapsed, which normally means the INCOMING QP "
+                   "spectrum already diverged -- check the previous iteration's inner-"
+                   "consistency numbers (this iteration: worst count {}, max|d eps| = {:.3e} "
+                   "a.u., min_den = {:.4e} a.u.).\nOtherwise this is a CONTRACTION ROUTING "
+                   "error (prefactor, spin, q-star/trev rule, MO rotation, or the Gamma head), "
+                   "not a tolerance to loosen.",
+                   anchor_worst, qp_modea::modea_anchor_gate, anchor_expect, iters_worst,
+                   dmax_worst, min_den_worst);
+  }
+}
 
 auto get_mf_MOs(utils::mpi_context_t<mpi3::communicator> &context, mf::MF &mf, hamilt::pseudopot &psp)
   -> std::tuple<sArray_t<Array_view_4D_t>, sArray_t<Array_view_3D_t> > {
@@ -174,7 +1146,8 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
                   const sArray_t<Array_view_4D_t> &sVhf_skij,
                   const sArray_t<Array_view_4D_t> &sMO_skia,
                   double mu,
-                  const imag_axes_ft::IAFT &FT, qp_params_t &qp_params) {
+                  const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
+                  const qp_modea::modea_ctx *modea_ctx) {
   using math::shm::make_shared_array;
   using math::nda::make_distributed_array;
   using local_Array_4D_t = nda::array<ComplexType, 4>;
@@ -272,10 +1245,138 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
       return std::make_tuple(s_rng.first()+s_loc, k_rng.first()+k_loc, a_rng.first()+a_loc);
     };
 
-    analyt_cont::AC_t AC(qp_params.ac_alg);
     auto n_to_iw = nda::map([&](int n) { return FT.omega(n); });
     nda::array<ComplexType, 1> iw_mesh(n_to_iw(FT.wn_mesh()));
 
+    if (qp_params.qp_map != "ac_pade") {
+
+    // The Matsubara-native quasiparticle maps (qp_maps_matsubara.hpp), scalar form
+    // -- the qp_type solvers belong to the AC route only.
+    auto [wp, widx] = positive_wn_nodes(iw_mesh);
+    const long npos = wp.shape(0);
+    nda::array<double, 1> wn2(2);
+    wn2(0) = wp(0);
+    wn2(1) = wp(1);
+    long n_clamped = 0, n_noconv = 0;
+    app_log(2, "\n* Solving quasiparticle equation for given Sigma(iw): ");
+    app_log(2, "  - processor grid for quasi-particle equation: (s, k, a) = ({}, {}, {})", 1, nkpools, np_a);
+    app_log(2, "  - quasiparticle map:                          {} (Matsubara-native, no AC)", qp_params.qp_map);
+    app_log(2, "  - positive fermionic nodes:                   {} (w0 = {:.6f}, w1 = {:.6f})", npos, wp(0), wp(1));
+    if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") {
+
+    // ---- mode A / mode B: the evGW diagonal leg ----
+    // The QP equation E = Vhf + Sigma_ii(E) is solved by the EXISTING generic helpers; only
+    // the sampler changes. The functor bridges to the route-B closed form on the cached
+    // DIAGONAL residues (z = (w - mu) + mu is ABSOLUTE, the sigma_route_b mu rider).
+    utils::check(modea_ctx != nullptr and modea_ctx->active,
+                 "solve_qp_eqn: qp_map = \"mode_a\" reached the solver without an evaluator "
+                 "context (built in the live W window of add_evscf_vcorr).");
+    utils::check(modea_ctx->have_cd and modea_ctx->have_diag,
+                 "solve_qp_eqn: qp_map = \"mode_a\" on the evGW leg requires "
+                 "qp_modea_route = \"cd\" (the diagnostic \"expansion\" route has no "
+                 "diagonal residue data on this processor grid).");
+    utils::check(qp_params.qp_type == "sc" or qp_params.qp_type == "sc_bisection" or
+                 qp_params.qp_type == "sc_newton" or qp_params.qp_type == "linearized",
+                 "solve_qp_eqn: qp_map = \"mode_a\" supports qp_type in {{sc, sc_bisection, "
+                 "sc_newton, linearized}}; \"{}\" is AC-specific (it needs a spectral "
+                 "function, which route B does not produce).", qp_params.qp_type);
+    app_log(2, "  - route-B (CD) diagonal sampler:              nJ x npk = {} poles, "
+               "eta = {:.3g}", modea_ctx->nJ * modea_ctx->npk, modea_ctx->eta);
+    // GUARD. This leg is reached only by evGW (qp_scf_mode = "evscf"); the qsGW leg goes
+    // through modea_run.
+    app_warning("solve_qp_eqn (qp_map = {}): THE evGW LEG IS INCOMPLETE AND VERY SLOW -- "
+                "the route-B diagonal sampler rebuilds the full nJ x npk = {} pole-weight "
+                "vector at EVERY secant/bisection step of EVERY (s,k,a), so an outer "
+                "iteration can take orders of magnitude longer than on the qsGW "
+                "(qp_scf_mode = \"qpscf\") leg. It is neither optimized nor covered by "
+                "the regression tests (the evscf test cases are hidden behind "
+                "[.modeb_evscf]). Results from this path are diagnostic only; use "
+                "qp_scf_mode = \"qpscf\" for production.",
+                qp_params.qp_map, modea_ctx->nJ * modea_ctx->npk);
+
+    struct modea_diag_sampler {
+      const qp_modea::modea_ctx *ctx;
+      long nkpts_ = 0;
+      std::function<std::tuple<long,long,long>(size_t)> I_to;
+      mutable nda::array<ComplexType, 1> w;
+      ComplexType evaluate(ComplexType dz, long I) const {
+        auto [is, ik, ia] = I_to(size_t(I));
+        const ComplexType z = dz + ctx->mu;   // sigma_route_b: z ABSOLUTE
+        ctx->pole_weights(is, ik, z, w);
+        ComplexType s(0.0);
+        const long nP = ctx->nJ * ctx->npk;
+        for (long P = 0; P < nP; ++P) s += ctx->Mdiag(is, ik, ia, P) * w(P);
+        return s;
+      }
+    };
+    modea_diag_sampler S;
+    S.ctx = modea_ctx;
+    S.I_to = I_to_ska;
+    S.w = nda::array<ComplexType, 1>(modea_ctx->nJ * modea_ctx->npk);
+
+    double res;
+    bool conv;
+    long n_noconv_a = 0;
+    const double eta_a = qp_params.qp_modea_eta;
+    for (size_t I = 0; I < dim1; ++I) {
+      if (qp_params.qp_type == "linearized") {
+        E_loc_1D(I) = qp_eqn_linearized(Vhf_loc_1D(I).real(), S, I, mu, E_loc_1D(I).real(), eta_a);
+      } else if (qp_params.qp_type == "sc_newton") {
+        std::tie(E_loc_1D(I), res, conv) =
+            qp_eqn_secant(Vhf_loc_1D(I).real(), S, I, mu, E_loc_1D(I).real(), 400,
+                          qp_params.tol, eta_a);
+        if (!conv) ++n_noconv_a;
+      } else {
+        std::tie(E_loc_1D(I), res) =
+            qp_eqn_bisection(Vhf_loc_1D(I).real(), S, I, mu, E_loc_1D(I).real(),
+                             qp_params.tol, eta_a);
+      }
+    }
+    n_noconv_a = comm->all_reduce_value(n_noconv_a, std::plus<>{});
+    if (n_noconv_a > 0)
+      app_warning("solve_qp_eqn (mode_a): the qp equation did not converge on {} states.",
+                  n_noconv_a);
+
+    } else if (qp_params.qp_map == "mats_lin") {
+      nda::array<ComplexType, 1> S2(2);
+      for (size_t I = 0; I < dim1; ++I) {
+        S2(0) = Sigma_loc_2D(widx[0], I);
+        S2(1) = Sigma_loc_2D(widx[1], I);
+        E_loc_1D(I) = qp_matsubara::qp_lin_diagonal(S2, wn2, Vhf_loc_1D(I).real(), n_clamped);
+      }
+    } else { // "mats_gmatch"
+      qp_matsubara::gmatch_opts opt;
+      opt.wpow = qp_params.qp_map_wpow;
+      app_log(2, "  - gmatch weights (reportable):                w_n = (w0/w_n)^{}", opt.wpow);
+      nda::array<ComplexType, 1> S2(2);
+      nda::array<ComplexType, 3> G(npos, 1, 1);
+      nda::array<ComplexType, 2> H(1, 1);
+      double rmax = 0.0;
+      for (size_t I = 0; I < dim1; ++I) {
+        const double vhf = Vhf_loc_1D(I).real();
+        for (long m = 0; m < npos; ++m)
+          G(m, 0, 0) = 1.0 / (ComplexType(mu - vhf, wp(m)) - Sigma_loc_2D(widx[m], I));
+        S2(0) = Sigma_loc_2D(widx[0], I);
+        S2(1) = Sigma_loc_2D(widx[1], I);
+        H(0, 0) = ComplexType(qp_matsubara::qp_lin_diagonal(S2, wn2, vhf, n_clamped, opt.z_floor));
+        auto info = qp_matsubara::qp_gmatch_block(G, wp, mu, H, opt);
+        if (not info.converged) ++n_noconv;
+        rmax = std::max(rmax, info.r);
+        E_loc_1D(I) = H(0, 0);
+      }
+      rmax = comm->all_reduce_value(rmax, boost::mpi3::max<>{});
+      app_log(2, "  - gmatch final weighted residual (max over states): {:.3e}", rmax);
+    }
+    n_clamped = comm->all_reduce_value(n_clamped, std::plus<>{});
+    n_noconv = comm->all_reduce_value(n_noconv, std::plus<>{});
+    if (n_clamped > 0)
+      app_log(2, "  - Z-window clamps: {} of {} states", n_clamped, ns * nkpts * nbnd);
+    if (n_noconv > 0)
+      app_warning("solve_qp_eqn: gmatch hit maxiter on {} states.", n_noconv);
+
+    } else {
+
+    analyt_cont::AC_t AC(qp_params.ac_alg);
     app_log(2, "\n* Solving quasiparticle equation for given Sigma(iw): ");
     app_log(2, "  - processor grid for quasi-particle equation: (s, k, a) = ({}, {}, {})", 1, nkpools, np_a);
     app_log(2, "  - quasi-particle equation algorithm:          {}", qp_params.qp_type);
@@ -283,39 +1384,99 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
     app_log(2, "  - eta:                                        {}", qp_params.eta);
     app_log(2, "  - tolerance for quasi-particle equation:      {}\n", qp_params.tol);
     AC.init(iw_mesh, Sigma_loc_2D, qp_params.Nfit);
+
+    // ---------------- OpenMP-threaded per-state root finding ----------------
+    // The four per-state root-finding loops (reached by the qp_type = sc* run modes), threaded
+    // like the per-state map evaluation in qp_approx.
+    //
+    // THREAD SAFETY:
+    //   * the bodies make no MPI call -- E_loc_1D is rank-local and every I writes one
+    //     distinct element; the all_reduce/barrier tail sits after the dispatch;
+    //   * `AC` is shared and read-only: AC_t/pade_driver/pade_t::evaluate are all `const`,
+    //     and AC.init ran above the loops;
+    //   * the `res`/`conv` scratch is declared inside the body;
+    //   * no logging inside the region: non-convergent states are collected and logged after
+    //     the loop, sorted by I so the message order is thread-count independent.
+    //
+    // VERBOSITY CAVEAT: qp_eqn_bisection logs its iterations with app_log(6, ...) from
+    // inside its own while loops (qp_solvers.hpp). Worker threads must not log, and at
+    // verbosity >= 6 those lines are the point of the run -- so the regions fall back to the
+    // serial path there instead of dropping or interleaving them.
+    auto qp_nthr = [&](long niter) -> long {
+      return (__app_output_level__ >= 6) ? 1l : utils::omp_threads_for(niter);
+    };
+    const size_t dim1_u = size_t(dim1);
+    // (I, residual) of the states whose solver did not converge; logged after the loop.
+    std::vector<std::pair<size_t, double>> qp_noconv;
+    auto qp_log_noconv = [&](const char *what, bool with_res) {
+      std::sort(qp_noconv.begin(), qp_noconv.end(),
+                [](auto const &a, auto const &b) { return a.first < b.first; });
+      for (auto const &e : qp_noconv) {
+        auto [is, ik, ia] = I_to_ska(e.first);
+        if (with_res)
+          app_warning("{} fails to converge at (s,k,a) = ({},{},{}); residual = {}",
+                      what, is, ik, ia, e.second);
+        else
+          app_warning("{} fails to converge at (s,k,a) = ({},{},{})", what, is, ik, ia);
+      }
+    };
     if (qp_params.qp_type == "sc" or qp_params.qp_type == "sc_bisection") {
-      double res;
-      for (size_t I = 0; I < dim1; ++I) {
+      [[maybe_unused]] const long nthr = qp_nthr(dim1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr) if (nthr > 1)
+#endif
+      for (size_t I = 0; I < dim1_u; ++I) {
+        double res;
         std::tie(E_loc_1D(I), res) =
             qp_eqn_bisection(Vhf_loc_1D(I).real(), AC, I, mu, E_loc_1D(I).real(), qp_params.tol, qp_params.eta);
       }
     } else if (qp_params.qp_type == "sc_newton") {
-      bool conv;
-      double res;
-      for (size_t I = 0; I < dim1; ++I) {
+      [[maybe_unused]] const long nthr = qp_nthr(dim1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr) if (nthr > 1)
+#endif
+      for (size_t I = 0; I < dim1_u; ++I) {
+        bool conv;
+        double res;
         std::tie(E_loc_1D(I), res, conv) =
             qp_eqn_secant(Vhf_loc_1D(I).real(), AC, I, mu, E_loc_1D(I).real(), 400, qp_params.tol, qp_params.eta);
         if (!conv) {
-          auto [is, ik, ia] = I_to_ska(I);
-          app_warning("secant method fails to converge at (s,k,a) = ({},{},{}); residual = {}", is, ik, ia, res);
+#ifdef _OPENMP
+#pragma omp critical (coqui_qp_noconv)
+#endif
+          qp_noconv.emplace_back(I, res);
         }
       }
+      qp_log_noconv("secant method", true);
     } else if (qp_params.qp_type == "linearized") {
-      for (size_t I = 0; I < dim1; ++I) {
+      [[maybe_unused]] const long nthr = qp_nthr(dim1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr) if (nthr > 1)
+#endif
+      for (size_t I = 0; I < dim1_u; ++I) {
         E_loc_1D(I) = qp_eqn_linearized(Vhf_loc_1D(I).real(), AC, I, mu, E_loc_1D(I).real(), qp_params.eta);
       }
     } else if (qp_params.qp_type == "spectral") {
-      bool conv;
-      for (size_t I = 0; I < dim1; ++I) {
+      [[maybe_unused]] const long nthr = qp_nthr(dim1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr) if (nthr > 1)
+#endif
+      for (size_t I = 0; I < dim1_u; ++I) {
+        bool conv;
         std::tie(E_loc_1D(I), conv) = qp_eqn_spectral(Vhf_loc_1D(I).real(), AC, I, mu, E_loc_1D(I).real(), qp_params.tol, qp_params.eta);
         if (!conv) {
-          auto [is, ik, ia] = I_to_ska(I);
-          app_warning("spectral method fails to converge at (s,k,a) = ({},{},{})", is, ik, ia);
+#ifdef _OPENMP
+#pragma omp critical (coqui_qp_noconv)
+#endif
+          qp_noconv.emplace_back(I, 0.0);
         }
       }
+      qp_log_noconv("spectral method", false);
     } else {
       utils::check(false, "solve_qp_eqn: unknown type of qp equation: {}", qp_params.qp_type);
     }
+
+    } // qp_map dispatch
   }
   dSigma_wska.reset();
   dVhf_ska.reset();
@@ -367,15 +1528,23 @@ void add_evscf_vcorr(MBState &mb_state,
     mb_solver.corr->evaluate(mb_state, eri);
     FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
     mpi->comm.barrier();
-
-    // deallocate dynamically screened interaction if it is not fixed for the next iteration.
-    if (not fixed_w) {
-      mb_state.dW_qtPQ.reset();
-    }
   }
 
-  // Solve the QP equation to get new QP energies. 
-  solve_qp_eqn(sE_ska, mb_state.sSigma_tskij.value(), sHeff_skij, sMO_skia, mu, FT, qp_params);
+  // The mode-A context must be built while dW is still alive
+  // (it is freed just below when keep_scr_coulomb_fixed is off). evGW needs the DIAGONAL
+  // residues replicated -- solve_qp_eqn distributes (s,k,a) on its own processor grid.
+  qp_modea::modea_ctx modea_ctx;
+  build_modea_ctx_if_needed(modea_ctx, mb_state, mb_solver, eri, sMO_skia, sE_ska, mu, FT,
+                            qp_params, true);
+
+  // deallocate dynamically screened interaction if it is not fixed for the next iteration.
+  if (not fixed_w) {
+    mb_state.dW_qtPQ.reset();
+  }
+
+  // Solve the QP equation to get new QP energies.
+  solve_qp_eqn(sE_ska, mb_state.sSigma_tskij.value(), sHeff_skij, sMO_skia, mu, FT, qp_params,
+               modea_ctx.active ? std::addressof(modea_ctx) : nullptr);
   mb_state.sG_tskij.reset();
   mb_state.sSigma_tskij.reset();
 
@@ -412,7 +1581,9 @@ void add_evscf_vcorr(MBState &mb_state,
 auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
                const sArray_t<Array_view_4D_t> &sMO_skia,
                const sArray_t<Array_view_3D_t> &sE_ska, double mu,
-               const imag_axes_ft::IAFT &FT, qp_params_t &qp_params)
+               const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
+               const sArray_t<Array_view_4D_t> *sHstat_skij,
+               const qp_modea::modea_ctx *modea_ctx)
                -> sArray_t<Array_view_4D_t> {
   using math::shm::make_shared_array;
   using math::nda::make_distributed_array;
@@ -443,6 +1614,16 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   auto b_rng = dSigma_wskab.local_range(4);
   auto [nw_loc, ns_loc, nk_loc, na_loc, nb_loc] = dSigma_wskab.local_shape();
 
+  // The mode-A tau-domain ORACLE for the anchor discrepancy needs the
+  // MO-basis Sigma^c(tau) BEFORE tau_to_w, i.e. the reference as the solver actually built
+  // it, with no fermionic transform applied. Only allocated for mode_a.
+  std::optional<sArray_t<Array_view_5D_t>> sSigma_tskab_shm;
+  if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") {
+    sSigma_tskab_shm.emplace(make_shared_array<Array_view_5D_t>(
+        *comm, *internode_comm, *node_comm, {nt, ns, nkpts, nbnd, nbnd}));
+    sSigma_tskab_shm->set_zero();
+  }
+
   // ------ basis transform from primary to MO basis ------
   {
     auto dSigma_tskab = make_distributed_array<local_Array_5D_t>(*comm, {1, 1, nkpools, np_a, np_b},
@@ -467,6 +1648,13 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
         }
       }
     }
+    if (sSigma_tskab_shm.has_value()) {
+      sSigma_tskab_shm->win().fence();
+      sSigma_tskab_shm->local()(nda::range::all, s_rng, k_rng, a_rng, b_rng) =
+          dSigma_tskab.local();
+      sSigma_tskab_shm->win().fence();
+      sSigma_tskab_shm->all_reduce();
+    }
     FT.tau_to_w(dSigma_tskab.local(), dSigma_wskab.local(), imag_axes_ft::fermion);
   }
 
@@ -486,10 +1674,191 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
     return std::make_tuple(s_rng.first()+s_loc, k_rng.first()+k_loc, a_rng.first()+a_loc, b_rng.first()+b_loc);
   };
 
-  analyt_cont::AC_t AC(qp_params.ac_alg);
   auto n_to_iw = nda::map([&](int n) { return FT.omega(n); });
   nda::array<ComplexType, 1> iw_mesh(n_to_iw(FT.wn_mesh()));
 
+  // ---- lineshape meter (see q6_lineshape_t in scf_common.hpp), part 1 ----
+  // THE LINESHAPE METER, input half: the MO-basis DIAGONAL Sigma^c_aa at the first and the
+  // highest positive fermionic node. Gathered HERE because this is the only point at which
+  // dSigma_wskab is alive for EVERY map -- the Matsubara branch below resets it, and the
+  // ac_pade branch consumes it in place. ADDITIVE: nothing downstream reads these arrays.
+  nda::array<ComplexType, 3> q6_sig_w0(ns, nkpts, nbnd), q6_sig_wtop(ns, nkpts, nbnd);
+  q6_sig_w0() = ComplexType(0.0);
+  q6_sig_wtop() = ComplexType(0.0);
+  double q6_w0 = -1.0, q6_wtop = -1.0;
+  {
+    // NOT positive_wn_nodes(): that helper hard-checks ">= 2 positive nodes" for the
+    // Matsubara maps, and a REPORTING hook must never be able to abort the ac_pade path.
+    auto w_rng = dSigma_wskab.local_range(0);
+    long g_w0 = -1, g_wtop = -1;
+    double lo = 1e300, hi = -1.0;
+    for (long n = 0; n < iw_mesh.shape(0); ++n) {
+      const double x = iw_mesh(n).imag();
+      if (x <= 0.0) continue;
+      if (x < lo) { lo = x; g_w0 = n; }
+      if (x > hi) { hi = x; g_wtop = n; }
+    }
+    if (g_w0 >= 0 and g_wtop >= 0) {
+      q6_w0 = lo;
+      q6_wtop = hi;
+      const bool have_w0 = (g_w0 >= w_rng.first() and g_w0 < w_rng.first() + long(w_rng.size()));
+      const bool have_wt = (g_wtop >= w_rng.first() and g_wtop < w_rng.first() + long(w_rng.size()));
+      for (auto [is_loc, is]: itertools::enumerate(s_rng))
+        for (auto [ik_loc, ik]: itertools::enumerate(k_rng))
+          for (auto [ia_loc, ia]: itertools::enumerate(a_rng))
+            for (auto [ib_loc, ib]: itertools::enumerate(b_rng)) {
+              if (ia != ib) continue;            // the (a,b) grid is disjoint => no double count
+              if (have_w0)
+                q6_sig_w0(is, ik, ia) = dSigma_wskab.local()(g_w0 - w_rng.first(),
+                                                             is_loc, ik_loc, ia_loc, ib_loc);
+              if (have_wt)
+                q6_sig_wtop(is, ik, ia) = dSigma_wskab.local()(g_wtop - w_rng.first(),
+                                                               is_loc, ik_loc, ia_loc, ib_loc);
+            }
+      comm->all_reduce_in_place_n(q6_sig_w0.data(), q6_sig_w0.size(), std::plus<>{});
+      comm->all_reduce_in_place_n(q6_sig_wtop.data(), q6_sig_wtop.size(), std::plus<>{});
+    }
+  }
+
+  auto sVcorr_skij = make_shared_array<Array_view_4D_t>(*comm, *internode_comm, *node_comm, {ns, nkpts, nbnd, nbnd});
+
+  if (qp_params.qp_map != "ac_pade") {
+
+  // The Matsubara-native maps (qp_maps_matsubara.hpp) act on whole (a,b) blocks per
+  // (s,k), so gather the MO-basis Sigma(iw) tiles into a shared array (disjoint
+  // writes + zeros-elsewhere all_reduce) and round-robin the blocks over ranks.
+  utils::check(qp_params.qp_map == "mats_lin" or sHstat_skij != nullptr,
+               "qp_approx: qp_map = {} needs the static Heff, which only the "
+               "qp-scf loop call path provides; use ac_pade or mats_lin here.",
+               qp_params.qp_map);
+  auto sSigma_wskab = make_shared_array<Array_view_5D_t>(*comm, *internode_comm, *node_comm,
+                                                         {nw, ns, nkpts, nbnd, nbnd});
+  sSigma_wskab.set_zero();
+  sSigma_wskab.win().fence();
+  sSigma_wskab.local()(nda::range::all, s_rng, k_rng, a_rng, b_rng) = dSigma_wskab.local();
+  sSigma_wskab.win().fence();
+  sSigma_wskab.all_reduce();
+  dSigma_wskab.reset();
+
+  auto [wp, widx] = positive_wn_nodes(iw_mesh);
+  const long npos = wp.shape(0);
+  nda::array<double, 1> wn2(2);
+  wn2(0) = wp(0);
+  wn2(1) = wp(1);
+  long n_clamped = 0, n_noconv = 0;
+  decltype(nda::range::all) all;
+  app_log(2, "\n* Applying the Matsubara-native static map to Sigma(iw): ");
+  app_log(2, "  - quasiparticle map:        {} (no AC)", qp_params.qp_map);
+  app_log(2, "  - positive fermionic nodes: {} (w0 = {:.6f}, w1 = {:.6f})", npos, wp(0), wp(1));
+  if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b")
+    app_log(2, "  - mode knobs:             route = {}, nconsist = {}, consist_tol = {:.1e}, "
+               "eta = {:.3g}, wsupp = {}, wfit = {}, wrtol = {:.2g}, wrank = {:.2g}, "
+               "wsketch = {}, wunion = {:.2g}",
+            qp_params.qp_modea_route, qp_params.qp_modea_nconsist,
+            qp_params.qp_modea_consist_tol, qp_params.qp_modea_eta,
+            qp_params.qp_modea_wsupp, qp_params.qp_modea_wfit, qp_params.qp_modea_wrtol,
+            qp_params.qp_modea_wrank, qp_params.qp_modea_wsketch,
+            qp_params.qp_modea_wunion);
+  if (qp_params.qp_modea_wfit == "contour")
+    app_log(2, "  - contour knobs:          qp_tc_eps = {:.1e}, qp_tc_delta = {:.4g} a.u. "
+               "({}), qp_tc_rho = {:.3g}, qp_tc_profile = {}, qp_tc_trunc = {}",
+            qp_params.qp_tc_eps, qp_params.qp_tc_delta,
+            qp_params.qp_tc_delta > 0.0 ? "explicit"
+                                        : "0 = the default recipe, 1.2 W_band/N_k floor",
+            qp_params.qp_tc_rho, qp_params.qp_tc_profile,
+            qp_params.qp_tc_trunc ? "on" : "off");
+  if (qp_params.qp_modea_wfit == "contour")
+    app_log(2, "  - contour solver:         line solver = {} (tol {:.1e}), band-factor "
+               "store cap = {:.2f} GB",
+            qp_params.qp_tc_krylov ? "warm-started GMRES" : "dense",
+            qp_params.qp_tc_krylov_tol, qp_params.qp_tc_bstore_gb);
+  if (qp_params.qp_modea_wfit == "contour")
+    app_log(2, "  - W^c grid:               qp_tc_wgrid_mev = {:.4g} meV{}, audit = {} "
+               "samples/q (hard abort {}); the knob is the ACCURACY TARGET -- h is derived "
+               "from the empirical law dSigma = K (h/delta)^2.81 / delta",
+            qp_params.qp_tc_wgrid_mev,
+            qp_params.qp_tc_wgrid_mev <= 0.0 ? " (CACHE OFF: per-target Dyson)"
+              : (qp_params.qp_tc_wgrid_h > 0.0 ? " (EXPERT h override)" : ""),
+            qp_params.qp_tc_wgrid_audit,
+            qp_params.qp_tc_wgrid_audit_hard ? "ON" : "off");
+  if (qp_params.qp_modea_wfit == "contour")
+    app_log(2, "  - contour evaluator:      band factors = {}, residue batch budget = "
+               "{:.0f} MB (the evaluator's persistent work space; it sets how many "
+               "residue targets one batched call carries)",
+            qp_params.qp_tc_bfactor, qp_params.qp_tc_batch_mb);
+  if (qp_params.qp_modea_wfit == "spectral")
+    app_log(2, "  - spectral knobs:         spectral_eta = {:.4g} a.u. ({:.4g} eV), "
+               "spectral_npole = {} positive-Omega nodes after coarsening, spectral_gamma = {}",
+            qp_params.qp_modea_spectral_eta,
+            qp_params.qp_modea_spectral_eta * 27.211386245988,
+            qp_params.qp_modea_spectral_npole, qp_params.qp_modea_spectral_gamma);
+  sVcorr_skij.set_zero();
+  sVcorr_skij.win().fence();
+  if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") {
+
+  // ---- the MODE-A map ----
+  // V^xc_ab = 1/2 [ Sigma^c_ab(eps_a) + Sigma^c_ab(eps_b) ] with Sigma^c from the
+  // contour-deformation kernel, driven to inner QP consistency at FIXED Sigma data. The
+  // Hermitize + MO -> primary tail below is the existing one, unchanged.
+  modea_run(sVcorr_skij, sSigma_wskab, sSigma_tskab_shm.value(), sMO_skia, sE_ska,
+            *sHstat_skij, wp, widx, mu, FT, qp_params.qp_map, modea_ctx, *comm);
+
+  } else if (qp_params.qp_map == "mats_lin") {
+    nda::array<ComplexType, 3> S2(2, nbnd, nbnd);
+    for (long sk = comm->rank(); sk < long(ns * nkpts); sk += comm->size()) {
+      long is = sk / nkpts, ik = sk % nkpts;
+      S2(0, all, all) = sSigma_wskab.local()(widx[0], is, ik, all, all);
+      S2(1, all, all) = sSigma_wskab.local()(widx[1], is, ik, all, all);
+      sVcorr_skij.local()(is, ik, all, all) = qp_matsubara::qp_lin_matrix(S2, wn2, n_clamped);
+    }
+  } else { // "mats_gmatch"
+    qp_matsubara::gmatch_opts opt;
+    opt.wpow = qp_params.qp_map_wpow;
+    app_log(2, "  - gmatch weights (reportable): w_n = (w0/w_n)^{}", opt.wpow);
+    nda::array<ComplexType, 3> S2(2, nbnd, nbnd), G(npos, nbnd, nbnd);
+    nda::array<ComplexType, 2> Hstat_ab(nbnd, nbnd), H(nbnd, nbnd), tmp(nbnd, nbnd);
+    nda::matrix<ComplexType> K(nbnd, nbnd);
+    double rmax = 0.0;
+    for (long sk = comm->rank(); sk < long(ns * nkpts); sk += comm->size()) {
+      long is = sk / nkpts, ik = sk % nkpts;
+      auto MO = sMO_skia.local()(is, ik, all, all); // (i, a)
+      // the static part in the MO basis
+      nda::blas::gemm(ComplexType(1.0), sHstat_skij->local()(is, ik, nda::ellipsis{}), MO,
+                      ComplexType(0.0), tmp);
+      nda::blas::gemm(ComplexType(1.0), nda::dagger(MO), tmp, ComplexType(0.0), Hstat_ab);
+      // the target G^GW on the positive nodes (built from Sigma^GW only)
+      for (long m = 0; m < npos; ++m) {
+        auto Sw = sSigma_wskab.local()(widx[m], is, ik, all, all);
+        for (long i = 0; i < nbnd; ++i)
+          for (long j = 0; j < nbnd; ++j) K(i, j) = -Hstat_ab(i, j) - Sw(i, j);
+        for (long i = 0; i < nbnd; ++i) K(i, i) += ComplexType(mu, wp(m));
+        nda::inverse_in_place(K);
+        G(m, all, all) = K;
+      }
+      // map-(i) initializer
+      S2(0, all, all) = sSigma_wskab.local()(widx[0], is, ik, all, all);
+      S2(1, all, all) = sSigma_wskab.local()(widx[1], is, ik, all, all);
+      H = Hstat_ab + qp_matsubara::qp_lin_matrix(S2, wn2, n_clamped, opt.z_floor);
+      auto info = qp_matsubara::qp_gmatch_block(G, wp, mu, H, opt);
+      if (not info.converged) ++n_noconv;
+      rmax = std::max(rmax, info.r);
+      sVcorr_skij.local()(is, ik, all, all) = H - Hstat_ab;
+    }
+    rmax = comm->all_reduce_value(rmax, boost::mpi3::max<>{});
+    app_log(2, "  - gmatch final weighted residual (max over blocks): {:.3e}", rmax);
+  }
+  n_clamped = comm->all_reduce_value(n_clamped, std::plus<>{});
+  n_noconv = comm->all_reduce_value(n_noconv, std::plus<>{});
+  if (n_clamped > 0)
+    app_log(2, "  - Z-window clamps: {} eigenvalues", n_clamped);
+  if (n_noconv > 0)
+    app_warning("qp_approx: gmatch hit maxiter on {} (s,k) blocks.", n_noconv);
+  sVcorr_skij.win().fence();
+  sVcorr_skij.all_reduce();
+
+  } else {
+
+  analyt_cont::AC_t AC(qp_params.ac_alg);
   app_log(2, "\n* Applying the static approximation (Phys. Rev. Lett. 93, 126406) to Sigma(w): ");
   app_log(2, "  - processor grid for V_QPGW : (s, k, a, b) = ({}, {}, {})", 1, nkpools, np_a, np_b);
   app_log(2, "  - ac algorithm:               {}", qp_params.ac_alg);
@@ -498,24 +1867,125 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   auto Sigma_loc_2D = nda::reshape(dSigma_wskab.local(), std::array<long, 2>{nw, dim1});
   AC.init(iw_mesh, Sigma_loc_2D, qp_params.Nfit);
 
-  auto sVcorr_skij = make_shared_array<Array_view_4D_t>(*comm, *internode_comm, *node_comm, {ns, nkpts, nbnd, nbnd});
+  // ---------------- OpenMP-threaded per-state map evaluation ----------------
+  // THREAD SAFETY:
+  //   * `shared_array::local()` is NOT a plain accessor: it is
+  //         Array_view_t(_shape, _win->base(0))
+  //     and mpi3::shared_window::base() -> query() -> **MPI_Win_shared_query**
+  //     (numerics/shared_array/nda.hpp, extern/mpi_wrapper/mpi3/shared_window.hpp).
+  //     Calling it inside the region would put MPI calls on worker threads at
+  //     MPI_THREAD_SINGLE -- undefined behaviour. Both views are therefore hoisted to locals
+  //     BEFORE the region; the body touches nothing but the window's memory.
+  //   * the loop sits BETWEEN the two win().fence() calls, and I_to_skab maps every I to a
+  //     distinct (s,k,a,b), so the stores are disjoint element stores;
+  //   * no HDF5, no logging;
+  //   * `AC` is shared and read-only (AC_t/pade_driver/pade_t::evaluate are `const`);
+  //   * the off_diag_mode string dispatch and its error check are hoisted out of the body,
+  //     because an abort raised from a worker thread is a bad failure mode (and it removes a
+  //     per-I string compare).
+  //
+  // DETERMINISM: iterations are independent, nothing is reassociated.
+  utils::check(qp_params.off_diag_mode == "qp_energy" or qp_params.off_diag_mode == "fermi",
+               "qp_approx: unknown off-diagonal mode: {}", qp_params.off_diag_mode);
+  const bool odm_qp_energy = (qp_params.off_diag_mode == "qp_energy");
+  const size_t dim1_u = size_t(dim1);
+  [[maybe_unused]] const long nthr = utils::omp_threads_for(dim1);
   sVcorr_skij.win().fence();
-  for (size_t I = 0; I < dim1; ++I) {
+  auto Vcorr_loc = sVcorr_skij.local();   // hoisted: local() is an MPI call, see above
+  auto E_ska_loc = sE_ska.local();        // hoisted: same
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr) if (nthr > 1)
+#endif
+  for (size_t I = 0; I < dim1_u; ++I) {
     auto [s, k, a, b] = I_to_skab(I);
-    if (qp_params.off_diag_mode == "qp_energy") {
-      double eps_a = sE_ska.local()(s, k, a).real() - mu;
-      double eps_b = sE_ska.local()(s, k, b).real() - mu;
-      sVcorr_skij.local()(s, k, a, b) = 0.5 * ( AC.evaluate(ComplexType(eps_a, qp_params.eta), I)
-                                                 + AC.evaluate(ComplexType(eps_b, qp_params.eta), I) );
-    } else if (qp_params.off_diag_mode == "fermi") {
-      double eps_a = (a == b)? sE_ska.local()(s, k, a).real() - mu : 0.0;
-      sVcorr_skij.local()(s, k, a, b) = AC.evaluate(ComplexType(eps_a, qp_params.eta), I);
+    if (odm_qp_energy) {
+      double eps_a = E_ska_loc(s, k, a).real() - mu;
+      double eps_b = E_ska_loc(s, k, b).real() - mu;
+      Vcorr_loc(s, k, a, b) = 0.5 * ( AC.evaluate(ComplexType(eps_a, qp_params.eta), I)
+                                        + AC.evaluate(ComplexType(eps_b, qp_params.eta), I) );
     } else {
-      utils::check(false, "qp_approx: unknown off-diagonal mode: {}", qp_params.off_diag_mode);
+      double eps_a = (a == b)? E_ska_loc(s, k, a).real() - mu : 0.0;
+      Vcorr_loc(s, k, a, b) = AC.evaluate(ComplexType(eps_a, qp_params.eta), I);
     }
   }
   sVcorr_skij.win().fence();
   sVcorr_skij.all_reduce();
+
+  } // qp_map dispatch
+
+  // ---- lineshape meter, part 2: output half ----
+  // sVcorr_skij still holds V^xc in the MO BASIS here (the Hermitize + MO -> primary tail is
+  // below), i.e. the map's own output measured against the map's own input -- which is what
+  // "what the static map discards" means. Reading it AFTER the Hermitization would only drop
+  // Im on the diagonal, and that drop is itself part of the discard.
+  sVcorr_skij.win().fence();
+  {
+    auto &LS = q6_lineshape();
+    LS = q6_lineshape_t{};
+    LS.w0 = q6_w0;
+    LS.wtop = q6_wtop;
+    if (q6_w0 > 0.0) {
+      // eps_floor: the denominator guard. At 1e-12 a.u. it sits ~10 orders below
+      // any Sigma^c this map is applied to, so it fires only on an exact zero.
+      constexpr double eps_floor = 1e-12;
+      double m0 = 0.0, mt = 0.0, s0 = 0.0, st = 0.0;
+      double a0 = 0.0, at = 0.0, b0 = 0.0, bt = 0.0;   // the ABSOLUTE discard, a.u.
+      long cnt = 0;
+      std::vector<long> occ, emp, win;
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nkpts; ++ik) {
+          // The gap window, built with the SAME rule as the mode-A diagnostics in
+          // modea_run (above): the two highest occupied + the two lowest empty
+          // states of the INCOMING qp spectrum. Map-independent by construction, so the
+          // meter compares the same states across ac_pade / mats_* / mode_a / mode_b.
+          occ.clear(); emp.clear(); win.clear();
+          for (long a = 0; a < nbnd; ++a)
+            ((sE_ska.local()(is, ik, a).real() < mu) ? occ : emp).push_back(a);
+          std::sort(occ.begin(), occ.end(), [&](long x, long y) {
+            return sE_ska.local()(is, ik, x).real() > sE_ska.local()(is, ik, y).real(); });
+          std::sort(emp.begin(), emp.end(), [&](long x, long y) {
+            return sE_ska.local()(is, ik, x).real() < sE_ska.local()(is, ik, y).real(); });
+          for (size_t t = 0; t < std::min<size_t>(2, occ.size()); ++t) win.push_back(occ[t]);
+          for (size_t t = 0; t < std::min<size_t>(2, emp.size()); ++t) win.push_back(emp[t]);
+          for (long a : win) {
+            const ComplexType V = sVcorr_skij.local()(is, ik, a, a);
+            const ComplexType S0 = q6_sig_w0(is, ik, a);
+            const ComplexType St = q6_sig_wtop(is, ik, a);
+            const double d0 = std::abs(S0 - V), dt = std::abs(St - V);
+            const double f0 = d0 / std::max(std::abs(S0), eps_floor);
+            const double ft = dt / std::max(std::abs(St), eps_floor);
+            m0 = std::max(m0, f0);
+            mt = std::max(mt, ft);
+            s0 += f0;
+            st += ft;
+            a0 = std::max(a0, d0);
+            at = std::max(at, dt);
+            b0 += d0;
+            bt += dt;
+            ++cnt;
+          }
+        }
+      if (cnt > 0) {
+        LS.frac_w0_max = m0;
+        LS.frac_w0_mean = s0 / double(cnt);
+        LS.frac_top_max = mt;
+        LS.frac_top_mean = st / double(cnt);
+        LS.abs_w0_max = a0;
+        LS.abs_w0_mean = b0 / double(cnt);
+        LS.abs_top_max = at;
+        LS.abs_top_mean = bt / double(cnt);
+        LS.n_states = cnt;
+      }
+    }
+    app_log(2, "  [qpGW lineshape] meter ({} gap-window diagonals): "
+               "|Sigma^c_aa - V^xc_aa| / |Sigma^c_aa| at iw_0 = {:.6f} a.u.: max {:.6e}, "
+               "mean {:.6e}; at iw_top = {:.6f} a.u.: max {:.6e}, mean {:.6e}. "
+               "ABSOLUTE discard |Sigma^c_aa - V^xc_aa| (a.u.): iw_0 max {:.6e} mean {:.6e}, "
+               "iw_top max {:.6e} mean {:.6e}",
+            LS.n_states, LS.w0, LS.frac_w0_max, LS.frac_w0_mean,
+            LS.wtop, LS.frac_top_max, LS.frac_top_mean,
+            LS.abs_w0_max, LS.abs_w0_mean, LS.abs_top_max, LS.abs_top_mean);
+  }
 
   // prepare for inverse transformation from MO to primary basis
   auto sMOinv_skai = make_shared_array<Array_view_4D_t>(*comm, *internode_comm, *node_comm, {ns, nkpts, nbnd, nbnd});
@@ -557,7 +2027,8 @@ void add_qpscf_vcorr(MBState &mb_state,
                      solvers::mb_solver_t<corr_solver_t> &mb_solver,
                      eri_t &eri,
                      const imag_axes_ft::IAFT &FT,
-                     qp_params_t &qp_params) {
+                     qp_params_t &qp_params,
+                     const sArray_t<Array_view_5D_t> *sG_ext) {
   using math::shm::make_shared_array;
 
   auto& sHeff_skij = mb_state.sHeff_skij.value();
@@ -567,29 +2038,70 @@ void add_qpscf_vcorr(MBState &mb_state,
   auto [ns, nkpts, nbnd, nbnd2] = sHeff_skij.shape();
   auto nt = FT.nt_f();
 
+  auto &qpt = qp_stage_timer();   // per-stage timers of the QP iteration
+  qpt.start("QP_G_BUILD");
+
   mb_state.sSigma_tskij.emplace(make_shared_array<Array_view_5D_t>(*mpi, {nt, ns, nkpts, nbnd, nbnd}));
   mb_state.sG_tskij.emplace(make_shared_array<Array_view_5D_t>(*mpi, {nt, ns, nkpts, nbnd, nbnd}));
-  update_G(mb_state.sG_tskij.value(), sMO_skia, sE_ska, mu, FT);
+  if (sG_ext == nullptr) {
+    update_G(mb_state.sG_tskij.value(), sMO_skia, sE_ska, mu, FT);
+  } else {
+    // The re-QP-ization step. The external G replaces the
+    // analytic QP G for BOTH consumers below -- update_w (so W_corr screens with
+    // P^RPA[G_ext] + P^lad + P_C(P_imp-P_dc)P_C^dag) and the Sigma^GW build. The MAP stage
+    // downstream (qp_approx / the mode-A CD kernel) is untouched: it consumes the MO-basis
+    // Sigma gather + mb_state.dW_qtPQ, both built from whatever G is here.
+    // element-wise dims: some bundled fmt versions have no std::array formatter
+    auto gx = sG_ext->shape();
+    auto ge = mb_state.sG_tskij.value().shape();
+    utils::check(gx == ge,
+                 "add_qpscf_vcorr: external Green's function shape ({},{},{},{},{}) != "
+                 "expected ({},{},{},{},{}).",
+                 gx[0], gx[1], gx[2], gx[3], gx[4], ge[0], ge[1], ge[2], ge[3], ge[4]);
+    auto &sG = mb_state.sG_tskij.value();
+    sG.win().fence();
+    if (mpi->node_comm.root()) sG.local() = sG_ext->local();
+    sG.win().fence();
+    mpi->comm.barrier();
+  }
   FT.check_leakage(mb_state.sG_tskij.value(), imag_axes_ft::fermion, "Green's function");
-  
+  qpt.stop("QP_G_BUILD");
+
   // compute screen interaction
   utils::check(mb_solver.scr_eri!=nullptr, "add_qpscf_vcorr: mb_solver.scr_eri == nullptr.");
+  qpt.start("QP_SCR_COULOMB");
   mb_solver.scr_eri->update_w(mb_state, eri, mb_solver.corr->iter());
-  
+  qpt.stop("QP_SCR_COULOMB");
+
   // compute dynamic self-energy in the primary basis
+  qpt.start("QP_SIGMA");
   mb_solver.corr->evaluate(mb_state, eri);
   FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
+  qpt.stop("QP_SIGMA");
 
-  // Add the correlation contribution to the QP Hamiltonian.
-  auto sVcorr_skij = qp_approx(mb_state.sSigma_tskij.value(),  sMO_skia, sE_ska, mu, FT, qp_params);
+  // Build the mode-A evaluator context HERE -- this is the only
+  // window in which mb_state.dW_qtPQ is alive (it is reset below).
+  qpt.start("QP_MAP");
+  qp_modea::modea_ctx modea_ctx;
+  build_modea_ctx_if_needed(modea_ctx, mb_state, mb_solver, eri, sMO_skia, sE_ska, mu, FT,
+                            qp_params, false);
+
+  // Add the correlation contribution to the QP Hamiltonian. At this point
+  // sHeff_skij holds the static (H0 + HF) part only -- the map-(ii) reference.
+  auto sVcorr_skij = qp_approx(mb_state.sSigma_tskij.value(),  sMO_skia, sE_ska, mu, FT, qp_params,
+                               std::addressof(sHeff_skij),
+                               modea_ctx.active ? std::addressof(modea_ctx) : nullptr);
   if (mpi->node_comm.root()) sHeff_skij.local() += sVcorr_skij.local();
   mpi->comm.barrier();
- 
+  qpt.stop("QP_MAP");
+
   // deallocation
   mb_state.dW_qtPQ.reset();
   mb_state.sG_tskij.reset();
   mb_state.sSigma_tskij.reset();
   mpi->comm.barrier();
+
+  print_qp_stage_timers();
 }
 
 
@@ -651,15 +2163,44 @@ template<typename comm_t, typename X_t>
 double solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t& iter_solver,
                        long it, std::string h5_prefix, X_t &sHeff_skij, const X_t &sS_skij) {
   double conv = 0;
-  if (it == 1) {
-    // Just check changes w.r.t. mf
+  // Which "scf/iter{ref_it}" holds the object this iteration is measured against, and is it
+  // a QP Hamiltonian at all?
+  //
+  // A qpGW run that RESTARTS from a plain-GW checkpoint -- which is exactly what the
+  // GW+EDMFT lattice stage does (dmft/io.py always emits 'restart': True for the [qpgw]
+  // block, and the workflow REQUIRES a pre-existing GW checkpoint) -- starts at
+  // it = init_it + 1 with init_it > 0, so it never sees the it == 1 branch below. The
+  // else branch then asks the iterative solver for "scf/iter{it-1}/Heff_skij", but a
+  // checkpoint written by the DYSON scf holds F_skij (+ system/H0_skij), never Heff_skij.
+  // nda::h5_read would then throw INSIDE the `node_comm.root()` guard, i.e. on one rank
+  // only: the root would unwind qp_scf_loop's shared arrays into MPI_Win_free while every
+  // other rank sits in the node_comm.broadcast_n below -- a hard deadlock with no error
+  // message.
+  //
+  // Treat "no QP Hamiltonian in the previous iteration" exactly like the first qp
+  // iteration: there is nothing to damp against yet, so report the change w.r.t. the
+  // reference Hamiltonian and (for DIIS) start the history here. it == 1 keeps ref_it = 0.
+  const long ref_it = (it == 1) ? 0 : it - 1;
+  const std::string ref_grp_name = "scf/iter" + std::to_string(ref_it);
+  bool prev_is_qp = false;
+  if (context.comm.root()) {
+    h5::file file(h5_prefix + ".mbpt.h5", 'r');
+    h5::group grp(file);
+    prev_is_qp = grp.has_subgroup(ref_grp_name) and
+                 grp.open_group(ref_grp_name).has_dataset("Heff_skij");
+  }
+  context.comm.broadcast_n(&prev_is_qp, 1, 0);
+
+  if (it == 1 or not prev_is_qp) {
+    // Just check changes w.r.t. mf (or, on a dyson-checkpoint restart, w.r.t. the
+    // effective one-body Hamiltonian F + H0 of the iteration we are continuing from).
     if (context.node_comm.root()) {
       auto H_mf = nda::make_regular(sHeff_skij.local());
       std::string filename = h5_prefix + ".mbpt.h5";
       h5::file file(filename, 'r');
       h5::group grp(file);
-      if (grp.has_subgroup("scf/iter0")) {
-        auto iter_grp = grp.open_group("scf/iter0");
+      if (grp.has_subgroup(ref_grp_name)) {
+        auto iter_grp = grp.open_group(ref_grp_name);
         if (iter_grp.has_dataset("Heff_skij")) {
           // checkpoint from a qp scf
           nda::h5_read(iter_grp, "Heff_skij", H_mf);
@@ -684,15 +2225,21 @@ double solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf
     }
     context.comm.barrier();
   } else {
+    // prev_is_qp is true here, so "scf/iter{it-1}/Heff_skij" exists on every rank's view of
+    // the file. The check is kept as a collective-safe assertion: everything below runs on
+    // the node root ONLY, so anything that throws there deadlocks the other ranks in the
+    // broadcast instead of failing. utils::check aborts the job with a message instead.
+    utils::check(prev_is_qp,
+                 "qp_scf_common::solve_iterative: \"{}/Heff_skij\" is missing in {}.mbpt.h5, "
+                 "so the qp Hamiltonian of the previous iteration cannot be damped against.",
+                 ref_grp_name, h5_prefix);
     iter_solver.metadata_log();
     if (context.node_comm.root()) {
       std::string filename = h5_prefix + ".mbpt.h5";
       h5::file file(filename, 'r');
       h5::group grp(file);
-      if (grp.has_subgroup("scf/iter" + std::to_string(it-1))) {
-        auto scf_grp = grp.open_group("scf");
-        conv = iter_solver.solve(sHeff_skij.local(), "Heff_skij", scf_grp, it);
-      }
+      auto scf_grp = grp.open_group("scf");
+      conv = iter_solver.solve(sHeff_skij.local(), "Heff_skij", scf_grp, it);
     }
     context.node_comm.broadcast_n(&conv, 1, 0);
   }
@@ -735,8 +2282,8 @@ template double update_mu(double, const mf::MF&, const sArray_t<Array_view_3D_t>
 template void add_evscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&, bool);
 template void add_evscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&, bool);
 
-template void add_qpscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&);
-template void add_qpscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&);
+template void add_qpscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&, const sArray_t<Array_view_5D_t>*);
+template void add_qpscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&, const sArray_t<Array_view_5D_t>*);
 
 template double qp_eqn_linearized(double, analyt_cont::AC_t &, long, double, double, double);
 template std::tuple<double,double> qp_eqn_bisection(double, analyt_cont::AC_t &, long, double, double, double, double);

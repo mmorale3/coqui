@@ -183,13 +183,13 @@ TEST_CASE("thc_intpts_ibz", "[methods]")
 #if defined(ENABLE_DEVICE)
   // standard cutoff
   { 
-    methods::thc thc(std::addressof(mf),mpi,make_thc_ptree(mf.ecutrho(),1,1024,1e-4,1));
+    methods::thc thc(std::addressof(mf), *mpi, make_thc_ptree(mf.ecutrho(),1,1024,1e-4,1));
     auto [ri_ibz_u,Xau,Xbu] = thc.interpolating_points<UNIFIED_MEMORY>();
   }
   
   // test reduced cutoff
   { 
-    methods::thc thc(std::addressof(mf),mpi,make_thc_ptree(mf.ecutrho()*0.3,1,1024,1e-4,1));
+    methods::thc thc(std::addressof(mf), *mpi, make_thc_ptree(mf.ecutrho()*0.3,1,1024,1e-4,1));
     auto [ri_ibz_u,Xau,Xbu] = thc.interpolating_points<UNIFIED_MEMORY>();
   }
 #endif
@@ -389,7 +389,7 @@ TEST_CASE("thc", "[methods]")
     auto Muv_u = thc.evaluate<UNIFIED_MEMORY>(ri_u,Xau,Xbu);
     thc.print_timers();
     auto const& L_u = std::get<0>(Muv_u);
-    auto [avE,mxE] = detail::max_diff_thc(mpi.comm,mf,Xa,Xa,L_h,Xau,Xau,L_u);
+    auto [avE,mxE] = detail::max_diff_thc(mpi->comm,mf,Xa,Xa,L_h,Xau,Xau,L_u);
     app_log(2, "  thc - standard cutoff [UNIFIED]: avE:{}   mxE:{}",avE,mxE);
     VALUE_EQUAL(avE,0.0);  
     VALUE_EQUAL(mxE,0.0);  
@@ -399,7 +399,7 @@ TEST_CASE("thc", "[methods]")
     auto Muv_d = thc.evaluate<DEVICE_MEMORY>(ri_d,Xad,Xbd);
     thc.print_timers();
     auto const& L_d = std::get<0>(Muv_d);
-    std::tie(avE,mxE) = detail::max_diff_thc(mpi.comm,mf,Xa,Xa,L_h,Xad,Xad,L_d);
+    std::tie(avE,mxE) = detail::max_diff_thc(mpi->comm,mf,Xa,Xa,L_h,Xad,Xad,L_d);
     app_log(2, "  thc - standard cutoff [DEVICE]: avE:{}   mxE:{}",avE,mxE);
     VALUE_EQUAL(avE,0.0);
     VALUE_EQUAL(mxE,0.0);
@@ -420,7 +420,7 @@ TEST_CASE("thc", "[methods]")
     auto Muv_u = thc.evaluate<UNIFIED_MEMORY>(ri_u,Xau,Xbu);
     thc.print_timers();
     auto const& L_u = std::get<0>(Muv_u);
-    auto [avE,mxE] = detail::max_diff_thc(mpi.comm,mf,Xa,Xa,L_h,Xau,Xau,L_u);
+    auto [avE,mxE] = detail::max_diff_thc(mpi->comm,mf,Xa,Xa,L_h,Xau,Xau,L_u);
     app_log(2, "  thc - reduced cutoff [UNIFIED]: avE:{}   mxE:{}",avE,mxE);
     VALUE_EQUAL(avE,0.0);  
     VALUE_EQUAL(mxE,0.0);  
@@ -430,7 +430,7 @@ TEST_CASE("thc", "[methods]")
     auto Muv_d = thc.evaluate<DEVICE_MEMORY>(ri_d,Xad,Xbd);
     thc.print_timers();
     auto const& L_d = std::get<0>(Muv_d);
-    std::tie(avE,mxE) = detail::max_diff_thc(mpi.comm,mf,Xa,Xa,L_h,Xad,Xad,L_d);
+    std::tie(avE,mxE) = detail::max_diff_thc(mpi->comm,mf,Xa,Xa,L_h,Xad,Xad,L_d);
     app_log(2, "  thc - standard cutoff [DEVICE]: avE:{}   mxE:{}",avE,mxE);
     VALUE_EQUAL(avE,0.0);
     VALUE_EQUAL(mxE,0.0);
@@ -459,7 +459,7 @@ TEST_CASE("thc_so", "[methods]")
     auto Muv_u = thc.evaluate<UNIFIED_MEMORY>(ri_u,Xau,Xbu);
     thc.print_timers();
     auto const& L_u = std::get<0>(Muv_u);
-    auto [avE,mxE] = detail::max_diff_thc(mpi.comm,mf,Xa,Xa,L_h,Xau,Xau,L_u);
+    auto [avE,mxE] = detail::max_diff_thc(mpi->comm,mf,Xa,Xa,L_h,Xau,Xau,L_u);
     app_log(2, "  thc_so - standard cutoff [UNIFIED]: avE:{}   mxE:{}",avE,mxE);
     VALUE_EQUAL(avE,0.0);
     VALUE_EQUAL(mxE,0.0);
@@ -469,7 +469,7 @@ TEST_CASE("thc_so", "[methods]")
     auto Muv_d = thc.evaluate<DEVICE_MEMORY>(ri_d,Xad,Xbd);
     thc.print_timers();
     auto const& L_d = std::get<0>(Muv_d);
-    std::tie(avE,mxE) = detail::max_diff_thc(mpi.comm,mf,Xa,Xa,L_h,Xad,Xad,L_d);
+    std::tie(avE,mxE) = detail::max_diff_thc(mpi->comm,mf,Xa,Xa,L_h,Xad,Xad,L_d);
     app_log(2, "  thc_so - standard cutoff [DEVICE]: avE:{}   mxE:{}",avE,mxE);
     VALUE_EQUAL(avE,0.0);
     VALUE_EQUAL(mxE,0.0);
@@ -490,7 +490,7 @@ TEST_CASE("thc_so", "[methods]")
     auto Muv_u = thc.evaluate<UNIFIED_MEMORY>(ri_u,Xau,Xbu);
     thc.print_timers();
     auto const& L_u = std::get<0>(Muv_u);
-    auto [avE,mxE] = detail::max_diff_thc(mpi.comm,mf,Xa,Xa,L_h,Xau,Xau,L_u);
+    auto [avE,mxE] = detail::max_diff_thc(mpi->comm,mf,Xa,Xa,L_h,Xau,Xau,L_u);
     app_log(2, "  thc_so - reduced cutoff [UNIFIED]: avE:{}   mxE:{}",avE,mxE);
     VALUE_EQUAL(avE,0.0);
     VALUE_EQUAL(mxE,0.0);
@@ -500,7 +500,7 @@ TEST_CASE("thc_so", "[methods]")
     auto Muv_d = thc.evaluate<DEVICE_MEMORY>(ri_d,Xad,Xbd);
     thc.print_timers();
     auto const& L_d = std::get<0>(Muv_d);
-    std::tie(avE,mxE) = detail::max_diff_thc(mpi.comm,mf,Xa,Xa,L_h,Xad,Xad,L_d);
+    std::tie(avE,mxE) = detail::max_diff_thc(mpi->comm,mf,Xa,Xa,L_h,Xad,Xad,L_d);
     app_log(2, "  thc_so - reduced cutoff [DEVICE]: avE:{}   mxE:{}",avE,mxE);
     VALUE_EQUAL(avE,0.0);
     VALUE_EQUAL(mxE,0.0);
@@ -602,7 +602,7 @@ TEST_CASE("thc_ranges", "[methods]")
     auto [ri_u,Xau,Xbu] = thc.interpolating_points<UNIFIED_MEMORY>(0,-1,a_rng,b_rng);
     auto Muv_u = thc.evaluate<UNIFIED_MEMORY>(ri_u,Xau,Xbu,false,a_rng,b_rng);
     auto const& L_u = std::get<0>(Muv_u);
-    auto [avE,mxE] = detail::max_diff_thc(mpi.comm,mf,Xa_r,*Xb_r,L_h,Xau,*Xbu,L_u);
+    auto [avE,mxE] = detail::max_diff_thc(mpi->comm,mf,Xa_r,*Xb_r,L_h,Xau,*Xbu,L_u);
     app_log(2, "  thc_so - standard cutoff [UNIFIED]: avE:{}   mxE:{}",avE,mxE);
     VALUE_EQUAL(avE,0.0);
     VALUE_EQUAL(mxE,0.0);
@@ -610,7 +610,7 @@ TEST_CASE("thc_ranges", "[methods]")
     auto [ri_d,Xad,Xbd] = thc.interpolating_points<DEVICE_MEMORY>(0,-1,a_rng,b_rng);
     auto Muv_d = thc.evaluate<DEVICE_MEMORY>(ri_d,Xad,Xbd,false,a_rng,b_rng);
     auto const& L_d = std::get<0>(Muv_d);
-    std::tie(avE,mxE) = detail::max_diff_thc(mpi.comm,mf,Xa_r,*Xb_r,L_h,Xad,*Xbd,L_d);
+    std::tie(avE,mxE) = detail::max_diff_thc(mpi->comm,mf,Xa_r,*Xb_r,L_h,Xad,*Xbd,L_d);
     app_log(2, "  thc_so - standard cutoff [DEVICE]: avE:{}   mxE:{}",avE,mxE);
     VALUE_EQUAL(avE,0.0);
     VALUE_EQUAL(mxE,0.0);
@@ -894,9 +894,9 @@ TEST_CASE("thc_coul_metric", "[methods]")
 
 /*
 TEST_CASE("thc_chol_ov", "[methods]") {
-  auto mpi.comm = mpi3::environment::get_mpi.comm_instance();
+  auto mpi->comm = mpi3::environment::get_mpi.comm_instance();
 
-  auto mf = mf::default_MF(mpi.comm, mf::pyscf_source);
+  auto mf = mf::default_MF(mpi->comm, mf::pyscf_source);
   int nkpts = mf.nkpts();
   int ik = 2;
   double eri_cutoff = 1e-6;
@@ -906,7 +906,7 @@ TEST_CASE("thc_chol_ov", "[methods]") {
 
   // Cholesky ERIs as the references
   methods::cholesky chol(std::addressof(mf), mpi, eri_cutoff, mf.ecutrho());
-  methods::thc thc(std::addressof(mf), mpi.comm, nda::range(-1,-1), nda::range(-1,-1),
+  methods::thc thc(std::addressof(mf), mpi->comm, nda::range(-1,-1), nda::range(-1,-1),
                  eri_cutoff, 50, mf.ecutrho());
 
   // q-independent interpolating points
@@ -971,9 +971,9 @@ TEST_CASE("thc_chol_ov", "[methods]") {
 
 #if defined(ENABLE_SLATE)
 TEST_CASE("thc_chol_ls", "[methods]") {
-  auto mpi.comm = mpi3::environment::get_mpi.comm_instance();
+  auto mpi->comm = mpi3::environment::get_mpi.comm_instance();
 
-  auto mf = mf::default_MF(mpi.comm, mf::pyscf_source);
+  auto mf = mf::default_MF(mpi->comm, mf::pyscf_source);
   int nkpts = mf.nkpts();
   int ik = 2;
   double eri_cutoff = 1e-6;
@@ -983,7 +983,7 @@ TEST_CASE("thc_chol_ls", "[methods]") {
 
   // Cholesky ERIs as the references
   methods::cholesky chol(std::addressof(mf), mpi, eri_cutoff, mf.ecutrho());
-  methods::thc thc(std::addressof(mf), mpi.comm, nda::range(-1,-1), nda::range(-1,-1),
+  methods::thc thc(std::addressof(mf), mpi->comm, nda::range(-1,-1), nda::range(-1,-1),
                  eri_cutoff, 50, mf.ecutrho());
 
   // q-independent interpolating points

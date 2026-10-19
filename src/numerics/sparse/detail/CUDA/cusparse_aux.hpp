@@ -37,7 +37,6 @@
 #include "nda/macros.hpp"
 
 #include "numerics/sparse/detail/concepts.hpp"
-#include "numerics/sparse/detail/ops_aux.hpp"
 
 namespace math::sparse::device
 {
@@ -88,22 +87,21 @@ uint32_t find_alignment(T *p) {
     return sizeof(T);
 }
 
-template<typename A_t>
-requires(CSRMatrix<A_t> or math::detail::is_tagged_matrix<A_t>) 
-constexpr auto get_operation() {
-  constexpr char op_a = math::detail::op_tag<A_t>::value;
-  using value_t = std::decay_t<typename std::decay_t<A_t>::value_type>;
-  if constexpr (op_a == 'n' or op_a == 'N') 
-    return CUSPARSE_OPERATION_NON_TRANSPOSE; 
-  else if constexpr (op_a == 't' or op_a == 'T') 
+// The cuSPARSE operation for an op char. For a REAL value type the conjugate transpose is the transpose:
+// cuSPARSE rejects CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE for CUDA_R_32F/64F operands ("conjugate
+// transpose (opA) is not valid for A data type (CUDA_R_64F)", CUSPARSE_STATUS_INVALID_VALUE at the
+// SpMM bufferSize query, observed with CUDA 12.5).
+template<typename value_type = std::complex<double>>
+inline auto get_operation(char op) {
+  constexpr bool is_real = std::is_floating_point_v<std::decay_t<value_type>>;
+  if (op == 'n' or op == 'N')
+    return CUSPARSE_OPERATION_NON_TRANSPOSE;
+  else if (op == 't' or op == 'T')
     return CUSPARSE_OPERATION_TRANSPOSE;
-  else if constexpr (op_a == 'c' or op_a == 'C' or op_a == 'h' or op_a == 'H') { 
-    if constexpr (::nda::is_complex_v<value_t>) { 
-      return CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE; 
-    } else {
-      return CUSPARSE_OPERATION_TRANSPOSE;
-    }
-  }
+  else if (op == 'c' or op == 'C' or op == 'h' or op == 'H')
+    return is_real ? CUSPARSE_OPERATION_TRANSPOSE : CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE;
+  utils::check(false, "Invalid operation op:{}",op);
+  return CUSPARSE_OPERATION_NON_TRANSPOSE;
 }
 
 template<::nda::MemoryArrayOfRank<1> X>
@@ -144,10 +142,41 @@ auto cuDn(X& x) {
   }
 }
 
+// slow stride is always the batched one
+template<::nda::MemoryArrayOfRank<3> X>
+auto cuDn(X& x) {
+  static_assert(::nda::mem::have_device_compatible_addr_space<X>, "Memory space mismatch");
+  static_assert(std::decay_t<X>::is_stride_order_C() or std::decay_t<X>::is_stride_order_Fortran(), "Layout mismatch");
+  utils::check(x.indexmap().min_stride() == 1, "Stride mismatch");
+  if constexpr (std::is_const_v<std::remove_pointer_t<decltype(x.data())>>) {
+    cusparseDnMatDescr_t cuX;
+    // const_cast: the cuSPARSE dense descriptor takes a non-const pointer (read-only use here)
+    using non_const_T = std::remove_const_t<std::remove_pointer_t<decltype(x.data())>>;
+    auto ptr = const_cast<non_const_T*>(x.data()); 
+    if constexpr (std::decay_t<X>::is_stride_order_C()) {
+      CUSPARSE_CHECK( cusparseCreateDnMat, &cuX, x.extent(1), x.extent(2), x.strides()[1], ptr, cusparse_datatype<::nda::get_value_t<X>>,CUSPARSE_ORDER_ROW);
+      CUSPARSE_CHECK( cusparseDnMatSetStridedBatch, cuX, x.extent(0), x.strides()[0]); 
+    } else {
+      CUSPARSE_CHECK( cusparseCreateDnMat, &cuX, x.extent(0), x.extent(1), x.strides()[1], ptr, cusparse_datatype<::nda::get_value_t<X>>,CUSPARSE_ORDER_COL);
+      CUSPARSE_CHECK( cusparseDnMatSetStridedBatch, cuX, x.extent(2), x.strides()[2]); 
+    }
+    return cuX;
+  } else {
+    cusparseDnMatDescr_t cuX;
+    if constexpr (std::decay_t<X>::is_stride_order_C()) {
+      CUSPARSE_CHECK( cusparseCreateDnMat, &cuX, x.extent(1), x.extent(2), x.strides()[1], x.data(), cusparse_datatype<::nda::get_value_t<X>>,CUSPARSE_ORDER_ROW);
+      CUSPARSE_CHECK( cusparseDnMatSetStridedBatch, cuX, x.extent(0), x.strides()[0]); 
+    } else {
+      CUSPARSE_CHECK( cusparseCreateDnMat, &cuX, x.extent(0), x.extent(1), x.strides()[1], x.data(), cusparse_datatype<::nda::get_value_t<X>>,CUSPARSE_ORDER_COL);
+      CUSPARSE_CHECK( cusparseDnMatSetStridedBatch, cuX, x.extent(2), x.strides()[2]); 
+    }
+    return cuX;
+  }
+}
 
 template<typename csr>
 requires( CSRMatrix<csr> )
-auto cuCSR(csr& spA, ::nda::MemoryArrayOfRank<1> auto& ofs) {
+auto cuCSR(csr& spA, ::nda::MemoryArrayOfRank<1> auto& ofs, int batchCount = 1) {
   constexpr MEMORY_SPACE MEM = csr::mem_type; 
   using value_type = std::decay_t<typename csr::value_type>;
   using index_type = std::decay_t<typename csr::index_type>;
@@ -157,26 +186,32 @@ auto cuCSR(csr& spA, ::nda::MemoryArrayOfRank<1> auto& ofs) {
   static_assert( std::is_same_v<index_type,int_type>, "Incompatible types: cuSparse requires index_type==int_type.");
   utils::check(spA.compact(), "device::csrmv: Sparse matrix must be in compact form.");
   if constexpr (std::is_const_v<std::remove_pointer_t<decltype(spA.values().data())>>) { 
-    cusparseConstSpMatDescr_t cuA;
+    cusparseSpMatDescr_t cuA;
+    // const_cast: the cuSPARSE sparse descriptor needs non-const pointers, e.g. to set
+    // batchCount (the data is only read)
+    auto val_ptr = const_cast<value_type*>(spA.values().data()); 
+    auto col_ptr = const_cast<index_type*>(spA.columns().data());
     auto [m, n] = spA.shape();
     if(ofs.extent(0) < m+1) ofs.resize(m+1);
-    ofs(::nda::range(m)) = spA.row_begin()(::nda::range(m));
-    ofs(::nda::range(m,m+1)) = spA.row_end()(::nda::range(m-1,m));
-    CUSPARSE_CHECK( cusparseCreateConstCsr, &cuA, m, n, spA.nnz(),
-                    ofs.data(), spA.columns().data(), spA.values().data(),
+    ofs(::nda::range(m)) = spA.row_begin_device()(::nda::range(m));
+    ofs(::nda::range(m,m+1)) = spA.row_end_device()(::nda::range(m-1,m));
+    CUSPARSE_CHECK( cusparseCreateCsr, &cuA, m, n, spA.nnz(),
+                    ofs.data(), col_ptr, val_ptr,
                     cusparse_indextype<int_type>, cusparse_indextype<index_type>,
                     CUSPARSE_INDEX_BASE_ZERO, cusparse_datatype<value_type> )
+    if(batchCount!=1) CUSPARSE_CHECK(cusparseCsrSetStridedBatch, cuA, batchCount, 0, 0);
     return cuA;
   } else {
     cusparseSpMatDescr_t cuA;
     auto [m, n] = spA.shape();
     if(ofs.extent(0) < m+1) ofs.resize(m+1);
-    ofs(::nda::range(m)) = spA.row_begin()(::nda::range(m));
-    ofs(::nda::range(m,m+1)) = spA.row_end()(::nda::range(m-1,m));
+    ofs(::nda::range(m)) = spA.row_begin_device()(::nda::range(m));
+    ofs(::nda::range(m,m+1)) = spA.row_end_device()(::nda::range(m-1,m));
     CUSPARSE_CHECK( cusparseCreateCsr, &cuA, m, n, spA.nnz(),
                     ofs.data(), spA.columns().data(), spA.values().data(),
                     cusparse_indextype<int_type>, cusparse_indextype<index_type>,
                     CUSPARSE_INDEX_BASE_ZERO, cusparse_datatype<value_type> )
+    if(batchCount!=1) CUSPARSE_CHECK(cusparseCsrSetStridedBatch, cuA, batchCount, 0, 0);
     return cuA;
   }
 }

@@ -27,19 +27,81 @@
  */ 
 
 #include <functional>
+#include <cstdlib>       // getenv/atol: the OMP_NUM_THREADS thread-safety guard below
 
 #include "utilities/check.hpp"
 #include "nda/nda.hpp"
 #include "nda/tensor.hpp"
+#include "mpi3/environment.hpp"
 #include "numerics/distributed_array/ops.hpp"
 #include "numerics/distributed_array/detail/ops_aux.hpp"
 #include "numerics/distributed_array/detail/slate_aux.hpp"
 #if defined(ENABLE_SLATE)
 #include "slate/slate.hh"
-#endif 
+#endif
 
 namespace math::nda::slate_ops
 {
+
+/** ---------------------------------------------------------------------------------
+ *  SLATE THREAD-SAFETY GUARD
+ *
+ *  SLATE's host paths run at its default Target::HostTask, so its OpenMP tasks issue
+ *  MPI calls directly (Tile::recv -> MPI_Wait, reached through listBcast). With
+ *  OMP_NUM_THREADS > 1 and MPI initialized below MPI_THREAD_MULTIPLE that is an
+ *  immediate SIGSEGV inside UCX (e.g. on the THC/ISDF build path, least_squares_solve),
+ *  whose only diagnostic is a wall of "event_base_loop: reentrant invocation".
+ *
+ *  The predicate lives here so every slate_ops entry point shares ONE definition of
+ *  "unsafe", and the vertex ladder's own richer message (vertex_ladder.icc) delegates
+ *  to it rather than re-deriving it.
+ *
+ *  Scope of the hazard: every slate_ops entry point short-circuits to serial
+ *  LAPACK/BLAS when the operand's communicator has size 1, so only comm.size() > 1
+ *  can reach SLATE at all -- which is exactly what is tested here. The recommended
+ *  recipe (OMP_NUM_THREADS=1 + blas_threads/MKL_NUM_THREADS=N) never trips
+ *  it: MKL's threading layer makes no MPI calls and SLATE's task layer stays serial.
+ * ---------------------------------------------------------------------------------- */
+namespace detail {
+
+/// OMP_NUM_THREADS as the OpenMP runtime will read it; 1 when unset or unparseable.
+inline long omp_threads_requested() {
+  static const long t = [] {
+    if (const char *e = std::getenv("OMP_NUM_THREADS")) {
+      const long v = std::atol(e);
+      if (v > 0) return v;
+    }
+    return 1L;
+  }();
+  return t;
+}
+
+/// True when SLATE's OpenMP task layer would issue concurrent MPI below MULTIPLE.
+inline bool slate_threading_unsafe(long comm_size) {
+  if (comm_size <= 1) return false;                // serial short-circuit: SLATE not entered
+  if (omp_threads_requested() <= 1) return false;   // task layer stays serial
+  return static_cast<int>(boost::mpi3::environment::thread_support())
+       < static_cast<int>(boost::mpi3::thread_level::multiple);
+}
+
+/// Loud abort in place of the UCX segfault. `op` names the slate_ops entry point.
+inline void slate_thread_guard(long comm_size, const char *op) {
+  if (not slate_threading_unsafe(comm_size)) return;
+  utils::check(false,
+               "slate_ops::{}: OMP_NUM_THREADS = {} on a {}-rank operand, with MPI "
+               "initialized below MPI_THREAD_MULTIPLE (provided level {}, required {}). "
+               "SLATE's OpenMP tasks issue concurrent MPI calls and WILL segfault inside "
+               "UCX. Fix, in order of preference: (1) run with "
+               "OMP_NUM_THREADS=1 and thread the BLAS layer instead -- set blas_threads "
+               "in the TOML (or MKL_NUM_THREADS in the environment), which needs no MPI "
+               "thread support at all; or (2) set COQUI_MPI_THREAD_MULTIPLE=1 to request "
+               "MPI_THREAD_MULTIPLE at init.",
+               op, omp_threads_requested(), comm_size,
+               static_cast<int>(boost::mpi3::environment::thread_support()),
+               static_cast<int>(boost::mpi3::thread_level::multiple));
+}
+
+} // namespace detail
 
 /***************************************************************************/
 /*  				Lapack	  				   */
@@ -52,6 +114,7 @@ void svd(A_t&& A, B_t&& U, std::vector<double> S, C_t&& VH)
   using dA_t = typename std::decay_t<A_t>;
   using dB_t = typename std::decay_t<B_t>;
   using dC_t = typename std::decay_t<C_t>;
+  detail::slate_thread_guard(A.communicator()->size(), "svd");
 #if defined(ENABLE_SLATE)
   static_assert(std::is_same_v<typename dA_t::value_type, typename dB_t::value_type>,
                                "Value mismatch");
@@ -74,6 +137,7 @@ void eig(A_t&& A, std::vector<double> L, B_t&& X)
 {
   using dA_t = typename std::decay_t<A_t>;
   using dB_t = typename std::decay_t<B_t>;
+  detail::slate_thread_guard(A.communicator()->size(), "eig");
 #if defined(ENABLE_SLATE)
   static_assert(std::is_same_v<typename dA_t::value_type, typename dB_t::value_type>,
                                "Value mismatch");
@@ -112,47 +176,70 @@ long lu_solve(DistributedMatrix auto&& A, DistributedMatrix auto&& B)
 
     auto Al = A.local();
     auto Bl = B.local();
-    ::nda::basic_array<int, 1, ::nda::C_layout, 'A', 
-        ::nda::heap<::nda::mem::get_addr_space<typename dA_t::Array_t>>> ipiv(Al.extent(0));
-    info = ::nda::lapack::getrf(Al,ipiv);
-    if( info != 0 ) {
-      app_warning(" serial lu_solve: getrf info != 0 , info:{}",info); 
-      return info;
-    }
 
-    if constexpr(dB_t::is_stride_order_Fortran()) {
-      info = ::nda::lapack::getrs(Al,Bl,ipiv);
-    } else {
-      if constexpr ( ::nda::mem::get_addr_space<typename dA_t::Array_t> == ::nda::mem::Host ) {
-        ::nda::basic_array<value_type, 2, ::nda::F_layout, 'A', 
-            ::nda::heap<::nda::mem::get_addr_space<typename dB_t::Array_t>>> Bf(Bl); 
-        info = ::nda::lapack::getrs(Al,Bf,ipiv);
-        Bl = Bf;
-      } else {
-        ::nda::basic_array<value_type, 2, ::nda::F_layout, 'A', 
-            ::nda::heap<::nda::mem::get_addr_space<typename dB_t::Array_t>>> Bf(Bl.shape()); 
-        // since it is not clear if tensor backend will always accept mixed layouts, 
-        // I'm creating a view to the transposed array
-        using layout_t = typename ::nda::F_stride_layout::template mapping<2>;
-        layout_t idx_{std::array<long,2>{Bl.extent(1),Bl.extent(0)},
-            std::array<long,2>{Bl.strides()[1],Bl.strides()[0]}};
-        ::nda::basic_array_view<value_type, 2, ::nda::F_stride_layout, 'A', 
-            ::nda::default_accessor, 
-            ::nda::borrowed<::nda::mem::get_addr_space<typename dB_t::Array_t>>> 
-            Bl_f(idx_,Bl.data()); 
-        ::nda::tensor::add(value_type(1.0),Bl_f,"ij",value_type(0.0),Bf,"ji");
-        info = ::nda::lapack::getrs(Al,Bf,ipiv);
-        ::nda::tensor::add(value_type(1.0),Bf,"ij",value_type(0.0),Bl_f,"ji");
+    // `hermitian` means: A is stored in C order and the solve is to be done against A^H. The
+    // distributed branch below implements that by conjugating A in place and handing slate the
+    // transposed view, and least_squares_solve's serial shortcut does the same. This serial
+    // shortcut must match, or the flag would mean A X = B at one rank and A^H X = B at several
+    // (indistinguishable for a hermitian A, which every caller passes). Pinned at every rank
+    // count by `matrix_array_hermitian_solve_orientation` in tests/test_matrix_array_ops.cpp.
+    constexpr bool conj_transpose = hermitian and not dA_t::is_stride_order_Fortran();
+
+    // the factorized operand: A^H when conj_transpose, otherwise A as stored
+    auto solve_against = [&](auto&& Am) {
+      ::nda::basic_array<int, 1, ::nda::C_layout, 'A',
+          ::nda::heap<::nda::mem::get_addr_space<typename dA_t::Array_t>>> ipiv(Am.extent(0));
+      long info_ = ::nda::lapack::getrf(Am,ipiv);
+      if( info_ != 0 ) {
+        app_warning(" serial lu_solve: getrf info != 0 , info:{}",info_);
+        return info_;
       }
+
+      if constexpr(dB_t::is_stride_order_Fortran()) {
+        info_ = ::nda::lapack::getrs(Am,Bl,ipiv);
+      } else {
+        if constexpr ( ::nda::mem::get_addr_space<typename dA_t::Array_t> == ::nda::mem::Host ) {
+          ::nda::basic_array<value_type, 2, ::nda::F_layout, 'A',
+              ::nda::heap<::nda::mem::get_addr_space<typename dB_t::Array_t>>> Bf(Bl);
+          info_ = ::nda::lapack::getrs(Am,Bf,ipiv);
+          Bl = Bf;
+        } else {
+          ::nda::basic_array<value_type, 2, ::nda::F_layout, 'A',
+              ::nda::heap<::nda::mem::get_addr_space<typename dB_t::Array_t>>> Bf(Bl.shape());
+          // since it is not clear if tensor backend will always accept mixed layouts,
+          // I'm creating a view to the transposed array
+          using layout_t = typename ::nda::F_stride_layout::template mapping<2>;
+          layout_t idx_{std::array<long,2>{Bl.extent(1),Bl.extent(0)},
+              std::array<long,2>{Bl.strides()[1],Bl.strides()[0]}};
+          ::nda::basic_array_view<value_type, 2, ::nda::F_stride_layout, 'A',
+              ::nda::default_accessor,
+              ::nda::borrowed<::nda::mem::get_addr_space<typename dB_t::Array_t>>>
+              Bl_f(idx_,Bl.data());
+          ::nda::tensor::add(value_type(1.0),Bl_f,"ij",value_type(0.0),Bf,"ji");
+          info_ = ::nda::lapack::getrs(Am,Bf,ipiv);
+          ::nda::tensor::add(value_type(1.0),Bf,"ij",value_type(0.0),Bl_f,"ji");
+        }
+      }
+      if( info_ != 0 )
+        app_warning(" serial lu_solve: getrs info != 0 , info:{}",info_);
+      return info_;
+    };
+
+    if constexpr (conj_transpose) {
+      // conj(A) seen through the transposed view is conj(A)^T = A^H, matching the
+      // distributed branch. Destructive in A, exactly as that branch is.
+      ::nda::tensor::scale(value_type(1.0),Al,::nda::tensor::op::CONJ);
+      info = solve_against(::nda::transpose(Al));
+    } else {
+      info = solve_against(Al);
     }
-    if( info != 0 )
-      app_warning(" serial lu_solve: getri info != 0 , info:{}",info); 
     return info;
   }
 
   constexpr bool _dev_ = ::nda::mem::have_device_compatible_addr_space<
 							 typename dA_t::Array_t,
                              typename dB_t::Array_t>;
+  detail::slate_thread_guard(A.communicator()->size(), "lu_solve");
 #if defined(ENABLE_SLATE)
 
   auto slate_lu = [&](auto &a, auto &b) {
@@ -287,6 +374,7 @@ long least_squares_solve(DistributedMatrix auto&& A, DistributedMatrix auto&& B)
 
   } // constexpr (not _dev_)
 
+  detail::slate_thread_guard(A.communicator()->size(), "least_squares_solve");
 #if defined(ENABLE_SLATE)
 
   auto slate_ls = [&](auto &a, auto &b) {
@@ -374,35 +462,41 @@ void inverse(DistributedMatrix auto&& A)
     return;
   }
 
+  detail::slate_thread_guard(A.communicator()->size(), "inverse");
 #if defined(ENABLE_SLATE)
 
   auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
   if constexpr (::nda::mem::on_host<local_Array_t>) {
+    slate::Options const opts = {
+#if defined(USE_SLATE_HOSTBATCH)
+	{ slate::Option::Target, slate::Target::HostBatch }
+#endif
+	};
     slate::Pivots pivots;
-    long info = slate::getrf ( As , pivots
-#if defined(USE_SLATE_HOSTBATCH)
-	,{ { slate::Option::Target, slate::Target::HostBatch} }
-#endif
-	);
+    long info = slate::getrf ( As , pivots, opts );
     utils::check(info == 0, "inverse: getrf info: {}.", info);
-    slate::getri ( As , pivots 
-#if defined(USE_SLATE_HOSTBATCH)
-	,{ { slate::Option::Target, slate::Target::HostBatch} }
-    utils::check(info == 0, "inverse: getri info: {}.", info);
-#endif
-	);
+    // slate::getri returns void; there is no info to check.
+    slate::getri ( As , pivots, opts );
   } else {
+    slate::Options const opts = {
+        // Set execution target to GPU Devices
+        { slate::Option::Target, slate::Target::Devices },
+        { slate::Option::Lookahead, 1 }};
     slate::Pivots pivots ;
-    long info = slate::getrf ( As , pivots, 
-        // Set execution target to GPU Devices
-        {{ slate::Option::Target, slate::Target::Devices },
-        { slate::Option::Lookahead, 1 }});
+    long info = slate::getrf ( As , pivots, opts );
     utils::check(info == 0, "inverse: getrf info: {}.", info);
-    info = slate::getri ( As , pivots,
-        // Set execution target to GPU Devices
-        {{ slate::Option::Target, slate::Target::Devices },
-        { slate::Option::Lookahead, 1 }} );
-    utils::check(info == 0, "inverse: getri info: {}.", info);
+    // The in-place slate::getri does NOT run on the GPU whatever Target is asked for:
+    // every internal op in impl::getri is hardcoded to Target::HostTask, and it reaches
+    // tiles through A(i,j) == at(i,j,HostNum), which does not exist for a device-resident
+    // matrix. Slate says so itself ("This routine is in-place and does not support GPUs.
+    // There is another one (out-of-place) that does"). So use the out-of-place form,
+    // which is just set(I) + getrs -- both of which have real Target::Devices paths --
+    // and copy the result back over A. Bs mirrors As' distribution exactly (emptyLike)
+    // and slate allocates its tiles from its own device pool.
+    auto Bs = As.emptyLike();
+    Bs.insertLocalTiles( slate::Target::Devices );
+    slate::getri ( As , pivots, Bs, opts );  // Bs = As^{-1}; As keeps its LU factors
+    slate::copy ( Bs, As, opts );            // back into the caller's device memory
   }
 #else
   utils::check(false, "inverse: requires SLATE, compile with ENABLE_SLATE.");
@@ -424,6 +518,7 @@ auto determinant(DistributedMatrix auto&&A, std::vector<std::pair<long,long>> &d
     }
   }
 
+  detail::slate_thread_guard(A.communicator()->size(), "determinant");
 #if defined(ENABLE_SLATE)
   if constexpr (::nda::mem::on_host<local_Array_t>) {
     auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
@@ -477,6 +572,7 @@ void cholesky(DistributedMatrix auto&& A, char UPLO = "L")
     return;
   }
 
+  detail::slate_thread_guard(A.communicator()->size(), "cholesky");
 #if defined(ENABLE_SLATE)
 
   auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
@@ -541,6 +637,7 @@ auto multiply_impl(T a, A_t&& A, B_t&& B, T b, C_t&& C)
     return std::forward<C_t>(C);
   }
 
+  detail::slate_thread_guard(C.communicator()->size(), "multiply");
 #if defined(ENABLE_SLATE)
   // C is fixed
   auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);

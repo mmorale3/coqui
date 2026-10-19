@@ -128,6 +128,8 @@ namespace methods {
 
 
   // useful routine for unit_tests, etc
+  // chol_tie_rtol defaults to 0 (legacy argmax pivots) here, unlike the thc input default (1e-6): the stored
+  // test references were built with the legacy point set, and capped-Np fixtures move by ~1 meV with the set.
   inline ptree make_thc_ptree(double ecut = 0.0,
       int chol_block_size = 8,
       int matrix_block_size = 1024,
@@ -135,7 +137,8 @@ namespace methods {
       int r_blk = 1,
       double distr_tol = 0.2,
       double memory_frac = 0.75,
-      bool use_least_squares = false)
+      bool use_least_squares = false,
+      double chol_tie_rtol = 0.0)
   {
     ptree pt;
     auto err = std::string("make_thc_ptree - Incorrect input - ");
@@ -150,7 +153,8 @@ namespace methods {
     pt.put("distr_tol", distr_tol);
     pt.put("memory_frac", memory_frac);
     pt.put("use_least_squares", use_least_squares);
-    
+    pt.put("chol_tie_rtol", chol_tie_rtol);
+
     return pt;
   }
 
@@ -169,7 +173,8 @@ namespace methods {
       bool use_least_squares = false,
       nda::range x_range = nda::range{-1,-1},
       nda::range y_range = nda::range{-1,-1},
-      std::string compute = "cpu")
+      std::string compute = "cpu",
+      double chol_tie_rtol = 0.0)
   {
     auto err = std::string("make_thc_reader_ptree - Incorrect input - ");
     utils::check( nIpts>0 or thresh>0.0, err+"Must set nIpts and/or thresh");
@@ -179,7 +184,8 @@ namespace methods {
     utils::check(r_blk > 0, err+"Invalid r_blk:{}",r_blk);
     utils::check(chol_block_size > 0, err+"Invalid chol_block_size:{}",chol_block_size);
 
-    ptree pt = make_thc_ptree(ecut,chol_block_size,matrix_block_size,thresh,r_blk,distr_tol,memory_frac,use_least_squares);
+    ptree pt = make_thc_ptree(ecut,chol_block_size,matrix_block_size,thresh,r_blk,distr_tol,memory_frac,use_least_squares,
+                              chol_tie_rtol);
 
     pt.put("nIpts", nIpts);
     pt.put("storage", storage);

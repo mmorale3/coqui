@@ -23,6 +23,10 @@
 #include <vector>
 #include <stdexcept>
 #include <stack>
+#include <cstdlib>       // getenv: the COQUI_MPI_THREAD_MULTIPLE init knob
+#include <cctype>
+#include <optional>
+#include <string>
 #include "cxxopts.hpp"
 #include "configuration.hpp"
 #include "IO/AppAbort.hpp"
@@ -32,6 +36,9 @@
 #include "mpi3/environment.hpp"
 #include "mpi3/communicator.hpp"
 #include "utilities/mpi_context.h"
+#include "utilities/blas_threads.hpp"
+#include "utilities/omp_threads.hpp"
+#include "arch/arch.h"
 
 #include "mean_field/MF.hpp"
 #include "mean_field/mf_utils.hpp"
@@ -45,14 +52,72 @@
 
 namespace mpi3 = boost::mpi3;
 
+#if defined(ENABLE_FFTW)
+// Defined in numerics/fft/fftw.cpp. Forward-declared rather than included so main.cpp does not need
+// fftw3.h on its include path.
+namespace math::fft::impl::host { void init_threads(long nthreads); }
+#endif
+
 template<MEMORY_SPACE MEM>
 void run(mpi3::communicator & comm, InputParser &parser);
 
 /** @file main.cpp
  */
+/** The MPI thread level has to be chosen at MPI_Init, which happens BEFORE any TOML is
+ *  parsed -- so the knob is an ENVIRONMENT variable. Threaded SLATE (any slate_ops path with
+ *  OMP_NUM_THREADS > 1) issues concurrent MPI calls from its OpenMP tasks and can segfault
+ *  inside the MPI transport (e.g. UCX) without MPI_THREAD_MULTIPLE. */
+/// Tri-state environment flag: +1 = explicitly on, 0 = explicitly off, -1 = unset.
+static int coqui_env_flag(const char *name) {
+  const char *v = std::getenv(name);
+  if (v == nullptr) return -1;
+  std::string s(v);
+  for (auto &c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+  if (s == "1" or s == "true" or s == "yes" or s == "on") return 1;
+  if (s == "0" or s == "false" or s == "no" or s == "off") return 0;
+  return -1;
+}
+
+/// OMP_NUM_THREADS as the OpenMP runtime will read it; 1 when unset or unparseable.
+static long coqui_omp_threads_env() {
+  if (const char *e = std::getenv("OMP_NUM_THREADS")) {
+    const long v = std::atol(e);
+    if (v > 0) return v;
+  }
+  return 1;
+}
+
+/** THREAD-LEVEL POLICY.
+ *
+ *  MPI_THREAD_MULTIPLE is requested when a code path will actually need it, i.e. whenever
+ *  OMP_NUM_THREADS > 1 -- exactly the condition under which SLATE's task layer goes parallel
+ *  and issues MPI calls from worker threads. Its locking overhead is negligible at one
+ *  thread and small on SLATE-dense paths, but not zero, so the request stays conditional.
+ *
+ *  Deliberately NOT triggered by `blas_threads`: BLAS-only threading makes no MPI calls,
+ *  so it neither needs nor pays for MULTIPLE. That is the recommended recipe
+ *  (OMP_NUM_THREADS=1 + blas_threads=N) and it keeps the thread-single init.
+ *
+ *  The env knob is TRI-STATE:
+ *    unset  => auto (MULTIPLE iff OMP_NUM_THREADS > 1)   <- the safe default
+ *    =1     => force MULTIPLE even at OMP_NUM_THREADS = 1
+ *    =0     => force thread-single even at OMP_NUM_THREADS > 1
+ *  The explicit-off state lets a test reach the unsupported configuration deliberately (to
+ *  check slate_ops' guard), and lets a site whose MPI has a pathological MULTIPLE
+ *  implementation opt out knowingly. slate_ops' guard turns that configuration into a loud
+ *  abort at the first distributed solve instead of a crash inside MPI. */
+static bool coqui_want_thread_multiple() {
+  const int knob = coqui_env_flag("COQUI_MPI_THREAD_MULTIPLE");
+  if (knob >= 0) return knob == 1;             // explicit on/off both honoured
+  return coqui_omp_threads_env() > 1;          // unset: auto
+}
+
 int main(int argc, char** argv)
 {
-  mpi3::environment env(argc, argv);
+  const bool want_thread_multiple = coqui_want_thread_multiple();
+  std::optional<mpi3::environment> env_;
+  if (want_thread_multiple) env_.emplace(argc, argv, mpi3::thread_level::multiple);
+  else                      env_.emplace(argc, argv);
   auto world = mpi3::environment::get_world_instance();
   bool root(world.root());
 
@@ -129,6 +194,11 @@ int main(int argc, char** argv)
   // setup output loggers
   setup_loggers(world.root(), output_level, debug_level);
 
+  // Bind each MPI rank to its own GPU (calls cudaSetDevice based on
+  // node-local rank). Without this, all ranks on a node default to
+  // device 0, accumulating their allocations on a single GPU.
+  arch::init(world.root(), output_level, debug_level);
+
   std::string welcome(
       std::string("\n ---------------------------------\n") +
                   "     ____ ___   ___  _   _ ___ \n" +
@@ -140,6 +210,35 @@ int main(int argc, char** argv)
                   " |  Correlated Quantum Interface  |\n" +
                   "  --------------------------------");
   app_log(1, welcome);
+  // Every run states the MPI thread support it actually got, so a threaded SLATE
+  // configuration reports its own support instead of assuming it. Scalars only -- some
+  // bundled fmt versions cannot format containers or enums.
+  app_log(2, "  MPI thread level: requested {} (COQUI_MPI_THREAD_MULTIPLE = {}, where "
+             "-1 = unset/auto, OMP_NUM_THREADS = {}), provided {} (MPI_THREAD_MULTIPLE = "
+             "{}, MPI_THREAD_SINGLE = {})",
+          static_cast<int>(want_thread_multiple ? mpi3::thread_level::multiple
+                                                : mpi3::thread_level::single),
+          coqui_env_flag("COQUI_MPI_THREAD_MULTIPLE"),
+          coqui_omp_threads_env(),
+          static_cast<int>(mpi3::environment::thread_support()),
+          static_cast<int>(mpi3::thread_level::multiple),
+          static_cast<int>(mpi3::thread_level::single));
+  // If OMP > 1 forced the MULTIPLE request but the MPI library could not provide it, say so
+  // HERE -- slate_ops' guard will abort at the first distributed solve, and this line is
+  // what explains why.
+  // Root-only: app_warning is not rank-gated, and every rank reaches this check.
+  if (root and coqui_omp_threads_env() > 1 and
+      static_cast<int>(mpi3::environment::thread_support()) <
+          static_cast<int>(mpi3::thread_level::multiple)) {
+    app_warning("OMP_NUM_THREADS = {} was requested, so MPI_THREAD_MULTIPLE was asked for, "
+                "but this MPI provides only level {}. SLATE's OpenMP tasks issue concurrent "
+                "MPI calls, so any distributed linear-algebra call will now ABORT rather "
+                "than segfault. Run with OMP_NUM_THREADS=1 and set blas_threads in the "
+                "TOML instead -- that is the recommended recipe and needs no MPI thread "
+                "support.",
+                coqui_omp_threads_env(),
+                static_cast<int>(mpi3::environment::thread_support()));
+  }
 
   // !!!! assume a single input for now
   std::string myinput = inputs[0];
@@ -152,7 +251,30 @@ int main(int argc, char** argv)
     exit(1);	
   }
 
-  // dispatch based on compute 
+  // The `blas_threads` knob. It is read HERE -- top level of the input, before any calculation block runs --
+  // for two reasons: it is genuinely global (there is one BLAS layer per process, not one
+  // per solver), and the THC/ISDF build is one of the phases it pays for, which happens
+  // before any solver block is entered. Absent or 0 => the BLAS thread count is left
+  // untouched.
+  utils::set_blas_threads(
+      io::get_value_with_default<long>(parser.get_root(), "blas_threads", 0l));
+
+  // The `omp_threads` knob. Read at the same place and for the same two reasons as
+  // blas_threads -- it is a per-process setting, and the THC/ISDF build (which FFTW's plan
+  // thread count below belongs to) runs before any solver block is entered. Absent or <= 1
+  // => every omp_threads-gated region takes its serial path. NOTE: this deliberately never
+  // touches OMP_NUM_THREADS.
+  utils::set_omp_threads(
+      io::get_value_with_default<long>(parser.get_root(), "omp_threads", 1l));
+
+#if defined(ENABLE_FFTW)
+  // FFTW's threaded double library (find_package(FFTW ... DOUBLE_OPENMP_LIB)) is linked and
+  // initialized here; the plan thread count comes from the SAME omp_threads knob, so FFTW
+  // never reads the OpenMP environment. One-shot, before any plan is created.
+  math::fft::impl::host::init_threads(utils::omp_threads());
+#endif
+
+  // dispatch based on compute
   if(compute == "default") {
     run<DEFAULT_MEMORY_SPACE>(world,parser);
   } else if(compute == "cpu") { 
@@ -259,10 +381,10 @@ void run(mpi3::communicator &comm, InputParser &parser)
         // consistent eri for all
         if (eri_type == "thc") {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(chol_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         }
 
       } else if (hf_eri_type!="") {
@@ -270,16 +392,16 @@ void run(mpi3::communicator &comm, InputParser &parser)
         // separate eri for hf and post-hf
         if (hf_eri_type=="thc" and eri_type=="thc") {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(thc_list[hf_eri_name]), *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else if (hf_eri_type=="thc" and eri_type=="cholesky") {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(thc_list[hf_eri_name]), *std::get<1>(chol_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else if (hf_eri_type=="cholesky" and eri_type=="thc") {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(chol_list[hf_eri_name]), *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(chol_list[hf_eri_name]), *std::get<1>(chol_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         }
 
       } else if (hartree_eri_type!="" and exchange_eri_type!="") {
@@ -290,25 +412,25 @@ void run(mpi3::communicator &comm, InputParser &parser)
               *std::get<1>(thc_list[hartree_eri_name]),
               *std::get<1>(thc_list[exchange_eri_name]),
               *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else if (hartree_eri_type=="cholesky" and exchange_eri_type=="thc" and eri_type=="thc") {
           auto mb_eri = methods::mb_eri_t(
               *std::get<1>(chol_list[hartree_eri_name]),
               *std::get<1>(thc_list[exchange_eri_name]),
               *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else if (hartree_eri_type=="thc" and exchange_eri_type=="cholesky" and eri_type=="thc") {
           auto mb_eri = methods::mb_eri_t(
               *std::get<1>(thc_list[hartree_eri_name]),
               *std::get<1>(chol_list[exchange_eri_name]),
               *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else if (hartree_eri_type=="cholesky" and exchange_eri_type=="cholesky" and eri_type=="thc") {
           auto mb_eri = methods::mb_eri_t(
               *std::get<1>(chol_list[hartree_eri_name]),
               *std::get<1>(chol_list[exchange_eri_name]),
               *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else {
           APP_ABORT("main::run: Unrecognized interaction setup for mbpt. "
                     "hf_eri_type = {}, hartree_eri_type = {}, exchange_eri_type = {}, eri_type = {}",
@@ -362,7 +484,8 @@ void run(mpi3::communicator &comm, InputParser &parser)
 
     } else if (cname == "ac" or cname == "unfold_bz"
                or cname == "band_interpolation" or cname == "spectral_interpolation" or cname == "local_dos"
-               or cname == "dump_vxc" or cname == "dump_hartree") { // more pproc options would be added.
+               or cname == "dump_vxc" or cname == "dump_hartree"
+               or cname == "cvv_eps" or cname == "qp_gaps") { // more pproc options would be added.
 
       ptree pt = it.second;
       auto mf_name = mf::get_mf(mpi_context, pt, mf_list);
@@ -465,16 +588,26 @@ void run(mpi3::communicator &comm, InputParser &parser)
         } else if (wann_type == "mlwf_h5") {
           auto mf_name = mf::get_mf(mpi_context, wann_pt, mf_list);
           wannier::mlwf_h5_from_wannier90_output(*mf_list[mf_name], wann_pt);
+        } else if (wann_type == "projection") {
+          auto mf_name = mf::get_mf(mpi_context, wann_pt, mf_list);
+          wannier::projected_wannier(*mf_list[mf_name], wann_pt);
         } else
           APP_ABORT("Error: Invalid wannier90 type: {}",wann_type);
       }
       mpi_context->comm.barrier();
 
+    } else if (cname == "blas_threads" or cname == "omp_threads") {
+
+      // Global run settings, not calculation blocks: consumed in main() before dispatch
+      // (see blas_threads / omp_threads above). Named here only so they do not
+      // trip the unknown-block abort. THIS IS THE SECOND OF THE TWO PARSE SITES -- a new
+      // top-level key must be added both where it is read (main(), above) and here.
+
     } else {
 
       app_error("unknown calculation type: {} \n",cname.c_str());
       mpi3::environment::finalize();
-      exit(1);	
+      exit(1);
 
     }
   } 

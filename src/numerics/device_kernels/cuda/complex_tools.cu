@@ -48,7 +48,7 @@ void zero_imag_impl(Arr & A)
     auto f = [=] __device__(long i) {
       A_d(i) = cuda::std::complex<double>{A_d(i).real(),0.0};  
     };
-    cub::DeviceFor::Bulk(N,f);
+    check_launch(cub::DeviceFor::Bulk(N,f), "complex_tools");
   } else if constexpr (rank==2) {
     long nc = A.extent(1);
     auto f = [=] __device__(long i) {
@@ -56,7 +56,7 @@ void zero_imag_impl(Arr & A)
       long a = i - b*nc;
       A_d(a,b) = cuda::std::complex<double>{A_d(a,b).real(),0.0};
     };
-    cub::DeviceFor::Bulk(N,f);
+    check_launch(cub::DeviceFor::Bulk(N,f), "complex_tools");
   } else if constexpr (rank==3) {
     long n1 = A.extent(1);
     long n2 = A.extent(2);
@@ -67,7 +67,7 @@ void zero_imag_impl(Arr & A)
       long c = i - i_*n2;
       A_d(a,b,c) = cuda::std::complex<double>{A_d(a,b,c).real(),0.0};
     };
-    cub::DeviceFor::Bulk(N,f);
+    check_launch(cub::DeviceFor::Bulk(N,f), "complex_tools");
   }
   
 }

@@ -43,7 +43,44 @@ def convert_gw_edmft_params(gw_edmft_params: dict):
         raise ValueError("'gw_iter_per_loop' must be a non-negative integer.")
     if not isinstance(edmft_iter_per_loop, int) or edmft_iter_per_loop < 0:
         raise ValueError("'edmft_iter_per_loop' must be a non-negative integer.")
-    if edmft_iter_per_loop == 0 and gw_iter_per_loop == 1:
+
+    # Lattice-stage selector. "gw": coqui.run_gw inside every GW+EDMFT cycle;
+    # "qpgw": a qpGW+BSE lattice stage producing a quasiparticle H_eff.
+    lattice_solver = gw_edmft_group.get('lattice_solver', 'gw')
+    if lattice_solver not in {'gw', 'qpgw'}:
+        raise ValueError(
+            f"'lattice_solver' must be one of \"gw\", \"qpgw\" (got {lattice_solver!r})."
+        )
+    gw_edmft_params['lattice_solver'] = lattice_solver
+    if lattice_solver == 'qpgw' and edmft_iter_per_loop == 0:
+        raise ValueError(
+            "lattice_solver=\"qpgw\" runs the qpGW+BSE lattice stage ONCE before the "
+            "outer loop (frozen H_eff, outer_loop=\"option1\"). With 'edmft_iter_per_loop' = 0 the "
+            "workflow would do nothing afterwards; set 'edmft_iter_per_loop' >= 1."
+        )
+
+    # Outer-loop selector (lattice_solver="qpgw" only).
+    # "option1": the qpGW stage runs once before the outer loop and H_eff stays frozen.
+    # "option2": H_eff is re-derived from Sigma^GW[G_latt, W_corr] EVERY outer cycle.
+    outer_loop = gw_edmft_group.get('outer_loop', 'option1')
+    if outer_loop not in {'option1', 'option2'}:
+        raise ValueError(
+            f"'outer_loop' must be one of \"option1\", \"option2\" (got {outer_loop!r})."
+        )
+    if outer_loop == 'option2' and lattice_solver != 'qpgw':
+        raise ValueError(
+            "outer_loop=\"option2\" re-derives H_eff from the qpGW lattice stage every "
+            f"cycle and therefore requires lattice_solver=\"qpgw\" (got {lattice_solver!r})."
+        )
+    gw_edmft_params['outer_loop'] = outer_loop
+    # Number of qp iterations of the per-cycle "option2" lattice stage. 1 = a single
+    # re-QP step per cycle; the outer loop supplies the outer iteration.
+    outer_qpgw_niter = gw_edmft_group.get('outer_qpgw_niter', 1)
+    if not isinstance(outer_qpgw_niter, int) or outer_qpgw_niter < 1:
+        raise ValueError("'outer_qpgw_niter' must be a positive integer.")
+    gw_edmft_params['outer_qpgw_niter'] = outer_qpgw_niter
+
+    if lattice_solver == 'gw' and edmft_iter_per_loop == 0 and gw_iter_per_loop == 1:
         # Current GW+EDMFT SC logic does not upfold the GW solution and write new `embed` data 
         # if `gw_iter_per_loop` is 1 in order to save some memory in the checkpoint hdf5. 
         # Here, we swap `niter` and `gw_iter_per_loop` to make sure `embed` data is updated in the checkpoint.  
@@ -91,16 +128,50 @@ def convert_gw_edmft_params(gw_edmft_params: dict):
     edmft_iter_params['mix_in_first_iter'] = edmft_mix_in_first_iter
 
     # GW parameters
-    if gw_iter_per_loop > 0:
-        gw_edmft_params['gw'] = { 
-            'outdir': outdir, 
+    if lattice_solver == 'gw' and gw_iter_per_loop > 0:
+        gw_edmft_params['gw'] = {
+            'outdir': outdir,
             'prefix': prefix,
-            'restart': True, 
+            'restart': True,
             'screen_type': screen_type,
             'niter': 1,
             'div_treatment': div_treatment,
             'iter_alg': gw_iter_params
         }
+
+    # qpGW lattice-stage parameters. The input's 'qpgw' section carries the qp/mode-A
+    # and BSE (pol_vertex_*) knobs and wins over the defaults derived from the
+    # top-level settings.
+    if lattice_solver == 'qpgw':
+        if screen_type not in {'rpa', 'gw_edmft'}:
+            raise ValueError(
+                f"lattice_solver=\"qpgw\" supports screen_type in {{\"rpa\", \"gw_edmft\"}} "
+                f"(got {screen_type!r}); the qpGW lattice stage accepts no other "
+                f"screening type."
+            )
+        qpgw_params = {
+            'outdir': outdir,
+            'prefix': prefix,
+            'restart': True,
+            'screen_type': screen_type,
+            # Unlike the per-cycle 'gw' block (niter=1, repeated every cycle), the frozen
+            # qpGW stage runs ONCE and must reach ITS OWN qp fixed point here -- a default
+            # of 1 would freeze a single-iteration (G0W0-class) H_eff silently.
+            'niter': 10,
+            'div_treatment': div_treatment,
+            'iter_alg': gw_iter_params
+        }
+        if outer_loop == 'option2':
+            # The stage runs INSIDE every outer cycle, so it takes `outer_qpgw_niter` qp
+            # iterations per cycle (default 1 = a single re-QP step) instead of running
+            # once to its own fixed point. The outer H_eff damping IS the qp loop's own
+            # iter_alg mixing against the checkpointed H_eff. Near a metal-insulator
+            # transition a conservative mixing is advisable; gw_iter_params carries the
+            # workflow default mixing = 0.3, overridable through 'iter_alg' (gw_mixing)
+            # or the 'qpgw' section below.
+            qpgw_params['niter'] = outer_qpgw_niter
+        qpgw_params.update(deepcopy(gw_edmft_group.get('qpgw', {})))
+        gw_edmft_params['qpgw'] = qpgw_params
 
     # wloc parameters
     gw_edmft_params['wloc'] = {'outdir': outdir, 'prefix': prefix, 'screen_type': screen_type, 
@@ -299,7 +370,7 @@ def _write_impurity_results(h5_grp, impurity_results):
     # ----- optional keys (raw numpy arrays on IR mesh) -----
     # "_data" appendices imply raw numpy arrays on IR mesh
     optional_keys = [
-        'gf_struct', 'mu_imp', 'convergence', 'density',
+        'gf_struct', 'mu_imp', 'convergence', 'causality', 'density',
         'G_iw_data', 'Sigma_iw_data',
         'Pi_iw_data', 'W_iw_data',
         'Sigma_infty_dc', 'Sigma_iw_dc_data', 'Pi_iw_dc_data'

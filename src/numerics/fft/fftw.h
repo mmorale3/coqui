@@ -27,8 +27,19 @@
 #include "configuration.hpp"
 #include "numerics/fft/fft_define.hpp"
 
-namespace math::fft::impl::host 
+namespace math::fft::impl::host
 {
+
+/**
+ * One-shot FFTW threading setup: calls fftw_init_threads() and fftw_plan_with_nthreads().
+ * Requires a threaded FFTW to be linked (see src/numerics/fft/CMakeLists.txt).
+ *
+ * `nthreads` comes from the `omp_threads` TOML knob, NOT from the OpenMP environment:
+ * fftw_plan_with_nthreads is a planner setting, so it must be called before any plan is
+ * created (main() does, right after the knob is read). `nthreads <= 1` is a no-op and
+ * keeps the serial planner (the default).
+ */
+void init_threads(long nthreads);
 
 // batched FFT interface
 fftplan_t create_plan_many_impl_(int rank, const int *n, int howmany,

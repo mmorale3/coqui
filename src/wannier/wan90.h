@@ -165,5 +165,42 @@ namespace wannier {
    */
   void mlwf_h5_from_wannier90_output(mf::MF &mf, ptree &pt);
 
+  /**
+   * Projection-only Wannier functions: U(k) = A_w(k) [A_w(k)^dag A_w(k)]^{-1/2}, with
+   * A_w(k)(n, m) = f(e_nk) <psi_nk | g_m> the energy-weighted projections of the Bloch orbitals of a band range
+   * on a set of trial orbitals g_m (hydrogenic functions at arbitrary centres, wannier90 conventions).
+   * No localisation or disentanglement iterations and no wannier90 library: the subspace is a k-local function of
+   * the trial orbitals, the same on every k-mesh. On a symmetry-reduced mean field the projections at the image
+   * k-points use the mean field's own (rotated) orbitals, so the result is symmetry covariant whenever the trial
+   * orbitals form a set closed under the symmetry operations of the mean field; this is measured and enforced
+   * (covariance_tol).
+   *
+   * @param mf - [INPUT] mean-field instance
+   * @param pt - [INPUT] property tree with input options
+   *
+   * Input options:
+   * Required:
+   *  - prefix                     [string] Output file name prefix.
+   *  - band_range                 [int array] [first, last): 0-based contiguous band range to project from.
+   *  - projections                [string array] One string per trial orbital, either
+   *                                 "cx cy cz l mr r zona"                       (default axes), or
+   *                                 "cx cy cz l mr r zx zy zz xx xy xz zona"     (the wannier90 nnkp layout);
+   *                                 centre in crystal coordinates, zona in inverse bohr.
+   * Optional:
+   *  - outdir = "./"              [string] Output directory.
+   *  - weight = "erfc"            [string] Energy weight on the band eigenvalues: "erfc", "gaussian" or "none".
+   *  - mu, sigma                  [double] Centre and width of the weight (required unless weight = "none").
+   *  - units = "ev"               [string] Units of mu and sigma: "ev", "ry" or "bohr" (Hartree).
+   *  - frozen_range               [int array] [first, last): bands kept EXACTLY in the subspace (e.g. an isolated
+   *                                 valence group); the remaining directions are the dominant ones of the weighted
+   *                                 projections on the other bands. The range must not cut a degenerate set.
+   *  - covariance_tol = 1e-6      [double] Abort when the symmetry leakage or unitarity defect of the projector
+   *                                 exceeds this value on a symmetry-reduced mesh (<= 0: report only).
+   *  - h5_filename                [string] Output HDF5 filename. Default: outdir/prefix.mlwf.h5
+   *  - dset_name, shells.*        as in mlwf_h5_from_wannier90_output.
+   *  - r0, rN, nr                 radial grid of the spherical Bessel transform of the trial orbitals.
+   */
+  void projected_wannier(mf::MF &mf, ptree &pt);
+
 }
 #endif

@@ -4,12 +4,14 @@
 if(ENABLE_CUDA)
  
   set(DEV_KERNEL_SRCS
-    argmax_min.cu 
+    argmax_min.cu
+    copy_cast.cu
     copy_select.cu
     complex_tools.cu
     symmetry_tools.cu
     potentials.cu
     kpoint_tools.cu
+    gw_tools.cu
   )
 
   foreach( X ${DEV_KERNEL_SRCS} )

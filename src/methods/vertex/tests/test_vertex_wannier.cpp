@@ -1,0 +1,463 @@
+/**
+ * ==========================================================================
+ * CoQuí: Correlated Quantum ínterface
+ *
+ * Copyright (c) 2022-2026 Simons Foundation & The CoQuí developer team
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==========================================================================
+ */
+
+/**
+ * ISDF-Vertex: Wannier-projector generalization of the subspace C. The vertex
+ * functional is a general-projector theory (Phi_2^C = Phi_2^x[PGP, W],
+ * P = U U^dag); this test exercises the Wannier-mode input substitutions
+ * X(:,C) -> X.U, G_CC -> U^dag G U, the Sigma^C injection and the rotated
+ * point selection.
+ *
+ * The subspace is installed through vertex_t::set_wannier_projector, fed a
+ * synthetic projector_t (in-memory constructor). Checks:
+ *   1. Degenerate U: U = the 0/1 window isometry (identity block) in Wannier
+ *      mode reproduces window mode to machine rounding (the gemm path vs the
+ *      slice path; the theory reduces exactly).
+ *   2. Gauge invariance: U -> U V, V a fixed M x M unitary (k-independent and
+ *      k-dependent), leaves all observables invariant (Phi depends on range(P)
+ *      only); any conj/transpose misplacement in the substitutions shows up at
+ *      O(1).
+ *   3. A non-trivial Wannier C (a genuine unitary mix of the window bands) runs
+ *      end-to-end and shifts e_corr from the full-window result: the subspace
+ *      actually acts, and the secondary (rotated selection) path agrees with the
+ *      global path.
+ *   4. Loewdin isometry: a non-orthonormal raw U is repaired (defect logged),
+ *      and the Loewdin result is gauge-equivalent to an orthonormal input.
+ *   5. The static rungs (B-S / B-L) satisfy checks 1 and 2.
+ *   6. A symmetry-closed Wannier C (SrVO3 t2g) has no symmetry leakage.
+ */
+
+#undef NDEBUG
+
+#include <array>
+#include <cmath>
+#include <complex>
+#include <functional>
+#include <random>
+#include <vector>
+
+#include "catch2/catch.hpp"
+
+#include "mpi3/environment.hpp"
+#include "mpi3/communicator.hpp"
+
+#include "nda/nda.hpp"
+#include "nda/linalg/eigenelements.hpp"
+
+#include "utilities/test_common.hpp"
+#include "methods/tests/test_common.hpp"
+#include "utilities/mpi_context.h"
+
+#include "numerics/imag_axes_ft/IAFT.hpp"
+#include "methods/vertex/vertex_pi.icc"
+
+#include "mean_field/default_MF.hpp"
+#include "methods/ERI/mb_eri_context.h"
+#include "methods/ERI/eri_utils.hpp"
+#include "methods/SCF/simple_dyson.h"
+#include "methods/SCF/scf_driver.hpp"
+#include "methods/embedding/projector_t.h"
+#include "methods/vertex/vertex_t.h"
+
+namespace bdft_tests {
+
+  using namespace methods;
+  using cplx = ComplexType;
+  static auto const r_all = nda::range::all;
+
+  namespace wan {
+
+    // A fixed M x M Haar-ish unitary from a deterministic seed (QR of a random
+    // complex Gaussian; the same on every rank because the seed is fixed).
+    inline nda::array<cplx, 2> random_unitary(long M, unsigned seed) {
+      std::mt19937 gen(seed);
+      std::normal_distribution<double> nd(0.0, 1.0);
+      nda::matrix<cplx> A(M, M);
+      for (long i = 0; i < M; ++i)
+        for (long j = 0; j < M; ++j) A(i, j) = cplx(nd(gen), nd(gen));
+      // Gram-Schmidt (columns) -> unitary Q
+      nda::matrix<cplx> Q(M, M);
+      Q() = cplx(0.0);
+      for (long j = 0; j < M; ++j) {
+        nda::array<cplx, 1> v = A(r_all, j);
+        for (long k = 0; k < j; ++k) {
+          cplx ip(0.0);
+          for (long i = 0; i < M; ++i) ip += std::conj(Q(i, k)) * v(i);
+          for (long i = 0; i < M; ++i) v(i) -= ip * Q(i, k);
+        }
+        double nrm = 0.0;
+        for (long i = 0; i < M; ++i) nrm += std::norm(v(i));
+        nrm = std::sqrt(nrm);
+        for (long i = 0; i < M; ++i) Q(i, j) = v(i) / nrm;
+      }
+      return Q;
+    }
+
+    // Build a synthetic projector_t whose proj_mat columns span the window
+    // [W0, W0+M) rotated by V (per k if k_dependent). proj_mat convention:
+    // _C_skIai(s,k,0,a,i) = C_{a,i}; U_{i,a} = conj(C_{a,i}). For the Wannier
+    // orbital |w_a> = sum_{i in window} R_{i,a} |psi_{W0+i}> we set C_{a,i} =
+    // conj(R_{i,a}), i.e. proj row a = conj of column a of R. R = V (or V(k)).
+    // A raw (non-orthonormal) R is allowed (Loewdin test): scale one column.
+    inline projector_t make_projector(mf::MF& mf, long W0, long M, long nW,
+                                       nda::array<cplx, 2> const* Vk0,
+                                       bool k_dependent, double raw_scale = 1.0) {
+      const long nk = mf.nkpts();
+      const long ns = mf.nspin();
+      nda::array<cplx, 5> C_ksIai(nk, ns, 1, M, nW);   // (nk, ns, nImp, M, nOrbs_W)
+      C_ksIai() = cplx(0.0);
+      for (long ik = 0; ik < nk; ++ik) {
+        nda::array<cplx, 2> R(nW, M);
+        R() = cplx(0.0);
+        if (Vk0 == nullptr) {
+          for (long a = 0; a < M; ++a) R(a, a) = cplx(1.0);   // identity block (M==nW)
+        } else {
+          auto V = k_dependent ? random_unitary(M, 4242u + unsigned(ik)) : *Vk0;
+          // embed the M x M rotation into the nW window rows (M <= nW): first M rows
+          for (long i = 0; i < M; ++i)
+            for (long a = 0; a < M; ++a) R(i, a) = V(i, a);
+        }
+        if (raw_scale != 1.0)
+          for (long i = 0; i < nW; ++i) R(i, 0) *= raw_scale;   // break orthonormality
+        for (long is = 0; is < ns; ++is)
+          for (long a = 0; a < M; ++a)
+            for (long i = 0; i < nW; ++i)
+              C_ksIai(ik, is, 0, a, i) = std::conj(R(i, a));
+      }
+      nda::array<long, 3> band_window(1, 1, 2);
+      band_window(0, 0, 0) = W0 + 1;        // 1-based first (ctor subtracts 1)
+      band_window(0, 0, 1) = W0 + nW;       // range(W0, W0+nW)
+      auto kpts_crys = nda::make_regular(mf.kpts_crystal());
+      return projector_t(mf, C_ksIai, band_window, kpts_crys,
+                         /*translate_home_cell*/ false, /*print_info*/ false);
+    }
+
+  } // namespace wan
+
+  // one scGW driver: n_iter, optional vertex; the projector (if any) installs a
+  // Wannier subspace through the production seam. rung selects the theory mode
+  // ("dynamic" default; "static" = B-S, "linear" = B-L). Returns (e_hf, e_corr).
+  template<typename MpiCtx, typename ProjFn>
+  std::pair<double, double> run_scgw(MpiCtx& mpi_context,
+                                     imag_axes_ft::IAFT& ft, std::string const& mf_name,
+                                     nda::range window, long n_iter, std::string const& isdf_mode,
+                                     ProjFn&& install_proj,
+                                     std::string const& rung = "dynamic",
+                                     std::function<void(solvers::vertex_t const&)> post = {}) {
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf_name));
+    thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
+                                               1e-10, mf->ecutrho(), 1, 1024));
+    auto eri = mb_eri_t(thc, thc);
+    // Unique checkpoint per call: with a fixed name, a failed run would leave a stale
+    // .mbpt.h5 that the next run's damping restart reads ("scf/iter1 does not exist").
+    // Unique names plus start-of-run cleanup make each run independent.
+    static long s_run_counter = 0;
+    std::string output = "coqui_vertex_wannier_" + std::to_string(s_run_counter++);
+    if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
+    mpi_context->comm.barrier();
+    solvers::hf_t hf;
+    solvers::gw_t gw(&ft, "ignore_g0", output);
+    solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+    simple_dyson dyson(mf.get(), &ft);
+    MBState mb_state(mpi_context, ft, output);
+    iter_scf::iter_scf_t iter_sol("damping");
+    // isdf_rank = -1 (auto = the full subspace pair rank ns*nk*M^2) adapts to M; a
+    // fixed rank (e.g. 32) would exceed N_pair for the rank-1 Wannier C (M=1 => N_pair=8)
+    // and abort in build_secondary_basis.
+    solvers::vertex_t vtx(&ft, window.size() > 0 ? "2nd_exchange" : "none", window,
+                          mf->nbnd(), "ignore_g0", isdf_mode, -1, 1e-8, -1.0, -1.0, rung);
+    if (vtx.enabled()) {
+      install_proj(vtx, *mf);
+      scr_eri.set_vertex(&vtx);
+      gw.set_vertex(&vtx);
+    }
+    auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                   solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                   n_iter, false, 1e-12, true);
+    if (post and vtx.enabled()) post(vtx);   // read post-run diagnostics (e.g. leakage)
+    mpi_context->comm.barrier();
+    if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
+    mpi_context->comm.barrier();
+    return {e_hf, e_corr};
+  }
+
+  TEST_CASE("vertex_wannier", "[methods][vertex][wannier]") {
+#ifndef ENABLE_DLR
+    SUCCEED("vertex_wannier skipped: build has ENABLE_DLR=OFF.");
+#else
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+
+    const long W0 = 1, M = 2, nW = 2;               // LiH-222 window [1,3), M = 2
+    const nda::range window(W0, W0 + nW);
+    const long n_iter = 2;
+    auto no_proj = [](solvers::vertex_t&, mf::MF&) {};
+
+    // ================= 1. DEGENERATE-U: Wannier(identity) == window ==================
+    // U = the 0/1 window isometry (identity block). Wannier mode must reproduce the
+    // window-mode result to machine rounding (the gemm path vs the slice path; the
+    // theory reduces exactly when P = the window indicator).
+    auto [ehf_win, ec_win] =
+        run_scgw(mpi_context, ft, "qe_lih222", window, n_iter, "global", no_proj);
+    auto install_identity = [&](solvers::vertex_t& v, mf::MF& mf) {
+      auto proj = wan::make_projector(mf, W0, M, nW, nullptr, false);
+      v.set_wannier_projector(proj, /*loewdin*/ true);
+      REQUIRE(v.wannier());
+      REQUIRE(v.subspace_rank() == M);
+      REQUIRE(v.isometry_defect() < 1e-12);          // identity block is already isometric
+    };
+    auto [ehf_wan_id, ec_wan_id] =
+        run_scgw(mpi_context, ft, "qe_lih222", window, n_iter, "global", install_identity);
+    app_log(1, "vertex_wannier degenerate-U: window   e_hf = {:.12f}, e_corr = {:.12f}",
+            ehf_win, ec_win);
+    app_log(1, "vertex_wannier degenerate-U: Wannier  e_hf = {:.12f}, e_corr = {:.12f}  "
+               "(|D e_corr| = {:.2e})", ehf_wan_id, ec_wan_id, std::abs(ec_wan_id - ec_win));
+    REQUIRE(std::abs(ehf_wan_id - ehf_win) < 1e-10);
+    REQUIRE(std::abs(ec_wan_id - ec_win) < 1e-10);
+
+    // ================= 2. GAUGE-INVARIANCE ============================================
+    // A genuine unitary mix of the window bands defines the physical subspace P; the
+    // observables depend on range(P) ONLY. Rotate the SAME P by V (k-indep) and by a
+    // k-dependent V(k): all observables must be invariant to kernel accuracy.
+    auto V0 = wan::random_unitary(M, 7u);
+    auto install_V = [&](solvers::vertex_t& v, mf::MF& mf) {
+      auto proj = wan::make_projector(mf, W0, M, nW, &V0, /*k_dep*/ false);
+      v.set_wannier_projector(proj, true);
+      REQUIRE(v.isometry_defect() < 1e-10);          // V is unitary -> already isometric
+    };
+    auto install_Vk = [&](solvers::vertex_t& v, mf::MF& mf) {
+      auto proj = wan::make_projector(mf, W0, M, nW, &V0, /*k_dep*/ true);
+      v.set_wannier_projector(proj, true);
+    };
+    // reference: an ORTHONORMAL non-trivial Wannier set (V0 itself); the two gauge
+    // rotations of the SAME span must reproduce it. range(P) is identical for all
+    // three (V0, V0 . W, V0 . W(k)) because the columns span the same window here
+    // (M == nW): P = the window indicator, so all of these ALSO equal the degenerate
+    // result -- the strongest form of the gauge/degenerate identity.
+    auto [ehf_V, ec_V] =
+        run_scgw(mpi_context, ft, "qe_lih222", window, n_iter, "global", install_V);
+    auto [ehf_Vk, ec_Vk] =
+        run_scgw(mpi_context, ft, "qe_lih222", window, n_iter, "global", install_Vk);
+    app_log(1, "vertex_wannier gauge: window     e_hf = {:.12f}, e_corr = {:.12f}", ehf_win, ec_win);
+    app_log(1, "vertex_wannier gauge: V(k-indep) e_hf = {:.12f}, e_corr = {:.12f}  "
+               "(|D e_hf| = {:.2e}, |D e_corr| = {:.2e})",
+            ehf_V, ec_V, std::abs(ehf_V - ehf_win), std::abs(ec_V - ec_win));
+    app_log(1, "vertex_wannier gauge: V(k)       e_hf = {:.12f}, e_corr = {:.12f}  "
+               "(|D e_hf| = {:.2e}, |D e_corr| = {:.2e})",
+            ehf_Vk, ec_Vk, std::abs(ehf_Vk - ehf_win), std::abs(ec_Vk - ec_win));
+    // full-window M == nW: every rotation has range(P) = the window => the OBSERVABLES
+    // (e_hf, e_corr) are invariant to the window result. This is the sharpest end-to-end
+    // check on the complex-U conj/transpose placement in the Sigma^C injection.
+    //
+    // The Sigma^C injection is the chain-rule sandwich conj(U) Sigma_bar U^T; the operator
+    // sandwich U Sigma_bar U^dag would break gauge invariance at O(1) for complex U while
+    // being invisible for real U. The kernel-level gauge tests (vertex_sigma_toy /
+    // vertex_pi_toy "wannier_gauge") check the covariance of both cuts to machine precision.
+    // End to end the same MF/THC feeds every run, so the gauge rotation cancels to rounding
+    // and a 1e-10 tolerance is ample.
+    app_log(1, "vertex_wannier gauge: complex-U invariance is machine-exact (chain-rule "
+               "injection).");
+    REQUIRE(std::abs(ehf_V - ehf_win) < 1e-10);
+    REQUIRE(std::abs(ec_V - ec_win) < 1e-10);
+    REQUIRE(std::abs(ehf_Vk - ehf_win) < 1e-10);
+    REQUIRE(std::abs(ec_Vk - ec_win) < 1e-10);
+
+    // ================= 3. NON-TRIVIAL M < nW Wannier C: it actually restricts =========
+    // A rank-1 Wannier subspace (M = 1) cut out of the 2-band window: genuinely
+    // smaller than the window C, so e_corr differs from the full-window vertex. The
+    // gauge rotation of THIS rank-1 P (a 1x1 phase) must still be invariant.
+    {
+      const long M1 = 1;
+      auto proj_span = wan::random_unitary(nW, 99u);     // pick column 0 as the orbital
+      auto install_rank1 = [&](solvers::vertex_t& v, mf::MF& mf, double phase) {
+        // R (nW x 1) = column 0 of proj_span, times e^{i phase} (the 1x1 gauge)
+        nda::array<cplx, 5> C(mf.nkpts(), mf.nspin(), 1, M1, nW);
+        C() = cplx(0.0);
+        for (long ik = 0; ik < mf.nkpts(); ++ik)
+          for (long is = 0; is < mf.nspin(); ++is)
+            for (long i = 0; i < nW; ++i)
+              C(ik, is, 0, 0, i) =
+                  std::conj(proj_span(i, 0) * std::exp(cplx(0.0, phase)));
+        nda::array<long, 3> bw(1, 1, 2);
+        bw(0, 0, 0) = W0 + 1; bw(0, 0, 1) = W0 + nW;
+        auto kpts_crys = nda::make_regular(mf.kpts_crystal());
+        projector_t p(mf, C, bw, kpts_crys, false, false);
+        v.set_wannier_projector(p, true);
+        REQUIRE(v.subspace_rank() == M1);
+      };
+      auto [ehf_r1, ec_r1] = run_scgw(mpi_context, ft, "qe_lih222", window, n_iter,
+                                      "global",
+                                      [&](solvers::vertex_t& v, mf::MF& mf) {
+                                        install_rank1(v, mf, 0.0);
+                                      });
+      auto [ehf_r1g, ec_r1g] = run_scgw(mpi_context, ft, "qe_lih222", window, n_iter,
+                                        "global",
+                                        [&](solvers::vertex_t& v, mf::MF& mf) {
+                                          install_rank1(v, mf, 1.2345);
+                                        });
+      app_log(1, "vertex_wannier rank-1 C: e_hf = {:.12f}, e_corr = {:.12f}", ehf_r1, ec_r1);
+      app_log(1, "vertex_wannier rank-1 C shift vs full-window = {:.3e}",
+              std::abs(ec_r1 - ec_win));
+      REQUIRE(std::isfinite(ec_r1));
+      REQUIRE(std::isfinite(ec_r1g));
+      // the rank-1 subspace genuinely differs from the full 2-band window vertex
+      // (the projector actually restricts the subspace)
+      REQUIRE(std::abs(ec_r1 - ec_win) > 1e-7);
+      // 1x1 gauge (a complex phase e^{i phi}) invariance of the rank-1 P: exact to
+      // rounding with the chain-rule injection.
+      app_log(1, "vertex_wannier rank-1 gauge (1x1 phase): |D e_corr| = {:.3e}",
+              std::abs(ec_r1g - ec_r1));
+      REQUIRE(std::abs(ehf_r1g - ehf_r1) < 1e-10);
+      REQUIRE(std::abs(ec_r1g - ec_r1) < 1e-10);
+
+      // secondary (rotated point selection) path on the SAME rank-1 Wannier C:
+      // a full-rank secondary basis reproduces the global path (the equivalence of
+      // the two point selections does not depend on U).
+      auto [ehf_sec, ec_sec] = run_scgw(mpi_context, ft, "qe_lih222", window, 1,
+                                        "secondary",
+                                        [&](solvers::vertex_t& v, mf::MF& mf) {
+                                          install_rank1(v, mf, 0.0);
+                                        });
+      auto [ehf_glo, ec_glo] = run_scgw(mpi_context, ft, "qe_lih222", window, 1,
+                                        "global",
+                                        [&](solvers::vertex_t& v, mf::MF& mf) {
+                                          install_rank1(v, mf, 0.0);
+                                        });
+      app_log(1, "vertex_wannier rank-1 secondary vs global: |D e_corr| = {:.3e}",
+              std::abs(ec_sec - ec_glo));
+      REQUIRE(std::isfinite(ec_sec));
+      REQUIRE(std::abs(ec_sec - ec_glo) < 1e-4);
+    }
+
+    // ================= 4. LOEWDIN isometry repair ====================================
+    // A raw (non-orthonormal) U -- one window column scaled by 1.5 -- has a measurable
+    // isometry defect; Loewdin restores U^dag U = 1 and the result is gauge-equivalent
+    // to the orthonormal window run (range(P) unchanged: scaling a column does not
+    // change the span, and Loewdin projects back to the same subspace indicator).
+    {
+      auto install_raw_loewdin = [&](solvers::vertex_t& v, mf::MF& mf) {
+        auto proj = wan::make_projector(mf, W0, M, nW, &V0, false, /*raw_scale*/ 1.5);
+        v.set_wannier_projector(proj, /*loewdin*/ true);
+        REQUIRE(v.isometry_defect() > 1e-3);           // the raw defect is measurable
+      };
+      // the repair itself (defect > 1e-3 before, U^dag U = 1 enforced after) is asserted
+      // inside install_raw_loewdin above.
+      auto [ehf_lw, ec_lw] = run_scgw(mpi_context, ft, "qe_lih222", window, n_iter,
+                                      "global", install_raw_loewdin);
+      app_log(1, "vertex_wannier Loewdin-repaired e_corr = {:.12f} (|D| vs window = {:.2e})",
+              ec_lw, std::abs(ec_lw - ec_win));
+      REQUIRE(std::isfinite(ec_lw));
+      // Loewdin of a column-scaled full-window set still spans the window => range(P) =
+      // the window, so with the chain-rule injection the observable matches window to
+      // rounding (complex-U gauge invariance).
+      REQUIRE(std::abs(ec_lw - ec_win) < 1e-10);
+    }
+
+    // ================= 5. STATIC RUNGS (B-S / B-L) x Wannier U =======================
+    // The static-rung theories route through the same U-dependent input substitutions
+    // (G_CC/X_C) and the same chain-rule injection as the dynamic path, so the
+    // degenerate-U identity and complex-U gauge invariance must hold in
+    // vertex_rung = "static" (B-S: Sigma^{C,x} + Sigma^{C,r}, P = RPA) and "linear"
+    // (B-L: + mixed terms, P^{C,L} injection, pi^dyn response). Covers, per run: the
+    // static Sigma injection, Pi^{C,0} -> Delta w -> Sigma^{C,r} (U-free by theory --
+    // full-space externals), and for B-L the factorized pi^dyn route and the P^{C,L}
+    // Dyson feed.
+    for (std::string rung : {std::string("static"), std::string("linear")}) {
+      auto [ehf_w, ec_w] = run_scgw(mpi_context, ft, "qe_lih222", window, n_iter,
+                                    "global", no_proj, rung);
+      auto [ehf_id, ec_id] = run_scgw(mpi_context, ft, "qe_lih222", window, n_iter,
+                                      "global", install_identity, rung);
+      auto [ehf_g, ec_g] = run_scgw(mpi_context, ft, "qe_lih222", window, n_iter,
+                                    "global", install_Vk, rung);
+      app_log(1, "vertex_wannier [{}]: window     e_hf = {:.12f}, e_corr = {:.12f}",
+              rung, ehf_w, ec_w);
+      app_log(1, "vertex_wannier [{}]: U=1_window e_hf = {:.12f}, e_corr = {:.12f}  "
+                 "(|D e_corr| = {:.2e})", rung, ehf_id, ec_id, std::abs(ec_id - ec_w));
+      app_log(1, "vertex_wannier [{}]: V(k) gauge e_hf = {:.12f}, e_corr = {:.12f}  "
+                 "(|D e_corr| = {:.2e})", rung, ehf_g, ec_g, std::abs(ec_g - ec_w));
+      REQUIRE(std::isfinite(ec_w));
+      // the static-mode vertex must actually act (a dead vertex would pass every
+      // invariance check trivially)
+      REQUIRE(std::abs(ec_w - ec_win) > 1e-9);   // differs from the DYNAMIC-rung result
+      // degenerate-U reduction (window fast path vs the gemm path)
+      REQUIRE(std::abs(ehf_id - ehf_w) < 1e-10);
+      REQUIRE(std::abs(ec_id - ec_w) < 1e-10);
+      // complex k-dependent gauge invariance (range(P) = the window for M == nW)
+      REQUIRE(std::abs(ehf_g - ehf_w) < 1e-10);
+      REQUIRE(std::abs(ec_g - ec_w) < 1e-10);
+    }
+
+    // ================= 6. SYMMETRY-CLOSED WANNIER C: SrVO3 t2g =======================
+    // A C that is symmetry-closed by construction has no band-cut D-matrix leakage.
+    // Three one-iteration B-S runs on the symmetric SVO mesh (leakage is
+    // rung-independent; B-S is the cheapest rung):
+    //   (a) window C = [20,22) cuts the t2g triplet (no 2-dim invariant subspace of a
+    //       3-dim multiplet exists) -> leakage O(0.1-1): the control;
+    //   (b) window C = [20,23) = the full t2g group -> leakage ~ 0 (closed window);
+    //   (c) the Wannier90 MLWF t2g projector (M = 3 on the same window, read from a
+    //       wan.h5 file) -> projector-level leakage ~ 0 and e_corr == (b) up to gauge:
+    //       range(P) = the window, so this is the gauge test with a real projector
+    //       file, with symmetry enabled (sections 1-5 run without symmetry).
+    {
+      imag_axes_ft::IAFT ft_svo(1000, 12.0, imag_axes_ft::dlr_basis, "low");
+      auto [svo_outdir, svo_prefix] = utils::utest_filename("qe_svo222_sym");
+      (void)svo_prefix;
+      std::string wannier_file = svo_outdir + "/../mlwf/svo.mlwf.h5";
+      const nda::range t2g(20, 23), t2g_cut(20, 22);
+
+      double leak_cut = -1.0, leak_closed = -1.0, leak_wan = -1.0;
+      auto grab = [](double& slot) {
+        return [&slot](solvers::vertex_t const& v) { slot = v.sym_leakage_max(); };
+      };
+      auto [ehf_cut, ec_cut] = run_scgw(mpi_context, ft_svo, "qe_svo222_sym", t2g_cut,
+                                        1, "global", no_proj, "static", grab(leak_cut));
+      auto [ehf_t2g, ec_t2g] = run_scgw(mpi_context, ft_svo, "qe_svo222_sym", t2g,
+                                        1, "global", no_proj, "static", grab(leak_closed));
+      auto install_mlwf = [&](solvers::vertex_t& v, mf::MF& mf) {
+        projector_t proj(mf, wannier_file, /*translate*/ false, /*print*/ false);
+        v.set_wannier_projector(proj, /*loewdin*/ true);
+        REQUIRE(v.subspace_rank() == 3);
+        REQUIRE(v.isometry_defect() < 1e-10);   // W90 t2g projection is ~unitary already
+      };
+      auto [ehf_wan, ec_wan] = run_scgw(mpi_context, ft_svo, "qe_svo222_sym", t2g,
+                                        1, "global", install_mlwf, "static",
+                                        grab(leak_wan));
+      app_log(1, "vertex_wannier svo t2g leakage: cut-window = {:.3e}, closed-window = "
+                 "{:.3e}, MLWF = {:.3e}", leak_cut, leak_closed, leak_wan);
+      app_log(1, "vertex_wannier svo t2g e_corr: closed-window = {:.12f}, MLWF = {:.12f} "
+                 "(|D| = {:.2e}; cut-window = {:.12f})", ec_t2g, ec_wan,
+              std::abs(ec_wan - ec_t2g), ec_cut);
+      REQUIRE(std::isfinite(ec_cut));
+      REQUIRE(std::isfinite(ec_t2g));
+      REQUIRE(std::isfinite(ec_wan));
+      // the leakage separation: the cut multiplet leaks at O(0.1-1); the closed window
+      // and the symmetry-closed MLWF set sit at the numerical floor
+      REQUIRE(leak_cut > 1e-2);
+      REQUIRE(leak_closed < 1e-8);
+      REQUIRE(leak_wan < 1e-8);
+      // production-file gauge identity: the full-rank MLWF rotation of the closed
+      // window has range(P) = the window, so observables match to gauge class
+      REQUIRE(std::abs(ehf_wan - ehf_t2g) < 1e-10);
+      REQUIRE(std::abs(ec_wan - ec_t2g) < 1e-10);
+    }
+#endif
+  }
+
+} // bdft_tests

@@ -295,7 +295,8 @@ def run_evgw(params, h_int,
 
 
 def run_qpgw(params, h_int,
-               h_int_hf = None, h_int_hartree = None, h_int_exchange = None):
+               h_int_hf = None, h_int_hartree = None, h_int_exchange = None,
+               *, projector_info = None, local_polarizabilities = None):
     """
     Run a quasiparticle self-consistent GW (qpGW) calculation.
 
@@ -321,6 +322,11 @@ def run_qpgw(params, h_int,
           constructing the qpGW Hamiltonian. ``"fermi"`` evaluates at the Fermi
           level; ``"qp_energy"`` evaluates at the quasiparticle energy of each
           state.
+        - ``screen_type`` *(str, optional, default ``"rpa"``)* — approximation used
+          to build the screened interaction W. ``"rpa"``, or ``"gw_edmft"`` for the
+          qpGW lattice stage of GW+EDMFT (requires ``projector_info``;
+          ``local_polarizabilities`` are added on top of the RPA polarizability
+          within the correlated subspace when given).
 
     h_int : ThcCoulomb or CholCoulomb
         Primary Coulomb interaction object.
@@ -333,6 +339,13 @@ def run_qpgw(params, h_int,
     h_int_exchange : ThcCoulomb or CholCoulomb, optional
         Coulomb object for the exchange channel. Must be paired with
         ``h_int_hartree``.
+    projector_info : dict, optional
+        Wannier projector data for defining the correlated subspace. Required keys:
+        ``"proj_mat"``, ``"band_window"``, ``"kpts_w90"``.
+    local_polarizabilities : dict, optional
+        Local polarizabilities for local EDMFT corrections.
+        Required keys: ``"imp"`` (impurity) and ``"dc"`` (double-counting).
+        Only used together with ``projector_info``.
 
     Returns
     -------
@@ -354,4 +367,4 @@ def run_qpgw(params, h_int,
     """
     _run_mbpt("qpgw", params, h_int,
               h_int_hf = h_int_hf, h_int_hartree = h_int_hartree, h_int_exchange = h_int_exchange,
-              projector_info = None, local_polarizabilities = None)
+              projector_info = projector_info, local_polarizabilities = local_polarizabilities)

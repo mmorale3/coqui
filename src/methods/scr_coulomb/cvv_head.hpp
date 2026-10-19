@@ -1,0 +1,668 @@
+/**
+ * ==========================================================================
+ * CoQuí: Correlated Quantum ínterface
+ *
+ * Copyright (c) 2022-2026 Simons Foundation & The CoQuí developer team
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==========================================================================
+ */
+
+#ifndef COQUI_CVV_HEAD_HPP
+#define COQUI_CVV_HEAD_HPP
+
+#include "configuration.hpp"
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+#include "numerics/shared_array/nda.hpp"
+#include "numerics/imag_axes_ft/IAFT.hpp"
+#include "numerics/imag_axes_ft/dlr_pole_fit.hpp"
+#include "utilities/check.hpp"
+#include "utilities/kpoint_utils.hpp"
+#include "utilities/interpolation_utils.hpp"
+#include "IO/app_loggers.h"
+#include "mean_field/MF.hpp"
+#include "numerics/sparse/csr_blas.hpp"   // D-rotated IBZ->full-BZ unfold
+
+namespace methods {
+namespace solvers {
+
+  /**
+   * Covariant-velocity (CVV) q -> 0 head of the polarizability, evaluated through a
+   * Wigner-Seitz R-space store of the band Hamiltonian and self-energy.
+   *
+   *   v~_a(k, iw) = d_k_a [ H0 + F + Sigma(k, iw) ]
+   *
+   * evaluated analytically through the Wigner-Seitz R-space store: the band-basis
+   * h(k) = H0 + F (+ Sigma(tau)) is unfolded IBZ -> full BZ (D-rotated, conj on trev k
+   * -- cvv_detail::unfold_rotate_slice; the SAME trev convention as the total-Sigma unfolding in mean_field/symmetry/unfold_bz.cpp --
+   * for hermitian slices conj == the transpose branch of
+   * vertex_wannier_detail::build_Gbar_fullbz), Fourier-transformed k -> R by one gemm
+   * against utils::k_to_R_coefficients on the WS grid, R-shell-truncated at
+   * cvv_rspace_tol (dropped shells are removed from the store; shells are |R|-symmetric so
+   * hermiticity v~(k)^dag = v~(k) is preserved exactly), and tau -> iw transformed ONCE
+   * on the (small, node-shared) R-object. Velocities are then assembled ON THE FLY per
+   * (s, k):
+   *
+   *   v~_a(k, iw) = sum_R i R_a e^{i k.R} / w_R  [ h_stat(R) + Sigma(R, iw) ]
+   *
+   * (one gemm; never stored globally). The k.R phase convention is the exact inverse
+   * pair of utils::k_to_R_coefficients / utils::R_to_k_coefficients, so the interpolant
+   * reproduces h(k) on the mesh exactly and the velocity is the exact analytic
+   * derivative of that interpolant.
+   */
+  namespace cvv_detail {
+
+    // Cartesian R vectors from lattice-unit indices: R = a*lattv(0,:) + b*lattv(1,:) + c*lattv(2,:)
+    inline nda::array<double, 2> rcart_from_idx(nda::MemoryArrayOfRank<2> auto const &Rpts_idx,
+                                                nda::stack_array<double, 3, 3> const &lattv) {
+      const long nR = Rpts_idx.shape(0);
+      nda::array<double, 2> Rc(nR, 3);
+      for (long i = 0; i < nR; ++i)
+        for (int a = 0; a < 3; ++a)
+          Rc(i, a) = Rpts_idx(i, 0) * lattv(0, a) + Rpts_idx(i, 1) * lattv(1, a) +
+                     Rpts_idx(i, 2) * lattv(2, a);
+      return Rc;
+    }
+
+    /**
+     * D-rotated IBZ -> full-BZ gather of one band-matrix slice.
+     * A copy/conj-on-trev (identity-D) unfold makes every stored k-slice
+     * STAR-CONSTANT, and the velocity -- the k-DERIVATIVE of the R interpolant -- of
+     * star-constant data loses the interband dipole at image k (eps_inf collapses
+     * toward 1 and cubic crystals lose xx = yy = zz). The slice is therefore rotated
+     * with the TRUE band D-matrices (MF::symmetry_rotation, as in projector_boson_t /
+     * build_sym_ctx):
+     *     A(k_img) = D . A(k_ibz) . D^dag,
+     * with the trev branch composing as the D -> 1 limits of the identity-D unfold:
+     * Sigma-class = conj(D A D^dag); G-class = (D A D^dag)^T.
+     * The composition is verified against symmetry-free (nosym) runs, not derived.
+     * D carries the nbnd-truncation leakage of the band D-matrices (symmetry.hpp row
+     * normalization).
+     */
+    /**
+     * qsymms POSITION of kp_symm(ik) per full-BZ k (the same search as build_sym_ctx in
+     * vertex_t.cpp: kp_symm returns the raw symm-list ID, while
+     * MF::symmetry_rotation indexes the stored qsymms subgroup by POSITION with
+     * 0 = identity, not stored).
+     */
+    inline nda::array<long, 1> k_isym_positions(mf::MF &mf) {
+      auto qsymms = mf.qsymms();
+      auto kp_symm = mf.kp_symm();
+      const long nsym = qsymms.extent(0), nk = mf.nkpts();
+      nda::array<long, 1> js_of(nk);
+      for (long ik = 0; ik < nk; ++ik) {
+        const int sidx = int(kp_symm(ik));
+        long js = -1;
+        for (long i = 0; i < nsym; ++i)
+          if (qsymms(i) == sidx) { js = i; break; }
+        utils::check(js >= 0,
+                     "cvv k_isym_positions: kp_symm({}) = {} not found in qsymms.",
+                     ik, sidx);
+        js_of(ik) = js;
+      }
+      return js_of;
+    }
+
+    inline void unfold_rotate_slice(mf::MF &mf, long isym, long ksrc, bool trev,
+                                    bool g_class,
+                                    nda::MemoryArrayOfRank<2> auto const &A_src,
+                                    nda::MemoryArrayOfRank<2> auto &&row,
+                                    nda::array<ComplexType, 2> &t1,
+                                    nda::array<ComplexType, 2> &t2) {
+      const long nb = A_src.shape(0);
+      if (isym == 0) {
+        if (not trev) { row = A_src; }
+        else if (g_class) {
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) row(i, j) = A_src(j, i);
+        } else {
+          row = nda::conj(A_src);
+        }
+        return;
+      }
+      auto [cjg, D] = mf.symmetry_rotation(isym, ksrc);
+      // kp_trev tracks the bz-level time reversal of the k MAPPING; cjg marks ops
+      // whose stored D itself composes with TR. TR over a plain rotation (trev, !cjg)
+      // is legal, and conjugation applies
+      // ONCE, driven by trev. A cjg op at a non-trev k would double-count TR: forbid.
+      utils::check(not cjg or trev,
+                   "cvv unfold_rotate_slice: TR-composed symmetry (cjg) at a non-trev "
+                   "k (isym = {}, ksrc = {}).", isym, ksrc);
+      // P = D A D^dag via two csrmm's: t1 = D.A; t2 = t1^dag; t1 = D.t2; P = t1^dag.
+      math::sparse::csrmm<'N'>(ComplexType(1.0), *D, A_src, ComplexType(0.0), t1);
+      for (long i = 0; i < nb; ++i)
+        for (long j = 0; j < nb; ++j) t2(i, j) = std::conj(t1(j, i));
+      math::sparse::csrmm<'N'>(ComplexType(1.0), *D, t2, ComplexType(0.0), t1);
+      if (not trev) {              // row = P
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) row(i, j) = std::conj(t1(j, i));
+      } else if (g_class) {        // row = P^T
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) row(i, j) = std::conj(t1(i, j));
+      } else {                     // row = conj(P)
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) row(i, j) = t1(j, i);
+      }
+    }
+
+    /**
+     * The per-k contraction rows over the WS R store. Rows 0..2 are the DERIVATIVE rows
+     *   P(a, R) = i R_a e^{i k.R} / w_R,
+     * row 3 (present iff with_value_row) is the VALUE (interpolation) row
+     *   P(3, R) = e^{i k.R} / w_R
+     * -- the exact adjoint pair of utils::k_to_R_coefficients' e^{-i k.R}/nk kernel
+     * (utils::R_to_k_coefficients convention, WS degeneracy weights w_R). kvec is
+     * CARTESIAN (the same convention k_to_R_coefficients applies to mf.kpts()).
+     */
+    inline nda::array<ComplexType, 2> phase_rows(nda::MemoryArrayOfRank<2> auto const &Rcart,
+                                                 nda::MemoryArrayOfRank<1> auto const &wR,
+                                                 nda::MemoryArrayOfRank<1> auto const &kvec,
+                                                 bool with_value_row = false) {
+      const long nR = Rcart.shape(0);
+      nda::array<ComplexType, 2> P(with_value_row ? 4 : 3, nR);
+      for (long i = 0; i < nR; ++i) {
+        const double kR = kvec(0) * Rcart(i, 0) + kvec(1) * Rcart(i, 1) + kvec(2) * Rcart(i, 2);
+        const ComplexType ph = std::exp(ComplexType(0.0, kR)) / double(wR(i));
+        for (int a = 0; a < 3; ++a) P(a, i) = ComplexType(0.0, Rcart(i, a)) * ph;
+        if (with_value_row) P(3, i) = ph;
+      }
+      return P;
+    }
+
+    /**
+     * Generic fermionic pair bubble, accumulated on the FULL bosonic tau grid:
+     *
+     *   Pi(tau_j, a, b) += pref * tr[ A_a(tau_j) . B_b(beta - tau_j) ]
+     *
+     * A and B arrive at the backend's fermionic iw nodes as flat batches
+     * (nw, da*nb*nb) / (nw, db*nb*nb); they are pole-fitted by the REGULARIZED w-side
+     * fit (imag_axes_ft::dlr_pole_fit_w -- never a square interpolatory solve;
+     * fit_error/residue_ratio maxima are reported to the caller, who checks them) and
+     * evaluated at the bosonic tau nodes through the analytic kernel K_F. A bosonic
+     * tau_to_w of the accumulated Pi then yields the Matsubara convolution
+     * -pref * (1/beta) sum_iw tr[A_a(iw) B_b(iw + inu)] per (a, b); the overall
+     * sign/normalization convention is pinned by the dense-Matsubara reference in
+     * test_scr_cvv.
+     */
+    inline void bubble_accumulate(imag_axes_ft::dlr_pole_fit_w const &pfw,
+                                  nda::MemoryArrayOfRank<2> auto const &A_wd,
+                                  nda::MemoryArrayOfRank<2> auto const &B_wd,
+                                  nda::MemoryArrayOfRank<2> auto const &Kt,      // (ntb, np): K_F(tau_j, eps_p)
+                                  nda::MemoryArrayOfRank<2> auto const &Kt_mir,  // (ntb, np): K_F(beta - tau_j, eps_p)
+                                  long nb, double pref,
+                                  nda::MemoryArrayOfRank<3> auto &&Pi_tab,       // (ntb, da, db), +=
+                                  double &fit_err_max, double &res_ratio_max) {
+      const long ntb = Kt.shape(0), nb2 = nb * nb;
+      const long da = A_wd.shape(1) / nb2, db = B_wd.shape(1) / nb2;
+      utils::check(A_wd.shape(1) == da * nb2 and B_wd.shape(1) == db * nb2,
+                   "cvv_detail::bubble_accumulate: batch width not a multiple of nb^2.");
+      utils::check(Pi_tab.shape(0) == ntb and Pi_tab.shape(1) == da and
+                   Pi_tab.shape(2) == db,
+                   "cvv_detail::bubble_accumulate: Pi shape mismatch.");
+
+      auto cA = pfw.coeffs(A_wd);
+      auto cB = pfw.coeffs(B_wd);
+      fit_err_max = std::max({fit_err_max, pfw.fit_error(A_wd, cA), pfw.fit_error(B_wd, cB)});
+      res_ratio_max = std::max({res_ratio_max, pfw.residue_ratio(A_wd, cA),
+                                pfw.residue_ratio(B_wd, cB)});
+
+      nda::array<ComplexType, 2> At(ntb, da * nb2), Bt(ntb, db * nb2);
+      nda::blas::gemm(Kt, cA, At);
+      nda::blas::gemm(Kt_mir, cB, Bt);
+
+      for (long j = 0; j < ntb; ++j)
+        for (long a = 0; a < da; ++a) {
+          const long oa = a * nb2;
+          for (long b = 0; b < db; ++b) {
+            const long ob = b * nb2;
+            ComplexType tr(0.0);   // tr[A B] = sum_im A(i,m) B(m,i), flat row indexing
+            for (long i = 0; i < nb; ++i)
+              for (long m = 0; m < nb; ++m)
+                tr += At(j, oa + i * nb + m) * Bt(j, ob + m * nb + i);
+            Pi_tab(j, a, b) += pref * tr;
+          }
+        }
+    }
+
+    /**
+     * The SUBTRACTED head coefficient (the object P00 actually consumes):
+     *
+     *   Phead_ab(inu) = [ Pi^jj_ab(inu) - Pi^jj_ab(0) ] / (inu)^2,
+     *
+     * finite at inu = 0 by Richardson extrapolation from the two smallest nonzero
+     * bosonic nodes. WHY THE SUBTRACTION: the raw paramagnetic bubble at inu = 0 does
+     * NOT give the density head -- for a gapped two-level system it overshoots by a
+     * factor of order gap^2. Continuity ties the
+     * density response to the TOTAL (paramagnetic + diamagnetic) current response,
+     * (inu)^2 P00(q, inu) = q^2 [k_para(inu) + k_dia]; for an INSULATOR the Drude
+     * weight vanishes, k_dia = -k_para(0), so
+     *
+     *   P00(q -> 0, inu) = q_a q_b [Pi_ab(inu) - Pi_ab(0)] / (inu)^2
+     *
+     * at EVERY inu (k_dia is nu-independent), with the nu -> 0 limit at the static
+     * point -- no explicit diamagnetic / d2h evaluation needed. The subtracted form
+     * agrees with the exact Adler-Wiser result on a two-level model
+     * ([2D/(D^2+nu^2) - 2/D]/(inu)^2 -> 2/D^3 = the chi_rho-rho q^2 coefficient).
+     */
+    inline nda::array<ComplexType, 3> head_subtract(nda::MemoryArrayOfRank<3> auto const &Pi_wab,
+                                                    imag_axes_ft::IAFT const &ft) {
+      const long nwb = Pi_wab.shape(0), da = Pi_wab.shape(1), db = Pi_wab.shape(2);
+      auto wn_b = ft.wn_mesh_b();
+      long i0 = -1;
+      for (long m = 0; m < nwb; ++m)
+        if (wn_b(m) == 0) i0 = m;
+      utils::check(i0 >= 0 and i0 + 2 < nwb,
+                   "cvv_detail::head_subtract: no inu = 0 node / bosonic grid too small.");
+      nda::array<ComplexType, 3> Ph(nwb, da, db);
+      for (long m = 0; m < nwb; ++m) {
+        if (m == i0) continue;
+        const ComplexType inu2 = ft.omega(wn_b(m)) * ft.omega(wn_b(m));
+        for (long a = 0; a < da; ++a)
+          for (long b = 0; b < db; ++b)
+            Ph(m, a, b) = (Pi_wab(m, a, b) - Pi_wab(i0, a, b)) / inu2;
+      }
+      // inu = 0: Richardson in nu^2 from the two smallest positive nodes
+      const double x1 = double(wn_b(i0 + 1)) * double(wn_b(i0 + 1));
+      const double x2 = double(wn_b(i0 + 2)) * double(wn_b(i0 + 2));
+      for (long a = 0; a < da; ++a)
+        for (long b = 0; b < db; ++b)
+          Ph(i0, a, b) = (x2 * Ph(i0 + 1, a, b) - x1 * Ph(i0 + 2, a, b)) / (x2 - x1);
+      return Ph;
+    }
+
+  } // cvv_detail
+
+  class cvv_head_t {
+  public:
+    template<nda::MemoryArray Array_base_t>
+    using sArray_t = math::shm::shared_array<Array_base_t>;
+
+    cvv_head_t(const imag_axes_ft::IAFT *ft, double rspace_tol = 1e-6);
+
+    cvv_head_t(cvv_head_t &&) = default;
+    cvv_head_t& operator=(cvv_head_t &&) = default;
+    ~cvv_head_t() {}
+
+    // R-shell truncation tolerance of the R-space store ([gw] cvv_rspace_tol)
+    double rspace_tol() const { return _rspace_tol; }
+    bool built() const { return _built; }
+    long nR() const { return _nR; }
+    long nR_kept() const { return _nR_kept; }
+    long nw() const { return _nw; }
+
+    /**
+     * Build the node-shared R-space store from the IBZ-resident state.
+     * @param H0_skij    - (ns, nkpts_ibz, nbnd, nbnd) bare one-body Hamiltonian
+     * @param F_skij     - (ns, nkpts_ibz, nbnd, nbnd) static self-energy (Fock)
+     * @param Sigma_tskij- (nts, ns, nkpts_ibz, nbnd, nbnd) dynamic self-energy on the
+     *                     fermionic tau mesh; an EMPTY array (size 0) means Sigma = 0
+     *                     (KS/HF control -- the velocity is then iw-independent).
+     * All ranks call this (collective over mf.mpi()); node roots compute the identical
+     * small store, node_sync publishes it.
+     */
+    void build(mf::MF &mf,
+               nda::MemoryArrayOfRank<4> auto const &H0_skij,
+               nda::MemoryArrayOfRank<4> auto const &F_skij,
+               nda::MemoryArrayOfRank<5> auto const &Sigma_tskij) {
+      decltype(nda::range::all) all;
+      auto ctx = mf.mpi();
+      const long ns = H0_skij.shape(0), nk_ibz = H0_skij.shape(1), nb = H0_skij.shape(2);
+      const long nk = mf.nkpts();
+      const bool has_sigma = Sigma_tskij.size() > 0;
+      const long nt = has_sigma ? Sigma_tskij.shape(0) : 0;
+      utils::check(F_skij.shape() == H0_skij.shape(),
+                   "cvv_head_t::build: F/H0 shape mismatch.");
+      if (has_sigma)
+        utils::check(Sigma_tskij.shape(1) == ns and Sigma_tskij.shape(2) == nk_ibz and
+                     Sigma_tskij.shape(3) == nb,
+                     "cvv_head_t::build: Sigma shape mismatch.");
+      utils::check(nk_ibz == mf.nkpts_ibz(), "cvv_head_t::build: nkpts_ibz mismatch.");
+      _ns = ns; _nb = nb; _nw = _ft->nw_f(); _has_sigma = has_sigma;
+
+      // Wigner-Seitz R grid of the k-mesh supercell (degeneracy-weighted boundary)
+      auto [rw, rp] = utils::WS_rgrid(mf.lattv(), mf.kp_grid());
+      _nR = rp.shape(0);
+      _Rcart = cvv_detail::rcart_from_idx(rp, mf.lattv());
+      _wR.resize(_nR);
+      for (long i = 0; i < _nR; ++i) _wR(i) = double(rw(i));
+      _kpts.resize(nk, 3);
+      _kpts() = mf.kpts();
+
+      // ---- FULL-n_R node-shared STAGING; the two flop-heavy loops (k -> R gemms,
+      // tau -> iw) round-robin over NODE ranks between window fences (the unfold_bz
+      // write pattern); the shell decision is taken on the omega staging; the FINAL
+      // stores are COMPACTED to the kept shells only. Every node computes identical content.
+      auto s_stat_stage = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+          *ctx, {ns, _nR, nb, nb});
+      s_stat_stage.set_zero();
+      using s5_t = sArray_t<nda::array_view<ComplexType, 5>>;
+      std::optional<s5_t> s_sigt_stage, s_sigw_stage;
+      if (has_sigma) {
+        s_sigt_stage = math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(
+            *ctx, {ns, _nR, nt, nb, nb});
+        s_sigw_stage = math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(
+            *ctx, {ns, _nR, _nw, nb, nb});
+        s_sigt_stage.value().set_zero();
+        s_sigw_stage.value().set_zero();
+      }
+      // f_Rk = e^{-i k.R}/nk on the full BZ: node-shared, node root computes
+      auto s_fRk = math::shm::make_shared_array<nda::array_view<ComplexType, 2>>(
+          *ctx, {_nR, nk});
+      s_fRk.win().fence();
+      if (ctx->node_comm.root()) {
+        auto f = s_fRk.local();
+        utils::k_to_R_coefficients(rp, mf.kpts(), mf.lattv(), f);
+      }
+      s_fRk.win().fence();
+      auto f_Rk = s_fRk.local();
+
+      auto kp_to_ibz = mf.kp_to_ibz();
+      auto kp_trev = mf.kp_trev();
+      auto kp_symm = mf.kp_symm();
+      const bool sym = (nk != nk_ibz);
+      // per-rank full-BZ slice gather with the TRUE D(S, k) rotation
+      // (cvv_detail::unfold_rotate_slice; Sigma-class trev branch). nosym meshes take
+      // the plain-copy fast path. One gemm k -> R per slice; no global unfolded object
+      // is materialized.
+      nda::array<ComplexType, 2> buf(nk, nb * nb);
+      nda::array<ComplexType, 2> rt1(nb, nb), rt2(nb, nb);
+      nda::array<long, 1> k_js;
+      if (sym) k_js = cvv_detail::k_isym_positions(mf);
+      auto gather_full = [&](auto const &A_kij_ibz) {   // (nk_ibz, nb, nb) at fixed pre-axes
+        for (long ik = 0; ik < nk; ++ik) {
+          auto row = nda::reshape(buf(ik, all), std::array<long, 2>{nb, nb});
+          if (not sym) { row = A_kij_ibz(ik, all, all); continue; }
+          cvv_detail::unfold_rotate_slice(mf, k_js(ik), long(kp_to_ibz(ik)),
+                                          bool(kp_trev(ik)), false,
+                                          A_kij_ibz(long(kp_to_ibz(ik)), all, all),
+                                          row, rt1, rt2);
+        }
+      };
+
+      // static part (ns gemms, cheap): node root
+      s_stat_stage.win().fence();
+      if (ctx->node_comm.root()) {
+        auto hstat = s_stat_stage.local();
+        for (long is = 0; is < ns; ++is) {
+          gather_full(H0_skij(is, all, all, all));
+          nda::array<ComplexType, 2> buf2(buf);
+          gather_full(F_skij(is, all, all, all));
+          buf += buf2;
+          auto h2 = nda::reshape(hstat(is, all, all, all),
+                                 std::array<long, 2>{_nR, nb * nb});
+          nda::blas::gemm(f_Rk, buf, h2);
+        }
+      }
+      s_stat_stage.win().fence();
+
+      if (has_sigma) {
+        // Sigma k -> R: (t, s) round-robin over node ranks; disjoint (is, :, it) writes
+        auto sig_t = s_sigt_stage.value().local();
+        nda::array<ComplexType, 2> tmpR(_nR, nb * nb);
+        s_sigt_stage.value().win().fence();
+        for (long ts = ctx->node_comm.rank(); ts < nt * ns;
+             ts += ctx->node_comm.size()) {
+          const long it = ts / ns, is = ts % ns;
+          gather_full(Sigma_tskij(it, is, all, all, all));
+          nda::blas::gemm(f_Rk, buf, tmpR);
+          for (long iR = 0; iR < _nR; ++iR)
+            sig_t(is, iR, it, all, all) =
+                nda::reshape(tmpR(iR, all), std::array<long, 2>{nb, nb});
+        }
+        s_sigt_stage.value().win().fence();
+        // tau -> iw ONCE per (s, R): round-robin over node ranks; disjoint (is, iR)
+        auto sig_w = s_sigw_stage.value().local();
+        s_sigw_stage.value().win().fence();
+        for (long sR = ctx->node_comm.rank(); sR < ns * _nR;
+             sR += ctx->node_comm.size()) {
+          const long is = sR / _nR, iR = sR % _nR;
+          auto S_tf = nda::reshape(sig_t(is, iR, all, all, all),
+                                   std::array<long, 2>{nt, nb * nb});
+          auto S_wf = nda::reshape(sig_w(is, iR, all, all, all),
+                                   std::array<long, 2>{_nw, nb * nb});
+          _ft->tau_to_w(S_tf, S_wf, imag_axes_ft::fermion);
+        }
+        s_sigw_stage.value().win().fence();
+        s_sigt_stage.reset();   // the tau staging is dead weight from here on
+      }
+
+      // shell selection (node root, on the omega staging) + node broadcast of the kept rows
+      std::vector<long> kept;
+      long nkept = 0;
+      if (ctx->node_comm.root()) {
+        if (has_sigma) {
+          auto swv = s_sigw_stage.value().local();
+          kept = select_kept_shells(s_stat_stage.local(), &swv);
+        } else {
+          kept = select_kept_shells(s_stat_stage.local(), nullptr);
+        }
+        nkept = long(kept.size());
+      }
+      ctx->node_comm.broadcast_n(&nkept, 1, 0);
+      kept.resize(nkept);
+      ctx->node_comm.broadcast_n(kept.data(), nkept, 0);
+      _nR_kept = nkept;
+
+      // compact the geometry on every rank (original row order preserved)
+      {
+        nda::array<double, 2> Rc(nkept, 3);
+        nda::array<double, 1> wk(nkept);
+        for (long i = 0; i < nkept; ++i) {
+          for (int a = 0; a < 3; ++a) Rc(i, a) = _Rcart(kept[i], a);
+          wk(i) = _wR(kept[i]);
+        }
+        _Rcart = Rc;
+        _wR = wk;
+      }
+
+      // final COMPACT node-shared stores; node root copies kept rows
+      _shstat = sArray_t<nda::array_view<ComplexType, 4>>(
+          math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+              *ctx, {ns, nkept, nb, nb}));
+      if (has_sigma)
+        _ssig = sArray_t<nda::array_view<ComplexType, 5>>(
+            math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(
+                *ctx, {ns, nkept, _nw, nb, nb}));
+      else
+        _ssig.reset();
+      _shstat.value().win().fence();
+      if (has_sigma) _ssig.value().win().fence();
+      if (ctx->node_comm.root()) {
+        auto dst = _shstat.value().local();
+        auto src = s_stat_stage.local();
+        for (long is = 0; is < ns; ++is)
+          for (long i = 0; i < nkept; ++i)
+            dst(is, i, all, all) = src(is, kept[i], all, all);
+        if (has_sigma) {
+          auto dsw = _ssig.value().local();
+          auto ssw = s_sigw_stage.value().local();
+          for (long is = 0; is < ns; ++is)
+            for (long i = 0; i < nkept; ++i)
+              dsw(is, i, all, all, all) = ssw(is, kept[i], all, all, all);
+        }
+      }
+      _shstat.value().win().fence();
+      if (has_sigma) _ssig.value().win().fence();
+      ctx->comm.barrier();
+      app_log(2, "  [CVV] R store compacted: {} / {} WS rows retained "
+                 "({:.1f} %% of the full-n_R staging footprint).",
+              nkept, _nR, 100.0 * double(nkept) / double(_nR));
+      _built = true;
+    }
+
+    /**
+     * The covariant velocity at one (spin, k): v~_a(k, iw_n), shape (3, nw_f, nb, nb).
+     * One gemm over the kept R shells; never stored globally.
+     */
+    nda::array<ComplexType, 4> velocity(long is, long ik) const;
+
+    /** Result of the head tensor evaluation. */
+    struct head_result_t {
+      // Pi_ab on the FULL bosonic tau grid (bubble integrand incl. prefactor) and its
+      // bosonic transform; inu = 0 sits at index nw_b/2 of the full Matsubara grid.
+      nda::array<ComplexType, 3> Pi_tab;   // (nt_b, 3, 3) paramagnetic bubble
+      nda::array<ComplexType, 3> Pi_wab;   // (nw_b, 3, 3) paramagnetic bubble
+      // the SUBTRACTED head coefficient (cvv_detail::head_subtract) -- the object
+      // P00(q->0, inu) = q_a q_b Phead_ab(inu) consumes (pproc readout / in-loop head)
+      nda::array<ComplexType, 3> Phead_wab;  // (nw_b, 3, 3)
+      double fit_error_max = 0.0;          // worst w-side pole-fit reconstruction error
+      double res_ratio_max = 0.0;          // worst residue amplification (watched)
+    };
+
+    /**
+     * The covariant-velocity head tensor
+     *   Pi_ab(inu) = -(2/(beta Nk V)) sum_{s,k,iw} Tr[ v~_a G v~_b G ]
+     * (spin factor 2 for ns = 1, plain spin sum for ns = 2). Per (s, k): G(tau) -> iw,
+     * M_a = v~_a G at the fermionic nodes, regularized w-side pole fit, bubble
+     * on the bosonic tau grid (cvv_detail::bubble_accumulate), k round-robin over the
+     * global communicator + one tiny all_reduce, one bosonic tau_to_w at the end.
+     * G_tskij is the IBZ-resident Green's function on the fermionic tau mesh; the
+     * full-BZ gather uses the TRANSPOSE on trev k (the build_Gbar_fullbz G-convention;
+     * Sigma-class objects use conj -- see build()).
+     */
+    head_result_t eval_head_tensor(mf::MF &mf,
+                                   nda::MemoryArrayOfRank<5> auto const &G_tskij) {
+      decltype(nda::range::all) all;
+      utils::check(_built, "cvv_head_t::eval_head_tensor: build() has not run.");
+      auto ctx = mf.mpi();
+      const long nk = mf.nkpts(), nk_ibz = mf.nkpts_ibz();
+      const long nt_f = G_tskij.shape(0), nb = _nb, nb2 = nb * nb;
+      utils::check(G_tskij.shape(1) == _ns and G_tskij.shape(2) == nk_ibz and
+                   G_tskij.shape(3) == nb,
+                   "cvv_head_t::eval_head_tensor: G shape mismatch.");
+      utils::check(nt_f == _ft->nt_f(), "cvv_head_t::eval_head_tensor: nt mismatch.");
+      ensure_bubble_tables();
+
+      const long ntb = _Kt.shape(0);
+      head_result_t res;
+      res.Pi_tab = nda::array<ComplexType, 3>(ntb, 3, 3);
+      res.Pi_tab() = ComplexType(0.0);
+      // normalization: -(spin_fac / (Nk V)) per k term; the 1/beta lives in the
+      // bosonic transform; the overall SIGN is pinned by the dense-Matsubara reference test.
+      const double pref = -((_ns == 1) ? 2.0 : 1.0) / (double(nk) * mf.volume());
+
+      auto kp_to_ibz = mf.kp_to_ibz();
+      auto kp_trev = mf.kp_trev();
+      auto kp_symm = mf.kp_symm();
+      const bool sym = (nk != nk_ibz);
+      nda::array<ComplexType, 2> Gk_t(nt_f, nb2), Gk_w(_nw, nb2);
+      nda::array<ComplexType, 2> M(_nw, 3 * nb2);
+      nda::array<ComplexType, 2> gt1(nb, nb), gt2(nb, nb);
+      nda::array<long, 1> k_js;
+      if (sym) k_js = cvv_detail::k_isym_positions(mf);
+      const long rank = ctx->comm.rank(), size = ctx->comm.size();
+      for (long isk = rank; isk < _ns * nk; isk += size) {
+        const long is = isk / nk, ik = isk % nk;
+        const long ksrc = sym ? long(kp_to_ibz(ik)) : ik;
+        // G at image k through the SAME D rotation as the velocity store
+        // (G-class trev branch = transpose composition); nosym = plain copy.
+        for (long it = 0; it < nt_f; ++it) {
+          auto Gt = nda::reshape(Gk_t(it, all), std::array<long, 2>{nb, nb});
+          auto Gsrc = G_tskij(it, is, ksrc, all, all);
+          if (not sym) Gt = Gsrc;
+          else cvv_detail::unfold_rotate_slice(mf, k_js(ik), ksrc,
+                                               bool(kp_trev(ik)), true, Gsrc, Gt,
+                                               gt1, gt2);
+        }
+        _ft->tau_to_w(Gk_t, Gk_w, imag_axes_ft::fermion);
+        auto v = velocity(is, ik);                       // (3, nw, nb, nb)
+        nda::array<ComplexType, 2> Gn(nb, nb), Mn(nb, nb);
+        for (long n = 0; n < _nw; ++n) {
+          for (long i = 0; i < nb; ++i)
+            for (long m = 0; m < nb; ++m) Gn(i, m) = Gk_w(n, i * nb + m);
+          for (long a = 0; a < 3; ++a) {
+            nda::blas::gemm(v(a, n, all, all), Gn, Mn);
+            const long oa = a * nb2;
+            for (long i = 0; i < nb; ++i)
+              for (long m = 0; m < nb; ++m) M(n, oa + i * nb + m) = Mn(i, m);
+          }
+        }
+        cvv_detail::bubble_accumulate(_pfw.value(), M, M, _Kt, _Kt_mir, nb, pref,
+                                      res.Pi_tab, res.fit_error_max, res.res_ratio_max);
+      }
+      ctx->comm.all_reduce_in_place_n(res.Pi_tab.data(), res.Pi_tab.size(), std::plus<>{});
+      res.fit_error_max = ctx->comm.max(res.fit_error_max);
+      res.res_ratio_max = ctx->comm.max(res.res_ratio_max);
+      imag_axes_ft::dlr_pole_fit_gate(res.fit_error_max, "cvv_head_t::eval_head_tensor",
+                                      1e-3, 1e-2, res.res_ratio_max);
+
+      res.Pi_wab = nda::array<ComplexType, 3>(_ft->nw_b(), 3, 3);
+      auto Pt2 = nda::reshape(res.Pi_tab, std::array<long, 2>{ntb, 9});
+      auto Pw2 = nda::reshape(res.Pi_wab, std::array<long, 2>{long(_ft->nw_b()), 9});
+      _ft->tau_to_w(Pt2, Pw2, imag_axes_ft::boson);
+      res.Phead_wab = cvv_detail::head_subtract(res.Pi_wab, *_ft);
+      const long i0 = _ft->nw_b() / 2;
+      app_log(2, "  [CVV] head tensor: diag Phead(inu=0) = ({:.6e}, {:.6e}, {:.6e}) "
+                 "[raw para bubble Pi(0) diag = ({:.3e}, {:.3e}, {:.3e})]; "
+                 "pole-fit err_max = {:.3e}, residue ratio max = {:.3g}",
+              res.Phead_wab(i0, 0, 0).real(), res.Phead_wab(i0, 1, 1).real(),
+              res.Phead_wab(i0, 2, 2).real(), res.Pi_wab(i0, 0, 0).real(),
+              res.Pi_wab(i0, 1, 1).real(), res.Pi_wab(i0, 2, 2).real(),
+              res.fit_error_max, res.res_ratio_max);
+      return res;
+    }
+
+    /** lazy build of the w-side pole fit + the bosonic-tau kernel tables (public so the
+     *  unit tests can drive cvv_detail::bubble_accumulate with the same tables). */
+    void ensure_bubble_tables() {
+      if (_pfw.has_value()) return;
+      _pfw = imag_axes_ft::dlr_pole_fit_w(*_ft);
+      auto const &pf = _pfw.value();
+      const long ntb = _ft->nt_b();
+      const double beta = _ft->beta();
+      auto taub = _ft->tau_mesh_b();
+      _Kt = nda::array<ComplexType, 2>(ntb, pf.np);
+      _Kt_mir = nda::array<ComplexType, 2>(ntb, pf.np);
+      for (long j = 0; j < ntb; ++j) {
+        const double s = (taub(j) + 1.0) * 0.5 * beta;   // tau_mesh in [-1, 1] convention
+        for (long p = 0; p < pf.np; ++p) {
+          _Kt(j, p) = ComplexType(imag_axes_ft::dlr_kF(beta, s, pf.epsl(p)));
+          _Kt_mir(j, p) = ComplexType(imag_axes_ft::dlr_kF(beta, beta - s, pf.epsl(p)));
+        }
+      }
+    }
+    imag_axes_ft::dlr_pole_fit_w const &pole_fit_w() { ensure_bubble_tables(); return _pfw.value(); }
+    nda::array<ComplexType, 2> const &Kt() const { return _Kt; }
+    nda::array<ComplexType, 2> const &Kt_mir() const { return _Kt_mir; }
+
+  private:
+    // shell selection on the FULL staging (|R| shells, cumulative dropped-norm bound,
+    // R = 0 never dropped);
+    // returns the KEPT row indices ascending, logs kept/dropped norms. Node-root only.
+    std::vector<long> select_kept_shells(
+        nda::array_view<ComplexType, 4> hs_stage,
+        nda::array_view<ComplexType, 5> const *sig_stage) const;
+
+    const imag_axes_ft::IAFT* _ft = nullptr;
+    double _rspace_tol = 1e-6;
+
+    bool _built = false;
+    bool _has_sigma = false;
+    long _ns = 0, _nb = 0, _nw = 0, _nR = 0, _nR_kept = 0;
+    nda::array<double, 2> _Rcart;   // (nR, 3) cartesian
+    nda::array<double, 1> _wR;      // (nR) WS degeneracy weights
+    nda::array<double, 2> _kpts;    // (nk, 3) cartesian (mf.kpts() copy)
+    // node-shared R stores, compacted to the kept shells
+    std::optional<sArray_t<nda::array_view<ComplexType, 4>>> _shstat;  // (ns, nR, nb, nb)
+    std::optional<sArray_t<nda::array_view<ComplexType, 5>>> _ssig;   // (ns, nR, nw, nb, nb)
+    // bubble machinery (lazy): the w-side regularized pole fit + the K_F tables on
+    // the bosonic tau grid (tau_j and beta - tau_j)
+    std::optional<imag_axes_ft::dlr_pole_fit_w> _pfw;
+    nda::array<ComplexType, 2> _Kt, _Kt_mir;
+  };
+
+} // solvers
+} // methods
+
+#endif // COQUI_CVV_HEAD_HPP

@@ -1,0 +1,30 @@
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "pwscf"
+outdir   = "qe_output_dir/OUT/"
+filetype = "h5"
+
+[qp_gaps]                        # band gaps of a stored (sc)GW checkpoint: Pade AC of the Dyson self-energy +
+                                 # the QP equation on the IBZ k-mesh, then the gaps on that mesh
+mean_field = "mf_qe"             # tag for the input [mean_field] instance
+outdir     = "./"                # directory where the coqui HDF5 checkpoint is
+prefix     = "scgw"              # prefix of the checkpoint <outdir>/<prefix>.mbpt.h5
+grp_name   = "scf"               # checkpoint group ("scf" for Dyson SCF)
+iteration  = -1                  # iteration to read; -1 = final_iter
+qp_type    = "sc"                # QP solver: sc | sc_newton | linearized
+ac_alg     = "pade"              # analytical continuation of the MO-diagonal self-energy
+qp_Nfit    = 26                  # number of Matsubara points in the Pade fit
+# qp_eta   = 3.14e-3             # shift above the real axis (Ha); default pi/beta
+# qp_tol   = 1e-8                # QP-equation tolerance
+#
+# Wannier interpolation of the QP bands onto a uniform fine mesh (the off-mesh, indirect CBM/VBM).
+# The QP Hamiltonian is downfolded with the projector of wannier_file (as in [band_interpolation]),
+# Fourier-interpolated to every point of qp_gaps_interp_mesh and diagonalized; the same gaps are
+# reported next to the mesh ones and written to qp_approx/gaps with the suffix "_interp"
+# (also kpts_crys_interp, E_ska_interp [Ha], interp_mesh). Only the projector's band window is
+# interpolated, so the window must contain the band edges. With qp_gaps_interp_mesh equal to the
+# mean-field mesh the interpolated bands reproduce the window eigenvalues on that mesh exactly.
+qp_gaps_interp      = true       # default false (the mesh-only report)
+qp_gaps_interp_mesh = [8, 8, 8]  # default: the mean-field mesh
+wannier_file        = "wan.h5"   # projector h5 (required when qp_gaps_interp = true)
+translate_home_cell = false      # as in [band_interpolation]

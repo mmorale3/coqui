@@ -1,0 +1,647 @@
+/**
+ * ==========================================================================
+ * CoQuí: Correlated Quantum ínterface
+ *
+ * Copyright (c) 2022-2026 Simons Foundation & The CoQuí developer team
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==========================================================================
+ */
+
+/**
+ * Distributed downfold unit test.
+ *
+ * fold_dW_distributed folds the RPA (t,P,Q)-distributed dynamic W to the secondary aux
+ * (N_m x N_m) without gathering any full Np x Np block. The physics tests rarely exercise
+ * the (P,Q) split -- for small systems the RPA puts every rank on t (np_P = np_Q = 1). This
+ * test forces np_P,np_Q > 1 grids (4 ranks = 1 x 1 x 2 x 2) so the (P,Q)-block assembly and
+ * the off-diagonal fold_core_block path are actually driven, and compares the distributed
+ * result to a fully replicated reference (gather dW, tau->nu transform, PH-unfold, fold
+ * each (q,l) on the full Np x Np). Both compute the same sums in a different order, so
+ * they agree to <= 1e-12.
+ *
+ * At 1 rank the grid is 1x1x1x1 (one (P,Q) block == the whole array) -- the distributed
+ * path reduces to the replicated fold and must be bit-identical. At 4 ranks the forced
+ * 1x1x2x2 grid genuinely splits P and Q; each rank owns a P_bs x Q_bs block and the
+ * off-diagonal blocks use fold_core_block(t(:,P_range), t(:,Q_range), ...).
+ */
+
+#undef NDEBUG
+
+#include <vector>
+
+#include "catch2/catch.hpp"
+
+#include "mpi3/environment.hpp"
+#include "mpi3/communicator.hpp"
+
+#include "configuration.hpp"
+#include "IO/AppAbort.hpp"
+#include "IO/app_loggers.h"
+#include "utilities/proc_grid_partition.hpp"
+
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+#include "numerics/distributed_array/nda.hpp"
+#include "utilities/test_common.hpp"
+
+#include "methods/vertex/vertex_secondary_fold.hpp"
+#include "methods/vertex/vertex_t.h"   // vertex_w0_detail::extract_nu0_row
+
+namespace bdft_tests {
+
+using namespace math::nda;
+template <int Rank> using shape_t = std::array<long, Rank>;
+
+// deterministic, distribution-independent global tau-domain value dW(q,t,P,Q).
+static ComplexType dwref(long q, long t, long P, long Q, long Np) {
+  double re = 0.31 * double(q) + 0.17 * double(t)
+            - 0.11 * double((P * Np + Q) % 13) + 0.07 * double((Q * 3 + P) % 11);
+  double im = 0.13 * double((q * 5 + t) % 7) - 0.19 * double((P + 2 * Q) % 9)
+            + 0.05 * double(t);
+  return ComplexType(re, im);
+}
+
+// deterministic downfold map t(q)(m, P).
+static ComplexType tref(long q, long m, long P) {
+  double re = 0.4 * std::cos(0.37 * double(m) + 0.11 * double(P) - 0.23 * double(q));
+  double im = 0.4 * std::sin(0.29 * double(P) - 0.19 * double(m) + 0.31 * double(q));
+  return ComplexType(re, im);
+}
+
+// deterministic rank-1-free head H(P,Q) (added at q = iq_gamma, weight w_head(t)).
+static ComplexType href(long P, long Q, long Np) {
+  double re = 0.09 * double((P * 7 + Q) % 5) - 0.03 * double((Q + Np) % 4);
+  double im = 0.06 * double((P + 3 * Q) % 6);
+  return ComplexType(re, im);
+}
+static double whead(long t) { return 0.5 - 0.02 * double(t); }
+
+// deterministic tau -> nu PH-symmetric transform matrix Twt(nw_half, nt_half).
+static ComplexType twtref(long w, long t) {
+  double re = 0.2 * std::cos(0.51 * double(w) - 0.13 * double(t));
+  double im = 0.2 * std::sin(0.23 * double(t) + 0.17 * double(w));
+  return ComplexType(re, im);
+}
+
+// replicated reference fold: out(m,n) = [t A t^dag](m,n) (the two-gemm fold_core the
+// distributed path must reproduce; kept local so the test does not depend on the .cpp-only
+// fold_core symbol -- only the header's fold_core_block / fold_dW_distributed are tested).
+static void ref_fold(nda::array_view<ComplexType, 2> t_mP,
+                     nda::array_view<ComplexType, 2> A_PQ,
+                     nda::array_view<ComplexType, 2> out_mn) {
+  const long Nm = t_mP.shape(0), Np = t_mP.shape(1);
+  nda::array<ComplexType, 2> tmp(Nm, Np);
+  nda::blas::gemm(t_mP, A_PQ, tmp);
+  nda::blas::gemm(tmp, nda::dagger(t_mP), out_mn);
+}
+
+TEST_CASE("vertex_dfold_distributed", "[methods][vertex][dfold]") {
+  using methods::solvers::vertex_secondary_detail::fold_dW_distributed;
+  using methods::solvers::vertex_secondary_detail::fold_core_block;
+  auto world = boost::mpi3::environment::get_world_instance();
+  const long P = world.size();
+  decltype(nda::range::all) all;
+
+  // small dims (the point is the (P,Q) split, not scale). Np >= 2 so 1x1x2x2 is legal.
+  const long nq = 3, nt_half = 4, nw_half = 4, nw_b = 2 * nw_half, Np = 6, Nm = 3;
+  const long iq_gamma = 1;
+  const bool head_at_gamma = true;
+
+  // PH-unfold map: index layout [0, nw_half) = negative nu (mirror of the upper half),
+  // [nw_half, nw_b) = non-negative nu, so nw_b/2 == nw_half and lpos = max(l, mirror(l)) -
+  // nw_b/2 lands in [0, nw_half) for both halves (mirror(l) = nw_b - 1 - l).
+  nda::array<long, 1> w_mirror_b(nw_b);
+  for (long l = 0; l < nw_b; ++l) w_mirror_b(l) = nw_b - 1 - l;
+
+  // replicated downfold maps t(q)(m, P).
+  nda::array<ComplexType, 3> t_qmP(nq, Nm, Np);
+  for (long q = 0; q < nq; ++q)
+    for (long m = 0; m < Nm; ++m)
+      for (long jp = 0; jp < Np; ++jp) t_qmP(q, m, jp) = tref(q, m, jp);
+
+  // head + transform closures (identical arithmetic to the reference below). Shared by
+  // every grid variant -- the distributed result must not depend on the layout.
+  auto head_add = [&](nda::MemoryArrayOfRank<2> auto&& W_bt_block, long it,
+                      nda::range const& P_rng, nda::range const& Q_rng) {
+    for (long ip = P_rng.first(); ip < P_rng.last(); ++ip)
+      for (long jq = Q_rng.first(); jq < Q_rng.last(); ++jq)
+        W_bt_block(ip - P_rng.first(), jq - Q_rng.first()) +=
+            ComplexType(whead(it)) * href(ip, jq, Np);
+  };
+  auto xform = [&](nda::MemoryArrayOfRank<3> auto&& W_bt_block,
+                   nda::MemoryArrayOfRank<3> auto&& W_bw_block) {
+    // W_bw(w,P,Q) = sum_t Twt(w,t) W_bt(t,P,Q); deterministic linear tau->nu stand-in.
+    const long pbs = W_bt_block.shape(1), qbs = W_bt_block.shape(2);
+    W_bw_block() = ComplexType(0.0);
+    for (long w = 0; w < nw_half; ++w)
+      for (long tt = 0; tt < nt_half; ++tt) {
+        ComplexType c = twtref(w, tt);
+        for (long ip = 0; ip < pbs; ++ip)
+          for (long jq = 0; jq < qbs; ++jq)
+            W_bw_block(w, ip, jq) += c * W_bt_block(tt, ip, jq);
+      }
+  };
+
+  // --- REPLICATED reference: full Np x Np gather + head + xform + PH-unfold + fold ------
+  nda::array<ComplexType, 4> Wbar_ref(nq, nw_b, Nm, Nm);
+  Wbar_ref() = ComplexType(0.0);
+  {
+    // full tau-domain dW, replicated (small; reference only).
+    nda::array<ComplexType, 4> W_qtPQ(nq, nt_half, Np, Np);
+    for (long q = 0; q < nq; ++q)
+      for (long t = 0; t < nt_half; ++t)
+        for (long ip = 0; ip < Np; ++ip)
+          for (long jq = 0; jq < Np; ++jq)
+            W_qtPQ(q, t, ip, jq) = dwref(q, t, ip, jq, Np);
+    // head at iq_gamma over all t (full Np x Np).
+    if (head_at_gamma)
+      for (long t = 0; t < nt_half; ++t)
+        for (long ip = 0; ip < Np; ++ip)
+          for (long jq = 0; jq < Np; ++jq)
+            W_qtPQ(iq_gamma, t, ip, jq) += ComplexType(whead(t)) * href(ip, jq, Np);
+
+    nda::array<ComplexType, 3> W_wpos(nw_half, Np, Np);
+    for (long q = 0; q < nq; ++q) {
+      // tau -> nu (same Twt as xform).
+      W_wpos() = ComplexType(0.0);
+      for (long w = 0; w < nw_half; ++w)
+        for (long tt = 0; tt < nt_half; ++tt) {
+          ComplexType c = twtref(w, tt);
+          for (long ip = 0; ip < Np; ++ip)
+            for (long jq = 0; jq < Np; ++jq)
+              W_wpos(w, ip, jq) += c * W_qtPQ(q, tt, ip, jq);
+        }
+      auto t_q = t_qmP(q, all, all);
+      for (long l = 0; l < nw_b; ++l) {
+        const long lpos = std::max(l, w_mirror_b(l)) - nw_b / 2;
+        ref_fold(t_q, W_wpos(lpos, all, all), Wbar_ref(q, l, all, all));
+      }
+    }
+  }
+
+  // --- run the DISTRIBUTED downfold on several forced grids, compare to the reference ---
+  // The q axis is never split (grid[0] = 1). We exercise, for the current rank count P:
+  //   - the 1x1xnp_Pxnp_Q "(P,Q)-split" grid, and
+  //   - grids that ALSO split t (grid[1] > 1), driving the t-pool block-assembly all_reduce
+  //     together with the (P,Q) fold.
+  // Each grid axis must divide P and be <= its global extent (t <= nt_half, P/Q <= Np).
+  using larray = nda::array<ComplexType, 4>;
+  auto run_grid = [&](shape_t<4> grid) {
+    auto dW = make_distributed_array<larray>(world, grid, {nq, nt_half, Np, Np}, {1, 1, 1, 1});
+    auto loc = dW.local();
+    auto [q0, t0, P0, Q0] = dW.origin();
+    auto ls = dW.local_shape();
+    for (long iq = 0; iq < ls[0]; ++iq)
+      for (long it = 0; it < ls[1]; ++it)
+        for (long ip = 0; ip < ls[2]; ++ip)
+          for (long jq = 0; jq < ls[3]; ++jq)
+            loc(iq, it, ip, jq) = dwref(q0 + iq, t0 + it, P0 + ip, Q0 + jq, Np);
+
+    nda::array<ComplexType, 4> Wbar_dist(nq, nw_b, Nm, Nm);
+    fold_dW_distributed(dW, t_qmP, nq, nt_half, Np, Nm, nw_b, nw_half, w_mirror_b,
+                        iq_gamma, head_at_gamma, head_add, xform, Wbar_dist, world);
+
+    double worst = 0.0;
+    for (long q = 0; q < nq; ++q)
+      for (long l = 0; l < nw_b; ++l)
+        for (long m = 0; m < Nm; ++m)
+          for (long n = 0; n < Nm; ++n)
+            worst = std::max(worst,
+                             std::abs(Wbar_dist(q, l, m, n) - Wbar_ref(q, l, m, n)));
+    world.all_reduce_in_place_n(&worst, 1, boost::mpi3::max<>{});
+    if (world.root())
+      app_log(1, "vertex_dfold_distributed[P={} grid=(q,t,P,Q)=({},{},{},{})]: distributed "
+                 "downfold == replicated reference (max|diff| = {:.3e}).",
+              P, grid[0], grid[1], grid[2], grid[3], worst);
+    return worst;
+  };
+
+  // enumerate legal grids {1, nt, nP, nQ} with nt*nP*nQ == P, nt <= nt_half, nP,nQ <= Np.
+  std::vector<shape_t<4>> grids;
+  for (long nt = 1; nt <= P; ++nt) {
+    if (P % nt != 0 or nt > nt_half) continue;
+    long rem = P / nt;
+    for (long nP = 1; nP <= rem; ++nP) {
+      if (rem % nP != 0) continue;
+      long nQ = rem / nP;
+      if (nP > Np or nQ > Np) continue;
+      grids.push_back({1, nt, nP, nQ});
+    }
+  }
+  REQUIRE(not grids.empty());   // at least the fully-P-split grid is always legal here
+  // the (P,Q)-split grid (t unsplit) is present whenever P factors into nP*nQ with nP,nQ <= Np.
+  bool worst_ok = true;
+  for (auto const& g : grids) worst_ok = worst_ok and (run_grid(g) <= 1e-12);
+  REQUIRE(worst_ok);
+
+  // fold_core_block sanity: on a DIAGONAL block (t_qP == t_qQ) it must equal the plain
+  // two-gemm fold (same gemms, same order -> bit-identical).
+  SECTION("fold_core_block_diag_equals_fold") {
+    nda::array<ComplexType, 2> A(Np, Np);
+    for (long ip = 0; ip < Np; ++ip)
+      for (long jq = 0; jq < Np; ++jq) A(ip, jq) = dwref(0, 0, ip, jq, Np);
+    auto t_q = t_qmP(0, all, all);
+    nda::array<ComplexType, 2> tmpA(Nm, Np), o1(Nm, Nm), o2(Nm, Nm);
+    ref_fold(t_q, A, o1);
+    fold_core_block(t_q, t_q, A, tmpA, o2);
+    double d = 0.0;
+    for (long m = 0; m < Nm; ++m)
+      for (long n = 0; n < Nm; ++n) d = std::max(d, std::abs(o1(m, n) - o2(m, n)));
+    REQUIRE(d == 0.0);
+  }
+}
+
+// deterministic, distribution-independent global bare-core value Z(q,P,Q). Reuses dwref at a
+// fixed tau slice so the Z fold shares the harness's value generator (Z has no t axis).
+static ComplexType zref(long q, long P, long Q, long Np) { return dwref(q, 0, P, Q, Np); }
+
+/**
+ * Distributed downfold of the bare core Z (fold_Z_distributed) unit test.
+ * fold_Z_distributed folds the (q,P,Q)-distributed Z to the secondary aux (N_m x N_m) without
+ * gathering any full Np x Np block. The physics tests rarely exercise the (P,Q) split (for
+ * small systems the dZ grid is {1,1,1}). This test forces {1, nP, nQ} grids that split P and Q
+ * (4 ranks: 1x2x2, 1x1x4, 1x4x1) so the (P,Q)-block off-diagonal fold_core_block path is
+ * driven, and compares to a fully replicated reference (gather Z, fold each q on the full
+ * Np x Np). The two must agree to <= 1e-12. At 1 rank the grid is 1x1x1 (one (P,Q) block ==
+ * the whole array) and the distributed path reduces to the replicated fold bit-identically.
+ */
+TEST_CASE("vertex_zfold_distributed", "[methods][vertex][dfold]") {
+  using methods::solvers::vertex_secondary_detail::fold_Z_distributed;
+  auto world = boost::mpi3::environment::get_world_instance();
+  const long P = world.size();
+  decltype(nda::range::all) all;
+
+  const long nq = 3, Np = 6, Nm = 3;
+  const long iq_gamma = 1;
+  const bool head_at_gamma = true;
+
+  // replicated downfold maps t(q)(m, P).
+  nda::array<ComplexType, 3> t_qmP(nq, Nm, Np);
+  for (long q = 0; q < nq; ++q)
+    for (long m = 0; m < Nm; ++m)
+      for (long jp = 0; jp < Np; ++jp) t_qmP(q, m, jp) = tref(q, m, jp);
+
+  // head_add closure: adds the head BLOCK H(P,Q) into the gamma block in place (bare piece,
+  // weight 1 -- mirrors the production Z(iq_gamma) += H_PQ). Layout-independent.
+  auto head_add = [&](nda::MemoryArrayOfRank<2> auto&& A_PQ_block,
+                      nda::range const& P_rng, nda::range const& Q_rng) {
+    for (long ip = P_rng.first(); ip < P_rng.last(); ++ip)
+      for (long jq = Q_rng.first(); jq < Q_rng.last(); ++jq)
+        A_PQ_block(ip - P_rng.first(), jq - Q_rng.first()) += href(ip, jq, Np);
+  };
+
+  // --- REPLICATED reference: full Np x Np gather + head + fold_core each q -----------------
+  nda::array<ComplexType, 3> Zbar_ref(nq, Nm, Nm);
+  Zbar_ref() = ComplexType(0.0);
+  {
+    nda::array<ComplexType, 2> A(Np, Np);
+    for (long q = 0; q < nq; ++q) {
+      for (long ip = 0; ip < Np; ++ip)
+        for (long jq = 0; jq < Np; ++jq) A(ip, jq) = zref(q, ip, jq, Np);
+      if (head_at_gamma and q == iq_gamma)
+        for (long ip = 0; ip < Np; ++ip)
+          for (long jq = 0; jq < Np; ++jq) A(ip, jq) += href(ip, jq, Np);
+      ref_fold(t_qmP(q, all, all), A, Zbar_ref(q, all, all));
+    }
+  }
+
+  // --- run the DISTRIBUTED downfold on several forced {1, nP, nQ} grids (q NEVER split) ----
+  using larray = nda::array<ComplexType, 3>;
+  auto run_grid = [&](shape_t<3> grid) {
+    auto dZ = make_distributed_array<larray>(world, grid, {nq, Np, Np}, {1, 1, 1});
+    auto loc = dZ.local();
+    auto [q0, P0, Q0] = dZ.origin();
+    auto ls = dZ.local_shape();
+    for (long iq = 0; iq < ls[0]; ++iq)
+      for (long ip = 0; ip < ls[1]; ++ip)
+        for (long jq = 0; jq < ls[2]; ++jq)
+          loc(iq, ip, jq) = zref(q0 + iq, P0 + ip, Q0 + jq, Np);
+
+    nda::array<ComplexType, 3> Zbar_dist(nq, Nm, Nm);
+    fold_Z_distributed(dZ, t_qmP, nq, Np, Nm, iq_gamma, head_at_gamma, head_add,
+                       Zbar_dist, world);
+
+    double worst = 0.0;
+    for (long q = 0; q < nq; ++q)
+      for (long m = 0; m < Nm; ++m)
+        for (long n = 0; n < Nm; ++n)
+          worst = std::max(worst, std::abs(Zbar_dist(q, m, n) - Zbar_ref(q, m, n)));
+    world.all_reduce_in_place_n(&worst, 1, boost::mpi3::max<>{});
+    if (world.root())
+      app_log(1, "vertex_zfold_distributed[P={} grid=(q,P,Q)=({},{},{})]: distributed "
+                 "downfold == replicated reference (max|diff| = {:.3e}).",
+              P, grid[0], grid[1], grid[2], worst);
+    return worst;
+  };
+
+  // enumerate legal grids {1, nP, nQ} with nP*nQ == P, nP,nQ <= Np. At 4 ranks this is
+  // exactly {1,2,2}, {1,1,4}, {1,4,1}.
+  std::vector<shape_t<3>> grids;
+  for (long nP = 1; nP <= P; ++nP) {
+    if (P % nP != 0) continue;
+    long nQ = P / nP;
+    if (nP > Np or nQ > Np) continue;
+    grids.push_back({1, nP, nQ});
+  }
+  REQUIRE(not grids.empty());
+  bool worst_ok = true;
+  for (auto const& g : grids) worst_ok = worst_ok and (run_grid(g) <= 1e-12);
+  REQUIRE(worst_ok);
+}
+
+/**
+ * Static vertex: the W0 one-row distributed build + fold.
+ *
+ * The W0 build has to bridge two different (P,Q) block layouts: the RPA polarizability
+ * lives on {nt_procs, 1, np_P, np_Q} (see rpa_pi.icc), whose (P,Q) partition covers only
+ * np_P*np_Q ranks, while W0 must be (P,Q)-block-distributed over all ranks with q unsplit
+ * (the thc.dZ({1,nP,nQ}) layout fold_Z_distributed and the slate 2D ops both take). The
+ * physics tests rarely split (P,Q) -- for small systems the RPA puts every rank on t.
+ * This case forces both splits:
+ *   (a) vertex_w0_detail::extract_nu0_row on every legal SOURCE grid {1, nt, nP, nQ} into
+ *       every legal OUTPUT grid {1, 1, nP', nQ'} vs a replicated sum_t R(t) Pi(t,q,P,Q);
+ *   (b) fold_Z_distributed of that i.nu = 0 row (the "one-row variant" of the dW fold --
+ *       W0 has exactly Z's shape, so the fold IS fold_Z_distributed) vs the replicated
+ *       two-gemm t W0 t^dag.
+ * Both to <= 1e-12; bit-identical at 1 rank (one (P,Q) block == the whole array).
+ */
+TEST_CASE("vertex_w0_row_fold_distributed", "[methods][vertex][dfold][w0]") {
+  using methods::solvers::vertex_secondary_detail::fold_Z_distributed;
+  using methods::solvers::vertex_w0_detail::extract_nu0_row;
+  auto world = boost::mpi3::environment::get_world_instance();
+  const long P = world.size();
+  decltype(nda::range::all) all;
+
+  // same toy dims as the folds above (the point is the two (P,Q) splits, not scale)
+  const long nq = 3, nt_half = 4, Np = 6, Nm = 3;
+  const long iq_gamma = 1;
+
+  // deterministic i.nu = 0 transform row (stands in for nu0_transform_row; the identity
+  // "that row == index 0 of tau_to_w_PHsym" is tested separately by
+  // test_vertex_w0.cpp::vertex_w0_transform_row).
+  nda::array<ComplexType, 1> R_t(nt_half);
+  for (long t = 0; t < nt_half; ++t) R_t(t) = twtref(0, t);
+
+  // replicated downfold maps t(q)(m, P).
+  nda::array<ComplexType, 3> t_qmP(nq, Nm, Np);
+  for (long q = 0; q < nq; ++q)
+    for (long m = 0; m < Nm; ++m)
+      for (long jp = 0; jp < Np; ++jp) t_qmP(q, m, jp) = tref(q, m, jp);
+
+  // --- REPLICATED reference: the i.nu = 0 row, then the full Np x Np fold -------------
+  nda::array<ComplexType, 3> W0_ref(nq, Np, Np);
+  nda::array<ComplexType, 3> W0bar_ref(nq, Nm, Nm);
+  {
+    W0_ref() = ComplexType(0.0);
+    for (long q = 0; q < nq; ++q)
+      for (long t = 0; t < nt_half; ++t)
+        for (long ip = 0; ip < Np; ++ip)
+          for (long jq = 0; jq < Np; ++jq)
+            W0_ref(q, ip, jq) += R_t(t) * dwref(q, t, ip, jq, Np);
+    for (long q = 0; q < nq; ++q)
+      ref_fold(t_qmP(q, all, all), W0_ref(q, all, all), W0bar_ref(q, all, all));
+  }
+
+  using larray4 = nda::array<ComplexType, 4>;
+  using larray3 = nda::array<ComplexType, 3>;
+  auto run_grids = [&](shape_t<4> src_grid, shape_t<3> out_grid) {
+    // source: the RPA-class tau-domain array on {1(q), nt, nP, nQ} -- NOTE the axis order
+    // the production Pi carries is (t, q, P, Q), so the "q unsplit" axis is axis 1 there;
+    // here we drive the general routine, which makes no assumption about the source grid.
+    auto dPi = make_distributed_array<larray4>(world, src_grid, {nt_half, nq, Np, Np},
+                                               {1, 1, 1, 1});
+    {
+      auto loc = dPi.local();
+      auto [t0, q0, P0, Q0] = dPi.origin();
+      auto ls = dPi.local_shape();
+      for (long it = 0; it < ls[0]; ++it)
+        for (long iq = 0; iq < ls[1]; ++iq)
+          for (long ip = 0; ip < ls[2]; ++ip)
+            for (long jq = 0; jq < ls[3]; ++jq)
+              loc(it, iq, ip, jq) = dwref(q0 + iq, t0 + it, P0 + ip, Q0 + jq, Np);
+    }
+
+    // (a) the i.nu = 0 row on the {1, 1, nP', nQ'} layout
+    shape_t<4> row_grid = {1, 1, out_grid[1], out_grid[2]};
+    auto dW0_1q = make_distributed_array<larray4>(world, row_grid, {1, nq, Np, Np},
+                                                  {1, 1, 1, 1});
+    extract_nu0_row(dPi, R_t, dW0_1q);
+
+    double worst_row = 0.0;
+    {
+      auto loc = dW0_1q.local();
+      auto Pr = dW0_1q.local_range(2);
+      auto Qr = dW0_1q.local_range(3);
+      for (long iq = 0; iq < nq; ++iq)
+        for (long ip = 0; ip < loc.shape(2); ++ip)
+          for (long jq = 0; jq < loc.shape(3); ++jq)
+            worst_row = std::max(worst_row,
+                                 std::abs(loc(0, iq, ip, jq) -
+                                          W0_ref(iq, Pr.first() + ip, Qr.first() + jq)));
+    }
+    world.all_reduce_in_place_n(&worst_row, 1, boost::mpi3::max<>{});
+
+    // (b) the one-row fold. The 3D W0 handle the production code builds must share the
+    //     (P,Q) partition of the rank-4 row above -- that is the assumption build_w0
+    //     relies on when it copies Z + dW0 into the {1, nP, nQ} array, so assert it.
+    auto dW0 = make_distributed_array<larray3>(world, out_grid, {nq, Np, Np}, {1, 1, 1});
+    REQUIRE(dW0.local_range(1) == dW0_1q.local_range(2));
+    REQUIRE(dW0.local_range(2) == dW0_1q.local_range(3));
+    dW0.local() = dW0_1q.local()(0, nda::ellipsis{});
+
+    nda::array<ComplexType, 3> W0bar_dist(nq, Nm, Nm);
+    auto no_head = [](nda::MemoryArrayOfRank<2> auto&&, nda::range const&,
+                      nda::range const&) {};
+    fold_Z_distributed(dW0, t_qmP, nq, Np, Nm, iq_gamma, false, no_head, W0bar_dist, world);
+
+    double worst_fold = 0.0;
+    for (long q = 0; q < nq; ++q)
+      for (long m = 0; m < Nm; ++m)
+        for (long n = 0; n < Nm; ++n)
+          worst_fold = std::max(worst_fold,
+                                std::abs(W0bar_dist(q, m, n) - W0bar_ref(q, m, n)));
+    world.all_reduce_in_place_n(&worst_fold, 1, boost::mpi3::max<>{});
+
+    if (world.root())
+      app_log(1, "vertex_w0_row_fold_distributed[P={} src=({},{},{},{}) out=({},{},{})]: "
+                 "max|row - ref| = {:.3e}, max|W0bar - t W0 t^dag| = {:.3e}",
+              P, src_grid[0], src_grid[1], src_grid[2], src_grid[3],
+              out_grid[0], out_grid[1], out_grid[2], worst_row, worst_fold);
+    return std::max(worst_row, worst_fold);
+  };
+
+  // legal SOURCE grids {1(t-unsplit-allowed), nt, nP, nQ}: the RPA layout is
+  // {nt, 1, nP, nQ}, i.e. t on axis 0 and q unsplit, so enumerate exactly that shape.
+  std::vector<shape_t<4>> src_grids;
+  for (long nt = 1; nt <= P; ++nt) {
+    if (P % nt != 0 or nt > nt_half) continue;
+    long rem = P / nt;
+    for (long nP = 1; nP <= rem; ++nP) {
+      if (rem % nP != 0) continue;
+      long nQ = rem / nP;
+      if (nP > Np or nQ > Np) continue;
+      src_grids.push_back({nt, 1, nP, nQ});
+    }
+  }
+  // legal OUTPUT grids {1, nP', nQ'} with nP'*nQ' == P (fold_Z_distributed's requirement)
+  std::vector<shape_t<3>> out_grids;
+  for (long nP = 1; nP <= P; ++nP) {
+    if (P % nP != 0) continue;
+    long nQ = P / nP;
+    if (nP > Np or nQ > Np) continue;
+    out_grids.push_back({1, nP, nQ});
+  }
+  REQUIRE(not src_grids.empty());
+  REQUIRE(not out_grids.empty());
+
+  bool ok = true;
+  for (auto const& sg : src_grids)
+    for (auto const& og : out_grids) ok = ok and (run_grids(sg, og) <= 1e-12);
+  REQUIRE(ok);
+}
+
+// deterministic replicated secondary-aux value Pibar(w, q, m, n) (partial-summed already;
+// here we drive the block-upfold with the FULL Pibar to mirror the production all_reduce).
+static ComplexType pbref(long w, long q, long m, long n) {
+  double re = 0.23 * double(w) + 0.15 * double(q)
+            - 0.09 * double((m * 5 + n) % 7) + 0.06 * double((n * 3 + m) % 5);
+  double im = 0.11 * double((w * 2 + q) % 6) - 0.14 * double((m + 2 * n) % 4)
+            + 0.04 * double(w);
+  return ComplexType(re, im);
+}
+
+// replicated reference UPFOLD: out(P,Q) = [t^dag Pibar t](P,Q) (the two-gemm upfold_core the
+// distributed block path must reproduce).
+static void ref_upfold(nda::array_view<ComplexType, 2> t_mP,
+                       nda::array_view<ComplexType, 2> Pi_mn,
+                       nda::array_view<ComplexType, 2> out_PQ) {
+  const long Nm = t_mP.shape(0), Np = t_mP.shape(1);
+  nda::array<ComplexType, 2> tmp(Np, Nm);
+  nda::blas::gemm(nda::dagger(t_mP), Pi_mn, tmp);
+  nda::blas::gemm(tmp, t_mP, out_PQ);
+}
+
+/**
+ * Distributed block-upfold unit test (adjoint of vertex_dfold_distributed; eval_Pi_C secondary
+ * path). upfold_core_block upfolds the secondary-aux Pi (N_m x N_m) to the global aux (Np x Np)
+ * one (P,Q) block at a time, so the full Np x Np upfold partial is never materialized. The
+ * physics tests rarely exercise the (P,Q) split; this test forces {1(w), 1(q), nP, nQ} grids
+ * (4 ranks: 1x1x2x2, 1x1x1x4, 1x1x4x1) that split P and Q, upfolds each rank's owned block from
+ * the replicated Pibar with upfold_core_block, and compares the distributed result to a fully
+ * replicated reference (two-gemm upfold on the full Np x Np). The two must agree to <= 1e-12.
+ * At 1 rank the grid is 1x1x1x1 (one (P,Q) block == the whole array) and the distributed block
+ * path reduces to the replicated upfold bit-identically.
+ */
+TEST_CASE("vertex_upfold_distributed", "[methods][vertex][dfold]") {
+  using methods::solvers::vertex_secondary_detail::upfold_core_block;
+  auto world = boost::mpi3::environment::get_world_instance();
+  const long P = world.size();
+  decltype(nda::range::all) all;
+
+  const long nw_b = 4, nq = 3, Np = 6, Nm = 3;
+
+  // replicated downfold maps t(q)(m, P).
+  nda::array<ComplexType, 3> t_qmP(nq, Nm, Np);
+  for (long q = 0; q < nq; ++q)
+    for (long m = 0; m < Nm; ++m)
+      for (long jp = 0; jp < Np; ++jp) t_qmP(q, m, jp) = tref(q, m, jp);
+
+  // replicated secondary-aux Pibar(w, q, m, n) (mirrors the production all_reduced partial).
+  nda::array<ComplexType, 4> Pibar_wqmn(nw_b, nq, Nm, Nm);
+  for (long w = 0; w < nw_b; ++w)
+    for (long q = 0; q < nq; ++q)
+      for (long m = 0; m < Nm; ++m)
+        for (long n = 0; n < Nm; ++n) Pibar_wqmn(w, q, m, n) = pbref(w, q, m, n);
+
+  // --- REPLICATED reference: full Np x Np upfold each (w,q) with upfold_core -----------------
+  nda::array<ComplexType, 4> Pi_up_ref(nw_b, nq, Np, Np);
+  Pi_up_ref() = ComplexType(0.0);
+  for (long q = 0; q < nq; ++q)
+    for (long w = 0; w < nw_b; ++w)
+      ref_upfold(t_qmP(q, all, all), Pibar_wqmn(w, q, all, all), Pi_up_ref(w, q, all, all));
+
+  // --- run the DISTRIBUTED block-upfold on forced {1, 1, nP, nQ} grids (w,q NEVER split) -----
+  // Every rank all_reduces the (small) Pibar (here already replicated -- exercises the call),
+  // then upfolds ONLY its owned (P,Q) block into dPi.local() via upfold_core_block.
+  using larray = nda::array<ComplexType, 4>;
+  auto run_grid = [&](shape_t<4> grid) {
+    // all_reduce the replicated Pibar (production step 1: linear -> commutes with rank sum).
+    nda::array<ComplexType, 4> Pibar = Pibar_wqmn;
+    world.all_reduce_in_place_n(Pibar.data(), Pibar.size(), std::plus<>{});
+    Pibar /= ComplexType(double(P));   // undo the P-fold replication so the value is unchanged
+
+    auto dPi = make_distributed_array<larray>(world, grid, {nw_b, nq, Np, Np}, {1, 1, 1, 1});
+    REQUIRE(dPi.grid()[1] == 1);       // q axis must not be split (production invariant)
+    auto P_range = dPi.local_range(2);
+    auto Q_range = dPi.local_range(3);
+    const long P_bs = dPi.local_shape()[2], Q_bs = dPi.local_shape()[3];
+    nda::array<ComplexType, 2> tmp(P_bs, Nm);
+    for (long iq = 0; iq < nq; ++iq) {
+      auto t_q = t_qmP(iq, all, all);
+      auto t_qP = t_q(all, P_range);
+      auto t_qQ = t_q(all, Q_range);
+      for (long w = 0; w < nw_b; ++w)
+        upfold_core_block(t_qP, t_qQ, Pibar(w, iq, all, all), tmp,
+                          dPi.local()(w, iq, all, all));
+    }
+
+    // compare my owned block to the replicated reference (each rank owns a disjoint block).
+    double worst = 0.0;
+    for (long w = 0; w < nw_b; ++w)
+      for (long q = 0; q < nq; ++q)
+        for (long ip = 0; ip < P_bs; ++ip)
+          for (long jq = 0; jq < Q_bs; ++jq)
+            worst = std::max(worst,
+                             std::abs(dPi.local()(w, q, ip, jq) -
+                                      Pi_up_ref(w, q, P_range.first() + ip, Q_range.first() + jq)));
+    world.all_reduce_in_place_n(&worst, 1, boost::mpi3::max<>{});
+    if (world.root())
+      app_log(1, "vertex_upfold_distributed[P={} grid=(w,q,P,Q)=({},{},{},{})]: distributed "
+                 "block-upfold == replicated reference (max|diff| = {:.3e}).",
+              P, grid[0], grid[1], grid[2], grid[3], worst);
+    return worst;
+  };
+
+  // enumerate legal grids {1, 1, nP, nQ} with nP*nQ == P, nP,nQ <= Np. At 4 ranks this is
+  // {1,1,2,2}, {1,1,1,4}, {1,1,4,1}.
+  std::vector<shape_t<4>> grids;
+  for (long nP = 1; nP <= P; ++nP) {
+    if (P % nP != 0) continue;
+    long nQ = P / nP;
+    if (nP > Np or nQ > Np) continue;
+    grids.push_back({1, 1, nP, nQ});
+  }
+  REQUIRE(not grids.empty());
+  bool worst_ok = true;
+  for (auto const& g : grids) worst_ok = worst_ok and (run_grid(g) <= 1e-12);
+  REQUIRE(worst_ok);
+
+  // upfold_core_block sanity: on a DIAGONAL FULL-range block (t_qP == t_qQ == full t(q)) it
+  // must equal the plain two-gemm upfold_core (same gemms, same order -> bit-identical).
+  SECTION("upfold_core_block_diag_equals_upfold") {
+    nda::array<ComplexType, 2> Pi(Nm, Nm);
+    for (long m = 0; m < Nm; ++m)
+      for (long n = 0; n < Nm; ++n) Pi(m, n) = pbref(0, 0, m, n);
+    auto t_q = t_qmP(0, all, all);
+    nda::array<ComplexType, 2> tmpA(Np, Nm), o1(Np, Np), o2(Np, Np);
+    ref_upfold(t_q, Pi, o1);
+    upfold_core_block(t_q, t_q, Pi, tmpA, o2);
+    double d = 0.0;
+    for (long ip = 0; ip < Np; ++ip)
+      for (long jq = 0; jq < Np; ++jq) d = std::max(d, std::abs(o1(ip, jq) - o2(ip, jq)));
+    REQUIRE(d == 0.0);
+  }
+}
+
+} // namespace bdft_tests

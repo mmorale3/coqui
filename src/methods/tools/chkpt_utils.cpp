@@ -19,10 +19,31 @@
  */
 
 
+#include <chrono>
+#include <cstdlib>
+
+#include "IO/app_loggers.h"
+#include "utilities/h5_background_writer.hpp"
 #include "chkpt_utils.h"
+#include "utilities/blas_threads.hpp"
+#include "utilities/omp_threads.hpp"
 
 namespace methods {
   namespace chkpt {
+
+/**
+ * Off by default: the background writer is only correct as long as every other
+ * HDF5 call in the process joins it first (see h5_background_writer.hpp), so it
+ * is opt-in. COQUI_ASYNC_CHKPT=1 turns it on; the synchronous path is used
+ * otherwise.
+ */
+bool async_checkpoint_enabled() {
+  static const bool on = []() {
+    const char* v = std::getenv("COQUI_ASYNC_CHKPT");
+    return v != nullptr and std::strtol(v, nullptr, 10) != 0;
+  }();
+  return on;
+}
 
 template<typename communicator_t>
 void write_metadata(communicator_t &comm, const mf::MF &mf, const imag_axes_ft::IAFT &ft,
@@ -31,6 +52,7 @@ void write_metadata(communicator_t &comm, const mf::MF &mf, const imag_axes_ft::
                      std::string output) {
   if (comm.root()) {
     std::string filename = output + ".mbpt.h5";
+    utils::h5_quiesce();  // see h5_background_writer.hpp
     h5::file file(filename, 'w');
     h5::group grp(file);
 
@@ -58,6 +80,18 @@ void write_metadata(communicator_t &comm, const mf::MF &mf, const imag_axes_ft::
     auto mf_grp = grp.create_group("mean_field");
     nda::h5_write(mf_grp, "eigvals", mf.eigval(), false);
 
+    // Run parameters: the threading settings travel with the results, so a checkpoint is
+    // self-describing about how it was produced. The settings are read through their
+    // accessors rather than passed through write_metadata's signature.
+    // blas_threads = 0 means "never requested": the library/environment default was in
+    // force (also the implicit setting of checkpoints without this group).
+    auto run_grp = grp.create_group("run_parameters");
+    h5::h5_write(run_grp, "blas_threads", utils::blas_threads());
+    h5::h5_write(run_grp, "blas_threads_backend", utils::blas_threads_backend_name());
+    // CoQui's own OpenMP thread count. omp_threads = 1 is the default (also the implicit
+    // setting of checkpoints without this dataset).
+    h5::h5_write(run_grp, "omp_threads", utils::omp_threads());
+
     auto iaft_grp = grp.create_group("imaginary_fourier_transform");
     std::string iaft_basis = imag_axes_ft::basis_enum_to_string(ft.basis());
     h5::h5_write(iaft_grp, "basis", iaft_basis);
@@ -81,26 +115,68 @@ void dump_scf(communicator_t &comm, long iter,
               const X_t &Dm, const Xt_t &G,
               const X_t &F, const Xt_t &Sigma,
               double mu, std::string output,
-              std::string input_grp, long input_iter) {
+              std::string input_grp, long input_iter, bool force_sync) {
   if (comm.root()) {
-    std::string filename = output + ".mbpt.h5";
-    std::string iter_grp_name = "iter" + std::to_string(iter);
-    h5::file file(filename, 'a');
-    h5::group grp(file);
-    auto scf_grp = (grp.has_subgroup("scf"))? grp.open_group("scf") : grp.create_group("scf");
-    auto iter_grp = (scf_grp.has_subgroup(iter_grp_name) )?
-        scf_grp.open_group(iter_grp_name) : scf_grp.create_group(iter_grp_name);
-
     if (input_iter==-1) input_iter = iter-1;
 
-    h5::h5_write(scf_grp, "final_iter", iter);
-    h5::h5_write(iter_grp, "greens_func_source", input_grp);
-    h5::h5_write(iter_grp, "greens_func_iteration", input_iter);
-    nda::h5_write(iter_grp, "G_tskij", G.local(), false);
-    nda::h5_write(iter_grp, "Sigma_tskij", Sigma.local(), false);
-    nda::h5_write(iter_grp, "F_skij", F.local(), false);
-    nda::h5_write(iter_grp, "Dm_skij", Dm.local(), false);
-    h5::h5_write(iter_grp, "mu", mu);
+    // The write itself, as a self-contained job. When run in the background it
+    // must own its data, so the arrays are taken by value; the copies are made
+    // by the caller below only on the async path.
+    auto do_write = [output, iter, input_grp, input_iter, mu]
+                    (auto const& Dm_l, auto const& G_l, auto const& F_l, auto const& S_l,
+                     bool background) {
+      // No h5_quiesce() here: do_write is what the background thread runs, and
+      // joining from inside it would be a self-join. The caller quiesces.
+      std::string filename = output + ".mbpt.h5";
+      std::string iter_grp_name = "iter" + std::to_string(iter);
+      h5::file file(filename, 'a');
+      h5::group grp(file);
+      auto scf_grp = (grp.has_subgroup("scf"))? grp.open_group("scf") : grp.create_group("scf");
+      auto iter_grp = (scf_grp.has_subgroup(iter_grp_name) )?
+          scf_grp.open_group(iter_grp_name) : scf_grp.create_group(iter_grp_name);
+
+      h5::h5_write(scf_grp, "final_iter", iter);
+      h5::h5_write(iter_grp, "greens_func_source", input_grp);
+      h5::h5_write(iter_grp, "greens_func_iteration", input_iter);
+
+      // The write is serial on this rank and can be large; the per-dataset bandwidth is
+      // reported at log level 3. app_log is not called from the background thread -- it
+      // is not safe to assume the logger is reentrant -- so the timings are only
+      // printed on the synchronous path.
+      auto timed_write = [&](const char* name, auto const& A) {
+        auto t0 = std::chrono::steady_clock::now();
+        nda::h5_write(iter_grp, name, A, false);
+        if (background) return;
+        double dt = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+        double gb = double(A.size())*sizeof(ComplexType)/(1024.0*1024.0*1024.0);
+        app_log(3, "    chkpt {:<12s} {:7.3f} GB in {:7.3f} s  ({:6.2f} GB/s)",
+                name, gb, dt, (dt > 0.0)? gb/dt : 0.0);
+      };
+      timed_write("G_tskij", G_l);
+      timed_write("Sigma_tskij", S_l);
+      timed_write("F_skij", F_l);
+      timed_write("Dm_skij", Dm_l);
+      h5::h5_write(iter_grp, "mu", mu);
+    };
+
+    if (async_checkpoint_enabled() and not force_sync) {
+      // Snapshot, then write off the critical path. The in-memory copy is much
+      // cheaper than the file-system write, and it is what lets the solvers
+      // overwrite G/Sigma in the next iteration while the previous one is still
+      // on its way to disk.
+      nda::array<ComplexType, 4> Dm_c = Dm.local();
+      nda::array<ComplexType, 5> G_c  = G.local();
+      nda::array<ComplexType, 4> F_c  = F.local();
+      nda::array<ComplexType, 5> S_c  = Sigma.local();
+      utils::h5_background_writer::instance().submit(
+          [do_write, Dm_c = std::move(Dm_c), G_c = std::move(G_c),
+           F_c = std::move(F_c), S_c = std::move(S_c)]() mutable {
+            do_write(Dm_c, G_c, F_c, S_c, true);
+          });
+    } else {
+      utils::h5_quiesce();
+      do_write(Dm.local(), G.local(), F.local(), Sigma.local(), false);
+    }
   }
   comm.barrier();
 }
@@ -113,6 +189,7 @@ void dump_scf(communicator_t &comm, long iter,
   if (comm.root()) {
     std::string filename = output + ".mbpt.h5";
     std::string iter_grp_name = "iter" + std::to_string(iter);
+    utils::h5_quiesce();  // see h5_background_writer.hpp
     h5::file file(filename, 'a');
     h5::group grp(file);
     auto scf_grp = (grp.has_subgroup("scf"))? grp.open_group("scf") : grp.create_group("scf");
@@ -135,6 +212,7 @@ long read_scf(mpi3::shared_communicator node_comm,
               std::string output, std::string h5_grp, long iter) {
   if (node_comm.root()) {
     std::string filename = output + ".mbpt.h5";
+    utils::h5_quiesce();  // see h5_background_writer.hpp
     h5::file file(filename, 'r');
 
     auto scf_grp = h5::group(file).open_group(h5_grp);
@@ -171,6 +249,7 @@ template<typename shared_array_t>
 void read_H0(mpi3::shared_communicator node_comm, std::string output, shared_array_t &H0) {
   if (node_comm.root()) {
     std::string filename = output + ".mbpt.h5";
+    utils::h5_quiesce();  // see h5_background_writer.hpp
     h5::file file(filename, 'r');
     auto sys_grp = h5::group(file).open_group("system");
 
@@ -184,6 +263,7 @@ template<typename shared_array_t>
 void read_ovlp(mpi3::shared_communicator node_comm, std::string output, shared_array_t &S) {
   if (node_comm.root()) {
     std::string filename = output + ".mbpt.h5";
+    utils::h5_quiesce();  // see h5_background_writer.hpp
     h5::file file(filename, 'r');
     auto sys_grp = h5::group(file).open_group("system");
 
@@ -197,6 +277,7 @@ template<typename shared_array_t>
 void read_dm(mpi3::shared_communicator node_comm, std::string output, long iter, shared_array_t &Dm) {
   if (node_comm.root()) {
     std::string filename = output + ".mbpt.h5";
+    utils::h5_quiesce();  // see h5_background_writer.hpp
     h5::file file(filename, 'r');
     auto scf_grp = h5::group(file).open_group("scf");
 
@@ -218,6 +299,7 @@ long read_qpscf(mpi3::shared_communicator node_comm,
   long iter;
   if (node_comm.root()) {
     std::string filename = output + ".mbpt.h5";
+    utils::h5_quiesce();  // see h5_background_writer.hpp
     h5::file file(filename, 'r');
 
     auto scf_grp = h5::group(file).open_group("scf");
@@ -261,6 +343,7 @@ void write_qpgw_results(std::string filename, long gw_iter,
     auto E_loc = E_ska.local();
     auto MO_loc = MO_skia.local();
     auto Vcorr_loc = Vcorr_skij.local();
+    utils::h5_quiesce();  // see h5_background_writer.hpp
     h5::file file(filename, 'a');
     auto iter_grp = h5::group(file).open_group("scf/iter"+std::to_string(gw_iter));
     auto qp_grp = (iter_grp.has_subgroup("qp_approx"))?
@@ -279,6 +362,7 @@ void read_qp_hamilt_components(X_4D_t &Vhf_skij,
                                double &mu,
                                std::string filename,
                                long gw_iter) {
+  utils::h5_quiesce();  // see h5_background_writer.hpp
   h5::file file(filename, 'r');
   auto scf_grp = h5::group(file).open_group("scf/iter" + std::to_string(gw_iter));
   auto qp_grp = scf_grp.open_group("qp_approx");
@@ -307,6 +391,7 @@ auto read_input_iterations(std::string filename)
   long weiss_b_iter;
   long embed_iter;
 
+  utils::h5_quiesce();  // see h5_background_writer.hpp
   h5::file file(filename, 'r');
 
   // gw_iter
@@ -341,6 +426,7 @@ auto read_input_iterations(std::string filename)
 
 bool is_qp_selfenergy(std::string filename) {
   long weiss_f_iter;
+  utils::h5_quiesce();  // see h5_background_writer.hpp
   h5::file file(filename, 'r');
   auto weiss_f_grp = h5::group(file).open_group("downfold_1e");
   h5::read(weiss_f_grp, "final_iter", weiss_f_iter);
@@ -355,6 +441,7 @@ bool read_sigma_local(nda::array<ComplexType, 5> &Sigma_imp_wsIab,
                       nda::array<ComplexType, 4> &Vhf_imp_sIab,
                       std::string filename, long weiss_f_iter) {
   bool sigma_local_exist = false;
+  utils::h5_quiesce();  // see h5_background_writer.hpp
   h5::file file(filename, 'r');
   auto root_grp = h5::group(file);
   std::optional<h5::group> weiss_f_grp;
@@ -382,6 +469,7 @@ bool read_sigma_local(nda::array<ComplexType, 5> &Sigma_imp_wsIab,
                       nda::array<ComplexType, 4> &Vhf_dc_sIab,
                       std::string filename, long weiss_f_iter) {
   bool sigma_local_exist = false;
+  utils::h5_quiesce();  // see h5_background_writer.hpp
   h5::file file(filename, 'r');
   auto root_grp = h5::group(file);
   std::optional<h5::group> weiss_f_grp;
@@ -412,6 +500,7 @@ bool read_sigma_local(nda::array<ComplexType, 5> &Sigma_imp_wsIab,
                       nda::array<ComplexType, 4> &Vhf_dc_sIab,
                       std::string filename, long weiss_f_iter) {
   bool sigma_local_exist = false;
+  utils::h5_quiesce();  // see h5_background_writer.hpp
   h5::file file(filename, 'r');
   auto root_grp = h5::group(file);
   std::optional<h5::group> weiss_f_grp;
@@ -443,6 +532,7 @@ bool read_pi_local(shared_array_t &sPi_imp, shared_array_t &sPi_dc,
   auto Pi_imp = sPi_imp.local();
   auto Pi_dc = sPi_dc.local();
   if (sPi_imp.node_comm()->root()) {
+    utils::h5_quiesce();  // see h5_background_writer.hpp
     h5::file file(filename, 'r');
     auto root_grp = h5::group(file);
 
@@ -484,7 +574,7 @@ template void dump_scf(
     mpi3::communicator&, long,
     const sArray_t<Array_view_4D_t>&, const sArray_t<Array_view_5D_t>&,
     const sArray_t<Array_view_4D_t>&, const sArray_t<Array_view_5D_t>&,
-    double, std::string, std::string, long);
+    double, std::string, std::string, long, bool);
 
 template void dump_scf(
     mpi3::communicator&, long,

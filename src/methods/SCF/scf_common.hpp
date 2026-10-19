@@ -22,6 +22,7 @@
 #ifndef COQUI_SCF_COMMON_HPP
 #define COQUI_SCF_COMMON_HPP
 
+#include <cmath>
 #include "configuration.hpp"
 #include "utilities/mpi_context.h"
 #include "nda/nda.hpp"
@@ -35,10 +36,15 @@
 #include "numerics/iter_scf/iter_scf_t.hpp"
 #include "numerics/shared_array/nda.hpp"
 #include "utilities/proc_grid_partition.hpp"
+#include "utilities/Timer.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
 
 namespace methods {
   // TODO Put everything in "scf" namespace to isolate using directives
+
+// The mode-A evaluator context is an opaque pointer here -- its
+// definition (methods/SCF/qp_modea.hpp) is only needed by the .cpp that builds and consumes it.
+namespace qp_modea { struct modea_ctx; }
 
 namespace detail {
 
@@ -47,12 +53,25 @@ auto bracket_mu_root(double old_mu, double delta, eval_t &&eval_f)
   -> std::tuple<double, double, double, double> {
   
   double f_old = eval_f(old_mu);
+  // A wrong Sigma makes N(mu) monotone-but-never-crossing, or NaN. An unbounded bracketing walk
+  // would spin forever, and a NaN falls through every comparison, so the search would return a NaN
+  // mu silently. Cap the walk and fail loudly: 200 steps of delta = 40 a.u. at the default delta,
+  // far beyond any real band.
+  constexpr int max_bracket_steps = 200;
+  utils::check(std::isfinite(f_old),
+               "update_mu: nelec is not finite at the starting mu = {}. The self-energy or the "
+               "eigenspectra are corrupt; the chemical potential search cannot proceed.", old_mu);
 
   if (f_old >= 0.0) {
     double mu_hi = old_mu;
     double mu_lo = old_mu - delta;
     double f_lo = eval_f(mu_lo);
+    int nstep = 0;
     while (f_lo > 0.0) {
+      utils::check(++nstep <= max_bracket_steps,
+                   "update_mu: failed to bracket the electron count from below after {} steps of {} a.u. "
+                   "(mu = {}, nelec - target = {}). N(mu) is not decreasing towards the target -- check "
+                   "the self-energy.", max_bracket_steps, delta, mu_lo, f_lo);
       mu_lo -= delta;
       f_lo = eval_f(mu_lo);
     }
@@ -62,7 +81,12 @@ auto bracket_mu_root(double old_mu, double delta, eval_t &&eval_f)
   double mu_lo = old_mu;
   double mu_hi = old_mu + delta;
   double f_hi = eval_f(mu_hi);
+  int nstep = 0;
   while (f_hi < 0.0) {
+    utils::check(++nstep <= max_bracket_steps,
+                 "update_mu: failed to bracket the electron count from above after {} steps of {} a.u. "
+                 "(mu = {}, nelec - target = {}). N(mu) is not increasing towards the target -- check "
+                 "the self-energy.", max_bracket_steps, delta, mu_hi, f_hi);
     mu_hi += delta;
     f_hi = eval_f(mu_hi);
   }
@@ -84,7 +108,13 @@ auto update_mu_bisection_impl(double old_mu, double tol, double delta, eval_t &&
   
   double mu_mid = 0.5 * (mu_lo + mu_hi);
   double f_mid = eval_f(mu_mid);
+  constexpr int max_bisect_steps = 200;   // 40 a.u. / 2^200; tol is never this small
+  int nbisect = 0;
   while (std::abs(f_mid) >= tol) {
+    utils::check(++nbisect <= max_bisect_steps,
+                 "update_mu: bisection did not reach mu_tol = {} in {} steps; bracket is [{}, {}] and "
+                 "nelec - target = {}. N(mu) is likely discontinuous at the target.",
+                 tol, max_bisect_steps, mu_lo, mu_hi, f_mid);
     if (f_mid >= 0.0) {
       mu_hi = mu_mid;
     } else {
@@ -93,6 +123,10 @@ auto update_mu_bisection_impl(double old_mu, double tol, double delta, eval_t &&
     mu_mid = 0.5 * (mu_lo + mu_hi);
     f_mid = eval_f(mu_mid);
   }
+  // Every comparison against a NaN is false, so a NaN appearing after the start would walk out as the answer.
+  utils::check(std::isfinite(mu_mid) and std::isfinite(f_mid),
+               "update_mu: search converged to a non-finite result (mu = {}, nelec - target = {}). The "
+               "self-energy or the eigenspectra are corrupt.", mu_mid, f_mid);
   return {mu_mid, f_mid};
 }
 
@@ -252,6 +286,75 @@ double update_mu(double old_mu, const mf::MF &mf, const X_t &sE_ski, double beta
 double compute_Nelec(double mu, const mf::MF &mf, const sArray_t<Array_view_3D_t> &sE_ski, double beta);
 
 /**
+ * Lineshape meter: the size of what the static quasiparticle map throws away.
+ *
+ * Over the gap-window DIAGONAL states (the same "two occupied + two empty straddling mu"
+ * window the mode-A diagnostics in qp_scf_common.cpp use), per qp iteration:
+ *
+ *     f(iw) = |Sigma^c_aa(iw) - V^xc,c_aa| / max(|Sigma^c_aa(iw)|, eps_floor)
+ *
+ * at the FIRST positive fermionic node (the dynamical-discard fraction: this is the
+ * frequency where the dynamics the static map cannot carry actually lives) and at the
+ * HIGHEST node (tail sanity). Both are read in the MO basis at the map stage, where the
+ * Sigma(iw) gather and the assembled V^xc coexist.
+ *
+ * This is a reporting hook only, following the qp_modea::last_run() pattern. No code path
+ * branches on it and qp_approx computes nothing extra for the map. Populated by qp_approx
+ * for every map (ac_pade and the Matsubara-native ones alike); the lineshape line of the
+ * iteration summary in qp_scf_loop reads it back.
+ *
+ * The ABSOLUTE discard |Sigma^c_aa(iw) - V^xc,c_aa| (a.u.) is carried alongside the ratio,
+ * and it is the one that answers "does the map discard more at low frequency". The RATIO
+ * is typically larger at iw_top than at iw_0; this is a normalization artifact, not a
+ * physics failure -- Sigma^c(iw) -> 0 in the tail, so at iw_top the ratio degenerates to
+ * |V^xc| / |Sigma^c(iw_top)| >> 1 with a vanishing denominator.
+ */
+struct q6_lineshape_t {
+  double frac_w0_max = -1.0;    // max_a f(iw_0)   over the gap-window diagonals
+  double frac_w0_mean = -1.0;   // mean_a f(iw_0)  over the same set
+  double frac_top_max = -1.0;   // max_a f(iw_top)
+  double frac_top_mean = -1.0;  // mean_a f(iw_top)
+  double abs_w0_max = -1.0;     // max_a |Sigma^c_aa(iw_0) - V^xc_aa|, a.u.
+  double abs_w0_mean = -1.0;    // mean_a of the same
+  double abs_top_max = -1.0;    // max_a |Sigma^c_aa(iw_top) - V^xc_aa|, a.u.
+  double abs_top_mean = -1.0;   // mean_a of the same
+  double w0 = -1.0;             // the first positive fermionic node, a.u.
+  double wtop = -1.0;           // the highest positive fermionic node, a.u.
+  long n_states = 0;            // gap-window diagonals entering the aggregates
+};
+inline q6_lineshape_t &q6_lineshape() { static q6_lineshape_t x; return x; }
+
+/**
+ * Process-wide timers for the quasi-particle stage of a qpGW iteration.
+ *
+ * add_qpscf_vcorr is a free function, so there is no object to hang a TimerManager on;
+ * this follows the q6_lineshape() accessor pattern directly above. The timers split the
+ * stage into G build, W, Sigma and the analytic-continuation / QP map. Cumulative over
+ * iterations, like every other timer block in the code.
+ */
+inline utils::TimerManager &qp_stage_timer() {
+  static utils::TimerManager t = [] {
+    utils::TimerManager tm;
+    // Pre-register: TimerManager::elapsed() aborts on an unregistered name, and the
+    // Green's-function branch below is conditional on the caller.
+    for (auto const &v : {"QP_G_BUILD", "QP_SCR_COULOMB", "QP_SIGMA", "QP_MAP"}) tm.add(v);
+    return tm;
+  }();
+  return t;
+}
+
+/// Report the quasi-particle stage walls (see qp_stage_timer).
+inline void print_qp_stage_timers() {
+  auto &t = qp_stage_timer();
+  app_log(2, "\n  QP-STAGE timers");
+  app_log(2, "  ---------------");
+  app_log(2, "    Green's function build:  {0:.3f} sec", t.elapsed("QP_G_BUILD"));
+  app_log(2, "    Screened Coulomb (W):    {0:.3f} sec", t.elapsed("QP_SCR_COULOMB"));
+  app_log(2, "    Self-energy (Sigma):     {0:.3f} sec", t.elapsed("QP_SIGMA"));
+  app_log(2, "    QP map (AC / Pade):      {0:.3f} sec\n", t.elapsed("QP_MAP"));
+}
+
+/**
  * Given a dynamic self-energy, solve the quasi-particle equation and update sE_ska in-place
  * @param sE_ska        - [INPUT] initial qp energies
  *                        [OUTPUT] updated qp energies
@@ -267,7 +370,8 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
                   const sArray_t<Array_view_4D_t> &sVhf_skij,
                   const sArray_t<Array_view_4D_t> &sMO_skia,
                   double mu,
-                  const imag_axes_ft::IAFT &FT, qp_params_t &qp_params);
+                  const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
+                  const qp_modea::modea_ctx *modea_ctx = nullptr);
 
 /**
  * Given a dynamic self-energy in the primary basis, return the static approximation (Phys. Rev. Lett. 96, 226402 (2006)) of it
@@ -287,7 +391,9 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
 auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
                const sArray_t<Array_view_4D_t> &sMO_skia,
                const sArray_t<Array_view_3D_t> &sE_ska, double mu,
-               const imag_axes_ft::IAFT &FT, qp_params_t &qp_params)
+               const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
+               const sArray_t<Array_view_4D_t> *sHstat_skij = nullptr,
+               const qp_modea::modea_ctx *modea_ctx = nullptr)
   -> sArray_t<Array_view_4D_t>;
 
 /**
@@ -333,6 +439,10 @@ void add_evscf_vcorr(MBState &mb_state,
  * @param FT             - [INPUT] Fourier transform driver on imaginary axes
  * @param mu             - [INPUT] chemical potential
  * @param qp_params     - [INPUT] setups for quasiparitcle eqn
+ * @param sG_ext        - [INPUT] when non-null, the EXTERNAL Green's function replaces the
+ *                        analytic QP G that update_G would build from (sMO_skia, sE_ska, mu).
+ *                        Both update_w and the Sigma^GW build then see it. nullptr (default):
+ *                        the analytic QP G is used.
  * @return new qp energies in share memory sE_ska(ns, nkpts, nbnd)
  */
 template<typename eri_t, typename corr_solver_t>
@@ -341,7 +451,8 @@ void add_qpscf_vcorr(MBState &mb_state,
                      solvers::mb_solver_t<corr_solver_t> &mb_solver,
                      eri_t &eri,
                      const imag_axes_ft::IAFT &FT,
-                     qp_params_t &qp_params);
+                     qp_params_t &qp_params,
+                     const sArray_t<Array_view_5D_t> *sG_ext = nullptr);
 
 template<typename function_t>
 double qp_eqn_linearized(double Vhf, function_t &Sigma, long I, double mu, double eps_ks, double eta = 0.0);
@@ -425,17 +536,25 @@ double solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf
  * @param restart      - [INPUT] whether this is a restart SCF
  * @return - maximum norm of the SCF error for F and Sigma
  */
+/**
+ * @param sF_prev      - [INPUT] previous iterate of F, if the caller still has it
+ * @param sSigma_prev  - [INPUT] previous iterate of Sigma, likewise
+ * When both are given, simple mixing uses them instead of reading them back from
+ * the checkpoint, which avoids a large serial HDF5 read per iteration.
+ */
 template<typename comm_t, typename X_t, typename Xt_t>
 auto solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t& iter_solver,
                      long iteration, std::string h5_prefix, X_t &sF_skij, Xt_t &sSigma_tskij,
                      const imag_axes_ft::IAFT *FT,
-                     std::array<std::string,3> dataset={"scf", "F_skij", "Sigma_tskij"})
+                     std::array<std::string,3> dataset={"scf", "F_skij", "Sigma_tskij"},
+                     X_t const* sF_prev = nullptr, Xt_t const* sSigma_prev = nullptr)
   -> std::tuple<double, double>;
 
 template<typename MPI_Context_t, typename X_t, typename Xt_t>
 auto damping_impl(MPI_Context_t &context, iter_scf::iter_scf_t& iter_solver,
                   long iteration, std::string h5_prefix, X_t &sF_skij, Xt_t &sSigma_tskij,
-                  std::array<std::string,3> datasets={"scf", "F_skij", "Sigma_tskij"})
+                  std::array<std::string,3> datasets={"scf", "F_skij", "Sigma_tskij"},
+                  X_t const* sF_prev = nullptr, Xt_t const* sSigma_prev = nullptr)
 -> std::tuple<double, double>;
 
 template<typename MPI_Context_t, typename X_t, typename Xt_t>

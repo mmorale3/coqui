@@ -42,8 +42,11 @@ namespace methods {
  * Generic self-consistent loop for full-frequency Green's function methods. 
  * The template parameters allow for different types of self-energy solvers (e.g. HF, GW, GF2) 
  * and different types of Coulomb Hamiltonian representations (e.g. THC, Cholesky).
+ * MEM selects the memory space of the correlated solver (gw_t is MEM-templated; every
+ * other solver is HOST-only -- see the constexpr branch in scf_driver.cpp).
  */
-template<typename dyson_type, typename eri_t, typename corr_solver_t>
+template<MEMORY_SPACE MEM = HOST_MEMORY,
+         typename dyson_type, typename eri_t, typename corr_solver_t>
 auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_axes_ft::IAFT& FT,
               solvers::mb_solver_t<corr_solver_t> mb_solver, iter_scf::iter_scf_t *iter_solver = nullptr,
               int niter = 1, bool restart = false, double conv_tol = 1e-9, bool const_mu = false,
@@ -51,15 +54,25 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
               -> std::tuple<double, double>;
 
 /**
- * Generic self-consistent loop for quasiparticle equations. 
- * The template parameters allow for different types of self-energy solvers (e.g. HF, GW, GF2) 
+ * Generic self-consistent loop for quasiparticle equations.
+ * The template parameters allow for different types of self-energy solvers (e.g. HF, GW, GF2)
  * and different types of Coulomb Hamiltonian representations (e.g. THC, Cholesky).
+ *
+ * The last two arguments re-quasiparticle-ize an external Green's function (e.g. a DMFT outer
+ * loop), following the scf_loop naming convention.
+ * @param gf_grp  - checkpoint group of an EXTERNAL Green's function ("scf"/"embed"), which
+ *                  ITERATION 1 consumes in place of the restart-H_eff's analytic QP G (its
+ *                  density matrix feeds the HF stage and it feeds the Sigma^GW/W build;
+ *                  iterations >= 2 revert to the loop's own QP G). Empty (default): no
+ *                  external G is read and the loop is the standard qp-SCF loop.
+ * @param gf_iter - iteration inside gf_grp; -1 = that group's "final_iter".
  */
 template<typename eri_t, typename corr_solver_t>
 double qp_scf_loop(MBState &mb_state, eri_t &mb_eri, const imag_axes_ft::IAFT& FT,
                    qp_params_t &qp_params, solvers::mb_solver_t<corr_solver_t> mb_solver,
                    iter_scf::iter_scf_t *iter_solver = nullptr, int niter = 1,
-                   bool restart = false, double conv_tol = 1e-8);
+                   bool restart = false, double conv_tol = 1e-8,
+                   std::string gf_grp = "", long gf_iter = -1);
 
 /**
  * RPA energy functional loop.

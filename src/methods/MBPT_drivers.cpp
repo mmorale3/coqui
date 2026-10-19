@@ -41,6 +41,8 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/embedding/embed_t.h"
 #include "methods/embedding/embed_eri_t.h"
+#include "methods/vertex/vertex_debug.hpp"
+#include "methods/vertex/vertex_t.h"
 #include "numerics/imag_axes_ft/IAFT.hpp"
 #include "numerics/iter_scf/iter_scf_utils.hpp"
 
@@ -48,6 +50,66 @@
 #include "MBPT_drivers.h"
 
 namespace mpi3 = boost::mpi3;
+namespace {
+  // the pol_vertex_sc* keys (the in-run coarse-sublattice self-consistency of the polarization vertex, vertex_sc.hpp)
+  methods::solvers::vertex_sc::config read_pol_sc(ptree const &pt) {
+    methods::solvers::vertex_sc::config c;
+    // the default scheme is "hybrid" when a sublattice is given (pol_vertex_sc_mesh), "none" (off) otherwise; on the identity
+    // sublattice (the mesh itself) "hybrid" runs as "direct" (scr_coulomb_t)
+    auto mesh = io::get_array_with_default<long>(pt, "pol_vertex_sc_mesh", std::vector<long>{});
+    const bool mode_given = pt.get_optional<std::string>("pol_vertex_sc").has_value();
+    c.mode = io::get_value_with_default<std::string>(pt, "pol_vertex_sc", mesh.empty() ? "none" : "hybrid");
+    utils::check(c.mode == "none" or c.mode == "interp" or c.mode == "direct" or c.mode == "hybrid",
+                 "pol_vertex_sc = \"{}\" is not valid: options are \"none\", \"interp\", \"direct\", \"hybrid\" (default: \"hybrid\" when "
+                 "pol_vertex_sc_mesh is given, \"none\" otherwise).", c.mode);
+    if (not mode_given and c.enabled())
+      app_log(1, "  [vertex self-consistency] pol_vertex_sc not given: pol_vertex_sc_mesh = [{}, {}, {}] selects the default scheme \"hybrid\".",
+              mesh[0], mesh.size() > 1 ? mesh[1] : 0, mesh.size() > 2 ? mesh[2] : 0);
+    if (c.enabled()) {
+      utils::check(mesh.size() == 3 and mesh[0] > 0 and mesh[1] > 0 and mesh[2] > 0,
+                   "pol_vertex_sc = \"{}\" needs pol_vertex_sc_mesh = [n1, n2, n3] (the coarse sublattice of the k mesh).", c.mode);
+      c.mesh = {mesh[0], mesh[1], mesh[2]};
+    }
+    c.period = io::get_value_with_default<long>(pt, "pol_vertex_sc_period", 1);
+    c.start = io::get_value_with_default<long>(pt, "pol_vertex_sc_start", 1);
+    c.mix = io::get_value_with_default<double>(pt, "pol_vertex_sc_mix", 0.5);
+    c.head = io::get_value_with_default<std::string>(pt, "pol_vertex_sc_head", "coarse");
+    c.col = io::get_value_with_default<std::string>(pt, "pol_vertex_sc_col", "gam1");
+    c.restart_file = io::get_value_with_default<std::string>(pt, "pol_vertex_sc_restart_file", "");
+    c.batch = io::get_value_with_default<long>(pt, "pol_vertex_sc_batch", 8);
+    c.trev = io::get_value_with_default<bool>(pt, "pol_vertex_sc_trev", true);
+    c.unfold = io::get_value_with_default<std::string>(pt, "pol_vertex_sc_unfold", "fit");
+    c.direct_select = io::get_value_with_default<std::string>(pt, "pol_vertex_sc_direct_select", "radius");
+    c.direct_radius = io::get_value_with_default<double>(pt, "pol_vertex_sc_direct_radius", 1.0);
+    c.direct_shells = io::get_value_with_default<long>(pt, "pol_vertex_sc_direct_shells", 1);
+    c.direct_count = io::get_value_with_default<long>(pt, "pol_vertex_sc_direct_count", 0);
+    c.nu_nodes = io::get_value_with_default<long>(pt, "pol_vertex_sc_nu_nodes", 0);
+    c.nu_rank = io::get_value_with_default<long>(pt, "pol_vertex_sc_nu_rank", 0);
+    c.nu_mode = io::get_value_with_default<std::string>(pt, "pol_vertex_sc_nu_mode", "modes");
+    c.nu_ref_period = io::get_value_with_default<long>(pt, "pol_vertex_sc_nu_ref_period", 0);
+    utils::check(c.nu_nodes >= 0 and c.nu_rank >= 0 and c.nu_ref_period >= 0,
+                 "pol_vertex_sc_nu_nodes / _nu_rank / _nu_ref_period must be >= 0 (got {}, {}, {}).", c.nu_nodes, c.nu_rank, c.nu_ref_period);
+    utils::check(c.nu_mode == "modes" or c.nu_mode == "regression",
+                 "pol_vertex_sc_nu_mode = \"{}\" is not valid: options are \"modes\" (default), \"regression\".", c.nu_mode);
+    c.sigma = io::get_value_with_default<std::string>(pt, "pol_vertex_sc_sigma", "follow");
+    utils::check(c.sigma == "follow" or c.sigma == "interp" or c.sigma == "direct",
+                 "pol_vertex_sc_sigma = \"{}\" is not valid: options are \"follow\" (default), \"interp\", \"direct\".", c.sigma);
+    utils::check(c.direct_select == "radius" or c.direct_select == "shells" or c.direct_select == "count",
+                 "pol_vertex_sc_direct_select = \"{}\" is not valid: options are \"radius\" (default), \"shells\", \"count\".", c.direct_select);
+    utils::check(c.direct_radius >= 0.0, "pol_vertex_sc_direct_radius must be >= 0 (got {}).", c.direct_radius);
+    utils::check(c.direct_shells >= 0, "pol_vertex_sc_direct_shells must be >= 0 (got {}).", c.direct_shells);
+    utils::check(c.direct_count >= 0, "pol_vertex_sc_direct_count must be >= 0 (got {}).", c.direct_count);
+    utils::check(c.unfold == "fit" or c.unfold == "solve", "pol_vertex_sc_unfold = \"{}\" is not valid: options are \"fit\" (default), \"solve\".", c.unfold);
+    utils::check(c.period >= 1 and c.start >= 1 and c.mix > 0.0 and c.mix <= 1.0,
+                 "pol_vertex_sc: invalid schedule (period {} >= 1, start {} >= 1, 0 < mix {} <= 1 required).", c.period, c.start, c.mix);
+    utils::check(c.head == "coarse" or c.head == "fine" or c.head == "none",
+                 "pol_vertex_sc_head = \"{}\" is not valid: options are \"coarse\" (default), \"fine\", \"none\".", c.head);
+    utils::check(c.col == "gam1" or c.col == "dyn" or c.col == "static",
+                 "pol_vertex_sc_col = \"{}\" is not valid: options are \"gam1\" (default), \"dyn\", \"static\".", c.col);
+    return c;
+  }
+}
+
 namespace methods
 {
 
@@ -100,13 +162,148 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
 }
 
 /**
+ * Vertex input checks shared by every driver site that constructs a vertex / knob carrier, so the five sites
+ * ([gw] x 2, [evgw], [qpgw] x 2) stay consistent. Policy: never skip or alter a requested step silently -- abort when
+ * the substitution can change the answer (with an input key that re-allows it where appropriate), WARN when it only
+ * changes performance.
+ */
+namespace mbpt_vertex_audit {
+
+  /** the fallback policies of vertex_t, all default false (= abort). vertex_t's class defaults are
+   *  permissive for library / unit-test callers; THIS is where a user run gets the strict defaults. */
+  inline void set_fallback_keys(solvers::vertex_t &v, ptree const& pt) {
+    const bool head = io::get_value_with_default<bool>(pt,"vertex_allow_missing_head",false);
+    const bool bare = io::get_value_with_default<bool>(pt,"pol_vertex_allow_bare_rung",false);
+    const bool unproj = io::get_value_with_default<bool>(pt,"pol_vertex_allow_unprojected",false);
+    const bool refl = io::get_value_with_default<bool>(pt,"vertex_allow_unchecked_reflection",false);
+    v.set_allow_missing_head(head);
+    v.set_allow_bare_rung(bare);
+    v.set_allow_unprojected(unproj);
+    v.set_allow_unchecked_reflection(refl);
+    if (head or bare or unproj or refl)
+      app_log(1, "  [WARNING] vertex fallbacks re-allowed by input (each continues with a WARNING instead of aborting, and "
+                 "each can change the answer):{}{}{}{}", head ? " vertex_allow_missing_head" : "",
+              bare ? " pol_vertex_allow_bare_rung" : "", unproj ? " pol_vertex_allow_unprojected" : "",
+              refl ? " vertex_allow_unchecked_reflection" : "");
+  }
+
+  /** requests that cannot be honoured as configured. Called AFTER an optional Wannier projector is
+   *  installed (it defines C in Wannier mode). The vertex_t CLASS keeps the exact empty-C no-op (test_vertex_noop). */
+  inline void check_vertex_requests(solvers::vertex_t const &v, ptree const& pt, std::string const& driver) {
+    // a vertex requested with an EMPTY subspace C would be a no-op (plain scGW / RPA screening): abort
+    utils::check(not v.enabled() or v.active(),
+                 "{}: vertex_type = \"{}\" is requested but the vertex subspace C is EMPTY (vertex_band_window = [{}, {})): "
+                 "the vertex would silently contribute nothing. Set a non-empty vertex_band_window (or a "
+                 "vertex_wannier_file), or vertex_type = \"none\".", driver, v.vertex_type(), v.band_window().first(),
+                 v.band_window().last());
+    utils::check(not v.pol_vertex_enabled() or v.pol_vertex_active(),
+                 "{}: pol_vertex = \"{}\" (pol_vertex_inject = \"{}\") is requested but the ladder window "
+                 "pol_vertex_band_window = [{}, {}) is EMPTY (it inherits vertex_band_window when absent): the ladder would "
+                 "silently do nothing. Set a non-empty pol_vertex_band_window (in Wannier mode: the projector's "
+                 "band window), or pol_vertex = \"none\" and pol_vertex_inject = \"none\".", driver, v.pol_vertex(),
+                 v.pol_vertex_inject(), v.pol_band_window().first(), v.pol_band_window().last());
+    // the Sigma-side vertex (pol_vertex_sigma) is built from the ladder machinery; without the pol vertex the knob
+    // carrier is never attached (or the builders never run), so the requested Sigma vertex would never be built.
+    auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none");
+    io::tolower(sig_mode);
+    utils::check(sig_mode == "none" or v.pol_vertex_enabled(),
+                 "{}: pol_vertex_sigma = \"{}\" needs the ladder machinery (pol_vertex = \"ladder\" with a non-empty "
+                 "pol_vertex_band_window), but pol_vertex = \"none\": the Sigma vertex would never be built. Set pol_vertex = \"ladder\" or pol_vertex_sigma = \"none\".",
+                 driver, sig_mode);
+    // keys that only act on the Sigma^C / Pi^C vertex (vertex_type): set without it they would be ignored
+    if (not v.enabled()) {
+      const double vs = io::get_value_with_default<double>(pt, "vertex_scale", 1.0);
+      const long vr = io::get_value_with_default<long>(pt, "vertex_ramp_iters", 0);
+      utils::check(vs == 1.0 and vr == 0, "{}: vertex_scale = {} / vertex_ramp_iters = {} act on the Sigma^C / Pi^C vertex "
+                   "(vertex_type), which is \"none\": they would be ignored. Remove them or set vertex_type.", driver, vs, vr);
+    }
+    // a Wannier frame with no vertex at all
+    utils::check(io::get_value_with_default<std::string>(pt, "vertex_wannier_file", "").empty() or v.enabled() or
+                 v.pol_vertex_enabled(),
+                 "{}: vertex_wannier_file is set but no vertex is requested (vertex_type = \"none\", pol_vertex = \"none\"): it "
+                 "would be ignored.", driver);
+  }
+
+  /** the vertex keys of the [evgw] / [qpgw] knob carrier (vertex_type = "none"). The ones the carrier / scr_coulomb
+   *  path can honour are forwarded exactly like the [gw] pol-vertex-only branch
+   *  does; the Sigma-vertex-only keys ABORT when present in the input (they have no meaning without vertex_type, which these
+   *  drivers do not support). Call after set_pol_vertex and the other carrier setters, before attaching the carrier. */
+  template<typename MF_ptr_t>
+  inline void carrier_vertex_keys(solvers::vertex_t &carrier, solvers::scr_coulomb_t &scr_eri, MF_ptr_t const& mf,
+                                  ptree const& pt, std::string const& driver, std::string const& screen_type) {
+    {   // vertex_type = "none" spelled out explicitly is what these drivers run anyway: only a real request aborts
+      auto vt = io::get_value_with_default<std::string>(pt, "vertex_type", "none");
+      io::tolower(vt);
+      utils::check(vt == "none", "{}: vertex_type = \"{}\" is not supported in the evgw/qpgw drivers (they carry only the "
+                   "pol-vertex ladder). Remove it from the input.", driver, vt);
+    }
+    for (auto const *key : {"vertex_rung", "vertex_isdf", "vertex_scale", "vertex_ramp_iters",
+                            "vertex_pidyn", "vertex_pidyn_tol", "vertex_bl_head_projection", "vertex_bl_static_head",
+                            "vertex_bl_w0_head_from_w", "vertex_bl_pidyn_const_rung", "vertex_bl_head_static_all"})
+      utils::check(not io::check_child_exists(pt, key),
+                   "{}: {} is not supported in the evgw/qpgw drivers (these drivers carry only the pol-vertex ladder, "
+                   "vertex_type = \"none\"; the key belongs to the Sigma^C / Pi^C vertex of the [gw] driver). Remove it from "
+                   "the input.", driver, key);
+    // honoured exactly as in the [gw] sites:
+    //  - vertex_div_treatment: the carrier's q -> 0 policy, which the readout instance takes
+    auto vertex_div_treatment = io::get_value_with_default<std::string>(pt,"vertex_div_treatment","");
+    io::tolower(vertex_div_treatment);
+    if (not vertex_div_treatment.empty()) carrier.set_div_treatment(vertex_div_treatment);
+    //  - vertex_bl_head_scale: copied onto the readout instance (build_w0 / cache_w heads)
+    carrier.set_bl_head_scale(io::get_value_with_default<double>(pt,"vertex_bl_head_scale",1.0));
+    //  - the eps(q_i, i nu) cuts of the readout (report-only)
+    carrier.set_eps_cut(io::get_value_with_default<long>(pt,"pol_eps_cut",0),
+                        io::get_value_with_default<long>(pt,"pol_eps_cut_dyn_nnu",0));
+    //  - the CVV head's R-shell tolerance (div_treatment = "cvv" only)
+    scr_eri.set_cvv_rspace_tol(io::get_value_with_default<double>(pt,"cvv_rspace_tol",1e-6));
+    //  - the Wannier projector of a pol-vertex-only run, with the same one-projector-per-run rule
+    auto vertex_wannier_file = io::get_value_with_default<std::string>(pt,"vertex_wannier_file","");
+    auto vertex_wannier_loewdin = io::get_value_with_default<bool>(pt,"vertex_wannier_loewdin",true);
+    if (not vertex_wannier_file.empty()) {
+      if (screen_type.substr(0,8) == "gw_edmft") {
+        auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
+        utils::check(embed_file == vertex_wannier_file,
+                     "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
+                     "wannier_file = \"{}\": one projector P per run is required (the vertex "
+                     "and the embedding must share the same Wannier orbitals); use the SAME "
+                     "wan.h5 for both.", vertex_wannier_file, embed_file);
+      }
+      auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
+      methods::projector_t proj(*mf, vertex_wannier_file, vtx_trans_home);
+      carrier.set_wannier_projector(proj, vertex_wannier_loewdin);   // aborts if no pol vertex is configured
+    }
+  }
+
+  /** the in-run Sigma reference's opt-in keys: pol_vertex_sigma_dyn_ref_adaptive (false) with its threshold
+   *  pol_vertex_sigma_dyn_ref_change (an input error without the flag), pol_vertex_sigma_dyn_final_full (false), and the
+   *  sampled regression's eigenvalue cuts pol_vertex_sigma_dyn_fit_cut_cst / _t (1e-14). */
+  inline void set_sigma_dyn_ref_keys(solvers::vertex_t &v, ptree const& pt) {
+    auto x = pt.get_optional<double>("pol_vertex_sigma_dyn_ref_change");
+    v.set_sigma_dyn_ref_adaptive(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_ref_adaptive",false),
+                                 x ? std::optional<double>(*x) : std::nullopt);
+    v.set_sigma_dyn_final_full(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_final_full",false));
+    v.set_sigma_dyn_fit_cut(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_fit_cut_cst",1e-14),
+                            io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_fit_cut_t",1e-14));
+  }
+
+} // namespace mbpt_vertex_audit
+
+/**
  * Many-body perturbation calculations from a given mean-field and ERI objects with arguments in property tree.
  * Optional arguments (with default values):
  *  - beta: "1000" Inverse temperature (a.u.)
  *  - wmax: Optional. Frequency cutoff for the IAFT grids (a.u.).
  *          If not provided, wmax is estimated from mean_field. 
  *  - iaft_prec: "high" Precision of IAFT grids. {choices: "high", "medium", "low"}
- *  - div_treatment: "gygi" Divergent treatment for Coulomb kernel. {choices: "ignore_g0", "gygi"}
+ *  - div_treatment: "gygi" Divergent treatment for Coulomb kernel. {choices: "ignore_g0",
+ *                 "gygi", "cvv"}. "cvv" (gw solver only) replaces the gygi/stored q->0
+ *                 EXTRAPOLATION of eps_inv_head by the covariant-velocity O(q^2) head,
+ *                 Pi_ab(inu) = -(2/(beta Nk V)) sum_k,iw tr[v~_a G v~_b G] with
+ *                 v~ = d_k(H0 + F + Sigma). update_w fills
+ *                 mb_state.eps_inv_head from the SUBTRACTED head coefficient
+ *                 Phead(inu) = [Pi^jj(inu) - Pi^jj(0)]/(inu)^2 (zero-Drude-weight
+ *                 identity; insulators), wings dropped; all downstream consumers
+ *                 single-source that array. Logs the meter v(q).P00 per iteration.
  *  - hf_div_treatment: "gygi" Divergent treatment for Coulomb kernel in HF. {choices: "ignore_g0", "gygi"}
  *  - niter: "1" Number of iterations in the self-consistent loop.
  *  - conv_thr: "1e-9" Convergence threshold for the self-consistent loop.
@@ -116,8 +313,383 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *  - prefix: "bdft.mbpt" Prefix used when output is not provided.
  *  - restart: "false" Restart from a previous bdft.scf calculation.
  *  - t_prescreen_thresh: "0.0" Threshold for prescreening in time (GF2 only for now)
+ *  - vertex_type: "none" Vertex correction on top of the gw solver.
+ *                 {choices: "none", "2nd_exchange"}. "2nd_exchange" enables BOTH cuts of the
+ *                 Phi-derivable second-order-exchange functional: Sigma^C (G3W2) and Pi^C (G4W).
+ *  - vertex_rung: "dynamic" Rung mode of the vertex correction (gw solver only).
+ *                 {choices: "dynamic", "linear", "static"}. "dynamic" (default) uses
+ *                 dynamic W rungs (G3W2 + G4W). "static" and "linear" are the two
+ *                 conserving static-rung truncations, in which the rungs are the iv = 0
+ *                 statically screened W0[G]: "static" keeps only the doubly-static term,
+ *                 "linear" is the functional linearized in dW = W - W0. ONE vertex_t drives
+ *                 all cuts of the selected mode, so mixed half-theories cannot be
+ *                 configured. All other vertex_* keys apply to every mode. An empty
+ *                 window is a no-op in every mode at the class level, but a USER
+ *                 input requesting a vertex with an empty C ABORTS.
+ *  - vertex_band_window: [i0, i1) Contiguous 0-based orbital range defining the vertex
+ *                 subspace C (gw solver only). Absent/empty window means C is the empty set,
+ *                 which reproduces plain scGW exactly when no vertex is requested
+ *                 (vertex_type = "none"); with vertex_type set (and no vertex_wannier_file
+ *                 defining C) an empty window ABORTS. In Wannier mode an
+ *                 explicitly set window must equal the projector's band window W_rng (an
+ *                 empty one is filled with W_rng and logged).
+ *                 Requirements with an active vertex: DLR IAFT backend (iaft basis "dlr");
+ *                 screen_type "rpa" or "rpa_k". Symmetry-reduced (IBZ) k-meshes are
+ *                 supported: external axes stay
+ *                 IBZ-resident and the rung transfers are sourced from IBZ-stored W/Z;
+ *                 the C-window D-matrix leakage of the symmetry rotations is measured
+ *                 and logged (expected small; O(leakage) relative error on the vertex).
+ *                 Note (dynamic rung): Pi^C uses the PREVIOUS iteration's screened W
+ *                 (one-iteration lag; on the first iteration an RPA W is solved first to
+ *                 provide the rung). With vertex_isdf = "global" dW stays resident across
+ *                 the iteration boundary (memory tradeoff); with "secondary" a downfolded
+ *                 N_m x N_m W-bar cache replaces it. The vertex inherits the run's
+ *                 div_treatment for its q->0 rung policy: "ignore_g0" includes the stored
+ *                 regularized W(Gamma) body; "gygi" additionally applies the analytic
+ *                 rank-1 head insertion (madelung x basis_head x eps_inv_head). At coarse
+ *                 k-meshes the gygi head can dominate the vertex rung sums (O(Nk^-1/3)
+ *                 convergence) -- check mesh convergence of the head fraction.
+ *  - vertex_isdf: "global" Auxiliary basis of the vertex kernels (gw solver only).
+ *                 {choices: "global", "secondary"}. "global" (default) runs the kernels in
+ *                 the global THC basis (dimension Np). "secondary"
+ *                 builds a dedicated secondary ISDF basis on the subspace C by re-running
+ *                 the restricted-range point selection (once per geometry) and runs both
+ *                 kernels with the auxiliary dimension N_m = O(nc^2 nk) << Np: the rung
+ *                 cores are downfolded with the frequency-independent transfer
+ *                 t(q) = s(q)^+ B(q)^dag C(q); Sigma^C lands directly in the C-C block;
+ *                 Pi^C is upfolded with the adjoint of the same t (no-leak). The q->0
+ *                 gygi head insertion downfolds automatically through t. Downfold
+ *                 fidelity is reported per q as eta(q, nu) at verbosity
+ *                 >= 2 (test scale).
+ *  - vertex_isdf_rank: "-1" Secondary basis size N_m ("secondary" only). -1 selects the
+ *                 full subspace pair rank nc^2 * nk (eta -> 0 limit); smaller values
+ *                 trade accuracy (monitored by eta) for cost. The point selection may
+ *                 return fewer points when the C pair-density metric is numerically
+ *                 rank-deficient; the returned count is used and logged.
+ *  - vertex_isdf_svd_tol: "1e-8" Relative SVD cutoff on the secondary pair collocation
+ *                 B(q) in the truncated pseudo-inverse solve for t(q) (the secondary
+ *                 metric s = B^dag B is regularized at the square of this value).
+ *  - vertex_isdf_thresh: "-1" Point-selection threshold for the secondary ISDF pivoted
+ *                 Cholesky ("secondary" only). -1 defaults to the GLOBAL THC thresh
+ *                 ([interaction.thc] thresh) so the selected interpolating vectors stay
+ *                 in the span of the global basis; a tighter override over-resolves the
+ *                 C pair-density metric and yields an ill-conditioned secondary metric.
+ *  - vertex_div_treatment: "" q->0 rung policy for the VERTEX only; empty inherits
+ *                 div_treatment. {choices: "ignore_g0", "gygi", "v1_skip"}. Lets the
+ *                 analytic rank-1 head inserted into the vertex rungs be switched off
+ *                 without changing the GW/HF divergence treatment -- that head is the one
+ *                 piece the Sigma^C-vs-GF2-exchange absolute cross-check does not cover,
+ *                 and on coarse k-meshes it can exceed the body contribution. It also sets
+ *                 the q->0 policy of the pol-vertex ladder's readout instance
+ *                 (pol-vertex-only runs), in [gw], [evgw] and [qpgw].
+ *  - vertex_pidyn: "factorized" Route for the linear mode's equal-time dynamic-rung
+ *                 polarization pi^dyn (vertex_rung = "linear" only; ignored otherwise).
+ *                 {choices: "factorized", "kernel", "check"}. "factorized" evaluates
+ *                 pi^dyn directly as ONE bosonic pairing of two bubbles against W --
+ *                 no twisted pairs, no pole algebra. "kernel" runs the full dynamic-rung
+ *                 Pi^C over every bosonic node and keeps only the tau = 0 row: it dominates
+ *                 the linear mode's vertex cost and is its only contact with the aux pole
+ *                 basis, so it is a diagnostic, not a recommendation. "check" runs BOTH and
+ *                 aborts if they disagree by more than vertex_pidyn_tol -- the
+ *                 production-scale counterpart of test_methods_vertex_pibardynfact.
+ *  - vertex_pidyn_tol: "-1" ABORT bar for vertex_pidyn = "check". <=0 uses 0.25, an O(1)
+ *                 routing bar. It is deliberately NOT tied to iaft eps: the two routes are
+ *                 exact Matsubara sums of DIFFERENT integrands read through the same tau = 0
+ *                 row, so their agreement floor is a REPRESENTABILITY floor whose prefactor
+ *                 grows with beta*wmax AND is data dependent (it can reach ~1e-2 at
+ *                 prec = "low"). An eps-derived abort would therefore be flaky by
+ *                 construction. What the check DOES discriminate is a routing/plumbing break,
+ *                 and such breaks produce O(1) disagreements. Exceeding
+ *                 max(1e-8, 100*iaft eps) instead emits a WARNING, which is the actionable
+ *                 statement: pi^dyn is grid-limited BY EITHER ROUTE, and the lever is iaft
+ *                 prec, not vertex_pidyn.
+ *  - vertex_scale: "1.0" Scale BOTH cuts by lambda, i.e. Phi_2^C -> lambda Phi_2^C.
+ *                 Conservation stays exact at every lambda because the scaling acts on the
+ *                 generating functional, not on the already-cut Sigma/P.
+ *  - vertex_ramp_iters: "0" If > 0, walk lambda up to vertex_scale over this many scf
+ *                 iterations (lambda_n = vertex_scale * min(1, n/ramp)). P^C carries no
+ *                 sign guarantee, so a full-strength vertex can drive eps = I - Z.Pi
+ *                 through zero and break the W-Dyson solve; ramping locates the largest
+ *                 lambda whose solution still has a positive-definite eps. Watch the
+ *                 "dielectric conditioning" line in the update_w log.
+ *  - vertex_isdf_cond_max: "-1" Per-q conditioning cap on the secondary downfold
+ *                 ("secondary" only). <=0 disables it (solve uses vertex_isdf_svd_tol). >0
+ *                 sets the per-q least-squares rcond = 1/sqrt(cond_max) so each transfer q's
+ *                 downfold is conditioned to <= cond_max. The ill-conditioning is q-specific
+ *                 (not at Gamma) with a shared point set, so it is capped in the SOLVE, not
+ *                 by pruning interpolating vectors.
+ *  - vertex_wannier_file: "" Path to a TRIQS-compatible wan.h5 (proj_mat + band_window;
+ *                 gw solver only). Applies to the Sigma^C vertex (vertex_type != "none")
+ *                 AND to a pol-vertex-only run (vertex_type = "none", pol_vertex =
+ *                 "ladder"): the latter is the coarse->fine interpolation path, whose
+ *                 dynamic-rung output is Pi_loc(q) in the MLWF-pair frame. When set, the
+ *                 vertex subspace C becomes the span of
+ *                 the M Wannier orbitals |w_a(k)> = sum_i U_ia(k)|psi_i(k)> read from the
+ *                 file (a general fixed projector P = U U^dag), replacing the
+ *                 vertex_band_window C. The theory is projector-general; window mode is the
+ *                 U = 1_window limit. U is FIXED for the whole
+ *                 SCF loop (re-Wannierization = a restart). If a gw_edmft embedding
+ *                 projector is also active it must be the SAME file. The
+ *                 rotated point selection of vertex_isdf = "secondary" is nosym-only.
+ *                 An explicitly set (non-empty) vertex_band_window /
+ *                 pol_vertex_band_window must equal the projector's band window W_rng
+ *                 (abort otherwise). Also honoured by the [evgw] / [qpgw] pol-vertex-only
+ *                 knob carrier.
+ *  - vertex_wannier_loewdin: "true" Loewdin-orthonormalize U at load so U^dag U = 1_M
+ *                 exactly (deterministic, gauge-covariant; the correction norm is
+ *                 logged). false = proceed with the raw disentangled U (warn; P then
+ *                 only approximately idempotent).
+ *  - cvv_rspace_tol: "1e-6" R-shell truncation tolerance of the CVV head's
+ *                 Sigma(R, iw) store (div_treatment = "cvv" only). The
+ *                 default is calibrated from the R-decay of that store.
+ *  - pol_vertex: "none" Ladder (BSE) polarization (gw solver; [evgw] / [qpgw] through the
+ *                 knob carrier, see below). {choices: "none", "ladder"}.
+ *                 "ladder" resums the density-channel BSE with the static screened
+ *                 kernel in the secondary-ISDF pair basis,
+ *                 Pi-bar = [1 - Pi-bar^0 K-bar]^-1 Pi-bar^0. By default it is a report-only
+ *                 eps_M readout; with pol_vertex_inject = "ladder_n2" it is injected into P
+ *                 beside the RPA bubble. Sigma stays GW-form unless pol_vertex_sigma is set,
+ *                 so the loop is then NOT Phi-derivable (a deliberate choice of accurate
+ *                 screening over Phi-derivability). Excludes an ACTIVE vertex_type (double
+ *                 counting) and requires the DLR IAFT backend. An empty ladder
+ *                 C-window ABORTS.
+ *                 [evgw] / [qpgw]: the knob carrier there honours the same
+ *                 pol_vertex_* keys plus vertex_div_treatment, vertex_bl_head_scale,
+ *                 vertex_wannier_file / _loewdin, cvv_rspace_tol, pol_eps_cut /
+ *                 _dyn_nnu; the Sigma^C-vertex keys (vertex_type, vertex_rung,
+ *                 vertex_isdf, vertex_scale, vertex_ramp_iters, vertex_pidyn[_tol],
+ *                 vertex_bl_head_projection / _static_head / _w0_head_from_w /
+ *                 _pidyn_const_rung / _head_static_all) ABORT when present.
+ *  - pol_vertex_kernel: "w0_prev" Ladder kernel source. {choices: "w0_prev", "w0_frozen"}.
+ *                 Validated and logged only: the kernel K-bar is always W-bar_0 built from
+ *                 THIS iteration's RPA polarizability, which coincides with "w0_prev"
+ *                 (W-bar_0 from the previous iteration's W) at self-consistency.
+ *  - pol_vertex_band_window, pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+ *    pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max, pol_vertex_isdf_distr_tol:
+ *                 the ladder's C-window and secondary-basis knobs. Each key ABSENT
+ *                 inherits the corresponding vertex_* value, so a ladder run on top of
+ *                 an existing vertex input needs only pol_vertex = "ladder".
+ *  - pol_vertex_sigma: "none" Vertex in the SELF-ENERGY. {choices: "none", "lff", "pair"}.
+ *                 "lff": the local-field-factor vertex, Sigma = G W~,
+ *                 W~ = W Gamma_eff, Gamma_eff = Pi_0^-1 (Pi_0 + dPi) in the frozen secondary frame of pol_vertex_interp_file
+ *                 (needs pol_vertex_isdf_points_file). Independent of pol_vertex_inject (the P side).
+ *                 "pair": the PAIR-RESOLVED static-ladder vertex in Sigma from the same pair-space
+ *                 machinery as the polarization ladder (the P side's right vertex, D -> D + T_s Cb D, on the right GW leg,
+ *                 contracted with W-bar(q, i nu) and G on the ladder's C window). pol_vertex_sigma_pair_col ("static" =
+ *                 the resummed T_s ladder | "static1" = one static rung K_s -- with pol_vertex_sigma_pair_outer = "static"
+ *                 this is exactly the static-rung Sigma^{C,x} diagram), pol_vertex_sigma_pair_outer ("dynamic" = W-bar(q, i nu) |
+ *                 "static" = W-bar_0), pol_vertex_sigma_scale, pol_vertex_sigma_pair_herm (true), pol_vertex_sigma_pair_diag
+ *                 (false: the nu-rank meter of the amplitude + a <prefix>.sigpair.h5 dump), pol_vertex_sigma_pair_side
+ *                 ("right" = the ladder on the right GW junction | "left" = on the left junction, A~ = [Cb T_s]^T D^* | "both"
+ *                 = the average; static path only). Dynamic-rung columns (vertex_sigma_dyn.icc): pol_vertex_sigma_pair_col = "dyn1" (Gamma_1:
+ *                 one FULL-FREQUENCY rung dressed by static ladders, A = K_s Gsum1 + y_1) | "dyn" (the resummed dynamic-rung
+ *                 ladder, A = K_s Gsum + y) | "dyn1_bare" (T_s = 0: the one bare dynamic rung; with outer "dynamic" == the
+ *                 G^3 W^2 second-order exchange Sigma^C) | "static_dyn" (y = 0 through the dynamic path == "static"): the
+ *                 dynbse solver runs on EVERY bosonic node (both signs) x every transfer at the update_w tail -- the cost of
+ *                 an all-nu dynamic dump -- and the two-frequency amputated vertex is contracted in tau (the twisted family
+ *                 by exact partial fractions). Node sampling and dumps: pol_vertex_sigma_dyn_dump (false; the all-node
+ *                 run writes its per-node objects to <prefix>.sigdyn.h5), pol_vertex_sigma_dyn_nodes ([] = all nodes; a list
+ *                 of FULL-mesh bosonic node indices evaluates only those and reconstructs the nu-sum in the rank-K nu-basis
+ *                 learned from pol_vertex_sigma_dyn_fit_file, K = pol_vertex_sigma_dyn_fit_rank (0 = the number of nodes);
+ *                 pol_vertex_sigma_dyn_auto_nodes (0) = choose that many sampled nodes from the dump's own nu-modes
+ *                 instead of listing them). pol_vertex_sigma_dyn_fit_file = "self" is the IN-RUN reference: the run's first
+ *                 Sigma pass solves every node and writes <prefix>.sigdyn.h5, the later passes are sampled from it;
+ *                 pol_vertex_sigma_dyn_ref_period (0) = n > 0 repeats the all-node reference pass every n passes;
+ *                 pol_vertex_sigma_dyn_ref_adaptive (false) = true renews it adaptively: when the vertex dSigma of a sampled
+ *                 pass differs from the reference pass's by more than pol_vertex_sigma_dyn_ref_change (1e-3; relative
+ *                 Frobenius, logged every sampled pass), the next pass solves every node (either renewal makes a reference);
+ *                 pol_vertex_sigma_dyn_final_full (false) = true makes the last scf iteration an all-node pass: iteration
+ *                 niter, or -- when the convergence test passes earlier on a sampled pass -- one more iteration, after
+ *                 which the loop stops. pol_vertex_sigma_dyn_fit_cut_cst / _t (1e-14) = the eigenvalue cut (of the
+ *                 largest) of the sampled passes' regression, for the cst + U object and the T family. The dump
+ *                 (the reference pass) runs on the device with the Sigma deposits.
+ *                 Performance options: pol_vertex_sigma_pair_ibz (false; the
+ *                 ladder solved on the IBZ transfers, the star folded in the band basis; required by the dynamic columns
+ *                 on a symmetry-reduced mesh), pol_vertex_sigma_dyn_ckpt_minutes
+ *                 (0; the Sigma accumulators checkpointed every so many minutes, restartable), pol_vertex_sigma_dyn_refit
+ *                 ("fit" | "union") + _rtol (1e-8), pol_vertex_sigma_share (false; the P-side all-nu readout's
+ *                 solves feed the Sigma deposits), pol_vertex_sigma_dyn_acc ("split" | "single": one tau-resolved
+ *                 accumulator, memory / (2 n_p + 1)), pol_vertex_sigma_interp_dump / _file / _projector (the coarse
+ *                 run's Wannier-frame dSigma consumed on a finer mesh).
+ *                 != "none" requires pol_vertex = "ladder" (aborts otherwise).
+ *  - pol_vertex_sigma_bub: "window" Pi_0 of the vertex: the dump's window bubble ("Pi_bub") or the loop's RPA Pi folded
+ *                 to the frame ("full"). pol_vertex_sigma_scale (1.0) multiplies the correction; pol_vertex_sigma_pinv_tol
+ *                 (1e-3) = the relative eigenvalue cutoff of Pi_0^-1 (the vertex is restricted to the bubble's strong modes;
+ *                 unbounded below ~1e-4); pol_vertex_sigma_head_scale (1.0) scales the q -> 0
+ *                 head of the correction (0 = body only); pol_vertex_sigma_col ("") = the dPi column (default: the injected one);
+ *                 pol_vertex_sigma_static (true) = the instantaneous part (the vertex's nu -> inf limit times the bare
+ *                 Coulomb) through the static self-energy (false: dropped; it is never sent through tau).
+ *  - pol_vertex_sc: IN-RUN coarse/fine vertex self-consistency (vertex_sc.hpp). {choices: "none", "interp", "direct", "hybrid"}.
+ *                 Default: "hybrid" when pol_vertex_sc_mesh is given, "none" (off) otherwise; "hybrid" on the identity sublattice
+ *                 (pol_vertex_sc_mesh = the k mesh) runs as "direct" (every transfer is a sublattice transfer: nothing to interpolate).
+ *                 The vertex polarization is recomputed every pol_vertex_sc_period W updates (from pol_vertex_sc_start) from the
+ *                 current G and W with the ladder's INTERNAL momenta on the coarse sublattice pol_vertex_sc_mesh = [n1, n2, n3]
+ *                 of the k mesh (N_c = n1 n2 n3 points), mixed with pol_vertex_sc_mix (0.5) into a node-shared store that the
+ *                 W-Dyson equation of every update injects (pol_vertex_inject = "ladder_n2", pol_vertex_rung = "dynamic";
+ *                 no pol_vertex_interp_file / pol_vertex_chain). "interp" (S1) solves the sublattice's own transfers (N_c / 2
+ *                 with pol_vertex_sc_trev = true, Pi-bar(-q) = conj Pi-bar(q)) and Fourier-interpolates (Wigner-Seitz images of
+ *                 the sublattice's supercell) to the mesh's IBZ transfers; "direct" (S2) solves EVERY fine IBZ transfer with the
+ *                 internal sums on the sublattice (exact at the fine q, no interpolation). pol_vertex_sc_head ("coarse" | "fine" |
+ *                 "none"): the Gamma-row head weight rescaled to the sublattice's Madelung weight N_c xi_c (default), kept, or
+ *                 removed; pol_vertex_sc_col ("gam1" | "dyn" | "static") the ladder column; pol_vertex_sc_batch (8) external
+ *                 transfers per ladder pass; pol_vertex_sc_unfold ("fit" | "solve": on a symmetric mesh "interp" solves the
+ *                 IBZ sublattice transfers only and unfolds their star images in the aux frame through the ISDF fit of the
+ *                 rotated pair densities, Pi-bar(S q) = conj(T) Pi-bar(q) T^T; "solve" solves every sublattice transfer, time
+ *                 reversal only; vertex_debug sc_unfold_check = 1 solves the images as well and logs the unfolding error);
+ *                 "hybrid" (S1 + S2): the fine IBZ transfers near Gamma are solved directly, the others interpolated from the
+ *                 (IBZ-solved, unfolded) sublattice set -- the small-q response exact at the cost of the interpolation scheme.
+ *                 The direct set (|q| = the minimum-image norm) is chosen by pol_vertex_sc_direct_select: "radius" (default;
+ *                 |q| <= pol_vertex_sc_direct_radius (1.0) coarse reciprocal spacings min_i |b_i| / n_i), "shells" (Gamma and
+ *                 the pol_vertex_sc_direct_shells (1) smallest non-zero |q| shells) or "count" (the pol_vertex_sc_direct_count
+ *                 smallest |q|, completed to whole shells); the log reports the resulting set. nu-sampled refreshes:
+ *                 pol_vertex_sc_nu_nodes (0 = every half node) = K solves the ladder on K half nodes chosen from the nu-modes of
+ *                 the STORED Pi-bar (nu = 0 and the highest node forced) and reconstructs every node in that basis
+ *                 (pol_vertex_sc_nu_rank (0 = K), pol_vertex_sc_nu_mode "modes" | "regression"); the first refresh (no stored
+ *                 Pi-bar) and every pol_vertex_sc_nu_ref_period-th refresh (0 = never again) solve all nodes; pol_vertex_sc_sigma
+ *                 ("follow" | "interp" | "direct") chooses the Sigma side's scheme independently (follow: interp and hybrid
+ *                 -> the interpolated S1 Sigma, direct -> S2); pol_vertex_sc_restart_file = a previous run's <prefix>.pol_sc.h5 (injected from the
+ *                 first update; the refresh schedule restarts at 1). With pol_vertex_sigma = "pair" (dynamic columns) the Sigma
+ *                 vertex follows the same mode: "direct" runs one restricted ladder pass per class of k-points modulo the
+ *                 sublattice (dSigma at every k, transfers on the sublattice, 1/N_c), "interp" runs the sublattice class alone and
+ *                 interpolates dSigma(k_c) in the MLWF frame (needs vertex_wannier_file; on a symmetric mesh the IBZ dSigma is
+ *                 unfolded first). The W-bar cache is restricted to the sublattice's transfers (vertex_debug sc_wcache_rows = 0
+ *                 keeps the full cache). Symmetric meshes need pol_vertex_sigma_pair_ibz = true for the Sigma side.
+ *  - pol_vertex_inject: "none" In-loop INJECTION of the ladder polarization (qpgw / evgw /
+ *                 gw solvers). {choices: "none", "ladder_n2"}. "none" leaves the ladder a
+ *                 report-only readout. "ladder_n2"
+ *                 screens with P_latt = P^RPA + P^lad, P^lad = the resummed static-rung
+ *                 electron-hole ladder (rungs >= 1, i.e. the terms with >= 2 chi0 factors:
+ *                 the bare bubble is excluded by construction, NO subtraction is performed).
+ *                 The rung is W-bar_0 = [1 - v P^RPA]^-1 v at i.nu = 0 from the SAME iteration.
+ *                 Auto-enables pol_vertex = "ladder"; excludes an
+ *                 ACTIVE vertex_type (double counting); an empty ladder C-window ABORTS.
+ *                 The run logs ||P^lad||/||P^RPA||, its per-q breakdown,
+ *                 the nu -> tau -> nu round trip r_rt, and the resolvent margin
+ *                 lambda_max = rho(chi0 Xi) -- which ABORTS at 1 (particle-hole
+ *                 instability) and warns above 0.9.
+ *  - pol_vertex_legs: "bare" The LEG VERTEX of the ladder's pair
+ *                 propagators. {choices: "bare", "ward"}. "bare": plain pair
+ *                 propagators. "ward" inserts the discrete-Ward vertex
+ *                 Lambda0 = 1 - [Sigma(iw+inu) - Sigma(iw)]/inu at the vertex of every
+ *                 pair propagator, built from the loop's own stored Sigma through its
+ *                 DLR pole products (no difference quotient), and adds the zero-rung
+ *                 term Delta P^Lambda to the ladder's output, (M,N)-Hermitized. The eps_M
+ *                 readout gains a "+DeltaLambda" column (chi0_Lambda alone). Requires
+ *                 ladder_solve_grid = 1.
+ *  - pol_vertex_rung: "static" The ladder's RUNG. {choices: "static", "dynamic"}. "static":
+ *                 the W0bar rung. "dynamic" resums the ladder with the FULL-FREQUENCY
+ *                 screened rung W(inu') (two-family DLR representation of the loop frequency,
+ *                 static part exact, dynamic remainder by GMRES); the eps_M readout gains the
+ *                 columns +static(sign-corrected) / +static+Pi^C_dyn / +Gamma_1 / +resummed at
+ *                 inu = 0. Knobs:
+ *                 pol_vertex_dyn_tol (1e-8), pol_vertex_dyn_maxit (30), pol_vertex_dyn_gmres
+ *                 (12: the GMRES restart length -- short restarts can stall at inu != 0; 0 = Neumann),
+ *                 pol_vertex_dyn_rhs_block (32: the RHS columns of the dynamic solves in blocks of
+ *                 this width -- the Krylov basis is the memory driver; 0 = all at once),
+ *                 pol_vertex_dyn_schedule ("longest": the unit order heuristic; "measured": longest-first by the previous
+ *                 call's measured unit times),
+ *                 pol_vertex_wcache ("replicated": the W-bar cache once per rank; "shared": once per NUMA node),
+ *                 pol_vertex_chain (false; true: the in-process vertex chain -- every update after the first injects the
+ *                 all-nu dump this run wrote at the previous update instead of pol_vertex_interp_file),
+ *                 vertex_debug ("": the vertex code's diagnostic switches as "key=value, key" -- sigdyn_route, sigdyn_families,
+ *                 sigdyn_legs, dynbse_union, dynbse_vmask, dynbse_tkeep, dynbse_tfold, dynbse_ritz, sigpair_ibz_diag,
+ *                 sigpair_ibz_dump, vertex_rdecay, allreduce_chunk, scf_causality_meter; COQUI_<KEY> environment
+ *                 variables are read as a fallback. An unknown key or an unparseable number / switch value
+ *                 ABORTS, true/false/on/off/yes/no read as 1/0, an environment-sourced value is logged as a [WARNING], and
+ *                 each driver section's string REPLACES the previous section's switches),
+ *                 pol_vertex_dyn_dump (false: per-unit dump + restart files
+ *                 "<prefix>.dynunits.<tag>.g<call>.r<rank>.bin" of the dynamic solves),
+ *                 pol_vertex_dyn_dense (true: the dense per-tau rung K_d(s), nt/2 x D^2 per rank;
+ *                 false: the THC pair-space streaming route), pol_vertex_dyn_rung_rank (0: the dense per-tau rung; R > 0: the
+ *                 FREQUENCY-FACTORIZED rung K_d(tau) ~ sum_{r<R} c_r(tau) K_r with R universal time functions computed once per
+ *                 W update from the W-bar cache and shared by every P and Sigma pass -- R x D^2 rung memory per unit and R x
+ *                 the rung flops; needs pol_vertex_dyn_dense = true), pol_vertex_dyn_rung_tol (0: off; > 0: the smallest R
+ *                 whose rung-level truncation error estimate max_tau |K[E(tau)]| / max_tau |K[W(tau)]| (Frobenius, the pair
+ *                 metric averaged over the internal k; rung_basis.hpp) is <= the tolerance; with pol_vertex_dyn_rung_rank
+ *                 also set, R is capped at that rank and a binding cap is logged as a WARNING; R, the achieved error, the
+ *                 rung memory and the basis hash are logged at every W update; the retired vertex_debug dyn_rung_rank /
+ *                 dyn_rung_build_rank abort), pol_vertex_dyn_rung_apply ("reconstruct", the default: the per-representative
+ *                 rung K_d(rep) = sum_r c_r(rep) K_r formed from the factors -- the resident rungs once per transfer, the others
+ *                 per rung pass -- and applied by the dense mirror-pair pass: the dense flops plus bandwidth-bound reconstructs,
+ *                 R D^2 + the resident rungs of memory, on the device as fast as the dense rung or faster; "factorized": every
+ *                 K_r on every tau column, R x the dense rung flops, the smallest footprint; the same rung to rounding; only
+ *                 with pol_vertex_dyn_rung_rank / _tol -- unused by the default dense rung, an explicit "reconstruct" without
+ *                 them aborts), pol_vertex_dyn_resolvent ("inverse": the static resolvent
+ *                 T_s stored dense; "lu": factorized once and applied as a solve), pol_vertex_dyn_device_fallback (false:
+ *                 a dynamic-vertex device stage that does not fit in device memory aborts the run; true: it moves to the
+ *                 CPU with a WARNING), pol_vertex_dyn_device_memory ("auto": dense dynamic rungs that do not fit
+ *                 in device memory are rebuilt on the device and / or copied from pinned host memory, split by measured cost;
+ *                 "rebuild" / "host": one source only; "resident": every rung must fit), pol_vertex_dyn_dressed ("auto": the exact dressed-leg Gamma_1 readout
+ *                 on every pass that supports it, the others run the standard path and say so; "on": required, abort where it
+ *                 cannot apply; "off"), pol_vertex_dyn_vmask_lo / _hi (Ha about mu: drop the in-gap
+ *                 vertex nodes, the small-nu fix's second half; off by default), pol_vertex_dyn_gamma1_only (false:
+ *                 the full resummation; true: stop at Gamma_1, 5-8x cheaper), pol_vertex_dyn_tfold (0: off; r > 0 folds the twisted
+ *                 pair components with |eps| >= r |nu| into the unshifted family -- the small-nu fix; r = 30 is typical), pol_vertex_dyn_iaft_prec ("": the loop's grid;
+ *                 "medium"/"high": the dynamic pair algebra on its own finer DLR), pol_vertex_dyn_table_mode (0: fitted twisted-pair
+ *                 tables at inu != 0; 1: the exact partial fractions through Dsq, a diagnostic), pol_vertex_dyn_union_stride (1: keep every
+ *                 n-th shifted G node of the inu != 0 union grid -- ~n^2 cheaper pair-pole algebra; check
+ *                 the reported G fit), pol_vertex_dyn_cut_r1 (true: the cut / all-nu dump also runs the one-bare-rung
+ *                 Pi_dyn1 pass; false skips it, Pi_dyn1 = Pi_static -- sufficient when only Gamma_1 is needed),
+ *                 pol_vertex_dyn_sign (-1 = the derived rung sign, +1 = the opposite sign convention).
+ *                 XOR pol_vertex_legs = "ward".
+ *  - the vertex fallback keys (all default false = ABORT, parsed by every gw / evgw / qpgw
+ *    site; true continues with a [WARNING] instead -- each one can change the answer):
+ *                 vertex_allow_missing_head (false: a gygi-class vertex q->0 policy whose analytic head cannot be built --
+ *                 madelung == 0 / empty basis_head -- or whose dynamic head piece has no eps_inv_head aborts;
+ *                 vertex_bl_head_scale = 0 is an explicit choice and is only logged), pol_vertex_allow_bare_rung (false: the
+ *                 dynamic-rung Pi^C without any screened W -- the bare rung W = Z fallback -- aborts),
+ *                 pol_vertex_allow_unprojected (false: an injected Pi^C with transfers lacking a stored -q partner, which
+ *                 the pair-symmetry projection cannot reach, aborts), vertex_allow_unchecked_reflection (false: the
+ *                 IBZ-mesh response rung's Pi(-q) = Pi(q)^T, measured on the self-inverse / stored-pair transfers,
+ *                 aborts above a relative 1e-8).
+ *  - ladder_solve_grid: 1  Ranks per SOLVE GRID for the ladder's dense resolvent.
+ *                 1 (default) is the per-rank LAPACK path; its
+ *                 threading comes from the BLAS library (t = OMP_NUM_THREADS as launched).
+ *                 g > 1 makes g ranks cooperate on each (s,q,nu) solve through SLATE, so
+ *                 no rank ever holds a full (D,D); it requires nproc % g == 0 and, at
+ *                 OMP_NUM_THREADS > 1, MPI_THREAD_MULTIPLE (env COQUI_MPI_THREAD_MULTIPLE=1
+ *                 -- SLATE's OpenMP tasks issue concurrent MPI calls). 0 = AUTO: g = 1 if
+ *                 the per-rank footprint fits ladder_solve_budget_gb, else the smallest g
+ *                 that fits (preferring divisors of the intra-node group).
+ *  - ladder_solve_budget_gb: 8.0  Per-rank memory budget the AUTO mode fits against.
+ *  - ladder_tda: false  DIAGNOSTIC. Tamm-Dancoff
+ *                 truncation of the ladder KERNEL: zero the blocks of the rung that couple
+ *                 resonant (occ at k, empty at k+q) to anti-resonant pairs, i.e. B = 0 in
+ *                 H = [[A, B], [-B*, -A*]] -- the Hermitian half-size reduction used e.g. by
+ *                 Cunningham et al., PRB 108, 165104 (2023). The default ladder is TDA-FREE;
+ *                 this switch measures the effect of the TDA.
+ *  - ladder_head_scale: 1.0  DIAGNOSTIC. Multiplies the analytic rank-1 q -> 0 head
+ *                 that build_w0 inserts into the static rung W0(Gamma) -- the head INSIDE
+ *                 the ladder kernel W-bar_0. 1.0 = the full gygi head,
+ *                 0.0 = head-free kernel. It does NOT touch the loop's own RPA W, its
+ *                 div_treatment, or the Sigma^C/Pi^C head insertions (vertex_bl_head_scale).
+ *                 Whether this head is inserted at all follows the readout instance's q->0
+ *                 policy, set by vertex_div_treatment.
+ *  - ladder_qnu_meter: false  DIAGNOSTIC, report-only. Prints the (q, nu)
+ *                 decomposition of the injected P^lad, the per-q Dyson-W change it drives
+ *                 (||dW_lad(q)||, Delta eps_M(q)), and the pre/post-secondary-fold head
+ *                 meter at Gamma.
+ *  - pol_eps_cut: 0  DIAGNOSTIC, report-only. When > 0, the ladder readout also
+ *                 reports eps_M(q_i, i nu_j) at pol_eps_cut transfers (q_min plus evenly
+ *                 spaced |q| ranks) on EVERY PH-sym bosonic half node, for every column it
+ *                 evaluates (RPA, +ladder, +DeltaLambda when legs = ward) and for the loop's
+ *                 own eps^-1 head (the in-loop eps_M: RPA scGW, or RPA + ladder with the
+ *                 injection on). Lines are tagged "[eps-cut]" for harvesting. Memory: rank 0 holds
+ *                 pol_eps_cut x nw_half x Np^2 complex RPA rows between the kernel build and
+ *                 the readout; the ladder is evaluated on all half nodes (one whalf pass).
+ *  - pol_eps_cut_dyn_nnu: 0  with pol_vertex_rung = "dynamic": the dynamic columns of the cut are
+ *                 evaluated on the lowest n half nodes only (0 = all half nodes); one dynamic
+ *                 solve per (node, transfer) is the cut's cost driver.
+ *  - eps_inf_fit: false  DIAGNOSTIC, report-only. Reports
+ *                 epsilon_inf from the small-q least-squares fit eps_M(q) = eps_inf + A |q|^2 (+ B |q|^4)
+ *                 of the loop's own static macroscopic dielectric function, eps_M(q) =
+ *                 1 / (1 + Re[eps^-1_{00}(q, i nu = 0) - 1]) on the eps_inf_fit_npts smallest NONZERO
+ *                 Cartesian |q| of the IBZ mesh (degree 1 in |q|^2 for 2-3 points, 2 for >= 4), next to
+ *                 the stored q -> 0 head of the div_treatment; written to scf/iter<n>/epsilon_inf_fit
+ *                 (+ _coeffs, _qabs, _eps, _residual). All other outputs are unchanged.
+ *  - eps_inf_fit_npts: 3  the number of smallest nonzero |q| used by eps_inf_fit (>= 2).
  */
-template<typename eri_t>
+template<MEMORY_SPACE MEM, typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
 {
   auto mf = eri.corr_eri->get().MF();
@@ -125,6 +697,12 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
   if (mpi->comm.size()%mpi->node_comm.size()!=0) {
     APP_ABORT("MBPT: number of processors on each node should be the same.");
   }
+  // Only the THC corr-ERI path has a device implementation of update_w /
+  // evaluate. For Cholesky corr-ERI, fall back to HOST_MEMORY so scf_loop
+  // resolves to the host instantiation (which is the only one defined).
+  using corr_t = std::decay_t<decltype(eri.corr_eri->get())>;
+  constexpr MEMORY_SPACE SCF_MEM =
+      std::is_same_v<corr_t, thc_reader_t> ? MEM : HOST_MEMORY;
   std::string err = std::string("mbpt - Incorrect input - ");
   auto div_treatment = io::get_value_with_default<std::string>(pt, "div_treatment", "gygi");
   auto hf_div_treatment = io::get_value_with_default<std::string>(pt, "hf_div_treatment", "gygi");
@@ -195,6 +773,125 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
   } else if(solver_type == "gw") {
     auto screen_type = io::get_value_with_default<std::string>(pt,"screen_type", "rpa");
 
+    // optional second-order-exchange vertex correction
+    auto vertex_type = io::get_value_with_default<std::string>(pt,"vertex_type","none");
+    io::tolower(vertex_type);
+    // Rung mode of the vertex: "dynamic" (default) = dynamic W rungs; "static"/"linear" = the
+    // static-rung truncations. Validated in the vertex_t constructor.
+    auto vertex_rung = io::get_value_with_default<std::string>(pt,"vertex_rung","dynamic");
+    io::tolower(vertex_rung);
+    auto vertex_band_window = io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0));
+    // auxiliary basis of the vertex kernels ("global" THC basis or a "secondary" ISDF basis on C)
+    auto vertex_isdf = io::get_value_with_default<std::string>(pt,"vertex_isdf","global");
+    io::tolower(vertex_isdf);
+    auto vertex_isdf_rank = io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1);
+    auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
+    // Secondary-ISDF point-selection thresh (-1 = default to the global THC thresh)
+    auto vertex_isdf_thresh = io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0);
+    // distr_tol for the SECONDARY basis' private thc builder (raises the cap on the number of
+    // ranks it can use; <= 0 = builder default 0.2).
+    auto vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0);
+    // Conditioning cap on the secondary metric s(q) (<=0 = disabled). >0 prunes the
+    // near-dependent tail of the selected basis so cond(s) stays under this value.
+    auto vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0);
+    // Phi-scaling of the vertex: BOTH cuts by the same lambda == Phi_2^C -> lambda Phi_2^C,
+    // so conservation is exact at every lambda (the approximation acts on Phi, not on the
+    // cuts). vertex_ramp_iters > 0 walks lambda from vertex_scale/ramp up to vertex_scale
+    // over that many scf iterations. Used to keep eps = I - Z.Pi positive definite: P^C is
+    // not sign-definite.
+    // q->0 rung policy for the VERTEX, independent of the GW/HF one. The gygi head
+    // inserted into the vertex rungs is a rank-1 Nk*madelung*chi.chi^dag block that can
+    // exceed the body contribution on coarse k-meshes, large enough to flip
+    // the sign of the traced Phi_2^C. It is also the ONE component the Sigma^C-vs-GF2
+    // absolute cross-check does not cover (that test runs "ignore_g0"). Being able to
+    // switch it WITHOUT changing the GW/HF divergence treatment makes it separable.
+    // Empty string = inherit div_treatment.
+    auto vertex_div_treatment = io::get_value_with_default<std::string>(pt,"vertex_div_treatment","");
+    io::tolower(vertex_div_treatment);
+    auto vertex_scale = io::get_value_with_default<double>(pt,"vertex_scale",1.0);
+    auto vertex_ramp_iters = io::get_value_with_default<long>(pt,"vertex_ramp_iters",0);
+    // the linear mode's pi^dyn route. "factorized" is the production route; "kernel"
+    // runs the full dynamic Pi^C and keeps tau = 0; "check" runs both and compares.
+    auto vertex_pidyn = io::get_value_with_default<std::string>(pt,"vertex_pidyn","factorized");
+    io::tolower(vertex_pidyn);
+    auto vertex_pidyn_tol = io::get_value_with_default<double>(pt,"vertex_pidyn_tol",-1.0);
+    // Project the rank-1 head channel out of the response middle factor at q = Gamma.
+    // DIAGNOSTIC, default false: it BREAKS PHI-DERIVABILITY (the linear mode's G-side
+    // functional-derivative check fails even when only part of the channel is removed),
+    // because it is applied to the Sigma cut only, leaving eval_Pi_C's P^{C,L} untouched.
+    // It does control the COLD-START basin. See vertex_t.h.
+    auto vertex_bl_head_projection =
+        io::get_value_with_default<bool>(pt,"vertex_bl_head_projection",false);
+    // DIAGNOSTIC, default false, NOT physical: freeze pi^dyn's Gamma rung head at its
+    // i.nu = 0 weight. Tests whether the head's retardation is what breaks pi^dyn's
+    // q -> 0 head suppression (which Pi^{C,0}, whose head IS frozen, satisfies exactly).
+    auto vertex_bl_static_head =
+        io::get_value_with_default<bool>(pt,"vertex_bl_static_head",false);
+    // DIAGNOSTIC, default false, changes the KERNEL DEFINITION: take W0's Gamma head
+    // weight from the same (vertex-corrected) eps^-1 that W's head uses, instead of from
+    // W0's own RPA-only Dyson. Makes the head part of W(Gamma,0) - W0(Gamma) vanish; that
+    // head residue can dominate |W(q,0) - W0(q)|. See vertex_t.h.
+    auto vertex_bl_w0_head_from_w =
+        io::get_value_with_default<bool>(pt,"vertex_bl_w0_head_from_w",false);
+    // DIAGNOSTIC, default false, NOT physical: the constant-rung check. Replaces
+    // pi^dyn's dynamic rung by the frequency-independent W0bar - Z, so pi^dyn's rung IS
+    // Pi^{C,0}'s rung and X^L must collapse to the DLR representability floor. A residual
+    // O(1) X^L points at the equal-time path itself. See vertex_t.h.
+    auto vertex_bl_pidyn_const_rung =
+        io::get_value_with_default<bool>(pt,"vertex_bl_pidyn_const_rung",false);
+    // The BALANCED FIRST-ORDER HEAD (default false). Linear mode only:
+    // every W input of the vertex functional carries W0's STATIC Gamma-head weight
+    // (instantaneous slot, 1 + eps_inv_head(i.nu=0); no dynamic-slot head), so the
+    // fluctuation dW = W - W0 carries no analytic head. CONSERVING (a modified
+    // interaction in Phi -- both cuts differentiate). The static mode is unaffected; the
+    // dynamic mode keeps its retarded head.
+    auto vertex_bl_head_static_all =
+        io::get_value_with_default<bool>(pt,"vertex_bl_head_static_all",false);
+    // Wannier-projector subspace C: when set, the
+    // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
+    // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
+    auto vertex_wannier_file = io::get_value_with_default<std::string>(pt,"vertex_wannier_file","");
+    auto vertex_wannier_loewdin = io::get_value_with_default<bool>(pt,"vertex_wannier_loewdin",true);
+    // ladder (pol_vertex) and CVV-head knobs. The pol_vertex_* basis knobs inherit the vertex_* values when
+    // their keys are absent, so a ladder run on top of an existing vertex input needs
+    // only pol_vertex = "ladder".
+    auto cvv_rspace_tol = io::get_value_with_default<double>(pt,"cvv_rspace_tol",1e-6);
+    auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
+    io::tolower(pol_vertex);
+    // in-loop INJECTION of the ladder into P. Auto-enables pol_vertex = "ladder" (logged in
+    // the setter).
+    auto pol_vertex_inject = io::get_value_with_default<std::string>(pt,"pol_vertex_inject","none");
+    io::tolower(pol_vertex_inject);
+    auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
+    io::tolower(pol_vertex_kernel);
+    auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",vertex_band_window);
+    auto pol_vertex_isdf_rank = io::get_value_with_default<long>(pt,"pol_vertex_isdf_rank",vertex_isdf_rank);
+    auto pol_vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_svd_tol",vertex_isdf_svd_tol);
+    auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",vertex_isdf_thresh);
+    auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",vertex_isdf_cond_max);
+    auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",vertex_isdf_distr_tol);
+    // the SOLVE GRID of the ladder's dense resolvent. ladder_solve_grid = 1 (default) is the
+    // per-rank LAPACK path; > 1 makes g ranks cooperate on
+    // each (s,q,nu) solve through SLATE; 0 is AUTO (the per-rank memory fit test against
+    // ladder_solve_budget_gb). Threads are deliberately NOT a TOML knob -- t is
+    // OMP_NUM_THREADS as launched, and t > 1 at g > 1 additionally needs the environment
+    // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
+    auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
+    auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
+    // three DIAGNOSTIC knobs on the ladder, all inactive at their defaults.
+    //  - ladder_tda        : Tamm-Dancoff truncation of the ladder KERNEL. Zeroes the
+    //                        resonant<->anti-resonant coupling block, i.e. the
+    //                        Hermitian half-size reduction. Default false (TDA-free).
+    //  - ladder_head_scale : scales the analytic rank-1 q->0 head inserted into the static
+    //                        rung W0(Gamma) = the ladder kernel W-bar_0. 1.0 = the
+    //                        full head, 0.0 = head-free kernel. Does NOT touch the
+    //                        loop's own RPA W, div_treatment, or the Sigma^C/Pi^C heads.
+    //  - ladder_qnu_meter  : the (q, nu) decomposition meters of P^lad and of the Dyson-W
+    //                        change, plus the pre/post-fold head meter. Report-only.
+    auto ladder_tda = io::get_value_with_default<bool>(pt,"ladder_tda",false);
+    auto ladder_head_scale = io::get_value_with_default<double>(pt,"ladder_head_scale",1.0);
+    auto ladder_qnu_meter = io::get_value_with_default<bool>(pt,"ladder_qnu_meter",false);
+
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
@@ -203,19 +900,192 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     }
     solvers::scr_coulomb_t scr_eri(&ft, screen_type, div_treatment);
     solvers::gw_t gw(&ft, div_treatment, output);
+
+    // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
+    // are switched together through this single object -- never one alone.
+    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
+                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
+                             vertex_isdf_cond_max, vertex_rung);
+    vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
+    vertex.set_pidyn_mode(vertex_pidyn, vertex_pidyn_tol);
+    vertex.set_bl_head_projection(vertex_bl_head_projection);
+    vertex.set_bl_static_head(vertex_bl_static_head);
+    vertex.set_bl_w0_head_from_w(vertex_bl_w0_head_from_w);
+    vertex.set_bl_pidyn_const_rung(vertex_bl_pidyn_const_rung);
+    vertex.set_bl_head_static_all(vertex_bl_head_static_all);
+    // vertex_bl_head_scale (default 1) multiplies the madelung weight of every analytic q -> 0 head the
+    // vertex kernel inserts (Sigma^C / Pi^C, the ladder rung W-bar_0 and the dynamic W-bar cache); 0 = a head-free
+    // (body-only) vertex, the interpolable coarse object. The loop's RPA W keeps its own div_treatment.
+    vertex.set_bl_head_scale(io::get_value_with_default<double>(pt,"vertex_bl_head_scale",1.0));
+    vertex.set_isdf_distr_tol(vertex_isdf_distr_tol);
+    if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
+    // validate + store the ladder knobs (the double-counting guard lives in the setter);
+    // the CVV R-shell tolerance is handed to the W builder below.
+    vertex.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
+                          pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+                          pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
+                          pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
+    vertex.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    mbpt_vertex_audit::set_fallback_keys(vertex, pt);   // the vertex fallback keys (default false = abort)
+    vertex.set_eps_cut(io::get_value_with_default<long>(pt,"pol_eps_cut",0),      // eps(q_i, i nu) cuts
+                       io::get_value_with_default<long>(pt,"pol_eps_cut_dyn_nnu",0));
+    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
+    {   // the ladder's leg vertex (inactive by default)
+      auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
+      io::tolower(pol_vertex_legs);
+      vertex.set_ladder_legs(pol_vertex_legs);
+      // the ladder's rung, static or full-frequency (static by default)
+      {
+        auto pol_vertex_rung = io::get_value_with_default<std::string>(pt,"pol_vertex_rung","static");
+        io::tolower(pol_vertex_rung);
+        vertex.set_ladder_rung(pol_vertex_rung,
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",12),
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+        vertex.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
+        vertex.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        // freeze / dump the secondary ISDF points, the Wannier output frame, and the fine-mesh consumer of an
+        // interpolated Pi(q)_{MN}
+        vertex_debug::set(io::get_value_with_default<std::string>(pt,"vertex_debug",""));   // the diagnostic switches
+        if (not vertex_debug::list().empty()) app_log(1, "  vertex_debug switches: {}", vertex_debug::list());
+        vertex.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
+                            io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
+        vertex.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
+        vertex.set_wcache_mode(io::get_value_with_default<std::string>(pt,"pol_vertex_wcache","replicated"));
+        vertex.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
+                           io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
+        vertex.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
+        vertex.set_pol_sc(read_pol_sc(pt));
+        vertex.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
+        vertex.set_ladder_dyn_rung(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rung_rank",0),
+                                  io::get_value_with_default<double>(pt,"pol_vertex_dyn_rung_tol",0.0));
+        if (auto rung_apply = pt.get_optional<std::string>("pol_vertex_dyn_rung_apply")) vertex.set_ladder_dyn_rung_apply(*rung_apply);
+        vertex.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
+        vertex.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
+        vertex.set_ladder_dyn_device_memory(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_device_memory","auto"));
+        vertex.set_ladder_dyn_dressed(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_dressed","auto"));
+        vertex.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
+        vertex.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
+        vertex.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
+        vertex.set_ladder_dyn_iaft_prec(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_iaft_prec",""));
+        vertex.set_ladder_dyn_tfold(io::get_value_with_default<double>(pt,"pol_vertex_dyn_tfold",0.0));
+        vertex.set_ladder_dyn_vmask(io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_lo",0.0),
+                                         io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
+        vertex.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
+        vertex.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
+        vertex.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
+        vertex.set_ladder_dyn_bubble_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_bubble_only",false));
+        vertex.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
+        vertex.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0),
+                                 io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_mode","modes"),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_auto_nodes",0));
+        vertex.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
+        {   // pol_vertex_sigma = "lff": the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
+          auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
+          auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
+          vertex.set_sigma_lff(sig_mode == "pair" ? std::string("none") : sig_mode, sig_bub,
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+          // pol_vertex_sigma = "pair" -- the pair-resolved static-ladder vertex in Sigma
+          vertex.set_sigma_pair(sig_mode == "pair",
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_col","static"),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          vertex.set_sigma_pair_ibz(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_ibz",false));
+          vertex.set_sigma_dyn_ckpt_minutes(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_ckpt_minutes",0.0));
+          vertex.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
+                                      io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
+          vertex.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
+          vertex.set_sigma_dyn_acc(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_acc","split"));
+          vertex.set_sigma_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_dump",""),
+                                  io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_file",""),
+                                  io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_projector",""));
+          vertex.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
+              io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
+              io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
+          vertex.set_sigma_dyn_auto_nodes(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_auto_nodes",0));
+          vertex.set_sigma_dyn_ref_period(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_ref_period",0));
+          mbpt_vertex_audit::set_sigma_dyn_ref_keys(vertex, pt);
+        }
+      }
+    }
+    scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
+    if (vertex.enabled()) {
+      utils::check(screen_type == "rpa" or screen_type == "rpa_k",
+                   "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
+                   "(got \"{}\"): combining the vertex correction with cRPA/EDMFT screening "
+                   "is not validated (Phi-derivability of the combination unestablished).",
+                   vertex.vertex_type(), screen_type);
+      // WANNIER MODE: build the projector from wan.h5 and install U. One U per run:
+      // if a gw_edmft embedding projector is also active, the vertex must consume the
+      // SAME wan.h5 or abort.
+      if (not vertex_wannier_file.empty()) {
+        if (screen_type.substr(0,8) == "gw_edmft") {
+          auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
+          utils::check(embed_file == vertex_wannier_file,
+                       "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
+                       "wannier_file = \"{}\": one projector P per run is required (the vertex "
+                       "and the embedding must share the same Wannier orbitals); use the SAME "
+                       "wan.h5 for both.", vertex_wannier_file, embed_file);
+        }
+        auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
+        methods::projector_t proj(*mf, vertex_wannier_file, vtx_trans_home);
+        vertex.set_wannier_projector(proj, vertex_wannier_loewdin);
+      }
+      scr_eri.set_vertex(&vertex);
+      gw.set_vertex(&vertex);
+    } else if (vertex.pol_vertex_enabled()) {
+      // a pol-vertex-only run (vertex_type = "none") attaches the knob carrier to scr_eri so
+      // update_w can run the ladder (readout, injection, Sigma vertex). Never attached to
+      // gw, and has_active_vertex() stays false (no Sigma^C / Pi^C).
+      // The coarse->fine interpolation path IS a pol-vertex-only run on a Wannier
+      // projector: vertex_type = "none" + pol_vertex =
+      // "ladder" + vertex_wannier_file. set_wannier_projector accepts a pol-vertex-only vertex
+      // and scr_coulomb's readout instance inherits U (ensure_pol_vertex ->
+      // adopt_wannier), so the dynbse then produces / dumps Pi_loc(q) in the MLWF-pair frame.
+      // Same one-projector-per-run rule as the Sigma^C branch above.
+      if (not vertex_wannier_file.empty()) {
+        if (screen_type.substr(0,8) == "gw_edmft") {
+          auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
+          utils::check(embed_file == vertex_wannier_file,
+                       "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
+                       "wannier_file = \"{}\": one projector P per run is required (the vertex "
+                       "and the embedding must share the same Wannier orbitals); use the SAME "
+                       "wan.h5 for both.", vertex_wannier_file, embed_file);
+        }
+        auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
+        methods::projector_t proj(*mf, vertex_wannier_file, vtx_trans_home);
+        vertex.set_wannier_projector(proj, vertex_wannier_loewdin);
+      }
+      scr_eri.set_vertex(&vertex);
+    }
+    // a requested vertex / ladder with an empty C (after any Wannier projector) and a Sigma vertex without
+    // the ladder abort here, before the scf loop
+    mbpt_vertex_audit::check_vertex_requests(vertex, pt, "mbpt [gw]");
+
     if (screen_type.substr(0,8)=="gw_edmft") {
 
       auto wannier_file = io::get_value<std::string>(pt,"wannier_file",err+"wannier_file");
       auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
 
       MBState mb_state(ft, output, mf, wannier_file, trans_home_cell);
-      scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
-               iter_solver.get(), niter, restart, conv_thr, const_mu,
-               greens_func_source, greens_func_iteration);
+      scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+                    iter_solver.get(), niter, restart, conv_thr, const_mu,
+                    greens_func_source, greens_func_iteration);
 
       auto dump_w_to_h5 = io::get_value_with_default<bool>(pt,"dump_w_to_h5", false);
       if (dump_w_to_h5) {
-        auto& W_qtPQ = mb_state.dW_qtPQ.value();
+        auto& W_qtPQ = mb_state.W_host();
         if (mb_state.mpi->comm.root()) {
           h5::file file("thc_screened_interaction.h5", 'w');
           h5::group grp(file);
@@ -228,13 +1098,13 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     } else {
 
       MBState mb_state(mpi, ft, output);
-      scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
-               iter_solver.get(), niter, restart, conv_thr, const_mu,
-               greens_func_source, greens_func_iteration);
+      scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+                    iter_solver.get(), niter, restart, conv_thr, const_mu,
+                    greens_func_source, greens_func_iteration);
 
       auto dump_w_to_h5 = io::get_value_with_default<bool>(pt,"dump_w_to_h5", false);
       if (dump_w_to_h5) {
-        auto& W_qtPQ = mb_state.dW_qtPQ.value();
+        auto& W_qtPQ = mb_state.W_host();
         if (mb_state.mpi->comm.root()) {
           h5::file file("thc_screened_interaction.h5", 'w');
           h5::group grp(file);
@@ -274,6 +1144,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                greens_func_source, greens_func_iteration);
     } else {
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", div_treatment);
+      scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
       scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gf2, &scr_eri),
                iter_solver.get(), niter, restart, conv_thr, const_mu,
                greens_func_source, greens_func_iteration);
@@ -314,15 +1185,290 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     auto Nfit    = io::get_value_with_default<int>(pt,"Nfit",18);
     io::tolower(ac_alg);
     io::tolower(qp_type);
+    auto qp_map = io::get_value_with_default<std::string>(pt,"qp_map","ac_pade");
+    io::tolower(qp_map);
+    utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
+                 qp_map=="mode_a" or qp_map=="mode_b",
+                 "evgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
+                 "\"mats_gmatch\", \"mode_a\", \"mode_b\".",
+                 qp_map);
     qp_params_t qp_params(qp_type, ac_alg, Nfit, eta, conv_thr, "evscf", keep_scr_coulomb_fixed,
                           "fermi", mu_tol, mu_update_alg);
+    qp_params.qp_map = qp_map;
+    qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
+    utils::check(qp_params.qp_map_wpow >= 0.0, "evgw: qp_map_wpow must be >= 0.");
+    // knobs of the real-axis quasiparticle maps qp_map = "mode_a" / "mode_b".
+    qp_params.qp_modea_route = io::get_value_with_default<std::string>(pt,"qp_modea_route","cd");
+    io::tolower(qp_params.qp_modea_route);
+    utils::check(qp_params.qp_modea_route=="cd" or qp_params.qp_modea_route=="expansion",
+                 "evgw: unknown qp_modea_route: {}. Valid options: \"cd\", \"expansion\".",
+                 qp_params.qp_modea_route);
+    qp_params.qp_modea_nconsist = io::get_value_with_default<long>(pt,"qp_modea_nconsist",5);
+    utils::check(qp_params.qp_modea_nconsist >= 1, "evgw: qp_modea_nconsist must be >= 1.");
+    qp_params.qp_modea_consist_tol = io::get_value_with_default<double>(pt,"qp_modea_consist_tol",1e-8);
+    utils::check(qp_params.qp_modea_consist_tol > 0.0, "evgw: qp_modea_consist_tol must be > 0.");
+    qp_params.qp_modea_eta = io::get_value_with_default<double>(pt,"qp_modea_eta",0.0);
+    // out-of-strip states are evaluated at eps + i*eta_far (0 = evaluate them at z = mu).
+    qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
+    utils::check(qp_params.qp_modea_eta_far >= 0.0,
+                 "evgw: qp_modea_eta_far must be >= 0 (0 = out-of-strip states are evaluated at mu).");
+    // the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset = the
+    // E_PH-derived strip. See qp_params_t.h.
+    qp_params.qp_modea_strip_lo =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
+    qp_params.qp_modea_strip_hi =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_hi",0.0);
+    utils::check(qp_params.qp_modea_strip_lo >= 0.0 and qp_params.qp_modea_strip_hi >= 0.0,
+                 "evgw: qp_modea_strip_lo / qp_modea_strip_hi are HALF-WIDTHS below and above "
+                 "mu and must be >= 0 (0 = unset = the E_PH strip).");
+    utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
+                 "evgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
+                 "for an explicit window, both 0 for the E_PH strip).");
+    // the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not the spacing; h is
+    // derived from an empirical error model (see qp_params_t.h). 0 = cache off.
+    qp_params.qp_tc_wgrid_mev =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
+    utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
+                 "evgw: qp_tc_wgrid_mev = {} must be >= 0 (0 = cache off).",
+                 qp_params.qp_tc_wgrid_mev);
+    qp_params.qp_tc_wgrid_h =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_h",0.0);
+    utils::check(qp_params.qp_tc_wgrid_h >= 0.0,
+                 "evgw: qp_tc_wgrid_h = {} must be >= 0 (0 = derive from the law)."
+                 , qp_params.qp_tc_wgrid_h);
+    qp_params.qp_tc_wgrid_audit =
+        io::get_value_with_default<long>(pt,"qp_tc_wgrid_audit",16);
+    utils::check(qp_params.qp_tc_wgrid_audit >= 0,
+                 "evgw: qp_tc_wgrid_audit = {} must be >= 0.",
+                 qp_params.qp_tc_wgrid_audit);
+    qp_params.qp_tc_wgrid_audit_hard =
+        io::get_value_with_default<bool>(pt,"qp_tc_wgrid_audit_hard",true);
+    qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
+    io::tolower(qp_params.qp_modea_wsupp);
+    qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
+    io::tolower(qp_params.qp_modea_wfit);
+    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu"
+                 or qp_params.qp_modea_wfit=="spectral"
+                 or qp_params.qp_modea_wfit=="contour",
+                 "evgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
+                 "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
+    // the tilted-contour route (qp_modea_wfit = "contour"), a SIBLING of the "spectral"
+    // knob family. Every value is documented on qp_params_t.h.
+    qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
+    utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
+                 "evgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
+    qp_params.qp_tc_delta = io::get_value_with_default<double>(pt,"qp_tc_delta",0.0);
+    utils::check(qp_params.qp_tc_delta >= 0.0,
+                 "evgw: qp_tc_delta = {} must be >= 0 (0 derives it from the target broadening and the k-mesh).",
+                 qp_params.qp_tc_delta);
+    qp_params.qp_tc_rho = io::get_value_with_default<double>(pt,"qp_tc_rho",0.65);
+    utils::check(qp_params.qp_tc_rho >= 0.0 and qp_params.qp_tc_rho < 1.0,
+                 "evgw: qp_tc_rho = {} must be in [0, 1).", qp_params.qp_tc_rho);
+    qp_params.qp_tc_profile =
+        io::get_value_with_default<std::string>(pt,"qp_tc_profile","flat");
+    io::tolower(qp_params.qp_tc_profile);
+    utils::check(qp_params.qp_tc_profile=="flat" or qp_params.qp_tc_profile=="growing",
+                 "evgw: unknown qp_tc_profile: {}. Valid options: \"flat\", \"growing\".",
+                 qp_params.qp_tc_profile);
+    qp_params.qp_tc_trunc = io::get_value_with_default<bool>(pt,"qp_tc_trunc",false);
+    qp_params.qp_tc_krylov = io::get_value_with_default<bool>(pt,"qp_tc_krylov",false);
+    qp_params.qp_tc_krylov_tol =
+        io::get_value_with_default<double>(pt,"qp_tc_krylov_tol",1e-12);
+    utils::check(qp_params.qp_tc_krylov_tol > 0.0 and qp_params.qp_tc_krylov_tol < 1.0,
+                 "evgw: qp_tc_krylov_tol = {} must be in (0, 1).",
+                 qp_params.qp_tc_krylov_tol);
+    qp_params.qp_tc_bstore_gb =
+        io::get_value_with_default<double>(pt,"qp_tc_bstore_gb",0.0);
+    utils::check(qp_params.qp_tc_bstore_gb >= 0.0,
+                 "evgw: qp_tc_bstore_gb = {} must be >= 0.", qp_params.qp_tc_bstore_gb);
+    qp_params.qp_tc_bfactor =
+        io::get_value_with_default<std::string>(pt,"qp_tc_bfactor","auto");
+    io::tolower(qp_params.qp_tc_bfactor);
+    utils::check(qp_params.qp_tc_bfactor == "auto" or qp_params.qp_tc_bfactor == "store"
+                 or qp_params.qp_tc_bfactor == "recompute",
+                 "evgw: unknown qp_tc_bfactor = {}. Valid: \"auto\", \"store\", "
+                 "\"recompute\".", qp_params.qp_tc_bfactor);
+    qp_params.qp_tc_batch_mb =
+        io::get_value_with_default<double>(pt,"qp_tc_batch_mb",64.0);
+    utils::check(qp_params.qp_tc_batch_mb > 0.0,
+                 "evgw: qp_tc_batch_mb = {} must be > 0.", qp_params.qp_tc_batch_mb);
+    // the spectral-quadrature W^c representation (qp_modea_wfit = "spectral").
+    qp_params.qp_modea_spectral_eta =
+        io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
+    utils::check(qp_params.qp_modea_spectral_eta > 0.0,
+                 "evgw: qp_modea_spectral_eta = {} must be > 0.",
+                 qp_params.qp_modea_spectral_eta);
+    qp_params.qp_modea_spectral_npole =
+        io::get_value_with_default<long>(pt,"qp_modea_spectral_npole",64);
+    qp_params.qp_modea_spectral_gamma =
+        io::get_value_with_default<std::string>(pt,"qp_modea_spectral_gamma","spectral");
+    io::tolower(qp_params.qp_modea_spectral_gamma);
+    qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
+    utils::check(qp_params.qp_modea_wrtol < 1.0,
+                 "evgw: qp_modea_wrtol must be < 1 (negative keeps the default pole-fit tolerance).");
+    qp_params.qp_modea_wrank = io::get_value_with_default<double>(pt,"qp_modea_wrank",1e-10);
+    utils::check(qp_params.qp_modea_wrank < 1.0,
+                 "evgw: qp_modea_wrank must be < 1 (<= 0 takes the dense reference sandwich).");
+    qp_params.qp_modea_wsketch = io::get_value_with_default<long>(pt,"qp_modea_wsketch",0);
+    qp_params.qp_modea_wunion = io::get_value_with_default<double>(pt,"qp_modea_wunion",-1.0);
+    utils::check(qp_params.qp_modea_wunion < 1.0,
+                 "evgw: qp_modea_wunion must be < 1 (< 0 disables the union-subspace "
+                 "restructure, 0 takes qp_modea_wrank).");
+    // The BSE (ladder) polarization. The [evgw] driver attaches no Sigma^C vertex, so vertex_t
+    // below is a pure
+    // KNOB CARRIER (vertex_type = "none") -- the pol-vertex-only attachment pattern of the
+    // [gw] block. The pol_vertex_* keys keep that block's "inherit vertex_*" default rule.
+    auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
+    io::tolower(pol_vertex);
+    auto pol_vertex_inject = io::get_value_with_default<std::string>(pt,"pol_vertex_inject","none");
+    io::tolower(pol_vertex_inject);
+    auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
+    io::tolower(pol_vertex_kernel);
+    auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",
+        io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0)));
+    auto pol_vertex_isdf_rank = io::get_value_with_default<long>(pt,"pol_vertex_isdf_rank",
+        io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1));
+    auto pol_vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_svd_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8));
+    auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",
+        io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0));
+    auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",
+        io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0));
+    auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0));
+    // the SOLVE GRID of the ladder's dense resolvent. ladder_solve_grid = 1 (default) is the
+    // per-rank LAPACK path; > 1 makes g ranks cooperate on
+    // each (s,q,nu) solve through SLATE; 0 is AUTO (the per-rank memory fit test against
+    // ladder_solve_budget_gb). Threads are deliberately NOT a TOML knob -- t is
+    // OMP_NUM_THREADS as launched, and t > 1 at g > 1 additionally needs the environment
+    // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
+    auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
+    auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
+    // three DIAGNOSTIC knobs on the ladder, all inactive at their defaults.
+    //  - ladder_tda        : Tamm-Dancoff truncation of the ladder KERNEL. Zeroes the
+    //                        resonant<->anti-resonant coupling block, i.e. the
+    //                        Hermitian half-size reduction. Default false (TDA-free).
+    //  - ladder_head_scale : scales the analytic rank-1 q->0 head inserted into the static
+    //                        rung W0(Gamma) = the ladder kernel W-bar_0. 1.0 = the
+    //                        full head, 0.0 = head-free kernel. Does NOT touch the
+    //                        loop's own RPA W, div_treatment, or the Sigma^C/Pi^C heads.
+    //  - ladder_qnu_meter  : the (q, nu) decomposition meters of P^lad and of the Dyson-W
+    //                        change, plus the pre/post-fold head meter. Report-only.
+    auto ladder_tda = io::get_value_with_default<bool>(pt,"ladder_tda",false);
+    auto ladder_head_scale = io::get_value_with_default<double>(pt,"ladder_head_scale",1.0);
+    auto ladder_qnu_meter = io::get_value_with_default<bool>(pt,"ladder_qnu_meter",false);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt, 0.7, true));
     } else {
       iter_solver = nullptr;
     }
     solvers::scr_coulomb_t scr_eri(&ft, "rpa", div_treatment);
+    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
     solvers::gw_t gw(&ft, div_treatment, output);
+    // the knob carrier MUST outlive qp_scf_loop -- same stack frame as scr_eri.
+    solvers::vertex_t pol_vertex_carrier(&ft, "none", nda::range(0,0), mf->nbnd(),
+                                         div_treatment);
+    pol_vertex_carrier.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
+                                      pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+                                      pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
+                                      pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
+    pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    mbpt_vertex_audit::set_fallback_keys(pol_vertex_carrier, pt);   // the vertex fallback keys (default false = abort)
+    {   // the ladder's leg vertex (inactive by default)
+      auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
+      io::tolower(pol_vertex_legs);
+      pol_vertex_carrier.set_ladder_legs(pol_vertex_legs);
+      // the ladder's rung, static or full-frequency (static by default)
+      {
+        auto pol_vertex_rung = io::get_value_with_default<std::string>(pt,"pol_vertex_rung","static");
+        io::tolower(pol_vertex_rung);
+        pol_vertex_carrier.set_ladder_rung(pol_vertex_rung,
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",12),
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+        pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
+        pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        // freeze / dump the secondary ISDF points, the Wannier output frame, and the fine-mesh consumer of an
+        // interpolated Pi(q)_{MN}
+        vertex_debug::set(io::get_value_with_default<std::string>(pt,"vertex_debug",""));   // the diagnostic switches
+        if (not vertex_debug::list().empty()) app_log(1, "  vertex_debug switches: {}", vertex_debug::list());
+        pol_vertex_carrier.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
+                            io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
+        pol_vertex_carrier.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
+        pol_vertex_carrier.set_wcache_mode(io::get_value_with_default<std::string>(pt,"pol_vertex_wcache","replicated"));
+        pol_vertex_carrier.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
+                           io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
+        pol_vertex_carrier.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
+        pol_vertex_carrier.set_pol_sc(read_pol_sc(pt));
+        pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
+        pol_vertex_carrier.set_ladder_dyn_rung(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rung_rank",0),
+                                              io::get_value_with_default<double>(pt,"pol_vertex_dyn_rung_tol",0.0));
+        if (auto rung_apply = pt.get_optional<std::string>("pol_vertex_dyn_rung_apply")) pol_vertex_carrier.set_ladder_dyn_rung_apply(*rung_apply);
+        pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
+        pol_vertex_carrier.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
+        pol_vertex_carrier.set_ladder_dyn_device_memory(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_device_memory","auto"));
+        pol_vertex_carrier.set_ladder_dyn_dressed(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_dressed","auto"));
+        pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
+        pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
+        pol_vertex_carrier.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
+        pol_vertex_carrier.set_ladder_dyn_iaft_prec(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_iaft_prec",""));
+        pol_vertex_carrier.set_ladder_dyn_tfold(io::get_value_with_default<double>(pt,"pol_vertex_dyn_tfold",0.0));
+        pol_vertex_carrier.set_ladder_dyn_vmask(io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_lo",0.0),
+                                                     io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
+        pol_vertex_carrier.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
+        pol_vertex_carrier.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
+        pol_vertex_carrier.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
+        pol_vertex_carrier.set_ladder_dyn_bubble_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_bubble_only",false));
+        pol_vertex_carrier.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
+        pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0),
+                                 io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_mode","modes"),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_auto_nodes",0));
+        pol_vertex_carrier.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
+        {   // pol_vertex_sigma = "lff": the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
+          auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
+          auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
+          pol_vertex_carrier.set_sigma_lff(sig_mode == "pair" ? std::string("none") : sig_mode, sig_bub,
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+          // pol_vertex_sigma = "pair" -- the pair-resolved static-ladder vertex in Sigma
+          pol_vertex_carrier.set_sigma_pair(sig_mode == "pair",
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_col","static"),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          pol_vertex_carrier.set_sigma_pair_ibz(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_ibz",false));
+          pol_vertex_carrier.set_sigma_dyn_ckpt_minutes(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_ckpt_minutes",0.0));
+          pol_vertex_carrier.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
+                                      io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
+          pol_vertex_carrier.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
+          pol_vertex_carrier.set_sigma_dyn_acc(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_acc","split"));
+          pol_vertex_carrier.set_sigma_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_dump",""),
+                                  io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_file",""),
+                                  io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_projector",""));
+          pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
+              io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
+              io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
+          pol_vertex_carrier.set_sigma_dyn_auto_nodes(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_auto_nodes",0));
+          pol_vertex_carrier.set_sigma_dyn_ref_period(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_ref_period",0));
+          mbpt_vertex_audit::set_sigma_dyn_ref_keys(pol_vertex_carrier, pt);
+        }
+      }
+    }
+    // the vertex keys of the [gw] sites -- forwarded where the carrier / scr path honours them, abort otherwise
+    mbpt_vertex_audit::carrier_vertex_keys(pol_vertex_carrier, scr_eri, mf, pt, "mbpt [" + solver_type + "]",
+                                           std::string("rpa"));
+    // empty-C / Sigma-vertex-without-ladder requests abort (as in the [gw] sites)
+    mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
+    if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     MBState mb_state(mpi, ft, output);
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
                 niter, restart, conv_thr);
@@ -337,25 +1483,312 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     io::tolower(off_diag_mode);
     utils::check(off_diag_mode=="fermi" or off_diag_mode=="qp_energy",
                  "unknown off_diag_mode: {}. Valid options are \"fermi\" and \"qp_energy\"");
+    auto qp_map = io::get_value_with_default<std::string>(pt,"qp_map","ac_pade");
+    io::tolower(qp_map);
+    utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
+                 qp_map=="mode_a" or qp_map=="mode_b",
+                 "qpgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
+                 "\"mats_gmatch\", \"mode_a\", \"mode_b\".",
+                 qp_map);
     qp_params_t qp_params("sc", ac_alg, Nfit, eta, 1e-8, "qpscf", false, off_diag_mode,
                           mu_tol, mu_update_alg);
+    qp_params.qp_map = qp_map;
+    qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
+    utils::check(qp_params.qp_map_wpow >= 0.0, "qpgw: qp_map_wpow must be >= 0.");
+    // knobs of the real-axis quasiparticle maps qp_map = "mode_a" / "mode_b".
+    qp_params.qp_modea_route = io::get_value_with_default<std::string>(pt,"qp_modea_route","cd");
+    io::tolower(qp_params.qp_modea_route);
+    utils::check(qp_params.qp_modea_route=="cd" or qp_params.qp_modea_route=="expansion",
+                 "qpgw: unknown qp_modea_route: {}. Valid options: \"cd\", \"expansion\".",
+                 qp_params.qp_modea_route);
+    qp_params.qp_modea_nconsist = io::get_value_with_default<long>(pt,"qp_modea_nconsist",5);
+    utils::check(qp_params.qp_modea_nconsist >= 1, "qpgw: qp_modea_nconsist must be >= 1.");
+    qp_params.qp_modea_consist_tol = io::get_value_with_default<double>(pt,"qp_modea_consist_tol",1e-8);
+    utils::check(qp_params.qp_modea_consist_tol > 0.0, "qpgw: qp_modea_consist_tol must be > 0.");
+    qp_params.qp_modea_eta = io::get_value_with_default<double>(pt,"qp_modea_eta",0.0);
+    // out-of-strip states are evaluated at eps + i*eta_far (0 = evaluate them at z = mu).
+    qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
+    utils::check(qp_params.qp_modea_eta_far >= 0.0,
+                 "qpgw: qp_modea_eta_far must be >= 0 (0 = out-of-strip states are evaluated at mu).");
+    // the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset = the
+    // E_PH-derived strip. See qp_params_t.h.
+    qp_params.qp_modea_strip_lo =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
+    qp_params.qp_modea_strip_hi =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_hi",0.0);
+    utils::check(qp_params.qp_modea_strip_lo >= 0.0 and qp_params.qp_modea_strip_hi >= 0.0,
+                 "qpgw: qp_modea_strip_lo / qp_modea_strip_hi are HALF-WIDTHS below and above "
+                 "mu and must be >= 0 (0 = unset = the E_PH strip).");
+    utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
+                 "qpgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
+                 "for an explicit window, both 0 for the E_PH strip).");
+    // the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not the spacing; h is
+    // derived from an empirical error model (see qp_params_t.h). 0 = cache off.
+    qp_params.qp_tc_wgrid_mev =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
+    utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
+                 "qpgw: qp_tc_wgrid_mev = {} must be >= 0 (0 = cache off).",
+                 qp_params.qp_tc_wgrid_mev);
+    qp_params.qp_tc_wgrid_h =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_h",0.0);
+    utils::check(qp_params.qp_tc_wgrid_h >= 0.0,
+                 "qpgw: qp_tc_wgrid_h = {} must be >= 0 (0 = derive from the law)."
+                 , qp_params.qp_tc_wgrid_h);
+    qp_params.qp_tc_wgrid_audit =
+        io::get_value_with_default<long>(pt,"qp_tc_wgrid_audit",16);
+    utils::check(qp_params.qp_tc_wgrid_audit >= 0,
+                 "qpgw: qp_tc_wgrid_audit = {} must be >= 0.",
+                 qp_params.qp_tc_wgrid_audit);
+    qp_params.qp_tc_wgrid_audit_hard =
+        io::get_value_with_default<bool>(pt,"qp_tc_wgrid_audit_hard",true);
+    qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
+    io::tolower(qp_params.qp_modea_wsupp);
+    qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
+    io::tolower(qp_params.qp_modea_wfit);
+    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu"
+                 or qp_params.qp_modea_wfit=="spectral"
+                 or qp_params.qp_modea_wfit=="contour",
+                 "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
+                 "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
+    // the tilted-contour route (qp_modea_wfit = "contour"), a SIBLING of the "spectral"
+    // knob family. Every value is documented on qp_params_t.h.
+    qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
+    utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
+                 "qpgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
+    qp_params.qp_tc_delta = io::get_value_with_default<double>(pt,"qp_tc_delta",0.0);
+    utils::check(qp_params.qp_tc_delta >= 0.0,
+                 "qpgw: qp_tc_delta = {} must be >= 0 (0 derives it from the target broadening and the k-mesh).",
+                 qp_params.qp_tc_delta);
+    qp_params.qp_tc_rho = io::get_value_with_default<double>(pt,"qp_tc_rho",0.65);
+    utils::check(qp_params.qp_tc_rho >= 0.0 and qp_params.qp_tc_rho < 1.0,
+                 "qpgw: qp_tc_rho = {} must be in [0, 1).", qp_params.qp_tc_rho);
+    qp_params.qp_tc_profile =
+        io::get_value_with_default<std::string>(pt,"qp_tc_profile","flat");
+    io::tolower(qp_params.qp_tc_profile);
+    utils::check(qp_params.qp_tc_profile=="flat" or qp_params.qp_tc_profile=="growing",
+                 "qpgw: unknown qp_tc_profile: {}. Valid options: \"flat\", \"growing\".",
+                 qp_params.qp_tc_profile);
+    qp_params.qp_tc_trunc = io::get_value_with_default<bool>(pt,"qp_tc_trunc",false);
+    qp_params.qp_tc_krylov = io::get_value_with_default<bool>(pt,"qp_tc_krylov",false);
+    qp_params.qp_tc_krylov_tol =
+        io::get_value_with_default<double>(pt,"qp_tc_krylov_tol",1e-12);
+    utils::check(qp_params.qp_tc_krylov_tol > 0.0 and qp_params.qp_tc_krylov_tol < 1.0,
+                 "qpgw: qp_tc_krylov_tol = {} must be in (0, 1).",
+                 qp_params.qp_tc_krylov_tol);
+    qp_params.qp_tc_bstore_gb =
+        io::get_value_with_default<double>(pt,"qp_tc_bstore_gb",0.0);
+    utils::check(qp_params.qp_tc_bstore_gb >= 0.0,
+                 "qpgw: qp_tc_bstore_gb = {} must be >= 0.", qp_params.qp_tc_bstore_gb);
+    qp_params.qp_tc_bfactor =
+        io::get_value_with_default<std::string>(pt,"qp_tc_bfactor","auto");
+    io::tolower(qp_params.qp_tc_bfactor);
+    utils::check(qp_params.qp_tc_bfactor == "auto" or qp_params.qp_tc_bfactor == "store"
+                 or qp_params.qp_tc_bfactor == "recompute",
+                 "qpgw: unknown qp_tc_bfactor = {}. Valid: \"auto\", \"store\", "
+                 "\"recompute\".", qp_params.qp_tc_bfactor);
+    qp_params.qp_tc_batch_mb =
+        io::get_value_with_default<double>(pt,"qp_tc_batch_mb",64.0);
+    utils::check(qp_params.qp_tc_batch_mb > 0.0,
+                 "qpgw: qp_tc_batch_mb = {} must be > 0.", qp_params.qp_tc_batch_mb);
+    // the spectral-quadrature W^c representation (qp_modea_wfit = "spectral").
+    qp_params.qp_modea_spectral_eta =
+        io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
+    utils::check(qp_params.qp_modea_spectral_eta > 0.0,
+                 "qpgw: qp_modea_spectral_eta = {} must be > 0.",
+                 qp_params.qp_modea_spectral_eta);
+    qp_params.qp_modea_spectral_npole =
+        io::get_value_with_default<long>(pt,"qp_modea_spectral_npole",64);
+    qp_params.qp_modea_spectral_gamma =
+        io::get_value_with_default<std::string>(pt,"qp_modea_spectral_gamma","spectral");
+    io::tolower(qp_params.qp_modea_spectral_gamma);
+    qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
+    utils::check(qp_params.qp_modea_wrtol < 1.0,
+                 "qpgw: qp_modea_wrtol must be < 1 (negative keeps the default pole-fit tolerance).");
+    qp_params.qp_modea_wrank = io::get_value_with_default<double>(pt,"qp_modea_wrank",1e-10);
+    utils::check(qp_params.qp_modea_wrank < 1.0,
+                 "qpgw: qp_modea_wrank must be < 1 (<= 0 takes the dense reference sandwich).");
+    qp_params.qp_modea_wsketch = io::get_value_with_default<long>(pt,"qp_modea_wsketch",0);
+    qp_params.qp_modea_wunion = io::get_value_with_default<double>(pt,"qp_modea_wunion",-1.0);
+    utils::check(qp_params.qp_modea_wunion < 1.0,
+                 "qpgw: qp_modea_wunion must be < 1 (< 0 disables the union-subspace "
+                 "restructure, 0 takes qp_modea_wrank).");
+    // The BSE (ladder) polarization. The [qpgw] driver attaches no Sigma^C vertex, so vertex_t
+    // below is a pure
+    // KNOB CARRIER (vertex_type = "none") -- the pol-vertex-only attachment pattern of the
+    // [gw] block. The pol_vertex_* keys keep that block's "inherit vertex_*" default rule.
+    auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
+    io::tolower(pol_vertex);
+    auto pol_vertex_inject = io::get_value_with_default<std::string>(pt,"pol_vertex_inject","none");
+    io::tolower(pol_vertex_inject);
+    auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
+    io::tolower(pol_vertex_kernel);
+    auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",
+        io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0)));
+    auto pol_vertex_isdf_rank = io::get_value_with_default<long>(pt,"pol_vertex_isdf_rank",
+        io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1));
+    auto pol_vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_svd_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8));
+    auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",
+        io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0));
+    auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",
+        io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0));
+    auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0));
+    // the SOLVE GRID of the ladder's dense resolvent. ladder_solve_grid = 1 (default) is the
+    // per-rank LAPACK path; > 1 makes g ranks cooperate on
+    // each (s,q,nu) solve through SLATE; 0 is AUTO (the per-rank memory fit test against
+    // ladder_solve_budget_gb). Threads are deliberately NOT a TOML knob -- t is
+    // OMP_NUM_THREADS as launched, and t > 1 at g > 1 additionally needs the environment
+    // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
+    auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
+    auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
+    // three DIAGNOSTIC knobs on the ladder, all inactive at their defaults.
+    //  - ladder_tda        : Tamm-Dancoff truncation of the ladder KERNEL. Zeroes the
+    //                        resonant<->anti-resonant coupling block, i.e. the
+    //                        Hermitian half-size reduction. Default false (TDA-free).
+    //  - ladder_head_scale : scales the analytic rank-1 q->0 head inserted into the static
+    //                        rung W0(Gamma) = the ladder kernel W-bar_0. 1.0 = the
+    //                        full head, 0.0 = head-free kernel. Does NOT touch the
+    //                        loop's own RPA W, div_treatment, or the Sigma^C/Pi^C heads.
+    //  - ladder_qnu_meter  : the (q, nu) decomposition meters of P^lad and of the Dyson-W
+    //                        change, plus the pre/post-fold head meter. Report-only.
+    auto ladder_tda = io::get_value_with_default<bool>(pt,"ladder_tda",false);
+    auto ladder_head_scale = io::get_value_with_default<double>(pt,"ladder_head_scale",1.0);
+    auto ladder_qnu_meter = io::get_value_with_default<bool>(pt,"ladder_qnu_meter",false);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
     } else {
       iter_solver = nullptr;
     }
     solvers::scr_coulomb_t scr_eri(&ft, "rpa", div_treatment);
+    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
     solvers::gw_t gw(&ft, div_treatment, output);
+    // the knob carrier MUST outlive qp_scf_loop -- same stack frame as scr_eri.
+    solvers::vertex_t pol_vertex_carrier(&ft, "none", nda::range(0,0), mf->nbnd(),
+                                         div_treatment);
+    pol_vertex_carrier.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
+                                      pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+                                      pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
+                                      pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
+    pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    mbpt_vertex_audit::set_fallback_keys(pol_vertex_carrier, pt);   // the vertex fallback keys (default false = abort)
+    {   // the ladder's leg vertex (inactive by default)
+      auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
+      io::tolower(pol_vertex_legs);
+      pol_vertex_carrier.set_ladder_legs(pol_vertex_legs);
+      // the ladder's rung, static or full-frequency (static by default)
+      {
+        auto pol_vertex_rung = io::get_value_with_default<std::string>(pt,"pol_vertex_rung","static");
+        io::tolower(pol_vertex_rung);
+        pol_vertex_carrier.set_ladder_rung(pol_vertex_rung,
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",12),
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+        pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
+        pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        // freeze / dump the secondary ISDF points, the Wannier output frame, and the fine-mesh consumer of an
+        // interpolated Pi(q)_{MN}
+        vertex_debug::set(io::get_value_with_default<std::string>(pt,"vertex_debug",""));   // the diagnostic switches
+        if (not vertex_debug::list().empty()) app_log(1, "  vertex_debug switches: {}", vertex_debug::list());
+        pol_vertex_carrier.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
+                            io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
+        pol_vertex_carrier.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
+        pol_vertex_carrier.set_wcache_mode(io::get_value_with_default<std::string>(pt,"pol_vertex_wcache","replicated"));
+        pol_vertex_carrier.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
+                           io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
+        pol_vertex_carrier.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
+        pol_vertex_carrier.set_pol_sc(read_pol_sc(pt));
+        pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
+        pol_vertex_carrier.set_ladder_dyn_rung(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rung_rank",0),
+                                              io::get_value_with_default<double>(pt,"pol_vertex_dyn_rung_tol",0.0));
+        if (auto rung_apply = pt.get_optional<std::string>("pol_vertex_dyn_rung_apply")) pol_vertex_carrier.set_ladder_dyn_rung_apply(*rung_apply);
+        pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
+        pol_vertex_carrier.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
+        pol_vertex_carrier.set_ladder_dyn_device_memory(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_device_memory","auto"));
+        pol_vertex_carrier.set_ladder_dyn_dressed(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_dressed","auto"));
+        pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
+        pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
+        pol_vertex_carrier.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
+        pol_vertex_carrier.set_ladder_dyn_iaft_prec(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_iaft_prec",""));
+        pol_vertex_carrier.set_ladder_dyn_tfold(io::get_value_with_default<double>(pt,"pol_vertex_dyn_tfold",0.0));
+        pol_vertex_carrier.set_ladder_dyn_vmask(io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_lo",0.0),
+                                                     io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
+        pol_vertex_carrier.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
+        pol_vertex_carrier.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
+        pol_vertex_carrier.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
+        pol_vertex_carrier.set_ladder_dyn_bubble_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_bubble_only",false));
+        pol_vertex_carrier.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
+        pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0),
+                                 io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_mode","modes"),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_auto_nodes",0));
+        pol_vertex_carrier.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
+        {   // pol_vertex_sigma = "lff": the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
+          auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
+          auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
+          pol_vertex_carrier.set_sigma_lff(sig_mode == "pair" ? std::string("none") : sig_mode, sig_bub,
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+          // pol_vertex_sigma = "pair" -- the pair-resolved static-ladder vertex in Sigma
+          pol_vertex_carrier.set_sigma_pair(sig_mode == "pair",
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_col","static"),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          pol_vertex_carrier.set_sigma_pair_ibz(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_ibz",false));
+          pol_vertex_carrier.set_sigma_dyn_ckpt_minutes(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_ckpt_minutes",0.0));
+          pol_vertex_carrier.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
+                                      io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
+          pol_vertex_carrier.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
+          pol_vertex_carrier.set_sigma_dyn_acc(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_acc","split"));
+          pol_vertex_carrier.set_sigma_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_dump",""),
+                                  io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_file",""),
+                                  io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_projector",""));
+          pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
+              io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
+              io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
+          pol_vertex_carrier.set_sigma_dyn_auto_nodes(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_auto_nodes",0));
+          pol_vertex_carrier.set_sigma_dyn_ref_period(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_ref_period",0));
+          mbpt_vertex_audit::set_sigma_dyn_ref_keys(pol_vertex_carrier, pt);
+        }
+      }
+    }
+    // the vertex keys of the [gw] sites -- forwarded where the carrier / scr path honours them, abort otherwise
+    mbpt_vertex_audit::carrier_vertex_keys(pol_vertex_carrier, scr_eri, mf, pt, "mbpt [" + solver_type + "]",
+                                           std::string("rpa"));
+    // empty-C / Sigma-vertex-without-ladder requests abort (as in the [gw] sites)
+    mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
+    if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
+    // re-QP-ization from an external Green's function. Parsed with an EMPTY default --
+    // absent means INERT, i.e. the qp loop builds its own analytic QP G. When
+    // set, ITERATION 1 consumes the external G of that checkpoint group (its density matrix
+    // drives the HF stage, and update_w / Sigma^GW screen with it); iterations >= 2 revert.
+    // Note: the function-scope greens_func_source above defaults to "scf" and belongs to the
+    // [gw]/[hf] dyson-scf branches -- the [qpgw] branch must NOT inherit that default.
+    auto qp_gf_grp = io::get_value_with_default<std::string>(pt,"greens_func_source","");
+    io::tolower(qp_gf_grp);
+    auto qp_gf_iter = io::get_value_with_default<long>(pt,"greens_func_iteration",-1);
+    utils::check(qp_gf_grp=="" or qp_gf_grp=="scf" or qp_gf_grp=="embed",
+                 "qpgw: greens_func_source = \"{}\" is not supported. Valid options: "
+                 "absent (the loop's own analytic QP G), \"scf\", \"embed\".", qp_gf_grp);
     MBState mb_state(mpi, ft, output);
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
-                niter, restart, conv_thr);
+                niter, restart, conv_thr, qp_gf_grp, qp_gf_iter);
 
   } else
     APP_ABORT("mbpt: Unknown solver type: {}",solver_type);
 }
 
 
-template<typename eri_t>
+template<MEMORY_SPACE MEM, typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
           nda::array<ComplexType, 5> const& projector_ksIai,
           nda::array<long, 3> const& band_window,
@@ -367,6 +1800,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
   if (mpi->comm.size()%mpi->node_comm.size()!=0) {
     APP_ABORT("MBPT: number of processors on each node should be the same.");
   }
+  using corr_t = std::decay_t<decltype(eri.corr_eri->get())>;
+  constexpr MEMORY_SPACE SCF_MEM =
+      std::is_same_v<corr_t, thc_reader_t> ? MEM : HOST_MEMORY;
   std::string err = std::string("mbpt - Incorrect input - ");
   auto div_treatment = io::get_value_with_default<std::string>(pt, "div_treatment", "gygi");
   auto hf_div_treatment = io::get_value_with_default<std::string>(pt, "hf_div_treatment", "gygi");
@@ -419,6 +1855,125 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
 
     auto screen_type = io::get_value_with_default<std::string>(pt,"screen_type", "rpa");
 
+    // optional second-order-exchange vertex correction
+    auto vertex_type = io::get_value_with_default<std::string>(pt,"vertex_type","none");
+    io::tolower(vertex_type);
+    // Rung mode of the vertex: "dynamic" (default) = dynamic W rungs; "static"/"linear" = the
+    // static-rung truncations. Validated in the vertex_t constructor.
+    auto vertex_rung = io::get_value_with_default<std::string>(pt,"vertex_rung","dynamic");
+    io::tolower(vertex_rung);
+    auto vertex_band_window = io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0));
+    // auxiliary basis of the vertex kernels ("global" THC basis or a "secondary" ISDF basis on C)
+    auto vertex_isdf = io::get_value_with_default<std::string>(pt,"vertex_isdf","global");
+    io::tolower(vertex_isdf);
+    auto vertex_isdf_rank = io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1);
+    auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
+    // Secondary-ISDF point-selection thresh (-1 = default to the global THC thresh)
+    auto vertex_isdf_thresh = io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0);
+    // distr_tol for the SECONDARY basis' private thc builder (raises the cap on the number of
+    // ranks it can use; <= 0 = builder default 0.2).
+    auto vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0);
+    // Conditioning cap on the secondary metric s(q) (<=0 = disabled). >0 prunes the
+    // near-dependent tail of the selected basis so cond(s) stays under this value.
+    auto vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0);
+    // Phi-scaling of the vertex: BOTH cuts by the same lambda == Phi_2^C -> lambda Phi_2^C,
+    // so conservation is exact at every lambda (the approximation acts on Phi, not on the
+    // cuts). vertex_ramp_iters > 0 walks lambda from vertex_scale/ramp up to vertex_scale
+    // over that many scf iterations. Used to keep eps = I - Z.Pi positive definite: P^C is
+    // not sign-definite.
+    // q->0 rung policy for the VERTEX, independent of the GW/HF one. The gygi head
+    // inserted into the vertex rungs is a rank-1 Nk*madelung*chi.chi^dag block that can
+    // exceed the body contribution on coarse k-meshes, large enough to flip
+    // the sign of the traced Phi_2^C. It is also the ONE component the Sigma^C-vs-GF2
+    // absolute cross-check does not cover (that test runs "ignore_g0"). Being able to
+    // switch it WITHOUT changing the GW/HF divergence treatment makes it separable.
+    // Empty string = inherit div_treatment.
+    auto vertex_div_treatment = io::get_value_with_default<std::string>(pt,"vertex_div_treatment","");
+    io::tolower(vertex_div_treatment);
+    auto vertex_scale = io::get_value_with_default<double>(pt,"vertex_scale",1.0);
+    auto vertex_ramp_iters = io::get_value_with_default<long>(pt,"vertex_ramp_iters",0);
+    // the linear mode's pi^dyn route. "factorized" is the production route; "kernel"
+    // runs the full dynamic Pi^C and keeps tau = 0; "check" runs both and compares.
+    auto vertex_pidyn = io::get_value_with_default<std::string>(pt,"vertex_pidyn","factorized");
+    io::tolower(vertex_pidyn);
+    auto vertex_pidyn_tol = io::get_value_with_default<double>(pt,"vertex_pidyn_tol",-1.0);
+    // Project the rank-1 head channel out of the response middle factor at q = Gamma.
+    // DIAGNOSTIC, default false: it BREAKS PHI-DERIVABILITY (the linear mode's G-side
+    // functional-derivative check fails even when only part of the channel is removed),
+    // because it is applied to the Sigma cut only, leaving eval_Pi_C's P^{C,L} untouched.
+    // It does control the COLD-START basin. See vertex_t.h.
+    auto vertex_bl_head_projection =
+        io::get_value_with_default<bool>(pt,"vertex_bl_head_projection",false);
+    // DIAGNOSTIC, default false, NOT physical: freeze pi^dyn's Gamma rung head at its
+    // i.nu = 0 weight. Tests whether the head's retardation is what breaks pi^dyn's
+    // q -> 0 head suppression (which Pi^{C,0}, whose head IS frozen, satisfies exactly).
+    auto vertex_bl_static_head =
+        io::get_value_with_default<bool>(pt,"vertex_bl_static_head",false);
+    // DIAGNOSTIC, default false, changes the KERNEL DEFINITION: take W0's Gamma head
+    // weight from the same (vertex-corrected) eps^-1 that W's head uses, instead of from
+    // W0's own RPA-only Dyson. Makes the head part of W(Gamma,0) - W0(Gamma) vanish; that
+    // head residue can dominate |W(q,0) - W0(q)|. See vertex_t.h.
+    auto vertex_bl_w0_head_from_w =
+        io::get_value_with_default<bool>(pt,"vertex_bl_w0_head_from_w",false);
+    // DIAGNOSTIC, default false, NOT physical: the constant-rung check. Replaces
+    // pi^dyn's dynamic rung by the frequency-independent W0bar - Z, so pi^dyn's rung IS
+    // Pi^{C,0}'s rung and X^L must collapse to the DLR representability floor. A residual
+    // O(1) X^L points at the equal-time path itself. See vertex_t.h.
+    auto vertex_bl_pidyn_const_rung =
+        io::get_value_with_default<bool>(pt,"vertex_bl_pidyn_const_rung",false);
+    // The BALANCED FIRST-ORDER HEAD (default false). Linear mode only:
+    // every W input of the vertex functional carries W0's STATIC Gamma-head weight
+    // (instantaneous slot, 1 + eps_inv_head(i.nu=0); no dynamic-slot head), so the
+    // fluctuation dW = W - W0 carries no analytic head. CONSERVING (a modified
+    // interaction in Phi -- both cuts differentiate). The static mode is unaffected; the
+    // dynamic mode keeps its retarded head.
+    auto vertex_bl_head_static_all =
+        io::get_value_with_default<bool>(pt,"vertex_bl_head_static_all",false);
+    // Wannier-projector subspace C: when set, the
+    // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
+    // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
+    auto vertex_wannier_file = io::get_value_with_default<std::string>(pt,"vertex_wannier_file","");
+    auto vertex_wannier_loewdin = io::get_value_with_default<bool>(pt,"vertex_wannier_loewdin",true);
+    // ladder (pol_vertex) and CVV-head knobs. The pol_vertex_* basis knobs inherit the vertex_* values when
+    // their keys are absent, so a ladder run on top of an existing vertex input needs
+    // only pol_vertex = "ladder".
+    auto cvv_rspace_tol = io::get_value_with_default<double>(pt,"cvv_rspace_tol",1e-6);
+    auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
+    io::tolower(pol_vertex);
+    // in-loop INJECTION of the ladder into P. Auto-enables pol_vertex = "ladder" (logged in
+    // the setter).
+    auto pol_vertex_inject = io::get_value_with_default<std::string>(pt,"pol_vertex_inject","none");
+    io::tolower(pol_vertex_inject);
+    auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
+    io::tolower(pol_vertex_kernel);
+    auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",vertex_band_window);
+    auto pol_vertex_isdf_rank = io::get_value_with_default<long>(pt,"pol_vertex_isdf_rank",vertex_isdf_rank);
+    auto pol_vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_svd_tol",vertex_isdf_svd_tol);
+    auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",vertex_isdf_thresh);
+    auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",vertex_isdf_cond_max);
+    auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",vertex_isdf_distr_tol);
+    // the SOLVE GRID of the ladder's dense resolvent. ladder_solve_grid = 1 (default) is the
+    // per-rank LAPACK path; > 1 makes g ranks cooperate on
+    // each (s,q,nu) solve through SLATE; 0 is AUTO (the per-rank memory fit test against
+    // ladder_solve_budget_gb). Threads are deliberately NOT a TOML knob -- t is
+    // OMP_NUM_THREADS as launched, and t > 1 at g > 1 additionally needs the environment
+    // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
+    auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
+    auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
+    // three DIAGNOSTIC knobs on the ladder, all inactive at their defaults.
+    //  - ladder_tda        : Tamm-Dancoff truncation of the ladder KERNEL. Zeroes the
+    //                        resonant<->anti-resonant coupling block, i.e. the
+    //                        Hermitian half-size reduction. Default false (TDA-free).
+    //  - ladder_head_scale : scales the analytic rank-1 q->0 head inserted into the static
+    //                        rung W0(Gamma) = the ladder kernel W-bar_0. 1.0 = the
+    //                        full head, 0.0 = head-free kernel. Does NOT touch the
+    //                        loop's own RPA W, div_treatment, or the Sigma^C/Pi^C heads.
+    //  - ladder_qnu_meter  : the (q, nu) decomposition meters of P^lad and of the Dyson-W
+    //                        change, plus the pre/post-fold head meter. Report-only.
+    auto ladder_tda = io::get_value_with_default<bool>(pt,"ladder_tda",false);
+    auto ladder_head_scale = io::get_value_with_default<double>(pt,"ladder_head_scale",1.0);
+    auto ladder_qnu_meter = io::get_value_with_default<bool>(pt,"ladder_qnu_meter",false);
+
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
@@ -427,15 +1982,519 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     }
     solvers::scr_coulomb_t scr_eri(&ft, screen_type, div_treatment);
     solvers::gw_t gw(&ft, div_treatment, output);
+
+    // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
+    // are switched together through this single object -- never one alone.
+    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
+                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
+                             vertex_isdf_cond_max, vertex_rung);
+    vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
+    vertex.set_pidyn_mode(vertex_pidyn, vertex_pidyn_tol);
+    vertex.set_bl_head_projection(vertex_bl_head_projection);
+    vertex.set_bl_static_head(vertex_bl_static_head);
+    vertex.set_bl_w0_head_from_w(vertex_bl_w0_head_from_w);
+    vertex.set_bl_pidyn_const_rung(vertex_bl_pidyn_const_rung);
+    vertex.set_bl_head_static_all(vertex_bl_head_static_all);
+    // vertex_bl_head_scale (default 1) multiplies the madelung weight of every analytic q -> 0 head the
+    // vertex kernel inserts (Sigma^C / Pi^C, the ladder rung W-bar_0 and the dynamic W-bar cache); 0 = a head-free
+    // (body-only) vertex, the interpolable coarse object. The loop's RPA W keeps its own div_treatment.
+    vertex.set_bl_head_scale(io::get_value_with_default<double>(pt,"vertex_bl_head_scale",1.0));
+    vertex.set_isdf_distr_tol(vertex_isdf_distr_tol);
+    if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
+    // validate + store the ladder knobs (the double-counting guard lives in the setter);
+    // the CVV R-shell tolerance is handed to the W builder below.
+    vertex.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
+                          pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+                          pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
+                          pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
+    vertex.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    mbpt_vertex_audit::set_fallback_keys(vertex, pt);   // the vertex fallback keys (default false = abort)
+    vertex.set_eps_cut(io::get_value_with_default<long>(pt,"pol_eps_cut",0),      // eps(q_i, i nu) cuts
+                       io::get_value_with_default<long>(pt,"pol_eps_cut_dyn_nnu",0));
+    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
+    {   // the ladder's leg vertex (inactive by default)
+      auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
+      io::tolower(pol_vertex_legs);
+      vertex.set_ladder_legs(pol_vertex_legs);
+      // the ladder's rung, static or full-frequency (static by default)
+      {
+        auto pol_vertex_rung = io::get_value_with_default<std::string>(pt,"pol_vertex_rung","static");
+        io::tolower(pol_vertex_rung);
+        vertex.set_ladder_rung(pol_vertex_rung,
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",12),
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+        vertex.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
+        vertex.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        // freeze / dump the secondary ISDF points, the Wannier output frame, and the fine-mesh consumer of an
+        // interpolated Pi(q)_{MN}
+        vertex_debug::set(io::get_value_with_default<std::string>(pt,"vertex_debug",""));   // the diagnostic switches
+        if (not vertex_debug::list().empty()) app_log(1, "  vertex_debug switches: {}", vertex_debug::list());
+        vertex.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
+                            io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
+        vertex.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
+        vertex.set_wcache_mode(io::get_value_with_default<std::string>(pt,"pol_vertex_wcache","replicated"));
+        vertex.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
+                           io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
+        vertex.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
+        vertex.set_pol_sc(read_pol_sc(pt));
+        vertex.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
+        vertex.set_ladder_dyn_rung(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rung_rank",0),
+                                  io::get_value_with_default<double>(pt,"pol_vertex_dyn_rung_tol",0.0));
+        if (auto rung_apply = pt.get_optional<std::string>("pol_vertex_dyn_rung_apply")) vertex.set_ladder_dyn_rung_apply(*rung_apply);
+        vertex.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
+        vertex.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
+        vertex.set_ladder_dyn_device_memory(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_device_memory","auto"));
+        vertex.set_ladder_dyn_dressed(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_dressed","auto"));
+        vertex.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
+        vertex.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
+        vertex.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
+        vertex.set_ladder_dyn_iaft_prec(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_iaft_prec",""));
+        vertex.set_ladder_dyn_tfold(io::get_value_with_default<double>(pt,"pol_vertex_dyn_tfold",0.0));
+        vertex.set_ladder_dyn_vmask(io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_lo",0.0),
+                                         io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
+        vertex.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
+        vertex.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
+        vertex.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
+        vertex.set_ladder_dyn_bubble_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_bubble_only",false));
+        vertex.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
+        vertex.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0),
+                                 io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_mode","modes"),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_auto_nodes",0));
+        vertex.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
+        {   // pol_vertex_sigma = "lff": the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
+          auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
+          auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
+          vertex.set_sigma_lff(sig_mode == "pair" ? std::string("none") : sig_mode, sig_bub,
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+          // pol_vertex_sigma = "pair" -- the pair-resolved static-ladder vertex in Sigma
+          vertex.set_sigma_pair(sig_mode == "pair",
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_col","static"),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          vertex.set_sigma_pair_ibz(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_ibz",false));
+          vertex.set_sigma_dyn_ckpt_minutes(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_ckpt_minutes",0.0));
+          vertex.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
+                                      io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
+          vertex.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
+          vertex.set_sigma_dyn_acc(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_acc","split"));
+          vertex.set_sigma_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_dump",""),
+                                  io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_file",""),
+                                  io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_projector",""));
+          vertex.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
+              io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
+              io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
+          vertex.set_sigma_dyn_auto_nodes(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_auto_nodes",0));
+          vertex.set_sigma_dyn_ref_period(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_ref_period",0));
+          mbpt_vertex_audit::set_sigma_dyn_ref_keys(vertex, pt);
+        }
+      }
+    }
+    scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
+    if (vertex.enabled()) {
+      utils::check(screen_type == "rpa" or screen_type == "rpa_k",
+                   "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
+                   "(got \"{}\"): combining the vertex correction with cRPA/EDMFT screening "
+                   "is not validated (Phi-derivability of the combination unestablished).",
+                   vertex.vertex_type(), screen_type);
+      // WANNIER MODE: build the projector from wan.h5 and install U. One U per run:
+      // if a gw_edmft embedding projector is also active, the vertex must consume the
+      // SAME wan.h5 or abort.
+      if (not vertex_wannier_file.empty()) {
+        if (screen_type.substr(0,8) == "gw_edmft") {
+          auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
+          utils::check(embed_file == vertex_wannier_file,
+                       "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
+                       "wannier_file = \"{}\": one projector P per run is required (the vertex "
+                       "and the embedding must share the same Wannier orbitals); use the SAME "
+                       "wan.h5 for both.", vertex_wannier_file, embed_file);
+        }
+        auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
+        methods::projector_t proj(*mf, vertex_wannier_file, vtx_trans_home);
+        vertex.set_wannier_projector(proj, vertex_wannier_loewdin);
+      }
+      scr_eri.set_vertex(&vertex);
+      gw.set_vertex(&vertex);
+    } else if (vertex.pol_vertex_enabled()) {
+      // a pol-vertex-only run (vertex_type = "none") attaches the knob carrier to scr_eri so
+      // update_w can run the ladder (readout, injection, Sigma vertex). Never attached to
+      // gw, and has_active_vertex() stays false (no Sigma^C / Pi^C).
+      // The coarse->fine interpolation path IS a pol-vertex-only run on a Wannier
+      // projector: vertex_type = "none" + pol_vertex =
+      // "ladder" + vertex_wannier_file. set_wannier_projector accepts a pol-vertex-only vertex
+      // and scr_coulomb's readout instance inherits U (ensure_pol_vertex ->
+      // adopt_wannier), so the dynbse then produces / dumps Pi_loc(q) in the MLWF-pair frame.
+      // Same one-projector-per-run rule as the Sigma^C branch above.
+      if (not vertex_wannier_file.empty()) {
+        if (screen_type.substr(0,8) == "gw_edmft") {
+          auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
+          utils::check(embed_file == vertex_wannier_file,
+                       "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
+                       "wannier_file = \"{}\": one projector P per run is required (the vertex "
+                       "and the embedding must share the same Wannier orbitals); use the SAME "
+                       "wan.h5 for both.", vertex_wannier_file, embed_file);
+        }
+        auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
+        methods::projector_t proj(*mf, vertex_wannier_file, vtx_trans_home);
+        vertex.set_wannier_projector(proj, vertex_wannier_loewdin);
+      }
+      scr_eri.set_vertex(&vertex);
+    }
+    // a requested vertex / ladder with an empty C (after any Wannier projector) and a Sigma vertex without
+    // the ladder abort here, before the scf loop
+    mbpt_vertex_audit::check_vertex_requests(vertex, pt, "mbpt [gw]");
+
     MBState mb_state(ft, output, mf, projector_ksIai, band_window, kpts_crys, trans_home_cell, false);
     if (local_polarizabilities) {
       mb_state.set_local_polarizabilities(std::move(local_polarizabilities.value()));
       local_polarizabilities.reset();
     }
 
-    scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
-             iter_solver.get(), niter, restart, conv_thr, const_mu,
-             greens_func_source, greens_func_iteration);
+    scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+                  iter_solver.get(), niter, restart, conv_thr, const_mu,
+                  greens_func_source, greens_func_iteration);
+
+  } else if (solver_type == "qpgw") {
+
+    // the qpGW+BSE lattice stage of GW+EDMFT. Same knob surface as the plain [qpgw] branch of the
+    // projector-less overload, PLUS the screen_type knob and the projector-carrying
+    // MBState -- so the lattice loop screens with
+    //   P_latt = P^RPA[G_latt] + P^lad + P_C[P_imp - P_dc]P_C^dag.
+    // FROZEN H_eff: the qp loop's own update_G supplies the G that eval_Pi_qdep consumes;
+    // the impurity self-energy re-enters the lattice only through the downfold/embed cycle
+    // (dmft_embed), never inside this loop. The bubble from the corrected G enters through
+    // greens_func_source (below), when the qpgw stage runs inside the outer cycle.
+    auto screen_type = io::get_value_with_default<std::string>(pt,"screen_type", "rpa");
+    io::tolower(screen_type);
+    utils::check(screen_type == "rpa" or screen_type == "gw_edmft",
+                 "qpgw: screen_type = \"{}\" is not supported by the qpGW lattice stage. "
+                 "Valid options: \"rpa\", \"gw_edmft\".", screen_type);
+
+    auto ac_alg  = io::get_value_with_default<std::string>(pt,"ac_alg","pade");
+    auto eta     = io::get_value_with_default<double>(pt,"eta", M_PI/ft.beta());
+    auto Nfit    = io::get_value_with_default<int>(pt,"Nfit",18);
+    auto off_diag_mode = io::get_value_with_default<std::string>(pt,"off_diag_mode","fermi");
+    io::tolower(ac_alg);
+    io::tolower(off_diag_mode);
+    utils::check(off_diag_mode=="fermi" or off_diag_mode=="qp_energy",
+                 "unknown off_diag_mode: {}. Valid options are \"fermi\" and \"qp_energy\"");
+    auto qp_map = io::get_value_with_default<std::string>(pt,"qp_map","ac_pade");
+    io::tolower(qp_map);
+    utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
+                 qp_map=="mode_a" or qp_map=="mode_b",
+                 "qpgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
+                 "\"mats_gmatch\", \"mode_a\", \"mode_b\".",
+                 qp_map);
+    qp_params_t qp_params("sc", ac_alg, Nfit, eta, 1e-8, "qpscf", false, off_diag_mode,
+                          mu_tol, mu_update_alg);
+    qp_params.qp_map = qp_map;
+    qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
+    utils::check(qp_params.qp_map_wpow >= 0.0, "qpgw: qp_map_wpow must be >= 0.");
+    // knobs of the real-axis quasiparticle maps qp_map = "mode_a" / "mode_b".
+    qp_params.qp_modea_route = io::get_value_with_default<std::string>(pt,"qp_modea_route","cd");
+    io::tolower(qp_params.qp_modea_route);
+    utils::check(qp_params.qp_modea_route=="cd" or qp_params.qp_modea_route=="expansion",
+                 "qpgw: unknown qp_modea_route: {}. Valid options: \"cd\", \"expansion\".",
+                 qp_params.qp_modea_route);
+    qp_params.qp_modea_nconsist = io::get_value_with_default<long>(pt,"qp_modea_nconsist",5);
+    utils::check(qp_params.qp_modea_nconsist >= 1, "qpgw: qp_modea_nconsist must be >= 1.");
+    qp_params.qp_modea_consist_tol = io::get_value_with_default<double>(pt,"qp_modea_consist_tol",1e-8);
+    utils::check(qp_params.qp_modea_consist_tol > 0.0, "qpgw: qp_modea_consist_tol must be > 0.");
+    qp_params.qp_modea_eta = io::get_value_with_default<double>(pt,"qp_modea_eta",0.0);
+    // out-of-strip states are evaluated at eps + i*eta_far (0 = evaluate them at z = mu).
+    qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
+    utils::check(qp_params.qp_modea_eta_far >= 0.0,
+                 "qpgw: qp_modea_eta_far must be >= 0 (0 = out-of-strip states are evaluated at mu).");
+    // the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset = the
+    // E_PH-derived strip. See qp_params_t.h.
+    qp_params.qp_modea_strip_lo =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
+    qp_params.qp_modea_strip_hi =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_hi",0.0);
+    utils::check(qp_params.qp_modea_strip_lo >= 0.0 and qp_params.qp_modea_strip_hi >= 0.0,
+                 "qpgw: qp_modea_strip_lo / qp_modea_strip_hi are HALF-WIDTHS below and above "
+                 "mu and must be >= 0 (0 = unset = the E_PH strip).");
+    utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
+                 "qpgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
+                 "for an explicit window, both 0 for the E_PH strip).");
+    // the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not the spacing; h is
+    // derived from an empirical error model (see qp_params_t.h). 0 = cache off.
+    qp_params.qp_tc_wgrid_mev =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
+    utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
+                 "qpgw: qp_tc_wgrid_mev = {} must be >= 0 (0 = cache off).",
+                 qp_params.qp_tc_wgrid_mev);
+    qp_params.qp_tc_wgrid_h =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_h",0.0);
+    utils::check(qp_params.qp_tc_wgrid_h >= 0.0,
+                 "qpgw: qp_tc_wgrid_h = {} must be >= 0 (0 = derive from the law)."
+                 , qp_params.qp_tc_wgrid_h);
+    qp_params.qp_tc_wgrid_audit =
+        io::get_value_with_default<long>(pt,"qp_tc_wgrid_audit",16);
+    utils::check(qp_params.qp_tc_wgrid_audit >= 0,
+                 "qpgw: qp_tc_wgrid_audit = {} must be >= 0.",
+                 qp_params.qp_tc_wgrid_audit);
+    qp_params.qp_tc_wgrid_audit_hard =
+        io::get_value_with_default<bool>(pt,"qp_tc_wgrid_audit_hard",true);
+    qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
+    io::tolower(qp_params.qp_modea_wsupp);
+    qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
+    io::tolower(qp_params.qp_modea_wfit);
+    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu"
+                 or qp_params.qp_modea_wfit=="spectral"
+                 or qp_params.qp_modea_wfit=="contour",
+                 "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
+                 "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
+    // the tilted-contour route (qp_modea_wfit = "contour"), a SIBLING of the "spectral"
+    // knob family. Every value is documented on qp_params_t.h.
+    qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
+    utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
+                 "qpgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
+    qp_params.qp_tc_delta = io::get_value_with_default<double>(pt,"qp_tc_delta",0.0);
+    utils::check(qp_params.qp_tc_delta >= 0.0,
+                 "qpgw: qp_tc_delta = {} must be >= 0 (0 derives it from the target broadening and the k-mesh).",
+                 qp_params.qp_tc_delta);
+    qp_params.qp_tc_rho = io::get_value_with_default<double>(pt,"qp_tc_rho",0.65);
+    utils::check(qp_params.qp_tc_rho >= 0.0 and qp_params.qp_tc_rho < 1.0,
+                 "qpgw: qp_tc_rho = {} must be in [0, 1).", qp_params.qp_tc_rho);
+    qp_params.qp_tc_profile =
+        io::get_value_with_default<std::string>(pt,"qp_tc_profile","flat");
+    io::tolower(qp_params.qp_tc_profile);
+    utils::check(qp_params.qp_tc_profile=="flat" or qp_params.qp_tc_profile=="growing",
+                 "qpgw: unknown qp_tc_profile: {}. Valid options: \"flat\", \"growing\".",
+                 qp_params.qp_tc_profile);
+    qp_params.qp_tc_trunc = io::get_value_with_default<bool>(pt,"qp_tc_trunc",false);
+    qp_params.qp_tc_krylov = io::get_value_with_default<bool>(pt,"qp_tc_krylov",false);
+    qp_params.qp_tc_krylov_tol =
+        io::get_value_with_default<double>(pt,"qp_tc_krylov_tol",1e-12);
+    utils::check(qp_params.qp_tc_krylov_tol > 0.0 and qp_params.qp_tc_krylov_tol < 1.0,
+                 "qpgw: qp_tc_krylov_tol = {} must be in (0, 1).",
+                 qp_params.qp_tc_krylov_tol);
+    qp_params.qp_tc_bstore_gb =
+        io::get_value_with_default<double>(pt,"qp_tc_bstore_gb",0.0);
+    utils::check(qp_params.qp_tc_bstore_gb >= 0.0,
+                 "qpgw: qp_tc_bstore_gb = {} must be >= 0.", qp_params.qp_tc_bstore_gb);
+    qp_params.qp_tc_bfactor =
+        io::get_value_with_default<std::string>(pt,"qp_tc_bfactor","auto");
+    io::tolower(qp_params.qp_tc_bfactor);
+    utils::check(qp_params.qp_tc_bfactor == "auto" or qp_params.qp_tc_bfactor == "store"
+                 or qp_params.qp_tc_bfactor == "recompute",
+                 "qpgw: unknown qp_tc_bfactor = {}. Valid: \"auto\", \"store\", "
+                 "\"recompute\".", qp_params.qp_tc_bfactor);
+    qp_params.qp_tc_batch_mb =
+        io::get_value_with_default<double>(pt,"qp_tc_batch_mb",64.0);
+    utils::check(qp_params.qp_tc_batch_mb > 0.0,
+                 "qpgw: qp_tc_batch_mb = {} must be > 0.", qp_params.qp_tc_batch_mb);
+    // the spectral-quadrature W^c representation (qp_modea_wfit = "spectral").
+    qp_params.qp_modea_spectral_eta =
+        io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
+    utils::check(qp_params.qp_modea_spectral_eta > 0.0,
+                 "qpgw: qp_modea_spectral_eta = {} must be > 0.",
+                 qp_params.qp_modea_spectral_eta);
+    qp_params.qp_modea_spectral_npole =
+        io::get_value_with_default<long>(pt,"qp_modea_spectral_npole",64);
+    qp_params.qp_modea_spectral_gamma =
+        io::get_value_with_default<std::string>(pt,"qp_modea_spectral_gamma","spectral");
+    io::tolower(qp_params.qp_modea_spectral_gamma);
+    qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
+    utils::check(qp_params.qp_modea_wrtol < 1.0,
+                 "qpgw: qp_modea_wrtol must be < 1 (negative keeps the default pole-fit tolerance).");
+    qp_params.qp_modea_wrank = io::get_value_with_default<double>(pt,"qp_modea_wrank",1e-10);
+    utils::check(qp_params.qp_modea_wrank < 1.0,
+                 "qpgw: qp_modea_wrank must be < 1 (<= 0 takes the dense reference sandwich).");
+    qp_params.qp_modea_wsketch = io::get_value_with_default<long>(pt,"qp_modea_wsketch",0);
+    qp_params.qp_modea_wunion = io::get_value_with_default<double>(pt,"qp_modea_wunion",-1.0);
+    utils::check(qp_params.qp_modea_wunion < 1.0,
+                 "qpgw: qp_modea_wunion must be < 1 (< 0 disables the union-subspace "
+                 "restructure, 0 takes qp_modea_wrank).");
+    // The BSE (ladder) polarization. The [qpgw] driver attaches no Sigma^C vertex, so vertex_t
+    // below is a pure
+    // KNOB CARRIER (vertex_type = "none") -- the pol-vertex-only attachment pattern of the
+    // [gw] block. The pol_vertex_* keys keep that block's "inherit vertex_*" default rule.
+    auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
+    io::tolower(pol_vertex);
+    auto pol_vertex_inject = io::get_value_with_default<std::string>(pt,"pol_vertex_inject","none");
+    io::tolower(pol_vertex_inject);
+    auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
+    io::tolower(pol_vertex_kernel);
+    auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",
+        io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0)));
+    auto pol_vertex_isdf_rank = io::get_value_with_default<long>(pt,"pol_vertex_isdf_rank",
+        io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1));
+    auto pol_vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_svd_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8));
+    auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",
+        io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0));
+    auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",
+        io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0));
+    auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0));
+    // the SOLVE GRID of the ladder's dense resolvent. ladder_solve_grid = 1 (default) is the
+    // per-rank LAPACK path; > 1 makes g ranks cooperate on
+    // each (s,q,nu) solve through SLATE; 0 is AUTO (the per-rank memory fit test against
+    // ladder_solve_budget_gb). Threads are deliberately NOT a TOML knob -- t is
+    // OMP_NUM_THREADS as launched, and t > 1 at g > 1 additionally needs the environment
+    // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
+    auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
+    auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
+    // three DIAGNOSTIC knobs on the ladder, all inactive at their defaults.
+    //  - ladder_tda        : Tamm-Dancoff truncation of the ladder KERNEL. Zeroes the
+    //                        resonant<->anti-resonant coupling block, i.e. the
+    //                        Hermitian half-size reduction. Default false (TDA-free).
+    //  - ladder_head_scale : scales the analytic rank-1 q->0 head inserted into the static
+    //                        rung W0(Gamma) = the ladder kernel W-bar_0. 1.0 = the
+    //                        full head, 0.0 = head-free kernel. Does NOT touch the
+    //                        loop's own RPA W, div_treatment, or the Sigma^C/Pi^C heads.
+    //  - ladder_qnu_meter  : the (q, nu) decomposition meters of P^lad and of the Dyson-W
+    //                        change, plus the pre/post-fold head meter. Report-only.
+    auto ladder_tda = io::get_value_with_default<bool>(pt,"ladder_tda",false);
+    auto ladder_head_scale = io::get_value_with_default<double>(pt,"ladder_head_scale",1.0);
+    auto ladder_qnu_meter = io::get_value_with_default<bool>(pt,"ladder_qnu_meter",false);
+    if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
+      iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
+    } else {
+      iter_solver = nullptr;
+    }
+    solvers::scr_coulomb_t scr_eri(&ft, screen_type, div_treatment);
+    scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
+    solvers::gw_t gw(&ft, div_treatment, output);
+    // the knob carrier MUST outlive qp_scf_loop -- same stack frame as scr_eri.
+    solvers::vertex_t pol_vertex_carrier(&ft, "none", nda::range(0,0), mf->nbnd(),
+                                         div_treatment);
+    pol_vertex_carrier.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
+                                      pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+                                      pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
+                                      pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
+    pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    mbpt_vertex_audit::set_fallback_keys(pol_vertex_carrier, pt);   // the vertex fallback keys (default false = abort)
+    {   // the ladder's leg vertex (inactive by default)
+      auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
+      io::tolower(pol_vertex_legs);
+      pol_vertex_carrier.set_ladder_legs(pol_vertex_legs);
+      // the ladder's rung, static or full-frequency (static by default)
+      {
+        auto pol_vertex_rung = io::get_value_with_default<std::string>(pt,"pol_vertex_rung","static");
+        io::tolower(pol_vertex_rung);
+        pol_vertex_carrier.set_ladder_rung(pol_vertex_rung,
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",12),
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+        pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
+        pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        // freeze / dump the secondary ISDF points, the Wannier output frame, and the fine-mesh consumer of an
+        // interpolated Pi(q)_{MN}
+        vertex_debug::set(io::get_value_with_default<std::string>(pt,"vertex_debug",""));   // the diagnostic switches
+        if (not vertex_debug::list().empty()) app_log(1, "  vertex_debug switches: {}", vertex_debug::list());
+        pol_vertex_carrier.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
+                            io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
+        pol_vertex_carrier.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
+        pol_vertex_carrier.set_wcache_mode(io::get_value_with_default<std::string>(pt,"pol_vertex_wcache","replicated"));
+        pol_vertex_carrier.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
+                           io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
+        pol_vertex_carrier.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
+        pol_vertex_carrier.set_pol_sc(read_pol_sc(pt));
+        pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
+        pol_vertex_carrier.set_ladder_dyn_rung(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rung_rank",0),
+                                              io::get_value_with_default<double>(pt,"pol_vertex_dyn_rung_tol",0.0));
+        if (auto rung_apply = pt.get_optional<std::string>("pol_vertex_dyn_rung_apply")) pol_vertex_carrier.set_ladder_dyn_rung_apply(*rung_apply);
+        pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
+        pol_vertex_carrier.set_ladder_dyn_device_fallback(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_device_fallback",false));
+        pol_vertex_carrier.set_ladder_dyn_device_memory(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_device_memory","auto"));
+        pol_vertex_carrier.set_ladder_dyn_dressed(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_dressed","auto"));
+        pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
+        pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
+        pol_vertex_carrier.set_ladder_dyn_schedule(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_schedule","longest"));
+        pol_vertex_carrier.set_ladder_dyn_iaft_prec(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_iaft_prec",""));
+        pol_vertex_carrier.set_ladder_dyn_tfold(io::get_value_with_default<double>(pt,"pol_vertex_dyn_tfold",0.0));
+        pol_vertex_carrier.set_ladder_dyn_vmask(io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_lo",0.0),
+                                                     io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
+        pol_vertex_carrier.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
+        pol_vertex_carrier.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
+        pol_vertex_carrier.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
+        pol_vertex_carrier.set_ladder_dyn_bubble_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_bubble_only",false));
+        pol_vertex_carrier.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
+        pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0),
+                                 io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_mode","modes"),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_auto_nodes",0));
+        pol_vertex_carrier.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
+        {   // pol_vertex_sigma = "lff": the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
+          auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
+          auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
+          pol_vertex_carrier.set_sigma_lff(sig_mode == "pair" ? std::string("none") : sig_mode, sig_bub,
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+          // pol_vertex_sigma = "pair" -- the pair-resolved static-ladder vertex in Sigma
+          pol_vertex_carrier.set_sigma_pair(sig_mode == "pair",
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_col","static"),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          pol_vertex_carrier.set_sigma_pair_ibz(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_ibz",false));
+          pol_vertex_carrier.set_sigma_dyn_ckpt_minutes(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_ckpt_minutes",0.0));
+          pol_vertex_carrier.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
+                                      io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
+          pol_vertex_carrier.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
+          pol_vertex_carrier.set_sigma_dyn_acc(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_acc","split"));
+          pol_vertex_carrier.set_sigma_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_dump",""),
+                                  io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_file",""),
+                                  io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_projector",""));
+          pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
+              io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
+              io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
+          pol_vertex_carrier.set_sigma_dyn_auto_nodes(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_auto_nodes",0));
+          pol_vertex_carrier.set_sigma_dyn_ref_period(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_ref_period",0));
+          mbpt_vertex_audit::set_sigma_dyn_ref_keys(pol_vertex_carrier, pt);
+        }
+      }
+    }
+    // the vertex keys of the [gw] sites -- forwarded where the carrier / scr path honours them, abort otherwise
+    mbpt_vertex_audit::carrier_vertex_keys(pol_vertex_carrier, scr_eri, mf, pt, "mbpt [" + solver_type + "]",
+                                           screen_type);
+    // empty-C / Sigma-vertex-without-ladder requests abort (as in the [gw] sites)
+    mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
+    if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
+
+    // re-QP-ization from an external Green's function -- SAME surface as the projector-less
+    // [qpgw] branch. Absent => INERT (the loop's own analytic QP G). When set,
+    // ITERATION 1 consumes the external G of that checkpoint group, so the ladder-injected screening
+    // W_corr = W[P^RPA[G_ext] + P^lad + P_C(P_imp - P_dc)P_C^dag] comes for free: update_w
+    // consumes the SAME injected mb_state.sG_tskij. The function-scope greens_func_source
+    // above defaults to "scf" and belongs to the [gw] dyson-scf branch.
+    auto qp_gf_grp = io::get_value_with_default<std::string>(pt,"greens_func_source","");
+    io::tolower(qp_gf_grp);
+    auto qp_gf_iter = io::get_value_with_default<long>(pt,"greens_func_iteration",-1);
+    utils::check(qp_gf_grp=="" or qp_gf_grp=="scf" or qp_gf_grp=="embed",
+                 "qpgw: greens_func_source = \"{}\" is not supported. Valid options: "
+                 "absent (the loop's own analytic QP G), \"scf\", \"embed\".", qp_gf_grp);
+
+    MBState mb_state(ft, output, mf, projector_ksIai, band_window, kpts_crys, trans_home_cell, false);
+    if (local_polarizabilities) {
+      mb_state.set_local_polarizabilities(std::move(local_polarizabilities.value()));
+      local_polarizabilities.reset();
+    }
+
+    qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
+                niter, restart, conv_thr, qp_gf_grp, qp_gf_iter);
 
   } else
     APP_ABORT("mbpt: Unknown solver type: {}",solver_type);
@@ -896,17 +2955,29 @@ template void downfolding_2e(
 template void hf_downfold(thc_reader_t&, ptree const&);
 template void gw_downfold(thc_reader_t&, ptree&);
 
-#define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
-template void mbpt(std::string, \
+#define MBPT_INST_MEM(MEM, HF, HARTREE, EXCHANGE, CORR) \
+template void mbpt<MEM>(std::string, \
      mb_eri_t<HF, HARTREE, EXCHANGE, CORR>&,    \
      ptree const&);                             \
-template void mbpt(std::string, \
+template void mbpt<MEM>(std::string, \
      mb_eri_t<HF, HARTREE, EXCHANGE, CORR>&, \
      ptree const&,                             \
      nda::array<ComplexType, 5> const&,  \
      nda::array<long, 3> const&,   \
      nda::array<RealType, 2> const&,           \
      std::optional<std::map<std::string, nda::array<ComplexType, 5> > >);
+
+// mbpt internally maps Cholesky-corr to scf_loop<HOST_MEMORY> via SCF_MEM,
+// so DEVICE instantiation is safe for ALL ERI combinations (the body
+// just routes accordingly).
+#if defined(ENABLE_DEVICE)
+#  define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+#else
+#  define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+#endif
 
 // All combinations of thc/chol for 4 eri slots
   MBPT_INST(thc_reader_t, thc_reader_t, thc_reader_t, thc_reader_t)

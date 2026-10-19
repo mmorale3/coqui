@@ -23,6 +23,7 @@
 #define COQUI_COM_DIIS_RESIDUAL_H
 
 #include "numerics/iter_scf/diis/vspace.h"
+#include "utilities/h5_background_writer.hpp"
 #include "numerics/iter_scf/diis/vspace_fock_sigma.hpp"
 #include "numerics/iter_scf/diis/diis_residual.h"
 
@@ -60,6 +61,7 @@ public:
     void upload_g_mu() {
         long iter_from_file;
         std::string filename = mbpt_output + ".mbpt.h5";
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file(filename, 'r');
         h5::group grp(file);
         utils::check(grp.has_subgroup("scf"), "Simulation HDF5 file does not have an scf group");

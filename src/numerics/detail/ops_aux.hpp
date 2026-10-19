@@ -26,12 +26,23 @@
  * Auxiliary functions 
  */ 
 
+#include <cctype>
 #include <utility>
 #include <type_traits>
 #include "utilities/check.hpp"
 #include "nda/nda.hpp"
 
-namespace math::detail
+namespace math
+{
+
+constexpr bool is_valid_op(char op) {
+  return (op == 'N') or (op == 'n') or
+         (op == 'T') or (op == 't') or
+         (op == 'C') or (op == 'c') or
+         (op == 'H') or (op == 'h');
+}
+
+namespace detail
 {
 
 /***************************************************************************/
@@ -121,6 +132,8 @@ inline constexpr bool is_transpose = false;
 template<typename A>
 inline constexpr bool is_transpose<transpose_tag<A>> = true;
 
-} // math::detail
+} // namespace detail
+
+} // namespace math
 
 #endif

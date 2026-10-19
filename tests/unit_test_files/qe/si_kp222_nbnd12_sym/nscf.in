@@ -1,0 +1,40 @@
+&CONTROL
+   calculation      = 'nscf'
+   outdir           = './out'
+   prefix           = 'si'
+   pseudo_dir       = './out/si.save'
+/
+&SYSTEM
+   ibrav            = 0
+   nat              = 2
+   ntyp             = 1
+   nbnd             = 12
+   ecutwfc          = 15.0
+   force_symmorphic = .true.
+   nosym            = .false.
+   noinv            = .false.
+   occupations      = 'smearing'
+   degauss          = 0.0015
+   smearing         = 'm-p'
+   input_dft        = 'pbe'
+/
+&ELECTRONS
+   conv_thr         = 1e-10
+   mixing_beta      = 0.7
+   diagonalization  = 'david'
+   diago_full_acc   = .true.
+/
+ATOMIC_SPECIES
+Si 28.0850 Si_ONCV_PBE-1.2.upf
+
+K_POINTS automatic
+2 2 2  0 0 0
+
+CELL_PARAMETERS angstrom
+3.83165229341589 0.00000000000000 0.00000000000000
+1.91582614670794 3.31830822456706 0.00000000000000
+1.91582614670794 1.10610274152235 3.12853099687795
+
+ATOMIC_POSITIONS crystal
+Si 0.00 0.00 0.00
+Si 0.25 0.25 0.25
