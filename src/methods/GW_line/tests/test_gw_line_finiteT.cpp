@@ -1788,7 +1788,7 @@ TEST_CASE("gw_line_finiteT_frame", "[gw_line][finiteT][hybrid][frame]") {
     auto pt = ft_params("gw_line_ft_frame_" + fr, 2, 200.0, "id", "auto", false);
     pt.put("theta_t_frac", 0.25);
     pt.put("scf_density", "matsubara");
-    if (fr != "old") pt.put("hyb_frame", fr);
+    pt.put("hyb_frame", fr);
     auto R = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
     rm_ckpt(comm, "gw_line_ft_frame_" + fr);
     return R;

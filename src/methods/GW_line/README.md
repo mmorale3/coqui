@@ -273,7 +273,7 @@ Hartree. "auto" defaults are computed at run time as described.
 | `tau_eps` | double | `1e-13` | tolerance of the tau ID | keep |
 | `spectra.occupation` | bool | `false` | also write f(w - mu) on the spectra grid (spectra/fermi_w; f A = the occupied spectrum) | finite-T plots |
 | `nu0_intraband` | bool | `false` | D4 (notes 12.8): add the Matsubara-convention (isothermal) nu_0 term of the exactly degenerate pairs (nu0.hpp); needs ignore_g0 + lehmann; off = bitwise | metals vs CoQui Matsubara: true |
-| `hyb_frame` | string | `"old"` | D4 (notes 12.10): frame of the closure with `scf_density = "matsubara"`: `"old"` closes at the previous mu and re-centres (bitwise); `"new"` takes the hybrid mu first and closes at H - mu_new (the G of the hybrid density; same fixed point); `"count"` = new + the poles keep the closure's own mu (N_closure = N_el) | metals: `"new"` |
+| `hyb_frame` | string | `"count"` | D4 (notes 12.10; default since 2026-10-19, was `"old"`): frame of the closure with `scf_density = "matsubara"`: `"old"` closes at the previous mu and re-centres; `"new"` takes the hybrid mu first and closes at H - mu_new (the G of the hybrid density; same fixed point); `"count"` = new + the poles keep the closure's own mu (N_closure = N_el) | default |
 | `final_pass.enable` | bool | `false` | sharper final pass (notes 12.6): one more unmixed iteration from the final poles at theta_t' on a copy of the checkpoint (`<output>.final_pass.gw_line.h5`); its spectra in `/final_pass/spectra` | metals: near-E_F spectra |
 | `final_pass.theta_t_frac` | double | `0.25` | theta_t' = theta_t_frac theta of the pass (0.125 allowed) | 0.25 |
 | `final_pass.wp` | double / "auto" | `"auto"` | omega_p of the pass's closure; auto = max(wp, wp_floor zeta_T') | auto |

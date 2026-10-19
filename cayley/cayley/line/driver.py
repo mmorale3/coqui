@@ -56,7 +56,7 @@ class LineSCGW:
                  wp_floor=15.0, mu_rule='neutral', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
                  scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5,
                  g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None,
-                 mixing_F=1.0, nu0_intraband=False, hyb_frame='old'):
+                 mixing_F=1.0, nu0_intraband=False, hyb_frame='count'):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
         over node_range (Ha) — dense nodes are what pins the weight distribution of the far poles (dev/tune_sigma_fit.txt).
@@ -83,8 +83,8 @@ class LineSCGW:
         # D4 nu_0 option (C++ key nu0_intraband, default off): the Matsubara-convention static term of the exactly degenerate pairs,
         # Sigma += -(1/(beta Nk)) sum_q X^+[G~(k-q, z) o dW(q)] X on the line nodes and in the tau leg (finite T, scgw only)
         self.nu0_intraband = bool(nu0_intraband)
-        # D4 closure frame (C++ key hyb_frame): with scf_density "matsubara" the Matsubara Dyson equation keeps Sigma_c(i w_n) fixed
-        # relative to mu and moves mu; "old" (default, bitwise) closes the line Sigma at the OLD mu and only re-centres the poles
+        # D4 closure frame (C++ key hyb_frame; default "count" since 2026-10-19): with scf_density "matsubara" the Matsubara Dyson
+        # equation keeps Sigma_c(i w_n) fixed relative to mu and moves mu; "old" (pre-D4) closes the line Sigma at the OLD mu and only re-centres the poles
         # (Sigma fixed in absolute energy: the closure G lags the hybrid mu by (1 - 1/Z) dmu per iteration); "new" closes with
         # H - mu_new, i.e. the same G as the hybrid density (identical fixed point, consistent iteration map)
         # "count": as "new", and the poles keep the closure's own mu (mu_rule; "number": N_closure = N_el)

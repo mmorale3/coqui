@@ -466,6 +466,8 @@ void gw_line_params_t::log() const {
             beta, 315775.02 / beta, thermal_tol, std::log(1.0 / thermal_tol) / beta, thermal_floor, thermal_floor_f, wp_floor, mu_rule,
             mu_dn_max, mu_th_factor, band_heights, band_x, mats_factor, bos_eps_T, bos_line_eps, cut_odd, cut_even, tau_grid, tau_eps,
             thermal_bases_file.empty() ? "" : "; DIAGNOSTIC: D / nu_b / Sigma basis from " + thermal_bases_file);
+  if (scf_density == "matsubara" and hyb_frame == "old")
+    app_log(1, "    hyb_frame = old: the closure is built at the previous mu and its poles re-centred (pre-D4 rule)");
   if (scf_density == "matsubara" and hyb_frame != "old")
     app_log(1, "    hyb_frame = {} (D4): the closure is built at the hybrid mu of the iteration (H - mu_new), the G of the hybrid density{}",
             hyb_frame, hyb_frame == "count" ? "; its poles keep the closure's own mu (mu rule: N_closure = N_el for \"number\")" : "");
@@ -847,7 +849,7 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "hyb_tau_eps", p.hyb_tau_eps);
   h5::h5_write(ig, "hyb_sigma_out", p.hyb_sigma_out);
   if (p.nu0_intraband) h5::h5_write(ig, "nu0_intraband", long(1));   // D4 (absent = off: the default files stay unchanged)
-  if (p.hyb_frame != "old") h5::h5_write(ig, "hyb_frame", p.hyb_frame);  // D4 (absent = "old")
+  h5::h5_write(ig, "hyb_frame", p.hyb_frame);   // D4 (files before 2026-10-19 lack it: "old")
   if (p.beta > 0.0) {   // S8b: the derived scales (E_T window, zeta_T bosonic floor, S_T guard)
     const double th = p.theta_deg * std::numbers::pi / 180.0, tt = p.theta_t_frac * th;
     const double rho = std::sin(th - tt) / std::sin(tt);
