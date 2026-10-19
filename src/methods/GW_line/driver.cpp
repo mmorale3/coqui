@@ -240,6 +240,10 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.hyb_tau_eps = io::get_value_with_default<double>(pt, "hyb_tau_eps", p.hyb_tau_eps);
   p.hyb_sigma_out = io::get_value_with_default<long>(pt, "hyb_sigma_out", p.hyb_sigma_out);   // D4
   p.nu0_intraband = io::get_value_with_default<bool>(pt, "nu0_intraband", p.nu0_intraband);   // D4 nu_0 term
+  p.hyb_frame     = io::get_value_with_default<std::string>(pt, "hyb_frame", p.hyb_frame);    // D4 closure frame
+  io::tolower(p.hyb_frame);
+  utils::check(p.hyb_frame == "old" or p.hyb_frame == "new" or p.hyb_frame == "count",
+               "gw_line: hyb_frame must be \"old\", \"new\" or \"count\" (got \"{}\")", p.hyb_frame);
   utils::check(p.scf_density == "closure" or p.scf_density == "matsubara",
                "gw_line: scf_density must be \"closure\" or \"matsubara\" (got \"{}\")", p.scf_density);
   utils::check(p.hyb_wmax > 0.0 and p.hyb_tau_eps > 0.0 and p.hyb_tau_eps < 1.0, "gw_line: invalid hyb_wmax / hyb_tau_eps");
@@ -462,6 +466,9 @@ void gw_line_params_t::log() const {
             beta, 315775.02 / beta, thermal_tol, std::log(1.0 / thermal_tol) / beta, thermal_floor, thermal_floor_f, wp_floor, mu_rule,
             mu_dn_max, mu_th_factor, band_heights, band_x, mats_factor, bos_eps_T, bos_line_eps, cut_odd, cut_even, tau_grid, tau_eps,
             thermal_bases_file.empty() ? "" : "; DIAGNOSTIC: D / nu_b / Sigma basis from " + thermal_bases_file);
+  if (scf_density == "matsubara" and hyb_frame != "old")
+    app_log(1, "    hyb_frame = {} (D4): the closure is built at the hybrid mu of the iteration (H - mu_new), the G of the hybrid density{}",
+            hyb_frame, hyb_frame == "count" ? "; its poles keep the closure's own mu (mu rule: N_closure = N_el for \"number\")" : "");
   if (nu0_intraband)
     app_log(1, "    nu0_intraband = true (D4): the Matsubara nu_0 term of the exactly degenerate pairs is added to Sigma_c (line + tau leg)");
   if (scf_density == "matsubara")
@@ -840,6 +847,7 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "hyb_tau_eps", p.hyb_tau_eps);
   h5::h5_write(ig, "hyb_sigma_out", p.hyb_sigma_out);
   if (p.nu0_intraband) h5::h5_write(ig, "nu0_intraband", long(1));   // D4 (absent = off: the default files stay unchanged)
+  if (p.hyb_frame != "old") h5::h5_write(ig, "hyb_frame", p.hyb_frame);  // D4 (absent = "old")
   if (p.beta > 0.0) {   // S8b: the derived scales (E_T window, zeta_T bosonic floor, S_T guard)
     const double th = p.theta_deg * std::numbers::pi / 180.0, tt = p.theta_t_frac * th;
     const double rho = std::sin(th - tt) / std::sin(tt);
@@ -2418,8 +2426,30 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
     } else
       cth.active = false;
     if (tpar.on() and not thermal) cth.tp = tpar;
-    auto co = closure(comm, Hrel, st.Sig_p, st.Sig_h, zeta, *bp, *bh, gp, gh, thermal ? cprm_it : cprm, nelec, Timer, grepr,
-                      tpar.on() ? &cth : nullptr);
+    // S8b.3 hybrid: mu, D and N from the Matsubara Dyson equation. D4 hyb_frame = "new": computed BEFORE the closure, which is then
+    // built at H - mu_new (the G of the hybrid density); "old" (bitwise): after it, the closure at the old mu re-centred below
+    std::optional<hybrid_density_t> hd;
+    double t_hyb = 0.0;
+    auto hybrid_step = [&](bool own_phase) {   // own_phase: outside the closure phase ("old"); inside it, timed by hybrid_density only
+      if (own_phase) e0 = tic("phase_closure");
+      Timer.add("hybrid_density");
+      const double h0 = Timer.elapsed("hybrid_density");
+      Timer.start("hybrid_density");
+      hd.emplace(matsubara_density(comm, Hrel, st.Stau_p, st.Stau_h, k_rows, cprm.k_weight, *hyb, prm.beta, prm.hyb_wmax, nelec, 200,
+                                   prm.hyb_sigma_out));
+      Timer.stop("hybrid_density");
+      t_hyb = own_phase ? toc("phase_closure", e0) : Timer.elapsed("hybrid_density") - h0;
+    };
+    const bool frame_new = hybrid and prm.hyb_frame != "old";
+    if (frame_new) hybrid_step(false);
+    nda::array<ComplexType, 3> Hcl;
+    if (frame_new) {
+      Hcl = Hrel;
+      for (long ik = 0; ik < nk; ++ik)
+        for (long i = 0; i < nb; ++i) Hcl(ik, i, i) -= hd->dmu;
+    }
+    auto co = closure(comm, frame_new ? Hcl : Hrel, st.Sig_p, st.Sig_h, zeta, *bp, *bh, gp, gh, thermal ? cprm_it : cprm, nelec, Timer,
+                      grepr, tpar.on() ? &cth : nullptr);
     st.phi = nda::array<double, 1>(nk);
     for (long ik = 0; ik < nk; ++ik) st.phi(ik) = co.diag[ik].phi;
     {   // S7f: how close the hard decisions of the upfolding are to flipping (closure noise floor)
@@ -2436,25 +2466,22 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
     const double tC = toc("phase_closure", e0);
     mem_trace(comm, mpi.node_comm, "closure");
     st.mu_sigma = st.mu;
-    // S8b.3 hybrid: mu, D and N from the Matsubara Dyson equation; the closure's poles re-centred at that mu
-    std::optional<hybrid_density_t> hd;
-    double hyb_dmu = co.dmu, t_hyb = 0.0, N_cl = 0.0, Dcl_err = 0.0;
+    // S8b.3 hybrid: the closure's poles re-centred at the hybrid mu
+    double hyb_dmu = co.dmu, N_cl = 0.0, Dcl_err = 0.0, dmu_cl = 0.0;
     if (hybrid) {
-      e0 = tic("phase_closure");
-      Timer.add("hybrid_density");
-      Timer.start("hybrid_density");
-      hd.emplace(matsubara_density(comm, Hrel, st.Stau_p, st.Stau_h, k_rows, cprm.k_weight, *hyb, prm.beta, prm.hyb_wmax, nelec, 200,
-                                   prm.hyb_sigma_out));
-      Timer.stop("hybrid_density");
-      t_hyb   = toc("phase_closure", e0);
+      if (not frame_new) hybrid_step(true);
       hyb_dmu = hd->dmu;
-      const double sh = co.dmu - hyb_dmu;   // closure energies (about mu_old + co.dmu) -> about mu_old + hyb_dmu
-      N_cl = numerics::line_dlr::electron_count_T(co.leh.e, co.leh.v, prm.beta, -sh, cprm.k_weight);
+      // closure energies about mu_old + co.dmu ("old") or mu_new + co.dmu ("new") -> about mu_new = mu_old + hyb_dmu
+      // ("count": the poles stay about the closure's own mu, i.e. its count constraint is kept)
+      const double sh = frame_new ? co.dmu : co.dmu - hyb_dmu;
+      dmu_cl          = sh;   // the closure's own mu relative to the hybrid mu
+      const double sh_used = prm.hyb_frame == "count" ? 0.0 : sh;
+      N_cl = numerics::line_dlr::electron_count_T(co.leh.e, co.leh.v, prm.beta, -sh_used, cprm.k_weight);
       auto [le, lv] = lehmann_lists(co.poles);
-      for (auto &e : le) e += sh;
+      for (auto &e : le) e += sh_used;
       co.poles = pole_data_t::from_lehmann(le, lv);
-      co.e_homo += sh;
-      co.e_lumo += sh;
+      co.e_homo += sh_used;
+      co.e_lumo += sh_used;
       auto Dcl = density_fermi(co.poles, prm.beta);
       for (long x = 0; x < Dcl.size(); ++x) Dcl_err = std::max(Dcl_err, std::abs(Dcl.data()[x] - hd->D.data()[x]));
     }
@@ -2545,7 +2572,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
         rec.N_trace      = hd->N_trace;
         rec.N_closure    = N_cl;
         rec.D_cl_err     = Dcl_err;
-        rec.dmu_closure  = co.dmu - hyb_dmu;
+        rec.dmu_closure  = dmu_cl;
         rec.tail_max     = hd->tail_max;
         rec.nfreq        = hd->nfreq;
         rec.dmu          = hyb_dmu;
@@ -2553,7 +2580,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
         app_log(1, "          hybrid: mu {:.12f} Ha (dmu {:+.4e} Ha), N(mu) {:.15f} (trace {:.15f}), {} frequencies, {} bisection steps, tail "
                    "max {:.1e}, {:.2f} s | closure at this mu: N {:.10f} (dN {:+.2e}), max|D_cl - D| {:.2e}, own mu {:+.3e} Ha ({})",
                 st.mu, hyb_dmu, hd->N, hd->N_trace, hd->nfreq, hd->nbisect, hd->tail_max, t_hyb, N_cl, N_cl - nelec, Dcl_err,
-                co.dmu - hyb_dmu, co.mu_rule);
+                dmu_cl, co.mu_rule);
       }
       app_log(1, "          finite T: {} iteration (window poles {}), mu rule {} (dN = N_T(mu_g) - N_el {:+.3e}, n_th {:.3e}), N(mu) {:.12f}, "
                  "-dN/dmu {:.4e} /Ha, min|e| {:.3e} Ha, omega_p {:.4f}, |D| {}, rank_b {}, tau nodes {}; next window {}",

@@ -162,6 +162,13 @@
  *                       exactly degenerate pairs (q = Gamma intraband, symmetry-degenerate pairs), Sigma += -(1/(beta N_k)) sum_q
  *                       X^dag [G~(k-q, z) o dW(q)] X, dW = W[Pi^an(0) + dPi] - W[Pi^an(0)], on the line nodes and in the tau leg
  *                       (thermal iterations; beta > 0, div_treatment = "ignore_g0"); what CoQui's Matsubara code includes; O(1/N_k).
+ *                       hyb_frame = "old" (D4 closure follow-up): the frame of the closure in hybrid runs. The Matsubara Dyson
+ *                       equation keeps Sigma_c(i w_n) fixed relative to mu while it moves mu; "old" (bitwise) closes the line
+ *                       Sigma_c at the previous mu and only re-centres the poles (the closure G then lags the hybrid mu by
+ *                       ~(1 - 1/Z) dmu); "new" computes the hybrid mu
+ *                       first and closes with H - mu_new, i.e. the closure represents the same G as the hybrid density (same
+ *                       fixed point; Na 4^3 beta 200 K 16 iteration 1: N_closure 9.156 -> 9.000, max|D_cl - D| 0.23 -> 4.4e-3).
+ *                       "count" = "new" + the poles keep the closure's own mu (its mu rule; "number": N_closure = N_el exactly).
  *                       An iteration is THERMAL iff a pole lies within E_T of mu; otherwise it is the T = 0 code (bitwise).
  *                       Thermal iterations need g_repr = "lehmann"; sigma_gap / bos_gap are not used there (two-sided gapless
  *                       Sigma basis, D-selected bosonic basis); start = "ks"; no multilevel, no optics.
@@ -329,6 +336,7 @@ struct gw_line_params_t {
   double hyb_tau_eps = 1e-13;                   ///< S8b.3: tolerance of the Sigma tau ID
   long hyb_sigma_out = 0;                       ///< D4: write Sigma_c(k, i w_n), n < hyb_sigma_out, per iteration (0: off)
   bool nu0_intraband = false;                   ///< D4: add the Matsubara nu_0 term of the exactly degenerate pairs (nu0.hpp; off = bitwise)
+  std::string hyb_frame = "old";                ///< D4 closure frame of the hybrid: "old" (bitwise) | "new" (closure at H - mu_new) | "count"
 
   static gw_line_params_t from_ptree(ptree const &pt);
   void log() const;

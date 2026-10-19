@@ -45,11 +45,13 @@
 
 #include "catch2/catch.hpp"
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <numbers>
 #include <string>
@@ -1761,6 +1763,56 @@ TEST_CASE("gw_line_finiteT_mixF", "[gw_line][finiteT][hybrid][mixF]") {
   ok = gate("iteration-1 |mu - mu_prototype| (Ha)", std::abs(B.history[0].mu - mu_py0), 1e-6) and ok;
   for (auto const &h : B.history) ok = gate("|N(mu) - N_el|", std::abs(h.N_mu - 4.0), 1e-12) and ok;
   rm_ckpt(comm, fa);
+  REQUIRE(ok);
+}
+
+// D4 closure follow-up: the frame of the closure in hybrid runs (key hyb_frame). "new" computes the hybrid mu first and closes the
+// line Sigma at H - mu_new (the G of the hybrid density), "old" (default, bitwise) closes at the previous mu and re-centres the
+// poles. lih222 beta 200 hybrid theta / 4 ([hybrid][scf] settings), 2 iterations per frame; reference gen_frame_ref.py (prototype
+// LineSCGW(hyb_frame)): the iteration-1 hybrid mu does not depend on the frame (bitwise here); mu of iteration 2 and the closure
+// count N_closure of iterations 1 and 2 against the prototype of the same frame (closure parity C++ vs python as [hybrid][scf]).
+TEST_CASE("gw_line_finiteT_frame", "[gw_line][finiteT][hybrid][frame]") {
+  lih_ft_t L;
+  auto &comm = L.mpi->comm;
+  std::map<std::string, std::array<nda::array<double, 1>, 2>> ref;   // frame -> (mu, N_closure)
+  {
+    h5::file f(ft_dir() + "lih222_frame_ref.h5", 'r');
+    h5::group g(f);
+    for (std::string fr : {"old", "new"}) {
+      auto gg = g.open_group(fr);
+      nda::h5_read(gg, "mu", ref[fr][0]);
+      nda::h5_read(gg, "N_closure", ref[fr][1]);
+    }
+  }
+  auto run = [&](std::string const &fr) {
+    auto pt = ft_params("gw_line_ft_frame_" + fr, 2, 200.0, "id", "auto", false);
+    pt.put("theta_t_frac", 0.25);
+    pt.put("scf_density", "matsubara");
+    if (fr != "old") pt.put("hyb_frame", fr);
+    auto R = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
+    rm_ckpt(comm, "gw_line_ft_frame_" + fr);
+    return R;
+  };
+  auto O  = run("old");
+  auto N  = run("new");
+  bool ok = O.history.size() == 2 and N.history.size() == 2;
+  app_log(1, "\n[finiteT][hybrid][frame] lih222 beta 200, 2 hybrid iterations per frame:");
+  for (auto const &[fr, R] : std::vector<std::pair<std::string, decltype(O) const *>>{{"old", &O}, {"new", &N}})
+    for (auto const &h : R->history)
+      app_log(1, "  {} iter {}: mu {:.12f} (prototype {:.12f}, {:+.2e}) | closure N {:.8f} (prototype {:.8f}, {:+.2e}), max|D_cl - D| "
+                 "{:.2e}, own mu {:+.2e} Ha",
+              fr, h.iter, h.mu, ref[fr][0](h.iter - 1), h.mu - ref[fr][0](h.iter - 1), h.N_closure, ref[fr][1](h.iter - 1),
+              h.N_closure - ref[fr][1](h.iter - 1), h.D_cl_err, h.dmu_closure);
+  ok = gate("iteration-1 hybrid mu independent of the frame (Ha)", std::abs(O.history[0].mu - N.history[0].mu), 1e-14) and ok;
+  ok = gate("iteration-1 |mu - mu_prototype| (Ha)", std::abs(N.history[0].mu - ref["new"][0](0)), 1e-6) and ok;
+  // iteration 2: the C++ / python closure parity of the hybrid (time grids, pruned Lehmann G; Mac 2026-10-19: mu 4.7e-7 Ha in
+  // both frames, N_closure 1.9e-6); iteration 1: the same closure of the same Sigma (9e-10)
+  ok = gate("frame new: iteration-2 |mu - mu_prototype| (Ha)", std::abs(N.history[1].mu - ref["new"][0](1)), 5e-6) and ok;
+  ok = gate("frame new: |N_closure - prototype| iteration 1", std::abs(N.history[0].N_closure - ref["new"][1](0)), 1e-8) and ok;
+  ok = gate("frame new: |N_closure - prototype| iteration 2", std::abs(N.history[1].N_closure - ref["new"][1](1)), 2e-5) and ok;
+  // the point of the frame: the closure G of iteration 1 carries N_el (old: 3.963, the lag of the hybrid mu step of 3.45 eV)
+  ok = gate("frame new: |N_closure - N_el| iteration 1", std::abs(N.history[0].N_closure - 4.0), 1e-5) and ok;
+  for (auto const &h : N.history) ok = gate("|N(mu) - N_el|", std::abs(h.N_mu - 4.0), 1e-12) and ok;
   REQUIRE(ok);
 }
 

@@ -56,7 +56,7 @@ class LineSCGW:
                  wp_floor=15.0, mu_rule='neutral', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
                  scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5,
                  g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None,
-                 mixing_F=1.0, nu0_intraband=False):
+                 mixing_F=1.0, nu0_intraband=False, hyb_frame='old'):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
         over node_range (Ha) — dense nodes are what pins the weight distribution of the far poles (dev/tune_sigma_fit.txt).
@@ -83,6 +83,12 @@ class LineSCGW:
         # D4 nu_0 option (C++ key nu0_intraband, default off): the Matsubara-convention static term of the exactly degenerate pairs,
         # Sigma += -(1/(beta Nk)) sum_q X^+[G~(k-q, z) o dW(q)] X on the line nodes and in the tau leg (finite T, scgw only)
         self.nu0_intraband = bool(nu0_intraband)
+        # D4 closure frame (C++ key hyb_frame): with scf_density "matsubara" the Matsubara Dyson equation keeps Sigma_c(i w_n) fixed
+        # relative to mu and moves mu; "old" (default, bitwise) closes the line Sigma at the OLD mu and only re-centres the poles
+        # (Sigma fixed in absolute energy: the closure G lags the hybrid mu by (1 - 1/Z) dmu per iteration); "new" closes with
+        # H - mu_new, i.e. the same G as the hybrid density (identical fixed point, consistent iteration map)
+        # "count": as "new", and the poles keep the closure's own mu (mu_rule; "number": N_closure = N_el)
+        assert hyb_frame in ('old', 'new', 'count'); self.hyb_frame = hyb_frame
         assert not self.nu0_intraband or (beta is not None and scheme == 'scgw'), "nu0_intraband: finite T, scheme scgw"
         assert g_repr in ('compressed', 'lehmann')
         self.g_repr, self.g_emax = g_repr, (lam if g_emax is None else g_emax)
@@ -192,16 +198,21 @@ class LineSCGW:
             self.F = self.mixing_F * self.F + (1.0 - self.mixing_F) * self.F_used
         self.F_used = self.F
         Hstat = self.H0 + self.F - self.mu * np.eye(nb)[None]
+        hyb = None
+        if self.scf_density == 'matsubara' and self.hyb_frame != 'old':      # hybrid mu first, closure at H - mu_new
+            Siw, S1, S2 = self.Siw_prev
+            hyb = _ft.density_matsubara(Hstat, Siw, self.iw_h, self.beta, S1, S2, nelec=self.nelec, k_weight=self.k_weight)
+        Hcl = Hstat if hyb is None else Hstat - hyb[0] * np.eye(nb)[None]
         e_all, v_all, info_all = [], [], []
         for ik in range(nk):
             w, g = fit_sigma_total(self.bt, self.fz, Sig[ik], mask)
-            e, v, info = lehmann_from_sigma(Hstat[ik], w, g, wp, self.K, tol_gram=self.tol_gram)
+            e, v, info = lehmann_from_sigma(Hcl[ik], w, g, wp, self.K, tol_gram=self.tol_gram)
             e_all.append(e); v_all.append(v); info_all.append(info)
         M = max(len(e) for e in e_all)
         e_arr = np.array([np.pad(e, (0, M - len(e)), constant_values=1e6) for e in e_all])
         v_arr = np.array([np.pad(v, ((0, 0), (0, M - v.shape[1]))) for v in v_all])
         if self.scf_density == 'matsubara':
-            return self._finish_matsubara(t0, tW, tS, dS, wp, Hstat, e_arr, v_arr, info_all, thermal)
+            return self._finish_matsubara(t0, tW, tS, dS, wp, Hstat, e_arr, v_arr, info_all, thermal, hyb)
         # 4. chemical potential, re-centring, thermal lists, static part
         dmu, rule = self._mu_shift(e_arr, v_arr)
         self.mu += dmu; e_arr = e_arr - dmu; gw.mu = self.mu
@@ -222,15 +233,20 @@ class LineSCGW:
                   f"held-out {max(rec['heldout']):.1e}  [W {tW:.0f}s, Sigma {tS:.0f}s, total {rec['ttot']:.0f}s]", flush=True)
         return rec
 
-    def _finish_matsubara(self, t0, tW, tS, dS, wp, Hstat, e_arr, v_arr, info_all, thermal):
+    def _finish_matsubara(self, t0, tW, tS, dS, wp, Hstat, e_arr, v_arr, info_all, thermal, hyb=None):
         """Step 4' of scf_density = "matsubara": mu, D, N from the Matsubara Dyson equation with the tau-leg Sigma_c(i w_n); the
         closure's Lehmann poles re-centred at the new mu; the closure's own D / N / mu choice logged."""
         gw, nk = self.gw, self.nk
         t1 = time.time()
         Siw, S1, S2 = self.Siw_prev
-        dmu, D, N_h, hinfo = _ft.density_matsubara(Hstat, Siw, self.iw_h, self.beta, S1, S2, nelec=self.nelec, k_weight=self.k_weight)
+        dmu, D, N_h, hinfo = hyb if hyb is not None else \
+            _ft.density_matsubara(Hstat, Siw, self.iw_h, self.beta, S1, S2, nelec=self.nelec, k_weight=self.k_weight)
         dmu_cl, rule_cl = self._mu_shift(e_arr, v_arr)                        # what the closure alone would have chosen
-        self.mu += dmu; e_arr = e_arr - dmu; gw.mu = self.mu
+        if hyb is not None:                                                    # (closure already about mu_new: e_arr unshifted)
+            if self.hyb_frame == 'count': e_arr = e_arr - dmu_cl
+            dmu_cl = dmu_cl + dmu
+        else: e_arr = e_arr - dmu
+        self.mu += dmu; gw.mu = self.mu
         N_cl = electron_count_T(e_arr, v_arr, self.beta, 0.0, self.k_weight)   # closure count at the hybrid mu
         self._set_poles_T(e_arr, v_arr)
         Dcl = gw.density_matrix()
