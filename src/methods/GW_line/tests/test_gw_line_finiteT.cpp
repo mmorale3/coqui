@@ -1727,6 +1727,43 @@ TEST_CASE("gw_line_finiteT_hybrid_scf", "[gw_line][finiteT][hybrid][scf]") {
   REQUIRE(ok);
 }
 
+// D4 (metals, charge sloshing): linear F mixing (key mixing_F). The F of the iteration-2 closure must be
+// mixing_F F[D_1] + (1 - mixing_F) F[D_KS] exactly (F replicated, rank independent); iteration 1 is unmixed (= prototype mu).
+// lih222 beta 200 hybrid theta / 4 as [hybrid][scf]; 1 iteration, then a restart to 2 (the restart path carries F and F_closure).
+TEST_CASE("gw_line_finiteT_mixF", "[gw_line][finiteT][hybrid][mixF]") {
+  lih_ft_t L;
+  auto &comm     = L.mpi->comm;
+  const double a = 0.4, mu_py0 = 0.20608474063937182;
+  auto params    = [&](std::string const &out, long niter, bool restart) {
+    auto pt = ft_params(out, niter, 200.0, "id", "auto", restart);
+    pt.put("theta_t_frac", 0.25);
+    pt.put("scf_density", "matsubara");
+    pt.put("mixing_F", a);
+    return pt;
+  };
+  const std::string fa = "gw_line_ft_mixF";
+  auto A  = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, params(fa, 1, false));   // A.F = F[D_1], A.F_closure = F[D_KS]
+  auto B  = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, params(fa, 2, true));    // B.F_closure = the mixed F of iteration 2
+  bool ok = long(B.history.size()) == 2 and B.history.back().mix == "linear";
+  double d = 0.0, m = 0.0, dF = 0.0;
+  for (long x = 0; x < A.F.size(); ++x) {
+    const ComplexType e = a * A.F.data()[x] + (1.0 - a) * A.F_closure.data()[x];
+    d  = std::max(d, std::abs(B.F_closure.data()[x] - e));
+    m  = std::max(m, std::abs(e));
+    dF = std::max(dF, std::abs(A.F.data()[x] - A.F_closure.data()[x]));
+  }
+  app_log(1, "\n[finiteT][mixF] mixing_F {}: max|F[D_1] - F[D_KS]| {:.3e}, iteration-2 F_closure vs mixed {:.2e} (rel {:.2e}); mu {:.12f} / "
+             "{:.12f}, residF {:.3e}",
+          a, dF, d, d / m, B.history[0].mu, B.history[1].mu, B.history[1].residF);
+  ok = gate("F[D_1] differs from F[D_KS] (the check is not empty)", dF > 1e-6 ? 0.0 : 1.0, 0.5) and ok;
+  ok = gate("iteration-2 F_closure = mixing_F F[D_1] + (1 - mixing_F) F[D_KS] (rel)", d / m, 1e-14) and ok;
+  ok = gate("residF of iteration 2 = max|F[D_1] - F[D_KS]|", std::abs(B.history[1].residF - dF), 1e-14) and ok;
+  ok = gate("iteration-1 |mu - mu_prototype| (Ha)", std::abs(B.history[0].mu - mu_py0), 1e-6) and ok;
+  for (auto const &h : B.history) ok = gate("|N(mu) - N_el|", std::abs(h.N_mu - 4.0), 1e-12) and ok;
+  rm_ckpt(comm, fa);
+  REQUIRE(ok);
+}
+
 // S8b thermal closure perf: the "lazy" terminal-phase scan (default in thermal iterations) vs the S8b.2 distributed eigen scan
 // (COQUI_GWLINE_THERMAL_SCAN = parallel): one thermal iteration (lih222 beta 200, the [scf] settings; n_free 16 at every k)
 // -> the same closure decisions (terminal phases), mu and poles within the roundoff of the two held-out error evaluations.
@@ -2510,5 +2547,39 @@ TEST_CASE("gw_line_metal_scf_svo222n", "[.metal_scf]") {
   }
   rm_ckpt(comm, fa);
   rm_ckpt(comm, fb);
+  REQUIRE(ok);
+}
+
+// D4 step 0 (mixing study, hidden): the svo222n hybrid SCF of [.metal_scf] with the mixing from the environment:
+// GW_LINE_MIX (Sigma, default 0.5), GW_LINE_MIX_F (F, default 1), GW_LINE_DAMP_BELOW (default 0), GW_LINE_METAL_NIT (default 12),
+// GW_LINE_CONV (conv_thr, default 1e-5). Prints the history (mu, dSigma, residual, F residual, closure count); no gate beyond N(mu).
+TEST_CASE("gw_line_metal_mix_svo222n", "[.metal_mix]") {
+  fx_t F("svo222n");
+  auto env_d = [](char const *n, double d) { char const *e = std::getenv(n); return e ? std::strtod(e, nullptr) : d; };
+  const long NIT = long(env_d("GW_LINE_METAL_NIT", 12));
+  const double mix = env_d("GW_LINE_MIX", 0.5), mixF = env_d("GW_LINE_MIX_F", 1.0), dbelow = env_d("GW_LINE_DAMP_BELOW", 0.0);
+  const double conv = env_d("GW_LINE_CONV", 1e-5);
+  auto pt = ft_params("gw_line_metal_mix", NIT, 200.0, "id", "neutral", false);
+  pt.put("theta_t_frac", 0.25);
+  pt.put("scf_density", "matsubara");
+  pt.put("K", 24);
+  pt.put("nphi", 72);
+  pt.put("mixing", mix);
+  pt.put("mixing_F", mixF);
+  pt.put("damp_below", dbelow);
+  pt.put("conv_thr", conv);
+  auto t0 = std::chrono::steady_clock::now();
+  auto A  = gw_line_scf<HOST_MEMORY>(*F.thc, *F.mf, pt);
+  const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  app_log(1, "\n[metal][mix] svo222n beta 200 theta / 4 hybrid K 24: mixing {} mixing_F {} damp_below {} conv_thr {:.0e}: {} iterations "
+             "in {:.0f} s, converged {}",
+          mix, mixF, dbelow, conv, A.history.size(), dt, A.converged);
+  bool ok = true;
+  for (auto const &h : A.history) {
+    app_log(1, "  MIX it {:2d} mu {:.8f} dmu {:+.3e} dSigma {:.3e} resid {:.3e} residF {:.3e} | closure N {:.6f} max|D_cl - D| {:.2e} | {}",
+            h.iter, h.mu, h.dmu, h.dSigma, h.resid, h.residF, h.N_closure, h.D_cl_err, h.mix);
+    ok = gate("|N(mu) - N_el|", std::abs(h.N_mu - 41.0), 1e-10) and ok;
+  }
+  rm_ckpt(F.mpi->comm, "gw_line_metal_mix");
   REQUIRE(ok);
 }

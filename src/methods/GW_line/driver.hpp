@@ -97,6 +97,9 @@
  *   damp_below = 3e-4, damp_mixing = 0.5   perf 7.2 damped tail (any mixing_alg): once resid < damp_below, linear steps with
  *                       damp_mixing (sticky, also across a restart). Undamped steps keep hopping at the closure's
  *                       discrete-decision noise (~1e-4 in Sigma for Si); damped steps let the decisions lock.
+ *   mixing_F = 1.0      D4 metals: linear mixing of F (= linear density mixing) in linear / damped steps, F_next = mixing_F F[D]
+ *                       + (1 - mixing_F) F_in; 1 = F unmixed (bitwise). Metals slosh charge without it (svo222n). With
+ *                       mixing_F < 1 convergence also needs mixing_F x max|F[D] - F_in| < conv_thr.
  *   start = "ks"        perf 7.2 initial G: "ks" (below) | "qp_diag": one Pi -> W -> Sigma pass on the KS poles (no SCF closure, not
  *                       counted as an iteration), diagonal G0W0 QP equation E_n = (H0 + F - mu)_nn + Re Sigma_nn(E_n + i
  *                       start_eta, default 1e-3 Ha) per k and band, Sigma_c from the upfolded closure representation of each k (Newton;

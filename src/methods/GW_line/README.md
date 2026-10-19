@@ -169,6 +169,7 @@ Hartree. "auto" defaults are computed at run time as described.
 | `diis_wF` | double | `-1.0` | weight of the F elements (< 0: the number of fermionic nodes) | with DIIS |
 | `damp_below` | double | `3e-4` | damped tail: once the residual max abs(Sigma[G] - Sigma_in) < damp_below, linear steps with `damp_mixing` (sticky, also across restarts); 0 = off | keep (undamped steps hop at the closure noise) |
 | `damp_mixing` | double | `0.5` | mixing of the damped tail, (0, 1] | rarely |
+| `mixing_F` | double | `1.0` | D4: linear mixing of F = V_H + Sigma_x (= linear density mixing) in linear / damped steps, (0, 1]; 1 = F[D] unmixed (bitwise the previous arithmetic); with mixing_F < 1 convergence also needs mixing_F x max abs(F[D] - F_in) < conv_thr; DIIS only with diis_mix_F = false | metals (charge sloshing): 0.2-0.3 |
 | `start` | string | `"ks"` | initial G: `"ks"` (KS poles, mu = KS mid-gap) / `"qp_diag"` (one extra Pi -> W -> Sigma pass on the KS poles + diagonal G0W0 QP equation; KS vectors with the QP energies) / `"qp_file"` (QP energies read from `start_file`) | warm starts save <= 1 iteration on Si |
 | `start_file` | string | `""` | h5 file of `start = "qp_file"` (e.g. a CoQui Matsubara `mbpt.h5`) | with qp_file |
 | `start_dataset` | string | `""` | dataset of absolute QP energies (Ha, band order); empty: `scf/iter<final_iter>/qp_approx/E_ska`, else `E_ska` / `qp_energies` at the root | with qp_file |

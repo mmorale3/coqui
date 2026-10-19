@@ -266,6 +266,10 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.mix.wF     = io::get_value_with_default<double>(pt, "diis_wF", p.mix.wF);
   p.mix.damp_below  = io::get_value_with_default<double>(pt, "damp_below", p.mix.damp_below);
   p.mix.damp_mixing = io::get_value_with_default<double>(pt, "damp_mixing", p.mix.damp_mixing);
+  p.mix.mixing_F    = io::get_value_with_default<double>(pt, "mixing_F", p.mix.mixing_F);   // D4 metals
+  utils::check(p.mix.mixing_F > 0.0 and p.mix.mixing_F <= 1.0, "gw_line: mixing_F must be in (0, 1]");
+  utils::check(p.mix.mixing_F == 1.0 or p.mix.alg == "linear" or not p.mix.mix_F,
+               "gw_line: mixing_F < 1 with mixing_alg = \"diis\" needs diis_mix_F = false (F is then mixed linearly in the linear steps only)");
   utils::check(p.mix.damp_below >= 0.0 and p.mix.damp_mixing > 0.0 and p.mix.damp_mixing <= 1.0,
                "gw_line: need damp_below >= 0 and damp_mixing in (0, 1]");
   utils::check(p.mix.alg == "linear" or p.mix.alg == "diis", "gw_line: mixing_alg must be \"linear\" or \"diis\" (got \"{}\")",
@@ -392,7 +396,8 @@ void gw_line_params_t::log() const {
                "{}), beta {}, reg {:.1e}, reset if max|c| > {} or |r| > {} x the best",
             mix.mix_F ? " and F" : "", mix.hist, mix.start, mixing, mix.beta, mix.reg, mix.cmax, mix.grow);
   else
-    app_log(1, "    mixing algorithm: linear (Sigma at the nodes, F unmixed)");
+    app_log(1, "    mixing algorithm: linear (Sigma at the nodes, {})",
+            mix.mixing_F < 1.0 ? "F mixed linearly with mixing_F = " + std::to_string(mix.mixing_F) : std::string("F unmixed"));
   if (mix.damp_below > 0.0)
     app_log(1, "    damped tail: linear mixing {} once max|Sigma[G] - Sigma_in| < {:.1e}", mix.damp_mixing, mix.damp_below);
   if (scheme != "scgw")
@@ -795,6 +800,7 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "diis_start", p.mix.start);
   h5::h5_write(ig, "diis_beta", p.mix.beta);
   h5::h5_write(ig, "diis_mix_F", long(p.mix.mix_F ? 1 : 0));
+  h5::h5_write(ig, "mixing_F", p.mix.mixing_F);   // D4
   h5::h5_write(ig, "start", p.start);
   h5::h5_write(ig, "start_file", p.start_file);
   h5::h5_write(ig, "coarse_niter", p.coarse_niter);
@@ -2523,8 +2529,10 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
     }
 
     // perf 7.2: only after a mixing step (an unmixed iteration has dS = 0); DIIS also needs mixing x residual < conv_thr
+    // D4: with mixing_F < 1 the F input must have converged too (mixing_F x max|F[D] - F_in| < conv_thr)
     if (rec.iter > 1 and mixed and dS < prm.conv_thr and
-        (mi.kind == "linear" or mi.kind == "damped" or prm.mixing * mi.resid < prm.conv_thr)) {
+        (mi.kind == "linear" or mi.kind == "damped" or prm.mixing * mi.resid < prm.conv_thr) and
+        (prm.mix.mixing_F >= 1.0 or prm.mix.mixing_F * mi.residF < prm.conv_thr)) {
       converged = true;
       app_log(1, "  converged: max|dSigma| = {:.2e} < conv_thr = {:.1e}", dS, prm.conv_thr);
       break;
@@ -2536,7 +2544,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
       res.history.back().dSigma < prm.conv_thr) {
     auto const &h = res.history.back();
     converged     = (h.mix != "none" or (h.resid == 0.0 and h.dSigma > 0.0)) and
-                (h.mix != "diis" and h.mix != "reset" ? true : prm.mixing * h.resid < prm.conv_thr);
+                (h.mix != "diis" and h.mix != "reset" ? true : prm.mixing * h.resid < prm.conv_thr) and
+                (prm.mix.mixing_F >= 1.0 or prm.mix.mixing_F * h.residF < prm.conv_thr);
   }
 
   // ---------------------------------------------------------------------------------------------- spectra
@@ -2782,6 +2791,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf(methods::thc_reader_t &
   pp.put("niter", done + 1);
   pp.put("restart", done > 0);
   pp.put("mixing", 1.0);
+  pp.put("mixing_F", 1.0);   // D4: the pass is one unmixed iteration
   pp.put("mixing_alg", "linear");
   pp.put("damp_below", 0.0);
   pp.put("final_pass.enable", false);

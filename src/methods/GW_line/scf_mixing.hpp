@@ -36,6 +36,11 @@
  *              in the history -> the history is reset to the newest pair and a linear step with `mixing` is taken.
  *              With mix_F the vector includes F (weight wF per element; the next closure uses the extrapolated F).
  *
+ * D4 metals (2026-10-18): mixing_F < 1 mixes F linearly in the linear and damped steps, F_next = mixing_F F[D] + (1 - mixing_F) F_in
+ * (F = V_H + Sigma_x is linear in D, so this is linear density mixing). Without it the static feedback is undamped whatever
+ * `mixing` is: a metal with a large DOS at mu sloshes charge (svo222n beta 200, mixing 0.5: max|F[D] - F_in| 0.03 -> 1.8 over 6
+ * iterations, mu +-0.1-0.2 Ha). mixing_F = 1 (default): F_next = F[D], bitwise the previous arithmetic.
+ *
  * Damped tail (any algorithm, damp_below > 0): once the residual max|out - in| drops below damp_below, every further step
  * is linear with damp_mixing (sticky; the DIIS history is dropped; kind "damped"). Undamped steps (mixing 1, DIIS) pass the
  * closure's discrete-decision noise (Gram cut, phase basins; ~1e-4 in Sigma for Si) straight into the next input, so
@@ -75,6 +80,7 @@ struct mixing_params_t {
   double damp_below  = 3e-4;    ///< > 0: linear steps with damp_mixing once the residual is below this (sticky)
   double damp_mixing = 0.5;
   double wF       = -1.0;       ///< weight of the F elements in the inner product (< 0: the number of fermionic nodes)
+  double mixing_F = 1.0;        ///< D4: linear mixing of F in linear / damped steps (1: F_next = F[D], unmixed)
 };
 
 /// what one mixing step did
@@ -158,11 +164,13 @@ public:
       reset();
       info.kind = "damped";
       linear_step(comm, distributed, Sp_in, Sh_in, Sp, Sh, info, prm.damp_mixing);
+      mix_F_linear(F_in, F_out, F_next);
       return info;
     }
     if (prm.alg == "linear") {   // the pre-7.2 arithmetic, bitwise
       info.kind = "linear";
       linear_step(comm, distributed, Sp_in, Sh_in, Sp, Sh, info);
+      mix_F_linear(F_in, F_out, F_next);
       return info;
     }
 
@@ -328,6 +336,12 @@ public:
   }
 
 private:
+  /// D4: F_next = mixing_F F_out + (1 - mixing_F) F_in (F replicated on every rank: rank independent); mixing_F = 1: untouched
+  void mix_F_linear(arr3 const &F_in, arr3 const &F_out, arr3 &F_next) const {
+    if (prm.mixing_F >= 1.0) return;
+    const double a = prm.mixing_F, b = 1.0 - a;
+    for (long x = 0; x < F_next.size(); ++x) F_next.data()[x] = a * F_out.data()[x] + b * F_in.data()[x];
+  }
   /// element a of a Sigma array (rows, nodes, nb, nb) is at a node kept by node_mask (always true without a mask)
   bool node_on(arr4 const &S, long a) const {
     if (node_mask == nullptr) return true;

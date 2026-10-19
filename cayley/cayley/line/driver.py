@@ -55,7 +55,8 @@ class LineSCGW:
                  nodes_per_ray=120, node_range=(1e-3, 60.0), beta=None, thermal_tol=1e-8, thermal_floor=30.0, thermal_floor_f=None,
                  wp_floor=15.0, mu_rule='neutral', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
                  scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5,
-                 g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None):
+                 g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None,
+                 mixing_F=1.0):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
         over node_range (Ha) — dense nodes are what pins the weight distribution of the far poles (dev/tune_sigma_fit.txt).
@@ -77,6 +78,8 @@ class LineSCGW:
         self.nb = X.shape[2]; self.mu = mu; self.theta, self.eps, self.lam = theta, eps, lam
         self.theta_t = theta * theta_t_frac
         self.wp, self.K, self.mixing, self.verbose = wp, K, mixing, verbose
+        # D4 (scgw loops, T = 0 and finite T): F_next = mixing_F F[D] + (1 - mixing_F) F_used from iteration 2 on (C++ key mixing_F; 1 = unmixed)
+        self.mixing_F, self.F_used = mixing_F, None
         assert g_repr in ('compressed', 'lehmann')
         self.g_repr, self.g_emax = g_repr, (lam if g_emax is None else g_emax)
         self.g_wtol, self.g_emin_frac, self.g_wsmall = g_wtol, g_emin_frac, g_wsmall
@@ -178,6 +181,9 @@ class LineSCGW:
         # 3. closure: total fit on the two-sided gapless basis at the unmasked nodes, moments at the floored omega_p, Lehmann G
         wp = wp_thermal(self.wp, self.zeta_T, self.wp_floor) if thermal else self.wp
         mask = self.fmask if thermal else None
+        if self.mixing_F < 1.0 and self.F_used is not None:
+            self.F = self.mixing_F * self.F + (1.0 - self.mixing_F) * self.F_used
+        self.F_used = self.F
         Hstat = self.H0 + self.F - self.mu * np.eye(nb)[None]
         e_all, v_all, info_all = [], [], []
         for ik in range(nk):
@@ -276,6 +282,9 @@ class LineSCGW:
         self.Sig_prev = Sig
         tS = time.time() - t0 - tW
         # 3. closure: moments -> upfold -> Lehmann G per k (mu-relative static Hamiltonian H0 + F - mu)
+        if self.mixing_F < 1.0 and self.F_used is not None:
+            self.F = self.mixing_F * self.F + (1.0 - self.mixing_F) * self.F_used
+        self.F_used = self.F
         Hstat = self.H0 + self.F - self.mu * np.eye(nb)[None]
         e_all, v_all, info_all = [], [], []
         for ik in range(nk):
