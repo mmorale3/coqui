@@ -150,7 +150,7 @@
  *                       mu_th_factor = 10, notes Eq. fT_nth), band_heights = 8, band_x = 21, band_top = 4, mats_factor = 4 (data set
  *                       D), bos_eps_T = 1e-12 (D-selected basis), bos_line_eps = 1e-10 (the line basis of D's line nodes),
  *                       cut_odd = 1e-11 (S8b.4; was 1e-13), cut_even = 1e-10 (split fit), tau_grid = "id" | "gl", tau_eps = 1e-13 (tau leg),
- *                       spectra.occupation = false, spectra.origin (S8c), final_pass.* (S8c, below), thermal_bases_file (parity: D, nu_b, the Sigma basis injected).
+ *                       spectra.occupation = false, spectra.origin (S8c), spectra.wp_scales = [] / spectra.K = 0 (D5 multi-scale spectra), final_pass.* (S8c, below), thermal_bases_file (parity: D, nu_b, the Sigma basis injected).
  *                       scf_density = "closure" | "matsubara" (S8b.3 hybrid, hybrid.hpp: tau-leg Sigma_c(i w_n) on the dense set
  *                       w_n <= hyb_wmax = 100 Ha, Matsubara Dyson D / N / mu (N = N_el exactly); the closure supplies only the next
  *                       poles; hyb_tau_eps = 1e-13; needs mixing_alg = "linear" and div_treatment = "ignore_g0").

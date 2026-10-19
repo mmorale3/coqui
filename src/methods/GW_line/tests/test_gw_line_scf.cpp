@@ -87,6 +87,7 @@
 #include "methods/ERI/eri_utils.hpp"
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/GW_line/driver.hpp"
+#include "methods/GW_line/spectra.hpp"
 #include "numerics/line_dlr/line_basis.hpp"
 #include "numerics/line_dlr/bosonic_basis.hpp"
 #include "numerics/line_dlr/cayley.hpp"
@@ -3248,5 +3249,113 @@ TEST_CASE("gw_line_scf_scheme", "[gw_line][scf][scheme]") {
       REQUIRE(ok);
       remove_file(comm, fa + ".gw_line.h5");
     }
+  }
+}
+
+// ======================================================================================================================
+// D5: multi-scale spectra (spectra.wp_scales / spectra.K) vs the prototype closure.spectra_multiscale (gen_spectra_ms_ref.py):
+// 2-orbital Al-like model with a plasmon satellite at -0.6 .. -1.25 Ha, the EXACT poles as the closure input; base closure
+// wp 0.11 (K 24) + scales 0.3, 0.8 (K 32). Checks: chi = python; the single-scale path = the pre-D5 arithmetic bitwise;
+// components and blend = python; blend vs the exact A in the satellite window (and better than the base closure); sum rules.
+// ======================================================================================================================
+TEST_CASE("gw_line_spectra_multiscale", "[gw_line][scf][spectra_ms]") {
+  using namespace methods::gw_line;
+  const std::string fn = gw_line_dir() + "spectra_ms_ref.h5";
+  h5::file f(fn, 'r');
+  h5::group g(f);
+  auto rd_c = [&](std::string const &nm, auto &out) {
+    using A_t = std::decay_t<decltype(out)>;
+    nda::array<double, A_t::rank> re, im;
+    nda::h5_read(g, nm + "_re", re);
+    nda::h5_read(g, nm + "_im", im);
+    out = A_t(re.shape());
+    for (long a = 0; a < re.size(); ++a) out.data()[a] = ComplexType(re.data()[a], im.data()[a]);
+  };
+  nda::array<ComplexType, 2> H;
+  nda::array<ComplexType, 3> pg;
+  rd_c("H", H);
+  rd_c("pole_g", pg);
+  nda::array<double, 1> pw, sc, om, eta, m0r, m1r;
+  nda::array<double, 2> At_ref, chi_ref, Aex;
+  nda::array<double, 3> comp_ref;
+  nda::h5_read(g, "pole_w", pw);
+  nda::h5_read(g, "scales", sc);
+  nda::h5_read(g, "omega", om);
+  nda::h5_read(g, "eta", eta);
+  nda::h5_read(g, "A_trace", At_ref);
+  nda::h5_read(g, "comp_trace", comp_ref);
+  nda::h5_read(g, "chi", chi_ref);
+  nda::h5_read(g, "A_exact_trace", Aex);
+  nda::h5_read(g, "m0_err", m0r);
+  nda::h5_read(g, "m1_err", m1r);
+  long K = 0, Kb = 0, nphi = 0;
+  double tg = 0.0;
+  h5::h5_read_attribute(g, "K", K);
+  h5::h5_read_attribute(g, "K_base", Kb);
+  h5::h5_read_attribute(g, "nphi", nphi);
+  h5::h5_read_attribute(g, "tol_gram", tg);
+  const long nw = om.size(), ne = eta.size();
+  std::vector<double> scales(sc.begin(), sc.end());
+  sigma_poles_t spk{pw, pg};
+  closure_params_t p;
+  p.wp       = scales[0];
+  p.K        = Kb;
+  p.tol_gram = tg;
+  p.nphi     = nphi;
+
+  auto chi = multiscale_weights(om, scales);
+  double dchi = 0.0;
+  for (long a = 0; a < chi.size(); ++a) dchi = std::max(dchi, std::abs(chi.data()[a] - chi_ref.data()[a]));
+  app_log(1, "  [spectra_ms] chi vs python {:.2e}", dchi);
+  REQUIRE(dchi < 1e-13);
+
+  // single scale = the pre-D5 arithmetic, bitwise
+  auto chi1 = multiscale_weights(om, {scales[0]});
+  auto r1   = spectra_k(H, spk, p, {scales[0]}, K, chi1, om, eta);
+  auto ck   = closure_k(H, spk, p);
+  bool bitwise = true;
+  for (long ie = 0; ie < ne; ++ie) {
+    auto A = numerics::line_dlr::spectral_function(H, ck.d, ck.W, om, eta(ie));
+    for (long iw = 0; iw < nw; ++iw) {
+      double tr = 0.0;
+      for (long i = 0; i < H.extent(0); ++i) {
+        tr += std::real(A(iw, i, i));
+        bitwise = bitwise and (r1.A_diag(ie, iw, i) == std::real(A(iw, i, i)));
+      }
+      bitwise = bitwise and (r1.A_trace(ie, iw) == tr);
+    }
+  }
+  REQUIRE(bitwise);
+
+  auto r = spectra_k(H, spk, p, scales, K, chi, om, eta);
+  closure_params_t pl = p;
+  pl.wp = scales.back();
+  pl.K  = K;
+  auto rl = spectra_k(H, spk, pl, {scales.back()}, K, multiscale_weights(om, {scales.back()}), om, eta);
+  for (long ie = 0; ie < ne; ++ie) {
+    double mx = 0.0, d_bl = 0.0, d_c0 = 0.0, d_cl = 0.0, e_bl = 0.0, e_b0 = 0.0;
+    for (long iw = 0; iw < nw; ++iw) mx = std::max(mx, Aex(ie, iw));
+    for (long iw = 0; iw < nw; ++iw) {
+      d_bl = std::max(d_bl, std::abs(r.A_trace(ie, iw) - At_ref(ie, iw)));
+      d_c0 = std::max(d_c0, std::abs(r1.A_trace(ie, iw) - comp_ref(0, ie, iw)));
+      d_cl = std::max(d_cl, std::abs(rl.A_trace(ie, iw) - comp_ref(scales.size() - 1, ie, iw)));
+      if (om(iw) < -0.6) {
+        e_bl = std::max(e_bl, std::abs(r.A_trace(ie, iw) - Aex(ie, iw)));
+        e_b0 = std::max(e_b0, std::abs(r1.A_trace(ie, iw) - Aex(ie, iw)));
+      }
+    }
+    d_bl /= mx; d_c0 /= mx; d_cl /= mx; e_bl /= mx; e_b0 /= mx;
+    app_log(1, "  [spectra_ms] eta {}: vs python blend {:.2e}, base {:.2e}, last scale {:.2e}; satellite window vs exact: blend {:.2e}, "
+               "base {:.2e}; sum rules m0 {:.2e} (python {:.2e}), m1 {:.2e} ({:.2e})",
+            eta(ie), d_bl, d_c0, d_cl, e_bl, e_b0, r.m0(ie), m0r(ie), r.m1(ie), m1r(ie));
+    REQUIRE(d_bl < 1e-6);
+    REQUIRE(d_c0 < 1e-6);
+    REQUIRE(d_cl < 1e-6);
+    REQUIRE(e_bl < (eta(ie) < 0.03 ? 2e-2 : 5e-3));
+    REQUIRE(e_b0 > 2.0 * e_bl);
+    REQUIRE(r.m0(ie) < 1e-3);
+    REQUIRE(r.m1(ie) < 1e-3);
+    REQUIRE(std::abs(r.m0(ie) - m0r(ie)) < 1e-6);
+    REQUIRE(std::abs(r.m1(ie) - m1r(ie)) < 1e-6);
   }
 }

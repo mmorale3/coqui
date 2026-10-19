@@ -256,3 +256,62 @@ def qp_diag(Hstat_rel, w, g, wp, K, V=None, tol_gram=1e-10, nphi=72):
     for n in range(nb):
         E[n], Z[n] = qp_secular(h[n], d, np.abs(WV[n]) ** 2)
     return E, Z, dict(npoles=len(d), **info)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# D5 (2026-10-19): multi-scale spectra. The resolution of one closure about the centre is (pi/K)[(w - mu)^2 + wp^2]/wp, so the
+# small wp of the SCF closure (Si: 0.11 Ha) cannot resolve plasmon satellites 10-30 eV below mu. The spectra are blended from
+# closures of the SAME Sigma_c fit at several Cayley scales s_0 = wp < s_1 < ... (each a positive Lehmann G), with the cos^2
+# partition of unity chi_i(w) in ln|w - mu| whose node i sits at |w - mu| = s_i (as the optics closure MB): A = sum_i chi_i A_i,
+# a convex combination (A >= 0); |w - mu| <= s_0 is the base closure unchanged.
+def multiscale_weights(om, scales):
+    """chi (ns, nw): cos^2 partition of unity in ln|w| (w mu-relative), node of scale i at |w| = scales[i] (ascending)."""
+    om = np.asarray(om, float); L = np.log(np.asarray(scales, float)); ns = len(L)
+    chi = np.zeros((ns, len(om)))
+    for j, x in enumerate(np.log(np.maximum(np.abs(om), 1e-300))):
+        if x <= L[0]: chi[0, j] = 1.0; continue
+        if x >= L[-1]: chi[-1, j] = 1.0; continue
+        i = int(np.searchsorted(L, x, side='right')) - 1; t = (x - L[i]) / (L[i + 1] - L[i])
+        chi[i, j] = np.cos(0.5 * np.pi * t) ** 2; chi[i + 1, j] = 1.0 - chi[i, j]
+    return chi
+
+
+def lorentz_tails(e, a, eta, lo, hi):
+    """Weight and principal-value first moment of sum_m a_m L_eta(w - e_m) OUTSIDE [lo, hi] (analytic)."""
+    fin = (np.arctan((hi - e) / eta) - np.arctan((lo - e) / eta)) / np.pi
+    m0 = (a * (1.0 - fin)).sum()
+    m1 = (a * (e * (1.0 - fin) - eta / (2 * np.pi) * np.log(((hi - e) ** 2 + eta ** 2) / ((lo - e) ** 2 + eta ** 2)))).sum()
+    return m0, m1
+
+
+def spectra_multiscale(Hrel, w, g, scales, K, om, etas, K_base=None, tol_gram=1e-10, nphi=72):
+    """Blended A(w) of one k from the Sigma_c fit (w, g) and Hrel = H_stat - mu. scales[0] = the base closure scale (order
+    K_base, default K), scales[1:] the extra scales (order K). Returns dict(A_diag (ne, nw, nb), A_trace (ne, nw),
+    comp_trace (ns, ne, nw), chi (ns, nw), m0_err (ne,), m1_err (ne,)): sum rules of the blended trace on the grid (trapezoid)
+    + the analytic Lorentzian tails of the last scale's Lehmann G outside the grid; m0_err = |M0 - nb| / nb,
+    m1_err = |M1 - Tr Hrel| / sum_i |Hrel_ii| (first moment: Sigma_c ~ C0/z enters only the second)."""
+    from ..spectral import spectral_function
+    nb = Hrel.shape[0]; om = np.asarray(om, float); scales = list(scales); ns = len(scales)
+    chi = multiscale_weights(om, scales)
+    comp = []
+    for i, s in enumerate(scales):
+        Ki = (K if K_base is None else K_base) if i == 0 else K
+        C = sigma_moments(w, g, s, Ki + 1)
+        d, W = upfold_block(C, Ki, s, 0.0, tol_gram=tol_gram, nphi=nphi)
+        comp.append((np.asarray(d, float), np.asarray(W)))
+    Ad = np.zeros((len(etas), len(om), nb)); At = np.zeros((len(etas), len(om))); Ct = np.zeros((ns, len(etas), len(om)))
+    m0e = np.zeros(len(etas)); m1e = np.zeros(len(etas))
+    for ie, eta in enumerate(etas):
+        for i, (d, W) in enumerate(comp):
+            S = lambda z, d=d, W=W: np.einsum('zl,il,jl->zij', 1.0 / (np.atleast_1d(z)[:, None] - d[None, :]), W, W.conj())
+            A = spectral_function(Hrel, S, om, eta)
+            dg = np.real(np.einsum('wii->wi', A))
+            Ad[ie] += chi[i][:, None] * dg; Ct[i, ie] = dg.sum(1)
+        At[ie] = Ad[ie].sum(1)
+        d, W = comp[-1]
+        e, V = np.linalg.eigh(upfolded_hamiltonian(Hrel, d, W)); a = (np.abs(V[:nb]) ** 2).sum(0)
+        t0, t1 = lorentz_tails(e, a, eta, om[0], om[-1])
+        M0 = np.trapezoid(At[ie], om) + t0; M1 = np.trapezoid(om * At[ie], om) + t1
+        tr = np.real(np.trace(Hrel))
+        m0e[ie] = abs(M0 - nb) / nb; m1e[ie] = abs(M1 - tr) / np.abs(np.real(np.diag(Hrel))).sum()
+    return dict(A_diag=Ad, A_trace=At, comp_trace=Ct, chi=chi, m0_err=m0e, m1_err=m1e)

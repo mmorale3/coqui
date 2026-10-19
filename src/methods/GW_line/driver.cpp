@@ -175,6 +175,8 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.spectra.wmin  = io::get_value_with_default<double>(pt, "spectra.wmin", p.spectra.wmin);
   p.spectra.wmax  = io::get_value_with_default<double>(pt, "spectra.wmax", p.spectra.wmax);
   p.spectra.nw    = io::get_value_with_default<long>(pt, "spectra.nw", p.spectra.nw);
+  p.spectra.wp_scales = io::get_array_with_default<double>(pt, "spectra.wp_scales", p.spectra.wp_scales);   // D5
+  p.spectra.K         = io::get_value_with_default<long>(pt, "spectra.K", p.spectra.K);                     // D5
   p.spectra_origin = io::get_value_with_default<double>(pt, "spectra.origin", p.spectra_origin);   // S8c
   // S8c task 3: the sharper final pass ("auto" = -1 for wp / K / thermal_tol)
   {
@@ -439,6 +441,11 @@ void gw_line_params_t::log() const {
     std::string e;
     for (auto x : spectra.eta) e += std::to_string(x) + " ";
     app_log(1, "    spectra: eta = [ {}] Ha, w - mu in [{}, {}] Ha, nw = {}", e, spectra.wmin, spectra.wmax, spectra.nw);
+    if (!spectra.wp_scales.empty()) {
+      std::string ws;
+      for (auto x : spectra.wp_scales) ws += std::to_string(x) + " ";
+      app_log(1, "    spectra (D5): multi-scale blend, extra Cayley scales [ {}] Ha, K {}", ws, spectra.K > 0 ? std::to_string(spectra.K) : std::string("= K"));
+    }
   } else {
     app_log(1, "    spectra: off");
   }
@@ -1167,6 +1174,14 @@ void write_spectra(boost::mpi3::communicator &comm, std::string const &file, spe
     h5::h5_write(sg, "vbm", mu + s.e_homo);
     h5::h5_write(sg, "cbm", mu + s.e_lumo);
     h5::h5_write(sg, "gap", s.e_lumo - s.e_homo);
+    if (!s.scales.empty()) {   // D5: scales of the blend, order of the extra closures, sum rules [n_eta, nk]
+      nda::array<double, 1> sc(long(s.scales.size()));
+      for (long i = 0; i < sc.size(); ++i) sc(i) = s.scales[i];
+      nda::h5_write(sg, "wp_scales", sc, false);
+      h5::h5_write(sg, "K_scales", s.K_scales);
+      nda::h5_write(sg, "sumrule_m0", s.m0_err, false);
+      nda::h5_write(sg, "sumrule_m1", s.m1_err, false);
+    }
   }
   comm.barrier();
 }
@@ -2661,6 +2676,13 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
     Timer.stop("spectra");
     app_log(1, "  spectra: A(k, w) for {} eta x {} k x {} w written to {}:/spectra ({:.1f} s)", sp.eta.size(), nk, sp.omega.size(),
             chk, Timer.elapsed("spectra"));
+    {
+      double m0 = 0.0, m1 = 0.0;
+      for (long a = 0; a < sp.m0_err.size(); ++a) m0 = std::max(m0, sp.m0_err.data()[a]);
+      for (long a = 0; a < sp.m1_err.size(); ++a) m1 = std::max(m1, sp.m1_err.data()[a]);
+      app_log(1, "  spectra: {} Cayley scale(s), sum rules of Tr A (grid + Lorentzian tails) max over eta, k: m0 {:.2e}, m1 {:.2e}",
+              sp.scales.size(), m0, m1);
+    }
     app_log(1, "  final QP edges: VBM {:.6f} Ha, CBM {:.6f} Ha (mu {:.6f} Ha) -> QP gap {:.4f} eV", st.mu + sp.e_homo,
             st.mu + sp.e_lumo, st.mu, (sp.e_lumo - sp.e_homo) * HA_EV);
     res.spectra = std::move(sp);

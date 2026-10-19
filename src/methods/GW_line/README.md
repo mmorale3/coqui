@@ -199,6 +199,8 @@ Hartree. "auto" defaults are computed at run time as described.
 | `spectra.wmin` | double | `-0.45` | grid start, w - mu (Ha) | per plot |
 | `spectra.wmax` | double | `0.45` | grid end, w - mu (Ha) | per plot |
 | `spectra.nw` | long | `601` | grid points | per plot |
+| `spectra.wp_scales` | list of double | [] | D5: extra Cayley scales (Ha, > the closure's wp) of the spectra: the same Sigma_c fit closed at each scale, A blended by a cos^2 partition of unity in ln\|w - mu\| (node i at \|w - mu\| = scale i); \|w - mu\| <= wp is the base closure unchanged; [] = bitwise the single closure | Si T = 0: [0.3, 0.8]; satellites 10-30 eV below mu |
+| `spectra.K` | long | `0` | D5: order of the extra closures (0 = K) | 32-48 |
 | `spectra.origin` | double | final mu | absolute energy (Ha) that w = 0 refers to (spectra/origin; the QP edges stay mu-relative) | comparisons on a fixed frame |
 
 **Optics (after the loop; `optics = { ... }` or `[gw_line.optics]`)**
@@ -270,6 +272,7 @@ Hartree. "auto" defaults are computed at run time as described.
 | `tau_grid` | string | `"id"` | tau-leg nodes on [0, beta/2]: `"id"` (finite-interval ID, ~40; Pi(q, 0) to 2e-14) / `"gl"` (composite GL, ~200-250, the python grid) | keep |
 | `tau_eps` | double | `1e-13` | tolerance of the tau ID | keep |
 | `spectra.occupation` | bool | `false` | also write f(w - mu) on the spectra grid (spectra/fermi_w; f A = the occupied spectrum) | finite-T plots |
+| `nu0_intraband` | bool | `false` | D4 (notes 12.8): add the Matsubara-convention (isothermal) nu_0 term of the exactly degenerate pairs (nu0.hpp); needs ignore_g0 + lehmann; off = bitwise | metals vs CoQui Matsubara: true |
 | `final_pass.enable` | bool | `false` | sharper final pass (notes 12.6): one more unmixed iteration from the final poles at theta_t' on a copy of the checkpoint (`<output>.final_pass.gw_line.h5`); its spectra in `/final_pass/spectra` | metals: near-E_F spectra |
 | `final_pass.theta_t_frac` | double | `0.25` | theta_t' = theta_t_frac theta of the pass (0.125 allowed) | 0.25 |
 | `final_pass.wp` | double / "auto" | `"auto"` | omega_p of the pass's closure; auto = max(wp, wp_floor zeta_T') | auto |
@@ -322,7 +325,9 @@ scf_line/    final_iter, start_done
     closure_phi  terminal phases of the closure per k
     Sigma_p, Sigma_h   only with checkpoint_sigma = "all": (nk, n_nodes, nb, nb)
 spectra/     mu, omega (nw, w - mu), eta (n_eta), A_k_w_diag (n_eta, nk, nw, nb) = diagonal of A in the KS band basis,
-             A_k_w_trace (n_eta, nk, nw), e_homo, e_lumo (mu-relative), vbm, cbm (absolute), gap
+             A_k_w_trace (n_eta, nk, nw), e_homo, e_lumo (mu-relative), vbm, cbm (absolute), gap; D5: wp_scales (the blend's
+             scales, [0] = the closure's wp), K_scales, sumrule_m0 / sumrule_m1 (n_eta, nk): |int Tr A - nb| / nb and
+             |int w Tr A - Tr(H_stat - mu)| / sum|H_ii - mu| on the grid + analytic Lorentzian tails (meaningful for dw <= eta / 5)
 optics/      omega (nw), omega_eV, eta, eta_rel, wp2_valence (4 pi N / Omega), nelec, volume (bohr^3); attributes units,
              method, physics_scope, broadening_order
   theta<deg>/   one group per line, e.g. theta20.0 (the SCF angle, first) and theta10.0: theta_deg, source (which G /
