@@ -1004,7 +1004,7 @@ nda::array<ComplexType, 4> sigma_total_of(mpi3::communicator &comm, std::string 
 
 void rm_ckpt(mpi3::communicator &comm, std::string const &stem) {
   comm.barrier();
-  if (comm.root())
+  if (comm.root() and std::getenv("GW_LINE_KEEP_CKPT") == nullptr)   // D4: keep the checkpoints for post-processing checks
     for (auto sfx : {".gw_line.h5", ".gw_line.sigma.h5"}) std::filesystem::remove(stem + sfx);
   comm.barrier();
 }
