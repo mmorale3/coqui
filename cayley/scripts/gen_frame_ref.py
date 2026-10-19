@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """D4 closure frame of the hybrid (C++ key hyb_frame; notes section 12 "The closure in the loop"): reference for the C++ test
 [finiteT][hybrid][frame], lih222 at beta 200, theta_t = theta / 4, scf_density "matsubara", the [hybrid][scf] settings (K 8, nphi 8,
-eps 1e-8, mu_rule auto), 2 iterations with hyb_frame "old" (the S8b.3 rule: closure at the previous mu, poles re-centred) and "new"
-(the hybrid mu first, closure at H - mu_new).
+eps 1e-8, mu_rule auto), 2 iterations with hyb_frame "old" (the S8b.3 rule: closure at the previous mu, poles re-centred), "new"
+(the hybrid mu first, closure at H - mu_new) and "count" (new + the poles keep the closure's own mu: N_closure = N_el).
 Prototype gates: iteration-1 hybrid mu independent of the frame [1e-13]; "new" = "old" with H shifted by -dmu_hyb before the
 closure: the iteration-1 Lehmann poles of "new" equal an explicit closure of the same Sigma fit at H - mu_new [1e-12].
 H5: attrs beta, generator, cayley_head, date, the gates; /<frame>/{mu (2,), N_closure (2,), D_cl_err (2,), dmu_closure (2,)}.
@@ -32,7 +32,7 @@ P = dict(theta=np.deg2rad(20.0), eps=1e-8, lam=6.0, bos_lam=12.0, bos_gap=0.02, 
          thermal_floor_f=30.0, wp_floor=15.0, mu_rule='auto', bos_eps_T=1e-10, wstep=dict(WSTEP_DEFAULTS, cut_odd=1e-11),
          scf_density='matsubara', theta_t_frac=0.25, g_repr='lehmann', verbose=False)
 R, gates = {}, {}
-for frame in ('old', 'new'):
+for frame in ('old', 'new', 'count'):
     sc = drv.LineSCGW(X, Z, qk, nk, nelec, H0, mu0, hyb_frame=frame, **P)
     sc.start_from_hamiltonian(np.array([np.diag(eig[k]) for k in range(nk)]).astype(complex))
     mu_s = sc.mu; F_s = sc.F.copy()

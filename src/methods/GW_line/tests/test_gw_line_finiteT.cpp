@@ -1778,7 +1778,7 @@ TEST_CASE("gw_line_finiteT_frame", "[gw_line][finiteT][hybrid][frame]") {
   {
     h5::file f(ft_dir() + "lih222_frame_ref.h5", 'r');
     h5::group g(f);
-    for (std::string fr : {"old", "new"}) {
+    for (std::string fr : {"old", "new", "count"}) {
       auto gg = g.open_group(fr);
       nda::h5_read(gg, "mu", ref[fr][0]);
       nda::h5_read(gg, "N_closure", ref[fr][1]);
@@ -1795,9 +1795,10 @@ TEST_CASE("gw_line_finiteT_frame", "[gw_line][finiteT][hybrid][frame]") {
   };
   auto O  = run("old");
   auto N  = run("new");
-  bool ok = O.history.size() == 2 and N.history.size() == 2;
+  auto C  = run("count");
+  bool ok = O.history.size() == 2 and N.history.size() == 2 and C.history.size() == 2;
   app_log(1, "\n[finiteT][hybrid][frame] lih222 beta 200, 2 hybrid iterations per frame:");
-  for (auto const &[fr, R] : std::vector<std::pair<std::string, decltype(O) const *>>{{"old", &O}, {"new", &N}})
+  for (auto const &[fr, R] : std::vector<std::pair<std::string, decltype(O) const *>>{{"old", &O}, {"new", &N}, {"count", &C}})
     for (auto const &h : R->history)
       app_log(1, "  {} iter {}: mu {:.12f} (prototype {:.12f}, {:+.2e}) | closure N {:.8f} (prototype {:.8f}, {:+.2e}), max|D_cl - D| "
                  "{:.2e}, own mu {:+.2e} Ha",
@@ -1812,7 +1813,13 @@ TEST_CASE("gw_line_finiteT_frame", "[gw_line][finiteT][hybrid][frame]") {
   ok = gate("frame new: |N_closure - prototype| iteration 2", std::abs(N.history[1].N_closure - ref["new"][1](1)), 2e-5) and ok;
   // the point of the frame: the closure G of iteration 1 carries N_el (old: 3.963, the lag of the hybrid mu step of 3.45 eV)
   ok = gate("frame new: |N_closure - N_el| iteration 1", std::abs(N.history[0].N_closure - 4.0), 1e-5) and ok;
-  for (auto const &h : N.history) ok = gate("|N(mu) - N_el|", std::abs(h.N_mu - 4.0), 1e-12) and ok;
+  // "count": the closure's poles keep its own mu (rule "number" here): N_closure = N_el; iteration 1 = the poles of "new" shifted
+  ok = gate("frame count: iteration-2 |mu - mu_prototype| (Ha)", std::abs(C.history[1].mu - ref["count"][0](1)), 5e-6) and ok;
+  // (iteration 1 the closure's rule is "number": N_el exactly; iteration 2 lih222 is gapped at the new mu and the rule keeps the gap)
+  ok = gate("frame count: |N_closure - N_el| iteration 1", std::abs(C.history[0].N_closure - 4.0), 1e-8) and ok;
+  ok = gate("frame count: |N_closure - prototype| iteration 2", std::abs(C.history[1].N_closure - ref["count"][1](1)), 2e-5) and ok;
+  for (auto const *R : {&N, &C})
+    for (auto const &h : R->history) ok = gate("|N(mu) - N_el|", std::abs(h.N_mu - 4.0), 1e-12) and ok;
   REQUIRE(ok);
 }
 
