@@ -953,6 +953,34 @@ TEST_CASE("gw_line_dump_svo222", "[.gw_line_dump_svo222]") {
           mf->nqpts(), mf->nqpts_ibz(), mf->nelec());
 }
 
+/// S8c task 2: the nosym/noinv twin svo222n (QE nscf 2x2x2 nbnd 40, nosym = noinv = .true., pw2coqui; rusty
+/// scripts/p_block/svo222n_qe.sbatch -> data/svo222n/out/svo.coqui.h5): THC with nIpts = 8 nbnd and system.h5 (H0 of all 8 k,
+/// KS eigenvalues, qk_to_k2, nelec) -> $GW_LINE_SVO222N/svo222n_thc/ (kept OUT of the repository: the h5 mean field is ~50 MB).
+/// The driver runs this fixture on the full-BZ path; the python oracle (gen_sharp_ref.py) reads the same THC.
+/// Run once on 1 rank with GW_LINE_SVO222N=<dir containing out/svo.coqui.h5>: test_gw_line_scf "[.gw_line_dump_svo222n]".
+TEST_CASE("gw_line_dump_svo222n", "[.gw_line_dump_svo222n]") {
+  char const *e = std::getenv("GW_LINE_SVO222N");
+  REQUIRE(e != nullptr);
+  const std::string D = std::string(e) + "/";
+  auto mpi = utils::make_unit_test_mpi_context();
+  auto mf  = std::make_shared<mf::MF>(mf::default_MF(mpi, mf::qe_source, D + "out/", "svo", mf::h5_input_type));
+  REQUIRE(mf->nkpts_ibz() == mf->nkpts());
+  REQUIRE(mf->nqpts_ibz() == mf->nqpts());
+  if (mpi->comm.root()) std::filesystem::create_directories(D + "svo222n_thc");
+  mpi->comm.barrier();
+  methods::thc_reader_t thc(mf, methods::make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", D + "svo222n_thc/thc.eri.h5", "bdft",
+                                                               1e-10, mf->ecutrho(), 1, 1024));
+  auto H0 = one_body_h0(*mf);
+  const long nk = mf->nkpts(), nb = mf->nbnd(), nocc = long(std::llround(double(mf->nelec()) / 2.0));
+  double homo = -1e300, lumo = 1e300;
+  for (long ik = 0; ik < nk; ++ik)
+    for (long n = 0; n < nb; ++n)
+      (n < nocc ? homo : lumo) = (n < nocc) ? std::max(homo, mf->eigval()(0, ik, n)) : std::min(lumo, mf->eigval()(0, ik, n));
+  write_system_h5(mpi->comm, D + "svo222n_thc/system.h5", *mf, thc.Np(), H0, 0.5 * (homo + lumo), true);
+  mpi->comm.barrier();
+  app_log(1, "wrote {}svo222n_thc/ (Np {}, nk {} (no symmetry), nelec {})", D, thc.Np(), nk, mf->nelec());
+}
+
 namespace {
 void restart_test(std::string const &tg, std::string const &gr = "compressed") {
   lih_t L;

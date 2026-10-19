@@ -136,12 +136,16 @@ struct fx_t {
   std::string name;
   explicit fx_t(std::string const &nm) : name(nm) {
     mpi = utils::make_unit_test_mpi_context();
-    if (nm == "svo222") {   // S8c: the xml route of the svo222_thc dump (test_gw_line_scf [.gw_line_dump_svo222]; IBZ k, all q).
-                            // NOT usable by the driver (ibz_t needs nq_ibz == nk_ibz; no pseudopotential data for H0): see [.metal_sharp]
-      const std::string qedir = std::string(PROJECT_SOURCE_DIR) + "/tests/unit_test_files/qe/svo_kp222_nbnd40/out/";
-      mf = std::make_shared<mf::MF>(mf::qe::qe_readonly(mf::qe::read_xml(mpi, qedir, "svo", -1, true)));
-    } else
-      mf = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_" + nm));
+    if (nm == "svo222n") {   // S8c: the nosym twin of svo222 ($GW_LINE_SVO222N: out/svo.coqui.h5 + svo222n_thc/, rusty data/svo222n;
+                             // test_gw_line_scf [.gw_line_dump_svo222n]); the full-BZ path of the driver
+      char const *e = std::getenv("GW_LINE_SVO222N");
+      utils::check(e != nullptr, "set GW_LINE_SVO222N to the svo222n data directory");
+      const std::string D = std::string(e) + "/";
+      mf  = std::make_shared<mf::MF>(mf::default_MF(mpi, mf::qe_source, D + "out/", "svo", mf::h5_input_type));
+      thc = std::make_unique<methods::thc_reader_t>(mf, "incore", D + "svo222n_thc/thc.eri.h5");
+      return;
+    }
+    mf  = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_" + nm));
     thc = std::make_unique<methods::thc_reader_t>(mf, "incore", ft_dir() + nm + "_thc/thc.eri.h5");
   }
 };
@@ -2214,7 +2218,7 @@ TEST_CASE("gw_line_finiteT_gauge", "[gw_line][finiteT][gauge]") {
 }
 
 // ============================================================================================================== [sharp]
-// S8c task 3 (notes section 12.6): the sharper final pass (lih222 and svo222 at beta 200: zeta_T' 0.0505, omega_p' 0.758 Ha). G0W0@KS (niter = 0 + final_pass: the pass IS the first iteration,
+// S8c task 3 (notes section 12.6): the sharper final pass (lih222 and svo222n at beta 200: zeta_T' 0.0505, omega_p' 0.758 Ha). G0W0@KS (niter = 0 + final_pass: the pass IS the first iteration,
 // from the KS poles at theta_t' = theta / 4, K 32, omega_p' = 15 zeta_T', node data at eps 1e-10, thermal_tol 1e-12 in the pass):
 //  (i)  Sigma_c of the pass at the nodes vs the exact finite-T Casida Sigma_c (sharp_ref.h5, the run's 240 nodes) on the theta / 2 mask
 //       (rho beta |z| >= c_f at theta / 2) and on the pass's own mask (rho' beta |z| >= c_f, rho' = 2.97): <= 1e-8;
@@ -2222,8 +2226,8 @@ TEST_CASE("gw_line_finiteT_gauge", "[gw_line][finiteT][gauge]") {
 //       cayley/scripts/gen_sharp_ref.py) with the run's own static part H0 + F[D_KS]: max|dA| / max A <= 1e-2 at eta 0.02 and
 //       <= 1e-3 at eta 0.05 (S8c.0 assessment, k = 1 of svo222: 2.9e-3 / 1.5e-4); the SCF-angle (theta / 2) G0W0 closure is
 //       reported next to it (no gate);
-//  (i') the SCF-angle (theta / 2) G0W0 Sigma_c at the nodes vs exact on the theta / 2 mask (svo222: the symmetric mesh -> the IBZ
-//       kernels; this replaces a stand-alone svo222 T1/T2 case, whose harness has no IBZ path);
+//  (i') the SCF-angle (theta / 2) G0W0 Sigma_c at the nodes vs exact on the theta / 2 mask (a T2-type kernel check through the
+//       driver; svo222n replaces a stand-alone svo222 T1/T2 case);
 //  (iii) lih222: the pass from a restart (niter = 1 done, restart, final_pass) == the in-run pass (niter = 1 + final_pass), bitwise.
 namespace {
 ptree sharp_params(std::string const &out, double beta, long niter, bool restart, double mu0, bool pass) {
@@ -2280,7 +2284,9 @@ bool run_sharp(std::string const &fxn, double beta, bool check_restart) {
     return pt;
   };
   // references
-  h5::file hs(ft_dir() + "sharp_ref.h5", 'r');
+  // svo222n: the reference lives with its data ($GW_LINE_SVO222N/sharp_ref_svo222n.h5, gen_sharp_ref.py on rusty)
+  const std::string sref = (fxn == "svo222n") ? std::string(std::getenv("GW_LINE_SVO222N")) + "/sharp_ref_svo222n.h5" : ft_dir() + "sharp_ref.h5";
+  h5::file hs(sref, 'r');
   h5::group rs(hs);
   auto gs          = rs.open_group(fxn);
   const double mu0 = read_attr<double>(gs, "mu0");
@@ -2292,7 +2298,7 @@ bool run_sharp(std::string const &fxn, double beta, bool check_restart) {
   nda::h5_read(gs, "Sw_im", swi);
   nda::array<ComplexType, 5> Sw(swr.shape());
   for (long a = 0; a < Sw.size(); ++a) Sw.data()[a] = ComplexType(swr.data()[a], swi.data()[a]);
-  const std::vector<long> ks = (fxn == "lih222") ? std::vector<long>{0, 3} : std::vector<long>{1};
+  const std::vector<long> ks = (fxn == "lih222") ? std::vector<long>{0, 3} : std::vector<long>{1};   // svo222n: k 1
   REQUIRE(long(ks.size()) == Sw.extent(0));
   nda::array<double, 1> zr, zi;
   nda::array<double, 4> szr, szi;
@@ -2380,7 +2386,7 @@ bool run_sharp(std::string const &fxn, double beta, bool check_restart) {
     pt.put("thermal_tol", 1e-12);
     auto Q  = gw_line_scf<HOST_MEMORY>(*F.thc, mf, pt);
     {   // the SCF-angle G0W0 Sigma_c at the nodes vs exact on the theta / 2 mask (the T2-type kernel check through the driver;
-        // on the symmetric svo222 mesh this is the IBZ path)
+        // svo222n: the metal at beta 200)
       auto S = sigma_total_of(comm, fo + "_scf.gw_line.h5", 1);
       double d = 0.0, m = 0.0;
       for (size_t a = 0; a < kz.size(); ++a)
@@ -2435,20 +2441,19 @@ bool run_sharp(std::string const &fxn, double beta, bool check_restart) {
 
 TEST_CASE("gw_line_finiteT_sharp_lih222", "[gw_line][finiteT][sharp]") { REQUIRE(run_sharp("lih222", 200.0, true)); }
 
-// NOTE (2026-10-18): the two svo222 driver cases below are HIDDEN ([.metal_sharp], [.metal_scf]): the svo222_thc fixture (the python oracle's THC) was
-// built on the xml-route mean field (IBZ k, full q, no pseudopotential data) that the driver cannot run (ibz_t: nq_ibz != nk_ibz;
-// H0), and the symmetric h5 fixture qe_svo222_sym (IBZ q) does not match that THC (head basis 8 vs 4 q). They need a consistent
-// svo222 fixture: a nosym QE twin (nscf from svo.save, nosym/noinv, pw2coqui, THC 8 nb) + the svo222 references regenerated
-// on its THC (gen_metal_ref.py / gen_sharp_ref.py, casida cache) -- rusty work (scripts/p_block/SUBMIT.md).
-TEST_CASE("gw_line_metal_sharp_svo222", "[.metal_sharp]") { REQUIRE(run_sharp("svo222", 200.0, false)); }
+// S8c task 2 / 3 on the metal: the svo222 driver cases run on the nosym twin svo222n (the original svo222_thc fixture sits on the
+// xml-route mean field -- IBZ k, full q, no pseudopotential data -- that the driver cannot run). Data outside the repository:
+// GW_LINE_SVO222N=<rusty data/svo222n> (out/svo.coqui.h5, svo222n_thc/, sharp_ref_svo222n.h5). Hidden (cost, data): run
+// "[.metal_sharp]" and "[.metal_scf]" explicitly.
+TEST_CASE("gw_line_metal_sharp_svo222n", "[.metal_sharp]") { REQUIRE(run_sharp("svo222n", 200.0, false)); }
 
 // S8c task 2 (metals): svo222 thermal SCF at beta 200 with the metals' settings (option A of the S8c.0 assessment: theta_t = theta / 4,
 // scf_density "matsubara" = hybrid, K 24, omega_p = 15 zeta_T = 0.758 Ha, mu_rule default): N(mu) = 41 to 1e-10 at every iteration,
 // restart (NIT / 2 + rest) bitwise = straight, 1 vs 2 ranks mu <= 1e-8 Ha per iteration (file gw_line_metal_scf_np<np>.h5; run 1 then 2
 // ranks). The mu vs CoQui scGW at beta 200 (<= 5 meV) is the demo comparison (S8c task 4, runs/s8c_mats), not gated here.
 // GW_LINE_METAL_NIT (default 6) for a local smoke run. Heavy (rusty): "[metal][scf]".
-TEST_CASE("gw_line_metal_scf_svo222", "[.metal_scf]") {
-  fx_t F("svo222");
+TEST_CASE("gw_line_metal_scf_svo222n", "[.metal_scf]") {
+  fx_t F("svo222n");
   auto &comm = F.mpi->comm;
   long NIT   = 6;
   if (char const *e = std::getenv("GW_LINE_METAL_NIT")) NIT = std::max(2L, std::strtol(e, nullptr, 10));

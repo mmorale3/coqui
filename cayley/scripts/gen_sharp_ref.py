@@ -20,6 +20,10 @@ D = ROOT + '/coqui/tests/unit_test_files/gw_line/'
 out = D + 'sharp_ref.h5'
 om = np.linspace(-0.3, 0.3, 151); etas = [0.02, 0.05]
 cases = [('lih222', 200.0, [0, 3]), ('svo222', 200.0, [1])]
+# S8c: the nosym metal twin svo222n (data outside the repository): SHARP_SVO222N=<dir with svo222n_thc/> writes
+# <dir>/sharp_ref_svo222n.h5 for that fixture only (rusty, in an allocation; Casida cache data/casida_cache/svo222n)
+if os.environ.get('SHARP_SVO222N'):
+    D = os.environ['SHARP_SVO222N'].rstrip('/') + '/'; out = D + 'sharp_ref_svo222n.h5'; cases = [('svo222n', 200.0, [1])]
 with h5py.File(out, 'w') as F:
     F.attrs.update(generator='coqui/cayley/scripts/gen_sharp_ref.py', date=datetime.date.today().isoformat(),
                    route='cayley.metal.SigmaFT.evaluate(zeta=...) direct, casida_hermitian', deg_tol=1e-8)
