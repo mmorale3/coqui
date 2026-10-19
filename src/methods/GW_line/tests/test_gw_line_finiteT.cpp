@@ -1764,6 +1764,52 @@ TEST_CASE("gw_line_finiteT_mixF", "[gw_line][finiteT][hybrid][mixF]") {
   REQUIRE(ok);
 }
 
+// D4: hybrid energies (E_H0, E_HF, E_corr = sum_k w_k (1/beta) sum_n Tr[Sigma_c G]) and Sigma_c(i w_n < hyb_sigma_out) in the checkpoint.
+// The S1 / (i w)^2 tail of E_corr: one hybrid iteration (lih222 beta 200, G0W0@KS + Matsubara Dyson) with hyb_wmax 100 (N 3184, the
+// default) and 200 Ha (N 6367): E_corr equal to 1e-7 (S1 tail + w^-4 elimination; with the S1 tail only: 1.1e-6, at 25 Ha 8e-5); the
+// D-energies E_H0 / E_HF agree likewise (D's own tail); Sigma_c(i w_n) written (n < 8) identical in both (the same tau-leg nodes).
+TEST_CASE("gw_line_finiteT_hybrid_energy", "[gw_line][finiteT][hybrid][energy]") {
+  lih_ft_t L;
+  auto &comm = L.mpi->comm;
+  auto run   = [&](std::string const &out, double wmax) {
+    auto pt = ft_params(out, 1, 200.0, "id", "auto", false);
+    pt.put("theta_t_frac", 0.25);
+    pt.put("scf_density", "matsubara");
+    pt.put("hyb_wmax", wmax);
+    pt.put("hyb_sigma_out", 8);
+    gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
+    std::array<double, 4> E{};
+    nda::array<ComplexType, 4> S;
+    {
+      h5::file f(out + ".gw_line.h5", 'r');
+      h5::group g(f);
+      auto it = g.open_group("scf_line").open_group("iter1");
+      auto eg = it.open_group("energy");
+      h5::h5_read(eg, "E_H0", E[0]);
+      h5::h5_read(eg, "E_HF", E[1]);
+      h5::h5_read(eg, "E_corr", E[2]);
+      h5::h5_read(it, "mu", E[3]);
+      nda::h5_read(it, "Sigma_c_iw", S);
+    }
+    comm.barrier();
+    rm_ckpt(comm, out);
+    return std::make_pair(E, S);
+  };
+  auto [Ea, Sa] = run("gw_line_ft_en_a", 100.0);
+  auto [Eb, Sb] = run("gw_line_ft_en_b", 200.0);
+  app_log(1, "\n[finiteT][hybrid][energy] lih222 beta 200 it 1: E_H0 {:.10f} / {:.10f}, E_HF {:.10f} / {:.10f}, E_corr {:.10f} / {:.10f} "
+             "(w_max 100 / 200 Ha), mu {:.12f} / {:.12f}",
+          Ea[0], Eb[0], Ea[1], Eb[1], Ea[2], Eb[2], Ea[3], Eb[3]);
+  bool ok = Sa.shape() == Sb.shape() and Sa.extent(1) == 8;
+  double dS = 0.0;
+  for (long x = 0; x < Sa.size(); ++x) dS = std::max(dS, std::abs(Sa.data()[x] - Sb.data()[x]));
+  ok = gate("E_corr(w_max 100) - E_corr(w_max 200) (Ha)", std::abs(Ea[2] - Eb[2]), 1e-7) and ok;
+  ok = gate("E_H0 + E_HF (w_max 100 vs 200) (Ha)", std::abs(Ea[0] + Ea[1] - Eb[0] - Eb[1]), 1e-7) and ok;
+  ok = gate("Sigma_c(i w_n < 8) written, w_max 100 vs 200", dS, 1e-13) and ok;
+  ok = gate("E_corr < 0 and O(0.01-1) Ha", (Ea[2] < 0.0 and Ea[2] > -1.0) ? 0.0 : 1.0, 0.5) and ok;
+  REQUIRE(ok);
+}
+
 // S8b thermal closure perf: the "lazy" terminal-phase scan (default in thermal iterations) vs the S8b.2 distributed eigen scan
 // (COQUI_GWLINE_THERMAL_SCAN = parallel): one thermal iteration (lih222 beta 200, the [scf] settings; n_free 16 at every k)
 // -> the same closure decisions (terminal phases), mu and poles within the roundoff of the two held-out error evaluations.

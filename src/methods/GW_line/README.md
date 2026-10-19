@@ -280,6 +280,7 @@ Hartree. "auto" defaults are computed at run time as described.
 | `scf_density` | string | `"closure"` | `"matsubara"` (S8b.3 hybrid, beta > 0): Sigma_c(i w_n) from the tau leg, D, N(mu) = N_el and mu from the Matsubara Dyson equation; the closure supplies only the next poles. Needs mixing_alg linear, div_treatment ignore_g0 | metals / exact particle number |
 | `hyb_wmax` | double | `100.0` | w_max (Ha) of the dense Matsubara set of the hybrid (N = ceil((w_max beta/pi - 1)/2) + 1 frequencies; truncation ~1e-12) | keep |
 | `hyb_tau_eps` | double | `1e-13` | tolerance of the tau ID of the hybrid Sigma leg | keep |
+| `hyb_sigma_out` | long | `0` | D4: write Sigma_c(k, i w_n) for n < hyb_sigma_out (KS band basis) to scf_line/iter<N>/Sigma_c_iw each hybrid iteration (energies E_H0 / E_HF / E_corr are always written to scf_line/iter<N>/energy/) | Matsubara comparisons (16) |
 
 **Diagnostics**
 

@@ -196,6 +196,13 @@ struct hybrid_density_t {
   double dmu = 0.0, N = 0.0, N_trace = 0.0, tail_max = 0.0;
   long nfreq = 0, nbisect = 0;
   nda::array<ComplexType, 3> D;   ///< (nk, nb, nb), every rank
+  /// D4: correlation energy per cell (Ha, both spins) E_c = sum_k w_k (1/beta) sum_{n in Z} Tr[Sigma_c(i w_n) G(i w_n)] at the root:
+  /// n < N summed + the analytic S1 / (i w)^2 tail -(2/beta) Tr S1 (beta/pi)^2 zeta(2, N + 1/2) / 4; the remainder ~ w^-4 (relative
+  /// O((E_max / w_N)^2) to the tail; lih222: 8e-5 / 1.3e-6 Ha at w_max 25 / 100) is eliminated between the sums to N/2 and N
+  /// (zeta(4, . + 1/2) weights, as D's w^-6 step). Ec_raw: the bare n < N sum (diagnostic).
+  double Ec = 0.0, Ec_raw = 0.0;
+  /// D4: Sigma_c(k, i w_n) for n < nout (nk, nout, nb, nb), every rank (nout = 0: empty)
+  nda::array<ComplexType, 4> sig_iw;
 };
 
 /**
@@ -205,7 +212,7 @@ struct hybrid_density_t {
 inline hybrid_density_t matsubara_density(boost::mpi3::communicator &comm, nda::array<ComplexType, 3> const &Hrel,
                                           nda::array<ComplexType, 4> const &Sp, nda::array<ComplexType, 4> const &Sh,
                                           std::vector<long> const &krows, std::vector<double> const &kw_in, hybrid_nodes_t const &HN,
-                                          double beta, double wmax, double nelec, long maxit = 200) {
+                                          double beta, double wmax, double nelec, long maxit = 200, long nout = 0) {
   using numerics::line_dlr::fermi;
   auto all = nda::range::all;
   const long nk = Hrel.extent(0), nb = Hrel.extent(1), nloc = long(krows.size()), nt = HN.ntau;
@@ -305,10 +312,18 @@ inline hybrid_density_t matsubara_density(boost::mpi3::communicator &comm, nda::
     out.dmu     = mid;
     out.N_trace = Nm + nelec;
   }
-  // D at the root
+  // D at the root (+ D4: E_c and Sigma_c(i w_n < nout))
   out.D = nda::array<ComplexType, 3>(nk, nb, nb);
   out.D() = 0.0;
   const double dm = out.dmu;
+  nout = std::min(nout, Nf);
+  if (nout > 0) {
+    out.sig_iw = nda::array<ComplexType, 4>(nk, nout, nb, nb);
+    out.sig_iw() = 0.0;
+  }
+  std::vector<double> ec_k(nk, 0.0), ecr_k(nk, 0.0);
+  const double z2 = hurwitz_zeta(2.0, double(Nf) + 0.5), z2h = hurwitz_zeta(2.0, double(Nh) + 0.5);
+  const double z4 = hurwitz_zeta(4.0, double(Nf) + 0.5), z4h = hurwitz_zeta(4.0, double(Nh) + 0.5);
   for (long l = 0; l < nloc; ++l) {
     auto const &d = kd[l];
     nda::matrix<ComplexType> dG(nb, nb), dGh(nb, nb), I(nb, nb);
@@ -316,9 +331,15 @@ inline hybrid_density_t matsubara_density(boost::mpi3::communicator &comm, nda::
     dGh() = 0.0;
     I()   = 0.0;
     for (long b = 0; b < nb; ++b) I(b, b) = 1.0;
+    double ec = 0.0, ech = 0.0;
     for (long n = 0; n < Nf; ++n) {
+      if (n == Nh) ech = ec;
       const ComplexType z = iw(n) + dm;
-      nda::matrix<ComplexType> G = nda::inverse(nda::matrix<ComplexType>(z * I - d.H - sigma_iw(l, n)));
+      nda::matrix<ComplexType> Sn = sigma_iw(l, n);
+      nda::matrix<ComplexType> G = nda::inverse(nda::matrix<ComplexType>(z * I - d.H - Sn));
+      for (long a = 0; a < nb; ++a)
+        for (long b = 0; b < nb; ++b) ec += 2.0 * (Sn(a, b) * G(b, a)).real();
+      if (n < nout) out.sig_iw(krows[l], n, all, all) = Sn;
       nda::matrix<ComplexType> Vz(nb, nb);
       for (long a = 0; a < nb; ++a)
         for (long b = 0; b < nb; ++b) Vz(a, b) = d.V(a, b) / (z - d.h(b));
@@ -336,11 +357,19 @@ inline hybrid_density_t matsubara_density(boost::mpi3::communicator &comm, nda::
     nda::matrix<ComplexType> xh = D0 + (dGh + nda::dagger(dGh)) / beta + T4h * B;
     out.D(krows[l], all, all) = extrap(xN, xh);
     for (auto const &x : B) out.tail_max = std::max(out.tail_max, T4 * std::abs(x));
+    const double c2 = 2.0 * d.trS1 * (beta / std::numbers::pi) * (beta / std::numbers::pi) / 4.0;
+    const double eN = ec - c2 * z2, eh = ech - c2 * z2h;
+    ec_k[krows[l]]  = kw[krows[l]] * (eN + (eN - eh) / (z4h - z4) * z4) / beta;
+    ecr_k[krows[l]] = kw[krows[l]] * ec / beta;
   }
   if (comm.size() > 1) {
     comm.all_reduce_in_place_n(out.D.data(), out.D.size(), std::plus<>{});
     out.tail_max = comm.all_reduce_value(out.tail_max, boost::mpi3::max<>{});
+    comm.all_reduce_in_place_n(ec_k.data(), nk, std::plus<>{});
+    comm.all_reduce_in_place_n(ecr_k.data(), nk, std::plus<>{});
+    if (nout > 0) comm.all_reduce_in_place_n(out.sig_iw.data(), out.sig_iw.size(), std::plus<>{});
   }
+  for (long k = 0; k < nk; ++k) out.Ec += ec_k[k], out.Ec_raw += ecr_k[k];   // k order: rank-count independent
   out.N = 0.0;
   for (long k = 0; k < nk; ++k) {
     double tr = 0.0;

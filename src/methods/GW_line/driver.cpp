@@ -235,6 +235,7 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   io::tolower(p.scf_density);
   p.hyb_wmax    = io::get_value_with_default<double>(pt, "hyb_wmax", p.hyb_wmax);
   p.hyb_tau_eps = io::get_value_with_default<double>(pt, "hyb_tau_eps", p.hyb_tau_eps);
+  p.hyb_sigma_out = io::get_value_with_default<long>(pt, "hyb_sigma_out", p.hyb_sigma_out);   // D4
   utils::check(p.scf_density == "closure" or p.scf_density == "matsubara",
                "gw_line: scf_density must be \"closure\" or \"matsubara\" (got \"{}\")", p.scf_density);
   utils::check(p.hyb_wmax > 0.0 and p.hyb_tau_eps > 0.0 and p.hyb_tau_eps < 1.0, "gw_line: invalid hyb_wmax / hyb_tau_eps");
@@ -821,6 +822,7 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "scf_density", p.scf_density);   // S8b.3
   h5::h5_write(ig, "hyb_wmax", p.hyb_wmax);
   h5::h5_write(ig, "hyb_tau_eps", p.hyb_tau_eps);
+  h5::h5_write(ig, "hyb_sigma_out", p.hyb_sigma_out);
   if (p.beta > 0.0) {   // S8b: the derived scales (E_T window, zeta_T bosonic floor, S_T guard)
     const double th = p.theta_deg * std::numbers::pi / 180.0, tt = p.theta_t_frac * th;
     const double rho = std::sin(th - tt) / std::sin(tt);
@@ -2391,7 +2393,8 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
       e0 = tic("phase_closure");
       Timer.add("hybrid_density");
       Timer.start("hybrid_density");
-      hd.emplace(matsubara_density(comm, Hrel, st.Stau_p, st.Stau_h, k_rows, cprm.k_weight, *hyb, prm.beta, prm.hyb_wmax, nelec));
+      hd.emplace(matsubara_density(comm, Hrel, st.Stau_p, st.Stau_h, k_rows, cprm.k_weight, *hyb, prm.beta, prm.hyb_wmax, nelec, 200,
+                                   prm.hyb_sigma_out));
       Timer.stop("hybrid_density");
       t_hyb   = toc("phase_closure", e0);
       hyb_dmu = hd->dmu;
@@ -2417,6 +2420,19 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
     auto D = hybrid ? nda::array<ComplexType, 3>(hd->D) : density_of(st.poles);
     static_F(D, st.F);
     if (hf_div) exchange_head_correction(st.F, D, madelung);
+    double E_H0 = 0.0, E_HF = 0.0;   // D4: energies per cell of the hybrid D (both spins)
+    if (hybrid) {
+      double ws = 0.0;
+      for (long ik = 0; ik < nk; ++ik) ws += cprm.k_weight.empty() ? 1.0 : cprm.k_weight[ik];
+      for (long ik = 0; ik < nk; ++ik) {
+        const double w = (cprm.k_weight.empty() ? 1.0 : cprm.k_weight[ik]) / ws;
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) {
+            E_H0 += 2.0 * w * (H0(ik, i, j) * D(ik, j, i)).real();
+            E_HF += w * (st.F(ik, i, j) * D(ik, j, i)).real();
+          }
+      }
+    }
     const double tF = toc("phase_F", e0);
     mem_trace(comm, mpi.node_comm, "F");
     {
@@ -2506,8 +2522,24 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
       have_hout_first = true;
     }
 
+    if (hybrid)
+      app_log(1, "          hybrid energies (Ha/cell): E_H0 {:.10f}  E_HF {:.10f}  E_corr {:.10f} (bare sum {:.10f})  total {:.10f}",
+              E_H0, E_HF, hd->Ec, hd->Ec_raw, E_H0 + E_HF + hd->Ec);
     Timer.start("checkpoint");
     write_state(comm, chk, st, &rec, kdp, sig_all, &hout);
+    if (hybrid and comm.root()) {   // D4: Matsubara-side observables of this iteration (exact to the kernels)
+      utils::h5_quiesce();
+      h5::file f(chk, 'a');
+      h5::group g(f);
+      auto it = g.open_group("scf_line").open_group("iter" + std::to_string(st.iter));
+      auto eg = it.create_group("energy");
+      h5::h5_write(eg, "E_H0", E_H0);
+      h5::h5_write(eg, "E_HF", E_HF);
+      h5::h5_write(eg, "E_corr", hd->Ec);
+      h5::h5_write(eg, "E_corr_bare", hd->Ec_raw);
+      h5::h5_write(eg, "E_total", E_H0 + E_HF + hd->Ec);
+      if (hd->sig_iw.size() > 0) nda::h5_write(it, "Sigma_c_iw", hd->sig_iw, false);
+    }
     mem_trace(comm, mpi.node_comm, "checkpoint");
     Timer.stop("checkpoint");
     Timer.stop("iteration");

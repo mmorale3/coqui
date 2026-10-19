@@ -154,6 +154,10 @@
  *                       scf_density = "closure" | "matsubara" (S8b.3 hybrid, hybrid.hpp: tau-leg Sigma_c(i w_n) on the dense set
  *                       w_n <= hyb_wmax = 100 Ha, Matsubara Dyson D / N / mu (N = N_el exactly); the closure supplies only the next
  *                       poles; hyb_tau_eps = 1e-13; needs mixing_alg = "linear" and div_treatment = "ignore_g0").
+ *                       D4: every hybrid iteration also writes E_H0 = 2 sum_k w_k Tr[H0 D], E_HF = sum_k w_k Tr[F[D] D] and
+ *                       E_corr = sum_k w_k (1/beta) sum_n Tr[Sigma_c G] (Matsubara, exact to the kernels; analytic S1 tail) to
+ *                       scf_line/iter<N>/energy/; hyb_sigma_out = 0: n > 0 also writes Sigma_c(k, i w_n), n < hyb_sigma_out, as
+ *                       scf_line/iter<N>/Sigma_c_iw (nk, n, nb, nb; KS band basis).
  *                       An iteration is THERMAL iff a pole lies within E_T of mu; otherwise it is the T = 0 code (bitwise).
  *                       Thermal iterations need g_repr = "lehmann"; sigma_gap / bos_gap are not used there (two-sided gapless
  *                       Sigma basis, D-selected bosonic basis); start = "ks"; no multilevel, no optics.
@@ -319,6 +323,7 @@ struct gw_line_params_t {
   std::string scf_density = "closure";          ///< S8b.3: "closure" | "matsubara" (hybrid: tau-leg Sigma, Matsubara D / N / mu)
   double hyb_wmax = 100.0;                      ///< S8b.3: w_max (Ha) of the dense Matsubara set
   double hyb_tau_eps = 1e-13;                   ///< S8b.3: tolerance of the Sigma tau ID
+  long hyb_sigma_out = 0;                       ///< D4: write Sigma_c(k, i w_n), n < hyb_sigma_out, per iteration (0: off)
 
   static gw_line_params_t from_ptree(ptree const &pt);
   void log() const;
