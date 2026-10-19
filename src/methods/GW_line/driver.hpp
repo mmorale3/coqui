@@ -158,6 +158,10 @@
  *                       E_corr = sum_k w_k (1/beta) sum_n Tr[Sigma_c G] (Matsubara, exact to the kernels; analytic S1 tail) to
  *                       scf_line/iter<N>/energy/; hyb_sigma_out = 0: n > 0 also writes Sigma_c(k, i w_n), n < hyb_sigma_out, as
  *                       scf_line/iter<N>/Sigma_c_iw (nk, n, nb, nb; KS band basis).
+ *                       nu0_intraband = false (D4, nu0.hpp): true adds the Matsubara-convention (isothermal) nu_0 term of the
+ *                       exactly degenerate pairs (q = Gamma intraband, symmetry-degenerate pairs), Sigma += -(1/(beta N_k)) sum_q
+ *                       X^dag [G~(k-q, z) o dW(q)] X, dW = W[Pi^an(0) + dPi] - W[Pi^an(0)], on the line nodes and in the tau leg
+ *                       (thermal iterations; beta > 0, div_treatment = "ignore_g0"); what CoQui's Matsubara code includes; O(1/N_k).
  *                       An iteration is THERMAL iff a pole lies within E_T of mu; otherwise it is the T = 0 code (bitwise).
  *                       Thermal iterations need g_repr = "lehmann"; sigma_gap / bos_gap are not used there (two-sided gapless
  *                       Sigma basis, D-selected bosonic basis); start = "ks"; no multilevel, no optics.
@@ -324,6 +328,7 @@ struct gw_line_params_t {
   double hyb_wmax = 100.0;                      ///< S8b.3: w_max (Ha) of the dense Matsubara set
   double hyb_tau_eps = 1e-13;                   ///< S8b.3: tolerance of the Sigma tau ID
   long hyb_sigma_out = 0;                       ///< D4: write Sigma_c(k, i w_n), n < hyb_sigma_out, per iteration (0: off)
+  bool nu0_intraband = false;                   ///< D4: add the Matsubara nu_0 term of the exactly degenerate pairs (nu0.hpp; off = bitwise)
 
   static gw_line_params_t from_ptree(ptree const &pt);
   void log() const;

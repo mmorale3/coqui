@@ -396,13 +396,13 @@ inline tau_nodes_t make_tau_nodes(thermal_params_t const &tp, double emax, doubl
 /**
  * The tau leg for the q list qs (file header): Pi_tau (g, nz, nP, nQ) = Pi(q, z) at z = zeta_tau (zeta_tau(0) = 0 = nu_0, then
  * optional i nu_n), Matsubara convention, MINUS the degenerate-pair term at z = 0 (the dynamic Pi(q, 0) of the data set).
- * poles: the (IBZ) Lehmann poles, mu-relative. Collective: none beyond polarization's (none).
+ * poles: the (IBZ) Lehmann poles, mu-relative. Collective: none beyond polarization's (none). dpi_out: the subtracted dPi (g, nP, nQ).
  */
 template <MEMORY_SPACE MEM>
 void pi_tau_leg(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF const &mf, ibz_t const &ibz, aux_grid_t const &grid,
                 thermal_params_t const &tp, tau_nodes_t const &tn, nda::array<ComplexType, 1> const &zeta_tau, long t_chunk,
                 memory::array<MEM, ComplexType, 4> &Pi_tau, utils::TimerManager &Timer, std::vector<long> const &qs,
-                long *ndeg = nullptr) {
+                long *ndeg = nullptr, nda::array<ComplexType, 3> *dpi_out = nullptr) {
   utils::check(zeta_tau.size() >= 1 and zeta_tau(0) == ComplexType(0.0), "gw_line::pi_tau_leg: zeta_tau(0) must be 0");
   Timer.add("Pi_tau_leg");
   Timer.start("Pi_tau_leg");
@@ -419,6 +419,7 @@ void pi_tau_leg(propagator_t<MEM> &prop, pole_data_t const &poles, mf::MF const 
     if constexpr (MEM == HOST_MEMORY) row -= dPiM(i, nda::range::all, nda::range::all);
     else nda::tensor::add(ComplexType(-1.0), dPiM(i, nda::range::all, nda::range::all), ComplexType(1.0), row);
   }
+  if (dpi_out) *dpi_out = std::move(dPi);   // D4 nu0_intraband: the degenerate-pair term itself (host blocks)
   Timer.stop("Pi_tau_leg");
 }
 

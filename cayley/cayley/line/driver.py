@@ -56,7 +56,7 @@ class LineSCGW:
                  wp_floor=15.0, mu_rule='neutral', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
                  scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5,
                  g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None,
-                 mixing_F=1.0):
+                 mixing_F=1.0, nu0_intraband=False):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
         over node_range (Ha) — dense nodes are what pins the weight distribution of the far poles (dev/tune_sigma_fit.txt).
@@ -80,6 +80,10 @@ class LineSCGW:
         self.wp, self.K, self.mixing, self.verbose = wp, K, mixing, verbose
         # D4 (scgw loops, T = 0 and finite T): F_next = mixing_F F[D] + (1 - mixing_F) F_used from iteration 2 on (C++ key mixing_F; 1 = unmixed)
         self.mixing_F, self.F_used = mixing_F, None
+        # D4 nu_0 option (C++ key nu0_intraband, default off): the Matsubara-convention static term of the exactly degenerate pairs,
+        # Sigma += -(1/(beta Nk)) sum_q X^+[G~(k-q, z) o dW(q)] X on the line nodes and in the tau leg (finite T, scgw only)
+        self.nu0_intraband = bool(nu0_intraband)
+        assert not self.nu0_intraband or (beta is not None and scheme == 'scgw'), "nu0_intraband: finite T, scheme scgw"
         assert g_repr in ('compressed', 'lehmann')
         self.g_repr, self.g_emax = g_repr, (lam if g_emax is None else g_emax)
         self.g_wtol, self.g_emin_frac, self.g_wsmall = g_wtol, g_emin_frac, g_wsmall
@@ -164,15 +168,18 @@ class LineSCGW:
         thermal = gw.thermal
         # 1. screened interaction on the data set D (thermal) or on all gapless line nodes (empty window)
         wres, _ = gw.w_step(self.qminus)
+        dW = gw.nu0_dW(getattr(gw, 'Pi0_last', None)) if (self.nu0_intraband and thermal) else None
         tW = time.time() - t0
         # 2. total Sigma_c at all fermionic nodes, linear mixing
         Sig = [gw.sigma(ik, wres, self.fz, qminus=self.qminus) for ik in range(nk)]
+        if dW is not None:
+            Sig = [s + gw.sigma_nu0(ik, dW, self.fz) for ik, s in enumerate(Sig)]
         if self.Sig_prev is not None:
             Sig = [self.mixing * s + (1 - self.mixing) * p for s, p in zip(Sig, self.Sig_prev)]
         dS = 0.0 if self.Sig_prev is None else max(np.abs(s - p)[self.fmask].max() for s, p in zip(Sig, self.Sig_prev))
         self.Sig_prev = Sig
         if self.scf_density == 'matsubara':                                  # 2b. tau-leg Sigma_c(i w_n), same mixing
-            r = gw.sigma_tau_leg(wres, self.iw_h, qminus=self.qminus, tau_kw=self.hyb_tau_kw)
+            r = gw.sigma_tau_leg(wres, self.iw_h, qminus=self.qminus, tau_kw=self.hyb_tau_kw, dW=dW)
             Siw = [r['sigma'], r['S1'], r['S2']]
             if self.Siw_prev is not None:
                 Siw = [self.mixing * a + (1 - self.mixing) * b for a, b in zip(Siw, self.Siw_prev)]

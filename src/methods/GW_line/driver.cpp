@@ -65,6 +65,7 @@
 #include "methods/GW_line/closure_device.hpp"
 #include "methods/GW_line/spectra.hpp"
 #include "methods/GW_line/time_grids.hpp"
+#include "methods/GW_line/nu0.hpp"
 #include "methods/GW_line/head.hpp"
 #include "methods/GW_line/head_pass.hpp"
 #include "methods/GW_line/optics.hpp"
@@ -236,6 +237,7 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.hyb_wmax    = io::get_value_with_default<double>(pt, "hyb_wmax", p.hyb_wmax);
   p.hyb_tau_eps = io::get_value_with_default<double>(pt, "hyb_tau_eps", p.hyb_tau_eps);
   p.hyb_sigma_out = io::get_value_with_default<long>(pt, "hyb_sigma_out", p.hyb_sigma_out);   // D4
+  p.nu0_intraband = io::get_value_with_default<bool>(pt, "nu0_intraband", p.nu0_intraband);   // D4 nu_0 term
   utils::check(p.scf_density == "closure" or p.scf_density == "matsubara",
                "gw_line: scf_density must be \"closure\" or \"matsubara\" (got \"{}\")", p.scf_density);
   utils::check(p.hyb_wmax > 0.0 and p.hyb_tau_eps > 0.0 and p.hyb_tau_eps < 1.0, "gw_line: invalid hyb_wmax / hyb_tau_eps");
@@ -355,6 +357,11 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
     utils::check(p.start == "ks", "gw_line: scheme = \"{}\" supports start = \"ks\" only", p.scheme);
     utils::check(p.coarse_niter == 0, "gw_line: scheme = \"{}\" does not support the multilevel schedule (coarse.niter)", p.scheme);
   }
+  if (p.nu0_intraband) {   // D4
+    utils::check(p.beta > 0.0, "gw_line: nu0_intraband needs beta > 0 (finite T)");
+    utils::check(p.div_treatment == "ignore_g0", "gw_line: nu0_intraband supports div_treatment = \"ignore_g0\" only (no head of dW)");
+    utils::check(p.g_repr == "lehmann", "gw_line: nu0_intraband needs g_repr = \"lehmann\"");
+  }
   if (p.scf_density == "matsubara") {   // S8b.3 hybrid
     utils::check(p.beta > 0.0, "gw_line: scf_density = \"matsubara\" needs beta > 0");
     utils::check(p.mix.alg == "linear", "gw_line: scf_density = \"matsubara\" needs mixing_alg = \"linear\"");
@@ -448,6 +455,8 @@ void gw_line_params_t::log() const {
             beta, 315775.02 / beta, thermal_tol, std::log(1.0 / thermal_tol) / beta, thermal_floor, thermal_floor_f, wp_floor, mu_rule,
             mu_dn_max, mu_th_factor, band_heights, band_x, mats_factor, bos_eps_T, bos_line_eps, cut_odd, cut_even, tau_grid, tau_eps,
             thermal_bases_file.empty() ? "" : "; DIAGNOSTIC: D / nu_b / Sigma basis from " + thermal_bases_file);
+  if (nu0_intraband)
+    app_log(1, "    nu0_intraband = true (D4): the Matsubara nu_0 term of the exactly degenerate pairs is added to Sigma_c (line + tau leg)");
   if (scf_density == "matsubara")
     app_log(1, "    scf_density = matsubara (S8b.3 hybrid): tau-leg Sigma_c(i w_n), w_max {} Ha, tau ID {:.0e}; D, N, mu from the Matsubara "
                "Dyson equation", hyb_wmax, hyb_tau_eps);
@@ -823,6 +832,7 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "hyb_wmax", p.hyb_wmax);
   h5::h5_write(ig, "hyb_tau_eps", p.hyb_tau_eps);
   h5::h5_write(ig, "hyb_sigma_out", p.hyb_sigma_out);
+  if (p.nu0_intraband) h5::h5_write(ig, "nu0_intraband", long(1));   // D4 (absent = off: the default files stay unchanged)
   if (p.beta > 0.0) {   // S8b: the derived scales (E_T window, zeta_T bosonic floor, S_T guard)
     const double th = p.theta_deg * std::numbers::pi / 180.0, tt = p.theta_t_frac * th;
     const double rho = std::sin(th - tt) / std::sin(tt);
@@ -1551,6 +1561,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
   const bool hybrid   = (prm.scf_density == "matsubara");
   const double E_rows = hybrid ? 700.0 / prm.beta : -1.0;
   std::optional<hybrid_nodes_t> hyb;
+  nu0_data_t nu0d;                       // D4 nu0_intraband: the factors of -dW(q) of the last W step (nu0.hpp)
   std::optional<bosonic_basis_t> bosX;   // bosT with the exact Bose weights (tau leg)
   std::optional<line_basis_t> bt;        // the two-sided gapless Sigma basis of the thermal closure
   bos_data_t Dset;
@@ -2027,13 +2038,23 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
     Hn()     = ComplexType(0.0);
     hres_p() = ComplexType(0.0);
     hres_h() = ComplexType(0.0);
+    const bool nu0_on = thermal and prm.nu0_intraband;   // D4
+    if (do_W and nu0_on) nu0d.reset(nq);
     for (long G = 0; G < (do_W ? qg.n : 0); ++G) {   // one group (all q) unless the Pi group does not fit; D2: none if W0 frozen
       e0 = tic("phase_Pi");
       arr4_t Pi_tau;
       if (thermal) {   // S8b tau leg first (the ray call below refills the propagator's A^ cache): dynamic Pi(q, 0)
         nda::array<ComplexType, 1> z0(1);
         z0(0) = ComplexType(0.0);
-        pi_tau_leg<MEM>(prop, st.poles, mf, ibz, grid, tpar, taun, z0, qplan.t_chunk, Pi_tau, Timer, qg.rows(G));
+        nda::array<ComplexType, 3> dpi_g;
+        pi_tau_leg<MEM>(prop, st.poles, mf, ibz, grid, tpar, taun, z0, qplan.t_chunk, Pi_tau, Timer, qg.rows(G), nullptr,
+                        nu0_on ? &dpi_g : nullptr);
+        if (nu0_on) {   // D4: dW(q) = W[Pi^an(0) + dPi] - W[Pi^an(0)] of the rows of this group
+          Timer.add("W_nu0");
+          Timer.start("W_nu0");
+          nu0_dw_rows<MEM>(Pi_tau, dpi_g, Zb, qg.rows(G), grid, comm, nu0d);
+          Timer.stop("W_nu0");
+        }
       }
       polarization<MEM>(prop, kpW, mf, grid, BB.zeta_nodes, *pi_p, *pi_h, qplan.t_chunk, Pi, Timer, sector_t::both,
                         qg.rows(G));
@@ -2162,6 +2183,20 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
       else
         head_sigma_correction(st.poles, Thead, hout.nu, hout.h0_res, hout.h0_res_hole, madelung, zeta, k_rows, Sp_new, Sh_new);
       Timer.stop("Sigma_head");
+    }
+    if (nu0_on and not nu0d.L.empty()) {   // D4 nu0_intraband: the Matsubara nu_0 term on the line nodes and the tau-leg nodes
+      Timer.add("Sigma_nu0");
+      Timer.start("Sigma_nu0");
+      if (do_W) nu0d.log(1);
+      nda::array<double, 1> s_tau;
+      if (hybrid) {
+        s_tau = nda::array<double, 1>(hyb->size());
+        for (long j = 0; j < hyb->ntau; ++j) s_tau(j) = hyb->idp.s(j);
+        for (long j = 0; j < 4; ++j) s_tau(hyb->ntau + j) = double(j) * hyb->delta;
+      }
+      nu0_sigma_add(st.poles, ibz, mf, thc, nu0d, prm.beta, k_rows, prm.sigma_kdist, comm, zeta, Sp_new, Sh_new,
+                    hybrid ? &s_tau : nullptr, hybrid ? &Stp_new : nullptr, hybrid ? &Sth_new : nullptr);
+      Timer.stop("Sigma_nu0");
     }
     if (prm.debug_noise_sigma > 0.0 and st.iter + 1 == prm.debug_noise_iter and not qp_pending) {
       // diagnostic (noise-floor meter): relative complex Gaussian noise on the new Sigma, seeded per GLOBAL k (rank-count

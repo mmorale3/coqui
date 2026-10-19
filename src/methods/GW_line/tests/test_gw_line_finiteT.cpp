@@ -1810,6 +1810,83 @@ TEST_CASE("gw_line_finiteT_hybrid_energy", "[gw_line][finiteT][hybrid][energy]")
   REQUIRE(ok);
 }
 
+// D4 nu0_intraband (nu0.hpp; notes section 12 "The nu_0 term"): one hybrid iteration (G0W0@KS, lih222 beta 50, theta / 4, mu rule
+// "number") with the option on and off. Same G and W, so on - off = the Matsubara nu_0 term of the exactly degenerate pairs exactly:
+// at i w_n (Sigma_c_iw, the tau-leg nodes + their transform) and at the line nodes (Sigma_p + Sigma_h), against the prototype oracle
+// lih222_nu0_ref.h5 (gen_nu0_ref.py: finite_t transition sums, dW = W[Pi^an(0) + dPi] - W[Pi^an(0)], pole residues R_qm(k)).
+TEST_CASE("gw_line_finiteT_nu0", "[gw_line][finiteT][hybrid][nu0]") {
+  lih_ft_t L;
+  auto &comm = L.mpi->comm;
+  double beta = 0.0, mu_ref = 0.0;
+  nda::array<ComplexType, 4> term_ref, pR;
+  nda::array<double, 2> pe;
+  {
+    h5::file f(ft_dir() + "lih222_nu0_ref.h5", 'r');
+    h5::group g(f);
+    beta     = read_attr<double>(g, "beta");
+    mu_ref   = read_attr<double>(g, "mu0");
+    term_ref = read_c<4>(g, "term_iw");
+    pR       = read_c<4>(g, "pole_R");
+    nda::h5_read(g, "pole_e", pe);
+  }
+  auto run = [&](std::string const &out, bool on) {
+    auto pt = ft_params(out, 1, beta, "id", "number", false);
+    pt.put("theta_t_frac", 0.25);
+    pt.put("scf_density", "matsubara");
+    pt.put("hyb_sigma_out", 8);
+    if (on) pt.put("nu0_intraband", true);
+    auto R = gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pt);
+    nda::array<ComplexType, 4> S;
+    nda::array<ComplexType, 1> z;
+    if (comm.root()) {
+      h5::file f(out + ".gw_line.h5", 'r');
+      h5::group g(f);
+      auto it = g.open_group("scf_line").open_group("iter1");
+      nda::h5_read(it, "Sigma_c_iw", S);
+      auto ig = g.open_group("input");
+      nda::h5_read(ig, "fermionic_nodes", z);
+    }
+    auto Sn = sigma_total_of(comm, out + ".gw_line.h5", 1);
+    rm_ckpt(comm, out);
+    return std::make_tuple(R, S, Sn, z);
+  };
+  auto [Ra, Sa, Na, za] = run("gw_line_ft_nu0_off", false);
+  auto [Rb, Sb, Nb, zb] = run("gw_line_ft_nu0_on", true);
+  bool ok = true;
+  if (comm.root()) {
+    const long nk = term_ref.extent(0), nw = term_ref.extent(1), nb = term_ref.extent(2), M = pe.extent(1);
+    double d = 0.0, m = 0.0, dn = 0.0, mn = 0.0, ds = 0.0;
+    for (long k = 0; k < nk; ++k)
+      for (long n = 0; n < nw; ++n)
+        for (long a = 0; a < nb; ++a)
+          for (long b = 0; b < nb; ++b) {
+            d = std::max(d, std::abs(Sb(k, n, a, b) - Sa(k, n, a, b) - term_ref(k, n, a, b)));
+            m = std::max(m, std::abs(term_ref(k, n, a, b)));
+            ds = std::max(ds, std::abs(Sa(k, n, a, b)));
+          }
+    for (long k = 0; k < nk; ++k)
+      for (long iz = 0; iz < za.size(); ++iz)
+        for (long a = 0; a < nb; ++a)
+          for (long b = 0; b < nb; ++b) {
+            ComplexType t = 0.0;
+            for (long p = 0; p < M; ++p) t += pR(k, p, a, b) / (za(iz) - pe(k, p));
+            dn = std::max(dn, std::abs(Nb(k, iz, a, b) - Na(k, iz, a, b) - t));
+            mn = std::max(mn, std::abs(t));
+          }
+    app_log(1, "\n[finiteT][hybrid][nu0] lih222 beta {}: iteration-1 mu (off / on) {:.12f} / {:.12f}; max|Sigma_c(i w_n)| {:.3e}, max|nu_0 "
+               "term| {:.3e} (i w_n), {:.3e} (line nodes)",
+            beta, Ra.history[0].mu, Rb.history[0].mu, ds, m, mn);
+    ok = gate("the term is not empty (max|term| / max|Sigma_c| > 1e-3)", m / ds > 1e-3 ? 0.0 : 1.0, 0.5) and ok;
+    ok = gate("Sigma_c(i w_n): on - off vs the oracle term (rel)", d / m, 1e-8) and ok;
+    ok = gate("line nodes: on - off vs the oracle term (rel)", dn / mn, 1e-8) and ok;
+    ok = gate("iteration-1 mu (on) moves (|dmu| > 1e-9 Ha)", std::abs(Rb.history[0].mu - Ra.history[0].mu) > 1e-9 ? 0.0 : 1.0, 0.5) and ok;
+    (void)mu_ref;
+  }
+  int okc = ok ? 1 : 0;
+  comm.broadcast_n(&okc, 1, 0);
+  REQUIRE(okc == 1);
+}
+
 // S8b thermal closure perf: the "lazy" terminal-phase scan (default in thermal iterations) vs the S8b.2 distributed eigen scan
 // (COQUI_GWLINE_THERMAL_SCAN = parallel): one thermal iteration (lih222 beta 200, the [scf] settings; n_free 16 at every k)
 // -> the same closure decisions (terminal phases), mu and poles within the roundoff of the two held-out error evaluations.

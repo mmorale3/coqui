@@ -316,6 +316,37 @@ class LineGW:
             out += (ph @ acc.reshape(len(tt), -1)).reshape(len(nus), self.Np, self.Np)
         return out, self.pi_tau_dpi(iq)
 
+    def nu0_dW(self, Pi0=None):
+        """D4 option nu0_intraband (notes section 12 "nu_0 term"): the Matsubara (isothermal) static term of the exactly degenerate
+        pairs, dW(q) = W[Pi^an(q, 0) + dPi(q)] - W[Pi^an(q, 0)] (Np, Np), dPi = pi_tau_dpi(q) (Pi^Mats(q, i nu_0) - Pi^an(q, 0));
+        None for q without degenerate pairs. Pi0: list over q of the dynamic Pi^an(q, 0) (default: from the tau leg)."""
+        out = []
+        for iq in range(self.nk):
+            dP = self.pi_tau_dpi(iq)
+            if not np.any(dP):
+                out.append(None); continue
+            P0 = (self.pi_tau_leg(iq, [0])[0][0] - dP) if Pi0 is None else Pi0[iq]
+            out.append(self.dyson_w(iq, np.array([P0 + dP]))[0] - self.dyson_w(iq, np.array([P0]))[0])
+        return out
+
+    def sigma_nu0(self, ik, dW, zeta):
+        """D4 nu_0 term of Sigma_c at any complex zeta (mu-relative): -(1/(beta Nk)) sum_q X(k)^dag [G~(k-q, zeta) o dW(q)] X(k),
+        G~(k, zeta) = X(k) [sum_m coef_m / (zeta - e_m)] X(k)^dag over ALL Lehmann poles (= the tau leg's W(tau) += dW/beta and
+        finite_t.sigma_nu0_term for KS poles). A positive-measure pole sum at the G poles (dW <= 0): analytic, carried on the line."""
+        e, coef = self.poles
+        zeta = np.atleast_1d(np.asarray(zeta, complex))
+        Xk = self.X[ik]
+        out = np.zeros((len(zeta), self.nb, self.nb), complex)
+        for iq in range(self.nk):
+            if dW[iq] is None: continue
+            ikmq = self.qk[iq, ik]; Xm = self.X[ikmq]
+            em = np.asarray(e[ikmq], float); keep = np.abs(em) < 1e5
+            Gm = np.array([Xm @ c @ Xm.conj().T for c in np.asarray(coef[ikmq])[keep]])          # (M, Np, Np)
+            for iz, z in enumerate(zeta):
+                Gt = np.tensordot(1.0 / (z - em[keep]), Gm, axes=1)
+                out[iz] += Xk.conj().T @ (Gt * dW[iq]) @ Xk
+        return -out / (self.beta * self.nk)
+
     def dyson_w(self, iq, Pi):
         """W(q, zeta_i) = ([1 - Z Pi]^-1 - 1) Z for each node; (nz, Np, Np)."""
         Z = self.Z[iq]; I = np.eye(self.Np)
@@ -340,6 +371,8 @@ class LineGW:
         the ONE joint solve of each pair (q, -q). T = 0: screened_interaction per q (W_minus for q != -q)."""
         z = self.bos_nodes()
         if Pi is None: Pi = [self.polarization(iq, z) for iq in range(self.nk)]
+        if self.thermal and np.any(z == 0):            # D4 nu_0 option: the dynamic Pi(q, 0) of this step (nu0_dW)
+            self.Pi0_last = [P[np.nonzero(z == 0)[0][0]] for P in Pi]
         W = [self.dyson_w(iq, Pi[iq]) for iq in range(self.nk)]
         wres = [None] * self.nk
         ws = self.wstep
