@@ -579,16 +579,18 @@ namespace bdft_tests {
    *   pyscf_si222    mode_a    9.257495
    *   pyscf_si222    mode_b    9.261511
    *
-   * Tolerance 1e-5 eV: the references are quoted to 1e-6 eV, and the failure this guards
-   * against (an out-of-strip state silently evaluated at eps instead of mu) moves the gap by
-   * O(0.1-1 eV) or diverges the loop. The eta_far > 0 cells are a MEASUREMENT, not a check --
+   * Tolerance 2e-3 eV: the references (macOS, clang + OpenBLAS) reproduce there to < 1e-6 eV,
+   * but the converged gaps are not platform-independent at that level -- qe_lih222 mode_a
+   * comes out 11.857375 eV on Linux (gcc + MKL), +5.05e-4 eV, with either pivot tie rule. The
+   * failure this guards against (an out-of-strip state silently evaluated at eps instead of
+   * mu) moves the gap by O(0.1-1 eV) or diverges the loop, 50x above the tolerance. The eta_far > 0 cells are a MEASUREMENT, not a check --
    * they live in [.etafar_scan] below.
    */
   TEST_CASE("qp_map_etafar_identity", "[methods][qpgw][qp_map_ab][etafar]") {
     using namespace qp_map_ab_detail;
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
-    constexpr double tol = 1e-5;   // eV
+    constexpr double tol = 2e-3;   // eV
 
     auto check = [&](std::string const &fix, std::string const &map, double gap, double ref) {
       app_log(1, "@@ETAFAR0 [{}/{}] gap = {:.6f} eV, reference = {:.6f} eV, "
