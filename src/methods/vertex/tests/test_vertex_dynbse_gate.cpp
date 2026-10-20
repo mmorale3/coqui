@@ -319,15 +319,23 @@ namespace bdft_tests {
           vertex_debug::set("dynbse_dev_nres=3,dyn_rung_recon_stage=2,dyn_rung_recon_check=1");
           pv->set_ladder_dyn_rhs_block(2);
           auto rp = run(0, 1e-6);
-          vertex_debug::set("dynbse_dev_unit=0,dyn_rung_recon_check=1");
+          vertex_debug::set("dynbse_dev_unit=0,dyn_rung_recon_check=1,dyn_rung_recon_host_gb=1000");
           auto rh = run(0, 1e-6);
+          // the host path with its representative rungs formed per application only (budget 0: one staging slot), and split
+          // (D = 128 here: 3 slots of 2.6e-4 GB with 2 staging slots -> 1 resident + 2 staged)
+          vertex_debug::set("dynbse_dev_unit=0,dyn_rung_recon_host_gb=0");
+          auto rh0 = run(0, 1e-6);
+          vertex_debug::set("dynbse_dev_unit=0,dyn_rung_recon_host_gb=8e-4,dyn_rung_recon_stage=2");
+          auto rh3 = run(0, 1e-6);
           vertex_debug::set("");
           pv->set_ladder_dyn_rhs_block(0);
-          const double x_p = worst(r6, rp), x_h = worst(r6, rh);
+          const double x_p = worst(r6, rp), x_h = worst(r6, rh), x_h0 = worst(rh, rh0), x_h3 = worst(rh, rh3);
           app_log(1, "dynbse_rung_factorized: reconstruct R = {}: 3 representative rungs resident + batched blocks vs resident {:.2e}; host vs "
-                     "device {:.2e}", R6, x_p, x_h);
+                     "device {:.2e}; host all staged {:.2e}, 1 resident + 2 staged {:.2e} vs all resident", R6, x_p, x_h, x_h0, x_h3);
           REQUIRE(x_p < 1e-11);
           REQUIRE(x_h < 1e-10);
+          REQUIRE(x_h0 < 1e-12);
+          REQUIRE(x_h3 < 1e-12);
         }
         pv->set_ladder_dyn_rung_apply("factorized");
       }

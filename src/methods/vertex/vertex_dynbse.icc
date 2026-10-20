@@ -54,6 +54,7 @@
 
 #include "methods/vertex/dynbse.hpp"
 #include "utilities/omp_threads.hpp"
+#include "utilities/freemem.h"
 #include <mpi.h>
 #if defined(ENABLE_FFTW)
 #include "numerics/fft/fftw.h"
@@ -131,6 +132,7 @@ namespace solvers {
       // the dense flops); true = "reconstruct", the per-node rung K_d(tau_i) = sum_r c_r(tau_i) K_r formed from the factors and
       // applied by the dense per-node pass (the dense flops plus the reconstructs; the same rung to rounding)
       bool rung_recon = false;
+      long node_ranks = 1;                           // the ranks sharing this rank's node (the host reconstructed rung's budget)
       std::vector<long> const *q_subset = nullptr;   // evaluate only these transfers (all q when null);
                                                      // the outputs keep the full q axis (zeros elsewhere)
       // RESTRICTED K VIEW (qx_of non-null). The k axis of G_CC / Xb / symc->Xhat is a gathered point list of extent
@@ -1700,7 +1702,15 @@ namespace solvers {
       // per-block scratch, sized to the current RHS block width nR (the kd operator reads F.nR)
       nda::array<cplx, 4> Dblk, CbD, Vout, Fs, Ys;
       nda::array<cplx, 4> Fs1, Ys1;   // family 1 of the fused two-family rung (dyn_fam_fuse)
-      nda::array<cplx, 2> Krec;       // the reconstructed rung's node rung (host path, pol_vertex_dyn_rung_apply = reconstruct)
+      // the reconstructed rung on the host (pol_vertex_dyn_rung_apply = reconstruct): K_d(rep) = sum_r c_r(rep) K_r depends on the
+      // transfer and the representative alone, so the first n_rc representatives are formed ONCE per transfer (Krc, reused by every
+      // rung application of its nu units and RHS blocks) and the rest per application, n_st at a time (Krec); vertex_debug
+      // dyn_rung_recon_host_gb = the per-rank bytes of both (default: half the node's free memory over its ranks, capped at all
+      // representatives), dyn_rung_recon_stage = the staging slots (4)
+      nda::array<cplx, 3> Krc, Krec;
+      long krc_gen = -1, kd_gen = 0, n_rc = -1, n_st = 1;
+      long n_rcb = 0, n_stb = 0;                        // (the resident sets formed, the staged rungs formed)
+      double t_rcb = 0.0, t_stb = 0.0;
       nda::array<cplx, 3> Fs3, Os3;
       nda::array<cplx, 2> Yc2;
       long nR_cur = -1;
@@ -2293,6 +2303,7 @@ namespace solvers {
         if (opt.dense_rung) {
           Kd_s = nda::array<cplx, 3>(rrank > 0 ? rrank : ndist, D, D);
           Kd0 = nda::array<cplx, 2>(D, D);
+          ++kd_gen;                                        // the host reconstructed rungs of the previous transfer are stale
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
           for (long r = 0; r < (rrank > 0 ? rrank : ndist); ++r) {
             auto Kr = Kd_s(r, all, all);
@@ -2471,40 +2482,90 @@ namespace solvers {
             bthr(false);
             kwatch.lap();
             if (opt.dense_rung and rrecon) {
-              // the factorized rung APPLIED DENSE: per PH representative, K_d(rep) = sum_r c_r(rep) K_r reconstructed from the factors
-              // (row blocks over the rank's threads), then Ys(i) = scale_k K_d(rep) Fs(i) for both mirror nodes as one threaded gemm
-              // (D x D)(D x nb nf nR) with both nodes' and both families' columns side by side
+              // the factorized rung APPLIED DENSE: per PH representative K_d(rep) = sum_r c_r(rep) K_r, then Ys(i) = scale_k K_d(rep) Fs(i)
+              // for both mirror nodes as one gemm (D x D)(D x nmir nf nR) with both nodes' and both families' columns side by side.
+              // The first n_rc representatives are formed once per transfer (Krc; their gemms then run over the rank's threads as the
+              // dense rung's), the others per application, n_st at a time (Krec; threaded gemms). Forming m of them is ONE gemm
+              // (m x R)(R x D^2): every K_r is read once per set instead of once per representative.
               const long nf = fuse2 ? 2 : 1;
-              if (Krec.shape(0) != D) Krec = nda::array<cplx, 2>(D, D);
-              for (long rr = 0; rr < ndist; ++rr) {
-                const long i = rep_nodes[size_t(rr)].first, i1 = rep_nodes[size_t(rr)].second;
+              const double gb_rep = double(D) * double(D) * 16.0 / 1.0e9;
+              if (n_rc < 0) {                                // sized once per driver call
+                const double gb_set = vertex_debug::number("dyn_rung_recon_host_gb", -1.0);   // vertex_debug: dyn_rung_recon_host_gb
+                const double gb_free = double(utils::freemem()) / 1024.0;
+                const long nloc = std::max(1l, opt.node_ranks);
+                const double gb = (gb_set >= 0.0) ? gb_set : 0.5 * gb_free / double(nloc);
+                const long nslot = long(gb / gb_rep);
+                const long stage = std::max(1l, long(vertex_debug::number("dyn_rung_recon_stage", 4.0)));
+                if (nslot >= ndist) {
+                  n_rc = ndist; n_st = 0;
+                } else {
+                  n_st = std::max(1l, std::min(stage, nslot));
+                  n_rc = std::max(0l, nslot - n_st);
+                  n_st = std::min(n_st, ndist - n_rc);
+                }
+                if (n_rc > 0) Krc = nda::array<cplx, 3>(n_rc, D, D);
+                if (n_st > 0) Krec = nda::array<cplx, 3>(n_st, D, D);
+                if (rank == 0) {
+                  char gb_txt[160] = {0};
+                  if (gb_set >= 0.0) std::snprintf(gb_txt, sizeof(gb_txt), "vertex_debug dyn_rung_recon_host_gb = %.3g", gb_set);
+                  else std::snprintf(gb_txt, sizeof(gb_txt), "half of the node's %.1f GB free over its %ld ranks; vertex_debug "
+                                     "dyn_rung_recon_host_gb sets it", gb_free, nloc);
+                  app_log(1, "  [dynbse] reconstructed rung on the host: {} of {} representative rungs formed once per transfer ({:.2f} GB), "
+                             "{} per rung application through {} staging slots ({:.2f} GB); budget {:.3g} GB per rank ({})",
+                          n_rc, ndist, double(n_rc) * gb_rep, ndist - n_rc, n_st, double(n_st) * gb_rep, gb, std::string(gb_txt));
+                }
+              }
+              // dst(j) = sum_r c_r(rep r0 + j) K_r, j < m
+              auto form = [&](long r0, long m, cplx *dst) {
+                nda::array<cplx, 2> cR(m, rrank);
+                for (long j = 0; j < m; ++j)
+                  for (long r = 0; r < rrank; ++r) cR(j, r) = c_tr(rep_nodes[size_t(r0 + j)].first, r);
+                nda::array_view<cplx, 2> Kf(std::array<long, 2>{rrank, D * D}, Kd_s.data());
+                nda::array_view<cplx, 2> Kt(std::array<long, 2>{m, D * D}, dst);
+                bthr(true);
+                nda::blas::gemm(cplx(1.0), cR, Kf, cplx(0.0), Kt);
+                bthr(false);
+              };
+              auto apply_rep = [&](long rr, auto const &Kr) {
+                const long i0 = rep_nodes[size_t(rr)].first, i1 = rep_nodes[size_t(rr)].second;
                 const long nmir = (i1 < 0) ? 1 : 2, w = nmir * nf * nR;
                 nda::array<cplx, 2> F2(D, w), Y2(D, w);
-#pragma omp parallel for schedule(static) num_threads(nthr)
-                for (long row = 0; row < D; ++row) {
-                  auto *kr = &Krec(row, 0);
-                  for (long x = 0; x < D; ++x) kr[x] = cplx(0.0);
-                  for (long r = 0; r < rrank; ++r) {
-                    const cplx cr = c_tr(i, r);
-                    auto const *kf = &Kd_s(r, row, 0);
-                    for (long x = 0; x < D; ++x) kr[x] += cr * kf[x];
-                  }
-                }
                 for (long f = 0; f < nf; ++f) {
                   auto const &Fsrc = f ? Fs1 : Fs;
                   for (long row = 0; row < D; ++row)
                     for (long bb = 0; bb < nmir; ++bb)
-                      for (long N = 0; N < nR; ++N) F2(row, (f * nmir + bb) * nR + N) = Fsrc(bb ? i1 : i, row / nc2, row % nc2, N);
+                      for (long N = 0; N < nR; ++N) F2(row, (f * nmir + bb) * nR + N) = Fsrc(bb ? i1 : i0, row / nc2, row % nc2, N);
                 }
-                bthr(true);
-                nda::blas::gemm(scale_k, Krec, F2, cplx(0.0), Y2);
-                bthr(false);
+                nda::blas::gemm(scale_k, Kr, F2, cplx(0.0), Y2);
                 for (long f = 0; f < nf; ++f) {
                   auto &Ydst = f ? Ys1 : Ys;
                   for (long row = 0; row < D; ++row)
                     for (long bb = 0; bb < nmir; ++bb)
-                      for (long N = 0; N < nR; ++N) Ydst(bb ? i1 : i, row / nc2, row % nc2, N) = Y2(row, (f * nmir + bb) * nR + N);
+                      for (long N = 0; N < nR; ++N) Ydst(bb ? i1 : i0, row / nc2, row % nc2, N) = Y2(row, (f * nmir + bb) * nR + N);
                 }
+              };
+              if (n_rc > 0 and krc_gen != kd_gen) {         // this transfer's resident representatives
+                const double t0 = db::wall_now();
+                form(0, n_rc, Krc.data());
+                krc_gen = kd_gen;
+                t_rcb += db::wall_now() - t0; ++n_rcb;
+              }
+              if (n_rc >= nthr) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
+                for (long rr = 0; rr < n_rc; ++rr) apply_rep(rr, Krc(rr, all, all));
+              } else {
+                bthr(true);
+                for (long rr = 0; rr < n_rc; ++rr) apply_rep(rr, Krc(rr, all, all));
+                bthr(false);
+              }
+              for (long s0 = n_rc; s0 < ndist; s0 += n_st) {
+                const long m = std::min(n_st, ndist - s0);
+                const double t0 = db::wall_now();
+                form(s0, m, Krec.data());
+                t_stb += db::wall_now() - t0; n_stb += m;
+                bthr(true);
+                for (long j = 0; j < m; ++j) apply_rep(s0 + j, Krec(j, all, all));
+                bthr(false);
               }
               if (rrecon_chk) {
                 const long w = nf * nR;
@@ -2545,17 +2606,17 @@ namespace solvers {
                 nda::array<cplx, 2> Fr(D, w), Yr(D, w);
                 Yr() = cplx(0.0);
                 for (long r = 0; r < rrank; ++r) {
-                  for (long y = 0; y < D; ++y)
+                  for (long row = 0; row < D; ++row)
                     for (long cc = 0; cc < w; ++cc) {
                       const long col = c0 + cc, f = col / (nt * nR), i = (col / nR) % nt, N = col % nR;
-                      Fr(y, cc) = c_tr(i, r) * (f ? Fs1 : Fs)(i, y / nc2, y % nc2, N);
+                      Fr(row, cc) = c_tr(i, r) * (f ? Fs1 : Fs)(i, row / nc2, row % nc2, N);
                     }
                   nda::blas::gemm(scale_k, Kd_s(r, all, all), Fr, cplx(1.0), Yr);
                 }
-                for (long y = 0; y < D; ++y)
+                for (long row = 0; row < D; ++row)
                   for (long cc = 0; cc < w; ++cc) {
                     const long col = c0 + cc, f = col / (nt * nR), i = (col / nR) % nt, N = col % nR;
-                    (f ? Ys1 : Ys)(i, y / nc2, y % nc2, N) = Yr(y, cc);
+                    (f ? Ys1 : Ys)(i, row / nc2, row % nc2, N) = Yr(row, cc);
                   }
               }
             } else if (opt.dense_rung and rung_pair) {
@@ -2564,20 +2625,20 @@ namespace solvers {
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
               for (long r = 0; r < ndist; ++r) {
                 const long i0 = rep_nodes[size_t(r)].first, i1 = rep_nodes[size_t(r)].second;
-                const long nb = (i1 < 0) ? 1 : 2, nf = fuse2 ? 2 : 1, w = nf * nb * nR;
+                const long nmir = (i1 < 0) ? 1 : 2, nf = fuse2 ? 2 : 1, w = nf * nmir * nR;
                 nda::array<cplx, 2> F2(D, w), Y2(D, w);
                 for (long f = 0; f < nf; ++f) {
                   auto const &Fsrc = f ? Fs1 : Fs;
-                  for (long y = 0; y < D; ++y)
-                    for (long bb = 0; bb < nb; ++bb)
-                      for (long N = 0; N < nR; ++N) F2(y, (f * nb + bb) * nR + N) = Fsrc(bb ? i1 : i0, y / nc2, y % nc2, N);
+                  for (long row = 0; row < D; ++row)
+                    for (long bb = 0; bb < nmir; ++bb)
+                      for (long N = 0; N < nR; ++N) F2(row, (f * nmir + bb) * nR + N) = Fsrc(bb ? i1 : i0, row / nc2, row % nc2, N);
                 }
                 nda::blas::gemm(scale_k, Kd_s(r, all, all), F2, cplx(0.0), Y2);
                 for (long f = 0; f < nf; ++f) {
                   auto &Ydst = f ? Ys1 : Ys;
-                  for (long y = 0; y < D; ++y)
-                    for (long bb = 0; bb < nb; ++bb)
-                      for (long N = 0; N < nR; ++N) Ydst(bb ? i1 : i0, y / nc2, y % nc2, N) = Y2(y, (f * nb + bb) * nR + N);
+                  for (long row = 0; row < D; ++row)
+                    for (long bb = 0; bb < nmir; ++bb)
+                      for (long N = 0; N < nR; ++N) Ydst(bb ? i1 : i0, row / nc2, row % nc2, N) = Y2(row, (f * nmir + bb) * nR + N);
                 }
               }
             } else if (opt.dense_rung) {
@@ -3284,6 +3345,10 @@ namespace solvers {
         met->recon_chk = std::max(met->recon_chk, rchk_call[0]);
         met->recon_chk_den = std::max(met->recon_chk_den, rchk_call[1]);
       }
+      if (rrecon and n_rc >= 0 and rank == 0)                   // the host reconstructed rung (sized at its first application)
+        app_log(1, "  [dynbse] reconstructed rung on the host ({} of {} representative rungs resident per transfer, {} staging slots): rank 0 "
+                   "formed {} resident sets ({:.2f} s) and {} staged rungs in the rung applications ({:.2f} s, {:.2f} ms per rung)",
+                n_rc, ndist, n_st, n_rcb, t_rcb, n_stb, t_stb, n_stb > 0 ? 1e3 * t_stb / double(n_stb) : 0.0);
 #if defined(ENABLE_CUDA)
       if (ue and rrecon) {                                      // the reconstructed rung: what the reconstructs cost this rank
         long nrn = 0, nrg = 0, nfm = 0;
@@ -3862,6 +3927,7 @@ namespace solvers {
     o.dense_rung = _dyn_dense;
     o.rung = rung_basis_for_driver(tools.nt_f);   // the factorized rung's time functions of this cache (null: per-tau rung)
     o.rung_recon = ladder_dyn_rung_reconstruct();   // pol_vertex_dyn_rung_apply
+    o.node_ranks = mpi->node_comm.size();          // (the host reconstructed rung shares the node memory among them)
     o.resolvent = _dyn_resolvent;
     o.tfold = _dyn_tfold;
     o.vmask_lo = _dyn_vmask_lo; o.vmask_hi = _dyn_vmask_hi;
@@ -4045,6 +4111,7 @@ namespace solvers {
     o.dense_rung = _dyn_dense;
     o.rung = rung_basis_for_driver(tools.nt_f);   // the factorized rung's time functions of this cache (null: per-tau rung)
     o.rung_recon = ladder_dyn_rung_reconstruct();   // pol_vertex_dyn_rung_apply
+    o.node_ranks = mpi->node_comm.size();          // (the host reconstructed rung shares the node memory among them)
     o.resolvent = _dyn_resolvent;
     o.union_stride = _dyn_union_stride;
     o.table_mode = _dyn_table_mode;
@@ -4780,6 +4847,7 @@ namespace solvers {
     o.dense_rung = _dyn_dense;
     o.rung = rung_basis_for_driver(tools.nt_f);   // the factorized rung's time functions of this cache (null: per-tau rung)
     o.rung_recon = ladder_dyn_rung_reconstruct();   // pol_vertex_dyn_rung_apply
+    o.node_ranks = mpi->node_comm.size();          // (the host reconstructed rung shares the node memory among them)
     o.resolvent = _dyn_resolvent;
     o.union_stride = _dyn_union_stride;
     o.table_mode = _dyn_table_mode;

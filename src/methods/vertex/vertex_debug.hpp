@@ -46,7 +46,7 @@ namespace vertex_debug {
   inline std::set<std::string> const &known_keys() {
     static const std::set<std::string> k = {
         "allreduce_chunk", "cache_w_device", "cache_w_redist", "dyn_dev_extra_gb", "dyn_dressed", "dyn_fam_fuse", "dyn_host_pin_gb",
-        "dyn_lu_threads", "dyn_r1_fuse", "dyn_rung_gram", "dyn_rung_pair", "dyn_rung_proj", "dyn_rung_recon_check", "dyn_rung_recon_stage", "dyn_view_sub", "dynbse_cb_gemm",
+        "dyn_lu_threads", "dyn_r1_fuse", "dyn_rung_gram", "dyn_rung_pair", "dyn_rung_proj", "dyn_rung_recon_check", "dyn_rung_recon_host_gb", "dyn_rung_recon_stage", "dyn_view_sub", "dynbse_cb_gemm",
         "dynbse_collapse_loop", "dynbse_dev_batch", "dynbse_dev_kbig", "dynbse_dev_nres", "dynbse_dev_rung_fuse", "dynbse_dev_sigma",
         "dynbse_dev_stream", "dynbse_dev_stream_check", "dynbse_dev_stream_g", "dynbse_dev_stream_layout", "dynbse_dev_stream_nb",
         "dynbse_dev_stream_unit", "dynbse_dev_unit", "dynbse_group_sched", "dynbse_unit_times", "sym_unfold_verbose", "sym_unfold_check", "sc_unfold_check", "sc_unfold_rcond", "dynbse_l0_active", "dynbse_l0_asm_gemm",
