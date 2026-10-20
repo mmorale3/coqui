@@ -54,6 +54,11 @@
 #include <map>
 #include <memory>
 #include <numbers>
+#include <sstream>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+#include "boost/property_tree/json_parser.hpp"
 #include <string>
 #include <tuple>
 #include <vector>
@@ -1004,6 +1009,53 @@ nda::array<ComplexType, 4> sigma_total_of(mpi3::communicator &comm, std::string 
   return Sp;
 }
 
+/// tag of a 1 vs 2 ranks comparison file: the settings (ptree) + the build (size and mtime of this test executable). A file left
+/// by another build or other settings is never compared (rusty 7284626: the np 2 file of the build before hyb_frame "count").
+std::string rank_cmp_tag(ptree const &pt) {
+  std::ostringstream os;
+  boost::property_tree::write_json(os, pt, false);
+  std::string exe;
+#if defined(__APPLE__)
+  char buf[4096];
+  uint32_t n = sizeof(buf);
+  if (_NSGetExecutablePath(buf, &n) == 0) exe = buf;
+#else
+  std::error_code ec0;
+  exe = std::filesystem::read_symlink("/proc/self/exe", ec0).string();
+#endif
+  std::string build = "unknown";
+  std::error_code ec;
+  if (not exe.empty()) {
+    const auto sz = std::filesystem::file_size(exe, ec);
+    const auto mt = std::filesystem::last_write_time(exe, ec).time_since_epoch().count();
+    if (not ec) build = std::to_string((unsigned long long)sz) + ":" + std::to_string((long long)mt);
+  }
+  return std::to_string(std::hash<std::string>{}(os.str())) + "@" + build;
+}
+
+void rank_cmp_write(mpi3::communicator &comm, std::string const &file, std::string const &tag, nda::array<double, 1> const &mus) {
+  if (comm.root()) {
+    h5::file f(file, 'w');
+    h5::group g(f);
+    nda::h5_write(g, "mu", mus, false);
+    h5::h5_write(g, "tag", tag);
+  }
+  comm.barrier();
+}
+
+/// true iff the other rank count's file exists and carries the same tag (same settings, same build)
+bool rank_cmp_usable(std::string const &file, std::string const &tag) {
+  if (not std::filesystem::exists(file)) return false;
+  std::string t;
+  {
+    h5::file f(file, 'r');
+    h5::group g(f);
+    if (g.has_key("tag")) h5::h5_read(g, "tag", t);
+  }
+  if (t != tag) app_log(1, "  {}: other settings or build (tag {} vs {}): not compared", file, t.empty() ? "none" : t, tag);
+  return t == tag;
+}
+
 void rm_ckpt(mpi3::communicator &comm, std::string const &stem) {
   comm.barrier();
   if (comm.root() and std::getenv("GW_LINE_KEEP_CKPT") == nullptr)   // D4: keep the checkpoints for post-processing checks
@@ -1197,14 +1249,16 @@ TEST_CASE("gw_line_finiteT_scf", "[gw_line][finiteT][scf]") {
     nda::array<double, 1> mus(long(A.history.size()));
     for (long i = 0; i < mus.size(); ++i) mus(i) = A.history[i].mu;
     auto S1 = sigma_total_of(comm, fa + ".gw_line.h5", 1);
+    const std::string tag = rank_cmp_tag(ft_params(fa, NIT, 200.0, "id", "neutral"));
     if (comm.root()) {
       h5::file f(mine, 'w');
       h5::group g(f);
       nda::h5_write(g, "mu", mus, false);
       nda::h5_write(g, "Sigma1", S1, false);
+      h5::h5_write(g, "tag", tag);
     }
     comm.barrier();
-    if (std::filesystem::exists(other)) {
+    if (rank_cmp_usable(other, tag)) {
       nda::array<double, 1> mo;
       nda::array<ComplexType, 4> So;
       {
@@ -1672,7 +1726,12 @@ TEST_CASE("gw_line_finiteT_hybrid_scf", "[gw_line][finiteT][hybrid][scf]") {
   const long NIT = 3, NR = 2;
   const double mu_py[5] = {0.20608474063937182, 0.2141961519644476, 0.2150988899866979, 0.21540045798415544, 0.21554059947920648};
   auto params = [&](std::string const &out, long niter, bool restart) {
+    // hyb_frame "new": "count" keeps the closure's own mu, which in the LiH gap is a count root with dN/dmu ~ 1e-3: the rank-dependent
+    // noise of the residues (BLAS reduction order) is amplified ~1e3 x (rusty 7284894: 8.7e-9 Ha at iteration 2; "neutral" 1.4e-9 on
+    // the Mac). That is the conditioning of a count in a gap, not a defect; "count" is meant for metals and its rank invariance is
+    // gated there ([.metal_scf]). This test keeps the S8b.4 rank gate of the hybrid machinery itself.
     auto pt = ft_params(out, niter, 200.0, "id", "auto", restart);
+    pt.put("hyb_frame", "new");
     pt.put("theta_t_frac", 0.25);
     pt.put("scf_density", "matsubara");
     return pt;
@@ -1703,13 +1762,9 @@ TEST_CASE("gw_line_finiteT_hybrid_scf", "[gw_line][finiteT][hybrid][scf]") {
     const std::string other = "gw_line_ft_hyb_np" + std::to_string(comm.size() == 1 ? 2 : 1) + ".h5";
     nda::array<double, 1> mus(long(A.history.size()));
     for (long i = 0; i < mus.size(); ++i) mus(i) = A.history[i].mu;
-    if (comm.root()) {
-      h5::file f(mine, 'w');
-      h5::group g(f);
-      nda::h5_write(g, "mu", mus, false);
-    }
-    comm.barrier();
-    if (std::filesystem::exists(other)) {
+    const std::string tag = rank_cmp_tag(params(fa, NIT, false));
+    rank_cmp_write(comm, mine, tag, mus);
+    if (rank_cmp_usable(other, tag)) {
       nda::array<double, 1> mo;
       {
         h5::file f(other, 'r');
@@ -2709,13 +2764,9 @@ TEST_CASE("gw_line_metal_scf_svo222n", "[.metal_scf]") {
     const std::string other = "gw_line_metal_scf_np" + std::to_string(comm.size() == 1 ? 2 : 1) + ".h5";
     nda::array<double, 1> mus(long(A.history.size()));
     for (long i = 0; i < mus.size(); ++i) mus(i) = A.history[i].mu;
-    if (comm.root()) {
-      h5::file f(mine, 'w');
-      h5::group g(f);
-      nda::h5_write(g, "mu", mus, false);
-    }
-    comm.barrier();
-    if (std::filesystem::exists(other)) {
+    const std::string tag = rank_cmp_tag(params(fa, NIT, false));
+    rank_cmp_write(comm, mine, tag, mus);
+    if (rank_cmp_usable(other, tag)) {
       nda::array<double, 1> mo;
       {
         h5::file f(other, 'r');
