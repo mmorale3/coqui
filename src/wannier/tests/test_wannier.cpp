@@ -45,6 +45,9 @@ namespace wannier_tests {
   using namespace wannier;
 
   TEST_CASE("wannier90_library_mode_svo", "[wannier][library_mode]") {
+#ifndef ENABLE_WANNIER90
+    SUCCEED("wannier90_library_mode_svo skipped: build has ENABLE_WANNIER90=OFF.");
+#else
     auto& mpi = utils::make_unit_test_mpi_context();
 
     auto test_library_mode = [&](std::shared_ptr<mf::MF> &mf, std::string test_name) {
@@ -154,6 +157,7 @@ namespace wannier_tests {
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_svo222_sym"));
       test_library_mode(mf, "qe_svo222_sym");
     }
+#endif
   }
 
 } // wannier_tests
