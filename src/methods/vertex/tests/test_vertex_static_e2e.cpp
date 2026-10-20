@@ -233,13 +233,15 @@ namespace bdft_tests {
               e_corr, bl.e_corr, shift_k, shift_f,
               std::abs(shift_k - shift_f) / std::max(std::abs(shift_k), 1e-30));
       REQUIRE(std::isfinite(e_corr));
-      // BOTH bars are relative to the VERTEX SHIFT, never to e_corr's own magnitude. e_corr
+      // The bar is relative to the VERTEX SHIFT, never to e_corr's own magnitude. e_corr
       // is ~84x the shift here (0.095 vs 1.13e-03), so an e_corr-relative bar would be far
       // tighter on the quantity actually under test -- tighter than the DLR floor of the
-      // object feeding it, hence meaningless. The relative difference of the shift is
-      // typically a few 1e-5.
+      // object feeding it, hence meaningless. (shift_k - shift_f is e_corr - bl.e_corr.)
+      // The kernel route reads pi^dyn through the grid-limited tau = 0 row and is not
+      // reproducible below a few 1e-4 of the shift: the factorized e_corr agrees to all 12
+      // printed digits between a macOS (Accelerate) and a rusty (MKL) build, while the
+      // kernel route's differs by 4.5e-7, i.e. rel diff of the shift 2.9e-5 vs 4.3e-4.
       REQUIRE(std::abs(e_corr - bl.e_corr) <= 1e-3 * std::abs(shift_k));
-      REQUIRE(std::abs(shift_k - shift_f) <= 1e-4 * std::abs(shift_k));
     }
 
     // ---- C = empty set must reproduce plain scGW EXACTLY in static mode -----------------
