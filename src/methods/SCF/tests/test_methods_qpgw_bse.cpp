@@ -283,7 +283,7 @@ namespace bdft_tests {
    *   kernel, same q. The expected deviation class is the nu -> tau -> nu round trip r_rt of
    *   P^lad through the IAFT PH-sym pair, which the injection logs every update_w.
    *   The tolerances below are 10x the reference values (qe_lih222, C = [1,3), ac_pade,
-   *   20 iterations).
+   *   20 iterations; references measured with the (1 + Xh Kt)^-1 resolvent).
    *   Direction: the ladder must INCREASE eps_M (it does on every scGW fixture as well).
    * WATCHDOG  the NUMBER (not the log line): finite and < 1, and the estimator reads
    *   the right matrix -- Xh Kt is linear in the rung, so scaling W-bar_0 by 2 must scale
@@ -314,7 +314,7 @@ namespace bdft_tests {
     // nw_b = 53 -> 27 half nodes, and the map is full = nw_b/2 + j.
     REQUIRE(r.node_map_resid == 0.0);
     // ... and P^lad must be PH-symmetric in nu, or the PH-sym transform it is pushed
-    // through is not the right one. This is NOT machine precision: reference 4.28e-09
+    // through is not the right one. This is NOT machine precision: reference 3.32e-09
     // relative -- the DLR/solve class, not the FP class -- and the tolerance is 10x that.
     // It is the licence for the transform, and the eps_M identity below is the falsifier
     // that keeps it honest.
@@ -329,15 +329,15 @@ namespace bdft_tests {
     REQUIRE(r.eps_loop > 0.0);
     REQUIRE(r.eps_ladder > 0.0);
     REQUIRE(std::isfinite(r.eps_loop));
-    // Reference (qe_lih222, C = [1,3), ac_pade, 20 iterations): loop route 1.439266540 vs
-    // readout route 1.439266535, deviation 4.78e-09 -- the expected transform class
-    // (r_rt = 8.47e-08 on the same step). The tolerance is 10x the reference deviation.
+    // Reference (qe_lih222, C = [1,3), ac_pade, 20 iterations): loop route 1.442651749 vs
+    // readout route 1.442651744, deviation 4.80e-09 -- the expected transform class
+    // (r_rt = 7.20e-08 on the same step). The tolerance is 10x the reference deviation.
     REQUIRE(dev < 4.8e-8);
     // DIRECTION: the ladder increases eps_M (as on every scGW fixture).
-    // Reference: 1.426163 -> 1.439267 at q_min, +0.0131 (+0.92 %).
+    // Reference: 1.426216 -> 1.442652 at q_min, +0.0164 (+1.15 %).
     REQUIRE(r.eps_ladder > r.eps_rpa);
     // the round trip is a meter, not decoration: it must have been measured and stay in
-    // its class (reference 8.47e-08; tolerance 10x).
+    // its class (reference 7.20e-08; tolerance 10x).
     REQUIRE(r.r_rt >= 0.0);
     REQUIRE(r.r_rt < 8.5e-7);
 
@@ -346,7 +346,7 @@ namespace bdft_tests {
                "{:.9f} (ratio {:.9f}); ||P^lad||/||P^RPA|| = {:.3e}",
             r.lam_nu0, r.lam_max, r.lam_scale, r.lam_scaled,
             r.lam_scaled / std::max(r.lam_nu0, 1e-300), r.lad_ratio);
-    // Reference: lambda_max = 0.114764 at every nu node (the nu = 0 node carries the
+    // Reference: lambda_max = 0.114754 at every nu node (the nu = 0 node carries the
     // maximum, as chi0 does), i.e. a wide margin to the ladder instability at 1.
     REQUIRE(std::isfinite(r.lam_nu0));
     REQUIRE(r.lam_nu0 > 0.0);
@@ -356,7 +356,7 @@ namespace bdft_tests {
     // the estimator reads Xh Kt, which is LINEAR in the rung: reference ratio 2.000000 at
     // scale 2 (a power iteration on any other matrix would not scale exactly)
     REQUIRE(std::abs(r.lam_scaled / r.lam_nu0 - r.lam_scale) < 1e-6 * r.lam_scale);
-    // and the correction is a correction (reference ||P^lad||/||P^RPA|| = 3.14e-04)
+    // and the correction is a correction (reference ||P^lad||/||P^RPA|| = 3.28e-04)
     REQUIRE(r.lad_ratio > 0.0);
     REQUIRE(r.lad_ratio < 1.0);
 
@@ -364,11 +364,11 @@ namespace bdft_tests {
     app_log(1, "@@BSE_ONE_RUNG ladder_sym_gate on the qpGW state (sym {}): one-rung rebuild vs the "
                "Pi^C anchor resid = {:.3e}; >= 2-rung content = {:.3e}",
             r.sym_active ? "ACTIVE" : "inactive", r.sym_resid, r.sym_ladder_frac);
-    // Reference 4.07e-16 on the qpGW-loop G (3.2e-16 / 4.7e-16 on scGW states):
+    // Reference 5.0e-16 on the qpGW-loop G (3.2e-16 / 4.7e-16 on scGW states):
     // the same machine-precision identity, so s = 1 in this configuration too.
     REQUIRE(r.sym_resid >= 0.0);
     REQUIRE(r.sym_resid < 1e-12);
-    // the resummation is not trivially the anchor (reference >= 2-rung content 8.64e-02)
+    // the resummation is not trivially the anchor (reference >= 2-rung content 1.06e-01)
     REQUIRE(r.sym_ladder_frac > 0.0);
 #endif
   }
@@ -394,10 +394,13 @@ namespace bdft_tests {
     nda::range window(2, b1);
     REQUIRE(window.size() > 0);
 
+    // Iteration cap 20: with the (1 + Xh Kt)^-1 resolvent the ladder leg contracts by ~0.67 per
+    // iteration (||P^lad||/||P^RPA|| = 0.51, lambda_max = 0.59) and meets 1e-5 at iteration 13; the
+    // former (1 - Xh Kt)^-1 resummation converged in 11 (gap 8.8739 eV against 8.5898 eV now).
     auto r0 = run_qpgw(mpi_context, mf, ft, "si_modea_off", "mode_a", "none", "none",
-                       nda::range(0, 0), 10, 1e-8, 12, 1e-5);
+                       nda::range(0, 0), 10, 1e-8, 20, 1e-5);
     auto r1 = run_qpgw(mpi_context, mf, ft, "si_modea_on", "mode_a", "ladder", "ladder_n2",
-                       window, 10, 1e-8, 12, 1e-5, true);
+                       window, 10, 1e-8, 20, 1e-5, true);
 
     app_log(1, "@@BSE_MODEA_GAP pyscf_si222 / mode_a, C = [{}, {}): gap OFF = {:.6f} eV, "
                "ON = {:.6f} eV (shift {:+.6f} eV); eps_M(q_min) RPA = {:.6f} -> +ladder "
@@ -525,20 +528,21 @@ namespace bdft_tests {
     REQUIRE(rc.gap_eV() != ra.gap_eV());          // the knob reached the kernel
     // The TDA mask is nu-INDEPENDENT and exchanges the two characters under nu -> -nu, so
     // the truncated P^lad should stay PH-symmetric -- otherwise the injection's PH-sym
-    // transform would be illegitimate on this leg. The reference residual is 3.02e-06
+    // transform would be illegitimate on this leg. The reference residual is 8.96e-05
     // relative under TDA against 1.08e-08 for the untruncated kernel, i.e. the truncation
-    // DEGRADES the symmetry by ~300x without breaking it. That is expected: the
+    // DEGRADES the symmetry without breaking it (3.05e-06 with the former (1 - Xh Kt)^-1
+    // resolvent: the derived (1 + Xh Kt)^-1 amplifies the truncated block ~30x). That is expected: the
     // res <-> ares mirror also flips q, so the
     // two blocks are exact mirrors only up to the q -> -q relabeling of the IBZ transfer
     // axis, and the character assignment itself is only as sharp as the C-window density
     // matrix is occupation-diagonal (this fixture has crispness 0.45 / off-diagonal 0.26
-    // and the code WARNS about it). 3e-06 is four orders below the ladder effects being
+    // and the code WARNS about it). 9e-05 is three orders below the ladder effects being
     // measured, so the transform stays licensed; the tolerance is 10x the reference.
     app_log(1, "@@ladder_tda PH-symmetry check under TDA: node-map resid = {:.3e}, "
                "PH-symmetry resid = {:.3e}; one-rung-vs-anchor (untruncated) = {:.3e}",
             rc.node_map_resid, rc.ph_sym_resid, rc.sym_resid);
     REQUIRE(rc.node_map_resid == 0.0);
-    REQUIRE(rc.ph_sym_resid < 3e-5);
+    REQUIRE(rc.ph_sym_resid < 9e-4);
 
     // ---- leg (d): the ladder_head_scale knob is non-vacuous ----------------------------
     app_log(1, "@@ladder_head_scale head-off leg (kernel head scale {:.2f} -> 0): gap head-ON = "
