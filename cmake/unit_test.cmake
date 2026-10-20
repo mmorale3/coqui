@@ -5,6 +5,13 @@
 # they run as their own step with a PMI environment instead of directly on the node that runs ctest.
 SET( COQUI_UNIT_TEST_LAUNCHER "" CACHE STRING "prefix command (;-separated list) for the non-MPI unit tests" )
 
+# Command (;-separated list) placed between mpiexec and the binary of the MPI unit tests. Empty by
+# default; on a multi-GPU node set it to a script that pins one device per rank and then execs its
+# arguments, e.g. CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK, since the slate-backed tests
+# require each rank to see exactly one GPU. MPIEXEC_PREFLAGS cannot carry it: the mpi dependency
+# rebuilds that cache entry (FORCE) at every configure.
+SET( COQUI_MPI_UNIT_TEST_WRAPPER "" CACHE STRING "command (;-separated list) between mpiexec and the MPI unit test binaries" )
+
 FUNCTION( ADD_UNIT_TEST TESTNAME TEST_BINARY )
     MESSAGE( STATUS "Adding test ${TESTNAME}")
     ADD_TEST(NAME ${TESTNAME} COMMAND ${COQUI_UNIT_TEST_LAUNCHER} ${TEST_BINARY} ${ARGN})
@@ -14,7 +21,7 @@ ENDFUNCTION()
 
 FUNCTION( ADD_MPI_UNIT_TEST TESTNAME TEST_BINARY PROC_COUNT )
     MESSAGE( STATUS "Adding test ${TESTNAME}")
-    ADD_TEST(NAME ${TESTNAME} COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${PROC_COUNT} ${MPIEXEC_PREFLAGS} ${TEST_BINARY} ${ARGN})
+    ADD_TEST(NAME ${TESTNAME} COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${PROC_COUNT} ${MPIEXEC_PREFLAGS} ${COQUI_MPI_UNIT_TEST_WRAPPER} ${TEST_BINARY} ${ARGN})
     # OMPI_MCA_hwloc_base_binding_policy=none keeps threaded runs (e.g. ctest at
     # MKL_NUM_THREADS=N) reproducible. Without it, OpenMPI 4.1 binds a low-rank-count job to a
     # single core:
