@@ -218,14 +218,23 @@ namespace bdft_tests {
     auto [e_hf_damp, e_corr_damp] = run_dyson_gw(damp_sol, "dyson_gw_damping_test");
     auto [e_hf_diis, e_corr_diis] = run_dyson_gw(diis_sol, "dyson_gw_diis_test");
 
-    // Damping reference for this cheap setup; DIIS should converge to the same state.
+    // DIIS must converge to the damping state: both stop at the 1e-7 criterion of the loop
+    // (measured agreement 5e-10 on every platform).
+    constexpr double tol_alg = 1e-7;
+    VALUE_EQUAL(e_hf_diis, e_hf_damp, tol_alg, 1e-12);
+    VALUE_EQUAL(e_corr_diis, e_corr_damp, tol_alg, 1e-12);
+    // Damping reference for this cheap setup. The converged state itself is NOT reproducible
+    // across platforms to 1e-6: the first GW iteration already differs by ~3e-7 (relative, in
+    // Sigma) between platforms, and the converged e_hf comes out -4.1693088 (reference),
+    // -4.1693157 (Linux, gcc + MKL) and -4.1693190 (macOS, clang + OpenBLAS), e_corr -0.1098516 /
+    // -0.1098500 / -0.1098489, independent of the MPI rank count, the pivot tie rule, the THC
+    // point count (128 or 400: the same 3.3e-6 spread) and the mu search.
+    // The absolute check therefore carries 3x the largest measured spread (1.0e-5).
     constexpr double e_hf_ref = -0.41698958999621144 + -3.7523191620415846;
     constexpr double e_corr_ref = -0.10985159447702234;
-    constexpr double tol = 1e-6;
-    VALUE_EQUAL(e_hf_damp, e_hf_ref, tol, tol);
-    VALUE_EQUAL(e_corr_damp, e_corr_ref, tol, tol);
-    VALUE_EQUAL(e_hf_diis, e_hf_ref, tol, tol);
-    VALUE_EQUAL(e_corr_diis, e_corr_ref, tol, tol);
+    constexpr double tol_ref = 3e-5;
+    VALUE_EQUAL(e_hf_damp, e_hf_ref, tol_ref, 1e-12);
+    VALUE_EQUAL(e_corr_damp, e_corr_ref, tol_ref, 1e-12);
   }
 
 
