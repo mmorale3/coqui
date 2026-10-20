@@ -83,6 +83,7 @@
 #include <complex>
 #include <algorithm>
 #include <vector>
+#include <string>
 
 #include "configuration.hpp"
 #include "utilities/check.hpp"
@@ -98,6 +99,7 @@
 // which this nda does not ship.
 #include "numerics/imag_axes_ft/dlr/nda_linalg_compat.hpp"
 #include "cppdlr/dlr_build.hpp"
+#include "cppdlr/dlr_imtime.hpp"
 #endif
 
 namespace imag_axes_ft {
@@ -138,16 +140,71 @@ namespace imag_axes_ft {
   }
 
   /**
+   * Which tau -> residue map dlr_pole_fit builds.
+   *
+   *  - least_squares: fit the auxiliary poles to the backend tau values (truncated SVD).
+   *    Smallest residual ON the backend grid, but the two cuts of one Phi_2^C then satisfy
+   *    Tr[Sigma^C G] + Tr[P^C W] = 0 only to ~1e-4 (LiH 2x2x2; ~4e-2 with the gygi head).
+   *  - aux_interpolation: the auxiliary function that takes the backend function's values at
+   *    the auxiliary DLR tau nodes (the interpolatory map the residue algebras were derived
+   *    with), with every direction of that map whose gain exceeds the least-squares map's
+   *    worst-case gain removed. Restores the identity to the kernels' accuracy class while
+   *    never amplifying more than least squares (the bare interpolatory map amplifies ~10x
+   *    more, which is what made scGW + vertex diverge).
+   *
+   * Both are FIXED linear maps (see dlr_pole_fit_rel_tol for why that is required).
+   */
+  enum class dlr_pole_fit_scheme { least_squares, aux_interpolation };
+
+  /** the scheme dlr_pole_fit uses when none is passed (set once from the input). */
+  inline dlr_pole_fit_scheme& dlr_pole_fit_default_scheme() {
+    static dlr_pole_fit_scheme s = dlr_pole_fit_scheme::least_squares;
+    return s;
+  }
+
+  /** sets the default scheme for the lifetime of the object, then restores the previous one. */
+  struct dlr_pole_fit_scheme_scope {
+    dlr_pole_fit_scheme prev;
+    explicit dlr_pole_fit_scheme_scope(dlr_pole_fit_scheme s) : prev(dlr_pole_fit_default_scheme()) {
+      dlr_pole_fit_default_scheme() = s;
+    }
+    ~dlr_pole_fit_scheme_scope() { dlr_pole_fit_default_scheme() = prev; }
+    dlr_pole_fit_scheme_scope(dlr_pole_fit_scheme_scope const&) = delete;
+    dlr_pole_fit_scheme_scope& operator=(dlr_pole_fit_scheme_scope const&) = delete;
+  };
+
+  inline dlr_pole_fit_scheme dlr_pole_fit_scheme_from_string(std::string const& name) {
+    if (name == "least_squares") return dlr_pole_fit_scheme::least_squares;
+    if (name == "aux_interpolation") return dlr_pole_fit_scheme::aux_interpolation;
+    utils::check(false, "imag_axes_ft::dlr_pole_fit: unknown pole-fit scheme \"{}\" (expected "
+                        "\"least_squares\" or \"aux_interpolation\").", name);
+    return dlr_pole_fit_scheme::least_squares;
+  }
+
+  inline std::string dlr_pole_fit_scheme_name(dlr_pole_fit_scheme s) {
+    return s == dlr_pole_fit_scheme::least_squares ? "least_squares" : "aux_interpolation";
+  }
+
+  /**
    * Auxiliary pole basis + regularized tau -> residue map. Build once per (IAFT, rel_tol).
    *
-   * KNOWN, ACCEPTED LIMITATION: the map is a least-squares fit, not an interpolation at the
-   * auxiliary nodes, and the vertex residue algebra is built on those nodes. The fit residual
-   * is smaller than the interpolatory one, but it no longer vanishes at the nodes, so the two
-   * cuts of one Phi_2^C satisfy Tr[Sigma^C G] + Tr[P^C W] = 0 only approximately:
-   * on LiH 2x2x2 the relative residual is ~2-5e-4 (interpolatory: 4e-6) and ~2-4e-2 with
-   * the gygi q -> 0 head (interpolatory: 5-7e-4), the spread being platform dependent. The
-   * least-squares map is kept because the interpolatory one diverges in scGW + vertex.
-   * test_methods_vertex_conservation and test_methods_vertex_refinement2 bound the residual.
+   * TWO SCHEMES (dlr_pole_fit_scheme). The least-squares map has the smallest residual on the
+   * backend grid, but the vertex residue algebra was derived with the interpolatory map, and
+   * the two cuts of one Phi_2^C satisfy Tr[Sigma^C G] + Tr[P^C W] = 0 to the kernels' accuracy
+   * only when the fitted function takes the data's values at the auxiliary tau nodes. On
+   * LiH 2x2x2 the relative residual is 1.6-5.5e-4 with least squares and 0.5-4.5e-5 with
+   * aux_interpolation (gygi q -> 0 head: 1.6-3.9e-2 vs 4.7-7.2e-4; ranges over platforms). The size of the fit residual
+   * does not decide this: an L2-optimal fit, whose residual is smaller in every norm, leaves
+   * 1.1e-4. The bare interpolatory map is NOT used: its gain is up to ~10x that of least
+   * squares and it diverged in scGW + vertex; aux_interpolation drops every direction whose
+   * gain exceeds the least-squares map's worst case.
+   *
+   * The gap closes with precision: at prec = "high" both schemes satisfy the identity to
+   * <~5e-6 (LiH 2x2x2: 5e-8 / 5e-6 with the head for least squares, 1e-8 / 6e-7 for
+   * aux_interpolation; Si 2x2x2, wmax 15: 3e-10 for least squares, 2-3e-8 for
+   * aux_interpolation). There the auxiliary-node kernel (condition ~5e13) is itself solved at
+   * truncated rank, so aux_interpolation is no longer exact at the nodes either. Least squares
+   * stays the default.
    */
   struct dlr_pole_fit {
     long np = 0;                         // number of auxiliary poles
@@ -156,7 +213,11 @@ namespace imag_axes_ft {
     double beta = 0.0;
     double rel_tol = 0.0;
     double s_max = 0.0, s_min_kept = 0.0;
-    double amplification = 0.0;          // ||Pinv||_2 = worst-case ||c|| / ||F||
+    double amplification = 0.0;          // 2-norm of the applied map = worst-case ||c|| / ||F||
+    dlr_pole_fit_scheme scheme = dlr_pole_fit_scheme::least_squares;
+    long n_capped = 0;                   // aux_interpolation: directions removed by the gain cap
+    long n_aux = 0;                      // aux_interpolation: rank of the auxiliary-node solve
+    double aux_cond = 0.0;               // aux_interpolation: condition number of the auxiliary-node kernel
     double min_abs_node = 0.0;           // min |hw_l|, dimensionless
     double min_node_gap = 0.0;           // min |hw_l - hw_l'|, dimensionless
 
@@ -173,12 +234,15 @@ namespace imag_axes_ft {
 
     dlr_pole_fit() = default;
 
-    dlr_pole_fit(IAFT const& ft, double rtol = -1.0) { build(ft, rtol); }
+    dlr_pole_fit(IAFT const& ft, double rtol = -1.0,
+                 dlr_pole_fit_scheme sch = dlr_pole_fit_default_scheme()) { build(ft, rtol, sch); }
 
-    /** rtol < 0 selects the default, `dlr_pole_fit_rel_tol`. */
-    void build(IAFT const& ft, double rtol = -1.0) {
+    /** rtol < 0 selects the default, `dlr_pole_fit_rel_tol`; the scheme defaults to the
+     *  process-wide `dlr_pole_fit_default_scheme()`. */
+    void build(IAFT const& ft, double rtol = -1.0,
+               dlr_pole_fit_scheme sch = dlr_pole_fit_default_scheme()) {
 #ifndef ENABLE_DLR
-      (void)ft; (void)rtol;
+      (void)ft; (void)rtol; (void)sch;
       utils::check(false, "imag_axes_ft::dlr_pole_fit: requires the DLR backend "
                           "(build with ENABLE_DLR=ON).");
 #else
@@ -193,6 +257,8 @@ namespace imag_axes_ft {
       beta = ft.beta();
       nt = ft.nt_f();
       rel_tol = rtol;
+      scheme = sch;
+      n_capped = 0;
 
       // --- auxiliary NONSYM pole grid ------------------------------------------------
       // Kept deliberately: the residue algebras divide by node gaps, and the NONSYM grid's
@@ -238,7 +304,7 @@ namespace imag_axes_ft {
           Kc(i, p) = ComplexType(Kmat(i, p));
         }
 
-      // --- thin SVD ------------------------------------------------------------------------
+      // --- least-squares map: thin SVD of the pole kernel on the backend tau grid ---------------
       nda::matrix<double, nda::F_layout> A(nt, np);
       A() = Kmat;
       long ms = std::min(nt, np);
@@ -261,15 +327,78 @@ namespace imag_axes_ft {
       s_min_kept = sig(n_kept - 1);
       amplification = 1.0 / s_min_kept;
 
-      sval = nda::array<double, 1>(ns_max);
-      Ut = nda::array<ComplexType, 2>(ns_max, nt);
-      Vs = nda::array<ComplexType, 2>(np, ns_max);
-      for (long k = 0; k < ns_max; ++k) {
-        sval(k) = sig(k);
-        for (long i = 0; i < nt; ++i) Ut(k, i) = ComplexType(U(i, k));
-        double inv = 1.0 / sig(k);
-        for (long p = 0; p < np; ++p) Vs(p, k) = ComplexType(VT(k, p) * inv);
+      if (scheme == dlr_pole_fit_scheme::least_squares) {
+        sval = nda::array<double, 1>(ns_max);
+        Ut = nda::array<ComplexType, 2>(ns_max, nt);
+        Vs = nda::array<ComplexType, 2>(np, ns_max);
+        for (long k = 0; k < ns_max; ++k) {
+          sval(k) = sig(k);
+          for (long i = 0; i < nt; ++i) Ut(k, i) = ComplexType(U(i, k));
+          double inv = 1.0 / sig(k);
+          for (long p = 0; p < np; ++p) Vs(p, k) = ComplexType(VT(k, p) * inv);
+        }
+        return;
       }
+
+      // --- aux_interpolation: interpolate at the auxiliary tau nodes, gain-capped -------------
+      // M = Kaux^+ T maps backend tau values to the residues of the auxiliary function that
+      // takes the backend function's values at the np auxiliary nodes. Kaux is the pole kernel
+      // at those nodes (pseudo-inverse at the same relative cut), T the backend interpolation.
+      cppdlr::imtime_ops aux(ft.lambda(), rf_v);
+      nda::array<double, 1> xa(np);
+      for (long l = 0; l < np; ++l) xa(l) = 2.0 * cppdlr::rel2abs(aux.get_itnodes(l)) - 1.0;
+      auto T = ft.construct_tau_interpolate_matrix(xa);                 // (np, nt)
+      nda::matrix<double, nda::F_layout> Ka(np, np);
+      for (long l = 0; l < np; ++l)
+        for (long p = 0; p < np; ++p) Ka(l, p) = dlr_kF(beta, (xa(l) + 1.0) * 0.5 * beta, epsl(p));
+      nda::vector<double> sa(np);
+      nda::matrix<double, nda::F_layout> Ua(np, np), VTa(np, np);
+      info = nda::lapack::gesvd(Ka, sa, Ua, VTa);
+      utils::check(info == 0, "imag_axes_ft::dlr_pole_fit: gesvd of the auxiliary-node kernel "
+                              "failed (info = {}).", info);
+      long na = 0;
+      while (na < np and sa(na) > rel_tol * sa(0)) ++na;
+      n_aux = na;
+      aux_cond = sa(0) / sa(np - 1);
+      nda::matrix<double, nda::F_layout> M(np, nt);
+      for (long p = 0; p < np; ++p)
+        for (long i = 0; i < nt; ++i) {
+          double acc = 0.0;
+          for (long k = 0; k < na; ++k) {
+            double uT = 0.0;
+            for (long l = 0; l < np; ++l) uT += Ua(l, k) * std::real(T(l, i));
+            acc += VTa(k, p) * uT / sa(k);
+          }
+          M(p, i) = acc;
+        }
+      // the GAIN CAP: the directions of M whose gain exceeds the least-squares map's
+      // worst-case gain 1/s_min_kept are dropped. On data the auxiliary basis represents they
+      // carry content at the level of the representation error; on content it cannot
+      // represent they are what turns O(eps) into residues far larger than the data.
+      const long mm = std::min(np, nt);
+      nda::vector<double> sm(mm);
+      nda::matrix<double, nda::F_layout> Um(np, np), VTm(nt, nt);
+      info = nda::lapack::gesvd(M, sm, Um, VTm);
+      utils::check(info == 0, "imag_axes_ft::dlr_pole_fit: gesvd of the interpolation map "
+                              "failed (info = {}).", info);
+      const double cap = amplification;
+      std::vector<long> keep;
+      for (long k = 0; k < mm; ++k)
+        if (sm(k) <= cap and sm(k) > dlr_pole_fit_smin_floor * sm(0)) keep.push_back(k);
+      utils::check(not keep.empty(), "imag_axes_ft::dlr_pole_fit: the gain cap {} kept no "
+                                     "direction of the interpolation map.", cap);
+      n_kept = ns_max = long(keep.size());
+      n_capped = mm - n_kept;
+      sval = nda::array<double, 1>(n_kept);
+      Ut = nda::array<ComplexType, 2>(n_kept, nt);
+      Vs = nda::array<ComplexType, 2>(np, n_kept);
+      for (long j = 0; j < n_kept; ++j) {
+        const long k = keep[size_t(j)];
+        sval(j) = sm(k);
+        for (long i = 0; i < nt; ++i) Ut(j, i) = ComplexType(sm(k) * VTm(k, i));
+        for (long p = 0; p < np; ++p) Vs(p, j) = ComplexType(Um(p, k));
+      }
+      amplification = sm(keep[0]);
 #endif
     }
 
@@ -368,12 +497,20 @@ namespace imag_axes_ft {
 
     /** one-line provenance for the run log. */
     void log(int level, std::string_view who) const {
-      app_log(level, "  {}: DLR rank = {} (aux pole rank = {}), least-squares pole fit, rank "
-                     "fixed by the relative singular-value cut {:.2g}\n"
-                     "    -> {} of {} usable directions kept, worst-case residue "
-                     "amplification {:.4g}, min|hw_l| = {:.4g}, min node gap = {:.4g}",
-              who, nt, np, rel_tol, n_kept, ns_max, amplification,
-              min_abs_node, min_node_gap);
+      if (scheme == dlr_pole_fit_scheme::least_squares)
+        app_log(level, "  {}: DLR rank = {} (aux pole rank = {}), least-squares pole fit, rank "
+                       "fixed by the relative singular-value cut {:.2g}\n"
+                       "    -> {} of {} usable directions kept, worst-case residue "
+                       "amplification {:.4g}, min|hw_l| = {:.4g}, min node gap = {:.4g}",
+                who, nt, np, rel_tol, n_kept, ns_max, amplification,
+                min_abs_node, min_node_gap);
+      else
+        app_log(level, "  {}: DLR rank = {} (aux pole rank = {}), auxiliary-node interpolation "
+                       "pole fit, gain capped at the least-squares map's (cut {:.2g})\n"
+                       "    -> {} directions kept, {} removed by the cap, worst-case residue "
+                       "amplification {:.4g}, min|hw_l| = {:.4g}, min node gap = {:.4g}",
+                who, nt, np, rel_tol, n_kept, n_capped, amplification,
+                min_abs_node, min_node_gap);
     }
   };
 

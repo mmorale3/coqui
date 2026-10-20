@@ -726,6 +726,9 @@ namespace bdft_tests {
     // wmax = 6.0: the vertex kernels' composite tau-product intermediates need ~3x
     // headroom over the LiH spectral range (~1.2); wmax = 1.2 (the plain-GW choice)
     // destroys the dynamic-rung cancellations.
+    // the identity holds to the kernels' accuracy only with the auxiliary-node interpolation
+    // pole fit (dlr_pole_fit_scheme); least squares leaves ~1e-4 here and ~4e-2 with the head
+    imag_axes_ft::dlr_pole_fit_scheme_scope fit_scheme(imag_axes_ft::dlr_pole_fit_scheme::aux_interpolation);
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_conservation_smoke";
 
@@ -881,11 +884,12 @@ namespace bdft_tests {
 
     REQUIRE(scale > 1e-12);
     REQUIRE(std::isfinite(rel));
-    // tolerance: DLR "low" (eps = 1e-6; pole-fit error ~2e-5 at this setting) and
+    // tolerance: DLR "low" (eps = 1e-6; pole-fit error ~1e-5 at this setting) and
     // composite tau-product fits at wmax = 6 -- the residual is a cancellation of two
-    // O(|S|) numbers each carrying those representation errors (expected ~1e-5);
-    // 1e-3 leaves ~100x headroom.
-    REQUIRE(rel < 1e-3);
+    // O(|S|) numbers each carrying those representation errors: measured 5.2e-6 (clang /
+    // Accelerate) and 4.5e-5 (gcc / MKL) with the auxiliary-node fit, 1.6e-4 and 5.5e-4 with
+    // least squares, so 1e-4 separates the two on both.
+    REQUIRE(rel < 1e-4);
 
     // positive control (a): flipped relative sign
     double rel_flip = std::abs(S_SG - S_PW) / scale;
@@ -972,12 +976,10 @@ namespace bdft_tests {
                  "|S_SG(gygi) - S_SG(ignore_g0)| = {} (scale {})",
               std::abs(S_SG_g - S_SG), std::abs(S_SG));
       REQUIRE(std::isfinite(rel_g));
-      // The least-squares auxiliary pole fit (dlr_pole_fit) breaks the identity at the
-      // few-percent level here: the analytic head is not Lehmann-class and dominates the
-      // rung sums at Nk = 8. Measured 1.6e-2 (gcc / MKL) to 3.9e-2 (clang / Accelerate);
-      // an interpolatory fit gives 5-7e-4 but diverges in scGW + vertex. The bound guards
-      // against a regression beyond that accepted level.
-      REQUIRE(rel_g < 1e-1);
+      // the analytic head is not Lehmann-class and dominates the rung sums at Nk = 8, so this
+      // is the harder case: measured 4.7e-4 to 7.2e-4 with the auxiliary-node fit (least
+      // squares: 1.6e-2 to 3.9e-2)
+      REQUIRE(rel_g < 1e-3);
       // the insertion must genuinely act on the functional
       REQUIRE(std::abs(S_SG_g - S_SG) > 1e-10);
     }
