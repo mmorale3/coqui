@@ -31,6 +31,7 @@
 #include "utilities/omp_threads.hpp"
 #include "utilities/h5_background_writer.hpp"
 #include "utilities/freemem.h"
+#include "utilities/device_budget.hpp"
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/GW/g0_div_utils.hpp"
@@ -175,6 +176,76 @@ namespace solvers {
     app_log(2, "      - FT_REDISTRIBUTE:        {0:.3f} sec\n", _Timer.elapsed("FT_REDISTRIBUTE"));
   }
 
+  void scr_coulomb_t::device_preflight(THC_ERI auto &thc) {
+    auto mpi = thc.mpi();
+    auto MF = thc.MF();
+    const long nproc = mpi->comm.size();
+    const long ns = MF->nspin(), nkpts = MF->nkpts(), nkpts_ibz = MF->nkpts_ibz(), nqpts_ibz = MF->nqpts_ibz();
+    const long nk_nt = nkpts - MF->nkpts_trev_pairs();
+    const long Np = thc.Np(), nbnd = MF->nbnd();
+    const long nt_half = (_ft->nt_b() % 2 == 0) ? _ft->nt_b() / 2 : _ft->nt_b() / 2 + 1;
+    const long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+    auto cdiv = [](long a, long b) { return (a + b - 1) / std::max(b, 1l); };
+    // largest local extent of a block-cyclic dimension n over np ranks with block size bs
+    auto lmax = [&](long n, long np, long bs) { return cdiv(cdiv(n, bs), np) * bs; };
+    constexpr double z = 16.0;
+
+    // the (t, q) layout of Pi and W (eval_Pi_rpa_Rspace; update_w hands W on with the same grid)
+    auto [ntp, nP, nQ] = Pi_R_proc_grid(nproc, nt_half, nqpts_ibz, ns, nkpts);
+    const long NPl = cdiv(Np, nP), NQl = cdiv(Np, nQ);
+    const double W_t = z * double(cdiv(nt_half, ntp) * nqpts_ibz * NPl * NQl);
+    // the polarization's work arrays (rpa_pi.icc): per P row and fixed
+    const double pi_row = z * (double(NQl) * double(2 * ns * nkpts + ns * nk_nt + nkpts + nqpts_ibz + (ns > 1 ? nkpts : 0) + 1) +
+                               double(ns * nk_nt * nbnd + nbnd));
+    const double pi_fix = z * double(ns * nk_nt * NQl * nbnd + nbnd * nbnd) + z * double(nkpts * nkpts + nqpts_ibz * nkpts);
+    // the imaginary-time transforms (tau_to_w / w_to_tau): (t, w) local buffers on a (P, Q) grid of all ranks
+    long bP = 1, bQ = 1;
+    if (nproc > 1) { bP = utils::find_proc_grid_min_diff(nproc, Np, Np); bQ = nproc / bP; }
+    const double B_t = (nproc > 1) ? z * double(nt_half * nqpts_ibz * cdiv(Np, bP) * cdiv(Np, bQ)) : 0.0;
+    const double B_w = (nproc > 1) ? z * double(nw_half * nqpts_ibz * cdiv(Np, bP) * cdiv(Np, bQ)) : 0.0;
+    auto [w_pgrid, w_bsize] = W_omega_proc_grid(nproc, nqpts_ibz, _ft->nw_b(), Np);
+    const long wP = lmax(Np, w_pgrid[2], w_bsize[2]), wQ = lmax(Np, w_pgrid[3], w_bsize[3]);
+    const double W_w = z * double(cdiv(nw_half, w_pgrid[0]) * cdiv(nqpts_ibz, w_pgrid[1]) * wP * wQ);
+    const double ft = (nproc > 1) ? std::max({W_t + B_t, B_t + B_w, B_w + W_w}) : W_t + W_w;
+    const double dyson = W_w + 5.0 * z * double(wP * wQ);        // Pi/W(w) + the Pi, Z, A tiles, Z(q) and the identity
+    const double transpose = 2.0 * W_t;                          // W(t, q) -> W(q, t) on the device
+    // the GW self-energy with W resident (gw_t::eval_Sigma_all): k-space kernel on symmetry-reduced meshes, else R space
+    const bool k_alg = (MF->nqpts() != MF->nqpts_ibz());
+    const double sigma = k_alg ? W_t + z * double(ns * nk_nt * NPl * NQl + 2 * ns * nkpts_ibz * NPl * NQl + ns * nk_nt * (NPl + NQl) * nbnd)
+                               : W_t * (1.0 + 3.0 * double(ns) * double(nkpts) / double(std::max(nqpts_ibz, 1l)));
+
+    const double budget = utils::device_budget_bytes(mpi->node_comm);
+    const double bmin = mpi->comm.all_reduce_value(budget, boost::mpi3::min<>{});
+    struct stage_t { const char *name; double need; };
+    const stage_t st[] = {{"polarization, all P rows in one block", W_t + pi_fix + pi_row * double(NPl)},
+                          {"polarization, one P row per block (smallest)", W_t + pi_fix + pi_row},
+                          {"tau <-> i nu transforms", ft},
+                          {"Dyson step", dyson},
+                          {"W (t, q) -> (q, t)", transpose},
+                          {k_alg ? "GW self-energy (k space), W resident" : "GW self-energy (R space), W resident", sigma}};
+    std::string tab;
+    bool fail = false;
+    for (auto const &s : st) {
+      const bool ok = (s.need <= bmin);
+      // the full-block polarization may exceed the budget: eval_Pi_rpa_Rspace then runs over row blocks
+      if (not ok and std::string(s.name).find("all P rows") == std::string::npos) fail = true;
+      char line[160];
+      std::snprintf(line, sizeof(line), "\n    %-48s %9.2f GB  %s", s.name, s.need / 1e9,
+                    ok ? "fits" : (std::string(s.name).find("all P rows") != std::string::npos ? "-> P row blocks" : "DOES NOT FIT"));
+      tab += line;
+    }
+    const char *mode = std::getenv("COQUI_DEVICE_PREFLIGHT");
+    const bool warn_only = (mode != nullptr and std::string(mode) == "warn");
+    app_log(fail ? 1 : 2,
+            "  [device preflight] per-rank peaks of update_w and the GW self-energy (estimates; {} ranks, {} ranks on this "
+            "device, {:.2f} GB usable on the fullest device after the {:.1f} GB reserve):{}",
+            nproc, utils::ranks_on_device(mpi->node_comm), bmin / 1e9, utils::device_reserve_bytes() / 1e9, tab);
+    utils::check(not fail or warn_only,
+                 "scr_coulomb_t::update_w: the device cannot hold every stage of this update (table above): use more ranks "
+                 "(devices), devices with more memory, or a smaller THC rank. COQUI_DEVICE_PREFLIGHT=warn continues anyway.");
+    if (fail) app_log(1, "  [device preflight] WARNING: COQUI_DEVICE_PREFLIGHT=warn -- continuing although a stage does not fit.");
+  }
+
   template<MEMORY_SPACE MEM>
   void scr_coulomb_t::update_w(MBState &mb_state, THC_ERI auto &thc, long h5_iter) {
     using math::nda::make_distributed_array;
@@ -305,6 +376,23 @@ namespace solvers {
          "TEMP_FT_alloc", "TEMP_FT_redist", "TEMP_FT_leakage",
          "TEMP_FT_gemm", "TEMP_FT_reset", "TEMP_FT_barrier"})
       _Timer.add(name);
+#if defined(ENABLE_DEVICE)
+    // The device W of the previous update is replaced at the end of this one, and from here to there nothing reads it
+    // on the device (a vertex that consumes the previous W in eval_Pi_C reads the host copy, which the scf driver
+    // retains -- needs_dw_retention). Kept, it would sit next to Pi and its work arrays and the two FT buffers, the
+    // largest arrays of the update: release it first (built into the host copy when that copy is still needed).
+    if constexpr (MEM != HOST_MEMORY) {
+      if (mb_state.dW_qtPQ_dev.has_value()) {
+        const double gb = 16.0 * double(mb_state.dW_qtPQ_dev.value().local().size()) / 1e9;
+        if (needs_dw_retention()) (void)mb_state.W_host();
+        mb_state.dW_qtPQ_dev.reset();
+        utils::device_sync();
+        app_log(1, "  [update_w] the previous device W released before Pi ({:.2f} GB per rank{})", gb,
+                needs_dw_retention() ? "; its host copy stays for the vertex" : "");
+      }
+      device_preflight(thc);
+    }
+#endif
     _Timer.start("TEMP_UW_TOTAL");
     _Timer.start("TEMP_UW_eval_Pi_qdep");
     _Timer.start("EVALUATE_PI");

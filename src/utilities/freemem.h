@@ -33,6 +33,8 @@ namespace utils {
 
 std::size_t freemem();
 std::size_t freemem_device();
+// PCI bus id of the active device ("" without a device build): ranks driving the same device report the same id
+std::string device_id();
 void memory_report(int io_lvl = 3, std::string message = {});
 
 // Synchronize the active CUDA/HIP device. Used to make GPU

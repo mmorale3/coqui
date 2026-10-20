@@ -159,6 +159,69 @@ namespace bdft_tests {
     }
     mpi_context->comm.barrier();
   }
+
+  // The device polarization over blocks of P rows (eval_Pi_rpa_Rspace when its work arrays do not fit next to Pi,
+  // forced here with COQUI_PI_ROW_BLOCK) gives the W of the one-block pass, and both match the host W. The second
+  // device update also releases the first one's device W before Pi.
+  TEST_CASE("thc_gw_qe_device_pi_blocks", "[methods][thc][gw][qe][device]") {
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_basis, "high");
+    std::string output = "coqui_dev_blk";
+
+    solvers::hf_t hf;
+    solvers::gw_t gw(&ft, "ignore_g0", output);
+    solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+    simple_dyson dyson(mf.get(), &ft);
+    MBState mb_state(mpi_context, ft, output);
+
+    thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 20, "", "incore", "", "bdft",
+                                               1e-10, mf->ecutrho(), 1, 1024));
+    auto eri = mb_eri_t(thc, thc);
+    iter_scf::iter_scf_t iter_sol("damping");
+    scf_loop(mb_state, dyson, eri, ft,
+             solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+             1, false, 1e-9, true);
+
+    auto W_of = [&]() {
+      nda::array<ComplexType, 4> W = mb_state.W_host().local();
+      mb_state.dW_qtPQ.reset();
+      return W;
+    };
+    auto rel = [&](nda::array<ComplexType, 4> const &A, nda::array<ComplexType, 4> const &B) {
+      double d = 0.0, n = 0.0;
+      for (long i = 0; i < A.size(); ++i) {
+        d = std::max(d, std::abs(A.data()[i] - B.data()[i]));
+        n = std::max(n, std::abs(B.data()[i]));
+      }
+      d = mpi_context->comm.all_reduce_value(d, boost::mpi3::max<>{});
+      n = mpi_context->comm.all_reduce_value(n, boost::mpi3::max<>{});
+      return d / n;
+    };
+
+    scr_eri.update_w<HOST_MEMORY>(mb_state, thc, -1);
+    nda::array<ComplexType, 4> W_host = mb_state.dW_qtPQ.value().local();
+    mb_state.dW_qtPQ.reset();
+    scr_eri.update_w<DEVICE_MEMORY>(mb_state, thc, -1);
+    auto W_one = W_of();
+    ::setenv("COQUI_PI_ROW_BLOCK", "3", 1);
+    scr_eri.update_w<DEVICE_MEMORY>(mb_state, thc, -1);
+    ::unsetenv("COQUI_PI_ROW_BLOCK");
+    auto W_blk = W_of();
+
+    double e_blk = rel(W_blk, W_one), e_host = rel(W_one, W_host);
+    app_log(1, "  device W: P row blocks vs one block {:.3e}, one block vs host {:.3e}", e_blk, e_host);
+    REQUIRE(W_one.shape() == W_host.shape());
+    REQUIRE(e_blk < 1e-12);
+    REQUIRE(e_host < 1e-9);
+
+    mpi_context->comm.barrier();
+    if (mpi_context->comm.root()) {
+      remove((output+".mbpt.h5").c_str());
+    }
+    mpi_context->comm.barrier();
+  }
 #endif
 
   TEST_CASE("thc_gw_qe", "[methods][thc][gw][qe]") {
