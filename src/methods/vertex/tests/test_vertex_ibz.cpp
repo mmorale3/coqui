@@ -481,6 +481,7 @@ namespace bdft_tests {
         }
       }
     }
+    double ls_floor = 0.0;   // the residual of the best linear transport the orbital data allow (empirical M below)
     // setup sanity: band-resolved MODULI (phase- and D-free): |psi_{krot,b}(r_P)| vs |psi_{k,b}(S^{+-1} r_P)| summed over the
     // window, and the plain |X(k)(S r_P)| vs |X(k)(r_P)| control (must be O(1) different), for the first op and first k
     {
@@ -518,6 +519,7 @@ namespace bdft_tests {
       nda::blas::gemm(A, M, cand);
       for (long P = 0; P < Nm; ++P) for (long b = 0; b < nW; ++b) { resM += std::norm(cand(P, b) - Bm(P, b)); denM += std::norm(Bm(P, b)); }
       app_log(1, "ibz transport: empirical M (X(k)(S^-1 r) = X(krot)(r) M, fit residual {:.3e}):\n      {}\n   stored D(js 1, k 0) window block:\n      {}", std::sqrt(resM / denM), sm, sd);
+      ls_floor = std::sqrt(resM / denM);
     }
     // point-resolved ratio for (js 1, k 1), band 0 (non-degenerate?): is the mismatch a POINT-dependent phase e^{i G0 . r_P}?
     {
@@ -601,7 +603,12 @@ namespace bdft_tests {
     double mn = 1.0;
     for (double b : best) mn = std::min(mn, b);
     app_log(1, "ibz transport: the best candidate reproduces the transported orbital to {:.3e} (the kernels use X(krot) . D against S^-1 r_P)", mn);
-    REQUIRE(mn < 1e-8);
+    // the bar is set by the orbital data, not by D: the fixture's wavefunctions are symmetric only to the eigensolver's
+    // convergence (the D-free window density at r_P and S r_P already differs by ~1e-8), and no transport matrix -- not even
+    // the least-squares one fitted on these points (ls_floor, ~1.6e-8 on qe_lih222_sym) -- does better. A wrong convention
+    // (D^T, D^*, D^dag, the other point list) is O(1).
+    app_log(1, "ibz transport: bar = max(1e-8, 5 x the least-squares transport residual {:.3e})", ls_floor);
+    REQUIRE(mn < std::max(1e-8, 5.0 * ls_floor));
     mpi_context->comm.barrier();
   }
 
