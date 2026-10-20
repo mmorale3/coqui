@@ -47,6 +47,7 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/SCF/scf_driver.hpp"
 #include "methods/vertex/vertex_t.h"
+#include "methods/vertex/vertex_debug.hpp"
 // vertex_bl_mixed_term_split uses the kernel's test-only S1/S2/S3 term selector,
 // vertex_detail::sigma_C_slot_probe.only_term. Header-only; the probe is an inline global.
 #include "methods/vertex/vertex_sigma.icc"
@@ -60,6 +61,10 @@ namespace bdft_tests {
     SUCCEED("vertex_static_e2e skipped: build has ENABLE_DLR=OFF.");
 #else
     auto &mpi_context = utils::make_unit_test_mpi_context();
+    // the causal projection of Sigma_c (on by default with a Sigma vertex) is off: an unconverged iterative fit (ADMM +
+    // Anderson) that turns rounding-level differences of its input or its BLAS into ~1e-6 changes of e_hf / e_corr (two
+    // identical runs differ by ~1e-12 after 10 iterations and ~1e-6 after its 6000), which would hide the identities below
+    vertex_debug::set("scf_causal_proj=0");
     // wmax headroom: B-S's intermediates are ordinary GG/GGG products (no twisted pairs,
     // no double convolution), so the dynamic theory's 3-4x requirement is relaxed -- but
     // the same basis is kept here so the comparison against the dynamic path is like for

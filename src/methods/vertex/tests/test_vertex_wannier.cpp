@@ -75,6 +75,7 @@
 #include "methods/SCF/scf_driver.hpp"
 #include "methods/embedding/projector_t.h"
 #include "methods/vertex/vertex_t.h"
+#include "methods/vertex/vertex_debug.hpp"
 
 namespace bdft_tests {
 
@@ -203,6 +204,10 @@ namespace bdft_tests {
     SUCCEED("vertex_wannier skipped: build has ENABLE_DLR=OFF.");
 #else
     auto& mpi_context = utils::make_unit_test_mpi_context();
+    // the causal projection of Sigma_c (on by default with a Sigma vertex) is off: an unconverged iterative fit (ADMM +
+    // Anderson) that turns rounding-level differences of its input or its BLAS into ~1e-6 changes of e_hf / e_corr (two
+    // identical runs differ by ~1e-12 after 10 iterations and ~1e-6 after its 6000), which would hide the identities below
+    vertex_debug::set("scf_causal_proj=0");
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
 
     const long W0 = 1, M = 2, nW = 2;               // LiH-222 window [1,3), M = 2
