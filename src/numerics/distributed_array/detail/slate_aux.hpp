@@ -41,6 +41,25 @@
 namespace math::nda::slate_ops::detail
 {
 
+/// Restores the calling thread's active CUDA device when it goes out of scope. Slate
+/// creates and destroys a BLAS++ queue for EVERY visible device (MatrixStorage ctor and
+/// dtor), and blas::Queue::~Queue makes its own device current, so destroying a
+/// slate::Matrix leaves device num_devices()-1 active. With several GPUs visible to a rank
+/// that silently moves the rank's later device allocations off the GPU its cuBLAS/cuSOLVER
+/// handles live on (cusolverDnZgetrs then fails with CUSOLVER_STATUS_INTERNAL_ERROR).
+/// Declare one before the first slate::Matrix of a scope, so it is destroyed after them.
+struct device_guard {
+#if defined(ENABLE_CUDA)
+  int dev = 0;
+  device_guard() { cudaGetDevice(&dev); }
+  ~device_guard() { cudaSetDevice(dev); }
+#else
+  device_guard() = default;
+#endif
+  device_guard(device_guard const&) = delete;
+  device_guard& operator=(device_guard const&) = delete;
+};
+
 /***************************************************************************/
 /*  				Utils	  				   */
 /***************************************************************************/

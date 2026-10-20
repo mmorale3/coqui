@@ -44,6 +44,7 @@
 #include "configuration.hpp"
 #include "utilities/check.hpp"
 #include "numerics/distributed_array/matrix_array.hpp"
+#include "numerics/distributed_array/detail/slate_aux.hpp"
 #if defined(ENABLE_SLATE)
 #include "slate/slate.hh"
 #endif
@@ -148,6 +149,7 @@ auto& multiply(T alpha, A_t&& A, B_t&& B, T beta, C_t&& C)
   ::math::nda::detail::check_batch(dB, dC, "slate_ops::multiply");
 
   auto opts = ::math::nda::detail::slate_opts<C_t>();
+  [[maybe_unused]] ::math::nda::slate_ops::detail::device_guard dev_guard;  // slate leaves another device active
   for (long ib = 0; ib < dC.n_local_batch(); ++ib) {
     auto As = ::math::nda::detail::apply_op(dA.slate_matrix(ib), opA);
     auto Bs = ::math::nda::detail::apply_op(dB.slate_matrix(ib), opB);
@@ -185,6 +187,7 @@ long lu_solve(A_t&& A, B_t&& B)
                "slate_ops::lu_solve: A must be square.");
   auto opts = ::math::nda::detail::slate_opts<A_t>();
   long info = 0;
+  [[maybe_unused]] ::math::nda::slate_ops::detail::device_guard dev_guard;  // slate leaves another device active
   for (long ib = 0; ib < A.n_local_batch(); ++ib) {
     auto As = A.slate_matrix(ib);
     auto Bs = B.slate_matrix(ib);
@@ -199,6 +202,7 @@ long least_squares_solve(A_t&& A, B_t&& B)
 {
   ::math::nda::detail::check_batch(A, B, "slate_ops::least_squares_solve");
   auto opts = ::math::nda::detail::slate_opts<A_t>();
+  [[maybe_unused]] ::math::nda::slate_ops::detail::device_guard dev_guard;  // slate leaves another device active
   for (long ib = 0; ib < A.n_local_batch(); ++ib) {
     auto As = A.slate_matrix(ib);
     auto Bs = B.slate_matrix(ib);
@@ -223,6 +227,7 @@ void inverse(A_t&& A)
   utils::check(A.global_shape()[R-2] == A.global_shape()[R-1],
                "slate_ops::inverse: A must be square.");
   auto opts = ::math::nda::detail::slate_opts<A_t>();
+  [[maybe_unused]] ::math::nda::slate_ops::detail::device_guard dev_guard;  // slate leaves another device active
   for (long ib = 0; ib < A.n_local_batch(); ++ib) {
     auto As = A.slate_matrix(ib);
     slate::Pivots pivots;

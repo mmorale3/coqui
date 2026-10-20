@@ -115,6 +115,7 @@ void svd(A_t&& A, B_t&& U, std::vector<double> S, C_t&& VH)
   using dB_t = typename std::decay_t<B_t>;
   using dC_t = typename std::decay_t<C_t>;
   detail::slate_thread_guard(A.communicator()->size(), "svd");
+  [[maybe_unused]] detail::device_guard dev_guard;  // slate leaves another device active
 #if defined(ENABLE_SLATE)
   static_assert(std::is_same_v<typename dA_t::value_type, typename dB_t::value_type>,
                                "Value mismatch");
@@ -138,6 +139,7 @@ void eig(A_t&& A, std::vector<double> L, B_t&& X)
   using dA_t = typename std::decay_t<A_t>;
   using dB_t = typename std::decay_t<B_t>;
   detail::slate_thread_guard(A.communicator()->size(), "eig");
+  [[maybe_unused]] detail::device_guard dev_guard;  // slate leaves another device active
 #if defined(ENABLE_SLATE)
   static_assert(std::is_same_v<typename dA_t::value_type, typename dB_t::value_type>,
                                "Value mismatch");
@@ -240,6 +242,7 @@ long lu_solve(DistributedMatrix auto&& A, DistributedMatrix auto&& B)
 							 typename dA_t::Array_t,
                              typename dB_t::Array_t>;
   detail::slate_thread_guard(A.communicator()->size(), "lu_solve");
+  [[maybe_unused]] detail::device_guard dev_guard;  // slate leaves another device active
 #if defined(ENABLE_SLATE)
 
   auto slate_lu = [&](auto &a, auto &b) {
@@ -375,6 +378,7 @@ long least_squares_solve(DistributedMatrix auto&& A, DistributedMatrix auto&& B)
   } // constexpr (not _dev_)
 
   detail::slate_thread_guard(A.communicator()->size(), "least_squares_solve");
+  [[maybe_unused]] detail::device_guard dev_guard;  // slate leaves another device active
 #if defined(ENABLE_SLATE)
 
   auto slate_ls = [&](auto &a, auto &b) {
@@ -463,6 +467,7 @@ void inverse(DistributedMatrix auto&& A)
   }
 
   detail::slate_thread_guard(A.communicator()->size(), "inverse");
+  [[maybe_unused]] detail::device_guard dev_guard;  // slate leaves another device active
 #if defined(ENABLE_SLATE)
 
   auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
@@ -519,6 +524,7 @@ auto determinant(DistributedMatrix auto&&A, std::vector<std::pair<long,long>> &d
   }
 
   detail::slate_thread_guard(A.communicator()->size(), "determinant");
+  [[maybe_unused]] detail::device_guard dev_guard;  // slate leaves another device active
 #if defined(ENABLE_SLATE)
   if constexpr (::nda::mem::on_host<local_Array_t>) {
     auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
@@ -573,6 +579,7 @@ void cholesky(DistributedMatrix auto&& A, char UPLO = "L")
   }
 
   detail::slate_thread_guard(A.communicator()->size(), "cholesky");
+  [[maybe_unused]] detail::device_guard dev_guard;  // slate leaves another device active
 #if defined(ENABLE_SLATE)
 
   auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
@@ -638,6 +645,7 @@ auto multiply_impl(T a, A_t&& A, B_t&& B, T b, C_t&& C)
   }
 
   detail::slate_thread_guard(C.communicator()->size(), "multiply");
+  [[maybe_unused]] detail::device_guard dev_guard;  // slate leaves another device active
 #if defined(ENABLE_SLATE)
   // C is fixed
   auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
