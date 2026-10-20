@@ -1706,7 +1706,7 @@ namespace solvers {
       // transfer and the representative alone, so the first n_rc representatives are formed ONCE per transfer (Krc, reused by every
       // rung application of its nu units and RHS blocks) and the rest per application, n_st at a time (Krec); vertex_debug
       // dyn_rung_recon_host_gb = the per-rank bytes of both (default: half the node's free memory over its ranks, capped at all
-      // representatives), dyn_rung_recon_stage = the staging slots (4)
+      // representatives), dyn_rung_recon_stage = the staging slots (default: the rank's threads)
       nda::array<cplx, 3> Krc, Krec;
       long krc_gen = -1, kd_gen = 0, n_rc = -1, n_st = 1;
       long n_rcb = 0, n_stb = 0;                        // (the resident sets formed, the staged rungs formed)
@@ -2484,9 +2484,10 @@ namespace solvers {
             if (opt.dense_rung and rrecon) {
               // the factorized rung APPLIED DENSE: per PH representative K_d(rep) = sum_r c_r(rep) K_r, then Ys(i) = scale_k K_d(rep) Fs(i)
               // for both mirror nodes as one gemm (D x D)(D x nmir nf nR) with both nodes' and both families' columns side by side.
-              // The first n_rc representatives are formed once per transfer (Krc; their gemms then run over the rank's threads as the
-              // dense rung's), the others per application, n_st at a time (Krec; threaded gemms). Forming m of them is ONE gemm
-              // (m x R)(R x D^2): every K_r is read once per set instead of once per representative.
+              // The first n_rc representatives are formed once per transfer (Krc), the others per application, n_st at a time (Krec).
+              // A set of at least half the rank's threads runs one representative per thread as the dense rung (one threaded gemm per
+              // representative is several times slower), a smaller one threaded gemms. Forming m of them is ONE gemm (m x R)(R x D^2):
+              // every K_r is read once per set instead of once per representative.
               const long nf = fuse2 ? 2 : 1;
               const double gb_rep = double(D) * double(D) * 16.0 / 1.0e9;
               if (n_rc < 0) {                                // sized once per driver call
@@ -2495,7 +2496,7 @@ namespace solvers {
                 const long nloc = std::max(1l, opt.node_ranks);
                 const double gb = (gb_set >= 0.0) ? gb_set : 0.5 * gb_free / double(nloc);
                 const long nslot = long(gb / gb_rep);
-                const long stage = std::max(1l, long(vertex_debug::number("dyn_rung_recon_stage", 4.0)));
+                const long stage = std::max(1l, long(vertex_debug::number("dyn_rung_recon_stage", double(nthr))));
                 if (nslot >= ndist) {
                   n_rc = ndist; n_st = 0;
                 } else {
@@ -2550,22 +2551,24 @@ namespace solvers {
                 krc_gen = kd_gen;
                 t_rcb += db::wall_now() - t0; ++n_rcb;
               }
-              if (n_rc >= nthr) {
-#pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
-                for (long rr = 0; rr < n_rc; ++rr) apply_rep(rr, Krc(rr, all, all));
-              } else {
-                bthr(true);
-                for (long rr = 0; rr < n_rc; ++rr) apply_rep(rr, Krc(rr, all, all));
-                bthr(false);
-              }
+              // representatives r0 .. r0 + m - 1 held in K(j, :, :)
+              auto apply_set = [&](long r0, long m, nda::array<cplx, 3> const &K) {
+                if (2 * m >= nthr) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(std::min(m, nthr))
+                  for (long j = 0; j < m; ++j) apply_rep(r0 + j, K(j, all, all));
+                } else {
+                  bthr(true);
+                  for (long j = 0; j < m; ++j) apply_rep(r0 + j, K(j, all, all));
+                  bthr(false);
+                }
+              };
+              if (n_rc > 0) apply_set(0, n_rc, Krc);
               for (long s0 = n_rc; s0 < ndist; s0 += n_st) {
                 const long m = std::min(n_st, ndist - s0);
                 const double t0 = db::wall_now();
                 form(s0, m, Krec.data());
                 t_stb += db::wall_now() - t0; n_stb += m;
-                bthr(true);
-                for (long j = 0; j < m; ++j) apply_rep(s0 + j, Krec(j, all, all));
-                bthr(false);
+                apply_set(s0, m, Krec);
               }
               if (rrecon_chk) {
                 const long w = nf * nR;
