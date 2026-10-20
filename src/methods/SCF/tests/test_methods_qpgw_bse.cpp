@@ -33,6 +33,7 @@
 #include "methods/SCF/scf_driver.hpp"
 #include "methods/scr_coulomb/scr_coulomb_t.h"
 #include "methods/vertex/vertex_t.h"
+#include "methods/vertex/vertex_debug.hpp"
 
 /**
  * The BSE (ladder) polarization in the qpGW loop. The loop screens with
@@ -477,10 +478,21 @@ namespace bdft_tests {
     nda::range window(3, b1);
     REQUIRE(window.size() == 2);
 
+#if defined(ENABLE_CUDA)
+    // On CUDA builds the meter keeps the host mirror of the Pi post-hooks (scr_coulomb_t:
+    // post_hooks_dev is off while ladder_qnu_meter is on), so a metered leg and a plain leg
+    // would run different arithmetic (2.6e-12 apart in e_hf, measured on A100) and leg (b)
+    // would compare two code paths instead of the meter's side effects. Both legs run on the
+    // mirror here; vertex_debug is process-wide, so it is cleared again right after.
+    methods::vertex_debug::set("pi_hooks_device=0");
+#endif
     auto ra = run_qpgw(mpi_context, mf, ft, "da_base", "ac_pade", "ladder", "ladder_n2",
                        window, 10, 1e-8, 12, 1e-5, false, "gygi", false, HS0, false);
     auto rb = run_qpgw(mpi_context, mf, ft, "da_meter", "ac_pade", "ladder", "ladder_n2",
                        window, 10, 1e-8, 12, 1e-5, false, "gygi", false, HS0, true);
+#if defined(ENABLE_CUDA)
+    methods::vertex_debug::set("");
+#endif
     // gates = true on the TDA leg: ladder_whalf_gate re-earns, FOR THE TRUNCATED KERNEL,
     // the PH-symmetry licence that the injection's nu -> tau transform depends on.
     auto rc = run_qpgw(mpi_context, mf, ft, "da_tda", "ac_pade", "ladder", "ladder_n2",
