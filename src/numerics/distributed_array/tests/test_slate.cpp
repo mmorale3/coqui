@@ -351,12 +351,16 @@ std::cout<<" nx: " <<nx <<std::endl;
     using local_Array_t = nda::cuarray<double, 2>;
     long nx = utils::find_proc_grid_min_diff(world.size(),N,N);
     long ny = world.size()/nx;
+    // Device views go to SLATE's batched kernels, which need the view tiles' stride (the
+    // local leading dimension N/ny) to equal the tile size of the workspace copies, so the
+    // block along the contiguous dimension is the whole local extent (see make_slate).
+    // Smaller device blocks need distributed_matrix_array (test_matrix_array_ops.cpp).
     auto A =  make_distributed_array<local_Array_t>(world, shape_t<2>{nx,ny},
-                        shape_t<2>{N,N}, {16, 16}, true);
+                        shape_t<2>{N,N}, {16, N/ny}, true);
     auto B =  make_distributed_array<local_Array_t>(world, shape_t<2>{nx,ny},
-                        shape_t<2>{N,N}, {16, 16}, true);
+                        shape_t<2>{N,N}, {16, N/ny}, true);
     auto C =  make_distributed_array<local_Array_t>(world, shape_t<2>{nx,ny},
-                        shape_t<2>{N,N}, {16, 16}, true);
+                        shape_t<2>{N,N}, {16, N/ny}, true);
     {
       A.local() = utils::make_random<double>(A.local_shape()[0],A.local_shape()[1]);;
       B.local() = utils::make_random<double>(B.local_shape()[0],B.local_shape()[1]);;

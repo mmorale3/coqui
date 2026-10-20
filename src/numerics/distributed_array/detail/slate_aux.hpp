@@ -162,6 +162,19 @@ auto make_slate(DMat& A_)
 		"Out of range: y:{}, shape:{}, j:{}, nb:{}, org:{}",
 		y,A.local_shape()[row_index],j,nb,A.origin()[col_index]);
       
+        if constexpr (view and tiles_on_device)
+          // SLATE's batched device kernels take ONE leading dimension per operand and region
+          // (assert(group.ld[m] == Mij.stride()) in slate/src/internal/internal_batch.hh), and
+          // its workspace copies of remote tiles have stride tileMb(i). A view into this rank's
+          // contiguous block has stride lld instead, so the two may only meet when they agree;
+          // otherwise SLATE aborts, or with NDEBUG silently reads remote tiles with the wrong
+          // stride. Device operands that need block-cyclic tiles belong in
+          // distributed_matrix_array (matrix_array.hpp), which is tile-major by construction.
+          utils::check(A.communicator()->size() == 1 or lld == tileMb(i),
+                       "make_slate: device tile ({},{}) has stride {} but SLATE's workspace tiles "
+                       "have stride {}; SLATE's batched device kernels cannot mix them. Use a "
+                       "block size equal to the local leading dimension, or "
+                       "distributed_matrix_array.", i, j, lld, tileMb(i));
         if constexpr (view) {
           // no dereference of Aloc when it is not on the host, hence the explicit offset
           auto* ptr = [&]() {
