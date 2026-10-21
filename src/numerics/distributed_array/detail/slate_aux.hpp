@@ -168,13 +168,14 @@ auto make_slate(DMat& A_)
           // its workspace copies of remote tiles have stride tileMb(i). A view into this rank's
           // contiguous block has stride lld instead, so the two may only meet when they agree;
           // otherwise SLATE aborts, or with NDEBUG silently reads remote tiles with the wrong
-          // stride. Device operands that need block-cyclic tiles belong in
-          // distributed_matrix_array (matrix_array.hpp), which is tile-major by construction.
+          // stride. Device operands belong in distributed_matrix_array (matrix_array.hpp),
+          // which is tile-major by construction; unified memory stays host-tagged and is
+          // staged by SLATE itself.
           utils::check(A.communicator()->size() == 1 or lld == tileMb(i),
                        "make_slate: device tile ({},{}) has stride {} but SLATE's workspace tiles "
-                       "have stride {}; SLATE's batched device kernels cannot mix them. Use a "
-                       "block size equal to the local leading dimension, or "
-                       "distributed_matrix_array.", i, j, lld, tileMb(i));
+                       "have stride {}; SLATE's batched device kernels cannot mix them. Use "
+                       "distributed_matrix_array (or unified memory) for device operands.",
+                       i, j, lld, tileMb(i));
         if constexpr (view) {
           // no dereference of Aloc when it is not on the host, hence the explicit offset
           auto* ptr = [&]() {

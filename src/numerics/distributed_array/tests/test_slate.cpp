@@ -348,19 +348,21 @@ std::cout<<" nx: " <<nx <<std::endl;
 #if defined(ENABLE_DEVICE)
 
   {
-    using local_Array_t = nda::cuarray<double, 2>;
+    // Unified, not nda::cuarray: views of a Device-memory distributed_array cannot feed
+    // SLATE's batched device kernels on more than one rank (their stride is the local
+    // leading dimension, SLATE's workspace tiles have stride mb; make_slate refuses the mix,
+    // and square tiles of the local extent do not exist on a 2D-split matrix). Device
+    // operands go through distributed_matrix_array, whose device multiply and solves are
+    // tested in test_matrix_array_ops.cpp. Unified tiles are staged by SLATE itself.
+    using local_Array_t = memory::unified_array<double, 2>;
     long nx = utils::find_proc_grid_min_diff(world.size(),N,N);
     long ny = world.size()/nx;
-    // Device views go to SLATE's batched kernels, which need the view tiles' stride (the
-    // local leading dimension N/ny) to equal the tile size of the workspace copies, so the
-    // block along the contiguous dimension is the whole local extent (see make_slate).
-    // Smaller device blocks need distributed_matrix_array (test_matrix_array_ops.cpp).
     auto A =  make_distributed_array<local_Array_t>(world, shape_t<2>{nx,ny},
-                        shape_t<2>{N,N}, {16, N/ny}, true);
+                        shape_t<2>{N,N}, {16, 16}, true);
     auto B =  make_distributed_array<local_Array_t>(world, shape_t<2>{nx,ny},
-                        shape_t<2>{N,N}, {16, N/ny}, true);
+                        shape_t<2>{N,N}, {16, 16}, true);
     auto C =  make_distributed_array<local_Array_t>(world, shape_t<2>{nx,ny},
-                        shape_t<2>{N,N}, {16, N/ny}, true);
+                        shape_t<2>{N,N}, {16, 16}, true);
     {
       A.local() = utils::make_random<double>(A.local_shape()[0],A.local_shape()[1]);;
       B.local() = utils::make_random<double>(B.local_shape()[0],B.local_shape()[1]);;
