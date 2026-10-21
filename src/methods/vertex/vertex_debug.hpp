@@ -57,9 +57,9 @@ namespace vertex_debug {
         "pi_hooks_device", "rung_dump", "rung_dump_exit", "rung_rank", "sc_wcache_rows", "scf_causality_abort", "scf_causality_matrix", "scf_causality_meter",
         "scf_causal_proj", "scf_causal_proj_maxit", "scf_causal_proj_tol", "scf_causal_proj_rho", "scf_causal_proj_wmax",
         "scf_causal_proj_wmin", "scf_causal_proj_nw", "scf_causal_proj_select", "scf_causal_proj_warn", "scf_causal_proj_device", "scf_causal_proj_dump",
-        "sigdyn_bases_cache", "sigdyn_blas_threads", "sigdyn_ckpt_keep", "sigdyn_ckpt_tol", "sigdyn_ckpt_tol_g", "sigdyn_families", "sigdyn_finish_device", "sigdyn_gram",
+        "sigdyn_bases_cache", "sigdyn_blas_threads", "sigdyn_dev_acc_rows", "sigdyn_dev_dump_slots", "sigdyn_ckpt_keep", "sigdyn_ckpt_tol", "sigdyn_ckpt_tol_g", "sigdyn_families", "sigdyn_finish_device", "sigdyn_gram",
         "sigdyn_grid_tol", "sigdyn_legs", "sigdyn_route", "sigdyn_sketch", "sigdyn_test_nnu", "sigdyn_test_nq",
-        "sigma_allow_nonconserving", "sigpair_ibz_diag", "sigpair_ibz_dump", "sym_dt", "sym_fold_conv", "sym_fold_dt",
+        "sigma_allow_nonconserving", "sigma_preflight", "sigpair_ibz_diag", "sigpair_ibz_dump", "sym_dt", "sym_fold_conv", "sym_fold_dt",
         "sym_trev_notrans", "trev_w_check", "vertex_rdecay", "w0_dyson_device", "wbar_dump", "wbar_dump_exit", "wbar_load"
     };
     return k;

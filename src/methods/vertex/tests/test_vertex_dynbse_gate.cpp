@@ -2153,4 +2153,101 @@ namespace bdft_tests {
 #endif
   }
 
+  /**
+   * The device footprint of the Sigma deposits (sigma_dyn_device_plan): the accumulator row cache and the reference dump's node
+   * slots, forced to ONE row and ONE slot (vertex_debug sigdyn_dev_acc_rows / sigdyn_dev_dump_slots) so that every new fold target
+   * and every node change evicts, against the resident accumulators of the same run. The caches are write-back (a miss loads the
+   * host value, an eviction writes it back): the device makes the same additions in the same order, so Sigma, the density matrix
+   * and the reference dump (Hc, HT, HS) agree to rounding (bitwise here). The check matters at that level: the finish of this
+   * fixture amplifies a 1e-16 regrouping of the accumulators to ~1e-5 in Sigma (measured with additive flushes).
+   * qe_lih222_sym with the IBZ solve (the unit scratch the row cache needs). A CPU build takes the host deposits in both runs.
+   */
+  TEST_CASE("dynbse_sigma_dyn_rowcache", "[methods][vertex][scgwt][dynbse][ibz]") {
+#ifndef ENABLE_DLR
+    SUCCEED("dynbse_sigma_dyn_rowcache skipped: build has ENABLE_DLR=OFF.");
+#else
+    using cplx = std::complex<double>;
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    const long nb = 3;
+    auto mfs = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_sym"));
+    REQUIRE(mfs->nkpts_ibz() < mfs->nkpts());
+    thc_reader_t thcs(mfs, make_thc_reader_ptree(mfs->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mfs->ecutrho(), 1, 1024));
+    auto eris = mb_eri_t(thcs, thcs);
+    struct outs { nda::array<cplx, 5> S; nda::array<cplx, 4> D; nda::array<cplx, 6> Hc, HT; nda::array<cplx, 5> HS; };
+    // kind 1: the dynamic band run that dumps its secondary points; 2: the pair Sigma vertex (col dyn1, outer dynamic, IBZ solve,
+    // the reference dump on) with the vertex_debug keys `dbg`
+    auto run = [&](std::string const &tag, int kind, std::string const &points, std::string const &dbg, outs &o) {
+      const std::string out = "coqui_d4_sigrc_" + tag;
+      solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      simple_dyson dyson(mfs.get(), &ft); MBState mb_state(mpi_context, ft, out);
+      iter_scf::iter_scf_t iter_sol("damping");
+      solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfs->nbnd());
+      vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, nb), -1, 1e-8, -1.0, -1.0, -1.0, "none");
+      vtx.set_ladder_rung("dynamic", 1e-8, 30, 12, -1.0);
+      vtx.set_ladder_dyn_gamma1_only(true);
+      vtx.set_wannier_frame("aux");
+      if (kind == 1) {
+        vtx.set_ladder_dyn_dump(true);
+        vtx.set_isdf_points("", true);
+      } else {
+        vtx.set_isdf_points(points, false);
+        vtx.set_sigma_pair(true, "dyn1", "dynamic", 1.0, true, false, "right");
+        vtx.set_sigma_pair_ibz(true);
+        vtx.set_sigma_dyn(true, {}, "", 0);
+      }
+      scr_eri.set_vertex(&vtx);
+      vertex_debug::set(dbg);
+      (void)scf_loop(mb_state, dyson, eris, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, kind == 1 ? 2 : 1, false, 1e-9, true);
+      vertex_debug::set("");
+      mpi_context->comm.barrier();
+      if (kind == 2) {
+        {
+          h5::file f(out + ".mbpt.h5", 'r'); h5::group g(f);
+          auto it = g.open_group("scf").open_group("iter1");
+          nda::h5_read(it, "Sigma_tskij", o.S);
+          nda::h5_read(it, "Dm_skij", o.D);
+        }
+        h5::file f(out + ".sigdyn.h5", 'r'); h5::group g(f);
+        nda::h5_read(g, "Hc", o.Hc);
+        nda::h5_read(g, "HT", o.HT);
+        if (g.has_dataset("HS")) nda::h5_read(g, "HS", o.HS);
+      }
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root() and kind == 2)
+        for (auto const &e : std::filesystem::directory_iterator("."))
+          if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
+      mpi_context->comm.barrier();
+    };
+    auto frob = [](auto const &a, auto const &b) {
+      REQUIRE(a.shape() == b.shape());
+      double d = 0.0, n = 0.0;
+      for (long i = 0; i < long(a.size()); ++i) { d += std::norm(a.data()[i] - b.data()[i]); n += std::norm(a.data()[i]); }
+      return std::sqrt(d) / std::max(std::sqrt(n), 1e-300);
+    };
+    const std::string pts = "coqui_d4_sigrc_P.secpts.h5";
+    outs none, R, C;
+    run("P", 1, "", "", none);
+    REQUIRE(std::filesystem::exists(pts));
+    run("R", 2, pts, "", R);
+    run("C", 2, pts, "sigdyn_dev_acc_rows=1,sigdyn_dev_dump_slots=1", C);
+    const double rS = frob(R.S, C.S), rD = frob(R.D, C.D), rHc = frob(R.Hc, C.Hc), rHT = frob(R.HT, C.HT);
+    const double rHS = (R.HS.size() > 0) ? frob(R.HS, C.HS) : 0.0;
+    app_log(1, "dynbse_sigma_dyn_rowcache: one accumulator row + one dump slot vs resident: Sigma {:.3e}, Dm {:.3e}, Hc {:.3e}, HT {:.3e}, "
+               "HS {:.3e} (relative Frobenius)", rS, rD, rHc, rHT, rHS);
+    REQUIRE(nda::max_element(nda::abs(R.S)) > 0.0);
+    REQUIRE(rS <= 1e-12);
+    REQUIRE(rD <= 1e-12);
+    REQUIRE(rHc <= 1e-12);
+    REQUIRE(rHT <= 1e-12);
+    REQUIRE(rHS <= 1e-12);
+    mpi_context->comm.barrier();
+    if (mpi_context->comm.root())
+      for (auto const &e : std::filesystem::directory_iterator("."))
+        if (e.path().filename().string().rfind("coqui_d4_sigrc_", 0) == 0) std::filesystem::remove(e.path());
+    mpi_context->comm.barrier();
+#endif
+  }
+
 } // namespace bdft_tests

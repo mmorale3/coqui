@@ -1879,6 +1879,7 @@ namespace vertex_pi { struct iaft_tools; }
       std::string dyn_refit = "fit";    // the E-refit target of the T family: fit (the DLR nodes) | union (all union nodes)
       double dyn_refit_rtol = 1e-8;     // the union fit's rank cutoff
       std::string dyn_acc = "split";    // the Sigma accumulators: split (S_cst, RT, RU per node) | single (one tau-resolved object)
+      bool plan_only = false;           // the preflight call (dynamic path): the setup and the device plan of the pass, no unit runs
     };
     struct sigma_pair_meter {
       double dsig_max = 0.0, dsig_herm = 0.0, ks_herm = 0.0;

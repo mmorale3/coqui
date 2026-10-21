@@ -639,6 +639,7 @@ namespace solvers {
           _pol_vtx->cache_w(mb_state, thc);
           const double w1 = uw_wall();
           park_W();
+          preflight_sigma_pair(mb_state, thc);
           refresh_pol_sc(mb_state, thc);
           app_log(1, "  [update_w wall] vertex self-consistency: W-bar cache fill {:.1f} s, refresh {:.1f} s", w1 - w0, uw_wall() - w1);
         } else {
@@ -651,6 +652,7 @@ namespace solvers {
       _pol_vtx->cache_w(mb_state, thc);
       const double w1 = uw_wall();
       park_W();
+      preflight_sigma_pair(mb_state, thc);
       pol_ladder_eps_readout(mb_state, thc, _pol_pi0_qPQ, std::addressof(eps_inv_head_q));
       app_log(1, "  [update_w wall] readout instance: W-bar cache fill {:.1f} s, eps readout (incl. the dynamic-rung driver) {:.1f} s",
               w1 - w0, uw_wall() - w1);
@@ -3809,6 +3811,30 @@ namespace solvers {
   // The readout instance (_pol_vtx) carries the frozen secondary frame, W-bar_0 (build_w0 at the pure-RPA point of this
   // update) and, on demand, the W-bar cache; the knobs live on the knob carrier (_vertex). The result is the C-window
   // block dSigma(tau) in band labels, published for gw_t::evaluate (added to Sigma after Sigma^GW).
+  void scr_coulomb_t::preflight_sigma_pair(MBState &mb_state, THC_ERI auto &thc) {
+#if defined(ENABLE_CUDA)
+    if (_vertex == nullptr or not _vertex->sigma_pair_enabled() or not _vertex->sigma_pair_dynamic() or
+        not _vertex->sigma_interp_file().empty() or _vertex->sigma_share() or not _vertex->pol_vertex_active() or _vertex->active())
+      return;
+    if (methods::vertex_debug::number("sigma_preflight", 1.0) == 0.0) return;   // vertex_debug: sigma_preflight
+    ensure_pol_vertex(thc);
+    if (_pol_vtx == nullptr) return;
+    vertex_t::sigma_pair_opts o = sigma_pair_opts_of(*_vertex, mb_state);
+    if (_vertex->sigma_dyn_self_ref()) {   // build_sigma_pair's choice of this pass (reference or sampled), without its bookkeeping
+      const long per = _vertex->sigma_dyn_ref_period();
+      const bool full = (_sigma_self_passes == 0) or (per > 0 and _sigma_since_ref >= per) or _sigma_renew_ref or _sigma_final_req;
+      if (full) { o.dyn_dump = true; o.dyn_nodes.clear(); o.dyn_auto_nodes = 0; o.dyn_fit_file.clear(); }
+      else { o.dyn_dump = false; o.dyn_fit_file = mb_state.coqui_prefix + ".sigdyn.h5"; }
+    }
+    o.plan_only = true;
+    app_log(1, "  [update_w] device preflight of this update's Sigma pass (before the P-side ladder pass)");
+    nda::array<ComplexType, 5> dS;
+    _pol_vtx->eval_sigma_pair_dyn(mb_state, thc, o, dS, nullptr);
+#else
+    (void)mb_state; (void)thc;
+#endif
+  }
+
   void scr_coulomb_t::build_sigma_pair(MBState &mb_state, THC_ERI auto &thc) {
     utils::check(_vertex != nullptr and _vertex->pol_vertex_active() and not _vertex->active(),
                  "build_sigma_pair: pol_vertex_sigma = \"pair\" needs the ladder machinery (pol_vertex = \"ladder\", a non-empty "
@@ -4220,6 +4246,7 @@ namespace solvers {
 
   template void scr_coulomb_t::build_sigma_lff(MBState&, thc_reader_t&, std::array<long, 4>, std::array<long, 4>);
   template void scr_coulomb_t::build_sigma_pair(MBState&, thc_reader_t&);
+  template void scr_coulomb_t::preflight_sigma_pair(MBState&, thc_reader_t&);
   template nda::array<ComplexType, 4> scr_coulomb_t::read_pol_interp_column(std::string const&, long, long,
                                                                             nda::array<long, 1> const&, thc_reader_t&);
   template void scr_coulomb_t::fold_rpa_pi_secondary(

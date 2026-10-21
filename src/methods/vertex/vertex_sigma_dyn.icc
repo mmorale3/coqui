@@ -56,8 +56,12 @@
 
 #include <set>
 #include <map>
+#include <format>
+#include <functional>
 #include "utilities/omp_threads.hpp"
 #include "methods/vertex/vertex_debug.hpp"
+#include "methods/vertex/dyn_device_fallback.hpp"
+#include "utilities/device_budget.hpp"
 namespace methods {
 namespace solvers {
   namespace vertex_dynbse_detail {
@@ -968,7 +972,113 @@ namespace solvers {
       ComplexType inu = ComplexType(-1.0, -1.0);
       long unit_is = -1, unit_q = -1;      // the IBZ solve: the unit whose deposits sit in the device scratch (mesh transfer index)
       std::vector<long> kpq_row;           // the deposit targets of the current (s, q) on the deposit mesh (the hook's kt map applied)
+      // the device footprint chosen by sigma_dyn_device_plan (0 = all resident): accumulator k rows, dump node slots
+      long acc_rows = 0, dump_slots = 0;
+      bool planned = false;                // the pass's preflight ran (sigma_dyn_device_plan_report logged it)
     };
+    /** THE SIGMA PASS'S DEVICE PLAN (per rank). The unit's floor (dynbse_cuda::ue_min_bytes: the least rung residency, staging and
+     *  block grouping ue_create may pick), the stages created after it (rung builds, dressed legs, the workspace margin: other_at(nR),
+     *  bytes in the engine's partition units) and the deposits (dynbse_cuda::ue_sd_bytes / 0.9) against the usable memory
+     *  min(90 % of the free memory -- the engine's partition --, free - COQUI_DEVICE_RESERVE_GB). Everything resident when it fits;
+     *  else (IBZ solve) the accumulators become a device row cache of as many k rows as fit and the reference dump keeps one
+     *  node slot, both write-back caches over the host objects (bitwise identical to the resident path from zeroed hosts). vertex_debug sigdyn_dev_acc_rows / sigdyn_dev_dump_slots
+     *  force the footprint (tests). fits = false: not even one row and one slot fit; then `hint_rhs` is the largest RHS block
+     *  width that would (0: none). */
+    struct sigma_dyn_dev_plan {
+      bool fits = false, forced = false;
+      long acc_rows = 0, dump_slots = 0, nR = 0, hint_rhs = 0;
+      double free_b = 0.0, budget = 0.0, unit_min = 0.0, other = 0.0, sd_full = 0.0, sd = 0.0, need = 0.0, need_full = 0.0;
+      double hint_need = 0.0, extra = 0.0;
+    };
+    inline sigma_dyn_dev_plan sigma_dyn_device_plan(dynbse_cuda::ue_config const &uc, dynbse_cuda::sd_config const &sc, long nout,
+                                                    std::function<double(long)> const &other_at, double free_b) {
+      sigma_dyn_dev_plan p;
+      p.free_b = free_b;
+      p.budget = std::min(0.9 * free_b, free_b - utils::device_reserve_bytes());
+      p.extra = std::max(0.0, 0.9 * free_b - p.budget);   // the reserve beyond the engine's own 10 % margin (small devices)
+      p.nR = uc.nR_max;
+      const long nka = (sc.nk_acc > 0) ? sc.nk_acc : sc.nk, nsl = sc.dump_nw;
+      auto need = [&](long nR, long rows, long slots, double *umin, double *oth, double *sdb) {
+        auto u = uc;
+        u.nR_max = nR; u.nblk_want = (nout + nR - 1) / nR;
+        auto c = sc;
+        c.acc_rows = rows; c.dump_slots = slots;
+        const double um = dynbse_cuda::ue_min_bytes(u), ot = other_at(nR), sd = dynbse_cuda::ue_sd_bytes(c, nR) / 0.9;
+        if (umin) *umin = um;
+        if (oth) *oth = ot;
+        if (sdb) *sdb = sd;
+        return um + ot + sd + p.extra;
+      };
+      // the largest footprint that fits at block width nR: (rows, slots), rows = 0 when not even one row does
+      auto best = [&](long nR, long &rows, long &slots) {
+        rows = nka; slots = nsl;
+        if (need(nR, rows, slots, nullptr, nullptr, nullptr) <= p.budget) return;
+        if (nsl > 0) slots = 1;
+        if (sc.nk_scr <= 0) { if (need(nR, rows, slots, nullptr, nullptr, nullptr) > p.budget) rows = 0; return; }
+        const double n1 = need(nR, 1, slots, nullptr, nullptr, nullptr), n2 = need(nR, std::min(2l, nka), slots, nullptr, nullptr, nullptr);
+        if (n1 > p.budget) { rows = 0; return; }
+        const double per = std::max(n2 - n1, 1.0);
+        rows = std::min(nka, 1 + long(std::floor((p.budget - n1) / per)));
+        while (rows > 1 and need(nR, rows, slots, nullptr, nullptr, nullptr) > p.budget) --rows;
+      };
+      const long fr = long(vertex_debug::number("sigdyn_dev_acc_rows", 0.0));    // vertex_debug: sigdyn_dev_acc_rows
+      const long fs = long(vertex_debug::number("sigdyn_dev_dump_slots", 0.0));  // vertex_debug: sigdyn_dev_dump_slots
+      p.need_full = need(p.nR, nka, nsl, &p.unit_min, &p.other, &p.sd_full);
+      if (fr > 0 or fs > 0) {
+        p.forced = true;
+        p.acc_rows = (fr > 0 and sc.nk_scr > 0) ? std::min(fr, nka) : nka;
+        p.dump_slots = (fs > 0 and nsl > 0) ? std::min(fs, nsl) : nsl;
+      } else best(p.nR, p.acc_rows, p.dump_slots);
+      if (p.acc_rows > 0) p.need = need(p.nR, p.acc_rows, p.dump_slots, nullptr, nullptr, &p.sd);
+      p.fits = (p.acc_rows > 0) and (p.forced or p.need <= p.budget);
+      if (not p.fits)
+        for (long r = p.nR - 1; r >= 1 and p.hint_rhs == 0; --r) {
+          long rr = 0, ss = 0;
+          best(r, rr, ss);
+          if (rr > 0) { p.hint_rhs = r; p.hint_need = need(r, rr, ss, nullptr, nullptr, nullptr); }
+        }
+      if (p.acc_rows >= nka) p.acc_rows = 0;          // 0 = every row resident
+      if (p.dump_slots >= nsl) p.dump_slots = 0;
+      return p;
+    }
+    /** the preflight line of the Sigma pass's device plan (rank 0), and the abort of an impossible plan on every rank -- before
+     *  any unit of the pass (pol_vertex_dyn_device_fallback = true lets the engine try and move what does not fit to the CPU) */
+    inline void sigma_dyn_device_plan_report(sigma_dyn_dev_plan const &p, dynbse_cuda::sd_config const &sc, long rank, bool log,
+                                             sigma_dyn_dev const &d) {
+      const long nka = (sc.nk_acc > 0) ? sc.nk_acc : sc.nk, nsl = sc.dump_nw;
+      const long rows = (p.acc_rows > 0) ? p.acc_rows : nka, slots = (p.dump_slots > 0) ? p.dump_slots : nsl;
+      const bool changed = d.planned and (d.acc_rows != p.acc_rows or d.dump_slots != p.dump_slots);
+      if (rank == 0 and (log or changed)) {
+        std::string res;
+        if (not p.fits)
+          res = std::format("DOES NOT FIT: {:.2f} GB needed even with one accumulator row and one dump node slot{}",
+                            p.acc_rows > 0 ? p.need / 1e9 : p.need_full / 1e9,
+                            p.hint_rhs > 0 ? std::format("; pol_vertex_dyn_rhs_block = {} would fit ({:.2f} GB)", p.hint_rhs, p.hint_need / 1e9)
+                                           : std::string("; no RHS block width fits"));
+        else if (p.acc_rows == 0 and p.dump_slots == 0)
+          res = "fits: the accumulators and the dump stay resident";
+        else
+          res = std::format("{}ROW CACHE: {} of {} accumulator k rows and {} of {} reference-dump node slots on the device ({:.2f} GB of "
+                            "deposits), write-back caches over the host accumulators / dump (pinned staging): a miss loads the host "
+                            "row, a full cache writes its rows back -- the same additions in the same order as the resident path",
+                            p.forced ? "FORCED (vertex_debug) " : "",
+                            rows, nka, slots, nsl, p.sd / 1e9);
+        app_log(1, "  [device preflight] {}Sigma pass, per rank: the unit at least {:.2f} GB, rung builds + dressed legs + margin {:.2f} GB, "
+                   "deposits {:.2f} GB with every row resident (accumulators {} k rows, unit scratch {} rows, reference dump {} nodes); "
+                   "{:.2f} GB usable = min(90 % of {:.2f} GB free, free - {:.1f} GB COQUI_DEVICE_RESERVE_GB) -> {}",
+                   changed ? "(re-planned at the first transfer) " : "", p.unit_min / 1e9, p.other / 1e9, p.sd_full / 1e9, nka, sc.nk_scr,
+                   nsl, p.budget / 1e9, p.free_b / 1e9, utils::device_reserve_bytes() / 1073741824.0, res);
+      }
+      if (not p.fits and not dyn_device_fallback_state())
+        utils::check(false, "pair_space_ladder_dyn: the Sigma pass does not fit on the device (rank {}): the unit needs at least {:.2f} GB, "
+                            "the rung builds + dressed legs + margin {:.2f} GB and the deposits {:.2f} GB even with one accumulator row and one "
+                            "dump node slot, {:.2f} GB usable ({:.2f} GB free). ABORTING before any unit of the pass.{} Or use devices with more "
+                            "memory (H200), or pol_vertex_dyn_device_fallback = true (the CPU path).", rank, p.unit_min / 1e9, p.other / 1e9,
+                     p.sd / 1e9, p.budget / 1e9, p.free_b / 1e9,
+                     p.hint_rhs > 0 ? std::format(" pol_vertex_dyn_rhs_block = {} would fit ({:.2f} GB; the RHS blocks are solved to the GMRES "
+                                                  "tolerance independently, so the results change at that tolerance).", p.hint_rhs, p.hint_need / 1e9)
+                                    : std::string(" No RHS block width fits."));
+    }
     /** the IBZ solve: fold the device scratch of the pending unit onto the device accumulators (a no-op without one) */
     inline void sigma_dyn_device_fold(sigma_dyn_hook &h, sigma_dyn_dev &d, dynbse_cuda::unit_engine *ue) {
       if (not d.on or not h.ibz or d.unit_q < 0) return;
@@ -1014,6 +1124,7 @@ namespace solvers {
       // solve deposits into a full-mesh scratch folded on the device (ue_sd_fold) when the unit changes
       c.nk_acc = h.S_cst.shape(2);
       c.nk_scr = h.ibz ? h.Su.shape(1) : 0;
+      c.acc_rows = d.acc_rows; c.dump_slots = d.dump_slots;   // the footprint of the pass's plan (0 = all resident)
       if (h.dump) {   // the reference dump on the device: the per-node objects over the deposit mesh (the host's layouts)
         const long nk_dep = (c.nk_scr > 0) ? c.nk_scr : c.nk_acc;
         utils::check(h.Hc_n.shape(0) > 0 and h.Hc_n.shape(3) == nk_dep and h.HT_n.shape(3) == nk_dep,
@@ -1026,6 +1137,9 @@ namespace solvers {
                                      1.0e6 * double(utils::freemem_device_effective()), buf, 256);
       why = buf;
       if (d.on and h.dump and h.nsk > 0) dynbse_cuda::ue_sd_set_dump(ue, h.Om.data());
+      if (d.on)   // the targets of the partial flushes (row cache / dump slots)
+        dynbse_cuda::ue_sd_set_host(ue, h.S_cst.data(), h.RT.data(), h.RU.data(), h.dump ? h.Hc_n.data() : nullptr,
+                                    h.dump ? h.HT_n.data() : nullptr, (h.dump and h.HS_n.size() > 0) ? h.HS_n.data() : nullptr);
       return d.on;
     }
     /** one block's deposits (right after the engine's ue_gamma1 of the same block): the device twin of sigma_dyn_accumulate */

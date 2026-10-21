@@ -348,6 +348,9 @@ namespace solvers {
     // READOUT instance (frozen secondary frame; W-bar_0 of this update, the W-bar cache on demand) and published as
     // mb_state.dSigma_pair_tskab
     void build_sigma_pair(MBState &mb_state, THC_ERI auto &thc);
+    /** the device preflight of this update's dynamic Sigma pass, run before the P-side ladder pass: the Sigma pass's setup up to
+     *  its device plan (logged; an impossible plan aborts before the hours of the P refresh). No unit runs, nothing is written. */
+    void preflight_sigma_pair(MBState &mb_state, THC_ERI auto &thc);
     // the interp file's column "Pi_<col>", q-matched to this mesh: (nw_half, nq, N_m, N_m), replicated (the read the
     // injection and the Sigma vertex share, with all of the consumer's consistency checks)
     nda::array<ComplexType, 4> read_pol_interp_column(std::string const &col, long nq_g, long nw_h_ft,
