@@ -983,12 +983,12 @@ namespace solvers {
      *  else (IBZ solve) the accumulators become a device row cache of as many k rows as fit and the reference dump keeps one
      *  node slot, both write-back caches over the host objects (bitwise identical to the resident path from zeroed hosts). vertex_debug sigdyn_dev_acc_rows / sigdyn_dev_dump_slots
      *  force the footprint (tests). fits = false: not even one row and one slot fit; then `hint_rhs` is the largest RHS block
-     *  width that would (0: none). */
+     *  width that would (0: none) and `hint_rhs_q` the largest with at least a quarter of the accumulator rows on the device. */
     struct sigma_dyn_dev_plan {
       bool fits = false, forced = false;
-      long acc_rows = 0, dump_slots = 0, nR = 0, hint_rhs = 0;
+      long acc_rows = 0, dump_slots = 0, nR = 0, hint_rhs = 0, hint_rhs_q = 0, hint_rows_q = 0;
       double free_b = 0.0, budget = 0.0, unit_min = 0.0, other = 0.0, sd_full = 0.0, sd = 0.0, need = 0.0, need_full = 0.0;
-      double hint_need = 0.0, extra = 0.0;
+      double need_min = 0.0, sd_min = 0.0, hint_need = 0.0, extra = 0.0;
     };
     inline sigma_dyn_dev_plan sigma_dyn_device_plan(dynbse_cuda::ue_config const &uc, dynbse_cuda::sd_config const &sc, long nout,
                                                     std::function<double(long)> const &other_at, double free_b) {
@@ -1024,6 +1024,7 @@ namespace solvers {
       const long fr = long(vertex_debug::number("sigdyn_dev_acc_rows", 0.0));    // vertex_debug: sigdyn_dev_acc_rows
       const long fs = long(vertex_debug::number("sigdyn_dev_dump_slots", 0.0));  // vertex_debug: sigdyn_dev_dump_slots
       p.need_full = need(p.nR, nka, nsl, &p.unit_min, &p.other, &p.sd_full);
+      p.need_min = need(p.nR, (sc.nk_scr > 0) ? 1l : nka, (nsl > 0) ? 1l : 0l, nullptr, nullptr, &p.sd_min);   // the least footprint
       if (fr > 0 or fs > 0) {
         p.forced = true;
         p.acc_rows = (fr > 0 and sc.nk_scr > 0) ? std::min(fr, nka) : nka;
@@ -1032,10 +1033,11 @@ namespace solvers {
       if (p.acc_rows > 0) p.need = need(p.nR, p.acc_rows, p.dump_slots, nullptr, nullptr, &p.sd);
       p.fits = (p.acc_rows > 0) and (p.forced or p.need <= p.budget);
       if (not p.fits)
-        for (long r = p.nR - 1; r >= 1 and p.hint_rhs == 0; --r) {
+        for (long r = p.nR - 1; r >= 1 and p.hint_rhs_q == 0; --r) {
           long rr = 0, ss = 0;
           best(r, rr, ss);
-          if (rr > 0) { p.hint_rhs = r; p.hint_need = need(r, rr, ss, nullptr, nullptr, nullptr); }
+          if (rr > 0 and p.hint_rhs == 0) { p.hint_rhs = r; p.hint_need = need(r, rr, ss, nullptr, nullptr, nullptr); }
+          if (rr >= std::max(1l, nka / 4)) { p.hint_rhs_q = r; p.hint_rows_q = rr; }
         }
       if (p.acc_rows >= nka) p.acc_rows = 0;          // 0 = every row resident
       if (p.dump_slots >= nsl) p.dump_slots = 0;
@@ -1051,18 +1053,19 @@ namespace solvers {
       if (rank == 0 and (log or changed)) {
         std::string res;
         if (not p.fits)
-          res = std::format("DOES NOT FIT: {:.2f} GB needed even with one accumulator row and one dump node slot{}",
-                            p.acc_rows > 0 ? p.need / 1e9 : p.need_full / 1e9,
-                            p.hint_rhs > 0 ? std::format("; pol_vertex_dyn_rhs_block = {} would fit ({:.2f} GB)", p.hint_rhs, p.hint_need / 1e9)
+          res = std::format("DOES NOT FIT: {:.2f} GB needed even with one accumulator row and one dump node slot{}", p.need_min / 1e9,
+                            p.hint_rhs > 0 ? std::format("; pol_vertex_dyn_rhs_block = {} would fit ({:.2f} GB){}", p.hint_rhs, p.hint_need / 1e9,
+                                                         p.hint_rhs_q > 0 ? std::format(", {} with {} of the {} accumulator rows",
+                                                                                        p.hint_rhs_q, p.hint_rows_q, nka) : std::string())
                                            : std::string("; no RHS block width fits"));
         else if (p.acc_rows == 0 and p.dump_slots == 0)
           res = "fits: the accumulators and the dump stay resident";
         else
-          res = std::format("{}ROW CACHE: {} of {} accumulator k rows and {} of {} reference-dump node slots on the device ({:.2f} GB of "
-                            "deposits), write-back caches over the host accumulators / dump (pinned staging): a miss loads the host "
-                            "row, a full cache writes its rows back -- the same additions in the same order as the resident path",
-                            p.forced ? "FORCED (vertex_debug) " : "",
-                            rows, nka, slots, nsl, p.sd / 1e9);
+          res = std::format("{}ROW CACHE: {} of {} accumulator k rows{} on the device ({:.2f} GB of deposits), write-back caches over "
+                            "the host accumulators{} (pinned staging): a miss loads the host row, a full cache writes its rows back -- the "
+                            "same additions in the same order as the resident path", p.forced ? "FORCED (vertex_debug) " : "", rows, nka,
+                            nsl > 0 ? std::format(" and {} of {} reference-dump node slots", slots, nsl) : std::string(),
+                            p.sd / 1e9, nsl > 0 ? " / dump" : "");
         app_log(1, "  [device preflight] {}Sigma pass, per rank: the unit at least {:.2f} GB, rung builds + dressed legs + margin {:.2f} GB, "
                    "deposits {:.2f} GB with every row resident (accumulators {} k rows, unit scratch {} rows, reference dump {} nodes); "
                    "{:.2f} GB usable = min(90 % of {:.2f} GB free, free - {:.1f} GB COQUI_DEVICE_RESERVE_GB) -> {}",
@@ -1074,9 +1077,11 @@ namespace solvers {
                             "the rung builds + dressed legs + margin {:.2f} GB and the deposits {:.2f} GB even with one accumulator row and one "
                             "dump node slot, {:.2f} GB usable ({:.2f} GB free). ABORTING before any unit of the pass.{} Or use devices with more "
                             "memory (H200), or pol_vertex_dyn_device_fallback = true (the CPU path).", rank, p.unit_min / 1e9, p.other / 1e9,
-                     p.sd / 1e9, p.budget / 1e9, p.free_b / 1e9,
-                     p.hint_rhs > 0 ? std::format(" pol_vertex_dyn_rhs_block = {} would fit ({:.2f} GB; the RHS blocks are solved to the GMRES "
-                                                  "tolerance independently, so the results change at that tolerance).", p.hint_rhs, p.hint_need / 1e9)
+                     p.sd_min / 1e9, p.budget / 1e9, p.free_b / 1e9,
+                     p.hint_rhs > 0 ? std::format(" pol_vertex_dyn_rhs_block = {} would fit ({:.2f} GB){} -- the RHS blocks are solved to the "
+                                                  "GMRES tolerance independently, so the results change at that tolerance.", p.hint_rhs,
+                                                  p.hint_need / 1e9, p.hint_rhs_q > 0 ? std::format(", {} with {} of the {} accumulator rows on the "
+                                                  "device", p.hint_rhs_q, p.hint_rows_q, nka) : std::string())
                                     : std::string(" No RHS block width fits."));
     }
     /** the IBZ solve: fold the device scratch of the pending unit onto the device accumulators (a no-op without one) */
