@@ -478,19 +478,20 @@ namespace bdft_tests {
     nda::range window(3, b1);
     REQUIRE(window.size() == 2);
 
-#if defined(ENABLE_CUDA)
-    // On CUDA builds the meter keeps the host mirror of the Pi post-hooks (scr_coulomb_t:
-    // post_hooks_dev is off while ladder_qnu_meter is on), so a metered leg and a plain leg
+#if defined(ENABLE_DEVICE)
+    // On device builds the meter keeps the host paths of the Pi pipeline (scr_coulomb_t: the
+    // ladder injection's upfold and nu -> tau gemms, the Pi post-hooks and the eps readout
+    // all leave the device while ladder_qnu_meter is on), so a metered leg and a plain leg
     // would run different arithmetic (2.6e-12 apart in e_hf, measured on A100) and leg (b)
     // would compare two code paths instead of the meter's side effects. Both legs run on the
-    // mirror here; vertex_debug is process-wide, so it is cleared again right after.
-    methods::vertex_debug::set("pi_hooks_device=0");
+    // host paths here; vertex_debug is process-wide, so it is cleared again right after.
+    methods::vertex_debug::set("inject_device=0, pi_hooks_device=0, eps_readout_device=0");
 #endif
     auto ra = run_qpgw(mpi_context, mf, ft, "da_base", "ac_pade", "ladder", "ladder_n2",
                        window, 10, 1e-8, 12, 1e-5, false, "gygi", false, HS0, false);
     auto rb = run_qpgw(mpi_context, mf, ft, "da_meter", "ac_pade", "ladder", "ladder_n2",
                        window, 10, 1e-8, 12, 1e-5, false, "gygi", false, HS0, true);
-#if defined(ENABLE_CUDA)
+#if defined(ENABLE_DEVICE)
     methods::vertex_debug::set("");
 #endif
     // gates = true on the TDA leg: ladder_whalf_gate re-earns, FOR THE TRUNCATED KERNEL,
