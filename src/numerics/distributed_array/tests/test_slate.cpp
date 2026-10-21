@@ -349,11 +349,12 @@ std::cout<<" nx: " <<nx <<std::endl;
 
   {
     // Unified, not nda::cuarray: views of a Device-memory distributed_array cannot feed
-    // SLATE's batched device kernels on more than one rank (their stride is the local
-    // leading dimension, SLATE's workspace tiles have stride mb; make_slate refuses the mix,
-    // and square tiles of the local extent do not exist on a 2D-split matrix). Device
-    // operands go through distributed_matrix_array, whose device multiply and solves are
-    // tested in test_matrix_array_ops.cpp. Unified tiles are staged by SLATE itself.
+    // SLATE's batched device gemm on more than one rank. Their stride is the local leading
+    // dimension while SLATE's workspace copies of remote tiles have stride mb, and the batch
+    // takes one ld per operand (assert(group.ld[m] == Mij.stride()) in SLATE's
+    // internal_batch.hh); square tiles of the local extent do not exist on a 2D-split
+    // matrix. Device gemm operands go through distributed_matrix_array, tested in
+    // test_matrix_array_ops.cpp. Unified tiles are staged by SLATE itself.
     using local_Array_t = memory::unified_array<double, 2>;
     long nx = utils::find_proc_grid_min_diff(world.size(),N,N);
     long ny = world.size()/nx;
