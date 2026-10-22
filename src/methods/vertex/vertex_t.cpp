@@ -2497,12 +2497,25 @@ namespace solvers {
                                        iq_gamma, skip_rung_gamma, 0,
                                        static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                        symc, Sigma_C);
-    else
+    else {
+      // An identically zero dynamic rung (dW == 0, e.g. the bare-rung cross-check against
+      // the GF2 exchange) leaves only the doubly-instantaneous reduction S3: families I-V
+      // and S1/S2 each carry a dynamic rung, and the static path is bit-identical to the
+      // dynamic one at dW == 0 (test_vertex_sigma, static_rung_W0 pin (2)). Skipping them
+      // saves the whole double bosonic convolution.
+      bool dw_zero = (Wt_qtPQ.size() > 0);
+      for (auto const &v : Wt_qtPQ)
+        if (v != ComplexType(0.0)) { dw_zero = false; break; }
+      dw_zero = mpi->comm.all_reduce_value(int(dw_zero), boost::mpi3::min<>{}) != 0;
+      if (dw_zero)
+        app_log(1, "  Sigma^C [rung = dynamic]: the dynamic rung is identically zero -- the S3 "
+                   "reduction alone (families I-V, S1/S2 vanish exactly).");
       vertex_detail::eval_sigma_C_g3w2(*_ft, mpi->comm, nda::range(0, nc), G_CC,
                                        X_C, Wt_qtPQ, Z_qPQ, kmq, qmin, iq_gamma,
-                                       skip_rung_gamma, 0,
+                                       skip_rung_gamma, dw_zero ? 1 : 0,
                                        static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                        symc, Sigma_C);
+    }
     {
       double max_abs = 0.0;
       long n_bad = 0;
