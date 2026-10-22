@@ -1346,11 +1346,14 @@ struct chemical_potential_t {
  * T=0 chemical potential of a moment-truncated Lehmann G: candidate gaps are the intervals between consecutive
  * quasiparticle-like poles (sum over orbitals of |v_m|^2 > qp_weight, all k merged) whose midpoint gives |N - nelec| <= ntol;
  * the WIDEST is chosen (fallback: the candidate with the best count). k weights are normalized to sum 1 (empty = uniform).
+ * Insulator filter (D2, 2026-10-22): if some candidates fill EVERY k to within ntol_k of nelec (per-k count
+ * 2 sum_{e_m(k) < mid} |v_m|^2, no k weight), the choice is restricted to them (an isolated conduction valley, SiC X, is not
+ * the gap); a metal has no such candidate and keeps the rule above; ntol_k <= 0 disables the filter.
  */
 inline chemical_potential_t chemical_potential(std::vector<nda::array<double, 1>> const &e_k,
                                                std::vector<nda::array<ComplexType, 2>> const &v_k, double nelec,
                                                std::vector<double> k_weight = {}, double qp_weight = 0.1,
-                                               double ntol = 0.5) {
+                                               double ntol = 0.5, double ntol_k = 0.5) {
   const long nk = long(e_k.size());
   utils::check(nk > 0 and long(v_k.size()) == nk, "cayley::chemical_potential: e_k / v_k size mismatch");
   if (k_weight.empty()) k_weight.assign(nk, 1.0);
@@ -1381,7 +1384,23 @@ inline chemical_potential_t chemical_potential(std::vector<nda::array<double, 1>
     cum[i] = acc;
     if (Wtot[order[i]] > qp_weight) qp.push_back(i);
   }
-  struct cand_t { double width, dn, mid, eh, el, N; };
+  // per-k sorted poles and cumulative counts (insulator filter)
+  std::vector<std::vector<double>> ek(nk), ck(nk);
+  for (long k = 0; k < nk; ++k) {
+    const long M = e_k[k].size(), n = v_k[k].extent(0);
+    std::vector<long> o(M);
+    std::iota(o.begin(), o.end(), 0L);
+    std::stable_sort(o.begin(), o.end(), [&](long a, long b) { return e_k[k](a) < e_k[k](b); });
+    ek[k].resize(M);
+    ck[k].assign(M + 1, 0.0);
+    for (long j = 0; j < M; ++j) {
+      double w = 0.0;
+      for (long i = 0; i < n; ++i) w += std::norm(v_k[k](i, o[j]));
+      ek[k][j]     = e_k[k](o[j]);
+      ck[k][j + 1] = ck[k][j] + 2.0 * w;
+    }
+  }
+  struct cand_t { double width, dn, mid, eh, el, N, dnk; };
   std::vector<cand_t> cands;
   for (size_t q = 0; q + 1 < qp.size(); ++q) {
     const long a = qp[q], b = qp[q + 1];
@@ -1389,12 +1408,23 @@ inline chemical_potential_t chemical_potential(std::vector<nda::array<double, 1>
     long idx = long(std::lower_bound(Es.begin(), Es.end(), mid) - Es.begin()) - 1;   // np.searchsorted(Es, mid) - 1
     if (idx < 0) idx += Mt;                                                          // python's negative index
     const double N = cum[idx];
-    cands.push_back({Es[b] - Es[a], std::abs(N - nelec), mid, Es[a], Es[b], N});
+    double dnk = 0.0;
+    for (long k = 0; k < nk; ++k) {
+      const long j = long(std::lower_bound(ek[k].begin(), ek[k].end(), mid) - ek[k].begin());   // poles with e < mid
+      dnk          = std::max(dnk, std::abs(ck[k][j] - nelec));
+    }
+    cands.push_back({Es[b] - Es[a], std::abs(N - nelec), mid, Es[a], Es[b], N, dnk});
   }
   utils::check(not cands.empty(), "cayley::chemical_potential: fewer than two quasiparticle poles");
   std::vector<cand_t> ok;
   for (auto const &c : cands)
     if (c.dn <= ntol) ok.push_back(c);
+  if (ntol_k > 0.0) {
+    std::vector<cand_t> ins;
+    for (auto const &c : ok)
+      if (c.dnk <= ntol_k) ins.push_back(c);
+    if (not ins.empty()) ok = std::move(ins);
+  }
   if (ok.empty())
     ok.push_back(*std::min_element(cands.begin(), cands.end(), [](auto const &x, auto const &y) { return x.dn < y.dn; }));
   auto best = *std::max_element(ok.begin(), ok.end(), [](auto const &x, auto const &y) { return x.width < y.width; });

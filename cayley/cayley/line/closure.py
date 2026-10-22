@@ -49,11 +49,15 @@ def lehmann_from_sigma(Hstat_rel, w, g, wp, K, tol_gram=1e-10, nphi=72):
     return e, V[:nb, :], dict(npoles=len(d), **info)
 
 
-def chemical_potential(e, v, nk, nelec, k_weight=None, qp_weight=0.1, ntol=0.5):
+def chemical_potential(e, v, nk, nelec, k_weight=None, qp_weight=0.1, ntol=0.5, ntol_k=0.5):
     """T=0 chemical potential for an approximate (moment-truncated) Lehmann G: the spectral weight below the physical gap is
     N_el only up to the moment/fit error, so exact filling would push mu across the gap. Candidate gaps are the intervals between
     consecutive quasiparticle-like poles (total weight > qp_weight) whose midpoint gives an electron count within ntol of nelec;
     among them the WIDEST gap is chosen (a near-degenerate multiplet split by noise must not be mistaken for the gap).
+    Insulator filter (D2, 2026-10-22): if some candidates fill EVERY k to within ntol_k of nelec (per-k count
+    2 sum_{e_m(k) < mid} |v_m|^2, no k weight), the choice is restricted to them. An isolated conduction valley (SiC X: 3 of 64 k,
+    k-weighted count 8.07, inside ntol) carries per-k counts N_el + 2Z there and is no longer taken for the gap; a metal has no
+    such candidate (per-k counts differ by 2Z across the Fermi surface) and keeps the rule above. ntol_k <= 0 disables the filter.
     Returns (mu_shift, e_homo, e_lumo, N(mu))."""
     nk_ = len(e)
     wk = np.full(nk_, 1.0 / nk_) if k_weight is None else np.asarray(k_weight) / np.sum(k_weight)
@@ -62,14 +66,22 @@ def chemical_potential(e, v, nk, nelec, k_weight=None, qp_weight=0.1, ntol=0.5):
     Wtot = np.concatenate([(np.abs(v[k]) ** 2).sum(0) for k in range(nk_)])                   # weight per pole (sum over orbitals)
     order = np.argsort(E); Es, Ws = E[order], Wt[order]; cum = np.cumsum(Ws)
     qp_idx = np.where(Wtot[order] > qp_weight)[0]
+    ek, ck = [], []                                                                            # per-k sorted poles, counts
+    for k in range(nk_):
+        o = np.argsort(e[k]); ek.append(np.asarray(e[k])[o])
+        ck.append(np.concatenate([[0.0], np.cumsum(2.0 * (np.abs(v[k]) ** 2).sum(0)[o])]))
     cands = []
     for a, b in zip(qp_idx[:-1], qp_idx[1:]):
         mid = 0.5 * (Es[a] + Es[b]); N = cum[np.searchsorted(Es, mid) - 1]
-        cands.append((Es[b] - Es[a], abs(N - nelec), mid, Es[a], Es[b], N))
+        dnk = max(abs(ck[k][np.searchsorted(ek[k], mid)] - nelec) for k in range(nk_))
+        cands.append((Es[b] - Es[a], abs(N - nelec), mid, Es[a], Es[b], N, dnk))
     ok = [c for c in cands if c[1] <= ntol]
+    ins = [c for c in ok if c[6] <= ntol_k] if ntol_k > 0 else []
+    if ins:
+        ok = ins
     if not ok:                                   # fall back to the best electron count
         ok = [min(cands, key=lambda c: c[1])]
-    width, dn, mu, e_homo, e_lumo, N = max(ok, key=lambda c: c[0])
+    width, dn, mu, e_homo, e_lumo, N, _ = max(ok, key=lambda c: c[0])
     return mu, e_homo, e_lumo, N
 
 

@@ -808,12 +808,18 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   out.e_lumo    = cp.e_lumo - cp.mu;
   out.N_mu      = cp.N;
   out.nel_lehmann = 0.0;
+  std::vector<double> kw_norm = p.k_weight;   // the logged counts with the k weights (IBZ: 2/nk overcounted the low-weight k)
+  if (kw_norm.empty()) kw_norm.assign(nk, 1.0);
+  {
+    const double ws = std::accumulate(kw_norm.begin(), kw_norm.end(), 0.0);
+    for (auto &x : kw_norm) x /= ws;
+  }
   for (long ik = 0; ik < nk; ++ik) {
     out.leh.e[ik] -= cp.mu;
     if (thermal_mu) continue;
     for (long m = 0; m < out.leh.e[ik].size(); ++m)
       if (out.leh.e[ik](m) < 0.0)
-        for (long i = 0; i < nb; ++i) out.nel_lehmann += 2.0 / double(nk) * std::norm(out.leh.v[ik](i, m));
+        for (long i = 0; i < nb; ++i) out.nel_lehmann += 2.0 * kw_norm[ik] * std::norm(out.leh.v[ik](i, m));
   }
   if (thermal_mu) {
     out.nel_lehmann = cp.N;   // N_T(mu) of the Lehmann G (k-weighted, Eq. fT_mu)
@@ -828,12 +834,7 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
     const double emax   = (gr.emax < 0.0) ? gp.lam : gr.emax;
     // S8b: near-mu pruning (iii) off in thermal mode (its purpose, a finite ray length, is served by the beta guard)
     const double e_near = (gr.emin_frac > 0.0 and not thermal_mu) ? gr.emin_frac * 0.5 * (out.e_lumo - out.e_homo) : 0.0;
-    std::vector<double> kw_n = p.k_weight;   // S8b: normalized k weights of the thermal count
-    if (thermal_mu) {
-      if (kw_n.empty()) kw_n.assign(nk, 1.0);
-      const double ws = std::accumulate(kw_n.begin(), kw_n.end(), 0.0);
-      for (auto &x : kw_n) x /= ws;
-    }
+    std::vector<double> kw_n = kw_norm;      // normalized k weights of the counts (IBZ: the star weights)
     std::vector<nda::array<double, 1>> ek(nk);
     std::vector<nda::array<ComplexType, 2>> vk(nk);
     out.dropped = out.dropped_sum = 0.0;
@@ -858,7 +859,7 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
         } else {
           keep.push_back(m);
           if (thermal_mu) out.nel_compressed += 2.0 * kw_n[ik] * numerics::line_dlr::fermi(e(m), th->tp.beta) * w;
-          else if (e(m) < 0.0) out.nel_compressed += 2.0 / double(nk) * w;
+          else if (e(m) < 0.0) out.nel_compressed += 2.0 * kw_n[ik] * w;
         }
       }
       ek[ik] = nda::array<double, 1>(long(keep.size()));
@@ -908,7 +909,7 @@ inline closure_out_t closure(boost::mpi3::communicator &comm, nda::array<Complex
   out.nel_compressed = 0.0;
   for (long ik = 0; ik < nk; ++ik)
     for (long m = 0; m < rh; ++m)
-      for (long i = 0; i < nb; ++i) out.nel_compressed += 2.0 / double(nk) * std::real(chole(ik, m, i, i));
+      for (long i = 0; i < nb; ++i) out.nel_compressed += 2.0 * kw_norm[ik] * std::real(chole(ik, m, i, i));
   Timer.stop("closure_compress");
   return out;
 }

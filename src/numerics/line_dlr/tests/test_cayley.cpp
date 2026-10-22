@@ -381,6 +381,36 @@ TEST_CASE("cayley_chemical_potential", "[numerics][cayley]") {
   CHECK(r.gap > 0.4);                                   // the wide gap, not the 1.5e-5 Ha noise split (which has better N)
 }
 
+TEST_CASE("cayley_chemical_potential_valley", "[numerics][cayley]") {
+  // D2 SiC (2026-10-22): an isolated conduction valley at one k must not be taken for the gap (gen_mu_valley_ref.py)
+  h5::file file(std::string(PROJECT_SOURCE_DIR) + "/tests/unit_test_files/gw_line/mu_valley.h5", 'r');
+  h5::group root(file);
+  auto g = root.open_group("mu_valley");
+  std::vector<nda::array<double, 1>> e_k(4);
+  std::vector<nda::array<dcomplex, 2>> v_k(4);
+  for (int k = 0; k < 4; ++k) {
+    nda::array<double, 2> vr;
+    nda::h5_read(g, "e_k" + std::to_string(k), e_k[k]);
+    nda::h5_read(g, "v_k" + std::to_string(k) + "_re", vr);
+    v_k[k] = nda::array<dcomplex, 2>(vr);
+  }
+  nda::array<double, 1> kw;
+  nda::h5_read(g, "k_weight", kw);
+  std::vector<double> kwv(kw.begin(), kw.end());
+  const double nel = read_attr<double>(g, "nelec"), qpw = read_attr<double>(g, "qp_weight"), ntol = read_attr<double>(g, "ntol");
+  for (std::string tag : {"new", "old"}) {
+    auto r = ldlr::chemical_potential(e_k, v_k, nel, kwv, qpw, ntol, tag == "new" ? 0.5 : 0.0);
+    std::cout << std::setprecision(10) << std::fixed << "\n[cayley] mu valley (" << tag << "): C++ mu " << r.mu << " gap " << r.gap
+              << " N " << r.N << " | python mu " << read_attr<double>(g, tag + "_mu") << std::scientific << "\n";
+    CHECK(std::abs(r.mu - read_attr<double>(g, tag + "_mu")) <= 1e-14);
+    CHECK(std::abs(r.e_homo - read_attr<double>(g, tag + "_e_homo")) <= 1e-14);
+    CHECK(std::abs(r.e_lumo - read_attr<double>(g, tag + "_e_lumo")) <= 1e-14);
+    CHECK(std::abs(r.N - read_attr<double>(g, tag + "_N")) <= 1e-12);
+  }
+  auto r = ldlr::chemical_potential(e_k, v_k, nel, kwv);   // default = the filter
+  CHECK(r.e_lumo < 0.1);                                    // the k3 valley is the conduction-band minimum
+}
+
 // =======================================================================
 //  5. (S7g, hidden) closure profile at production size (closure_bench.hpp); host LAPACK only here, the device variants
 //     run from test_gw_line_device "[.closure_bench_dev]"
