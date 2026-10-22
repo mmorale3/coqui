@@ -172,6 +172,23 @@ namespace solvers {
     }
 
     /**
+     * Process grid (t, P, Q) of the R-space polarization (eval_Pi_rpa_Rspace): t pools bounded so that the per-pool
+     * intermediates (ns nkpts Np^2 per pool) stay below Pi itself, the rest of the ranks on a (P, Q) grid.
+     */
+    static auto Pi_R_proc_grid(long nproc, long nt_half, long nqpts_ibz, long ns, long nkpts)
+    -> std::array<long, 3> {
+      // CNY: Memory for intermediate objects scales with ntpools.
+      // Therefore, we restrict ntpools*ns*nkpts*Np*Np*2 < nt_half*nqpts_ibz*Np*Np
+      long ntpools_max = std::max(long(nt_half * nqpts_ibz / (ns * nkpts * 2)), 1L);
+      while (nproc % ntpools_max != 0) ntpools_max -= 1;
+      long ntpools = utils::find_proc_grid_max_npools(nproc, nt_half, 0.2);
+      if (ntpools > ntpools_max) ntpools = ntpools_max;
+      long np_PQ = nproc / ntpools;
+      long np_P = utils::find_proc_grid_min_diff(np_PQ, 1, 1);
+      return {ntpools, np_P, np_PQ / np_P};
+    }
+
+    /**
      * Evaluate the screened interaction W in place from a Matsubara polarizability
      * @param dPi_wqPQ - [INPUT/OUTPUT] polarizability / screened interaction: (nw, nqpts_ibz, Np, Np)
      * @param thc      - [INTPUT] THC ERI object
@@ -331,6 +348,9 @@ namespace solvers {
     // READOUT instance (frozen secondary frame; W-bar_0 of this update, the W-bar cache on demand) and published as
     // mb_state.dSigma_pair_tskab
     void build_sigma_pair(MBState &mb_state, THC_ERI auto &thc);
+    /** the device preflight of this update's dynamic Sigma pass, run before the P-side ladder pass: the Sigma pass's setup up to
+     *  its device plan (logged; an impossible plan aborts before the hours of the P refresh). No unit runs, nothing is written. */
+    void preflight_sigma_pair(MBState &mb_state, THC_ERI auto &thc);
     // the interp file's column "Pi_<col>", q-matched to this mesh: (nw_half, nq, N_m, N_m), replicated (the read the
     // injection and the Sigma vertex share, with all of the consumer's consistency checks)
     nda::array<ComplexType, 4> read_pol_interp_column(std::string const &col, long nq_g, long nw_h_ft,
@@ -543,6 +563,15 @@ namespace solvers {
     // (vertex_t::cache_w) and dW is freed unconditionally --
     // plain-GW memory profile. Defined in the .cpp.
     bool needs_dw_retention() const;
+
+    /**
+     * Device memory preflight of update_w and of the GW self-energy that follows it: the per-rank peak of every stage
+     * (the polarization at its smallest row block, the imaginary-time transforms with their redistribution buffers,
+     * the Dyson step, the (t,q) -> (q,t) copy of W, the self-energy with W resident) from the array shapes and
+     * process grids, against the memory this rank may use (utils::device_budget_bytes). Logged as a table; a stage that
+     * cannot fit aborts here, before any work of the update (COQUI_DEVICE_PREFLIGHT=warn logs it and continues).
+     */
+    void device_preflight(THC_ERI auto &thc);
     // true iff the attached vertex adds to Sigma: pol_vertex_sigma = "pair" / "lff", or the Sigma^C vertex (vertex_type).
     // scf_loop projects Sigma_c onto its causal part by default in that case. Defined in the .cpp.
     bool sigma_vertex_active() const;

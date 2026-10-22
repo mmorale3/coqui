@@ -84,6 +84,8 @@ namespace solvers {
                                   // -- false = the shared aux grid with Dsq/Dcb (inu = 0 only)
       double readout_tol = 0.0;   // GMRES: stop when the physical readout D^dag Gsum moves by less than this
                                   // per cycle (0 = off); the criterion blind to readout-invisible modes
+      bool plan_only = false;     // the preflight call: run the setup up to the device plan of the pass (logged; an impossible
+                                  // plan aborts), then return before the first unit -- nothing is solved, deposited or written
       long rhs_block = 0;         // solve the Nm right-hand-side columns in blocks of this width (0 = all at
                                   // once): the Krylov basis (m + 1 tf_vectors of width nR) is the memory
                                   // driver; each block converges to tol independently (differences at tol)
@@ -1199,8 +1201,8 @@ namespace solvers {
                      "pair_space_ladder_dyn: the Sigma hook needs EVERY bosonic node ({} of {} given) unless sampled weights are set "
                      "(or the hook is a shared one: its node set over the P-side call and the Sigma-side call).", nu_list.size(), nw_b);
         utils::check(opt.dump_prefix.empty(), "pair_space_ladder_dyn: the Sigma hook and the unit dump/restart are exclusive.");
-        opt.sigma->init(nt, ns, nk, np, nc, b, nw_b);
-        if (rank == 0) {
+        if (not opt.plan_only) opt.sigma->init(nt, ns, nk, np, nc, b, nw_b);   // (the preflight call allocates nothing)
+        if (rank == 0 and not opt.plan_only) {
           auto const &h = *opt.sigma;
           app_log(1, "  [Sigma vertex, dynamic] Sigma hook armed: col {}, outer W {}; accumulators (nt {}, nk {}, np {}, nc {}) {}, {:.2f} GB per rank",
                   h.col, h.outer, nt, h.S_cst.shape(2), np, nc, h.single_acc ? "in ONE tau-resolved object" : "x 3", h.gb_acc());
@@ -1960,7 +1962,118 @@ namespace solvers {
       bool ue_tried = false;
       db::l0_table_store ue_store;
       sigma_dyn_dev sd_dev;                                // the Sigma deposits on the engine (off = the host deposits)
+      // the device-resident unit's configuration and its memory partition (the bytes kept free for the later device stages:
+      // rung builds, Sigma deposits, dressed legs) for nd_x rung representatives; the Sigma pass plans its deposits here
+      // (sigma_dyn_device_plan). Called before the unit loop (the preflight) and at the first transfer (the engine).
+      auto unit_config = [&](long nd_x, bool plan_log) {
+        dynbse_cuda::ue_config uc;
+        uc.np = np; uc.np_fit = b.np_fit; uc.nk = nk; uc.nc = nc; uc.ng = ng; uc.nt = nt; uc.nR_max = nrb;
+        uc.ndist = (rrank > 0 and not rrecon) ? rrank : nd_x; uc.n_kept = b.pf.n_kept; uc.nout = nout;   // R rung slots when frequency-factorized
+        // the reconstructed rung: the ndist representative rung slots and R resident factor slots; vertex_debug dyn_rung_recon_stage =
+        // the rungs reconstructed per gemm (the factors are read once per such gemm; each slot is one D^2 staging buffer)
+        uc.nfac = rrecon ? rrank : 0;
+        uc.recon_stage = long(vertex_debug::number("dyn_rung_recon_stage", 4.0));   // vertex_debug: dyn_rung_recon_stage
+        utils::check(uc.recon_stage >= 1, "pair_space_ladder_dyn: vertex_debug dyn_rung_recon_stage = {} must be >= 1.", uc.recon_stage);
+        uc.l0_fused = int(vertex_debug::number("dynbse_l0_fused", 2.0));        // vertex_debug: dynbse_l0_fused (0 | 1 | 2 = merged)
+        uc.l0_fz_cfg = int(vertex_debug::number("dynbse_l0_fz_cfg", 44.0));     // vertex_debug: dynbse_l0_fz_cfg
+        uc.l0_fz_bench = int(vertex_debug::number("dynbse_l0_fz_bench", 0.0)); // vertex_debug: dynbse_l0_fz_bench
+        uc.l0_asm_gemm = int(vertex_debug::number("dynbse_l0_asm_gemm", 1.0));  // vertex_debug: dynbse_l0_asm_gemm
+        // the memory policy of the dense rungs (pol_vertex_dyn_device_memory): the resident count and the sources of the others
+        // (device rebuild, needs the device rung builds = nosym meshes; pinned-host copy), and the device bytes the engine leaves
+        // free for the stages created after it -- rung builds, Sigma deposits, dressed legs -- computed with their own formulas.
+        // vertex_debug dynbse_dev_nres = n forces n resident rungs (exercises the non-resident paths); -1 = the most that fit.
+        {
+          auto const &mpol = dyn_device_memory_state();
+          const bool kb_will = vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0;
+          uc.nres = long(vertex_debug::number("dynbse_dev_nres", -1.0));   // vertex_debug: dynbse_dev_nres
+          // vertex_debug: dynbse_dev_rung_fuse = 1 packs the one-bare-rung and Gamma_1 inputs into one rung pass (more device
+          // memory; slower than two passes when the rungs are resident and the gemms are compute-bound)
+          uc.rung_fuse = int(vertex_debug::number("dynbse_dev_rung_fuse", 0.0));
+          // vertex_debug: dyn_rung_proj = 0 runs every factorized rung pass unprojected (the full tau output; the default projects
+          // it onto the n_kept refit directions after the first pass of every transfer -- l0_cuda.cuh, ue_config::fact_proj)
+          uc.fact_proj = int(vertex_debug::number("dyn_rung_proj", 1.0));
+          uc.stream = ue_stream ? 1 : 0;
+          if (ue_stream) { uc.rung_fuse = 0; uc.nres = 0; }
+          uc.partial_ok = kb_will ? 1 : 0;
+          // the block-batched rung pass (partial residency): the unit's RHS blocks, the rung inputs per block (2 when the dressed
+          // P-side pass adds the one-bare-rung column), and vertex_debug dynbse_dev_batch (-1 auto, 0 off, n = n blocks per group)
+          uc.nblk_want = (nout + nrb - 1) / nrb;
+          uc.batch_nin = (dressed_req and opt.sigma == nullptr and Pi_dyn1 != nullptr and not opt.one_rung_only) ? 2 : 1;
+          uc.batch = long(vertex_debug::number("dynbse_dev_batch", -1.0));   // vertex_debug: dynbse_dev_batch
+          uc.host_pin_gb = vertex_debug::number("dyn_host_pin_gb", 8.0);         // vertex_debug: dyn_host_pin_gb
+          uc.nonres_src = (mpol == "auto") ? 0 : (mpol == "rebuild" ? 1 : (mpol == "host" ? 2 : 3));
+          // the reconstructed rung: the non-resident node rungs are always reconstructed from the resident factors on the device
+          // ("auto" / "rebuild"); "resident" keeps every node rung resident; there is no pinned-host source
+          utils::check(not (rrecon and mpol == "host"), "pair_space_ladder_dyn: pol_vertex_dyn_device_memory = host has no meaning for the "
+                       "reconstructed rung (pol_vertex_dyn_rung_apply = reconstruct: the node rungs that are not resident are reconstructed "
+                       "from the resident factors K_r on the device). ABORTING: use auto (or resident).");
+          if (rrecon) uc.partial_ok = 1;
+          // (the frequency-factorized rung: its R slots K_r follow the same policy -- the non-resident ones are rebuilt from A_r
+          // on the device or copied from pinned host memory, once per rung pass, and every pass applies each K_r to all tau
+          // columns of its packed inputs)
+          utils::check(not (mpol == "rebuild" and not kb_will and not ue_stream),
+                       "pair_space_ladder_dyn: pol_vertex_dyn_device_memory = rebuild needs the device rung builds ({}). ABORTING: use "
+                       "auto or host.", "vertex_debug dynbse_dev_kbig = 0");
+          const long nrep_b = (rrank > 0) ? rrank : nd_x;
+          // (Wannier pairs: the deposits read the closure's residues, the legs are the MLWF-rotated ones -- the same objects as
+          // the host deposits'; the IBZ solve: the per-unit scratch and the star fold live on the device too)
+          const bool sd_will = opt.sigma != nullptr and sigma_dyn_device_ok(*opt.sigma);
+          const bool dr_will = dressed_req and (opt.sigma == nullptr or sd_will);
+          double later = 0.0;
+          const double kb_r = kb_will ? dynbse_cuda::ue_kb_bytes(ns, nq, Nm, nk, nc, nrep_b, nk_arr, sym ? symc->nsym : 1l) / 0.9 : 0.0;
+          const double fixed_r = 0.5e9 + 1.0e9 * vertex_debug::number("dyn_dev_extra_gb", 0.0);   // vertex_debug: dyn_dev_extra_gb
+          later += kb_r;
+          if (sd_will) {
+            dynbse_cuda::sd_config sc;
+            sc.nt = nt; sc.nw_f = long(tools.ft->Ttw_ff().shape(1)); sc.ns = ns; sc.nk = nk; sc.nc = nc; sc.np = np;
+            sc.np_fit = b.np_fit; sc.ng = ng; sc.Nm = Nm;
+            // the accumulators' and the scratch's k extents and the reference dump, as sigma_dyn_device_init will set them
+            auto const &hk = *opt.sigma;
+            const long nk_dep_e = (hk.nk_mesh > 0) ? hk.nk_mesh : nk;
+            const bool ibz_e = hk.ibz and hk.symc != nullptr and hk.symc->active;
+            sc.nk_acc = ibz_e ? hk.symc->nk_ibz : nk_dep_e;
+            sc.nk_scr = ibz_e ? hk.nk_rows(nk_dep_e) : 0;
+            if (hk.dump) { sc.dump_nw = tools.nw_b; sc.dump_nsk = long(vertex_debug::number("sigdyn_sketch", 8.0)); }
+            // the Sigma pass's device plan: everything resident when it fits next to the unit's floor, else the accumulator
+            // row cache and one dump node slot (logged; an impossible plan aborts here, before any unit)
+            auto other_at = [&](long r) { return kb_r + fixed_r + (dr_will ? dynbse_cuda::ue_dressed_bytes(ng, np, nk, nc, nout, r) / 0.9 : 0.0); };
+            uc.reserve_bytes = 0.0;
+            const auto pl = sigma_dyn_device_plan(uc, sc, nout, other_at, 1.0e6 * double(utils::freemem_device_effective()));
+            sigma_dyn_device_plan_report(pl, sc, rank, plan_log, sd_dev);
+            sd_dev.acc_rows = pl.acc_rows; sd_dev.dump_slots = pl.dump_slots;
+            sc.acc_rows = pl.acc_rows; sc.dump_slots = pl.dump_slots;
+            sd_dev.planned = true;
+            later += dynbse_cuda::ue_sd_bytes(sc, nrb) / 0.9 + pl.extra;
+          }
+          if (dr_will) later += dynbse_cuda::ue_dressed_bytes(ng, np, nk, nc, nout, nrb) / 0.9;
+          uc.reserve_bytes = later + fixed_r;
+          if (rank == 0 and plan_log)
+            app_log(1, "  [dynbse] device memory policy \"{}\": {:.2f} GB kept free for the later device stages (rung builds {}, "
+                       "Sigma deposits {}, dressed legs {})", mpol, uc.reserve_bytes / 1e9, kb_will, sd_will, dr_will);
+        }
+        return uc;
+      };
+      // THE PREFLIGHT of a Sigma pass, before any unit: the unit's configuration for this pass's rung representatives (the PH
+      // mirror pairs of the tau nodes, transfer-independent) and the deposits' device plan -- logged; an impossible plan aborts here
+      bool sd_planned = false;
+      if (ue_want and opt.sigma != nullptr and sigma_dyn_device_ok(*opt.sigma)) {
+        long nd0 = 0;
+        if (opt.dense_rung) {
+          std::vector<long> r0s;
+          for (long i = 0; i < nt; ++i) {
+            const long r0 = std::min(i, long(tools.t_mirror(i)));
+            if (std::find(r0s.begin(), r0s.end(), r0) == r0s.end()) r0s.push_back(r0);
+          }
+          nd0 = long(r0s.size());
+        }
+        (void)unit_config(nd0, true);
+        sd_planned = true;
+      }
 #endif
+      if (opt.plan_only) {                                 // the preflight call (scr_coulomb_t::preflight_sigma_pair): no unit runs
+        if (dyn_sched) MPI_Win_free(&win);
+        return;
+      }
       bool kb_dev = false;                                 // the rungs are built on the device (the host K_d arrays stay empty)
       if (met) { met->unit_diag = nda::array<double, 2>(nunits_all, 13); met->unit_diag() = 0.0; }
       const long cond_call = ladder_cond::next_call();     // this call's index in the open conditioning-meter pass (0: none)
@@ -2071,80 +2184,7 @@ namespace solvers {
 #if defined(ENABLE_CUDA)
         if (ue_want and not ue_tried) {                   // created at the first transfer (ndist is known), before its rungs
           ue_tried = true;
-          dynbse_cuda::ue_config uc;
-          uc.np = np; uc.np_fit = b.np_fit; uc.nk = nk; uc.nc = nc; uc.ng = ng; uc.nt = nt; uc.nR_max = nrb;
-          uc.ndist = (rrank > 0 and not rrecon) ? rrank : ndist; uc.n_kept = b.pf.n_kept; uc.nout = nout;   // R rung slots when frequency-factorized
-          // the reconstructed rung: the ndist representative rung slots and R resident factor slots; vertex_debug dyn_rung_recon_stage =
-          // the rungs reconstructed per gemm (the factors are read once per such gemm; each slot is one D^2 staging buffer)
-          uc.nfac = rrecon ? rrank : 0;
-          uc.recon_stage = long(vertex_debug::number("dyn_rung_recon_stage", 4.0));   // vertex_debug: dyn_rung_recon_stage
-          utils::check(uc.recon_stage >= 1, "pair_space_ladder_dyn: vertex_debug dyn_rung_recon_stage = {} must be >= 1.", uc.recon_stage);
-          uc.l0_fused = int(vertex_debug::number("dynbse_l0_fused", 2.0));        // vertex_debug: dynbse_l0_fused (0 | 1 | 2 = merged)
-          uc.l0_fz_cfg = int(vertex_debug::number("dynbse_l0_fz_cfg", 44.0));     // vertex_debug: dynbse_l0_fz_cfg
-          uc.l0_fz_bench = int(vertex_debug::number("dynbse_l0_fz_bench", 0.0)); // vertex_debug: dynbse_l0_fz_bench
-          uc.l0_asm_gemm = int(vertex_debug::number("dynbse_l0_asm_gemm", 1.0));  // vertex_debug: dynbse_l0_asm_gemm
-          // the memory policy of the dense rungs (pol_vertex_dyn_device_memory): the resident count and the sources of the others
-          // (device rebuild, needs the device rung builds = nosym meshes; pinned-host copy), and the device bytes the engine leaves
-          // free for the stages created after it -- rung builds, Sigma deposits, dressed legs -- computed with their own formulas.
-          // vertex_debug dynbse_dev_nres = n forces n resident rungs (exercises the non-resident paths); -1 = the most that fit.
-          {
-            auto const &mpol = dyn_device_memory_state();
-            const bool kb_will = vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0;
-            uc.nres = long(vertex_debug::number("dynbse_dev_nres", -1.0));   // vertex_debug: dynbse_dev_nres
-            // vertex_debug: dynbse_dev_rung_fuse = 1 packs the one-bare-rung and Gamma_1 inputs into one rung pass (more device
-            // memory; slower than two passes when the rungs are resident and the gemms are compute-bound)
-            uc.rung_fuse = int(vertex_debug::number("dynbse_dev_rung_fuse", 0.0));
-            // vertex_debug: dyn_rung_proj = 0 runs every factorized rung pass unprojected (the full tau output; the default projects
-            // it onto the n_kept refit directions after the first pass of every transfer -- l0_cuda.cuh, ue_config::fact_proj)
-            uc.fact_proj = int(vertex_debug::number("dyn_rung_proj", 1.0));
-            uc.stream = ue_stream ? 1 : 0;
-            if (ue_stream) { uc.rung_fuse = 0; uc.nres = 0; }
-            uc.partial_ok = kb_will ? 1 : 0;
-            // the block-batched rung pass (partial residency): the unit's RHS blocks, the rung inputs per block (2 when the dressed
-            // P-side pass adds the one-bare-rung column), and vertex_debug dynbse_dev_batch (-1 auto, 0 off, n = n blocks per group)
-            uc.nblk_want = (nout + nrb - 1) / nrb;
-            uc.batch_nin = (dressed_req and opt.sigma == nullptr and Pi_dyn1 != nullptr and not opt.one_rung_only) ? 2 : 1;
-            uc.batch = long(vertex_debug::number("dynbse_dev_batch", -1.0));   // vertex_debug: dynbse_dev_batch
-            uc.host_pin_gb = vertex_debug::number("dyn_host_pin_gb", 8.0);         // vertex_debug: dyn_host_pin_gb
-            uc.nonres_src = (mpol == "auto") ? 0 : (mpol == "rebuild" ? 1 : (mpol == "host" ? 2 : 3));
-            // the reconstructed rung: the non-resident node rungs are always reconstructed from the resident factors on the device
-            // ("auto" / "rebuild"); "resident" keeps every node rung resident; there is no pinned-host source
-            utils::check(not (rrecon and mpol == "host"), "pair_space_ladder_dyn: pol_vertex_dyn_device_memory = host has no meaning for the "
-                         "reconstructed rung (pol_vertex_dyn_rung_apply = reconstruct: the node rungs that are not resident are reconstructed "
-                         "from the resident factors K_r on the device). ABORTING: use auto (or resident).");
-            if (rrecon) uc.partial_ok = 1;
-            // (the frequency-factorized rung: its R slots K_r follow the same policy -- the non-resident ones are rebuilt from A_r
-            // on the device or copied from pinned host memory, once per rung pass, and every pass applies each K_r to all tau
-            // columns of its packed inputs)
-            utils::check(not (mpol == "rebuild" and not kb_will and not ue_stream),
-                         "pair_space_ladder_dyn: pol_vertex_dyn_device_memory = rebuild needs the device rung builds ({}). ABORTING: use "
-                         "auto or host.", "vertex_debug dynbse_dev_kbig = 0");
-            const long nrep_b = (rrank > 0) ? rrank : ndist;
-            // (Wannier pairs: the deposits read the closure's residues, the legs are the MLWF-rotated ones -- the same objects as
-            // the host deposits'; the IBZ solve: the per-unit scratch and the star fold live on the device too)
-            const bool sd_will = opt.sigma != nullptr and sigma_dyn_device_ok(*opt.sigma);
-            const bool dr_will = dressed_req and (opt.sigma == nullptr or sd_will);
-            double later = 0.0;
-            if (kb_will) later += dynbse_cuda::ue_kb_bytes(ns, nq, Nm, nk, nc, nrep_b, nk_arr, sym ? symc->nsym : 1l) / 0.9;
-            if (sd_will) {
-              dynbse_cuda::sd_config sc;
-              sc.nt = nt; sc.nw_f = long(tools.ft->Ttw_ff().shape(1)); sc.ns = ns; sc.nk = nk; sc.nc = nc; sc.np = np;
-              sc.np_fit = b.np_fit; sc.ng = ng; sc.Nm = Nm;
-              // the accumulators' and the scratch's k extents and the reference dump, as sigma_dyn_device_init will set them
-              auto const &hk = *opt.sigma;
-              const long nk_dep_e = (hk.nk_mesh > 0) ? hk.nk_mesh : nk;
-              const bool ibz_e = hk.ibz and hk.symc != nullptr and hk.symc->active;
-              sc.nk_acc = ibz_e ? hk.symc->nk_ibz : nk_dep_e;
-              sc.nk_scr = ibz_e ? hk.nk_rows(nk_dep_e) : 0;
-              if (hk.dump) { sc.dump_nw = tools.nw_b; sc.dump_nsk = long(vertex_debug::number("sigdyn_sketch", 8.0)); }
-              later += dynbse_cuda::ue_sd_bytes(sc, nrb) / 0.9;
-            }
-            if (dr_will) later += dynbse_cuda::ue_dressed_bytes(ng, np, nk, nc, nout, nrb) / 0.9;
-            uc.reserve_bytes = later + 0.5e9 + 1.0e9 * vertex_debug::number("dyn_dev_extra_gb", 0.0);   // vertex_debug: dyn_dev_extra_gb
-            if (rank == 0)
-              app_log(1, "  [dynbse] device memory policy \"{}\": {:.2f} GB kept free for the later device stages (rung builds {}, "
-                         "Sigma deposits {}, dressed legs {})", mpol, uc.reserve_bytes / 1e9, kb_will, sd_will, dr_will);
-          }
+          dynbse_cuda::ue_config uc = unit_config(ndist, not sd_planned);
           char why[256] = {0};
           ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
           if (ue) {                                       // the rung form (mirror pairs / frequency-factorized)
@@ -2241,8 +2281,12 @@ namespace solvers {
                 ? sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, opt.sigma->G_close, nk, nc, ng, epsG, Nm, tools, why_sd)
                 : sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, G_CC, nk, nc, ng, epsG, Nm, tools, why_sd);
             if (rank == 0)
-              app_log(1, "  [dynbse] device Sigma deposits: {}{}", ok ? "ON (accumulators resident, flushed at checkpoints and the end)"
-                                                                        : "OFF -- ", ok ? "" : why_sd);
+              app_log(1, "  [dynbse] device Sigma deposits: {}{}",
+                      ok ? ((sd_dev.acc_rows > 0 or sd_dev.dump_slots > 0)
+                                ? "ON (accumulator row cache / dump node slots of the preflight plan: write-back caches over the host "
+                                  "objects, written back at checkpoints and the end)"
+                                : "ON (accumulators resident, flushed at checkpoints and the end)")
+                         : "OFF -- ", ok ? "" : why_sd);
             if (ok) sd_flush_hook = [&]() { sigma_dyn_device_flush(*opt.sigma, sd_dev, ue.get()); };
             else dev_fallback("the device Sigma deposits", why_sd);
           } else if (ue and opt.sigma != nullptr and rank == 0) {
@@ -3390,6 +3434,15 @@ namespace solvers {
                    "legs out {:.1f} s, H2D/D2H {:.1f} s", rs_t[0], rs_t[1], rs_t[2], rs_t[3], rs_t[4]);
 #endif
       write_sig_ckpt();                                         // the finished run's accumulators (a restart loads them)
+#if defined(ENABLE_CUDA)
+      if (ue and sd_dev.on and (sd_dev.acc_rows > 0 or sd_dev.dump_slots > 0) and rank == 0) {
+        long n_a = 0, r_a = 0, n_d = 0;
+        double g_a = 0.0, g_d = 0.0, t_f = 0.0;
+        dynbse_cuda::ue_sd_flush_stats(ue.get(), &n_a, &r_a, &g_a, &n_d, &g_d, &t_f);
+        app_log(1, "  [dynbse] device Sigma deposits on rank 0: {} accumulator cache evictions ({} rows written back), {:.1f} GB moved; "
+                   "{} dump slot evictions, {:.1f} GB moved; {:.1f} s (loads + write-backs)", n_a, r_a, g_a, n_d, g_d, t_f);
+      }
+#endif
       if (sig_carry.on) {                                       // the earlier calls' deposits back (this call's are all in now)
         auto &h = *opt.sigma;
         h.S_cst += sig_carry.S;
@@ -4867,11 +4920,12 @@ namespace solvers {
     o.readout_tol = 1e-6;
     o.q_subset = std::addressof(qs);
     o.sigma = std::addressof(hook);
-    if (opt.dyn_ckpt_minutes > 0.0) { o.sigma_ckpt = mb_state.coqui_prefix + ".sigdyn_ckpt"; o.sigma_ckpt_minutes = opt.dyn_ckpt_minutes; }   // the Sigma-accumulator checkpoint
+    o.plan_only = opt.plan_only;                                      // the preflight call: the setup and the device plan only
+    if (opt.dyn_ckpt_minutes > 0.0 and not opt.plan_only) { o.sigma_ckpt = mb_state.coqui_prefix + ".sigdyn_ckpt"; o.sigma_ckpt_minutes = opt.dyn_ckpt_minutes; }   // the Sigma-accumulator checkpoint
     std::vector<std::string> ckpt_files;                              // this rank's checkpoint files (one per driver call)
     o.sigma_ckpt_files = std::addressof(ckpt_files);
     vd::dyn_meter dmet;
-    ladder_cond::begin("Sigma pass");                                 // the conditioning meter of the pass's static ladders
+    if (not opt.plan_only) ladder_cond::begin("Sigma pass");          // the conditioning meter of the pass's static ladders
     const double sw_pre = twatch.peek();                              // the Sigma call's phase walls
     // ---- the COARSE-SUBLATTICE Sigma vertex (pol_vertex_sc): dSigma(k) for every k of the mesh with the ladder's
     // internal momenta on the class of k modulo the sublattice (a shifted copy of the sublattice, closed under the
@@ -4991,6 +5045,11 @@ namespace solvers {
         if (not nus.empty())
           vd::pair_space_ladder_dyn(vin.G_CC, vin.Xb, vin.W0b, nda::array_view<ComplexType, 4>(vin.Wbh), view.kpq, view.kpq, tools, nus,
                                     nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), ov, &dmet, vin.symc_ptr());
+        if (opt.plan_only) {                                         // the preflight: the first class's plan is the pass's
+          hook.kmap = nullptr; hook.qmap = nullptr;
+          app_log(1, "  [Sigma vertex, dynamic] preflight of the Sigma pass done ({:.1f} s): the pass fits the device plan above", twatch.peek());
+          return;
+        }
         hook.flush_unit();                                           // this class's deposits of the last unit
         hook.kmap = nullptr; hook.qmap = nullptr;
         app_log(1, "  [Sigma vertex, dynamic] class {} of {} done ({} internal k points)", icl, classes.size(), view.nk_int);
@@ -4999,6 +5058,10 @@ namespace solvers {
     } else if (not nus.empty()) {
       vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
                                 nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o, &dmet, symc);
+    }
+    if (opt.plan_only) {
+      app_log(1, "  [Sigma vertex, dynamic] preflight of the Sigma pass done ({:.1f} s): the pass fits the device plan above", twatch.peek());
+      return;
     }
     const double sw_drv = twatch.peek();
     const double gb_acc = hook.gb_acc(), gb_scr = hook.gb_scr(), gb_dump = hook.gb_dump();   // the memory line below

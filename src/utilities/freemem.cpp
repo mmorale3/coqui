@@ -57,6 +57,23 @@ std::size_t freemem_device()
 #endif
 }
 
+std::string device_id()
+{
+#if defined(ENABLE_CUDA)
+  int dev = 0;
+  char bus[32] = {0};
+  if (cudaGetDevice(&dev) != cudaSuccess or cudaDeviceGetPCIBusId(bus, sizeof(bus), dev) != cudaSuccess) return {};
+  return std::string(bus);
+#elif defined(ENABLE_HIP)
+  int dev = 0;
+  char bus[32] = {0};
+  if (hipGetDevice(&dev) != hipSuccess or hipDeviceGetPCIBusId(bus, sizeof(bus), dev) != hipSuccess) return {};
+  return std::string(bus);
+#else
+  return {};
+#endif
+}
+
 void device_sync()
 {
 #if defined(ENABLE_CUDA)

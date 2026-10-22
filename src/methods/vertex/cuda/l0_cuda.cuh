@@ -186,6 +186,9 @@ namespace methods::solvers::dynbse_cuda {
   void ue_destroy(unit_engine *e);
   /** bytes the engine needs for a configuration (the caller's feasibility check; nres < 0 counts every rung resident) */
   double ue_bytes(ue_config const &c);
+  /** the smallest configuration ue_create would try for `c` (the least rung residency, staging and block grouping it allows):
+   *  the unit's floor for the device memory plan of a pass */
+  double ue_min_bytes(ue_config const &c);
   /** the resident tau rungs of an engine (== ndist: all), and the non-resident rebuilds so far (count, wall seconds) */
   long ue_nres(unit_engine const *e);
   /** the reconstructed rung: the staging slots the engine allocated (ue_create lowers ue_config::recon_stage when that many do
@@ -298,6 +301,13 @@ namespace methods::solvers::dynbse_cuda {
     // the number of bosonic nodes (0 = no dump), dump_nsk = the number of random sketch contractions of the T family (0 = none).
     // Device-resident Hc (nw, ns, nt, nk_dep, nc2), HT (nw, ns, np, nk_dep, nc2), HS (nw, ns, np, nk_dep, nsk), the host's layouts.
     long dump_nw = 0, dump_nsk = 0;
+    // THE DEVICE FOOTPRINT (0 = everything resident, the layouts above). acc_rows < nk_acc (the IBZ solve only): the device
+    // holds a WRITE-BACK cache of that many accumulator k rows over the host accumulators (ue_sd_set_host; pinned staging): the
+    // star fold loads a target's host row on a miss and, when the cache is full, writes every cached row back. dump_slots <
+    // dump_nw: the reference dump keeps that many bosonic nodes on the device the same way (a unit of another node loads its
+    // host block, evicting the slots when all are taken). The device adds every deposit onto the value the resident path would
+    // hold: bitwise identical when the host objects start at zero (a loaded checkpoint / a carried hook: rounding class).
+    long acc_rows = 0, dump_slots = 0;
   };
   /** run-wide: Ttw_ff (nt, nw_f) the fermionic w -> tau matrix; Uw (nw_f, np) = 1 / (i w_n - e_a); Gw (nw_f, ns, nk, nc, nc)
    *  G on the fermionic nodes; eps (np), epsG (ng) for the confluence check. Allocates and zeroes the accumulators. false
@@ -323,6 +333,13 @@ namespace methods::solvers::dynbse_cuda {
   /** ADD the device accumulators into the host ones -- S_cst (nt, ns, nk_acc, nc, nc), RT / RU (nt, ns, nk_acc, np, nc, nc) -- and
    *  zero them (the pending unit scratch, if any, must have been folded: ue_sd_fold) */
   void ue_sd_flush(unit_engine *e, cplx *S_cst, cplx *RT, cplx *RU);
+  /** the host targets of the partial flushes (sd_config::acc_rows / dump_slots below full residency): the accumulators (the
+   *  ue_sd_flush layouts) and the dump (the ue_sd_flush_dump layouts; HS may be nullptr). Required before the first fold /
+   *  node change when either cache is active. */
+  void ue_sd_set_host(unit_engine *e, cplx *S_cst, cplx *RT, cplx *RU, cplx *Hc, cplx *HT, cplx *HS);
+  /** the write-back caches so far: accumulator cache evictions (count, rows written back) and the GB moved (loads + write-backs),
+   *  dump slot evictions (count) and the GB moved, their wall seconds */
+  void ue_sd_flush_stats(unit_engine const *e, long *n_acc, long *rows_acc, double *gb_acc, long *n_dump, double *gb_dump, double *t);
   /** the reference dump: the sketch contractions Om (nsk, nc2, nc2) row-major (once, after ue_sd_init with dump_nsk > 0) */
   void ue_sd_set_dump(unit_engine *e, cplx const *Om);
   /** the reference dump: the bosonic node m of the following blocks (the dump's first index) */

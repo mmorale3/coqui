@@ -10,6 +10,7 @@
 #include "utilities/mpi_context.h"
 #include "utilities/Timer.hpp"
 #include "utilities/freemem.h"
+#include "utilities/device_budget.hpp"
 #include "IO/app_loggers.h"
 
 #include "mean_field/MF.hpp"
@@ -47,15 +48,8 @@ namespace solvers {
     size_t nt_half = (nt_f % 2 == 0)? nt_f / 2 : nt_f / 2 + 1;
     double sp_factor = (ns == 2)? -1.0 : -2.0;
 
-    // CNY: Memory for intermediate objects scales with ntpools.
-    // Therefore, we restrict ntpools*ns*nkpts*Np*Np*2 < nt_half*nqpts_ibz*Np*Np
-    long ntpools_max = std::max(long(nt_half * nqpts_ibz / (ns * nkpts * 2)), 1L);
-    while (mpi->comm.size()%ntpools_max !=0) ntpools_max -= 1;
-    long ntpools = utils::find_proc_grid_max_npools(mpi->comm.size(), nt_half, 0.2);
-    if (ntpools > ntpools_max) ntpools = ntpools_max;
-    int np_PQ = mpi->comm.size() / ntpools;
-    int np_P = utils::find_proc_grid_min_diff(np_PQ, 1, 1);
-    int np_Q = np_PQ / np_P;
+    auto [ntpools, np_P_l, np_Q_l] = Pi_R_proc_grid(mpi->comm.size(), nt_half, nqpts_ibz, ns, nkpts);
+    int np_P = int(np_P_l), np_Q = int(np_Q_l);
     utils::check(ntpools > 0 and ntpools <= nt_half, "scr_coulomb_t::eval_Pi_rpa_Rspace: ntpools <= 0 or ntpools > nt_half");
     utils::check(mpi->comm.size() % ntpools == 0,
                  "scr_coulomb_t::eval_Pi_rpa_Rspace: gcomm.size() % ntpools({}) != 0", ntpools);
@@ -98,6 +92,136 @@ namespace solvers {
     // Setup t_intra_comm
     mpi3::communicator t_intra_comm = mpi->comm.split(t_origin, mpi->comm.rank());
     utils::check(t_intra_comm.size()==np_P*np_Q, "t_intra_comm.size() = {} != np_P*np_Q", t_intra_comm.size());
+
+#if defined(ENABLE_DEVICE)
+    if constexpr (MEM != HOST_MEMORY) {
+      // DEVICE: the k-sized intermediates -- G(t) and G(beta-t) in R space, the IBZ -> full-mesh buffer, the FT output --
+      // and the staged THC factors scale with the rank's P rows. When they do not fit next to Pi they run over blocks of
+      // P rows: the same products, one row block at a time (the THC factors are staged once per block, not per call).
+      // The plan is logged; a device that cannot hold even one row aborts here, before any work.
+      decltype(nda::range::all) all;
+      const long nk_nt = nkpts_no_trev;
+      const long nbnd = G_tskij.shape(4);
+      // bytes per P row of a block: Gp, Gn (ns nk), buf (ns nk_nt), the FT output (nk), the Pi staging (nq), the spin
+      // scratch (nk, ns > 1), the left THC factor (ns nk_nt nbnd), the transform scratch (NQ + nbnd)
+      const double row_b = 16.0 * (double(NQ_loc) * double(2 * ns * nkpts + ns * nk_nt + nkpts + nqpts_ibz + (ns > 1 ? nkpts : 0) + 1) +
+                                   double(ns * nk_nt * nbnd + nbnd));
+      // fixed: the right THC factor and the (nbnd x nbnd) transform input
+      const double fix_b = 16.0 * double(ns * nk_nt * NQ_loc * nbnd + nbnd * nbnd);
+      const double budget = utils::device_budget_bytes(mpi->node_comm);
+      long nPc = NP_loc;
+      if (NP_loc > 0 and fix_b + row_b * double(NP_loc) > budget)
+        nPc = std::min(long(NP_loc), long(std::floor((budget - fix_b) / row_b)));
+      // COQUI_PI_ROW_BLOCK = n caps the rows per block (tests and diagnostics; 0 or unset: from the budget alone)
+      if (const char *v = std::getenv("COQUI_PI_ROW_BLOCK"); v != nullptr and std::atol(v) > 0)
+        nPc = std::min(nPc, std::atol(v));
+      long nPc_min = mpi->comm.all_reduce_value(nPc, boost::mpi3::min<>{});
+      const double need1 = fix_b + row_b;
+      double budget_min = mpi->comm.all_reduce_value(budget, boost::mpi3::min<>{});
+      utils::check(nPc_min >= 1,
+                   "scr_coulomb_t::eval_Pi_rpa_Rspace: the device cannot hold the polarization's work arrays next to Pi: one P row "
+                   "needs {:.2f} GB, {:.2f} GB are available on the fullest device (after Pi {:.2f} GB per rank and the {:.1f} GB "
+                   "reserve, COQUI_DEVICE_RESERVE_GB). Use more devices (ranks), a device with more memory, or a smaller THC rank.",
+                   need1 / 1e9, budget_min / 1e9, 16.0 * double(nt_loc * nq_loc * NP_loc * NQ_loc) / 1e9,
+                   utils::device_reserve_bytes() / 1e9);
+      const long nchunk = (NP_loc + nPc - 1) / std::max(nPc, 1l);
+      long nchunk_max = mpi->comm.all_reduce_value(nchunk, boost::mpi3::max<>{});
+      app_log(nchunk_max > 1 ? 1 : 2,
+              "  [Pi device plan] Pi {:.2f} GB/rank; work arrays {:.2f} GB/rank for the full {} P rows, {:.2f} GB available on "
+              "the fullest device -> {}", 16.0 * double(nt_loc * nq_loc * NP_loc * NQ_loc) / 1e9,
+              (fix_b + row_b * double(NP_loc)) / 1e9, NP_loc, budget_min / 1e9,
+              nchunk_max > 1 ? "blocks of " + std::to_string(nPc_min) + " P rows (" + std::to_string(nchunk_max) + " blocks)"
+                             : std::string("one block"));
+
+      using dev_4D_t = memory::array<DEVICE_MEMORY, ComplexType, 4>;
+      dev_4D_t Gp, Gn, buf, Xl;
+      memory::array<DEVICE_MEMORY, ComplexType, 2> X_R;
+      memory::array<DEVICE_MEMORY, ComplexType, 3> T_qPQ;
+      auto Xr = thc_solver_comm::stage_X(thc, 0, ns, nk_nt, Q_origin, NQ_loc);
+      _Timer.stop("PI_ALLOC_R");
+      auto Pi_tqPQ_loc = dPi_tqPQ.local();
+      // G(+-t) of this block: primary -> aux on the non-trev k points, the trev partners by conjugation, then k -> R
+      const long nQ = NQ_loc;                    // (a plain copy: the lambda below does not capture structured bindings)
+      auto setup_G = [&](long it_g, dev_4D_t &Gx, long np) {
+        _Timer.start("PI_PRIM_TO_AUX");
+        thc_solver_comm::primary_to_aux_staged(G_tskij(it_g, nda::ellipsis{}), buf, Xl, Xr, MF->kp_to_ibz(), MF->kp_trev());
+        _Timer.stop("PI_PRIM_TO_AUX");
+        for (size_t ik = 0; ik < nkpts; ++ik) {
+          auto dst = Gx(all, ik, all, all);
+          if (kp_trev(ik)) {
+            dst = buf(all, kp_trev_pair(ik), all, all);
+            nda::tensor::scale(ComplexType(1.0), dst, nda::tensor::op::CONJ);
+          } else {
+            dst = buf(all, ik, all, all);
+          }
+        }
+        if (nkpts != 1) {
+          _Timer.start("PI_FT_R");
+          for (size_t is = 0; is < ns; ++is) {
+            auto GR_2D = nda::reshape(Gx(is, nda::ellipsis{}), shape_t<2>{nkpts, np * nQ});
+            nda::blas::gemm(get_f_Rk(), GR_2D, X_R);
+            GR_2D = X_R;
+          }
+          _Timer.stop("PI_FT_R");
+        }
+      };
+      for (long c = 0; c < nchunk; ++c) {
+        const long p0 = c * nPc, np = std::min(nPc, long(NP_loc) - p0);
+        _Timer.start("PI_ALLOC_R");
+        if (Gp.shape(2) != np) {
+          Gp = dev_4D_t(ns, nkpts, np, NQ_loc);
+          Gn = dev_4D_t(ns, nkpts, np, NQ_loc);
+          buf = dev_4D_t(ns, nk_nt, np, NQ_loc);
+          X_R = memory::array<DEVICE_MEMORY, ComplexType, 2>(nkpts, np * NQ_loc);
+          if (nchunk > 1) T_qPQ = memory::array<DEVICE_MEMORY, ComplexType, 3>(nqpts_ibz, np, NQ_loc);
+        }
+        Xl = thc_solver_comm::stage_X(thc, 0, ns, nk_nt, P_origin + p0, np);
+        if (c == 0) utils::memory_report(2, "eval_Pi_rpa_Rspace: after the work arrays of the first P block");
+        _Timer.stop("PI_ALLOC_R");
+        for (size_t it = 0; it < nt_loc; it++) {
+          setup_G(it + t_origin, Gp, np);
+          setup_G(G_tskij.shape(0) - it - t_origin - 1, Gn, np);
+
+          // Hadamard product: GG = sp_factor sum_s Gp_s conj(Gn_s), in the storage of Gp(0)
+          _Timer.start("PI_HADPROD_R");
+          auto GG_RPQ = Gp(0, nda::ellipsis{});
+          nda::tensor::elementwise(ComplexType(1.0), nda::conj(Gn(0, nda::ellipsis{})), "RPQ",
+                                   ComplexType(1.0), GG_RPQ, "RPQ", nda::tensor::op::MUL);
+          for (long s = 1; s < ns; ++s) {
+            memory::array<DEVICE_MEMORY, ComplexType, 3> tmp_RPQ(GG_RPQ.shape());
+            tmp_RPQ() = Gp(s, nda::ellipsis{});
+            nda::tensor::elementwise(ComplexType(1.0), nda::conj(Gn(s, nda::ellipsis{})), "RPQ",
+                                     ComplexType(1.0), tmp_RPQ, "RPQ", nda::tensor::op::MUL);
+            nda::tensor::elementwise(ComplexType(1.0), tmp_RPQ, "RPQ",
+                                     ComplexType(1.0), GG_RPQ, "RPQ", nda::tensor::op::SUM);
+          }
+          nda::tensor::scale(ComplexType(sp_factor), GG_RPQ);
+          _Timer.stop("PI_HADPROD_R");
+
+          if (nkpts != 1) {
+            // FT back to q-space
+            _Timer.start("PI_FT_R");
+            auto GGR_2D = nda::reshape(GG_RPQ, shape_t<2>{nkpts, np * NQ_loc});
+            if (nchunk == 1) {
+              auto Piq_2D = nda::reshape(Pi_tqPQ_loc(it, nda::ellipsis{}), shape_t<2>{nqpts_ibz, NP_loc * NQ_loc});
+              nda::blas::gemm(get_f_qR(), GGR_2D, Piq_2D);
+            } else {
+              auto T_2D = nda::reshape(T_qPQ, shape_t<2>{nqpts_ibz, np * NQ_loc});
+              nda::blas::gemm(get_f_qR(), GGR_2D, T_2D);
+              for (size_t iq = 0; iq < nqpts_ibz; ++iq)
+                Pi_tqPQ_loc(it, iq, nda::range(p0, p0 + np), all) = T_qPQ(iq, all, all);
+            }
+            _Timer.stop("PI_FT_R");
+          } else {
+            Pi_tqPQ_loc(it, 0, nda::range(p0, p0 + np), all) = GG_RPQ(0, all, all);
+          }
+        } // it
+      } // P blocks
+      dPi_tqPQ.communicator()->barrier();
+      _Timer.stop("EVALUATE_PI_R");
+      return dPi_tqPQ;
+    }
+#endif
 
     // The total memory requirement is ntpools*ns*nkpts*Np*Np rather than nt*ns*nkpts*Np*Np
     auto dGp_sRPQ = make_distributed_array<local_Array_4D_t>(

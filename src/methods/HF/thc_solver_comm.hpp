@@ -356,6 +356,64 @@ namespace methods {
         O_IPQ.communicator()->all_reduce_in_place_n(O_Iab.data(), O_Iab.size(), std::plus<>{});
       }
 
+#if defined(ENABLE_DEVICE)
+      /**
+       * Device copy of the THC collocation factors used by primary_to_aux_staged:
+       * rows [P0, P0 + nP) of X(s, ip, k) for every spin s < ns and k point k < nkpts.
+       * @return (ns, nkpts, nP, nbnd) on the device
+       */
+      template<THC_ERI thc_t>
+      static auto stage_X(thc_t &thc, int ip, long ns, long nkpts, long P0, long nP)
+      -> memory::array<DEVICE_MEMORY, ComplexType, 4> {
+        decltype(nda::range::all) all;
+        long nbnd = thc.X(0, ip, 0).shape(1);
+        nda::range P_rng(P0, P0 + nP);
+        nda::array<ComplexType, 4> X_host(ns, nkpts, nP, nbnd);
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < nkpts; ++k) X_host(s, k, all, all) = thc.X(s, ip, k)(P_rng, all);
+        return memory::to_memory_space<DEVICE_MEMORY>(X_host);
+      }
+
+      /**
+       * Basis transformation from the primary basis to the THC auxiliary basis on the device, with the
+       * collocation factors staged once by the caller (stage_X) instead of on every call:
+       *         O_skPQ(s, k) = Xl(s, k) * O(s, kp_map(k)) * Xr(s, k)^dag   (O^T when kp_trev(k)).
+       * The arithmetic is that of the device branch of _primary_to_aux_impl.
+       * @param O_skab - [INPUT] (ns, nkpts_ibz, nbnd, nbnd) in the primary basis (host)
+       * @param O_skPQ - [OUTPUT] (ns, nkpts, nP, nQ) on the device, nkpts <= Xl.shape(1)
+       * @param Xl     - [INPUT] (ns, nkpts, nP, nbnd): rows of the left factor (stage_X)
+       * @param Xr     - [INPUT] (ns, nkpts, nQ, nbnd): rows of the right factor (stage_X)
+       */
+      template<nda::MemoryArrayOfRank<4> Array_primary_t>
+      static void primary_to_aux_staged(const Array_primary_t &O_skab,
+                                        memory::array<DEVICE_MEMORY, ComplexType, 4> &O_skPQ,
+                                        memory::array<DEVICE_MEMORY, ComplexType, 4> const &Xl,
+                                        memory::array<DEVICE_MEMORY, ComplexType, 4> const &Xr,
+                                        nda::ArrayOfRank<1> auto const& kp_map,
+                                        nda::ArrayOfRank<1> auto const& kp_trev) {
+        decltype(nda::range::all) all;
+        long ns = O_skPQ.shape(0), nkpts = O_skPQ.shape(1), nP = O_skPQ.shape(2), nQ = O_skPQ.shape(3);
+        long nbnd = O_skab.shape(2);
+        utils::check(Xl.shape(2) == nP and Xr.shape(2) == nQ and Xl.shape(1) >= nkpts and Xr.shape(1) >= nkpts,
+                     "primary_to_aux_staged: X factor shapes do not match the output block.");
+        memory::array<DEVICE_MEMORY, ComplexType, 2> Oab_dev(nbnd, nbnd);
+        memory::array<DEVICE_MEMORY, ComplexType, 2> Ask_Pb_dev(nP, nbnd);
+        memory::array<DEVICE_MEMORY, ComplexType, 2> O_PQ_dev(nP, nQ);
+        for (long s = 0; s < ns; ++s) {
+          for (long k = 0; k < nkpts; ++k) {
+            Oab_dev = O_skab(s, kp_map(k), all, all);
+            if (kp_trev(k)) {
+              nda::blas::gemm(Xl(s, k, all, all), nda::transpose(Oab_dev), Ask_Pb_dev);
+            } else {
+              nda::blas::gemm(Xl(s, k, all, all), Oab_dev, Ask_Pb_dev);
+            }
+            nda::blas::gemm(Ask_Pb_dev, nda::dagger(Xr(s, k, all, all)), O_PQ_dev);
+            O_skPQ(s, k, all, all) = O_PQ_dev;
+          }
+        }
+      }
+#endif
+
     private:
       /**
        * Internal implementation of transformation from a primary basis to a THC auxiliary basis:

@@ -1480,6 +1480,18 @@ namespace methods::solvers::dynbse_cuda {
     std::vector<long> htgt;
     long m_dump = -1;
     bool om_set = false;
+    // the device footprint (sd_config::acc_rows / dump_slots): nrow accumulator rows on the device (nk_acc = all resident; fewer =
+    // a row cache, row_of: k -> row or -1, k_of: row -> k, nused rows taken); nslot dump node slots (dump_nw = all; fewer: slot_m:
+    // slot -> node, nsused taken, slot = the current node's slot); the host targets of the partial flushes and their staging
+    long nrow = 0, nused = 0, nslot = 0, nsused = 0, slot = -1;
+    std::vector<long> row_of, k_of, slot_m;
+    cplx *hS = nullptr, *hRT = nullptr, *hRU = nullptr, *hHc = nullptr, *hHT = nullptr, *hHS = nullptr;
+    cplx *pin = nullptr;
+    size_t pin_n = 0;
+    long n_acc_fl = 0, rows_acc_fl = 0, n_dump_fl = 0;
+    double b_acc_fl = 0.0, b_dump_fl = 0.0, t_fl = 0.0;
+    bool row_cache() const { return nrow < nk_acc; }
+    bool slot_cache() const { return c.dump_nw > 0 and nslot < c.dump_nw; }
     cd **qA = nullptr, **qB = nullptr, **qC = nullptr;
     unsigned long long *red = nullptr;
     std::vector<cplx> Ttw_h;
@@ -1663,6 +1675,46 @@ namespace methods::solvers::dynbse_cuda {
   }
 
 
+  double ue_min_bytes(ue_config const &c_in) {
+    // ue_create's candidate set without the budget: every residency, staging count and block grouping it may try
+    const bool recon = (c_in.nfac > 0 and not c_in.stream);
+    const bool can_rebuild = recon ? (c_in.nonres_src != 3)
+                                   : ((c_in.partial_ok != 0) and c_in.nonres_src != 2 and c_in.nonres_src != 3);
+    const bool can_copy = (not recon) and (c_in.nonres_src == 0 or c_in.nonres_src == 2);
+    const bool partial_allowed = (c_in.nonres_src != 3) and (can_rebuild or can_copy);
+    double least = -1.0;
+    auto take = [&](ue_config const &x) {
+      const double b = ue_bytes(x);
+      if (least < 0.0 or b < least) least = b;
+    };
+    if (c_in.stream) {
+      ue_config x = c_in;
+      x.nres = 0; x.rung_fuse = 0; x.nblk = 1;
+      take(x);
+      return least;
+    }
+    const long st_hi = recon ? std::max(1l, c_in.recon_stage) : 1l;
+    for (long st = 1; st <= st_hi; ++st) {
+      ue_config x = c_in;
+      if (recon) x.recon_stage = st;
+      x.rung_fuse = 0; x.nblk = 1;
+      if (c_in.nres >= 0) { x.nres = std::min(c_in.nres, c_in.ndist); take(x); }
+      else {
+        x.nres = c_in.ndist; take(x);
+        if (partial_allowed) for (long n = c_in.ndist - 1; n >= 0; --n) { x.nres = n; take(x); }
+      }
+      if (c_in.nblk_want > 1 and c_in.batch != 0 and partial_allowed) {
+        const long gmax = (c_in.batch > 0) ? std::min(c_in.batch, c_in.nblk_want) : c_in.nblk_want;
+        const long gmin = (c_in.batch > 0) ? gmax : 2;
+        const long n_hi = (c_in.nres >= 0) ? std::min(c_in.nres, c_in.ndist - 1) : c_in.ndist - 1;
+        const long n_lo = (c_in.nres >= 0) ? n_hi : 0;
+        for (long g = gmax; g >= gmin; --g)
+          for (long n = n_hi; n >= n_lo; --n) { x.nres = n; x.nblk = g; take(x); }
+      }
+    }
+    return least;
+  }
+
   // the device bytes of the stages created after the unit (one source of truth for their own checks and for
   // the unit's memory partition, which keeps exactly this much free for them)
   double ue_kb_bytes(long ns, long nq, long Nm, long nk, long nc, long nrep, long nk_arr, long nsym) {
@@ -1674,7 +1726,8 @@ namespace methods::solvers::dynbse_cuda {
   double ue_sd_bytes(sd_config const &c, long R) {
     const long nt = c.nt, nw = c.nw_f, ns = c.ns, nk = c.nk, nc2 = c.nc * c.nc, np = c.np, ng = c.ng, Nm = c.Nm, D = nk * nc2;
     const double W = double(D) * double(R);
-    const long nka = (c.nk_acc > 0) ? c.nk_acc : nk, nks = c.nk_scr;
+    const long nka_all = (c.nk_acc > 0) ? c.nk_acc : nk, nks = c.nk_scr;
+    const long nka = (c.acc_rows > 0 and c.acc_rows < nka_all) ? c.acc_rows : nka_all;   // the accumulator rows on the device
     const double acc = double(nt * ns * nc2) * (1.0 + 2.0 * double(np)) * double(nka + nks) +
                        (nks > 0 ? 2.0 * double(nt * np * nc2) : 0.0);
     const double blk = W * (3.0 + 2.0 * double(nw) + double(nt)) + double(R * Nm) + double(ng * nk * nc2) +
@@ -1682,8 +1735,9 @@ namespace methods::solvers::dynbse_cuda {
     const double per_a = double(nk) * (2.0 * double(nc2 * nc2) + double(ng * nc2));
     double dump = 0.0;
     if (c.dump_nw > 0) {
-      const double nkd = double(nks > 0 ? nks : nka);
-      dump = double(c.dump_nw * ns) * nkd * (double(nt * nc2) + double(np * nc2) + double(np * c.dump_nsk)) +
+      const double nkd = double(nks > 0 ? nks : nka_all);
+      const long nsl = (c.dump_slots > 0 and c.dump_slots < c.dump_nw) ? c.dump_slots : c.dump_nw;   // the dump's node slots
+      dump = double(nsl * ns) * nkd * (double(nt * nc2) + double(np * nc2) + double(np * c.dump_nsk)) +
              double(c.dump_nsk * nc2 * nc2) + double(nt) * W;
     }
     return 16.0 * (acc + blk + per_a + dump) + 64.0e6;
@@ -1883,6 +1937,7 @@ namespace methods::solvers::dynbse_cuda {
       if (p) (void)cudaFree(p);
     for (void *p : e->sd.allocs)
       if (p) (void)cudaFree(p);
+    if (e->sd.pin) (void)cudaFreeHost(e->sd.pin);
     for (void *p : e->kb.allocs)
       if (p) (void)cudaFree(p);
     for (void *p : e->dr.allocs)
@@ -2842,7 +2897,21 @@ namespace methods::solvers::dynbse_cuda {
     s.nk_acc = (c.nk_acc > 0) ? c.nk_acc : nk;
     s.nk_scr = c.nk_scr;
     s.nk_dep = (s.nk_scr > 0) ? s.nk_scr : s.nk_acc;
-    const size_t nS = size_t(nt * ns * s.nk_acc * nc2);
+    // the device footprint: the accumulator rows (a row cache only behind the IBZ solve's scratch: the plain deposits address
+    // every k of the accumulators directly) and the dump's node slots
+    s.nrow = (c.acc_rows > 0 and c.acc_rows < s.nk_acc) ? c.acc_rows : s.nk_acc;
+    if (s.row_cache() and s.nk_scr <= 0)
+      APP_ABORT(std::string(" ue_sd_init: an accumulator row cache (") + std::to_string(s.nrow) + " of " + std::to_string(s.nk_acc) +
+                " rows) needs the IBZ solve's unit scratch (the plain deposits address every accumulator row) -- ABORTING.");
+    s.nused = 0;
+    s.row_of.assign(size_t(s.row_cache() ? s.nk_acc : 0), -1l);
+    s.k_of.assign(size_t(s.row_cache() ? s.nrow : 0), -1l);
+    s.nslot = (c.dump_nw > 0) ? ((c.dump_slots > 0 and c.dump_slots < c.dump_nw) ? c.dump_slots : c.dump_nw) : 0;
+    s.nsused = 0; s.slot = -1;
+    s.slot_m.assign(size_t(s.slot_cache() ? s.nslot : 0), -1l);
+    s.hS = s.hRT = s.hRU = s.hHc = s.hHT = s.hHS = nullptr;
+    s.n_acc_fl = s.rows_acc_fl = s.n_dump_fl = 0; s.b_acc_fl = s.b_dump_fl = s.t_fl = 0.0;
+    const size_t nS = size_t(nt * ns * s.nrow * nc2);
     s.S = al(nS, "sd S"); s.RT = al(nS * size_t(np), "sd RT"); s.RU = al(nS * size_t(np), "sd RU");
     cu_check(cudaMemsetAsync(s.S, 0, nS * sizeof(cd), 0), "sd zero S");
     cu_check(cudaMemsetAsync(s.RT, 0, nS * size_t(np) * sizeof(cd), 0), "sd zero RT");
@@ -2859,8 +2928,8 @@ namespace methods::solvers::dynbse_cuda {
       s.Sd = s.Ss; s.RTd = s.RTs; s.RUd = s.RUs;
     }
     s.Hc = s.HT = s.HS = s.Om = s.Ft0 = nullptr; s.tgt = nullptr; s.m_dump = -1; s.om_set = false;
-    if (c.dump_nw > 0) {   // the reference dump: the per-node objects on the deposit mesh
-      const size_t nd = size_t(c.dump_nw * ns) * size_t(s.nk_dep);
+    if (c.dump_nw > 0) {   // the reference dump: the per-node objects on the deposit mesh (nslot node slots)
+      const size_t nd = size_t(s.nslot * ns) * size_t(s.nk_dep);
       s.Hc = al(nd * size_t(nt * nc2), "sd dump Hc"); s.HT = al(nd * size_t(np * nc2), "sd dump HT");
       cu_check(cudaMemsetAsync(s.Hc, 0, nd * size_t(nt * nc2) * sizeof(cd), 0), "sd zero dump Hc");
       cu_check(cudaMemsetAsync(s.HT, 0, nd * size_t(np * nc2) * sizeof(cd), 0), "sd zero dump HT");
@@ -2895,6 +2964,11 @@ namespace methods::solvers::dynbse_cuda {
     }
     s.eps.assign(eps, eps + np);
     s.epsG.assign(epsG, epsG + ng);
+    if (s.row_cache() or s.slot_cache()) {   // the pinned staging of the partial flushes: one (is, row) block of RT / RU, or a chunk
+      s.pin_n = std::max<size_t>(size_t(nt * np) * size_t(nc2), size_t(nt * nc2));
+      if (s.slot_cache()) s.pin_n = std::max<size_t>(s.pin_n, size_t(1) << 22);
+      cu_check(cudaMallocHost(&s.pin, s.pin_n * sizeof(cplx)), "sd pinned staging");
+    }
     s.on = true;
     return true;
   }
@@ -2995,14 +3069,15 @@ namespace methods::solvers::dynbse_cuda {
     const bool dump = (s.c.dump_nw > 0);
     if (dump) {
       // the reference dump: the same legs on the UNWEIGHTED tau image (Ttw_ff alone) into Hc(m, is, tau, kpq(k))
-      if (s.m_dump < 0 or s.m_dump >= s.c.dump_nw) APP_ABORT(std::string(" ue_sd_block: the dump node was not set (ue_sd_set_node)."));
+      if (s.m_dump < 0 or s.m_dump >= s.c.dump_nw or s.slot < 0 or s.slot >= s.nslot)
+        APP_ABORT(std::string(" ue_sd_block: the dump node was not set (ue_sd_set_node)."));
       cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nt), int(nw), &one, s.Fw, int(W), s.Ttw, int(nw), &zero,
                             s.Ft0, int(W)), "sd dump Ft0 = Ttw Fw");
       for (long it = 0; it < nt; ++it)
         for (long ik = 0; ik < nk; ++ik) {
           const size_t b = size_t(it * nk + ik);
           s.hA[b] = s.Ft0 + size_t(it) * W + size_t(ik) * nc2 * nR;
-          s.hC[b] = s.Hc + size_t((((s.m_dump * ns + is) * nt + it) * nkd + s.kpq[size_t(ik)]) * nc2);
+          s.hC[b] = s.Hc + size_t((((s.slot * ns + is) * nt + it) * nkd + s.kpq[size_t(ik)]) * nc2);
         }
       h2d(s.qA, s.hA.data(), size_t(nt * nk), "sd qA"); h2d(s.qC, s.hC.data(), size_t(nt * nk), "sd qC");
       cub_check(cublasZgemmBatched(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(nc), int(nc), int(nc * nR), &one, (const cd **)s.qA, int(nc * nR),
@@ -3040,7 +3115,7 @@ namespace methods::solvers::dynbse_cuda {
         if (dump) {   // the reference dump: the trace proxy and the random sketch of the same Y
           for (long lb = 0; lb < na; ++lb)
             for (long ik = 0; ik < nk; ++ik)
-              s.htgt[size_t(lb * nk + ik)] = ((s.m_dump * ns + is) * np + a0 + lb) * nkd + s.kpq[size_t(ik)];
+              s.htgt[size_t(lb * nk + ik)] = ((s.slot * ns + is) * np + a0 + lb) * nkd + s.kpq[size_t(ik)];
           cu_check(cudaMemcpy(s.tgt, s.htgt.data(), size_t(nb) * sizeof(long), cudaMemcpyHostToDevice), "sd dump tgt");
           sd_dump_trace_kernel<<<grid_for(nb * nc2), 256>>>(nb, nc, s.Y, s.tgt, s.HT);
           launch_check("sd dump HT");
@@ -3114,6 +3189,148 @@ namespace methods::solvers::dynbse_cuda {
     }
   }
 
+  namespace {
+    // THE WRITE-BACK CACHES of the device deposits (sd_config::acc_rows / dump_slots). A host row (an accumulator k row, a dump
+    // node block) is the running value of its device copy: a miss LOADS the host value into the device row, an eviction (a full
+    // cache, a checkpoint, the end) WRITES the device row back over it. The device thus adds every deposit onto exactly the value
+    // the resident accumulators would hold -- the same additions in the same order: bitwise identical to the resident path when
+    // the host objects start at zero (a restart's loaded checkpoint or a carried hook start them elsewhere: rounding class).
+    void sd_d2h(sd_state &s, cd const *d, cplx *h, size_t n, char const *what) {   // device -> host, through the pinned staging
+      for (size_t o = 0; o < n; o += s.pin_n) {
+        const size_t m = std::min(s.pin_n, n - o);
+        cu_check(cudaMemcpy(s.pin, d + o, m * sizeof(cd), cudaMemcpyDeviceToHost), what);
+        std::copy(s.pin, s.pin + m, h + o);
+      }
+    }
+    void sd_h2d(sd_state &s, cplx const *h, cd *d, size_t n, char const *what) {   // host -> device, through the pinned staging
+      for (size_t o = 0; o < n; o += s.pin_n) {
+        const size_t m = std::min(s.pin_n, n - o);
+        std::copy(h + o, h + o + m, s.pin);
+        cu_check(cudaMemcpy(d + o, s.pin, m * sizeof(cd), cudaMemcpyHostToDevice), what);
+      }
+    }
+    // one accumulator row: k's host values (S at (it, is, k), RT / RU rows (it, is, k)) <-> device row r (load = true: H2D)
+    void sd_row_io(unit_engine *e, long kk, long r, bool load) {
+      auto &s = e->sd;
+      if (s.hS == nullptr or s.hRT == nullptr or s.hRU == nullptr)
+        APP_ABORT(std::string(" ue_sd: the accumulator row cache needs the host accumulators (ue_sd_set_host) -- ABORTING."));
+      const long nt = s.c.nt, ns = s.c.ns, np = s.c.np, nc2 = e->nc2, nka = s.nk_acc, nr = s.nrow;
+      const size_t blk = size_t(nt * np) * size_t(nc2), row = size_t(np) * size_t(nc2);
+      const size_t pitch = size_t(ns * nr * nc2) * sizeof(cd), wb = size_t(nc2) * sizeof(cd);
+      for (long is = 0; is < ns; ++is) {
+        cd *dS = s.S + size_t(is * nr + r) * size_t(nc2);   // the (it, is, r) matrices at stride ns nr nc2
+        if (load) {
+          for (long it = 0; it < nt; ++it)
+            std::copy_n(s.hS + size_t((it * ns + is) * nka + kk) * size_t(nc2), nc2, s.pin + size_t(it) * size_t(nc2));
+          cu_check(cudaMemcpy2D(dS, pitch, s.pin, wb, wb, size_t(nt), cudaMemcpyHostToDevice), "sd row load S");
+        } else {
+          cu_check(cudaMemcpy2D(s.pin, wb, dS, pitch, wb, size_t(nt), cudaMemcpyDeviceToHost), "sd row write-back S");
+          for (long it = 0; it < nt; ++it)
+            std::copy_n(s.pin + size_t(it) * size_t(nc2), nc2, s.hS + size_t((it * ns + is) * nka + kk) * size_t(nc2));
+        }
+        for (int pass = 0; pass < 2; ++pass) {   // RT / RU: the contiguous (is, r) block (nt, np, nc2) <-> the host rows (it, is, k)
+          cd *d = ((pass == 0) ? s.RT : s.RU) + size_t(is * nr + r) * blk;
+          cplx *h = (pass == 0) ? s.hRT : s.hRU;
+          if (load) {
+            for (long it = 0; it < nt; ++it) std::copy_n(h + size_t((it * ns + is) * nka + kk) * row, row, s.pin + size_t(it) * row);
+            cu_check(cudaMemcpy(d, s.pin, blk * sizeof(cd), cudaMemcpyHostToDevice), "sd row load RT/RU");
+          } else {
+            cu_check(cudaMemcpy(s.pin, d, blk * sizeof(cd), cudaMemcpyDeviceToHost), "sd row write-back RT/RU");
+            for (long it = 0; it < nt; ++it) std::copy_n(s.pin + size_t(it) * row, row, h + size_t((it * ns + is) * nka + kk) * row);
+          }
+        }
+      }
+      s.b_acc_fl += 16.0 * double(ns) * (double(nt * nc2) + 2.0 * double(blk));
+    }
+    // the accumulator row cache: every cached row WRITTEN BACK over its host row and the cache emptied
+    void sd_flush_rows(unit_engine *e) {
+      auto &s = e->sd;
+      if (s.nused == 0) return;
+      const double t0 = wnow();
+      cu_check(cudaDeviceSynchronize(), "sd flush rows");
+      for (long r = 0; r < s.nused; ++r) {
+        const long kk = s.k_of[size_t(r)];
+        sd_row_io(e, kk, r, false);
+        s.row_of[size_t(kk)] = -1;
+        s.k_of[size_t(r)] = -1;
+      }
+      ++s.n_acc_fl;
+      s.rows_acc_fl += s.nused;
+      s.nused = 0;
+      s.t_fl += wnow() - t0;
+    }
+    // a row for target k (a miss evicts the whole cache when it is full, then loads k's host row)
+    long sd_row_for(unit_engine *e, long kk) {
+      auto &s = e->sd;
+      long r = s.row_of[size_t(kk)];
+      if (r >= 0) return r;
+      if (s.nused == s.nrow) sd_flush_rows(e);
+      const double t0 = wnow();
+      cu_check(cudaDeviceSynchronize(), "sd row load");
+      r = s.nused++;
+      s.row_of[size_t(kk)] = r;
+      s.k_of[size_t(r)] = kk;
+      sd_row_io(e, kk, r, true);
+      s.t_fl += wnow() - t0;
+      return r;
+    }
+    // the dump's node slots: every taken slot WRITTEN BACK over its node's host block and the slots emptied
+    void sd_flush_slots(unit_engine *e) {
+      auto &s = e->sd;
+      if (s.nsused == 0) return;
+      if (s.hHc == nullptr or s.hHT == nullptr or (s.HS != nullptr and s.hHS == nullptr))
+        APP_ABORT(std::string(" ue_sd: the dump's node slots need the host dump (ue_sd_set_host) -- ABORTING."));
+      const double t0 = wnow();
+      cu_check(cudaDeviceSynchronize(), "sd flush slots");
+      const size_t per = size_t(s.c.ns) * size_t(s.nk_dep);
+      const size_t nHc = per * size_t(s.c.nt * e->nc2), nHT = per * size_t(s.c.np * e->nc2), nHS = per * size_t(s.c.np * s.c.dump_nsk);
+      for (long sl = 0; sl < s.nsused; ++sl) {
+        const size_t m = size_t(s.slot_m[size_t(sl)]);
+        sd_d2h(s, s.Hc + size_t(sl) * nHc, s.hHc + m * nHc, nHc, "sd write-back dump Hc");
+        sd_d2h(s, s.HT + size_t(sl) * nHT, s.hHT + m * nHT, nHT, "sd write-back dump HT");
+        if (s.HS != nullptr) sd_d2h(s, s.HS + size_t(sl) * nHS, s.hHS + m * nHS, nHS, "sd write-back dump HS");
+        s.slot_m[size_t(sl)] = -1;
+        s.b_dump_fl += 16.0 * double(nHc + nHT + (s.HS != nullptr ? nHS : 0));
+      }
+      ++s.n_dump_fl;
+      s.nsused = 0;
+      s.slot = -1;
+      s.t_fl += wnow() - t0;
+    }
+    // a slot for node m (a miss evicts every slot when they are all taken, then loads m's host block)
+    long sd_slot_for(unit_engine *e, long m) {
+      auto &s = e->sd;
+      for (long sl = 0; sl < s.nsused; ++sl)
+        if (s.slot_m[size_t(sl)] == m) return sl;
+      if (s.nsused == s.nslot) sd_flush_slots(e);
+      if (s.hHc == nullptr or s.hHT == nullptr or (s.HS != nullptr and s.hHS == nullptr))
+        APP_ABORT(std::string(" ue_sd: the dump's node slots need the host dump (ue_sd_set_host) -- ABORTING."));
+      const double t0 = wnow();
+      cu_check(cudaDeviceSynchronize(), "sd slot load");
+      const long sl = s.nsused++;
+      s.slot_m[size_t(sl)] = m;
+      const size_t per = size_t(s.c.ns) * size_t(s.nk_dep);
+      const size_t nHc = per * size_t(s.c.nt * e->nc2), nHT = per * size_t(s.c.np * e->nc2), nHS = per * size_t(s.c.np * s.c.dump_nsk);
+      sd_h2d(s, s.hHc + size_t(m) * nHc, s.Hc + size_t(sl) * nHc, nHc, "sd load dump Hc");
+      sd_h2d(s, s.hHT + size_t(m) * nHT, s.HT + size_t(sl) * nHT, nHT, "sd load dump HT");
+      if (s.HS != nullptr) sd_h2d(s, s.hHS + size_t(m) * nHS, s.HS + size_t(sl) * nHS, nHS, "sd load dump HS");
+      s.b_dump_fl += 16.0 * double(nHc + nHT + (s.HS != nullptr ? nHS : 0));
+      s.t_fl += wnow() - t0;
+      return sl;
+    }
+  }
+
+  void ue_sd_set_host(unit_engine *e, cplx *S_cst, cplx *RT, cplx *RU, cplx *Hc, cplx *HT, cplx *HS) {
+    auto &s = e->sd;
+    s.hS = S_cst; s.hRT = RT; s.hRU = RU; s.hHc = Hc; s.hHT = HT; s.hHS = HS;
+  }
+
+  void ue_sd_flush_stats(unit_engine const *e, long *n_acc, long *rows_acc, double *gb_acc, long *n_dump, double *gb_dump, double *t) {
+    auto const &s = e->sd;
+    *n_acc = s.n_acc_fl; *rows_acc = s.rows_acc_fl; *gb_acc = s.b_acc_fl / 1e9;
+    *n_dump = s.n_dump_fl; *gb_dump = s.b_dump_fl / 1e9; *t = s.t_fl;
+  }
+
   void ue_sd_fold(unit_engine *e, long is, long nterm, long const *k, long const *src, unsigned char const *ident,
                   unsigned char const *cflag, cplx const *N) {
     auto &s = e->sd;
@@ -3134,13 +3351,25 @@ namespace methods::solvers::dynbse_cuda {
       cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), int(nc), int(nc), &one, Nb, int(nc), 0ll,
                                           s.fT, int(nc), (long long)nc2, &zero, s.fY, int(nc), (long long)nc2, int(nb)), "sd fold Y = N^T T");
     };
-    for (long t = 0; t < nterm; ++t) {
+    // the row cache: the terms in the order of their target (stable: a target's terms keep their order, so every row receives
+    // the same additions in the same order as the resident accumulators); a target without a row takes a free one, and a full
+    // cache is flushed into the host accumulators first
+    std::vector<long> ord(static_cast<size_t>(std::max(nterm, 0l)));
+    for (long t = 0; t < nterm; ++t) ord[size_t(t)] = t;
+    if (s.row_cache()) std::stable_sort(ord.begin(), ord.end(), [&](long a, long b) { return k[a] < k[b]; });
+    const long nr = s.nrow;
+    (void)nka;
+    for (long tt = 0; tt < nterm; ++tt) {
+      const long t = ord[size_t(tt)];
+      long r = k[t];
+      if (k[t] < 0 or k[t] >= s.nk_acc) APP_ABORT(std::string(" ue_sd_fold: a fold target is outside the accumulators (internal)."));
+      if (s.row_cache()) r = sd_row_for(e, k[t]);
       cd const *Nb = s.fN + size_t(t) * size_t(nc2);
-      // S: the (it, is, src) matrices at stride ns nks nc2 -> the (it, is, k) ones at stride ns nka nc2
+      // S: the (it, is, src) matrices at stride ns nks nc2 -> the (it, is, row) ones at stride ns nrow nc2
       {
         cd const *X = s.Ss + size_t(is * nks + src[t]) * size_t(nc2);
-        cd *dst = s.S + size_t(is * nka + k[t]) * size_t(nc2);
-        const long sX = ns * nks * nc2, sD = ns * nka * nc2;
+        cd *dst = s.S + size_t(is * nr + r) * size_t(nc2);
+        const long sX = ns * nks * nc2, sD = ns * nr * nc2;
         if (ident[t]) sd_fold_add_kernel<<<grid_for(nt * nc2), 256>>>(nt, nc2, sD, sX, int(cflag[t]), X, dst);
         else { rotate(X, sX, nt, Nb); sd_fold_add_kernel<<<grid_for(nt * nc2), 256>>>(nt, nc2, sD, nc2, int(cflag[t]), s.fY, dst); }
         launch_check("sd fold S");
@@ -3148,7 +3377,7 @@ namespace methods::solvers::dynbse_cuda {
       // RT / RU: the (is, src) block of nt np contiguous matrices -> the (is, k) block
       for (int pass = 0; pass < 2; ++pass) {
         cd const *X = ((pass == 0) ? s.RTs : s.RUs) + size_t(is * nks + src[t]) * size_t(nt * np) * size_t(nc2);
-        cd *dst = ((pass == 0) ? s.RT : s.RU) + size_t(is * nka + k[t]) * size_t(nt * np) * size_t(nc2);
+        cd *dst = ((pass == 0) ? s.RT : s.RU) + size_t(is * nr + r) * size_t(nt * np) * size_t(nc2);
         const long nb = nt * np;
         if (ident[t]) sd_fold_add_kernel<<<grid_for(nb * nc2), 256>>>(1, nb * nc2, 0, 0, int(cflag[t]), X, dst);
         else { rotate(X, nc2, nb, Nb); sd_fold_add_kernel<<<grid_for(nb * nc2), 256>>>(1, nb * nc2, 0, 0, int(cflag[t]), s.fY, dst); }
@@ -3174,11 +3403,17 @@ namespace methods::solvers::dynbse_cuda {
     if (s.c.dump_nw <= 0) return;
     if (m < 0 or m >= s.c.dump_nw) APP_ABORT(std::string(" ue_sd_set_node: node ") + std::to_string(m) + " outside the dump's " + std::to_string(s.c.dump_nw) + ".");
     s.m_dump = m;
+    s.slot = s.slot_cache() ? sd_slot_for(e, m) : m;
   }
 
   void ue_sd_flush_dump(unit_engine *e, cplx *Hc, cplx *HT, cplx *HS) {
     auto &s = e->sd;
     if (not s.on or s.c.dump_nw <= 0) return;
+    if (s.slot_cache()) {   // the write-back: the slots over the host dump (the registered one)
+      if (Hc != s.hHc or HT != s.hHT or HS != s.hHS) APP_ABORT(std::string(" ue_sd_flush_dump: not the host dump of ue_sd_set_host -- ABORTING."));
+      sd_flush_slots(e);
+      return;
+    }
     const long nt = s.c.nt, ns = s.c.ns, np = s.c.np, nc2 = e->nc2, nsk = s.c.dump_nsk;
     const size_t nd = size_t(s.c.dump_nw * ns) * size_t(s.nk_dep), chunk = size_t(1) << 22;
     std::vector<cplx> tmp(chunk);
@@ -3200,6 +3435,11 @@ namespace methods::solvers::dynbse_cuda {
   void ue_sd_flush(unit_engine *e, cplx *S_cst, cplx *RT, cplx *RU) {
     auto &s = e->sd;
     if (not s.on) return;
+    if (s.row_cache()) {   // the write-back of the cached rows (the pending scratch is folded first)
+      if (S_cst != s.hS or RT != s.hRT or RU != s.hRU) APP_ABORT(std::string(" ue_sd_flush: not the host accumulators of ue_sd_set_host -- ABORTING."));
+      sd_flush_rows(e);
+      return;
+    }
     const long nt = s.c.nt, ns = s.c.ns, nk = s.nk_acc, np = s.c.np, nc2 = e->nc2;
     const size_t nS = size_t(nt * ns * nk) * size_t(nc2), nA = nS * size_t(np);
     const size_t chunk = size_t(1) << 22;
