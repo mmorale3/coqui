@@ -2218,6 +2218,7 @@ auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
                   "layout, which slate's batched device path rejects for a distributed matrix. "
                   "Port this call site to distributed_matrix_array before instantiating it for "
                   "device memory.");
+    [[maybe_unused]] math::nda::slate_ops::detail::device_guard dev_guard;  // slate leaves another device active
     auto As = math::nda::slate_ops::detail::to_slate_view<true>(ChC_uv);
     auto Bs = math::nda::slate_ops::detail::to_slate_view<true>(Snv);
     if(use_least_squares) {

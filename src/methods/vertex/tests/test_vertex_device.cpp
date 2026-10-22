@@ -48,6 +48,7 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/SCF/scf_driver.hpp"
 #include "methods/vertex/vertex_t.h"
+#include "methods/vertex/vertex_debug.hpp"
 
 namespace bdft_tests {
 
@@ -56,6 +57,10 @@ namespace bdft_tests {
 
   TEST_CASE("vertex_device_bridge_lih", "[methods][vertex][device]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
+    // the causal projection of Sigma_c (on by default with a Sigma vertex) is off: an unconverged iterative fit (ADMM +
+    // Anderson) that turns rounding-level differences of its input or its BLAS into ~1e-6 changes of e_hf / e_corr (two
+    // identical runs differ by ~1e-12 after 10 iterations and ~1e-6 after its 6000), which would hide the identities below
+    vertex_debug::set("scf_causal_proj=0");
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_device";
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));

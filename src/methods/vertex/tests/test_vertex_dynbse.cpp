@@ -993,11 +993,14 @@ namespace bdft_tests {
     };
     for (int fitted = 0; fitted < 2; ++fitted) {
       auto so = run_solver(T, ft, inu, bool(fitted), 1e-8, 40, 0);
-      auto sg = run_solver(T, ft, inu, bool(fitted), 1e-8, 40, 4);
+      // GMRES(12), the production restart length: on the shared set GMRES(4) stagnates against the spurious small-nu mode
+      // (|Ritz| ~3) at 6.7e-6 (40 applications, whatever the cap; the stagnated value is platform dependent), GMRES(12)
+      // converges in ~22 applications to 2.5e-7, the union set's value (the oracle's own Richardson floor is ~1e-6 / 4)
+      auto sg = run_solver(T, ft, inu, bool(fitted), 1e-8, 40, 12);
       app_log(1, "dynbse small-nu [{}]: Neumann vs oracle {:.3e} (Gamma1 {:.3e}), {} it, converged {}, contraction "
                  "{:.3e}, refit {:.3e}; history:{}", fitted ? "shared/fitted" : "union/exact", rel_diff(so.P, Pdy),
               rel_diff(so.P1, Pdy), so.res.iterations, so.res.converged, so.res.contraction, so.res.fit_err_max, hist_of(so.res));
-      app_log(1, "dynbse small-nu [{}]: GMRES(4) vs oracle {:.3e}, {} applications, converged {}, max |Ritz| {:.3e}; "
+      app_log(1, "dynbse small-nu [{}]: GMRES(12) vs oracle {:.3e}, {} applications, converged {}, max |Ritz| {:.3e}; "
                  "shift-table fit {:.2e}; history:{}", fitted ? "shared/fitted" : "union/exact", rel_diff(sg.P, Pdy),
               sg.res.iterations, sg.res.converged, sg.res.contraction, sg.shift_fit_err, hist_of(sg.res));
       // family scales of the first iterate's y: the 1/nu cancellation hazard made visible

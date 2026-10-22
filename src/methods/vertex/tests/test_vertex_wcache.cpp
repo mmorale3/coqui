@@ -62,6 +62,7 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/SCF/scf_driver.hpp"
 #include "methods/vertex/vertex_t.h"
+#include "methods/vertex/vertex_debug.hpp"
 
 namespace bdft_tests {
 
@@ -76,6 +77,10 @@ namespace bdft_tests {
     SUCCEED("vertex_wcache_e2e skipped: build has ENABLE_DLR=OFF.");
 #else
     auto& mpi_context = utils::make_unit_test_mpi_context();
+    // the causal projection of Sigma_c (on by default with a Sigma vertex) is off: an unconverged iterative fit (ADMM +
+    // Anderson) that turns rounding-level differences of its input or its BLAS into ~1e-6 changes of e_hf / e_corr (two
+    // identical runs differ by ~1e-12 after 10 iterations and ~1e-6 after its 6000), which would hide the identities below
+    vertex_debug::set("scf_causal_proj=0");
     // wmax = 6.0: the headroom the vertex needs so that products of tau-objects (pair and
     // triple products) stay within the IAFT basis span
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
@@ -162,6 +167,10 @@ namespace bdft_tests {
   // vs the LEGACY retained-dW branch, bitwise; ignore_g0 and gygi head policies.
   TEST_CASE("vertex_wcache_identity", "[methods][vertex][wcache][smoke]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
+    // the causal projection of Sigma_c (on by default with a Sigma vertex) is off: an unconverged iterative fit (ADMM +
+    // Anderson) that turns rounding-level differences of its input or its BLAS into ~1e-6 changes of e_hf / e_corr (two
+    // identical runs differ by ~1e-12 after 10 iterations and ~1e-6 after its 6000), which would hide the identities below
+    vertex_debug::set("scf_causal_proj=0");
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_wcache_id";
 
