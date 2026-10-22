@@ -38,6 +38,9 @@ Schemes (D2, T = 0 only; argument scheme):
           E <- mixing E_new + (1 - mixing) E_old from iteration 2 on (iteration 1 = the diagonal G0W0 energies);
           mu = QP mid-gap (KS band order; nocc = nelec / 2). ev_window (Ha, None = all bands): bands with |e_start - mu_start|
           > ev_window take the shift of the nearest in-window band of the same k (scissor). No closure / Lehmann G.
+          History dE = max|dE_QP| (all bands); dE_win = the same over the in-window states with Z > ev_conv_zmin in this and the
+          previous iteration (C++ ev_conv = "window"; the low-Z states of a quasi-continuum hop between roots); resid = the
+          metric selected by ev_conv ('all' | 'window').
   "evgw0" evgw with W frozen at iteration 1."""
 import numpy as np, time
 from .line_dlr import LineBasis, BosonicLineBasis
@@ -55,7 +58,7 @@ class LineSCGW:
                  nodes_per_ray=120, node_range=(1e-3, 60.0), beta=None, thermal_tol=1e-8, thermal_floor=30.0, thermal_floor_f=None,
                  wp_floor=15.0, mu_rule='neutral', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
                  scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5,
-                 g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None,
+                 g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None, ev_conv='all', ev_conv_zmin=0.5,
                  mixing_F=1.0, nu0_intraband=False, hyb_frame='count'):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
@@ -75,6 +78,7 @@ class LineSCGW:
         assert scheme in ('scgw', 'scgw0', 'evgw', 'evgw0'), scheme
         assert scheme == 'scgw' or beta is None, "schemes other than scgw: T = 0 only"
         self.scheme, self.ev_window, self.w0 = scheme, ev_window, None
+        self.ev_conv, self.ev_conv_zmin = ev_conv, ev_conv_zmin
         self.nb = X.shape[2]; self.mu = mu; self.theta, self.eps, self.lam = theta, eps, lam
         self.theta_t = theta * theta_t_frac
         self.wp, self.K, self.mixing, self.verbose = wp, K, mixing, verbose
@@ -380,13 +384,18 @@ class LineSCGW:
         first = len(self.history) == 0
         E = Enew if first else self.mixing * Enew + (1.0 - self.mixing) * self.ev_E
         dE = float(np.abs(E - self.ev_E).max())
+        # windowed metric (C++ ev_conv = "window"): in-window states with Z > ev_conv_zmin in this and the previous iteration
+        Zp = np.ones_like(Z) if self.ev_Z is None else self.ev_Z
+        inw = np.ones(Z.shape, bool) if not self.ev_window else np.abs(self.ev_E0 - self.ev_mu0) <= self.ev_window
+        sel = inw & (Z > self.ev_conv_zmin) & (Zp > self.ev_conv_zmin)
+        dE_win = float(np.abs(E - self.ev_E)[sel].max()) if sel.any() else 0.0
         nocc = int(round(self.nelec / 2))
         homo, lumo = E[:, :nocc].max(), E[:, nocc:].min()
         assert lumo > homo, f"evgw: QP energies have no gap in the KS band order (homo {homo}, lumo {lumo})"
         self.ev_E, self.ev_Z, self.ev_Enew = E, Z, Enew
         self.mu = 0.5 * (homo + lumo); gw.mu = self.mu
         gw.set_poles(E - self.mu, self.ev_v)
-        rec = dict(dE=dE, dSigma=dS, mu=self.mu, gap_eV=(lumo - homo) * 27.211386, e_homo=homo - self.mu, e_lumo=lumo - self.mu,
+        rec = dict(dE=dE, dE_win=dE_win, resid=dE_win if self.ev_conv == 'window' else dE, dSigma=dS, mu=self.mu, gap_eV=(lumo - homo) * 27.211386, e_homo=homo - self.mu, e_lumo=lumo - self.mu,
                    npoles=npl, tW=tW, tS=tS, ttot=time.time() - t0)
         self.history.append(rec)
         if self.verbose:

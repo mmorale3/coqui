@@ -116,7 +116,10 @@
  *                       E <- mixing E_new + (1 - mixing) E_old from iteration 2 (iteration 1 = diagonal G0W0@KS), mu = QP
  *                       mid-gap, F = F[D_KS] fixed, no closure; converged when max|dE_QP| < conv_thr; ev_window (Ha, <= 0:
  *                       all bands): bands with |e_KS - mu0| > ev_window take the shift of the nearest in-window band of the same
- *                       k (scissor). Checkpoint scf_line/iter<N>/{E_qp, Z_qp} (absolute Ha). Non-scgw schemes: T = 0,
+ *                       k (scissor). ev_conv (2026-10-22): "all" (default) = max|dE_QP| over all (k, band); "window" = over the
+ *                       (k, band) inside ev_window (all if <= 0) with certified Z > ev_conv_zmin in this AND the previous
+ *                       iteration (the low-Z states of a quasi-continuum hop between roots of comparable Z; both metrics are logged,
+ *                       history dE_qp / dE_qp_win). Checkpoint scf_line/iter<N>/{E_qp, Z_qp} (absolute Ha). Non-scgw schemes: T = 0,
  *                       start = "ks", no coarse levels; the spectra use the last Sigma with F_closure = F[D_KS].
  *                       Python oracle: cayley.line.driver.LineSCGW(scheme = ...).
  *   coarse = { niter = 0, eps = 1e-8, K = 16, nodes_per_ray = 80, time_eps = coarse.eps }   perf 7.2 multilevel schedule: iterations
@@ -280,6 +283,8 @@ struct gw_line_params_t {
   double start_eta = 1e-3;               ///< perf 7.2: unused since D2 (the diagonal QP equation is solved exactly at eta = 0)
   std::string scheme = "scgw";           ///< D2: "scgw" | "scgw0" (W frozen at iteration 1) | "evgw" | "evgw0" (driver.hpp doc)
   double ev_window = 0.0;                ///< D2: evgw*: bands with |e_KS - mu0| > ev_window (Ha) get a scissor shift; <= 0: all bands
+  std::string ev_conv = "all";           ///< evgw* convergence metric: "all" (max|dE_QP|, all bands) | "window" (driver.hpp doc)
+  double ev_conv_zmin = 0.5;             ///< "window": only states with Z > ev_conv_zmin (this and the previous iteration)
   long coarse_niter = 0;                 ///< perf 7.2: multilevel schedule, iterations 1..coarse_niter at coarse settings
   double coarse_eps = 1e-8, coarse_time_eps = 1e-8;
   long coarse_K = 16, coarse_nodes_per_ray = 80;
@@ -357,6 +362,7 @@ struct gw_line_iter_t {
   long pruned_w = 0, pruned_near = 0;    ///< lehmann: poles pruned by weight / near-mu rule (all k)
   double pruned_w_weight = 0.0, pruned_near_weight = 0.0;
   double dE_qp = 0.0;                    ///< D2 evgw*: max|E_QP(this iteration) - E_QP(previous)| (Ha, after mixing)
+  double dE_qp_win = 0.0;                ///< evgw*: the same over the ev_conv = "window" states (logged for both ev_conv)
   double resid = 0.0, residF = 0.0;      ///< perf 7.2: max|Sigma[G] - Sigma_in| (total Sigma), max|F[D] - F_in| (0 before 7.2)
   std::string mix = "none";              ///< perf 7.2: mixing step of this iteration (none | linear | diis | reset)
   long ndiis = 0;                        ///< perf 7.2: DIIS history entries used

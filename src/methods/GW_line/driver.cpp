@@ -297,6 +297,10 @@ gw_line_params_t gw_line_params_t::from_ptree(ptree const &pt) {
   p.scheme    = io::get_value_with_default<std::string>(pt, "scheme", p.scheme);
   io::tolower(p.scheme);
   p.ev_window = io::get_value_with_default<double>(pt, "ev_window", p.ev_window);
+  p.ev_conv   = io::get_value_with_default<std::string>(pt, "ev_conv", p.ev_conv);
+  io::tolower(p.ev_conv);
+  utils::check(p.ev_conv == "all" or p.ev_conv == "window", "gw_line: ev_conv must be \"all\" or \"window\" (got \"{}\")", p.ev_conv);
+  p.ev_conv_zmin = io::get_value_with_default<double>(pt, "ev_conv_zmin", p.ev_conv_zmin);
   utils::check(p.scheme == "scgw" or p.scheme == "scgw0" or p.scheme == "evgw" or p.scheme == "evgw0",
                "gw_line: scheme must be \"scgw\", \"scgw0\", \"evgw\" or \"evgw0\" (got \"{}\")", p.scheme);
   p.coarse_niter         = io::get_value_with_default<long>(pt, "coarse.niter", p.coarse_niter);
@@ -421,6 +425,8 @@ void gw_line_params_t::log() const {
                                 : " (KS vectors + QP energies; W from the QP G every iteration)");
   if ((scheme == "evgw" or scheme == "evgw0") and ev_window > 0.0)
     app_log(1, "    ev_window: {:.4f} Ha (bands outside: scissor shift of the nearest in-window band)", ev_window);
+  if ((scheme == "evgw" or scheme == "evgw0") and ev_conv == "window")
+    app_log(1, "    ev_conv: window (max|dE_QP| over ev_window states with Z > {:.2f} in two consecutive iterations)", ev_conv_zmin);
   if (start == "ks") app_log(1, "    start: KS poles");
   else if (start == "qp_diag")
     app_log(1, "    start: qp_diag (one Pi -> W -> Sigma pass on the KS poles, diagonal QP equation solved exactly (largest-Z root); "
@@ -693,6 +699,7 @@ void write_history(h5::group &g, gw_line_iter_t const &r) {
   h5::h5_write(hg, "ndiis", r.ndiis);
   h5::h5_write(hg, "level", r.level);
   if (r.dE_qp > 0.0) h5::h5_write(hg, "dE_qp", r.dE_qp);   // D2 evgw*
+  if (r.dE_qp > 0.0) h5::h5_write(hg, "dE_qp_win", r.dE_qp_win);
   if (not r.mu_rule.empty()) {   // S8b
     auto tg = hg.create_group("thermal");
     h5::h5_write(tg, "thermal", r.thermal);
@@ -762,6 +769,7 @@ gw_line_iter_t read_history(h5::group &g) {
     h5::h5_read(hg, "level", r.level);
   }
   if (hg.has_dataset("dE_qp")) h5::h5_read(hg, "dE_qp", r.dE_qp);   // D2
+  if (hg.has_dataset("dE_qp_win")) h5::h5_read(hg, "dE_qp_win", r.dE_qp_win);
   if (hg.has_subgroup("thermal")) {   // S8b
     auto tg = hg.open_group("thermal");
     h5::h5_read(tg, "thermal", r.thermal);
@@ -808,6 +816,8 @@ void write_input(h5::group &g, gw_line_params_t const &p, nda::array<ComplexType
   h5::h5_write(ig, "closure_dev_svd", p.closure_dev_svd);
   h5::h5_write(ig, "scheme", p.scheme);   // D2
   h5::h5_write(ig, "ev_window", p.ev_window);
+  h5::h5_write(ig, "ev_conv", p.ev_conv);
+  h5::h5_write(ig, "ev_conv_zmin", p.ev_conv_zmin);
   h5::h5_write(ig, "mixing", p.mixing);
   h5::h5_write(ig, "conv_thr", p.conv_thr);
   h5::h5_write(ig, "t_chunk", p.t_chunk);
@@ -1010,7 +1020,7 @@ void write_state(boost::mpi3::communicator &comm, std::string const &file, state
   comm.barrier();
 }
 
-static constexpr int NHIST = 39;   ///< columns of the broadcast history table
+static constexpr int NHIST = 40;   ///< columns of the broadcast history table
 static const std::vector<std::string> mix_names = {"none", "linear", "diis", "reset", "damped"};
 double mix_code(std::string const &m) {
   auto it = std::find(mix_names.begin(), mix_names.end(), m);
@@ -1099,7 +1109,7 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
                          double(r.nt_sig_p), double(r.nt_sig_h), r.g_repr == "lehmann" ? 1.0 : 0.0, double(r.ng_min),
                          double(r.ng_max), r.g_emin, double(r.pruned_w), r.pruned_w_weight, double(r.pruned_near),
                          r.pruned_near_weight, r.resid, r.residF, mix_code(r.mix), double(r.ndiis), double(r.level),
-                         double(r.thermal), r.wp_used, r.dE_qp};
+                         double(r.thermal), r.wp_used, r.dE_qp, r.dE_qp_win};
       for (int j = 0; j < NHIST; ++j) hist(i - 1, j) = v[j];
     }
   }
@@ -1154,6 +1164,7 @@ state_t read_state(boost::mpi3::communicator &comm, std::string const &file, lon
     r.ndiis = long(std::llround(hist(i, 34))); r.level = long(std::llround(hist(i, 35)));
     r.thermal = long(std::llround(hist(i, 36))); r.wp_used = hist(i, 37);   // S8b
     r.dE_qp = hist(i, 38);   // D2
+    r.dE_qp_win = hist(i, 39);
     history.push_back(r);
   }
   return st;
@@ -2299,12 +2310,17 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
         }
       }
       const bool first = (st.iter == 0);
-      double dE = 0.0;
+      double dE = 0.0, dE_win = 0.0;
       for (long ik = 0; ik < nk; ++ik)
         for (long n = 0; n < nb; ++n) {
           E(ik, n) = first ? Enew(ik, n) : prm.mixing * Enew(ik, n) + (1.0 - prm.mixing) * st.E_qp(ik, n);
-          dE       = std::max(dE, std::abs(E(ik, n) - st.E_qp(ik, n)));
+          const double d = std::abs(E(ik, n) - st.E_qp(ik, n));
+          dE             = std::max(dE, d);
+          const bool inw = prm.ev_window <= 0.0 or std::abs(eig(ik, n) - mu0) <= prm.ev_window;
+          if (inw and qp.z(ik, n) > prm.ev_conv_zmin and st.Z_qp(ik, n) > prm.ev_conv_zmin) dE_win = std::max(dE_win, d);
         }
+      const double dE_all = dE;
+      if (prm.ev_conv == "window") dE = dE_win;   // the convergence metric
       double dS = 0.0;
       if (st.have_sigma) {
         for (long a = 0; a < Sp_new.size(); ++a)
@@ -2348,15 +2364,16 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
       rec.nt_sig_h    = sig_h->size();
       rec.g_repr      = "lehmann";   // KS vectors + QP energies (factorized Lehmann form)
       pole_counts(st.poles, rec.ng_min, rec.ng_max, rec.g_emin);
-      rec.dE_qp = dE;
-      rec.resid = dE;
+      rec.dE_qp     = dE_all;
+      rec.dE_qp_win = dE_win;
+      rec.resid     = dE;
       rec.mix   = first ? std::string("none") : std::string("linear");
       rec.level = cur_level;
       rec.time  = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       res.history.push_back(rec);
-      app_log(1, "iter {:3d} ({}): max|dE_QP| {:.3e} Ha  mu {:.6f} (dmu {:+.4f} eV)  QP gap {:.4f} eV  dSigma {:.2e}  min Z (band edges) "
-                 "{:.3f}{}  [Pi {:.1f}s W {:.1f}s Sigma+QP {:.1f}s total {:.1f}s]",
-              rec.iter, prm.scheme, dE, rec.mu, rec.dmu * HA_EV, rec.gap * HA_EV, dS, zmin_edge,
+      app_log(1, "iter {:3d} ({}): max|dE_QP| {:.3e} Ha (window, Z > {:.2f}: {:.3e})  mu {:.6f} (dmu {:+.4f} eV)  QP gap {:.4f} eV  "
+                 "dSigma {:.2e}  min Z (band edges) {:.3f}{}  [Pi {:.1f}s W {:.1f}s Sigma+QP {:.1f}s total {:.1f}s]",
+              rec.iter, prm.scheme, dE_all, prm.ev_conv_zmin, dE_win, rec.mu, rec.dmu * HA_EV, rec.gap * HA_EV, dS, zmin_edge,
               nscissor > 0 ? ", scissor " + std::to_string(nscissor) + " (k, band)" : std::string(""), tPi, tW, tS, rec.time);
       if (st.iter == 1) {
         hout_first      = hout;
@@ -2368,7 +2385,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
       Timer.stop("iteration");
       if (rec.iter > 1 and dE < prm.conv_thr) {
         converged = true;
-        app_log(1, "  converged: max|dE_QP| = {:.2e} < conv_thr = {:.1e}", dE, prm.conv_thr);
+        app_log(1, "  converged: max|dE_QP| ({}) = {:.2e} < conv_thr = {:.1e}", prm.ev_conv, dE, prm.conv_thr);
         break;
       }
       continue;
@@ -2650,7 +2667,7 @@ template <MEMORY_SPACE MEM> gw_line_result_t gw_line_scf_impl(methods::thc_reade
     }
   }
   if (ev_scheme and not converged and not res.history.empty() and res.history.back().iter > 1)   // D2
-    converged = res.history.back().dE_qp < prm.conv_thr;
+    converged = (prm.ev_conv == "window" ? res.history.back().dE_qp_win : res.history.back().dE_qp) < prm.conv_thr;
   if (not ev_scheme and not converged and not res.history.empty() and res.history.back().iter > 1 and
       res.history.back().dSigma < prm.conv_thr) {
     auto const &h = res.history.back();

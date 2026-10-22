@@ -3,8 +3,10 @@
 test test_gw_line_scf [gw_line][scheme], lih222 fixture. Settings, inputs and the C++-bases replacement exactly as
 gen_lih222_scf_ref.py (its docstring); mixing 0.5 (Sigma for scgw0; QP energies for evgw/evgw0 from iteration 2).
 Output tests/unit_test_files/gw_line/lih222_<scheme>_ref.h5: per iteration mu, gap (Ha), dSigma, [scgw0: nelec, nelec_lehmann],
-[ev: dE, E_qp (niter, nk, nb) absolute Ha, Z_qp], Sigma_k0_re/_im at every 4th node (Sigma of the iteration, unmixed for ev).
-Usage: gen_lih222_scheme_ref.py <scheme> [niter=3] [--lam-b L (12)] [--out FILE]"""
+[ev: dE, dE_win (ev_conv "window" metric, Z > 0.5, all bands), E_qp (niter, nk, nb) absolute Ha, Z_qp], Sigma_k0_re/_im at every 4th node (Sigma of the iteration, unmixed for ev).
+Usage: gen_lih222_scheme_ref.py <scheme> [niter=3] [--lam-b L (12)] [--out FILE]
+The committed lih222_evgw{,0}_ref.h5 predate dE_win (2026-10-22): it was added from their stored E_qp / Z_qp with the same rule
+(KS energies / Z = 1 before iteration 1); a regeneration reproduces it to 4e-7 Ha (E_qp drift 1e-5 Ha vs the stored file)."""
 import sys, os, time, functools, numpy as np, h5py
 ROOT = os.environ.get('CAYLEY_ROOT', '/Users/mmorales/Projects/Cayley_real_axis_scGW')
 sys.path.insert(0, ROOT + '/coqui/cayley')
@@ -48,14 +50,14 @@ if not native:
 sc.start_from_hamiltonian(np.array([np.diag(eig[k]) for k in range(nk)]).astype(complex))
 idx = np.arange(0, len(sc.fz), 4)
 ev = scheme in ('evgw', 'evgw0')
-H = {k: [] for k in ('mu', 'gap', 'dSigma', 'nelec', 'nelec_lehmann', 'dE')}
+H = {k: [] for k in ('mu', 'gap', 'dSigma', 'nelec', 'nelec_lehmann', 'dE', 'dE_win')}
 Sig, Eq, Zq = [], [], []
 t0 = time.time()
 for it in range(niter):
     rec = sc.iterate()
     H['mu'].append(rec['mu']); H['gap'].append(rec['gap_eV'] / 27.211386); H['dSigma'].append(rec['dSigma'])
     if ev:
-        H['dE'].append(rec['dE']); Eq.append(sc.ev_E.copy()); Zq.append(sc.ev_Z.copy())
+        H['dE'].append(rec['dE']); H['dE_win'].append(rec['dE_win']); Eq.append(sc.ev_E.copy()); Zq.append(sc.ev_Z.copy())
     else:
         H['nelec'].append(rec['nelec']); H['nelec_lehmann'].append(rec['nelec_exact'])
     Sig.append(sc.sigma_total(0)[idx])

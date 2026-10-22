@@ -176,6 +176,8 @@ Hartree. "auto" defaults are computed at run time as described.
 | `start_eta` | double | `1e-3` | unused since D2: the diagonal QP equation of `qp_diag` / evGW is solved exactly at eta = 0 (largest-Z root of the upfolded Sigma_nn, `warm_start.hpp`) | never |
 | `scheme` | string | `"scgw"` | D2: `"scgw"` / `"scgw0"` (W frozen at iteration 1 = RPA@KS, own copy of the bosonic basis; G self-consistent) / `"evgw"` (KS vectors + QP energies; W[G_QP] every iteration; diagonal QP equation; energies mixed with `mixing`; converged on max abs(dE_QP) < `conv_thr`) / `"evgw0"` (evgw with W0 frozen). Non-scgw: T = 0, `start = "ks"`, no coarse levels; checkpoint `iter<N>/{E_qp, Z_qp}` | GW0-type comparisons |
 | `ev_window` | double | `0.0` | evgw*: bands with abs(e_KS - mu0) > ev_window (Ha) take the QP shift of the nearest in-window band of the same k (scissor); <= 0: all bands | high bands with low Z |
+| `ev_conv` | string | `"all"` | evgw* convergence metric: `"all"` = max abs(dE_QP) over all (k, band); `"window"` = over the ev_window states (all if ev_window <= 0) with Z > ev_conv_zmin in this and the previous iteration (low-Z states of a quasi-continuum hop between roots); both are logged (history dE_qp / dE_qp_win) | Si 4³ evGW: all-band metric 0.03-0.4 Ha never converges, gaps < 1 meV |
+| `ev_conv_zmin` | double | `0.5` | ev_conv = "window": Z threshold (Z > 0.5 = certified unique root) | |
 | `coarse.niter` | long | `0` | multilevel schedule: iterations 1..coarse.niter at coarse settings, then production (niter >= coarse.niter + 2; incompatible with `bases_file`) | not recommended (net gain ~3% on Si) |
 | `coarse.eps` | double | `1e-8` | coarse-level basis tolerance | with coarse |
 | `coarse.K` | long | `16` | coarse-level moments | with coarse |

@@ -3215,6 +3215,21 @@ TEST_CASE("gw_line_scf_scheme", "[gw_line][scf][scheme]") {
         ok = gate_line("max|E_QP - py| Z>0.5, 10 eV (Ha)", dq, EV_GATE[it]) and ok;
         ok = gate_line("max|E_QP - py| all bands (Ha)", dall, EV_GATE_ALL) and ok;
         ok = gate_line("|dmu| (Ha)", A.history[it].mu - mu_r(it), EV_GATE[it]) and ok;
+        // ev_conv "window" metric (logged for both settings) vs the prototype's dE_win (Z > 0.5 in two iterations, all bands)
+        ok = gate_line("dE_qp_win - py (Ha)", A.history[it].dE_qp_win - rd(ref_of(sch), "dE_win")(it), EV_GATE_ALL) and ok;
+      }
+      if (sch == "evgw") {   // ev_conv = "window" converges where "all" does not (py: dE 0.130 / dE_win 0.074 at it 2)
+        const std::string fw = fa + "_win";
+        auto pw = scheme_params(fw, 3, false, sch);
+        pw.put("ev_conv", "window");
+        pw.put("conv_thr", 0.1);
+        auto W = methods::gw_line::gw_line_scf<HOST_MEMORY>(*L.thc, *L.mf, pw);
+        REQUIRE(W.history.size() == 2);
+        REQUIRE(W.converged);
+        REQUIRE(W.history[1].dE_qp_win < 0.1);
+        REQUIRE(W.history[1].dE_qp > 0.1);
+        REQUIRE(W.history[1].dE_qp == A.history[1].dE_qp);   // the metric does not change the iteration
+        remove_file(comm, fw + ".gw_line.h5");
       }
       if (sch == "evgw") {   // iteration 1 = the qp_diag start pass
         const std::string fq = "gw_line_scheme_qpd";
