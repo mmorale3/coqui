@@ -234,6 +234,8 @@ set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT
 # of the SELF-CONSISTENT G with the vertex OFF (baseline control), the same with the vertex
 # ON over several iterations, and a sym-vs-nosym e_corr TRAJECTORY over more iterations
 # than the 2-iteration gold check of test_vertex_ibz.
+# It runs ~4.0-4.4 h on 2 ranks (dielectric_stability alone 2.7-2.9 h; its dynamic-rung
+# kernels are host-bound, so a GPU build is no faster), past the directory default: twice that.
 set(TEST_ID methods_vertex_scdiag)
 
 add_executable(test_${TEST_ID} test_vertex_scdiag.cpp)
@@ -241,8 +243,9 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+math(EXPR COQUI_VERTEX_SCDIAG_TIMEOUT "2 * ${COQUI_VERTEX_TEST_TIMEOUT}")
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
-                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
+                    TIMEOUT ${COQUI_VERTEX_SCDIAG_TIMEOUT})
 
 # The DISTRIBUTED (SLATE) solve path of the pair-space ladder behind ladder_solve_grid = g,
 # compared with the per-rank path on one fixture state -- the whalf evaluator,
