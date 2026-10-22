@@ -85,25 +85,22 @@ namespace solvers {
       nda::blas::gemm(tmp, U, Gbar);                  // (U^dag G) U
     }
 
-    // Sigma^C injection, CHAIN-RULE form (pinned by the gauge-invariance tests):
-    //   Sigma^C_ij += sum_ab conj(U_ia) Sigma_bar_ab U_jb = [conj(U) Sigma_bar U^T]_ij
-    // over i,j in W_rng. The Sigma kernel emits Sigma_bar(a,b) with the external index a
-    // carrying the NON-conjugated collocation leg (X_bar, phase phi_a) and b the
-    // CONJUGATED leg (conj(X_bar), phase conj(phi_b)); so under U -> U V the kernel output
-    // transforms as Sigma_bar -> V^T Sigma_bar conj(V), and only the chain-rule sandwich
-    // conj(U) Sigma_bar U^T is invariant (the operator sandwich U Sigma_bar U^dag leaks at
-    // O(1) under a COMPLEX gauge -- the vertex_sigma_toy "wannier_gauge" oracle). This
-    // equals Sigma_bar for U = I, so the window / degenerate-U bit-identity is preserved
-    // (conj(I) Sigma_bar I^T = Sigma_bar; NO transpose of Sigma_bar). Sw is the W_rng
-    // destination block. Implemented as conj(U) . Sigma_bar . transpose(U).
+    // Sigma^C injection. The Sigma kernel emits Sigma_bar(a,b) = dPhi/dG_bar(a,b) (the
+    // external index a on the NON-conjugated collocation leg X_bar, b on the CONJUGATED
+    // one), i.e. the TRANSPOSE of the self-energy matrix <a|Sigma|b>: under U -> U V it
+    // transforms as V^T Sigma_bar conj(V), while G and Sigma transform as V^dag (.) V (the
+    // vertex_sigma_toy "wannier_gauge" oracle pins the kernel side). The band-space
+    // self-energy is therefore
+    //   Sigma^C_ij += sum_ab U_ia Sigma_bar_ba conj(U_jb) = [U Sigma_bar^T U^dag]_ij
+    // over i,j in W_rng: the transpose of the chain-rule sandwich conj(U) Sigma_bar U^T,
+    // gauge invariant like it, and equal to the window injection Sigma_bar^T for U = I.
+    // Sw is the W_rng destination block.
     inline void upfold_Sigma(nda::MemoryArrayOfRank<2> auto const &U,      // (nrow, M)
                              nda::MemoryArrayOfRank<2> auto const &Sbar,   // (M, M)
                              nda::array<ComplexType, 2> &tmp,              // (nrow, M)
                              nda::MemoryArrayOfRank<2> auto &&Sw) {        // (nrow, nrow)
-      // conj(U) cannot be passed alone to gemm (BLAS has no conj-only op); materialize it.
-      auto Uc = nda::make_regular(nda::conj(U));       // (nrow x M)
-      nda::blas::gemm(Uc, Sbar, tmp);                  // conj(U) Sigma_bar   (nrow x M)
-      nda::blas::gemm(ComplexType(1.0), tmp, nda::transpose(U), ComplexType(1.0), Sw);
+      nda::blas::gemm(U, nda::transpose(Sbar), tmp);   // U Sigma_bar^T   (nrow x M)
+      nda::blas::gemm(ComplexType(1.0), tmp, nda::dagger(U), ComplexType(1.0), Sw);
     }
 
     // X_bar(s,k) = X(s,k) . U(s,k) : the rotated collocation (Np x M). X_skPa carries

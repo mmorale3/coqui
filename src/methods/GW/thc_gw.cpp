@@ -225,6 +225,8 @@ namespace methods {
       }
       // Sigma vertex, pair-resolved: the static-ladder vertex self-energy (scr_coulomb_t::build_sigma_pair,
       // the C-window block in band labels, replicated) accumulated on top of Sigma^GW; released here.
+      // The pair machinery carries dPhi/dG_ab (it reproduces the vertex Sigma^{C,x} kernel), the TRANSPOSE of the
+      // matrix Sigma_ij = <i|Sigma|j> held here: Sigma_ij += dS_ji (see vertex_t::eval_Sigma_C).
       _sigma_pair_dmax = 0.0; _sigma_pair_smax = 0.0;
       if (mb_state.dSigma_pair_tskab.has_value()) {
         auto &sSigma = mb_state.sSigma_tskij.value();
@@ -247,7 +249,7 @@ namespace methods {
                 for (long i = 0; i < nb; ++i)
                   for (long j = 0; j < nb; ++j) {
                     auto &sv = S_loc(it, is, ik, b0 + i, b0 + j);
-                    const auto dv = dS(it, is, ik, i, j);
+                    const auto dv = dS(it, is, ik, j, i);
                     dmax = std::max(dmax, std::abs(dv)); smax = std::max(smax, std::abs(sv));
                     sv += dv;
                   }

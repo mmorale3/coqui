@@ -3147,11 +3147,25 @@ namespace solvers {
                            : _bl_drop == 2 ? "Sigma^(C,x), the kernel term"
                                            : "BOTH Sigma^C pieces (P^{C,L} still injected, "
                                              "so this isolates its effect via Sigma_GW)"));
-      if (stat and _bl_drop != 1 and _bl_drop != 3) sSigma_tskij.local() += Sigma_r;
+      // Both kernels emit dPhi/dG_ab, the TRANSPOSE of the self-energy matrix
+      // Sigma_ij = <i|Sigma|j> that sSigma_tskij holds (and the Dyson solver inverts with):
+      // Sigma_ij = dPhi/dG_ji. Hence the transposes below. On Hermitian data this is the
+      // complex conjugate: the diagonal is unaffected, the off-diagonal is not, under any
+      // complex orbital gauge (test_vertex_gf2xchk: Sigma^C at C = full, W = v, equals
+      // the GF2 exchange only after it).
+      auto Sloc = sSigma_tskij.local();
+      if (stat and _bl_drop != 1 and _bl_drop != 3)
+        for (long it = 0; it < Sigma_r.shape(0); ++it)
+          for (long is = 0; is < Sigma_r.shape(1); ++is)
+            for (long ik = 0; ik < Sigma_r.shape(2); ++ik)
+              Sloc(it, is, ik, all, all) += nda::transpose(Sigma_r(it, is, ik, all, all));
       if (_bl_drop == 2 or _bl_drop == 3) {
         // kernel term dropped -- nothing to accumulate on the C-C block
       } else if (not wan) {
-        sSigma_tskij.local()(all, all, all, _band_window, _band_window) += Sigma_C;
+        for (long it = 0; it < nt; ++it)
+          for (long is = 0; is < ns; ++is)
+            for (long ik = 0; ik < nk_ext; ++ik)
+              Sloc(it, is, ik, _band_window, _band_window) += nda::transpose(Sigma_C(it, is, ik, all, all));
       } else {
         const long nW = _band_window.size();
         nda::array<ComplexType, 2> tmp(nW, nc);
