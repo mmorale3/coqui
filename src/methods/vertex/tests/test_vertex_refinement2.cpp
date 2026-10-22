@@ -618,6 +618,8 @@ namespace bdft_tests {
     SUCCEED("vertex_secondary_isdf_lih skipped: build has ENABLE_DLR=OFF.");
 #else
     auto& mpi_context = utils::make_unit_test_mpi_context();
+    // the conservation identities below hold to the kernels' accuracy with the auxiliary-node fit
+    imag_axes_ft::dlr_pole_fit_scheme_scope fit_scheme(imag_axes_ft::dlr_pole_fit_scheme::aux_interpolation);
     // wmax = 6.0: the headroom the vertex needs so that products of tau-objects (pair and
     // triple products) stay within the IAFT basis span
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
@@ -958,9 +960,7 @@ namespace bdft_tests {
                  "S_SG = ({}, {}), S_PW = ({}, {}), rel = {}",
               S_SG_g.real(), S_SG_g.imag(), S_PW_g.real(), S_PW_g.imag(), rel_g);
       REQUIRE(std::isfinite(rel_g));
-      // accepted least-squares pole-fit violation with the gygi head (see dlr_pole_fit and
-      // test_vertex_conservation): measured 3.9e-2; bounded against a regression beyond it
-      REQUIRE(rel_g < 1e-1);
+      REQUIRE(rel_g < 1e-3);
     }
 
     if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());

@@ -40,10 +40,13 @@
 #include "catch2/catch.hpp"
 #include "configuration.hpp"
 #include "nda/nda.hpp"
+#include "nda/lapack.hpp"
+#include <string>
 
 #include "utilities/test_common.hpp"
 #include "numerics/imag_axes_ft/IAFT.hpp"
 #include "numerics/imag_axes_ft/dlr_pole_fit.hpp"
+#include "cppdlr/dlr_imtime.hpp"
 
 namespace bdft_tests {
 
@@ -259,6 +262,133 @@ namespace bdft_tests {
         REQUIRE(err < 1e-2);
         // and the gate must not fire on a perturbation this small
         imag_axes_ft::dlr_pole_fit_gate(err, "test_dlr_pole_fit");
+      }
+    }
+  }
+
+
+  // ---- the auxiliary-node interpolation scheme ----------------------------------------------
+  // The residue algebras were derived with the interpolatory map (the auxiliary function that
+  // takes the data's values at the auxiliary tau nodes), and the Phi-derivable identity
+  // Tr[Sigma^C G] + Tr[P^C W] = 0 holds to the kernels' accuracy only with it
+  // (test_methods_vertex_conservation). Bare, that map amplifies up to ~10x more than least
+  // squares; the scheme removes every direction whose gain exceeds the least-squares map's.
+  TEST_CASE("dlr_pole_fit_aux_interpolation", "[iaft]") {
+    using imag_axes_ft::dlr_pole_fit_scheme;
+    struct grid_t { double wmax; const char* prec; };
+    for (auto [wmax, prec] : {grid_t{4.0, "low"}, grid_t{6.0, "low"}, grid_t{15.0, "high"}}) {
+      const double beta = 1000.0;
+      imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::dlr_basis, prec);
+      imag_axes_ft::dlr_pole_fit ls(ft, -1.0, dlr_pole_fit_scheme::least_squares);
+      imag_axes_ft::dlr_pole_fit ai(ft, -1.0, dlr_pole_fit_scheme::aux_interpolation);
+      INFO("wmax " << wmax << " prec " << prec << ": nt " << ai.nt << " np " << ai.np << " kept " << ai.n_kept
+                   << " capped " << ai.n_capped << " gain " << ai.amplification << " (least squares " << ls.amplification << ")");
+      REQUIRE(ai.scheme == dlr_pole_fit_scheme::aux_interpolation);
+      REQUIRE(ai.n_kept > 0);
+
+      // ---- 1. the gain never exceeds the least-squares map's ------------------------------
+      REQUIRE(ai.amplification <= ls.amplification * (1.0 + 1e-12));
+
+      // ---- 2. exact at the auxiliary nodes on every direction the cap keeps ----------------
+      cppdlr::imtime_ops aux(ft.lambda(), cppdlr::build_dlr_rf(ft.lambda(), ft.eps()));
+      REQUIRE(aux.rank() == ai.np);
+      nda::array<double, 1> xa(ai.np);
+      for (long l = 0; l < ai.np; ++l) xa(l) = 2.0 * cppdlr::rel2abs(aux.get_itnodes(l)) - 1.0;
+      auto T = ft.construct_tau_interpolate_matrix(xa);
+      double worst = 0.0;
+      for (long j : {0l, ai.n_kept / 2, ai.n_kept - 1}) {
+        nda::array<cplx, 2> v(ai.nt, 1);
+        for (long i = 0; i < ai.nt; ++i) v(i, 0) = ai.Ut(j, i) / ai.sval(j);   // a unit data direction
+        auto c = ai.coeffs(v);
+        double r = 0.0, sc = 0.0;
+        for (long l = 0; l < ai.np; ++l) {
+          cplx fb = 0, ff = 0;
+          for (long i = 0; i < ai.nt; ++i) fb += T(l, i) * v(i, 0);
+          for (long p = 0; p < ai.np; ++p) ff += c(p, 0) * imag_axes_ft::dlr_kF(beta, (xa(l) + 1.0) * 0.5 * beta, ai.epsl(p));
+          r = std::max(r, std::abs(fb - ff));
+          sc = std::max(sc, std::abs(fb));
+        }
+        worst = std::max(worst, r / std::max(sc, maxabs(c) * 1e-6));
+      }
+      app_log(1, "aux interpolation, wmax {} {}: {} kept, {} capped, gain {:.3e} (least squares {:.3e}), "
+                 "aux-node residual on kept directions {:.2e}, aux solve rank {} of {} (cond {:.2e})", wmax, prec, ai.n_kept, ai.n_capped,
+              ai.amplification, ls.amplification, worst, ai.n_aux, ai.np, ai.aux_cond);
+      // exact when the auxiliary-node kernel is solved at full rank; at high precision its
+      // condition number (~5e13) exceeds the relative cut and the solve is a truncated least
+      // squares on those nodes, like the backend-grid fit itself
+      if (ai.n_aux == ai.np) REQUIRE(worst < 1e-8);
+
+      // ---- 3. Lehmann data: accuracy, residue size, pole convention -----------------------
+      std::vector<double> e{-3.1, -0.9, -0.05, 0.4, 1.7, 3.6};
+      std::vector<double> w{0.7, -1.3, 0.45, 1.0, -0.6, 0.25};
+      auto F = lehmann_tau(ai, e, w, 3);
+      auto c = ai.coeffs(F);
+      REQUIRE(ai.fit_error(F, c) < 1e-4);
+      REQUIRE(maxabs(c) < 50.0 * maxabs(F));
+      {
+        auto wf = ft.wn_mesh_f();
+        double err = 0, scale = 0;
+        for (long n = 0; n < std::min(6L, (long)wf.size()); ++n) {
+          cplx z(0.0, double(wf(n)) * M_PI / beta);
+          cplx got = 0, ref = 0;
+          for (long p = 0; p < ai.np; ++p) got += c(p, 0) / (z - ai.epsl(p));
+          for (size_t k = 0; k < e.size(); ++k) ref += w[k] / (z - e[k]);
+          err = std::max(err, std::abs(got - ref));
+          scale = std::max(scale, std::abs(ref));
+        }
+        REQUIRE(err / scale < 1e-4);
+      }
+
+      // ---- 4. a fixed linear map: batched == per column, covariant under column mixing ----
+      {
+        nda::array<cplx, 2> F1(ai.nt, 1), FV(ai.nt, 3);
+        const double th = 0.7;
+        for (long i = 0; i < ai.nt; ++i) {
+          F1(i, 0) = F(i, 1);
+          FV(i, 0) = std::cos(th) * F(i, 0) + std::sin(th) * F(i, 1);
+          FV(i, 1) = -std::sin(th) * F(i, 0) + std::cos(th) * F(i, 1);
+          FV(i, 2) = F(i, 2);
+        }
+        auto c1 = ai.coeffs(F1);
+        auto cV = ai.coeffs(FV);
+        double d1 = 0, dV = 0, cm = maxabs(c);
+        for (long p = 0; p < ai.np; ++p) {
+          d1 = std::max(d1, std::abs(c1(p, 0) - c(p, 1)));
+          dV = std::max(dV, std::abs(cV(p, 0) - (std::cos(th) * c(p, 0) + std::sin(th) * c(p, 1))));
+          dV = std::max(dV, std::abs(cV(p, 1) - (-std::sin(th) * c(p, 0) + std::cos(th) * c(p, 1))));
+        }
+        REQUIRE(d1 <= 1e-10 * std::max(cm, 1.0));
+        REQUIRE(dV <= 1e-9 * std::max(cm, 1.0));
+      }
+
+      // ---- 5. content the auxiliary basis cannot represent does not explode the residues --
+      // (the probe of the least-squares test's case 4: a tau direction projected off every
+      // kernel column, relative size 1e-4)
+      {
+        auto F0 = lehmann_tau(ai, e, w, 1);
+        const double fmax = maxabs(F0);
+        nda::array<double, 1> r(ai.nt);
+        unsigned seed = 12345;
+        for (long i = 0; i < ai.nt; ++i) {
+          seed = seed * 1103515245u + 12345u;
+          r(i) = 2.0 * (double((seed >> 16) & 0x7fff) / 32767.0) - 1.0;
+        }
+        for (int pass = 0; pass < 2; ++pass)
+          for (long p = 0; p < ai.np; ++p) {
+            double kk = 0, kr = 0;
+            for (long i = 0; i < ai.nt; ++i) { kk += ai.Kmat(i, p) * ai.Kmat(i, p); kr += ai.Kmat(i, p) * r(i); }
+            for (long i = 0; i < ai.nt; ++i) r(i) -= kr / kk * ai.Kmat(i, p);
+          }
+        const double rn = maxabs(r);
+        for (long i = 0; i < ai.nt; ++i) F0(i, 0) += cplx(1e-4 * fmax * r(i) / rn);
+        auto cp = ai.coeffs(F0);
+        auto cl = ls.coeffs(F0);
+        app_log(1, "  unrepresentable probe: residue/data {:.3e} (least squares {:.3e})",
+                maxabs(cp) / fmax, maxabs(cl) / fmax);
+        // O(1) residues, or -- at high precision, where the least-squares map itself gives ~80
+        // on this probe -- no larger than the least-squares map's
+        REQUIRE(maxabs(cp) < std::max(50.0 * fmax, maxabs(cl)));
+        REQUIRE(ai.fit_error(F0, cp) < 1e-2);
       }
     }
   }

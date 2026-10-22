@@ -44,6 +44,7 @@
 #include "methods/vertex/vertex_debug.hpp"
 #include "methods/vertex/vertex_t.h"
 #include "numerics/imag_axes_ft/IAFT.hpp"
+#include "numerics/imag_axes_ft/dlr_pole_fit.hpp"
 #include "numerics/iter_scf/iter_scf_utils.hpp"
 
 #include "SCF/scf_driver.hpp"
@@ -274,6 +275,15 @@ namespace mbpt_vertex_audit {
     }
   }
 
+  /** pol_vertex_pole_fit ("least_squares", the default | "aux_interpolation"): the tau -> residue map of the
+   *  auxiliary DLR pole fit used by every vertex residue algebra (dlr_pole_fit.hpp). aux_interpolation restores
+   *  Tr[Sigma^C G] + Tr[P^C W] = 0 to the kernels' accuracy; least_squares leaves a ~1e-4 relative residual. */
+  inline void set_pole_fit_scheme(ptree const& pt) {
+    auto name = io::get_value_with_default<std::string>(pt, "pol_vertex_pole_fit", "least_squares");
+    imag_axes_ft::dlr_pole_fit_default_scheme() = imag_axes_ft::dlr_pole_fit_scheme_from_string(name);
+    app_log(2, "  vertex auxiliary pole fit: {}", name);
+  }
+
   /** the in-run Sigma reference's opt-in keys: pol_vertex_sigma_dyn_ref_adaptive (false) with its threshold
    *  pol_vertex_sigma_dyn_ref_change (an input error without the flag), pol_vertex_sigma_dyn_final_full (false), and the
    *  sampled regression's eigenvalue cuts pol_vertex_sigma_dyn_fit_cut_cst / _t (1e-14). */
@@ -498,6 +508,10 @@ namespace mbpt_vertex_audit {
  *                 pol_vertex_sigma_dyn_ref_adaptive (false) = true renews it adaptively: when the vertex dSigma of a sampled
  *                 pass differs from the reference pass's by more than pol_vertex_sigma_dyn_ref_change (1e-3; relative
  *                 Frobenius, logged every sampled pass), the next pass solves every node (either renewal makes a reference);
+ *                 pol_vertex_pole_fit ("least_squares" | "aux_interpolation") = the tau -> residue map of the auxiliary
+ *                 DLR pole fit in every vertex residue algebra: aux_interpolation (interpolation at the auxiliary tau
+ *                 nodes, gain capped at the least-squares map's) keeps Tr[Sigma^C G] + Tr[P^C W] = 0 to the kernels'
+ *                 accuracy, least_squares to ~1e-4 relative (dlr_pole_fit.hpp).
  *                 pol_vertex_sigma_dyn_final_full (false) = true makes the last scf iteration an all-node pass: iteration
  *                 niter, or -- when the convergence test passes earlier on a sampled pass -- one more iteration, after
  *                 which the loop stops. pol_vertex_sigma_dyn_fit_cut_cst / _t (1e-14) = the eigenvalue cut (of the
@@ -1071,6 +1085,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     }
     // a requested vertex / ladder with an empty C (after any Wannier projector) and a Sigma vertex without
     // the ladder abort here, before the scf loop
+    mbpt_vertex_audit::set_pole_fit_scheme(pt);
     mbpt_vertex_audit::check_vertex_requests(vertex, pt, "mbpt [gw]");
 
     if (screen_type.substr(0,8)=="gw_edmft") {
@@ -1467,6 +1482,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     mbpt_vertex_audit::carrier_vertex_keys(pol_vertex_carrier, scr_eri, mf, pt, "mbpt [" + solver_type + "]",
                                            std::string("rpa"));
     // empty-C / Sigma-vertex-without-ladder requests abort (as in the [gw] sites)
+    mbpt_vertex_audit::set_pole_fit_scheme(pt);
     mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     MBState mb_state(mpi, ft, output);
@@ -1765,6 +1781,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     mbpt_vertex_audit::carrier_vertex_keys(pol_vertex_carrier, scr_eri, mf, pt, "mbpt [" + solver_type + "]",
                                            std::string("rpa"));
     // empty-C / Sigma-vertex-without-ladder requests abort (as in the [gw] sites)
+    mbpt_vertex_audit::set_pole_fit_scheme(pt);
     mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     // re-QP-ization from an external Green's function. Parsed with an EMPTY default --
@@ -2153,6 +2170,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     }
     // a requested vertex / ladder with an empty C (after any Wannier projector) and a Sigma vertex without
     // the ladder abort here, before the scf loop
+    mbpt_vertex_audit::set_pole_fit_scheme(pt);
     mbpt_vertex_audit::check_vertex_requests(vertex, pt, "mbpt [gw]");
 
     MBState mb_state(ft, output, mf, projector_ksIai, band_window, kpts_crys, trans_home_cell, false);
@@ -2471,6 +2489,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     mbpt_vertex_audit::carrier_vertex_keys(pol_vertex_carrier, scr_eri, mf, pt, "mbpt [" + solver_type + "]",
                                            screen_type);
     // empty-C / Sigma-vertex-without-ladder requests abort (as in the [gw] sites)
+    mbpt_vertex_audit::set_pole_fit_scheme(pt);
     mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
 
