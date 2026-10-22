@@ -579,21 +579,32 @@ namespace bdft_tests {
    *   pyscf_si222    mode_a    9.257495
    *   pyscf_si222    mode_b    9.261511
    *
-   * Tolerance 1e-5 eV: the references are quoted to 1e-6 eV, and the failure this guards
-   * against (an out-of-strip state silently evaluated at eps instead of mu) moves the gap by
-   * O(0.1-1 eV) or diverges the loop. The eta_far > 0 cells are a MEASUREMENT, not a check --
+   * Tolerance 1e-2 eV. The converged gaps are deterministic on one platform (identical on 2
+   * and 4 ranks) but not across BLAS/compiler stacks: against the references (macOS, clang +
+   * OpenBLAS, reproduced there to < 1e-6 eV), Linux (gcc + MKL) gives
+   *
+   *   qe_lih222 mode_a +5.05e-4, qe_lih222 mode_b -3.54e-3, pyscf_si222 mode_a +1.40e-3,
+   *   pyscf_si222 mode_b -4.5e-7 eV.
+   *
+   * At eta_far = 0 the map evaluates undamped pole sums whose smallest denominators reach
+   * 1e-6 a.u., so rounding-level differences move the fixed point at the meV level; an equally
+   * valid THC point set (pivot tie rule 1e-6 instead of 0) moves pyscf_si222 mode_a by the same
+   * +1.4e-3 eV on macOS. 1e-2 eV is ~3x the largest measured spread and still 10x below the
+   * failure this guards against (an out-of-strip state silently evaluated at eps instead of
+   * mu moves the gap by O(0.1-1 eV) or diverges the loop). All four cells are CHECKed so one
+   * run reports them all. The eta_far > 0 cells are a MEASUREMENT, not a check --
    * they live in [.etafar_scan] below.
    */
   TEST_CASE("qp_map_etafar_identity", "[methods][qpgw][qp_map_ab][etafar]") {
     using namespace qp_map_ab_detail;
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
-    constexpr double tol = 1e-5;   // eV
+    constexpr double tol = 1e-2;   // eV
 
     auto check = [&](std::string const &fix, std::string const &map, double gap, double ref) {
       app_log(1, "@@ETAFAR0 [{}/{}] gap = {:.6f} eV, reference = {:.6f} eV, "
                  "d = {:+.2e} eV", fix, map, gap, ref, gap - ref);
-      REQUIRE(std::abs(gap - ref) < tol);
+      CHECK(std::abs(gap - ref) < tol);
     };
     {
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
