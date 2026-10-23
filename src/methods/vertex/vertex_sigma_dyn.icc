@@ -299,7 +299,7 @@ namespace solvers {
         // only the partner terms of q's star read its scratch; the regular unit applies the main terms
         const auto pit = partner_rep.find(unit_iq);
         const bool is_partner = (pit != partner_rep.end());
-        auto const &ftq = fold_terms_of(is_partner ? pit->second : unit_iq);
+        auto const &ftq = fold_terms_of(unit_is, is_partner ? pit->second : unit_iq);
         vertex_sym::fold_terms ft;
         if (is_partner) ft.partner = {}, ft.terms = ftq.partner;
         else { ft.terms = ftq.terms; n_trev_images += ftq.n_trev; }
@@ -312,13 +312,13 @@ namespace solvers {
         if (np_ > 0) { RTu() = ComplexType(0.0); RUu() = ComplexType(0.0); }
         unit_is = unit_iq = unit_m = -1;
       }
-      /** the star-fold term table of the IBZ transfer q (vertex_sym::fold_star_terms), cached per transfer; shared by the host
-       *  fold above and the device fold (sigma_dyn_device_fold) */
-      std::map<long, vertex_sym::fold_terms> fold_cache;
-      vertex_sym::fold_terms const &fold_terms_of(long q) {
-        auto it = fold_cache.find(q);
+      /** the star-fold term table of the IBZ transfer q for spin is (vertex_sym::fold_star_terms), cached per (spin, transfer);
+       *  shared by the host fold above and the device fold (sigma_dyn_device_fold) */
+      std::map<std::pair<long, long>, vertex_sym::fold_terms> fold_cache;
+      vertex_sym::fold_terms const &fold_terms_of(long is, long q) {
+        auto it = fold_cache.find({is, q});
         if (it == fold_cache.end()) {
-          auto ft = vertex_sym::fold_star_terms(*symc, q, S_cst.shape(3));
+          auto ft = vertex_sym::fold_star_terms(*symc, q, S_cst.shape(3), is);
           if (dep_on()) {   // the sources on the deposit rows; a source with no row holds no deposit (its term adds zero)
             auto to_rows = [&](std::vector<vertex_sym::fold_term> &tl) {
               std::vector<vertex_sym::fold_term> kept;
@@ -334,7 +334,7 @@ namespace solvers {
             to_rows(ft.terms);
             to_rows(ft.partner);
           }
-          it = fold_cache.emplace(q, std::move(ft)).first;
+          it = fold_cache.emplace(std::make_pair(is, q), std::move(ft)).first;
         }
         return it->second;
       }
@@ -355,7 +355,8 @@ namespace solvers {
       std::vector<long> partners_needed(std::vector<long> const &q_ibz_list, long nc) {
         std::vector<long> out;
         if (symc == nullptr or not symc->active) return out;
-        for (long q : q_ibz_list) if (vertex_sym::fold_star_terms(*symc, q, nc).needs_partner()) out.push_back(q);
+        // (the partner terms are an index property of the star, the same for every spin)
+        for (long q : q_ibz_list) if (vertex_sym::fold_star_terms(*symc, q, nc, 0).needs_partner()) out.push_back(q);
         return out;
       }
       /** the deposit targets of block (is, iq, m): the unit scratch under ibz (flushing the previous unit), else the accumulators */
@@ -1089,7 +1090,7 @@ namespace solvers {
       if (not d.on or not h.ibz or d.unit_q < 0) return;
       const auto pit = h.partner_rep.find(d.unit_q);
       const bool is_partner = (pit != h.partner_rep.end());
-      auto const &ftq = h.fold_terms_of(is_partner ? pit->second : d.unit_q);
+      auto const &ftq = h.fold_terms_of(d.unit_is, is_partner ? pit->second : d.unit_q);
       auto const &tl = is_partner ? ftq.partner : ftq.terms;
       const long nc = h.S_cst.shape(3), nterm = long(tl.size());
       std::vector<long> tk(static_cast<size_t>(nterm)), tsrc(static_cast<size_t>(nterm));

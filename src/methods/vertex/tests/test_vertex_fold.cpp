@@ -58,7 +58,7 @@ namespace bdft_tests {
       vsym::fill_index_maps(c, *mf);
       c.active = true;
       c.ns = 1; c.nc = 1; c.naux = 0;
-      c.Dc = nda::array<ComplexType, 4>(c.nsym, c.nk_full, 1, 1);
+      c.Dc = nda::array<ComplexType, 5>(1, c.nsym, c.nk_full, 1, 1);
       c.Dc() = ComplexType(1.0);
       const long nk = c.nk_full, nq = c.nq_full;
 
@@ -126,7 +126,7 @@ namespace bdft_tests {
       long n_terms = 0, n_partner = 0, n_trev = 0, n_cjg = 0, n_part_q = 0;
       double err_max = 0.0;
       for (long iq = 0; iq < c.nq_ibz; ++iq) {
-        auto ft = vsym::fold_star_terms(c, iq, 1);
+        auto ft = vsym::fold_star_terms(c, iq, 1, 0);
         long star_size = 0;
         for (long qp = 0; qp < nq; ++qp) if (c.q_star(qp) == iq) ++star_size;
         REQUIRE(long(ft.terms.size() + ft.partner.size()) == star_size * c.nk_ibz);
@@ -175,7 +175,7 @@ namespace bdft_tests {
       vsym::sym_ctx c;
       vsym::fill_index_maps(c, *mf);
       c.active = true; c.ns = 1; c.nc = 1;
-      c.Dc = nda::array<ComplexType, 4>(c.nsym, c.nk_full, 1, 1);
+      c.Dc = nda::array<ComplexType, 5>(1, c.nsym, c.nk_full, 1, 1);
       c.Dc() = ComplexType(1.0);
       auto kc = mf->kpts_crystal();
       auto ops = mf->symm_list();
@@ -208,7 +208,7 @@ namespace bdft_tests {
       nda::array<ComplexType, 4> Y(1, c.nk_ibz, 1, 1);
       for (long k = 0; k < c.nk_ibz; ++k) Y(0, k, 0, 0) = F(k);
       double cons = -1.0;
-      auto X = vsym::unfold_from_ibz(c, Y, &cons);
+      auto X = vsym::unfold_from_ibz(c, Y, 0, &cons);
       long n_tr = 0;
       double err = 0.0, fim = 0.0;
       for (long p = 0; p < c.nk_full; ++p) {

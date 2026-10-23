@@ -386,7 +386,7 @@ namespace solvers {
                 if (dS_unit.size() > 0) dS_unit(it, k, i, j) += pref * acc;
               }
         }
-        if (ibz) vertex_sym::fold_star_into_ibz(*symc, iq, dSq, dSig(all, is, all, all, all), &n_trev_images, &n_cjg_rot);
+        if (ibz) vertex_sym::fold_star_into_ibz(*symc, iq, is, dSq, dSig(all, is, all, all, all), &n_trev_images, &n_cjg_rot);
         if (dump_env != nullptr) dump_unit(is, iq, ibz ? dSq : dS_unit);
         if (ibz and vertex_debug::flag("sigpair_ibz_diag")) {   // vertex_debug: sigpair_ibz_diag
           // IBZ-solve diagnostic: the Hermiticity of this unit's deposit at the IBZ and the non-IBZ externals, and its star

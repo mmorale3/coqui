@@ -99,18 +99,23 @@ namespace vertex_sym {
     std::shared_ptr<math::shm::shared_array<nda::array_view<ComplexType, 5>>> Xhat_shm;
     nda::array_view<ComplexType, 5> Xhat;
 
-    // C-window D blocks Dc(js, k, a, j) (js >= 1; identity slot unused) and the
-    // conjugation flags from symmetry_rotation (true for trev k) -- kept for the
-    // G-rotation consistency diagnostic and for tests.
-    nda::array<ComplexType, 4> Dc;
+    // C-window D blocks Dc(is, js, k, a, j) per spin (the band rotations follow each spin's orbitals; js >= 1, identity
+    // slot unused) and the conjugation flags from symmetry_rotation (true for trev k, the same for all spins) -- kept for
+    // the G-rotation consistency diagnostic and for tests.
+    nda::array<ComplexType, 5> Dc;
     nda::array<bool, 2> cjg;
     // WANNIER mode only (empty otherwise): the rotation the star fold of a Sigma-side contribution uses in place of Dc,
-    //   Dfold(js, k) = U(k)^dag D U(ksrc)   (U(k)^T D U(ksrc) for a conjugated rotation),
+    //   Dfold(is, js, k) = U(k)^dag D U(ksrc)   (U(k)^T D U(ksrc) for a conjugated rotation), per spin,
     // with D the band rotation on the projector's window and ksrc the point Dc refers to. The fold transports an operator
     // from ksrc back to k, so the projector enters with k and ksrc exchanged relative to the leg rotation
     // Dc = U(ksrc)^dag D U(k) (conj(U(k)) when conjugated); for a band window (U = 1) both are D.
-    nda::array<ComplexType, 4> Dfold;
-    nda::array<ComplexType, 4> const &fold_rotation() const { return (Dfold.size() > 0) ? Dfold : Dc; }
+    nda::array<ComplexType, 5> Dfold;
+    /** the fold rotation of spin is, (nsym, nk, nc, nc) */
+    auto fold_rotation(long is) const {
+      auto const &D = (Dfold.size() > 0) ? Dfold : Dc;
+      utils::check(is >= 0 and is < D.shape(0), "sym_ctx::fold_rotation: spin {} out of range (the rotations carry {} spins).", is, D.shape(0));
+      return D(is, nda::ellipsis{});
+    }
     // WANNIER mode: whether the projector is time-reversal covariant, U(-k) = conj U(k) (vertex_t::build_sym_ctx measures
     // it; a diagnostic -- the star fold's Sigma_{-q} at a TRIM point always goes through the -q partner unit)
     bool trim_conj_ok = false;
@@ -270,8 +275,8 @@ namespace vertex_sym {
 
   namespace detail {
     /** the -q source of a time-reversal image at p: Sigma_{-qs}(p) from the unit's Sigma_{qs}: (src, conj_in, N1 or empty) */
-    inline void minus_transfer_source(sym_ctx const &c, long iq, long p, long nc, long &src, bool &conj_in, nda::array<ComplexType, 2> &N1,
-                                      bool &from_partner) {
+    inline void minus_transfer_source(sym_ctx const &c, long iq, long p, long nc, long is, long &src, bool &conj_in,
+                                      nda::array<ComplexType, 2> &N1, bool &from_partner) {
       src = p; conj_in = false; N1 = nda::array<ComplexType, 2>(); from_partner = false;
       if (c.qminus(iq) == iq) return;                             // -qs = qs: a TRIM transfer
       const long pm = c.kminus(p);
@@ -293,15 +298,16 @@ namespace vertex_sym {
                    int(c.q_star(qm) == iq and c.cjg(c.q_isym(qm), p)));
       const long js = c.q_isym(qm);
       src = c.krot(js, p);
-      auto const &DD = c.fold_rotation();
+      auto DD = c.fold_rotation(is);
       N1 = nda::array<ComplexType, 2>(nc, nc);
       for (long a = 0; a < nc; ++a)
         for (long j = 0; j < nc; ++j) N1(a, j) = DD(js, p, a, j);  // B = N1^dag X(src) N1
     }
   }
 
-  /** the term table of the IBZ transfer iq (nc = the C-sector size; see fold_term) */
-  inline fold_terms fold_star_terms(sym_ctx const &c, long iq, long nc) {
+  /** the term table of the IBZ transfer iq for spin is (nc = the C-sector size; see fold_term). The index part (sources,
+   *  flags, partner terms) is the same for all spins; the rotations N are the spin's. */
+  inline fold_terms fold_star_terms(sym_ctx const &c, long iq, long nc, long is) {
     utils::check(c.qminus.size() == c.nq_full and c.kminus.size() == c.nk_full, "fold_star_terms: the sym context has no qminus / kminus maps.");
     // THE C-SECTOR ROTATION CONVENTION OF THE FOLD.
     // A star member's deposit is Y = Dm^dag B Dm with Dm = Dc^T, i.e. Y = conj(Dc) B Dc^T, NOT Dc^dag B Dc. The two agree
@@ -311,7 +317,7 @@ namespace vertex_sym {
     // vertex_debug sym_fold_conv selects Dm for diagnostics: 1 = Dc^T (default), 0 = Dc, 2 = Dc^*, 3 = Dc^dag.
     const bool fold_dt = vertex_debug::flag("sym_fold_dt") or vertex_debug::flag("sym_dt");
     const long fold_conv = fold_dt ? 1 : long(vertex_debug::number("sym_fold_conv", 1.0));
-    auto const &DD = c.fold_rotation();   // Dc, or the Wannier-mode fold rotation
+    auto DD = c.fold_rotation(is);   // Dc, or the Wannier-mode fold rotation
     fold_terms out;
     nda::array<ComplexType, 2> Dm(nc, nc), N1, T(nc, nc);
     for (long qp = 0; qp < c.nq_full; ++qp) {
@@ -327,7 +333,7 @@ namespace vertex_sym {
         fold_term t;
         t.k = k;
         bool conj_in = false, from_partner = false;
-        if (minus) detail::minus_transfer_source(c, iq, pt, nc, t.src, conj_in, N1, from_partner);
+        if (minus) detail::minus_transfer_source(c, iq, pt, nc, is, t.src, conj_in, N1, from_partner);
         else { t.src = pt; N1 = nda::array<ComplexType, 2>(); }
         if (js != 0) {
           for (long a = 0; a < nc; ++a)
@@ -372,20 +378,21 @@ namespace vertex_sym {
   /**
    * UNFOLD a C-sector object from the IBZ to the full mesh with the fold's rotation convention: the fold says
    * Sigma(k) = (cj ? conj : id)[Dm^dag Sigma(p) Dm] for p = S k (p = S(-k) under a conjugated rotation), so
-   * Sigma(p) = Dm (cj ? conj(Sigma(k)) : Sigma(k)) Dm^dag. Y (nt, nk_ibz, nc, nc) -> X (nt, nk_full, nc, nc).
+   * Sigma(p) = Dm (cj ? conj(Sigma(k)) : Sigma(k)) Dm^dag. Y (nt, nk_ibz, nc, nc) of spin is -> X (nt, nk_full, nc, nc).
    * Every full-mesh point is reached from several (js, k) (the little group of k); X(p) is the AVERAGE over them, which
    * projects Y onto its little-group-symmetric part (the terms agree exactly when Y commutes with the little-group
    * representation). `consistency` (optional) returns max |Y(k) - (cj ? conj : id)[Dm^dag X(p) Dm]| / max |Y| over all
    * (js, k): 0 for a symmetric Y; a finite value measures how far the input is from symmetric (THC / aux-basis noise).
    */
-  inline nda::array<ComplexType, 4> unfold_from_ibz(sym_ctx const &c, nda::ArrayOfRank<4> auto const &Y, double *consistency = nullptr) {
+  inline nda::array<ComplexType, 4> unfold_from_ibz(sym_ctx const &c, nda::ArrayOfRank<4> auto const &Y, long is,
+                                                    double *consistency = nullptr) {
     decltype(nda::range::all) all;
     const long nt = Y.shape(0), nc = Y.shape(2);
     utils::check(Y.shape(1) == c.nk_ibz and Y.shape(3) == nc, "unfold_from_ibz: Y is ({} x {} x {} x {}), nk_ibz {}.", Y.shape(0), Y.shape(1),
                  Y.shape(2), Y.shape(3), c.nk_ibz);
     const bool fold_dt = vertex_debug::flag("sym_fold_dt") or vertex_debug::flag("sym_dt");
     const long fold_conv = fold_dt ? 1 : long(vertex_debug::number("sym_fold_conv", 1.0));
-    auto const &DD = c.fold_rotation();
+    auto DD = c.fold_rotation(is);
     nda::array<ComplexType, 4> X(nt, c.nk_full, nc, nc);
     X() = ComplexType(0.0);
     std::vector<long> count(size_t(c.nk_full), 0l);
@@ -455,14 +462,14 @@ namespace vertex_sym {
     return X;
   }
 
-  inline void fold_star_into_ibz(sym_ctx const &c, long iq, nda::ArrayOfRank<4> auto const &dSq, nda::ArrayOfRank<4> auto &&dSig,
+  inline void fold_star_into_ibz(sym_ctx const &c, long iq, long is, nda::ArrayOfRank<4> auto const &dSq, nda::ArrayOfRank<4> auto &&dSig,
                                  long *n_trev = nullptr, long *n_cjg = nullptr) {
     const long nc = dSq.shape(2);
     utils::check(dSq.shape(1) == c.nk_full and dSig.shape(1) == c.nk_ibz and dSq.shape(3) == nc and dSig.shape(2) == nc,
                  "fold_star_into_ibz: shapes (dSq {} x {} x {} x {}, dSig {} x {} x {} x {}, nk_full {}, nk_ibz {}).",
                  dSq.shape(0), dSq.shape(1), dSq.shape(2), dSq.shape(3), dSig.shape(0), dSig.shape(1), dSig.shape(2), dSig.shape(3),
                  c.nk_full, c.nk_ibz);
-    auto ft = fold_star_terms(c, iq, nc);
+    auto ft = fold_star_terms(c, iq, nc, is);
     utils::check(not ft.needs_partner(), "fold_star_into_ibz: the star of transfer {} needs the -q unit (Sigma_{{-q}} at a TRIM point); "
                  "this entry point has none.", iq);
     if (n_trev) *n_trev += ft.n_trev;

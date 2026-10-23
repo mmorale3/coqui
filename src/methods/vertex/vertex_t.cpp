@@ -657,7 +657,7 @@ namespace solvers {
     /**
      * G-rotation consistency diagnostic: for each symmetry
      * position js >= 1 and a sample of full-BZ k, measure
-     *   || G_CC(k) - Dc(js,k)^dag G_CC(krot(js,k)) Dc(js,k) ||_F / ||G_CC(k)||_F
+     *   || G_CC(k) - Dc(js,k)^dag G_CC(krot(js,k)) Dc(js,k) ||_F / ||G_CC(k)||_F   (every spin)
      * on one tau slice. O(leakage) is expected (window truncation of the exact
      * covariance); a much larger value indicates a map/conjugation bug. Non-trev
      * k only (the trev gauge composition is exercised by the kernels themselves).
@@ -667,13 +667,14 @@ namespace solvers {
                                  nda::ArrayOfRank<1> auto const& kp_trev) {
       decltype(nda::range::all) all;
       const long nc = ctx.nc;
-      const long it = G_full.shape(0) / 2, is = 0;
+      const long it = G_full.shape(0) / 2;
       nda::array<ComplexType, 2> T1(nc, nc), T2(nc, nc);
       double worst = 0.0;
+      for (long is = 0; is < ctx.ns; ++is)
       for (long js = 1; js < ctx.nsym; ++js) {
         for (long k = 0; k < ctx.nk_full; ++k) {
           if (kp_trev(k) or ctx.cjg(js, k)) continue;
-          auto Dc = ctx.Dc(js, k, all, all);
+          auto Dc = ctx.Dc(is, js, k, all, all);
           auto Gk = G_full(it, is, k, all, all);
           auto Gr = G_full(it, is, ctx.krot(js, k), all, all);
           nda::blas::gemm(ComplexType(1.0), nda::dagger(Dc), Gr, ComplexType(0.0), T1);
@@ -799,13 +800,8 @@ namespace solvers {
     vertex_sym::sym_ctx ctx;
     ctx.active = true;
     ctx.ns = X_w.shape(0);
-    // The C-sector rotations come from the mean field's band rotations (symmetry_rotation, built from the spin-0 orbitals
-    // only), and in Wannier mode Dc / Dfold below are stored for spin 0 only: a spin-polarized run on a symmetry-reduced
-    // mesh would rotate the spin-1 legs and folds with the spin-0 gauge.
-    utils::check(ctx.ns == 1,
-                 "vertex_t::build_sym_ctx: the vertex on a symmetry-reduced k mesh (IBZ or time reversal) supports ns = 1 only "
-                 "(this run: ns = {}); the band rotations of the mean field are those of spin 0. Run the collinear-spin vertex on "
-                 "a symmetry-free k mesh.", ctx.ns);
+    // The C-sector rotations (Dc, Dfold, the effective columns Xhat) are per spin: the mean field's band rotations follow
+    // each spin's orbitals (symmetry_rotation(js, k, is)), and in Wannier mode each spin has its own projector U(s, k).
     ctx.nk_full = MF->nkpts();
     ctx.nk_ibz = MF->nkpts_ibz();
     ctx.nq_full = MF->nqpts();
@@ -823,10 +819,13 @@ namespace solvers {
     const long nW = wan ? U_skia->shape(2) : nc;
     utils::check(C0_global >= 0 and C0_global + nW <= nbnd,
                  "vertex_t::build_sym_ctx: invalid window [{}, {}).", C0_global, C0_global + nW);
-    if (wan)
-      utils::check(U_skia->shape(0) == ctx.ns and U_skia->shape(1) == ctx.nk_full and
-                   U_skia->shape(3) == nc,
+    if (wan) {
+      utils::check(U_skia->shape(0) == ctx.ns,
+                   "vertex_t::build_sym_ctx: the Wannier projector carries {} spin(s), the run {}: one projector per spin is "
+                   "required (a projector is not shared between spins).", U_skia->shape(0), ctx.ns);
+      utils::check(U_skia->shape(1) == ctx.nk_full and U_skia->shape(3) == nc,
                    "vertex_t::build_sym_ctx: U_skia shape mismatch with X_w.");
+    }
 
     // the index maps (transfer tables, krot, the time-reversal pairs, -k / -q; the conjugation flags are filled in the
     // distributed tile loop below)
@@ -876,7 +875,7 @@ namespace solvers {
     // Xhat is NODE-SHARED (one copy per NUMA node) and the (js, ik) build loop is
     // DISTRIBUTED across node_comm -- each (js, ik) tile is computed on exactly one
     // node-rank and written into the shared window (a partition => exact GATHER).
-    // Dc/cjg stay per-rank (small: nsym*nk*nc^2) but are ALSO filled only on the owning
+    // Dc/cjg stay per-rank (small: ns*nsym*nk*nc^2) but are ALSO filled only on the owning
     // rank and node-gathered (zero-init + all_reduce = exact). The leakage scalars are a
     // per-(js,ik) sum, node-reduced. On one rank per node this is bit-identical.
     auto mpi = thc.mpi();
@@ -884,10 +883,10 @@ namespace solvers {
         math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(
             *mpi, std::array<long, 5>{ctx.ns, ctx.nsym, ctx.nk_full, ctx.naux, nc}));
     ctx.Xhat.rebind(ctx.Xhat_shm->local());   // ctor zero-inits; identity slot filled below
-    ctx.Dc = nda::array<ComplexType, 4>(ctx.nsym, ctx.nk_full, nc, nc);
+    ctx.Dc = nda::array<ComplexType, 5>(ctx.ns, ctx.nsym, ctx.nk_full, nc, nc);
     ctx.Dc() = ComplexType(0.0);
     if (wan) {   // the star-fold rotation of the Sigma-side vertex (vertex_sym.hpp)
-      ctx.Dfold = nda::array<ComplexType, 4>(ctx.nsym, ctx.nk_full, nc, nc);
+      ctx.Dfold = nda::array<ComplexType, 5>(ctx.ns, ctx.nsym, ctx.nk_full, nc, nc);
       ctx.Dfold() = ComplexType(0.0);
       // the time-reversal covariance of the projector, U(-k) = conj(U(k)) <=> real Wannier functions: then the MLWF Bloch
       // sums at a TRIM point are real and Sigma_{-q}(p) = conj(Sigma_q(p)) there (the star fold's TRIM case through a
@@ -928,8 +927,8 @@ namespace solvers {
       for (long jk = mpi->node_comm.rank(); jk < njk; jk += mpi->node_comm.size()) {
         const long js = 1 + jk / ctx.nk_full;
         const long ik = jk % ctx.nk_full;
-        {
-          auto [cj, Dsp] = MF->symmetry_rotation(js, ik, 0);
+        for (long is = 0; is < ctx.ns; ++is) {   // the band rotation follows the orbitals of spin is
+          auto [cj, Dsp] = MF->symmetry_rotation(js, ik, is);
           ctx.cjg(js, ik) = cj;
           csrmm<'N'>(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dcols);
           const long ksrc = ctx.krot(js, cj ? long(kp_trev_pair(ik)) : ik);
@@ -937,7 +936,7 @@ namespace solvers {
           // normalization (as in projector_boson_t.cpp).
           // WANNIER: the projector-level leakage ||(1 - P(Sk)) D U(k)|| = mass of D U(k)
           // falling outside range(P(Sk)); 0 for a symmetry-closed Wannier set.
-          auto Dc = ctx.Dc(js, ik, all, all);
+          auto Dc = ctx.Dc(is, js, ik, all, all);
           if (not wan) {
             double m_in = 0.0, m_all = 0.0;
             for (long a = 0; a < nbnd; ++a)
@@ -963,7 +962,7 @@ namespace solvers {
           // (symmetry.hpp). Xhat = X(ksrc).Dc enters EIGHT collocation legs of
           // Sigma^C and four of Pi^C, so this defect is the accuracy floor of the whole
           // symmetry path.
-          // (WANNIER: Dc is the projected rotation d = U(ksrc)^dag D U(k), filled in the spin loop below -- measured there)
+          // (WANNIER: Dc is the projected rotation d = U(ksrc)^dag D U(k), filled in the block below -- measured there)
           auto unit_defect = [&]() {
             double d2 = 0.0;
             for (long a = 0; a < nc; ++a)
@@ -978,8 +977,8 @@ namespace solvers {
           // effective columns: base collocation at the D-pair point
           // (the trev pair's rotation for trev k -- the API redirect), conj for trev.
           // WANNIER: base = X_bar(ksrc) . d(k;S), d = U(ksrc)^dag D_win U(ik) (M x M).
-          nda::array<ComplexType, 2> dloc(nc, nc);   // per-spin C-sector rotation
-          for (long is = 0; is < ctx.ns; ++is) {
+          nda::array<ComplexType, 2> dloc(nc, nc);   // the C-sector rotation of spin is
+          {
             if (wan) {
               // DU(nbnd, M) = Dcols(nbnd, nW) . U(ik)(nW, M)
               // For a CONJUGATED rotation (cj) the kernel applies conj to the whole effective column X_bar(ksrc) dloc, so
@@ -997,8 +996,8 @@ namespace solvers {
                 for (long a = 0; a < nc; ++a) dW_win(p, a) = DU(C0_global + p, a);
               nda::blas::gemm(nda::dagger((*U_skia)(is, ksrc, all, all)), dW_win, dloc);
               // projector-level leakage: 1 - ||P(ksrc) DU||^2 / ||DU||^2
-              if (is == 0) {
-                Dc = dloc;                               // store the is=0 rotation
+              {
+                Dc = dloc;                               // store the rotation of spin is
                 unit_defect();
                 // the fold rotation U(k)^dag D_WW U(ksrc) (U(k)^T D_WW U(ksrc) for a conjugated rotation)
                 {
@@ -1010,7 +1009,7 @@ namespace solvers {
                     for (long p = 0; p < nW; ++p)
                       Uk(a, p) = cj ? (*U_skia)(is, ik, p, a) : std::conj((*U_skia)(is, ik, p, a));
                   nda::blas::gemm(Uk, DUs, F);
-                  ctx.Dfold(js, ik, all, all) = F;
+                  ctx.Dfold(is, js, ik, all, all) = F;
                 }
                 double m_all = 0.0, m_in = 0.0;
                 for (long a = 0; a < nc; ++a) {

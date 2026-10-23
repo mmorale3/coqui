@@ -1871,8 +1871,7 @@ namespace solvers {
       _pol_vtx->secondary_star(q_full, q_ibz, js, tr);
     };
     auto unfold = [&](long q_img, long js, bool tr, std::vector<long> const &k_int, auto const &P, double *resid) {
-      const long is = 0;   // one polarization per transfer (the legs of spin 0; spin-summed objects)
-      auto U = _pol_vtx->unfold_fit_matrix(*MF, is, q_img, js, k_int, resid);
+      auto U = _pol_vtx->unfold_fit_matrix(*MF, q_img, js, k_int, resid);   // one fit for the spin-summed polarization
       return vertex_t::unfold_pol(U, P, tr);
     };
     const long n_solve = vsc::evaluate(sc, MF->lattv(), kc, qc, nq_ibz, make, solve, add, star, unfold);

@@ -5152,7 +5152,7 @@ namespace solvers {
       decltype(nda::range::all) all;
       for (long is = 0; is < dSig.shape(1); ++is) {
         double cons = 0.0;
-        (void)vertex_sym::unfold_from_ibz(*symc, dSig(all, is, all, all, all), &cons);
+        (void)vertex_sym::unfold_from_ibz(*symc, dSig(all, is, all, all, all), is, &cons);
         app_log(1, "  [Sigma vertex, dynamic] DIAGNOSTIC sym_unfold_check: little-group consistency residual of dSigma (spin {}) = {:.3e}", is, cons);
       }
     }
@@ -5170,7 +5170,7 @@ namespace solvers {
         nda::array<ComplexType, 4> full;                             // (nt, nk_full, nc, nc): dSigma at every point of the mesh (zero off the sublattice)
         if (sym_) {
           double cons = 0.0;
-          full = vertex_sym::unfold_from_ibz(*symc, dSig(all, is, all, all, all), &cons);
+          full = vertex_sym::unfold_from_ibz(*symc, dSig(all, is, all, all, all), is, &cons);
           app_log(1, "  [Sigma vertex, dynamic] S1: IBZ -> full-mesh unfold of dSigma (spin {}) = the little-group average; the input's "
                      "little-group asymmetry (THC / aux-basis noise) {:.3e}{}", is, cons, cons > 1e-2 ? " -- WARNING: large" : "");
         } else full = dSig(all, is, all, all, all);

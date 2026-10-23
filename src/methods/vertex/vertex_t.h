@@ -2035,24 +2035,26 @@ namespace vertex_pi { struct iaft_tools; }
      * SAME pair-space ladder Lambda' as Pi-bar(q') = Theta'^* Lambda' Theta'^T (covariance). The un-rotated densities are
      * FITTED onto the rotated ones, Theta' = T Theta_rot (least squares over the pairs: the ISDF fit of the frame change), so
      * Pi-bar(q') = conj(T) Pi-bar(+-qs) T^T, with Pi-bar(-qs) = conj(Pi-bar(qs)). Exact when the fit is; the residual
-     * ||Theta' - T Theta_rot|| / ||Theta'|| (`resid`) is the quality meter.
-     *   unfold_fit_matrix: U = conj(T) (N_m x N_m) for (spin is, image transfer q_img, its op js, the sublattice points k_int)
+     * ||Theta' - T Theta_rot|| / ||Theta'|| (`resid`) is the quality meter. Pi-bar is spin-summed, so one T serves every
+     * spin: the fit pools the pairs of all spins (each spin's densities rotated with its own band rotations).
+     *   unfold_fit_matrix: U = conj(T) (N_m x N_m) for (image transfer q_img, its op js, the sublattice points k_int)
      *   unfold_pol: Pi-bar(q') (nw, N_m, N_m) = U [trev ? conj(P) : P] U^dag from P = Pi-bar(qs)
      */
-    nda::array<ComplexType, 2> unfold_fit_matrix(auto const &MF, long is, long q_img, long js, std::vector<long> const &k_int, double *resid = nullptr) const {
+    nda::array<ComplexType, 2> unfold_fit_matrix(auto const &MF, long q_img, long js, std::vector<long> const &k_int, double *resid = nullptr) const {
       decltype(nda::range::all) all;
       utils::check(_sym_secondary.has_value() and _sym_secondary->active, "vertex_t::unfold_fit_matrix: no secondary symmetry context.");
       auto const &c = _sym_secondary.value();
-      const long Nm = _Xb_skma.shape(2), nc = _Xb_skma.shape(3), nk = long(k_int.size()), np = nk * nc * nc;
+      const long ns = _Xb_skma.shape(0), Nm = _Xb_skma.shape(2), nc = _Xb_skma.shape(3), nk = long(k_int.size()), np = ns * nk * nc * nc;
       utils::check(c.naux == Nm and c.nc == nc and js >= 0 and js < c.nsym, "vertex_t::unfold_fit_matrix: context mismatch (naux {} N_m {}, nc {} {}, js {}).",
                    c.naux, Nm, c.nc, nc, js);
       auto qmin = MF.qminus();
       nda::array<ComplexType, 2> Th(Nm, np), Tr(Nm, np);
+      for (long is = 0; is < ns; ++is)
       for (long i = 0; i < nk; ++i) {
         const long k = k_int[size_t(i)], kq = MF.qk_to_k2(int(qmin(q_img)), int(k));   // k + q'
         for (long a = 0; a < nc; ++a)
           for (long b = 0; b < nc; ++b) {
-            const long col = (i * nc + a) * nc + b;
+            const long col = ((is * nk + i) * nc + a) * nc + b;
             for (long M = 0; M < Nm; ++M) {
               Th(M, col) = _Xb_skma(is, k, M, a) * std::conj(_Xb_skma(is, kq, M, b));
               Tr(M, col) = c.Xhat(is, js, k, M, a) * std::conj(c.Xhat(is, js, kq, M, b));
