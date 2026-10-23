@@ -715,6 +715,13 @@ namespace solvers {
     auto C = proj.C_skIai();                       // (ns, nk, 1, M, nOrbs_W)
     auto const &W_rng = proj.W_rng()[0];
     const long ns = C.shape(0), nk = C.shape(1), M = C.shape(3), nW = C.shape(4);
+    // collinear spin: one projector per spin, U(s, k); a projector is never shared between spins
+    utils::check(ns == proj.MF()->nspin(),
+                 "vertex_t::set_wannier_projector: the Wannier projector {} carries {} spin(s), the run {}: one projector per spin "
+                 "is required (U(s, k) for every spin of the run; a projector is not shared between spins).",
+                 proj.C_file().empty() ? "(in-memory)" : proj.C_file(), ns, proj.MF()->nspin());
+    utils::check(nk == proj.MF()->nkpts(),
+                 "vertex_t::set_wannier_projector: the Wannier projector carries {} k-points, the mesh {}.", nk, proj.MF()->nkpts());
     utils::check(nW == W_rng.size(),
                  "vertex_t::set_wannier_projector: proj_mat window dim {} != W_rng size "
                  "{}.", nW, long(W_rng.size()));

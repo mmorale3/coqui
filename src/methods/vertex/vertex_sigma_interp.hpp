@@ -92,6 +92,8 @@ namespace vertex_sigma_interp {
     utils::check(mf.nkpts() == mf.nkpts_ibz() and nk == mf.nkpts(),
                  "dump_sigma_pair_wannier: the coarse run must be on a NOSYM mesh (dSigma on {} k of {}, nkpts_ibz {}).", nk, mf.nkpts(), mf.nkpts_ibz());
     utils::check(proj.nImps() == 1, "dump_sigma_pair_wannier: one impurity block expected.");
+    utils::check(proj.C_skIai().shape(0) == ns, "dump_sigma_pair_wannier: the projector carries {} spin(s), the run {}: one projector "
+                 "per spin is required (a projector is not shared between spins).", proj.C_skIai().shape(0), ns);
     auto const &W = proj.W_rng()[0];
     utils::check(W.first() == window_first and long(W.size()) == nc,
                  "dump_sigma_pair_wannier: the projector's window [{}, {}) is not the pair vertex's [{}, {}).", W.first(), W.last(), window_first, window_first + nc);
@@ -254,6 +256,8 @@ namespace vertex_sigma_interp {
     utils::check(W.first() == window_first and long(W.size()) == nc,
                  "interpolate_sigma_pair: the fine projector's window [{}, {}) is not the pair vertex's [{}, {}).", W.first(), W.last(), window_first, window_first + nc);
     utils::check(ns == mf.nspin(), "interpolate_sigma_pair: spin count mismatch.");
+    utils::check(proj.C_skIai().shape(0) == ns, "interpolate_sigma_pair: the fine projector carries {} spin(s), the run {}: one "
+                 "projector per spin is required (a projector is not shared between spins).", proj.C_skIai().shape(0), ns);
     // k -> R on the coarse mesh, R -> k on the fine IBZ points
     const long nkf = mf.nkpts_ibz();
     // the fine IBZ points are taken as the first nkf points of the full list (kf below, and the caller's dSigma

@@ -1241,7 +1241,8 @@ namespace solvers {
     const long norb = proj_boson.nImpOrbs(), nab = norb * norb, nc = bw.size();
     utils::check(nk == mf.nkpts() and ns == mf.nspin(),
                  "scr_coulomb_t::accumulate_pi_lad_loc_orb: projector axes ({} spins, {} "
-                 "k-points) do not match the mean field ({}, {}).", ns, nk, mf.nspin(),
+                 "k-points) do not match the mean field ({}, {}): one projector per spin is "
+                 "required (a projector is not shared between spins).", ns, nk, mf.nspin(),
                  mf.nkpts());
     utils::check(C_skIai.shape(4) == W_rng.size(),
                  "scr_coulomb_t::accumulate_pi_lad_loc_orb: projector column count {} != "
