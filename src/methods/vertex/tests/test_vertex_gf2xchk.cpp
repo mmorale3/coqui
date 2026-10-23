@@ -198,6 +198,20 @@ namespace bdft_tests {
             f.normA, f.normB, f.lambda.real(), f.lambda.imag(), f.resid,
             mf->nkpts(), ft.beta());
 
+    if (sh[1] == 2) {
+      // the spin blocks must differ, or the comparison could not tell the spins apart
+      double d2 = 0.0, n2 = 0.0;
+      for (long it = 0; it < sh[0]; ++it)
+        for (long ik = 0; ik < sh[2]; ++ik)
+          for (long a = 0; a < sh[3]; ++a)
+            for (long b = 0; b < sh[4]; ++b) {
+              d2 += std::norm(SigX(it, 0, ik, a, b) - SigX(it, 1, ik, a, b));
+              n2 += std::norm(SigX(it, 0, ik, a, b));
+            }
+      const double asym = std::sqrt(d2 / std::max(n2, 1e-300));
+      app_log(1, "  spin asymmetry of the reference ||Sigma_up - Sigma_dn|| / ||Sigma_up|| = {:.3e}\n", asym);
+      REQUIRE(asym > 1e-3);
+    }
     REQUIRE(f.normA > 1e-12);
     REQUIRE(f.normB > 1e-12);
     // TOPOLOGY: the two kernels must be proportional -- a shape mismatch (wrong
@@ -222,6 +236,20 @@ namespace bdft_tests {
 #else
     auto &mpi_context = utils::make_unit_test_mpi_context();
     run_crosscheck(mpi_context, "pyscf_h2_222", 1.2, 10);
+#endif
+  }
+
+  // ====================================================================================
+  // COLLINEAR SPIN (ns = 2): the spin-polarized UHF Li system GF2 is pinned against
+  // (methods/GF2/tests/test_thc_gf2.cpp). The rung conserves the spin of the pair, so the
+  // same-spin exchange is the only channel on both sides and Sigma^C_s must equal the GF2
+  // exchange of spin s with no spin factor.
+  TEST_CASE("vertex_gf2_exchange_crosscheck_li_uhf", "[methods][vertex][gf2][spin]") {
+#ifndef ENABLE_DLR
+    SUCCEED("skipped: build has ENABLE_DLR=OFF.");
+#else
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    run_crosscheck(mpi_context, "pyscf_li_222u", 1.2, 10);
 #endif
   }
 
