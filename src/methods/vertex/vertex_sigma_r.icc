@@ -458,7 +458,7 @@ namespace vertex_detail {
                 Sigma_r_tskab(it, is, ik, a, b) += res(a, b);
           } else {
             using math::sparse::csrmm;
-            auto [cjg, D] = MF->symmetry_rotation(isym, ik);
+            auto [cjg, D] = MF->symmetry_rotation(isym, ik, is);
             utils::check(not cjg, "eval_sigma_C_response_sym: unexpected conjugated "
                                   "symmetry rotation at (isym = {}, ik = {}).", isym, ik);
             csrmm<'H'>(ComplexType(1.0), *D, res, ComplexType(0.0), Tm);

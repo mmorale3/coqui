@@ -103,6 +103,12 @@ inline decltype(auto) default_MF(std::shared_ptr<utils::mpi_context_t<comm_t>>& 
     auto [outdir,prefix] = utils::utest_filename(src);
     return default_MF(comm, mf::qe_source, outdir, prefix, h5_input_type);
 
+  } else if (src == "qe_si222_lsda_sym" or src == "qe_si222_lsda_nosym") {
+
+    // the same pair as a collinear-spin run (h5 only: si.coqui.h5 from pw2coqui)
+    auto [outdir,prefix] = utils::utest_filename(src);
+    return default_MF(comm, mf::qe_source, outdir, prefix, h5_input_type);
+
   } else if (src == "qe_lih223") {
 
     auto [outdir,prefix] = utils::utest_filename("qe_lih223");

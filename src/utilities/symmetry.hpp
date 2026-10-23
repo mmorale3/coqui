@@ -781,6 +781,9 @@ auto partition_irreducible_r_grid(utils::Communicator auto& comm,
  *                         (indexed by mapping) in sparse format
  *   - (if Sparse==false:) shared_array<C,3>(n,a,b) with the rotation matrices
  *                         (indexed by mapping) in dense tensor format
+ * With collinear spin, the orbitals of each spin in the basis (nspin_in_basis of the system) are
+ * rotated separately: the matrices of spin is are stored at is*nsk + n, with nsk = (number of
+ * matrices) / nspin_in_basis and n = sk_to_n(s,k), which is the same for all spins.
 */
 // MAM: Need to be able to allocate sparse matrix in shared memory!
 //      If the matrix is fairly dense, then this will eat up a lot of memory!
@@ -828,6 +831,7 @@ auto generate_dmatrix(MF_t &mf,
   auto const & kp_to_ibz = bz.kp_to_ibz;
   auto const & kp_symm = bz.kp_symm;
   long nbnd = mf.nbnd();
+  long nspin = mf.get_sys().nspin_in_basis;
   long ns = slist.extent(0);
   long nstot = symms.size();
   auto wfc_g = mf.wfc_truncated_grid();
@@ -846,17 +850,18 @@ auto generate_dmatrix(MF_t &mf,
   if(irred) {
     // a hardcoded threshold for sorted eigenvalues.
     double thresh = 1e-6;
-    for (int ik=0; ik<nkpts; ++ik) {
-      auto iter = std::adjacent_find(eigv(0,ik,all).begin(), eigv(0,ik,all).end(),
-                                     [&thresh](double a, double b) { return a-b>thresh; });
-      auto idx = std::distance(eigv(0,ik,all).begin(), iter);
-      // don't use utils::check, since it will evaluate the parameters (e.g. in debug mode) which will
-      // cause a seg fault when the check is fine 
-      if( iter!=eigv(0,ik,all).end() )
-        APP_ABORT("Error in generate_dmat: assume_irreducible with unsorted eigenvalues at ik={}: \n"
-                   "Error in generate_dmat: assume_irreducible with unsorted eigenvalues at ik={}: \n"
-                   "eigv(i={})={}, eigv(i+1={})={}, threshold = {}.",
-                   ik, idx, eigv(0,ik,idx), idx+1, eigv(0,ik,idx+1), thresh);
+    for (int ispin=0; ispin<nspin; ++ispin) {
+      for (int ik=0; ik<nkpts; ++ik) {
+        auto iter = std::adjacent_find(eigv(ispin,ik,all).begin(), eigv(ispin,ik,all).end(),
+                                       [&thresh](double a, double b) { return a-b>thresh; });
+        auto idx = std::distance(eigv(ispin,ik,all).begin(), iter);
+        // don't use utils::check, since it will evaluate the parameters (e.g. in debug mode) which will
+        // cause a seg fault when the check is fine 
+        if( iter!=eigv(ispin,ik,all).end() )
+          APP_ABORT("Error in generate_dmat: assume_irreducible with unsorted eigenvalues at ispin={}, ik={}: \n"
+                     "eigv(i={})={}, eigv(i+1={})={}, threshold = {}.",
+                     ispin, ik, idx, eigv(ispin,ik,idx), idx+1, eigv(ispin,ik,idx+1), thresh);
+      }
     }
   }
 
@@ -959,7 +964,7 @@ auto generate_dmatrix(MF_t &mf,
     sp_d = sp_mat({nbnd,nbnd},nz);  
     Temp = nda::array<ComplexType,2>(nz,nz);
   } else {
-    shm_dmat = make_shared_array<Array_view_3D_t>(*mpi, {sk.size(),nbnd,nbnd});
+    shm_dmat = make_shared_array<Array_view_3D_t>(*mpi, {nspin*long(sk.size()),nbnd,nbnd});
     shm_dmat.set_zero();
 
   }
@@ -975,12 +980,16 @@ auto generate_dmatrix(MF_t &mf,
   // dimensions to allow symmetry rotations and matrix element calculations.
   // MAM: Currently forcing the mesh to be compatible from the start, but this can still be done if needed
 
-  int kold = -1;
-  auto [isk0, isk1] = itertools::chunk_range(0, sk.size(), comm.size() ,comm.rank());
+  // the matrices of all spins, spin-major: element ispin*nsk + n
+  long nsk = sk.size();
+  long ntot = nspin*nsk;
+  int kold = -1, sold = -1;
+  auto [isk0, isk1] = itertools::chunk_range(0, ntot, comm.size() ,comm.rank());
   long bad_norm_count = 0;
   for( long isk=isk0; isk<isk1; ++isk ) { 
 
-    if(isk == 0) { // first term is always the identity
+    int ispin = isk / nsk;
+    if(isk % nsk == 0) { // first term of each spin is always the identity
       if constexpr (Sparse) {
         dmat_s.emplace_back(math::sparse::identity<ComplexType,MEM>(nbnd));
       } else {
@@ -990,13 +999,14 @@ auto generate_dmatrix(MF_t &mf,
       continue;
     }
 
-    int is = sk[isk].first;
-    int ik = sk[isk].second;
+    int is = sk[isk % nsk].first;
+    int ik = sk[isk % nsk].second;
 
     // read orbital if necessary
-    if(kold != ik) {
+    if(kold != ik or sold != ispin) {
       kold = ik;
-      mf.get_orbital_set('w',0,ik,{0,nbnd},psi(0,all,all)); 
+      sold = ispin;
+      mf.get_orbital_set('w',ispin,ik,{0,nbnd},psi(0,all,all)); 
     }
 
     // kRinv = k2 - kp, kp = k2 - kRinv
@@ -1033,7 +1043,7 @@ auto generate_dmatrix(MF_t &mf,
       int ib=0;
       while(ib < nbnd) {
         int nb=1;
-        while( ib+nb<nbnd and std::abs(eigv(0,ik,ib)-eigv(0,ik,ib+nb)) < 1e-4 ) nb++;
+        while( ib+nb<nbnd and std::abs(eigv(ispin,ik,ib)-eigv(ispin,ik,ib+nb)) < 1e-4 ) nb++;
         nda::range b_rng(ib,ib+nb);
         if constexpr (Sparse) {
           nda::blas::gemm(ComplexType(1.0),psi(1,b_rng,all),
@@ -1092,19 +1102,19 @@ auto generate_dmatrix(MF_t &mf,
 
   if constexpr (Sparse) {
     std::vector<sp_mat> dmat;
-    dmat.reserve(sk.size());
+    dmat.reserve(ntot);
     if( comm.size() == 1 ) {
       for(int i=0; i<dmat_s.size(); i++)
         dmat.emplace_back(dmat_s[i]);
     } else {
       // loop over ranks and bcast sparse arrays in compact format
-      nda::array<long,1> sz(sk.size(),0);
+      nda::array<long,1> sz(ntot,0);
       nda::array<char,1> buff(0);
       for(long i=0; i<dmat_s.size(); ++i)
         sz(isk0+i) = dmat_s[i].size_of_serialized_in_bytes(true); 
-      comm.all_reduce_in_place_n(sz.data(),sk.size(),std::plus<>{});
+      comm.all_reduce_in_place_n(sz.data(),ntot,std::plus<>{});
       for(int r=0; r<comm.size(); r++) {
-        auto [p0, p1] = itertools::chunk_range(0, sk.size(), comm.size(), r);
+        auto [p0, p1] = itertools::chunk_range(0, ntot, comm.size(), r);
         long nr = std::accumulate(sz.data()+p0, sz.data()+p1, long(0));
         buff.resize(nr);
         if(comm.rank()==r) {

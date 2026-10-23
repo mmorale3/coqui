@@ -171,7 +171,7 @@ inline std::pair<double, double> loewdin_weighted_frozen(nda::MemoryArrayOfRank<
 
 /**
  * Symmetry covariance of a projector on a symmetry-reduced mesh. For every symmetry position js >= 1 of the mean field
- * and every k of the full mesh, the rotation D(js, k) of MF::symmetry_rotation carries the bands at k to the bands at
+ * and every k of the full mesh, the rotation D(js, k) of MF::symmetry_rotation (per spin) carries the bands at k to the bands at
  * ksrc; the subspace is covariant when d = U(ksrc)^dag D U(k) is unitary (the rotated subspace at k is the subspace at
  * ksrc). Returns {max leakage 1 - ||d||_F^2 / ||D U(k)||_F^2, max ||d^dag d - 1||_F}.
  */
@@ -189,10 +189,11 @@ inline std::pair<double, double> projector_covariance(mf::MF &mf, nda::range b_r
   for (long j = 0; j < nW; ++j) E(b_rng.first() + j, j) = ComplexType(1.0);
   for (long js = 1; js < nsym; ++js)
     for (long ik = 0; ik < nk; ++ik) {
-      auto [cj, Dsp] = mf.symmetry_rotation(js, ik);
-      math::sparse::csrmm<'N'>(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dcols);
-      const long ksrc = mf.ks_to_k(int(js), int(cj ? long(kp_trev_pair(ik)) : ik));
       for (long is = 0; is < ns; ++is) {
+        // the rotation follows the orbitals of spin is
+        auto [cj, Dsp] = mf.symmetry_rotation(js, ik, is);
+        math::sparse::csrmm<'N'>(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dcols);
+        const long ksrc = mf.ks_to_k(int(js), int(cj ? long(kp_trev_pair(ik)) : ik));
         if (cj) {
           auto Uc = nda::make_regular(nda::conj(U_skia(is, ik, all, all)));
           nda::blas::gemm(Dcols, Uc, DU);

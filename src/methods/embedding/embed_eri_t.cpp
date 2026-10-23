@@ -75,7 +75,7 @@ namespace methods {
                             nda::dagger(C_skIai(is, ik, I, nda::ellipsis{})),
                             T_skIPa(isym, is, ik, I, nda::ellipsis{}));
           } else {
-            auto [cjg, D_ij] = _MF->symmetry_rotation(isym, ik);
+            auto [cjg, D_ij] = _MF->symmetry_rotation(isym, ik, is);
             // D_ij * Cfull_jb = tmp_ib
             Cfull_jb() = 0.0;
             if(not cjg) {

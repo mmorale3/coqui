@@ -524,7 +524,7 @@ namespace methods {
                 // identity operation
                 sF_skij.local()(is,ik,all,all) += sF_skab.local()(is,ik,all,all);
               } else {
-                auto [cjg,D] = MF->symmetry_rotation(isym,ik);
+                auto [cjg,D] = MF->symmetry_rotation(isym,ik,is);
                 utils::check(not cjg, "Oh oh.");
                 csrmm<'H'>(ComplexType(1.0),*D,sF_skab.local()(is,ik,all,all),
                            ComplexType(0.0),Tm);

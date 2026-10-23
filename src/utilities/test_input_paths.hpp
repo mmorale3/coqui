@@ -93,6 +93,14 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/si_kp222_nbnd12/out/",
                            std::string("si"));
+  } else if (src == "qe_si222_lsda_sym" or src == "qe_si222_lsda_nosym") {
+    // the qe_si222_sym / qe_si222_nosym pair as a collinear-spin (nspin = 2) QE run with 8 bands (no degenerate set cut;
+    // 6x6x6 SCF): the density converges to zero moment, but each spin is diagonalized on its own, so the two spins'
+    // orbitals differ by gauge within the degenerate subspaces (h5 only: si.coqui.h5 from pw2coqui).
+    const std::string dir = (src == "qe_si222_lsda_sym") ? "si_kp222_nbnd8_lsda_sym" : "si_kp222_nbnd8_lsda_nosym";
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/" + dir + "/out/",
+                           std::string("si"));
   } else if (src == "qe_si333_sym" or src == "qe_si333_nosym" or
              src == "qe_si444_sym" or src == "qe_si444_trevonly" or src == "qe_si444_noinv") {
     // Si diamond, 12 bands (ecutwfc 15 Ry), force_symmorphic (h5 only: si.coqui.h5 from pw2coqui).

@@ -114,7 +114,7 @@ namespace solvers {
       return js_of;
     }
 
-    inline void unfold_rotate_slice(mf::MF &mf, long isym, long ksrc, bool trev,
+    inline void unfold_rotate_slice(mf::MF &mf, long isym, long ksrc, long ispin, bool trev,
                                     bool g_class,
                                     nda::MemoryArrayOfRank<2> auto const &A_src,
                                     nda::MemoryArrayOfRank<2> auto &&row,
@@ -131,7 +131,7 @@ namespace solvers {
         }
         return;
       }
-      auto [cjg, D] = mf.symmetry_rotation(isym, ksrc);
+      auto [cjg, D] = mf.symmetry_rotation(isym, ksrc, ispin);
       // kp_trev tracks the bz-level time reversal of the k MAPPING; cjg marks ops
       // whose stored D itself composes with TR. TR over a plain rotation (trev, !cjg)
       // is legal, and conjugation applies
@@ -379,11 +379,11 @@ namespace solvers {
       nda::array<ComplexType, 2> rt1(nb, nb), rt2(nb, nb);
       nda::array<long, 1> k_js;
       if (sym) k_js = cvv_detail::k_isym_positions(mf);
-      auto gather_full = [&](auto const &A_kij_ibz) {   // (nk_ibz, nb, nb) at fixed pre-axes
+      auto gather_full = [&](auto const &A_kij_ibz, long is) {   // (nk_ibz, nb, nb) at fixed pre-axes, spin is
         for (long ik = 0; ik < nk; ++ik) {
           auto row = nda::reshape(buf(ik, all), std::array<long, 2>{nb, nb});
           if (not sym) { row = A_kij_ibz(ik, all, all); continue; }
-          cvv_detail::unfold_rotate_slice(mf, k_js(ik), long(kp_to_ibz(ik)),
+          cvv_detail::unfold_rotate_slice(mf, k_js(ik), long(kp_to_ibz(ik)), is,
                                           bool(kp_trev(ik)), false,
                                           A_kij_ibz(long(kp_to_ibz(ik)), all, all),
                                           row, rt1, rt2);
@@ -395,9 +395,9 @@ namespace solvers {
       if (ctx->node_comm.root()) {
         auto hstat = s_stat_stage.local();
         for (long is = 0; is < ns; ++is) {
-          gather_full(H0_skij(is, all, all, all));
+          gather_full(H0_skij(is, all, all, all), is);
           nda::array<ComplexType, 2> buf2(buf);
-          gather_full(F_skij(is, all, all, all));
+          gather_full(F_skij(is, all, all, all), is);
           buf += buf2;
           auto h2 = nda::reshape(hstat(is, all, all, all),
                                  std::array<long, 2>{_nR, nb * nb});
@@ -414,7 +414,7 @@ namespace solvers {
         for (long ts = ctx->node_comm.rank(); ts < nt * ns;
              ts += ctx->node_comm.size()) {
           const long it = ts / ns, is = ts % ns;
-          gather_full(Sigma_tskij(it, is, all, all, all));
+          gather_full(Sigma_tskij(it, is, all, all, all), is);
           nda::blas::gemm(f_Rk, buf, tmpR);
           for (long iR = 0; iR < _nR; ++iR)
             sig_t(is, iR, it, all, all) =
@@ -571,7 +571,7 @@ namespace solvers {
           auto Gt = nda::reshape(Gk_t(it, all), std::array<long, 2>{nb, nb});
           auto Gsrc = G_tskij(it, is, ksrc, all, all);
           if (not sym) Gt = Gsrc;
-          else cvv_detail::unfold_rotate_slice(mf, k_js(ik), ksrc,
+          else cvv_detail::unfold_rotate_slice(mf, k_js(ik), ksrc, is,
                                                bool(kp_trev(ik)), true, Gsrc, Gt,
                                                gt1, gt2);
         }

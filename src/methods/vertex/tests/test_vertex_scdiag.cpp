@@ -108,7 +108,7 @@ namespace bdft_tests {
       for (long js = 1; js < nsym; ++js)
         for (long k = 0; k < nk; ++k) {
           if (kp_trev(k)) continue;
-          auto [cj, Dsp] = mf.symmetry_rotation(js, k);
+          auto [cj, Dsp] = mf.symmetry_rotation(js, k, 0);
           if (cj) continue;
           const long ksrc = mf.ks_to_k(int(js), int(k));
           const long kib = kp_to_ibz(k), kib_src = kp_to_ibz(ksrc);

@@ -327,14 +327,15 @@ class MF
     auto efermi() const 
     { return std::visit( [&](auto&& v) { return v.get_sys().efermi; }, var ); }
 
-    decltype(auto) symmetry_rotation(long s, long k) const
+    // band rotation d(s, k) of spin ispin (the rotations follow each spin's orbitals)
+    decltype(auto) symmetry_rotation(long s, long k, long ispin) const
     {
       auto ns = qsymms().extent(0);
       auto nk = nkpts();
       utils::check( s>0, "MF::symmetry_rotation: Symmetry index must be > 0, since s==0 is the identity and not stored.");
       utils::check( s>0 and s<ns, "out of bounds.");
       utils::check( k>=0 and k<nk, "out of bounds.");
-      return std::visit( [&](auto&& v) { return v.symmetry_rotation(s,k); }, var );
+      return std::visit( [&](auto&& v) { return v.symmetry_rotation(s,k,ispin); }, var );
     };
 
     // orbitals

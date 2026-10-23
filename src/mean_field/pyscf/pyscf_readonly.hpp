@@ -399,7 +399,7 @@ namespace mf {
         }
       }
 
-      decltype(auto) symmetry_rotation(long s, long k) const
+      decltype(auto) symmetry_rotation(long s, long k, long) const
       { 
         utils::check( false, "Symmetry operations are not allowed in pyscf backend.");
         long ns = sys.bz().qsymms.extent(0);

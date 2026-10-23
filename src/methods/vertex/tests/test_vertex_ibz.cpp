@@ -88,7 +88,7 @@ namespace bdft_tests {
       using math::sparse::csrmm;
       for (long js = 1; js < nsym; ++js)
         for (long ik = 0; ik < nk; ++ik) {
-          auto [cj, Dsp] = mf.symmetry_rotation(js, ik);
+          auto [cj, Dsp] = mf.symmetry_rotation(js, ik, 0);
           (void)cj;
           csrmm<'N'>(cplx(1.0), *Dsp, E, cplx(0.0), Dcols);
           double m_in = 0.0, m_all = 0.0;
@@ -442,7 +442,7 @@ namespace bdft_tests {
         }
       auto trev_pair = mf->kp_trev_pair();
       for (long k = 0; k < nk; ++k) {
-        auto [cj, Dsp] = mf->symmetry_rotation(js, k);
+        auto [cj, Dsp] = mf->symmetry_rotation(js, k, 0);
         // time-reversal images (cj): the kernels' column is conj(X(krot(js, pair(k))) . D) (build_sym_ctx) -- tested against the
         // same transported orbital psi_k(S r_P); the plain points otherwise
         math::sparse::csrmm<'N'>(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dfull);   // D E: (nbnd, nW), rows = all bands
@@ -507,7 +507,7 @@ namespace bdft_tests {
       nda::blas::gemm(nda::dagger(A), A, G); nda::blas::gemm(nda::dagger(A), Bm, Rhs);
       nda::matrix<ComplexType> Gm(nW, nW); Gm() = G; nda::inverse_in_place(Gm);
       nda::blas::gemm(Gm, Rhs, M);
-      auto [cj0, Dsp0] = mf->symmetry_rotation(js, k);
+      auto [cj0, Dsp0] = mf->symmetry_rotation(js, k, 0);
       math::sparse::csrmm<'N'>(ComplexType(1.0), *Dsp0, E, ComplexType(0.0), Dfull);
       std::string sm, sd;
       for (long a = 0; a < nW; ++a) {
@@ -529,7 +529,7 @@ namespace bdft_tests {
       utils::symm_op opi = op; opi.R = op.Rinv; opi.Rinv = op.R;
       utils::transform_r(opi, nda::array<long, 1>::zeros({3}), mesh, ipSi);
       auto XSi = builder.collocation_at_points(ipSi, nda::range(0, nk), W);
-      auto [cj, Dsp] = mf->symmetry_rotation(js, k);
+      auto [cj, Dsp] = mf->symmetry_rotation(js, k, 0);
       math::sparse::csrmm<'N'>(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dfull);
       for (long a = 0; a < nW; ++a) for (long b = 0; b < nW; ++b) Dw(a, b) = Dfull(w0 + a, b);
       for (long P = 0; P < Nm; ++P) for (long a = 0; a < nW; ++a) Xr(P, a) = X(0, kr, a, P);

@@ -568,18 +568,23 @@ public:
     get_orbital_set(OT,_ispin,k_rng,b_rng,O_,r);
   }
 
-  decltype(auto) symmetry_rotation(long s, long k) const
+  // band rotation of spin ispin: the orbitals (and so the rotations) of the spins in the basis differ,
+  // generate_dmatrix stores nspin_in_basis spin blocks of sk_to_n's matrices
+  decltype(auto) symmetry_rotation(long s, long k, long ispin) const
   { 
     long ns = sys.bz().qsymms.extent(0);
     long nk = sys.bz().nkpts;
     utils::check(s>0, "Symmetry index must be > 0, since s==0 is the identity and not stored.");
     utils::check(s>0 and s < ns, "out of bounds.");
     utils::check(k>=0 and k < nk, "out of bounds.");
-    long n;
+    utils::check(ispin>=0 and ispin < sys.nspin, "symmetry_rotation: ispin:{} out of range:(0,{})", ispin, sys.nspin);
+    long nsb = sys.nspin_in_basis;
+    utils::check(dmat.size() % nsb == 0, " Error: Incorrect dmat dimensions.");
+    long n = std::min(ispin, nsb-1) * long(dmat.size() / nsb);
     if(sys.bz().kp_trev(k))
-      n = sk_to_n(s-1,sys.bz().kp_trev_pair(k));
+      n += sk_to_n(s-1,sys.bz().kp_trev_pair(k));
     else
-      n = sk_to_n(s-1,k);
+      n += sk_to_n(s-1,k);
     utils::check(dmat.size() > n, " Error: Incorrect dmat dimensions.");
     return std::make_tuple(sys.bz().kp_trev(k),  std::addressof(dmat.at(n)));
   }

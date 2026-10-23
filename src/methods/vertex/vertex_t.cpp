@@ -929,7 +929,7 @@ namespace solvers {
         const long js = 1 + jk / ctx.nk_full;
         const long ik = jk % ctx.nk_full;
         {
-          auto [cj, Dsp] = MF->symmetry_rotation(js, ik);
+          auto [cj, Dsp] = MF->symmetry_rotation(js, ik, 0);
           ctx.cjg(js, ik) = cj;
           csrmm<'N'>(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dcols);
           const long ksrc = ctx.krot(js, cj ? long(kp_trev_pair(ik)) : ik);

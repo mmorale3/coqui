@@ -509,7 +509,7 @@ namespace qp_modea {
     // that DEFINES the image k-point's orbitals (symmetry.hpp), so a reduced mesh
     // can run the whole isym loop with D = 1 everywhere and never test the rotation. These
     // two numbers say whether a given run did.
-    long n_D_nonid = 0;                // (isym, k) pairs with a non-identity stored D
+    long n_D_nonid = 0;                // (isym, k, spin) cases with a non-identity stored D
     double d_ident_worst = 0.0;        // worst max|D - 1| over those pairs
     double d_unit_worst = 0.0;         // worst max|D^dag D - 1| (the symmetry accuracy floor)
   };

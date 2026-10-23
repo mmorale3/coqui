@@ -1919,8 +1919,9 @@ namespace qp_modea {
       for (long isym = 0; isym < nsym; ++isym) {
         ncls(isym) = MF->nq_per_s(isym);
         if (isym == 0) continue;
-        for (long ik = 0; ik < nk_ibz; ++ik) {
-          auto [cjg, D] = MF->symmetry_rotation(isym, ik);
+        for (long isk = 0; isk < MF->nspin() * nk_ibz; ++isk) {
+          const long is = isk / nk_ibz, ik = isk % nk_ibz;
+          auto [cjg, D] = MF->symmetry_rotation(isym, ik, is);
           Dd() = ComplexType(0.0);
           math::sparse::csrmm<'N'>(ComplexType(1.0), *D, Id, ComplexType(0.0), Dd);
           double di = 0.0;
@@ -1943,10 +1944,10 @@ namespace qp_modea {
         ctx.diag.d_unit_worst = std::max(ctx.diag.d_unit_worst, dun(isym));
       }
       app_log(lvl, "  - symmetry census:             {} q-symmetry classes over {} full-BZ "
-                   "transfers, {} IBZ k; D-rotation exercised on {} of {} (isym > 0, k) pairs, "
+                   "transfers, {} IBZ k; D-rotation exercised on {} of {} (isym > 0, k, spin) cases, "
                    "worst max|D - 1| = {:.3e}, worst max|D^dag D - 1| = {:.3e} (REPORTED -- it "
                    "cancels against the reference, which applies the same D)",
-              nsym, nqpts, nk_ibz, ctx.diag.n_D_nonid, (nsym - 1) * nk_ibz,
+              nsym, nqpts, nk_ibz, ctx.diag.n_D_nonid, (nsym - 1) * nk_ibz * MF->nspin(),
               ctx.diag.d_ident_worst, ctx.diag.d_unit_worst);
       for (long isym = 0; isym < nsym; ++isym)
         app_log(lvl + 1, "  - symmetry class {:>3}:          {} transfers, D non-identity at "
@@ -2049,7 +2050,7 @@ namespace qp_modea {
           if (isym == 0) {
             XCe_b = XCi(is * nkpts + ks, all, all);
           } else {
-            auto [cjg, D] = MF->symmetry_rotation(isym, ik);
+            auto [cjg, D] = MF->symmetry_rotation(isym, ik, is);
             utils::check(not cjg, "qp_modea (band factors): symmetry_rotation(isym = {}, "
                                   "k = {}) reports the conjugation flag.", isym, ik);
             math::sparse::csrmm<'N'>(ComplexType(1.0), *D,
@@ -2104,7 +2105,7 @@ namespace qp_modea {
           if (isym == 0) {
             XCe = XCi(is * nkpts + ks, all, all);
           } else {
-            auto [cjg, D] = MF->symmetry_rotation(isym, ik);
+            auto [cjg, D] = MF->symmetry_rotation(isym, ik, is);
             utils::check(not cjg, "qp_modea: symmetry_rotation(isym = {}, k = {}) reports the "
                                   "conjugation flag, which the GW assembly this map reproduces "
                                   "does not handle either (thc_gw.icc:311).", isym, ik);

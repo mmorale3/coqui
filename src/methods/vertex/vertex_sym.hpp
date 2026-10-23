@@ -193,7 +193,7 @@ namespace vertex_sym {
     if (with_cjg)
       for (long js = 1; js < ctx.nsym; ++js)
       for (long ik = 0; ik < ctx.nk_full; ++ik) {
-        auto [cj, Dsp] = MF.symmetry_rotation(js, ik);
+        auto [cj, Dsp] = MF.symmetry_rotation(js, ik, 0);   // the flag is that of the k map, the same for all spins
         ctx.cjg(js, ik) = cj;
       }
   }

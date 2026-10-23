@@ -297,6 +297,70 @@ namespace bdft_tests {
 
   }
 
+  TEST_CASE("thc_gw_qe_lsda_sym", "[methods][thc][gw][qe][spin]") {
+    // Collinear spin (nspin = 2) on a symmetry-reduced mesh. The Si 2x2x2 LSDA run converges to zero moment, but QE
+    // diagonalizes each spin on its own, so the two spins' orbitals differ by gauge within the degenerate subspaces and
+    // the band rotations of the IBZ unfolding differ between the spins. One HF + GW iteration on the IBZ must give the
+    // same Fock matrix and self-energy for both spins (gauge-invariant: their spectra at each k; the 8 bands close every
+    // degenerate set). The unreduced mesh gives the floor of the LSDA run itself (~4e-7). With the spin-0 rotations
+    // applied to both spins the IBZ asymmetry was 1.8e-2 (F) and 3.1e-3 (Sigma).
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    decltype(nda::range::all) all;
+
+    auto solve_thc_gw = [&](std::string fx) {
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fx));
+      REQUIRE(mf->nspin() == 2);
+      imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_basis, "high");
+      std::string output = "coqui_lsda";
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, "ignore_g0", output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      simple_dyson dyson(mf.get(), &ft);
+      MBState mb_state(mpi_context, ft, output);
+      thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 20, "", "incore", "", "bdft",
+                                                 1e-10, mf->ecutrho(), 1, 1024));
+      auto eri = mb_eri_t(thc, thc);
+      iter_scf::iter_scf_t iter_sol("damping");
+      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                     solvers::mb_solver_t(&hf,&gw,&scr_eri), &iter_sol,
+                                     1, false, 1e-9, true);
+      // the spin asymmetry of the spectra of F(s, k) and of the Hermitian part of Sigma(tau, s, k) at the first tau
+      auto spin_asym = [&](auto const &A_skij) {
+        const long nk = A_skij.shape(1), nb = A_skij.shape(2);
+        double d = 0.0;
+        for (long ik = 0; ik < nk; ++ik) {
+          nda::array<ComplexType, 2> A0(nb, nb), A1(nb, nb);
+          A0 = A_skij(0, ik, all, all);
+          A1 = A_skij(1, ik, all, all);
+          A0 = 0.5 * (A0 + nda::dagger(A0));
+          A1 = 0.5 * (A1 + nda::dagger(A1));
+          auto e0 = std::get<0>(nda::linalg::eigenelements(A0));
+          auto e1 = std::get<0>(nda::linalg::eigenelements(A1));
+          for (long n = 0; n < nb; ++n) d = std::max(d, std::abs(e0(n) - e1(n)));
+        }
+        return d;
+      };
+      const double dF = spin_asym(mb_state.sF_skij.value().local());
+      auto S = mb_state.sSigma_tskij.value().local();
+      const double dS = spin_asym(S(0, nda::ellipsis{}));
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) remove((output+".mbpt.h5").c_str());
+      mpi_context->comm.barrier();
+      return std::make_tuple(e_hf, e_corr, mf->nkpts_ibz(), dF, dS);
+    };
+
+    auto [e_hf_s, e_corr_s, nk_s, dF_s, dS_s] = solve_thc_gw("qe_si222_lsda_sym");
+    auto [e_hf_n, e_corr_n, nk_n, dF_n, dS_n] = solve_thc_gw("qe_si222_lsda_nosym");
+    app_log(1, "thc_gw_qe_lsda_sym: IBZ ({} k): e_hf = {:.12f}, e_corr = {:.12f}, spin asymmetry F {:.3e} Sigma {:.3e}; "
+               "full mesh ({} k): e_hf = {:.12f}, e_corr = {:.12f}, spin asymmetry F {:.3e} Sigma {:.3e}",
+               nk_s, e_hf_s, e_corr_s, dF_s, dS_s, nk_n, e_hf_n, e_corr_n, dF_n, dS_n);
+    REQUIRE(nk_s < nk_n);
+    REQUIRE(dF_n < 1e-6);
+    REQUIRE(dS_n < 1e-6);
+    REQUIRE(dF_s < 1e-6);
+    REQUIRE(dS_s < 1e-6);
+  }
+
   TEST_CASE("thc_rpa_qe", "[methods][thc][rpa][qe]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
 
