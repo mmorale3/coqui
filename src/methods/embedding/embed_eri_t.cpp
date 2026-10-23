@@ -908,6 +908,19 @@ namespace methods {
       if (have_lad) {
         sPi_dc_wabcd_new.win().fence();
         if (mpi->node_comm.root()) {
+          // a collinear-spin lattice stage stores P^lad_loc,orb spin-resolved on the spin-orbital axes s norb + m; P_dc is
+          // the spin sum, P(m, n, m', n') = sum_{s, s'} P(s m, s n, s' m', s' n')
+          const long norb_dc = sPi_dc_wabcd_new.shape()[1];
+          if (orb_dc and Pi_lad_loc.shape()[1] == 2 * norb_dc) {
+            nda::array<ComplexType, 5> Psum(Pi_lad_loc.shape()[0], norb_dc, norb_dc, norb_dc, norb_dc);
+            Psum() = ComplexType(0.0);
+            for (long s = 0; s < 2; ++s)
+              for (long sp = 0; sp < 2; ++sp)
+                Psum += Pi_lad_loc(nda::range::all, nda::range(s * norb_dc, (s + 1) * norb_dc), nda::range(s * norb_dc, (s + 1) * norb_dc),
+                                   nda::range(sp * norb_dc, (sp + 1) * norb_dc), nda::range(sp * norb_dc, (sp + 1) * norb_dc));
+            Pi_lad_loc = std::move(Psum);
+            app_log(1, "  - ladder DC: the spin-resolved P^lad_loc,orb (2 x {} spin-orbitals) summed over the spins for P_dc.", norb_dc);
+          }
           // element-wise dims: some bundled fmt versions have no std::array formatter
           utils::check(Pi_lad_loc.shape() == sPi_dc_wabcd_new.shape(),
                        "downfold_edmft_impl: P^lad_loc shape ({},{},{},{},{}) does not "

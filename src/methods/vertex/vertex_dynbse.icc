@@ -772,6 +772,8 @@ namespace solvers {
     /**
      * THE DRIVER. Outputs (nnu, nq, Nm, Nm), any may be null; all are ZEROED here and indexed by
      * position in nu_list; every (jn, iq) cell written by exactly one rank (the caller all-reduces).
+     * The Wannier-pair frame (opt.wannier_pairs) has nout = M^2 pair labels (a, b) for ns = 1 and the spin-orbital pair
+     * labels (s M + a, s M + b), (ns M)^2 of them, spin-major, for ns > 1: spin-resolved, the blocks with s != s' are zero.
      *   Pi_static : the static ladder, rungs >= 1  ( (spin/nk) D^dag [Cb Gamma_s - Cb D] )
      *   Pi_dyn1   : the one bare dynamic rung        ( (spin/nk) D^dag [sum_iw L0 K_d L0 D] )
      *   Pi_gam1   : the first iterate, rungs >= 1
@@ -844,16 +846,41 @@ namespace solvers {
                    "pair_space_ladder_dyn: W cache shape ({}, {}, {}, {}) != ({}, {}, {}, {}).",
                    Wbh.shape(0), Wbh.shape(1), Wbh.shape(2), Wbh.shape(3), nq, nw_half, Nm, Nm);
       utils::check(nt == tools.nt_f, "pair_space_ladder_dyn: G tau axis {} != nt_f {}.", nt, tools.nt_f);
+      // the Wannier-pair frame with ns > 1 is SPIN-RESOLVED: the outputs carry the spin-orbital pair labels
+      // (s M + a, s M + b), nout_o = (ns M)^2, spin-major; a spin unit fills its (s, s) block (the ladder is spin-diagonal),
+      // the blocks of different spins are zero. The units solve and read out on their own pairs (nout = M^2) into a
+      // per-unit scratch, which spin_scatter moves into the unit's block. ns = 1: nout_o = nout, no scratch.
+      const bool wan_spin = wan and ns > 1;
+      const long nso = ns * nc, nout_o = wan_spin ? nso * nso : nout;
       for (auto *o : {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn, opt.Pi_bub})
         if (o != nullptr) {
-          utils::check(o->shape(0) == nnu and o->shape(1) == nq_ext and o->shape(2) == nout and o->shape(3) == nout,
-                       "pair_space_ladder_dyn: output shape mismatch (nout = {}).", nout);
+          utils::check(o->shape(0) == nnu and o->shape(1) == nq_ext and o->shape(2) == nout_o and o->shape(3) == nout_o,
+                       "pair_space_ladder_dyn: output shape mismatch (nout = {}).", nout_o);
           (*o)() = cplx(0.0);
         }
       utils::check(not opt.bubble_only or opt.Pi_bub != nullptr, "pair_space_ladder_dyn: bubble_only needs the Pi_bub output.");
-      utils::check(not wan or ns == 1,
-                   "pair_space_ladder_dyn: the Wannier-pair output frame with ns = {} is not supported: each spin's columns are in "
-                   "the pair labels of its own projector U(s, k), so their sum is not one object. Use the aux/point frame.", ns);
+      nda::array<cplx, 4> *spin_ext[4] = {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn};
+      std::array<nda::array<cplx, 4>, 4> spin_scr;
+      if (wan_spin) {
+        nda::array<cplx, 4> **ptr[4] = {&Pi_static, &Pi_dyn1, &Pi_gam1, &Pi_dyn};
+        for (int c = 0; c < 4; ++c)
+          if (spin_ext[c] != nullptr) {
+            spin_scr[size_t(c)] = nda::array<cplx, 4>(nnu, nq_ext, nout, nout);
+            spin_scr[size_t(c)]() = cplx(0.0);
+            *ptr[c] = &spin_scr[size_t(c)];
+          }
+      }
+      // the spin-orbital pair index of the unit's pair (a, b) of spin is
+      auto so_pair = [&](long is, long ab) { return (is * nc + ab / nc) * nso + is * nc + ab % nc; };
+      auto spin_scatter = [&](long jn, long iq, long is) {
+        for (int c = 0; c < 4; ++c)
+          if (spin_ext[c] != nullptr) {
+            auto &sc = spin_scr[size_t(c)];
+            for (long M = 0; M < nout; ++M)
+              for (long N = 0; N < nout; ++N) (*spin_ext[c])(jn, iq, so_pair(is, M), so_pair(is, N)) += sc(jn, iq, M, N);
+            sc(jn, iq, all, all) = cplx(0.0);
+          }
+      };
       for (auto m : nu_list) utils::check(m >= 0 and m < nw_b, "pair_space_ladder_dyn: nu index {} out of range.", m);
 
       // ---- the vertex basis and G's residues --------------------------------------------------
@@ -2108,7 +2135,8 @@ namespace solvers {
           }
           auto Pb = db::collapse(Dc, CbDf);                                                   // (nout, nout)
           for (long M = 0; M < nout; ++M)
-            for (long N = 0; N < nout; ++N) (*opt.Pi_bub)(jn_unit, iq, M, N) += cplx(spinfac / double(nk)) * Pb(M, N);
+            for (long N = 0; N < nout; ++N)
+              (*opt.Pi_bub)(jn_unit, iq, wan_spin ? so_pair(is, M) : M, wan_spin ? so_pair(is, N) : N) += cplx(spinfac / double(nk)) * Pb(M, N);
           if (met) met->t_cb += watch.lap();
           if (opt.bubble_only) {
             if (met) { ++met->nunits; ++met->nconv; }
@@ -2128,6 +2156,7 @@ namespace solvers {
               if (outs[c] != nullptr)
                 for (long M = 0; M < nout; ++M)
                   for (long N = 0; N < nout; ++N) (*outs[c])(jn_unit, iq, M, N) += blk[size_t((c * nout + M) * nout + N)];
+            if (wan_spin) spin_scatter(jn_unit, iq, is);
             if (met and Pi_dyn1 != nullptr and not opt.one_rung_only) {
               // the one-bare-rung slot of a Gamma_1-pass record is filled only when that pass fused it (device unit); an all-zero
               // block means the caller's separate one-rung pass must supply the column
@@ -2815,7 +2844,7 @@ namespace solvers {
           // columns (a restored record is added the same way).
           nda::array<cplx, 4> *spin_outs[4] = {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn};
           std::vector<nda::array<cplx, 2>> spin_keep;
-          if (ns > 1)
+          if (ns > 1 and not wan_spin)   // (the Wannier-pair frame reads out into the per-unit scratch instead)
             for (auto *o : spin_outs)
               if (o != nullptr) {
                 spin_keep.emplace_back((*o)(jn, iq, all, all));
@@ -3326,7 +3355,8 @@ namespace solvers {
             dump_out.write(reinterpret_cast<char const *>(blk.data()), std::streamsize(blk.size() * sizeof(cplx)));
             dump_out.flush();
           }
-          if (ns > 1) {
+          if (wan_spin) spin_scatter(jn, iq, is);
+          else if (ns > 1) {
             size_t c = 0;
             for (auto *o : spin_outs)
               if (o != nullptr) (*o)(jn, iq, all, all) += spin_keep[c++];
@@ -3992,7 +4022,9 @@ namespace solvers {
     auto &tools = *tools_h.tools;
     const long nq = long(_W0b_qmm.value().shape(0)), Nm = _Xb_skma.shape(2);   // nq_ibz on a symmetric mesh
     const bool pair_frame = _wannier and (_wannier_frame == "pair");   // "aux" (points) is the interpolable frame
-    const long nout = pair_frame ? _M * _M : Nm;
+    // the pair frame with ns > 1 is spin-resolved: the spin-orbital pair labels (s M + a, s M + b) (pair_space_ladder_dyn)
+    const long ns_g = G_CC.shape(1);
+    const long nout = pair_frame ? (ns_g * _M) * (ns_g * _M) : Nm;
     std::vector<long> nu0 = {tools.m0};
     nda::array<ComplexType, 4> Ps(1, nq, nout, nout), P1(1, nq, nout, nout), Pg(1, nq, nout, nout), Pd(1, nq, nout, nout);
     vd::dyn_opts o;
@@ -4017,7 +4049,8 @@ namespace solvers {
                  "besides pol_vertex_dyn_tol = {:.1e}", _dyn_tol);
     if (_wannier) {
       o.wannier_pairs = pair_frame;
-      if (pair_frame) app_log(1, "  [dynamic vertex] Wannier-pair vertex output: Pi_loc(q) in the MLWF pair basis (M = {}, nab = {}; G_bar / X_bar inputs, identity pair legs) -- the SAME-CELL pair block.", _M, nout);
+      if (pair_frame) app_log(1, "  [dynamic vertex] Wannier-pair vertex output: Pi_loc(q) in the MLWF pair basis (M = {}, nab = {}{}; G_bar / X_bar inputs, identity pair legs) -- the SAME-CELL pair block.", _M, nout,
+                              ns_g > 1 ? ", spin-orbital pairs (s M + a, s M + b), spin-resolved" : "");
       else app_log(1, "  [dynamic vertex] Wannier-C vertex output in the aux/point frame: Pi(q)_{{MN}} on the N_m = {} secondary points (M = {} MLWFs, G_bar / X_bar inputs) -- the interpolable frame (freeze the points on the fine mesh).", nout, _M);
     }
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0.g" + std::to_string(gen);
@@ -4070,6 +4103,8 @@ namespace solvers {
       nda::h5_write(g, "Pi_dyn", r.Pi_dyn);
       h5::h5_write(g, "nout", nout);
       h5::h5_write(g, "frame", std::string(pair_frame ? "pair" : "aux"));
+      // ns > 1 in the pair frame: the labels are the spin-orbital pairs (s M + a, s M + b), spin-major (nout = (ns M)^2)
+      h5::h5_write(g, "nspin", ns_g);
       h5::h5_write(g, "wannier", long(_wannier ? 1 : 0));
       h5::h5_write(g, "nm", Nm);
       h5::h5_write(g, "window_first", long(_band_window.first()));

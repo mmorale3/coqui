@@ -194,8 +194,9 @@ public:
   // pair-leg maps E -- an O(1) object in the SAME convention as sPi_dc_wabcd (the pair pack
   // abcd of eval_Pi_rpa_dc), no metric inverse anywhere. Produced by the same injection as
   // the diagnostic above whenever a bosonic projector is present; consumed under
-  // pi_lad_dc = "orbital". Same shape class as sPi_dc_wabcd, (nw_half, nImpOrbs^4).
-  // Single impurity.
+  // pi_lad_dc = "orbital". Same shape class as sPi_dc_wabcd, (nw_half, nImpOrbs^4); with
+  // collinear spin (ns = 2) spin-resolved on the spin-orbital axes s nImpOrbs + m (spin-major),
+  // (nw_half, (2 nImpOrbs)^4), the spin sum taken by the consumer. Single impurity.
   std::optional<sArray_t<nda::array_view<ComplexType, 5> > > sPi_lad_loc_orb_wabcd;
 
   // Quasiparticle approx. to the dynamic part of the double-counting self-energy

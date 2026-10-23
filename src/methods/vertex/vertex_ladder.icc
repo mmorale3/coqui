@@ -969,8 +969,9 @@ namespace solvers {
      * unchanged whether or not it is requested.
      *
      * ORBITAL OUTPUTS: U_skia != nullptr (ns, nk, norb, nc) additionally enables the
-     * ORBITAL (chi-convention) outputs Pi_lad_loc / Pi_onerung_loc, (nnu, nq_ext, nab,
-     * nab) with nab = norb^2 -- the SAME sandwich with the E legs of the file header in
+     * ORBITAL (chi-convention) outputs Pi_lad_loc / Pi_onerung_loc, (nnu, nq_ext, ns nab,
+     * ns nab) with nab = norb^2, spin-resolved: the unit of spin s fills the block of the pair
+     * labels s nab + (m norb + n) (no spin sum) -- the SAME sandwich with the E legs of the file header in
      * place of the THC collapse D. They are a second RHS block through the SAME
      * resolvent factorization, so requesting them leaves the D-space outputs BITWISE
      * unchanged and costs one extra (Dsz x nab) triple product per (jn, iq).
@@ -1056,10 +1057,10 @@ namespace solvers {
       for (auto const &o : {Pi_lad_loc, Pi_onerung_loc})
         if (o != nullptr)
           utils::check(o->shape(0) == nnu and o->shape(1) == nq_ext and
-                       o->shape(2) == nab and o->shape(3) == nab,
+                       o->shape(2) == ns * nab and o->shape(3) == ns * nab,
                        "pair_space_ladder: orbital output is {} x {} x {} x {}, expected "
                        "{} x {} x {} x {}.", o->shape(0), o->shape(1), o->shape(2),
-                       o->shape(3), nnu, nq_ext, nab, nab);
+                       o->shape(3), nnu, nq_ext, ns * nab, ns * nab);
       if (sym) {
         utils::check(nq_w == symc->nq_ibz and nq_ext == symc->nq_ibz and
                      nq_full == symc->nq_full and nk == symc->nk_full,
@@ -1486,7 +1487,8 @@ namespace solvers {
                 nda::blas::gemm(nda::transpose(Cb(ik, jl, all, all)), Ecj(ik, all, all),
                                 Y2e(ik, all, all));
               }
-              auto Pre = (*Pi_onerung_loc)(jn, iq, all, all);
+              const nda::range sb(is * nab, (is + 1) * nab);   // the spin block
+              auto Pre = (*Pi_onerung_loc)(jn, iq, sb, sb);
               for (long ik = 0; ik < nk; ++ik)
                 for (long ikp = 0; ikp < nk; ++ikp) {
                   nda::blas::gemm(nda::transpose(Kb(ik, ikp, all, all)),
@@ -1604,7 +1606,8 @@ namespace solvers {
                 utils::check(info == 0, "pair_space_ladder: orbital getrs info = {}.",
                              info);
               }
-              auto Po = (*Pi_lad_loc)(jn, iq, all, all);
+              const nda::range sb(is * nab, (is + 1) * nab);   // the spin block
+              auto Po = (*Pi_lad_loc)(jn, iq, sb, sb);
               nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Estack_c), XKXE,
                               ComplexType(1.0), Po);
             }
@@ -1864,10 +1867,10 @@ namespace solvers {
                      Pi_ladder->shape(2), Pi_ladder->shape(3), nnu, nq_ext, Nm, Nm);
       if (want_loc)
         utils::check(Pi_lad_loc->shape(0) == nnu and Pi_lad_loc->shape(1) == nq_ext and
-                     Pi_lad_loc->shape(2) == nab and Pi_lad_loc->shape(3) == nab,
+                     Pi_lad_loc->shape(2) == ns * nab and Pi_lad_loc->shape(3) == ns * nab,
                      "pair_space_ladder_slate: Pi_lad_loc is {} x {} x {} x {}, expected {} "
-                     "x {} x {} x {}.", Pi_lad_loc->shape(0), Pi_lad_loc->shape(1),
-                     Pi_lad_loc->shape(2), Pi_lad_loc->shape(3), nnu, nq_ext, nab, nab);
+                     "x {} x {} x {} (spin-resolved).", Pi_lad_loc->shape(0), Pi_lad_loc->shape(1),
+                     Pi_lad_loc->shape(2), Pi_lad_loc->shape(3), nnu, nq_ext, ns * nab, ns * nab);
       if (sym) {
         utils::check(nq_w == symc->nq_ibz and nq_ext == symc->nq_ibz and
                      nq_full == symc->nq_full and nk == symc->nk_full,
@@ -2219,7 +2222,7 @@ namespace solvers {
               if (want_loc)
                 for (long M = 0; M < nab; ++M)
                   for (long N = 0; N < nab; ++N)
-                    (*Pi_lad_loc)(jn, iq, M, N) += Pbuf(ncD + M, ncD + N);
+                    (*Pi_lad_loc)(jn, iq, is * nab + M, is * nab + N) += Pbuf(ncD + M, ncD + N);
             }
           }
           pph.end();
@@ -3127,7 +3130,8 @@ namespace solvers {
 
   /**
    * The ORBITAL / chi-convention local part of the SAME resummed ladder, per external q,
-   * (n_nu_half, nq_ibz, nab, nab) with nab = norb^2 and the pair pack
+   * (n_nu_half, nq_ibz, ns nab, ns nab) with nab = norb^2, spin-resolved (the spin-s block on the
+   * pair labels s nab + (m norb + n); the blocks of different spins are zero), and the pair pack
    * abcd = (m, n, m', n') of dc_utilities.hpp's eval_Pi_rpa_dc (see the file header for
    * the leg derivation; ladder_loc_gate checks it). The q-average of the local
    * (double-counting) polarization is NOT taken here -- the caller does it with the
@@ -3195,9 +3199,9 @@ namespace solvers {
     for (long j = 0; j < nw_half; ++j) nu_h[j] = nw_b / 2 + j;
 
     const long nq_ext = MF->nqpts_ibz();
-    nda::array<ComplexType, 4> Ploc(nw_half, nq_ext, nab, nab);
+    nda::array<ComplexType, 4> Ploc(nw_half, nq_ext, ns * nab, ns * nab);
     if (Pi_onerung_loc != nullptr)
-      *Pi_onerung_loc = nda::array<ComplexType, 4>(nw_half, nq_ext, nab, nab);
+      *Pi_onerung_loc = nda::array<ComplexType, 4>(nw_half, nq_ext, ns * nab, ns * nab);
     // the same solve-grid dispatch as eval_pol_ladder_whalf. The ONE-RUNG
     // output is the one thing the distributed path cannot serve -- it needs the full
     // (nk, nk, nc2, nc2) K store, which is the (D, D)-class object this path exists to
@@ -3316,11 +3320,22 @@ namespace solvers {
     out.nnu_checked = nnu;
 
     // ---- the KERNEL side: the E-leg one-rung and the resummed local object -----------
+    // (the kernel's outputs are spin-resolved; the checks below are on their spin sum)
     nda::array<ComplexType, 4> P1k(nnu, nq_ext, nab, nab), Plk(nnu, nq_ext, nab, nab);
-    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0b, kmq, kpq, tools, nu_sub,
-                                            nullptr, nullptr, mpi->comm.rank(),
-                                            mpi->comm.size(), symc, nullptr, nullptr,
-                                            &U_skia, &Plk, &P1k);
+    {
+      nda::array<ComplexType, 4> P1s(nnu, nq_ext, ns * nab, ns * nab), Pls(nnu, nq_ext, ns * nab, ns * nab);
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0b, kmq, kpq, tools, nu_sub,
+                                              nullptr, nullptr, mpi->comm.rank(),
+                                              mpi->comm.size(), symc, nullptr, nullptr,
+                                              &U_skia, &Pls, &P1s);
+      P1k() = ComplexType(0.0);
+      Plk() = ComplexType(0.0);
+      for (long is = 0; is < ns; ++is) {
+        const nda::range sb(is * nab, (is + 1) * nab);
+        P1k += P1s(all, all, sb, sb);
+        Plk += Pls(all, all, sb, sb);
+      }
+    }
     mpi->comm.all_reduce_in_place_n(P1k.data(), P1k.size(), std::plus<>{});
     mpi->comm.all_reduce_in_place_n(Plk.data(), Plk.size(), std::plus<>{});
     out.lad_loc_max = 0.0;

@@ -1264,35 +1264,47 @@ namespace solvers {
     auto Ploc = _pol_vtx->eval_pol_ladder_loc_whalf(mb_state, thc, U_skia);
     const long nw_h = Ploc.shape(0), nq_ibz = Ploc.shape(1), nqpts = mf.nqpts();
     const long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
-    utils::check(nw_h == nw_half and Ploc.shape(2) == nab,
+    utils::check(nw_h == nw_half and Ploc.shape(2) == ns * nab,
                  "scr_coulomb_t::accumulate_pi_lad_loc_orb: evaluator returned {} x {} x "
                  "{} rows, expected {} x {} x {}.", nw_h, nq_ibz, Ploc.shape(2), nw_half,
-                 mf.nqpts_ibz(), nab);
+                 mf.nqpts_ibz(), ns * nab);
 
+    // spin-resolved: with ns > 1 the orbital axes are the spin-orbitals s norb + m (spin-major), the object
+    // P(s m, s n, s' m', s' n') of the spin-diagonal ladder (s' = s); ns = 1: the plain orbital axes
+    const long nso = ns * norb;
     if (not mb_state.sPi_lad_loc_orb_wabcd or
-        mb_state.sPi_lad_loc_orb_wabcd.value().shape()[0] != nw_h)
+        mb_state.sPi_lad_loc_orb_wabcd.value().shape()[0] != nw_h or
+        mb_state.sPi_lad_loc_orb_wabcd.value().shape()[1] != nso)
       mb_state.sPi_lad_loc_orb_wabcd.emplace(
           math::shm::make_shared_array<Array_view_5D_t>(
-              *thc.mpi(), {nw_h, norb, norb, norb, norb}));
+              *thc.mpi(), {nw_h, nso, nso, nso, nso}));
 
     double lmax = 0.0;
     mb_state.sPi_lad_loc_orb_wabcd.value().win().fence();
     if (thc.mpi()->node_comm.root()) {
-      auto D = nda::reshape(mb_state.sPi_lad_loc_orb_wabcd.value().local(),
-                            shape_t<3>{nw_h, nab, nab});
-      D() = ComplexType(0.0);
+      // the q average on the spin-major pair labels, then (ns > 1) onto the spin-orbital axes
+      nda::array<ComplexType, 3> Dp(nw_h, ns * nab, ns * nab);
+      Dp() = ComplexType(0.0);
       for (long iq = 0; iq < nqpts; ++iq) {
         const long iq_ibz = mf.qp_to_ibz(iq);
         const bool trev = mf.qp_trev(iq);
         for (long j = 0; j < nw_h; ++j) {
           auto Pq = Ploc(j, iq_ibz, all, all);
           if (trev)
-            D(j, all, all) += nda::conj(Pq);
+            Dp(j, all, all) += nda::conj(Pq);
           else
-            D(j, all, all) += Pq;
+            Dp(j, all, all) += Pq;
         }
       }
-      D() /= double(nqpts);
+      Dp() /= double(nqpts);
+      auto D = mb_state.sPi_lad_loc_orb_wabcd.value().local();
+      D() = ComplexType(0.0);
+      for (long j = 0; j < nw_h; ++j)
+        for (long is = 0; is < ns; ++is)
+          for (long ab = 0; ab < nab; ++ab)
+            for (long cd = 0; cd < nab; ++cd)
+              D(j, is * norb + ab / norb, is * norb + ab % norb, is * norb + cd / norb, is * norb + cd % norb) =
+                  Dp(j, is * nab + ab, is * nab + cd);
       for (auto const &v : D) lmax = std::max(lmax, std::abs(v));
     }
     mb_state.sPi_lad_loc_orb_wabcd.value().win().fence();
