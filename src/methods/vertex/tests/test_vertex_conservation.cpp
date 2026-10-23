@@ -289,14 +289,16 @@ namespace bdft_tests {
       // loses orbital hermiticity -- this breaks the G_ab = conj(G_ba) degeneracy and
       // pins the trace orientation AND the conjugation convention of the pairing.
       // The rung data (X, Z, M) are identical.
-      explicit model_t(bool nonherm = false)
+      // seed / de: a different orbital set and a rigid shift of the poles (the second spin of the collinear-spin
+      // section); the defaults are the sigma test's model
+      explicit model_t(bool nonherm = false, unsigned seed = 29, double de = 0.0)
                 : eps(nk, nbnd), Pr(nk, nbnd, nbnd, nbnd), X_skPa(ns, nk, Np, nbnd),
                   Z_qPQ(nk, Np, Np), M_qPQ(nk, Np, Np), kmq(nk, nk), kpq(nk, nk), qmin(nk) {
-        rng_t rng(29);
+        rng_t rng(seed);
         rng_t rng_nh(101);   // separate stream: the base model data stay identical
         const double base[3] = {-0.67, -0.11, 0.52};
         for (long k = 0; k < nk; ++k) {
-          for (long r = 0; r < nbnd; ++r) eps(k, r) = base[r] + 0.06 * double(k);
+          for (long r = 0; r < nbnd; ++r) eps(k, r) = base[r] + 0.06 * double(k) + de;
           auto U = unitary(nbnd, rng);
           auto V = nonherm ? unitary(nbnd, rng_nh) : U;
           for (long r = 0; r < nbnd; ++r)
@@ -713,6 +715,78 @@ namespace bdft_tests {
       REQUIRE(rel < 1e-7);
       for (int o = 1; o < 4; ++o)
         REQUIRE(cons::rel_residual(S_SG_o[o], S_PW) > 1e5 * std::max(rel, 1e-14));
+    }
+
+    SECTION("collinear_spin") {
+      // ns = 2 with different orbitals and poles per spin and ONE spin-independent W (the rung data of the first
+      // model). The rung conserves the spin of the pair, so the kernels decouple per spin:
+      //   Sigma^C[ns = 2](s) == Sigma^C[ns = 1](G_s, X_s)          (no spin factor in Sigma)
+      //   Pi^C[ns = 2]       == (Pi^C[ns = 1](up) + Pi^C[ns = 1](dn)) / 2   (ns = 1 carries the factor 2)
+      // and the conservation identity holds with the spin trace.
+      model_t up, dn(false, 47, 0.07);
+      auto Wt = up.Wdyn_tau(ft);
+      auto Ww = up.Wdyn_w(tools);
+      constexpr long ns2 = 2;
+      auto project = [&](model_t const &m) {
+        auto Gm = m.G_tau(ft);
+        nda::array<cplx, 5> Gp(nt, 1, nk, nbnd, nbnd);
+        Gp() = cplx(0.0);
+        for (long it = 0; it < nt; ++it)
+          for (long ik = 0; ik < nk; ++ik) Gp(it, 0, ik, C(), C()) = Gm(it, 0, ik, C(), C());
+        return Gp;
+      };
+      auto Gu = project(up), Gd = project(dn);
+      nda::array<cplx, 5> G2(nt, ns2, nk, nbnd, nbnd);
+      nda::array<cplx, 4> X2(ns2, nk, Np, nbnd);
+      G2(c_all, 0, c_all, c_all, c_all) = Gu(c_all, 0, c_all, c_all, c_all);
+      G2(c_all, 1, c_all, c_all, c_all) = Gd(c_all, 0, c_all, c_all, c_all);
+      X2(0, c_all, c_all, c_all) = up.X_skPa(0, c_all, c_all, c_all);
+      X2(1, c_all, c_all, c_all) = dn.X_skPa(0, c_all, c_all, c_all);
+
+      auto sigma = [&](auto const &G, auto const &X) {
+        nda::array<cplx, 5> S(nt, G.shape(1), nk, nbnd, nbnd);
+        solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), G, X, Wt, up.Z_qPQ, up.kmq, up.qmin,
+                                                        /*iq_gamma*/ 0, /*skip*/ false, S);
+        return S;
+      };
+      auto pi = [&](auto const &G, auto const &X) {
+        nda::array<cplx, 4> P(tools.nw_b, nk, Np, Np);
+        P() = cplx(0.0);
+        vertex_pi::pi_c_accumulate_w(ft, tools, G, X, up.Z_qPQ, &Ww, up.kmq, up.kpq, C(), P, 0, 1,
+                                     /*skip_rung_gamma=*/false);
+        return P;
+      };
+      auto Su = sigma(Gu, up.X_skPa), Sd = sigma(Gd, dn.X_skPa), S2 = sigma(G2, X2);
+      auto Pu = pi(Gu, up.X_skPa), Pd = pi(Gd, dn.X_skPa), P2 = pi(G2, X2);
+
+      double ds = 0.0, sscale = 0.0, sasym = 0.0;
+      for (long it = 0; it < nt; ++it)
+        for (long ik = 0; ik < nk; ++ik)
+          for (long a = 0; a < nbnd; ++a)
+            for (long b = 0; b < nbnd; ++b) {
+              ds = std::max({ds, std::abs(S2(it, 0, ik, a, b) - Su(it, 0, ik, a, b)),
+                             std::abs(S2(it, 1, ik, a, b) - Sd(it, 0, ik, a, b))});
+              sscale = std::max(sscale, std::abs(Su(it, 0, ik, a, b)));
+              sasym = std::max(sasym, std::abs(Su(it, 0, ik, a, b) - Sd(it, 0, ik, a, b)));
+            }
+      double dp = 0.0, pscale = 0.0;
+      for (long i = 0; i < P2.size(); ++i) {
+        dp = std::max(dp, std::abs(P2.data()[i] - 0.5 * (Pu.data()[i] + Pd.data()[i])));
+        pscale = std::max(pscale, std::abs(P2.data()[i]));
+      }
+      auto S_SG = cons::trace_sigma_G(tools, S2, G2)[0];
+      auto [S_PW, S_PW_alt] = cons::trace_pi_W(ft, tools, T0row, P2, up.Z_qPQ, Wt, /*iq_skip=*/-1, nk);
+      (void)S_PW_alt;
+      const double rel = cons::rel_residual(S_SG, S_PW);
+      app_log(1, "conservation_toy_spin: Sigma^C per spin vs ns = 1 max|diff| = {:.3e} (scale {:.3e}, spin asymmetry {:.3e}); "
+                 "Pi^C vs the ns = 1 average max|diff| = {:.3e} (scale {:.3e}); S_SigmaG = ({}, {}), S_PW = ({}, {}), rel = {:.3e}",
+              ds, sscale, sasym, dp, pscale, S_SG.real(), S_SG.imag(), S_PW.real(), S_PW.imag(), rel);
+      REQUIRE(sscale > 1e-10);
+      REQUIRE(sasym > 1e-2 * sscale);   // the two spins are genuinely different
+      REQUIRE(ds < 1e-12 * sscale);
+      REQUIRE(pscale > 1e-10);
+      REQUIRE(dp < 1e-12 * pscale);
+      REQUIRE(rel < 1e-8);
     }
 #endif  // ENABLE_DLR
   }
