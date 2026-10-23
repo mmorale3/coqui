@@ -112,6 +112,9 @@ namespace solvers {
       decltype(nda::range::all) all;
       const long ns = X_skPa.shape(0), nk = X_skPa.shape(1), Np = X_skPa.shape(2);
       const long M = U_skia.shape(3);
+      utils::check(U_skia.shape(0) == ns and U_skia.shape(1) >= nk,
+                   "vertex Wannier mode: the projector carries ({} spins, {} k), the run ({} spins, {} k). A collinear-spin run "
+                   "needs the projector of each spin, U(s, k).", U_skia.shape(0), U_skia.shape(1), ns, nk);
       nda::array<ComplexType, 4> Xbar(ns, nk, Np, M);
       for (long is = 0; is < ns; ++is)
         for (long ik = 0; ik < nk; ++ik)

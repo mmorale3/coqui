@@ -799,6 +799,13 @@ namespace solvers {
     vertex_sym::sym_ctx ctx;
     ctx.active = true;
     ctx.ns = X_w.shape(0);
+    // The C-sector rotations come from the mean field's band rotations (symmetry_rotation, built from the spin-0 orbitals
+    // only), and in Wannier mode Dc / Dfold below are stored for spin 0 only: a spin-polarized run on a symmetry-reduced
+    // mesh would rotate the spin-1 legs and folds with the spin-0 gauge.
+    utils::check(ctx.ns == 1,
+                 "vertex_t::build_sym_ctx: the vertex on a symmetry-reduced k mesh (IBZ or time reversal) supports ns = 1 only "
+                 "(this run: ns = {}); the band rotations of the mean field are those of spin 0. Run the collinear-spin vertex on "
+                 "a symmetry-free k mesh.", ctx.ns);
     ctx.nk_full = MF->nkpts();
     ctx.nk_ibz = MF->nkpts_ibz();
     ctx.nq_full = MF->nqpts();
@@ -1310,22 +1317,27 @@ namespace solvers {
       auto gather_at_points = [&](nda::array<long, 1> const &pts) {
         const long Nm = pts.extent(0);
         const long nW = long(_band_window.size());
-        auto Xw = builder.collocation_at_points(pts, nda::range(0, nkpts), _band_window);   // (ns, nk, nW, Nm)
+        auto Xw = builder.collocation_at_points(pts, nda::range(0, nkpts), _band_window);   // (ns_in_basis, nk, nW, Nm)
+        utils::check(Xw.shape(0) == ns or Xw.shape(0) == 1,
+                     "vertex_t::build_secondary_basis: the collocation has {} spins, the run {}.", Xw.shape(0), ns);
         Xa = nda::array<ComplexType, 4>(ns, nkpts, nc, Nm);
         Xa() = ComplexType(0.0);
-        for (long is = 0; is < ns; ++is)
+        for (long is = 0; is < ns; ++is) {
+          const long isb = std::min(is, long(Xw.shape(0)) - 1);   // a spin-independent basis (nspin_in_basis = 1)
           for (long ik = 0; ik < nkpts; ++ik)
             for (long a = 0; a < nc; ++a)
               for (long m = 0; m < Nm; ++m) {
                 if (_wannier) {
                   ComplexType acc(0.0);
-                  for (long i = 0; i < nW; ++i) acc += Xw(is, ik, i, m) * _U_skia(is, ik, i, a);
+                  for (long i = 0; i < nW; ++i) acc += Xw(isb, ik, i, m) * _U_skia(is, ik, i, a);
                   Xa(is, ik, a, m) = acc;
                 } else {
-                  Xa(is, ik, a, m) = Xw(is, ik, a, m);
+                  Xa(is, ik, a, m) = Xw(isb, ik, a, m);
                 }
               }
+        }
       };
+      bool spin_bcast = false;   // the window collocation carries spin 0 only (nspin_in_basis = 1): copied to every spin below
       if (frozen) {
         // FROZEN secondary points (coarse->fine interpolation): the point list of the coarse run is reused on THIS
         // mesh -- no selection. The collocation is gathered at the given points in the selection's convention
@@ -1384,7 +1396,9 @@ namespace solvers {
         (void)dXb;   // empty optional for a_range == b_range at Gamma (single_psi path)
         const long Nm = ip.extent(0);
         auto gs = dXa.global_shape();
-        utils::check(gs[0] == ns and gs[1] == nkpts and gs[2] == nc and gs[3] == Nm,
+        // the builder's spin axis is nspin_in_basis: 1 for a spin-independent basis under ns = 2
+        spin_bcast = (gs[0] == 1 and ns > 1);
+        utils::check((gs[0] == ns or spin_bcast) and gs[1] == nkpts and gs[2] == nc and gs[3] == Nm,
                      "vertex_t::build_secondary_basis: unexpected collocation shape "
                      "({}, {}, {}, {}); expected ({}, {}, {}, {}).",
                      gs[0], gs[1], gs[2], gs[3], ns, nkpts, nc, Nm);
@@ -1457,6 +1471,8 @@ namespace solvers {
       // transpose to the kernels' (aux, orb) layout. Any fixed per-point phase/scale
       // convention of the selection output is absorbed by the least-squares transfer.
       if (not replicated) mpi->comm.all_reduce_in_place_n(Xa.data(), Xa.size(), std::plus<>{});
+      if (spin_bcast)
+        for (long is = 1; is < ns; ++is) Xa(is, all, all, all) = Xa(0, all, all, all);
       _Xb_skma = nda::array<ComplexType, 4>(ns, nkpts, Nm, nc);
       for (long is = 0; is < ns; ++is)
         for (long ik = 0; ik < nkpts; ++ik)
