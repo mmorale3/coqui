@@ -937,9 +937,10 @@ namespace solvers {
      *
      * PARALLELIZATION: the flattened (s, iq) pairs are round-robined over
      * (rank, nproc) -- each owner builds its K blocks ONCE (they are nu-independent)
-     * and runs all requested nu. Every (jn, iq) output cell is written by exactly one
-     * rank, so the caller's all_reduce (zeros elsewhere) reproduces the replicated
-     * result BITWISE. (rank, nproc) = (0, 1) is the replicated mode. Outputs are
+     * and runs all requested nu. Every (jn, iq) output cell is accumulated by the
+     * owners of its spin units only (exactly one rank for ns = 1), so the caller's
+     * all_reduce (zeros elsewhere) reproduces the replicated result (BITWISE for
+     * ns = 1). (rank, nproc) = (0, 1) is the replicated mode. Outputs are
      * ZEROED here, indexed by POSITION in nu_list.
      *
      * NODE-GROUP SCHEDULING: g_comm != nullptr makes (rank, nproc) the GROUP grid
@@ -2214,11 +2215,11 @@ namespace solvers {
             if (grank == 0) {
               if (Pi_ladder != nullptr)
                 for (long M = 0; M < Nm; ++M)
-                  for (long N = 0; N < Nm; ++N) (*Pi_ladder)(jn, iq, M, N) = Pbuf(M, N);
+                  for (long N = 0; N < Nm; ++N) (*Pi_ladder)(jn, iq, M, N) += Pbuf(M, N);
               if (want_loc)
                 for (long M = 0; M < nab; ++M)
                   for (long N = 0; N < nab; ++N)
-                    (*Pi_lad_loc)(jn, iq, M, N) = Pbuf(ncD + M, ncD + N);
+                    (*Pi_lad_loc)(jn, iq, M, N) += Pbuf(ncD + M, ncD + N);
             }
           }
           pph.end();

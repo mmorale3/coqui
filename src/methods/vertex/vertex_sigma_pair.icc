@@ -324,7 +324,7 @@ namespace solvers {
             nda::blas::gemm(nda::transpose(Dconj), CbA, Pchk);        // (Nm x D)(D x Nm)
             }
             for (long M = 0; M < Nm; ++M)
-              for (long N = 0; N < Nm; ++N) if (not sym or iq < nq) (*opt.Pi_check)(l, iq, M, N) = cplx(spinfac / double(nk)) * Pchk(M, N);
+              for (long N = 0; N < Nm; ++N) if (not sym or iq < nq) (*opt.Pi_check)(l, iq, M, N) += cplx(spinfac / double(nk)) * Pchk(M, N);
           }
           if (opt.nu_diag) Astore(l, all, all) = Amp;
           if (met) met->t_amp += watch.lap();

@@ -29,7 +29,8 @@
  * resummed vertex.
  *
  * The (s, q, nu) units are distributed over (rank, nproc) (round-robin or dynamic scheduling) and
- * every (jn, iq) cell is written by exactly one rank, so the caller's zeros-elsewhere all_reduce reproduces the replicated result
+ * every unit ADDS its columns to its (jn, iq) cell (the spin sum: with ns = 2 the two spin units of a cell may run on the same
+ * rank or on different ones), so the caller's zeros-elsewhere all_reduce reproduces the replicated result
  * (the pair_space_ladder contract). The k-sum of the rung runs either as a direct gemm or through
  * the k-mesh Fourier transform (kmesh_ft); the gemm path is the machine-precision cross-check.
  */
@@ -850,6 +851,9 @@ namespace solvers {
           (*o)() = cplx(0.0);
         }
       utils::check(not opt.bubble_only or opt.Pi_bub != nullptr, "pair_space_ladder_dyn: bubble_only needs the Pi_bub output.");
+      utils::check(not wan or ns == 1,
+                   "pair_space_ladder_dyn: the Wannier-pair output frame with ns = {} is not supported: each spin's columns are in "
+                   "the pair labels of its own projector U(s, k), so their sum is not one object. Use the aux/point frame.", ns);
       for (auto m : nu_list) utils::check(m >= 0 and m < nw_b, "pair_space_ladder_dyn: nu index {} out of range.", m);
 
       // ---- the vertex basis and G's residues --------------------------------------------------
@@ -2104,7 +2108,7 @@ namespace solvers {
           }
           auto Pb = db::collapse(Dc, CbDf);                                                   // (nout, nout)
           for (long M = 0; M < nout; ++M)
-            for (long N = 0; N < nout; ++N) (*opt.Pi_bub)(jn_unit, iq, M, N) = cplx(spinfac / double(nk)) * Pb(M, N);
+            for (long N = 0; N < nout; ++N) (*opt.Pi_bub)(jn_unit, iq, M, N) += cplx(spinfac / double(nk)) * Pb(M, N);
           if (met) met->t_cb += watch.lap();
           if (opt.bubble_only) {
             if (met) { ++met->nunits; ++met->nconv; }
@@ -2123,7 +2127,7 @@ namespace solvers {
             for (int c = 0; c < 4; ++c)
               if (outs[c] != nullptr)
                 for (long M = 0; M < nout; ++M)
-                  for (long N = 0; N < nout; ++N) (*outs[c])(jn_unit, iq, M, N) = blk[size_t((c * nout + M) * nout + N)];
+                  for (long N = 0; N < nout; ++N) (*outs[c])(jn_unit, iq, M, N) += blk[size_t((c * nout + M) * nout + N)];
             if (met and Pi_dyn1 != nullptr and not opt.one_rung_only) {
               // the one-bare-rung slot of a Gamma_1-pass record is filled only when that pass fused it (device unit); an all-zero
               // block means the caller's separate one-rung pass must supply the column
@@ -2806,6 +2810,17 @@ namespace solvers {
           const long m = nu_list[jn];
           const cplx inu = (m == tools.m0) ? cplx(0.0) : cplx(tools.ft->omega(tools.wn_b(m)));
           inu_cur = inu;
+          // ns > 1: the readouts below WRITE the unit's columns into its (jn, iq) cells, which may already hold the other spin's
+          // columns (same rank). Those are set aside here and added back after the dump record, which so keeps the unit's own
+          // columns (a restored record is added the same way).
+          nda::array<cplx, 4> *spin_outs[4] = {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn};
+          std::vector<nda::array<cplx, 2>> spin_keep;
+          if (ns > 1)
+            for (auto *o : spin_outs)
+              if (o != nullptr) {
+                spin_keep.emplace_back((*o)(jn, iq, all, all));
+                (*o)(jn, iq, all, all) = cplx(0.0);
+              }
           // inu != 0: the twisted-pair tables of this node; built once per (unit, nu)
           db::shift_tables const *stp = nullptr;
           if (inu != cplx(0.0)) {
@@ -3310,6 +3325,11 @@ namespace solvers {
                   for (long N = 0; N < nout; ++N) blk[size_t((c * nout + M) * nout + N)] = (*outs[c])(jn, iq, M, N);
             dump_out.write(reinterpret_cast<char const *>(blk.data()), std::streamsize(blk.size() * sizeof(cplx)));
             dump_out.flush();
+          }
+          if (ns > 1) {
+            size_t c = 0;
+            for (auto *o : spin_outs)
+              if (o != nullptr) (*o)(jn, iq, all, all) += spin_keep[c++];
           }
           res.iterations = it_unit;
           res.converged = conv_unit;
