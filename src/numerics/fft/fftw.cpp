@@ -19,6 +19,7 @@
  */
 
 
+#include <cstdlib>
 #include <map>
 #include "IO/app_loggers.h"
 #include "utilities/check.hpp"
@@ -48,6 +49,22 @@ void init_threads(long nthreads)
   app_log(2, "  FFTW planner thread count set to {} (from omp_threads).", nthreads);
 }
 
+// Planner rigor. FFTW_MEASURE (the default of create_plan*), FFTW_PATIENT and FFTW_EXHAUSTIVE choose among the
+// algorithms of a transform by TIMING them, so the plan -- and with it the last bits of every transform -- can differ
+// between runs, between the ranks of one run, and between nodes. That roundoff is harmless on its own, but a
+// self-consistent loop whose later steps are ill conditioned (e.g. the vertex's causal projection of Sigma_c) amplifies
+// it to visible differences in the energies. The requested rigor is therefore reduced to FFTW_ESTIMATE, which plans
+// from the transform's shape alone and is reproducible; COQUI_FFTW_TIMED_PLANS=1 restores the timed planner.
+static unsigned planner_flags(unsigned flags)
+{
+  static const bool timed = [] {
+    const char *v = std::getenv("COQUI_FFTW_TIMED_PLANS");
+    return v != nullptr and std::strtol(v, nullptr, 10) != 0;
+  }();
+  if (timed) return flags;
+  return (flags & ~(FFTW_PATIENT | FFTW_EXHAUSTIVE)) | FFTW_ESTIMATE;
+}
+
 fftplan_t create_plan_many_impl_(int rank, const int *n, int howmany,
                              ComplexType *in, const int *inembed,
                              int istride, int idist,
@@ -59,12 +76,12 @@ fftplan_t create_plan_many_impl_(int rank, const int *n, int howmany,
   *fwd = fftw_plan_many_dft(rank,n,std::max(howmany,1),
                         reinterpret_cast<fftw_complex*>(in),inembed,istride,idist,
                         reinterpret_cast<fftw_complex*>(out),onembed,ostride,odist,
-                        FFTW_FORWARD,flags); 
+                        FFTW_FORWARD,planner_flags(flags)); 
   fftw_plan* inv = new fftw_plan{};
   *inv = fftw_plan_many_dft(rank,n,std::max(howmany,1),
                         reinterpret_cast<fftw_complex*>(in),inembed,istride,idist,
                         reinterpret_cast<fftw_complex*>(out),onembed,ostride,odist,
-                        FFTW_BACKWARD,flags);
+                        FFTW_BACKWARD,planner_flags(flags));
   return fftplan_t {FFT_BACKEND_FFTW,howmany,rank,fwd,inv};
 }
 fftplan_t create_plan_many_impl_(int rank, const int *n, int howmany,
@@ -78,7 +95,7 @@ fftplan_t create_plan_many_impl_(int rank, const int *n, int howmany,
   *fwd = fftw_plan_many_dft_r2c(rank,n,std::max(howmany,1),
                         in,inembed,istride,idist,
                         reinterpret_cast<fftw_complex*>(out),onembed,ostride,odist,
-                        flags);
+                        planner_flags(flags));
   return fftplan_t {FFT_BACKEND_FFTW,howmany,rank,fwd,nullptr};
 }
 fftplan_t create_plan_many_impl_(int rank, const int *n, int howmany,
@@ -92,7 +109,7 @@ fftplan_t create_plan_many_impl_(int rank, const int *n, int howmany,
   *fwd = fftw_plan_many_dft_c2r(rank,n,std::max(howmany,1),
                         reinterpret_cast<fftw_complex*>(in),inembed,istride,idist,
                         out,onembed,ostride,odist,
-                        flags);
+                        planner_flags(flags));
   return fftplan_t {FFT_BACKEND_FFTW,howmany,rank,fwd,nullptr};
 }
 fftplan_t create_plan_many_impl_(int rank, [[maybe_unused]] const int *n, int howmany,
