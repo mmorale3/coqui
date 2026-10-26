@@ -52,6 +52,10 @@
   `vertex_allow_unchecked_reflection`.
 - `vertex_debug` keys are validated against a known-key list (an unknown key aborts) and parsed strictly.
 - A Σ^C rung that violates the pair symmetry W_PQ(q) = W_QP(−q) is reported with a prominent warning.
+- Host FFTW plans are built with `FFTW_ESTIMATE` (planned from the transform shape, reproducible) instead of the timed
+  `FFTW_MEASURE` / `PATIENT` / `EXHAUSTIVE`: a timed plan differs between runs and ranks in the last bits of every
+  transform, which a vertex SCF with the causal projection of Σ_c amplified to 1e-6 Ha in `e_corr`. `COQUI_FFTW_TIMED_PLANS=1`
+  restores the timed planner.
 
 ### Known limitations
 
@@ -59,6 +63,9 @@
   satisfies the Φ-derivability identity Tr[Σ^C G] + Tr[P^C W] = 0 only approximately (relative 2–5e-4 on LiH 2×2×2,
   2–4e-2 with the gygi q → 0 head).
 - The vertex supports collinear spin only (`npol = 1`).
+- The causal projection of Σ_c (unconverged ADMM with Anderson acceleration, 6000 iterations) amplifies roundoff-level
+  differences of its input (different CPU, BLAS or FFT code path) to about 1% of the removed part, i.e. ~1e-6 Ha in
+  `e_corr` and a scatter of the little-group residual of G. Runs on the same hardware and build are reproducible.
 
 ## CoQui v0.3.0 [2026-06-03]
 
