@@ -19,6 +19,7 @@
  */
 
 
+#include <algorithm>
 #include <filesystem>
 #include <unordered_set>
 #include <sstream>
@@ -400,6 +401,82 @@ namespace solvers {
     utils::device_sync();
     _Timer.stop("EVALUATE_PI");
     _Timer.stop("TEMP_UW_eval_Pi_qdep");
+
+    // pol_q0_ward = "gamma": the q = 0 Ward-identity leakage of the bubble.
+    // With a correlated G (Z < 1) the G=G'=0 element of Pi does not vanish at q = 0: L(tau) = head of Pi(Gamma, tau)
+    // = the q = 0 bubble sum_k Tr[G_k(tau) G_k(beta - tau)], which a non-interacting gapped G makes zero. It is
+    // q-independent at small q and adds 4 pi L / (Omega q^2) to eps_00(q): metallic screening as q -> 0, the source of
+    // the slow k convergence. It is removed at every q by the rank-1 update
+    //   Pi(t,q) -= L(t) u(q) u(q)^dag,   u(q) = chi(q) / ||chi(q)||^2   (chi = thc.basis_head(), the G = 0 components),
+    // which lowers the head chi^dag Pi chi by exactly L(t): the q -> 0 limit of the Ward-Takahashi vertex
+    // i nu Gamma(k; 0, i nu) = G^-1(k, iw + i nu) - G^-1(k, iw), for which the q = 0 bubble vanishes.
+    if (_q0_ward == "gamma" or _q0_ward == "gamma_dual") {
+      if constexpr (MEM == HOST_MEMORY) {
+        auto MF = thc.MF();
+        long nq = MF->nqpts_ibz();
+        long iq_gamma = -1, iq_min = -1;
+        double q2_min = 1e300;
+        for (long iq = 0; iq < nq; ++iq) {
+          auto qv = MF->Qpts_ibz(iq);
+          double q2 = qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2);
+          if (q2 < 1e-12) { if (iq_gamma < 0) iq_gamma = iq; }
+          else if (q2 < q2_min) { q2_min = q2; iq_min = iq; }
+        }
+        utils::check(iq_gamma >= 0, "update_w: pol_q0_ward = \"{}\" needs q = 0 in the IBZ q list.", _q0_ward);
+        auto head_tq = div_utils::head_from_prod_basis(dPi_tqPQ, thc);   // (nts, nq), all-reduced
+        auto [nts_g, nq_g, NP, NQ] = dPi_tqPQ.global_shape();
+        nda::array<ComplexType, 1> L(nts_g);
+        for (long t = 0; t < nts_g; ++t) L(t) = head_tq(t, iq_gamma);
+
+        // "gamma": u = chi/||chi||^2. It lowers the head by L but also changes Pi at G != 0 (the aux functions are not
+        // orthogonal across plane waves), i.e. it injects spurious wings. "gamma_dual": u = chibar/(chi^dag chibar) with
+        // chibar = S^-1 chi (thc.basis_bar_head(), <chi_u|chibar_v> = delta_uv): the best representation of the G = 0
+        // plane wave in the span of the aux functions, so the update acts on the head only (up to the ISDF error).
+        auto chi = thc.basis_head();                                      // (nqpts_ibz, Np)
+        auto chibar = thc.basis_bar_head();                               // (nqpts_ibz, Np)
+        const bool dual = (_q0_ward == "gamma_dual");
+        auto Pl = dPi_tqPQ.local();
+        auto t_rng = dPi_tqPQ.local_range(0);
+        auto q_rng = dPi_tqPQ.local_range(1);
+        auto P_rng = dPi_tqPQ.local_range(2);
+        auto Q_rng = dPi_tqPQ.local_range(3);
+        nda::array<ComplexType, 1> uP(P_rng.size()), uQc(Q_rng.size());
+        for (auto [iq, q] : itertools::enumerate(q_rng)) {
+          // u = d / (chi^dag d), d = chi or chibar: chi^dag u = 1, so chi^dag (L u u^dag) chi = L
+          ComplexType n2 = 0.0;
+          for (long P = 0; P < NP; ++P) n2 += std::conj(chi(q, P)) * (dual ? chibar(q, P) : chi(q, P));
+          if (std::abs(n2) < 1e-300) continue;
+          for (auto [ip, P] : itertools::enumerate(P_rng)) uP(ip) = (dual ? chibar(q, P) : chi(q, P)) / n2;
+          for (auto [iQ, Q] : itertools::enumerate(Q_rng)) uQc(iQ) = std::conj((dual ? chibar(q, Q) : chi(q, Q)) / n2);
+          for (auto [it, t] : itertools::enumerate(t_rng)) {
+            ComplexType c = L(t);
+            for (long ip = 0; ip < long(P_rng.size()); ++ip) {
+              ComplexType cu = c * uP(ip);
+              for (long iQ = 0; iQ < long(Q_rng.size()); ++iQ) Pl(it, iq, ip, iQ) -= cu * uQc(iQ);
+            }
+          }
+        }
+
+        // report: the leakage and the heads at Gamma and at the smallest nonzero q, before and after, at i nu = 0
+        auto head_after = div_utils::head_from_prod_basis(dPi_tqPQ, thc);
+        long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+        auto to_w0 = [&](auto const& h, long iq) {
+          nda::array<ComplexType, 2> ht(nts_g, 1), hw(nw_half, 1);
+          for (long t = 0; t < nts_g; ++t) ht(t, 0) = h(t, iq);
+          _ft->tau_to_w_PHsym(ht, hw);
+          return hw(0, 0).real();
+        };
+        double Lmax = 0.0;
+        for (long t = 0; t < nts_g; ++t) Lmax = std::max(Lmax, std::abs(L(t)));
+        app_log(1, "  [q0 ward] pol_q0_ward = {}: head of Pi(Gamma) removed at every q. L(i nu = 0) = {:.6e}, "
+                   "max_tau |L| = {:.4e}; head(Gamma, i nu = 0) {:.4e} -> {:.4e}; smallest |q| = {:.4f}: head {:.6e} -> {:.6e}",
+                _q0_ward, to_w0(head_tq, iq_gamma), Lmax, to_w0(head_tq, iq_gamma), to_w0(head_after, iq_gamma),
+                std::sqrt(q2_min), iq_min >= 0 ? to_w0(head_tq, iq_min) : 0.0,
+                iq_min >= 0 ? to_w0(head_after, iq_min) : 0.0);
+      } else {
+        utils::check(false, "update_w: pol_q0_ward = \"{}\" is host-only (CPU build).", _q0_ward);
+      }
+    }
 
     // evaluate screened interaction (dW_tqPQ) and reset polarizability (dPi_tqPQ)
     // a) dPi_tqPQ is reset during dyson_W_from_Pi_tau()
@@ -2761,8 +2838,53 @@ namespace solvers {
     utils::device_sync();
     _Timer.stop("TEMP_DWFP_tau_to_w");
 
+    // pol_q0_ward = "w_sm": the q = 0 leakage h(i nu) = head of Pi(Gamma, i nu), read before the Dyson step overwrites Pi
+    if (_q0_ward == "w_sm") {
+      auto MF = thc.MF();
+      long iq_gamma = -1;
+      for (long iq = 0; iq < MF->nqpts_ibz() and iq_gamma < 0; ++iq) {
+        auto qv = MF->Qpts_ibz(iq);
+        if (qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2) < 1e-12) iq_gamma = iq;
+      }
+      utils::check(iq_gamma >= 0, "dyson_W_from_Pi_tau: pol_q0_ward = \"w_sm\" needs q = 0 in the IBZ q list.");
+      if constexpr (::nda::mem::on_host<local_Array_t>) {
+        auto head_wq = div_utils::head_from_prod_basis(dPi_wqPQ, thc);   // (nw, nq), all-reduced
+        nda::array<ComplexType, 1> hw(head_wq.shape(0));
+        for (long n = 0; n < hw.size(); ++n) hw(n) = head_wq(n, iq_gamma);
+        _q0_ward_hw = std::move(hw);
+      } else {
+        // device: only the Gamma column, h(n) = sum_PQ conj(chi(Gamma, P)) Pi(n, Gamma, P, Q) chi(Gamma, Q)
+        // (head_from_prod_basis's bar_basis = false contraction), y = Pi chi on the device per local i nu, then reduced
+        constexpr MEMORY_SPACE MEMW = ::nda::mem::on_host<local_Array_t> ? HOST_MEMORY : DEVICE_MEMORY;
+        const long nw_g = dPi_wqPQ.global_shape()[0];
+        auto [nw_l, nq_l, NP_l, NQ_l] = dPi_wqPQ.local_shape();
+        auto [w_o, q_o, P_o, Q_o] = dPi_wqPQ.origin();
+        nda::array<ComplexType, 1> hw(nw_g);
+        hw() = ComplexType(0.0);
+        if (iq_gamma >= q_o and iq_gamma < q_o + nq_l and NP_l > 0 and NQ_l > 0) {
+          auto chi = thc.basis_head();
+          nda::array<ComplexType, 2> cQ(NQ_l, 1);
+          for (long iQ = 0; iQ < NQ_l; ++iQ) cQ(iQ, 0) = chi(iq_gamma, Q_o + iQ);
+          auto cQd = memory::to_memory_space<MEMW>(cQ);
+          memory::array<MEMW, ComplexType, 2> Bd(NP_l, NQ_l), yd(NP_l, 1);
+          auto Ml = dPi_wqPQ.local();
+          for (long n = 0; n < nw_l; ++n) {
+            Bd = Ml(n, iq_gamma - q_o, nda::ellipsis{});
+            nda::blas::gemm(ComplexType(1.0), Bd, cQd, ComplexType(0.0), yd);
+            auto yh = memory::to_memory_space<HOST_MEMORY>(yd);
+            ComplexType s = 0.0;
+            for (long iP = 0; iP < NP_l; ++iP) s += std::conj(chi(iq_gamma, P_o + iP)) * yh(iP, 0);
+            hw(w_o + n) += s;
+          }
+        }
+        dPi_wqPQ.communicator()->all_reduce_in_place_n(hw.data(), hw.size(), std::plus<>{});
+        _q0_ward_hw = std::move(hw);
+      }
+    }
+
     _Timer.start("TEMP_DWFP_dyson_W_in_place");
     dyson_W_in_place(dPi_wqPQ, thc);
+    _q0_ward_hw.reset();
     utils::device_sync();
     _Timer.stop("TEMP_DWFP_dyson_W_in_place");
 
@@ -2928,6 +3050,98 @@ namespace solvers {
         math::nda::slate_ops::multiply(dA_PQ, dZ_PQ, dPi_PQ);
         utils::device_sync();
         _Timer.stop("TEMP_DWiP_gemm_AZ");
+
+        // pol_q0_ward = "w_sm": remove the q = 0 Ward-identity leakage h(i nu) from the
+        // G = 0 head of P EXACTLY, P' = P - h e0 e0^dag  =>  W'^-1 = W^-1 + h e0 e0^dag, i.e. by Sherman-Morrison
+        //   W' = W - h / (1 + h W00) (W b)(b^dag W),   b = conj(chibar(q)),  W00 = b^dag W b,
+        // with b the dual G = 0 vector through which the head of W is read (div_utils::eval_eps_inv_q). Unlike a rank-1
+        // change of Pi in the aux basis (the G = 0 plane wave is not in the span of the aux functions), this changes the
+        // plane-wave head of P only. Skipped at q = 0, where the G = 0 Coulomb component is absent.
+        if (_q0_ward_hw.has_value()) {
+          {
+            auto qv = thc.MF()->Qpts_ibz(iq);
+            if (qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2) > 1e-12) {
+              ComplexType h = _q0_ward_hw.value()(long(n) + long(w_origin));
+              // taper: h -> f(|q| / r_in) h, f = 1 - smoothstep(q1 -> q2); r_in = min |G| / 2 over G != 0
+              double ftaper = 1.0, qabs = std::sqrt(qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2)), r_in = 0.0;
+              if (_q0_ward_q2 > 0.0) {
+                auto rv = thc.MF()->recv();
+                double g2min = 1e300;
+                for (int i0 = -2; i0 <= 2; ++i0)
+                  for (int i1 = -2; i1 <= 2; ++i1)
+                    for (int i2 = -2; i2 <= 2; ++i2) {
+                      if (i0 == 0 and i1 == 0 and i2 == 0) continue;
+                      double g2 = 0.0;
+                      for (int d = 0; d < 3; ++d) {
+                        double g = i0 * rv(0, d) + i1 * rv(1, d) + i2 * rv(2, d);
+                        g2 += g * g;
+                      }
+                      g2min = std::min(g2min, g2);
+                    }
+                r_in = 0.5 * std::sqrt(g2min);
+                double s = std::clamp((qabs / r_in - _q0_ward_q1) / (_q0_ward_q2 - _q0_ward_q1), 0.0, 1.0);
+                ftaper = 1.0 - s * s * s * (10.0 - 15.0 * s + 6.0 * s * s);
+              }
+              if (long(n) + long(w_origin) == 0 and wq_intra_comm.root() and _q0_ward_q2 > 0.0)
+                app_log(1, "  [q0 ward w_sm taper] q {} |q| {:.4f} = {:.4f} r_in (r_in {:.4f}): f = {:.6f}",
+                        iq, qabs, qabs / r_in, r_in, ftaper);
+              h *= ftaper;
+              auto chibar = thc.basis_bar_head();
+              nda::array<ComplexType, 1> a(NP), r(NQ);
+              a() = 0.0; r() = 0.0;
+              // W = Z + dW on the local block: a_P = sum_Q W_PQ b_Q, r_Q = sum_P conj(b_P) W_PQ (partial, then reduced)
+              if constexpr (MEM == HOST_MEMORY) {
+                for (long iP = 0; iP < NP_loc; ++iP) {
+                  long P = iP + P_origin;
+                  for (long iQ = 0; iQ < NQ_loc; ++iQ) {
+                    long Q = iQ + Q_origin;
+                    ComplexType w = Z_PQ(iP, iQ) + Pi_PQ(iP, iQ);
+                    a(P) += w * std::conj(chibar(iq, Q));
+                    r(Q) += chibar(iq, P) * w;
+                  }
+                }
+              } else if (NP_loc > 0 and NQ_loc > 0) {
+                // device: a = (Z + dW) b and r = b^dag (Z + dW) as gemms against the local slices of b
+                nda::array<ComplexType, 2> bQ(NQ_loc, 1), bP(1, NP_loc);
+                for (long iQ = 0; iQ < NQ_loc; ++iQ) bQ(iQ, 0) = std::conj(chibar(iq, iQ + Q_origin));
+                for (long iP = 0; iP < NP_loc; ++iP) bP(0, iP) = chibar(iq, iP + P_origin);
+                auto bQd = memory::to_memory_space<MEM>(bQ);
+                auto bPd = memory::to_memory_space<MEM>(bP);
+                memory::array<MEM, ComplexType, 2> ad(NP_loc, 1), rd(1, NQ_loc);
+                nda::blas::gemm(ComplexType(1.0), Z_PQ, bQd, ComplexType(0.0), ad);
+                nda::blas::gemm(ComplexType(1.0), Pi_PQ, bQd, ComplexType(1.0), ad);
+                nda::blas::gemm(ComplexType(1.0), bPd, Z_PQ, ComplexType(0.0), rd);
+                nda::blas::gemm(ComplexType(1.0), bPd, Pi_PQ, ComplexType(1.0), rd);
+                auto ah = memory::to_memory_space<HOST_MEMORY>(ad);
+                auto rh = memory::to_memory_space<HOST_MEMORY>(rd);
+                for (long iP = 0; iP < NP_loc; ++iP) a(iP + P_origin) = ah(iP, 0);
+                for (long iQ = 0; iQ < NQ_loc; ++iQ) r(iQ + Q_origin) = rh(0, iQ);
+              }
+              wq_intra_comm.all_reduce_in_place_n(a.data(), a.size(), std::plus<>{});
+              wq_intra_comm.all_reduce_in_place_n(r.data(), r.size(), std::plus<>{});
+              ComplexType W00 = 0.0;
+              for (long P = 0; P < NP; ++P) W00 += chibar(iq, P) * a(P);
+              ComplexType c = h / (ComplexType(1.0) + h * W00);
+              if constexpr (MEM == HOST_MEMORY) {
+                for (long iP = 0; iP < NP_loc; ++iP)
+                  for (long iQ = 0; iQ < NQ_loc; ++iQ)
+                    Pi_PQ(iP, iQ) -= c * a(iP + P_origin) * r(iQ + Q_origin);
+              } else if (NP_loc > 0 and NQ_loc > 0) {
+                // device: dW -= c a r^T as one rank-1 gemm
+                nda::array<ComplexType, 2> aP(NP_loc, 1), rQ(1, NQ_loc);
+                for (long iP = 0; iP < NP_loc; ++iP) aP(iP, 0) = a(iP + P_origin);
+                for (long iQ = 0; iQ < NQ_loc; ++iQ) rQ(0, iQ) = r(iQ + Q_origin);
+                auto aPd = memory::to_memory_space<MEM>(aP);
+                auto rQd = memory::to_memory_space<MEM>(rQ);
+                nda::blas::gemm(-c, aPd, rQd, ComplexType(1.0), Pi_PQ);
+              }
+              if (long(n) + long(w_origin) == 0 and wq_intra_comm.root() and iq < 4)
+                app_log(1, "  [q0 ward w_sm] q {} (|q|^2 {:.4e}), i nu = 0: h = {:.6e}, W00 = {:.6e} -> {:.6e}",
+                        iq, qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2), h.real(), W00.real(),
+                        (W00 / (ComplexType(1.0) + h * W00)).real());
+            }
+          }
+        }
         _Timer.start("TEMP_DWiP_writeback");
         Pi_wqPQ(n, iq_loc, nda::ellipsis{}) = Pi_PQ;
         utils::device_sync();

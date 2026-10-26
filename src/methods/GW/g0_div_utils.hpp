@@ -435,6 +435,7 @@ namespace methods {
         auto [nts, nqpts_ibz, NP, NQ] = dM_tqPQ.global_shape();
 
         nda::array<ComplexType, 2> m_t(nts, nqpts_ibz);
+        m_t() = ComplexType(0.0);   // accumulated with += below, then all-reduced
         nda::array<ComplexType, 1> buffer_P(NP_loc);
         auto Mloc = dM_tqPQ.local();
         if(bar_basis) {

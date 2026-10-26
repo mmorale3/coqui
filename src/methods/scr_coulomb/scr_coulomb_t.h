@@ -322,6 +322,15 @@ namespace solvers {
     // eps_M(q) on the _eps_inf_fit_npts smallest nonzero |q| next to the stored head (eval_eps_inf_fit).
     bool _eps_inf_fit = false;
     long _eps_inf_fit_npts = 3;
+    // [gw] pol_q0_ward (default "none"): removal of the q = 0 Ward-identity leakage of Pi (update_w).
+    std::string _q0_ward = "none";
+    // "w_sm": the leakage h(i nu) = head of Pi(Gamma, i nu) on the global bosonic grid of the Dyson step (set in
+    // dyson_W_from_Pi_tau, consumed by dyson_W_in_place, then reset)
+    std::optional<nda::array<ComplexType, 1>> _q0_ward_hw;
+    // [gw] pol_q0_ward_q1 / pol_q0_ward_q2 (default 0.3 / 1.0): the "w_sm" taper bounds in units of the inscribed BZ
+    // radius (q2 <= 0: off = h(Gamma) at every q)
+    double _q0_ward_q1 = 0.3;
+    double _q0_ward_q2 = 1.0;
     utils::TimerManager _Timer;
 
     // optional second-order-exchange vertex correction (not owned).
@@ -547,6 +556,23 @@ namespace solvers {
     // the small-q eps_inf fit (report-only; npts = the smallest nonzero |q| used, >= 2)
     void set_eps_inf_fit(bool on, long npts = 3) { _eps_inf_fit = on; _eps_inf_fit_npts = std::max(npts, 2l); }
     bool eps_inf_fit() const { return _eps_inf_fit; }
+    // q = 0 Ward-identity leakage of Pi: "none" | "gamma" | "gamma_dual" (subtract the G=G'=0 element of Pi(q = 0, tau) at
+    // every q along u = chi/||chi||^2, resp. along the dual direction u = chibar/(chi^dag chibar)) | "w_sm" (the same
+    // head-only change of P applied exactly to W(i nu) by Sherman-Morrison inside dyson_W_in_place)
+    void set_q0_ward(std::string mode) {
+      utils::check(mode == "none" or mode == "gamma" or mode == "gamma_dual" or mode == "w_sm",
+                   "scr_coulomb_t: pol_q0_ward = \"{}\" is not one of \"none\", \"gamma\", \"gamma_dual\", \"w_sm\".", mode);
+      _q0_ward = mode;
+    }
+    std::string const& q0_ward() const { return _q0_ward; }
+    // "w_sm" taper: h(q) = f(|q|/r_in) h(Gamma), r_in = the inscribed Brillouin-zone radius; f = 1 below q1,
+    // a C2 smoothstep to 0 at q2, 0 beyond (default q1 = 0.3, q2 = 1.0). q2 <= 0: no taper, h applied at every q.
+    void set_q0_ward_taper(double q1, double q2) {
+      utils::check(q2 <= 0.0 or (q1 >= 0.0 and q1 < q2),
+                   "scr_coulomb_t: pol_q0_ward_q1/q2 = {}/{} need 0 <= q1 < q2 (or q2 <= 0 for no taper).", q1, q2);
+      _q0_ward_q1 = q1;
+      _q0_ward_q2 = q2;
+    }
     long eps_inf_fit_npts() const { return _eps_inf_fit_npts; }
     std::string& screen_type() { return _screen_type; };
     std::string screen_type() const { return _screen_type; };
