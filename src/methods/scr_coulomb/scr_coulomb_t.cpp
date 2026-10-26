@@ -409,7 +409,7 @@ namespace solvers {
     //   Pi(t,q) -= L(t) u(q) u(q)^dag,   u(q) = chi(q) / ||chi(q)||^2   (chi = thc.basis_head(), the G = 0 components),
     // which lowers the head chi^dag Pi chi by exactly L(t): the q -> 0 limit of the Ward-Takahashi vertex
     // i nu Gamma(k; 0, i nu) = G^-1(k, iw + i nu) - G^-1(k, iw), for which the q = 0 bubble vanishes.
-    if (_q0_ward != "none") {
+    if (_q0_ward == "gamma" or _q0_ward == "gamma_dual") {
       if constexpr (MEM == HOST_MEMORY) {
         auto MF = thc.MF();
         long nq = MF->nqpts_ibz();
@@ -2825,8 +2825,24 @@ namespace solvers {
     utils::device_sync();
     _Timer.stop("TEMP_DWFP_tau_to_w");
 
+    // pol_q0_ward = "w_sm": the q = 0 leakage h(i nu) = head of Pi(Gamma, i nu), read before the Dyson step overwrites Pi
+    if (_q0_ward == "w_sm") {
+      auto MF = thc.MF();
+      long iq_gamma = -1;
+      for (long iq = 0; iq < MF->nqpts_ibz() and iq_gamma < 0; ++iq) {
+        auto qv = MF->Qpts_ibz(iq);
+        if (qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2) < 1e-12) iq_gamma = iq;
+      }
+      utils::check(iq_gamma >= 0, "dyson_W_from_Pi_tau: pol_q0_ward = \"w_sm\" needs q = 0 in the IBZ q list.");
+      auto head_wq = div_utils::head_from_prod_basis(dPi_wqPQ, thc);   // (nw, nq), all-reduced
+      nda::array<ComplexType, 1> hw(head_wq.shape(0));
+      for (long n = 0; n < hw.size(); ++n) hw(n) = head_wq(n, iq_gamma);
+      _q0_ward_hw = std::move(hw);
+    }
+
     _Timer.start("TEMP_DWFP_dyson_W_in_place");
     dyson_W_in_place(dPi_wqPQ, thc);
+    _q0_ward_hw.reset();
     utils::device_sync();
     _Timer.stop("TEMP_DWFP_dyson_W_in_place");
 
@@ -2992,6 +3008,48 @@ namespace solvers {
         math::nda::slate_ops::multiply(dA_PQ, dZ_PQ, dPi_PQ);
         utils::device_sync();
         _Timer.stop("TEMP_DWiP_gemm_AZ");
+
+        // pol_q0_ward = "w_sm": remove the q = 0 Ward-identity leakage h(i nu) from the
+        // G = 0 head of P EXACTLY, P' = P - h e0 e0^dag  =>  W'^-1 = W^-1 + h e0 e0^dag, i.e. by Sherman-Morrison
+        //   W' = W - h / (1 + h W00) (W b)(b^dag W),   b = conj(chibar(q)),  W00 = b^dag W b,
+        // with b the dual G = 0 vector through which the head of W is read (div_utils::eval_eps_inv_q). Unlike a rank-1
+        // change of Pi in the aux basis (the G = 0 plane wave is not in the span of the aux functions), this changes the
+        // plane-wave head of P only. Skipped at q = 0, where the G = 0 Coulomb component is absent.
+        if (_q0_ward_hw.has_value()) {
+          if constexpr (MEM == HOST_MEMORY) {
+            auto qv = thc.MF()->Qpts_ibz(iq);
+            if (qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2) > 1e-12) {
+              ComplexType h = _q0_ward_hw.value()(long(n) + long(w_origin));
+              auto chibar = thc.basis_bar_head();
+              nda::array<ComplexType, 1> a(NP), r(NQ);
+              a() = 0.0; r() = 0.0;
+              // W = Z + dW on the local block: a_P = sum_Q W_PQ b_Q, r_Q = sum_P conj(b_P) W_PQ (partial, then reduced)
+              for (long iP = 0; iP < NP_loc; ++iP) {
+                long P = iP + P_origin;
+                for (long iQ = 0; iQ < NQ_loc; ++iQ) {
+                  long Q = iQ + Q_origin;
+                  ComplexType w = Z_PQ(iP, iQ) + Pi_PQ(iP, iQ);
+                  a(P) += w * std::conj(chibar(iq, Q));
+                  r(Q) += chibar(iq, P) * w;
+                }
+              }
+              wq_intra_comm.all_reduce_in_place_n(a.data(), a.size(), std::plus<>{});
+              wq_intra_comm.all_reduce_in_place_n(r.data(), r.size(), std::plus<>{});
+              ComplexType W00 = 0.0;
+              for (long P = 0; P < NP; ++P) W00 += chibar(iq, P) * a(P);
+              ComplexType c = h / (ComplexType(1.0) + h * W00);
+              for (long iP = 0; iP < NP_loc; ++iP)
+                for (long iQ = 0; iQ < NQ_loc; ++iQ)
+                  Pi_PQ(iP, iQ) -= c * a(iP + P_origin) * r(iQ + Q_origin);
+              if (long(n) + long(w_origin) == 0 and wq_intra_comm.root() and iq < 4)
+                app_log(1, "  [q0 ward w_sm] q {} (|q|^2 {:.4e}), i nu = 0: h = {:.6e}, W00 = {:.6e} -> {:.6e}",
+                        iq, qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2), h.real(), W00.real(),
+                        (W00 / (ComplexType(1.0) + h * W00)).real());
+            }
+          } else {
+            utils::check(false, "dyson_W_in_place: pol_q0_ward = \"w_sm\" is host-only (CPU build).");
+          }
+        }
         _Timer.start("TEMP_DWiP_writeback");
         Pi_wqPQ(n, iq_loc, nda::ellipsis{}) = Pi_PQ;
         utils::device_sync();

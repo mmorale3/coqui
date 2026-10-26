@@ -324,6 +324,9 @@ namespace solvers {
     long _eps_inf_fit_npts = 3;
     // [gw] pol_q0_ward (default "none"): removal of the q = 0 Ward-identity leakage of Pi (update_w).
     std::string _q0_ward = "none";
+    // "w_sm": the leakage h(i nu) = head of Pi(Gamma, i nu) on the global bosonic grid of the Dyson step (set in
+    // dyson_W_from_Pi_tau, consumed by dyson_W_in_place, then reset)
+    std::optional<nda::array<ComplexType, 1>> _q0_ward_hw;
     utils::TimerManager _Timer;
 
     // optional second-order-exchange vertex correction (not owned).
@@ -550,10 +553,11 @@ namespace solvers {
     void set_eps_inf_fit(bool on, long npts = 3) { _eps_inf_fit = on; _eps_inf_fit_npts = std::max(npts, 2l); }
     bool eps_inf_fit() const { return _eps_inf_fit; }
     // q = 0 Ward-identity leakage of Pi: "none" | "gamma" | "gamma_dual" (subtract the G=G'=0 element of Pi(q = 0, tau) at
-    // every q along u = chi/||chi||^2, resp. along the dual direction u = chibar/(chi^dag chibar))
+    // every q along u = chi/||chi||^2, resp. along the dual direction u = chibar/(chi^dag chibar)) | "w_sm" (the same
+    // head-only change of P applied exactly to W(i nu) by Sherman-Morrison inside dyson_W_in_place)
     void set_q0_ward(std::string mode) {
-      utils::check(mode == "none" or mode == "gamma" or mode == "gamma_dual",
-                   "scr_coulomb_t: pol_q0_ward = \"{}\" is not one of \"none\", \"gamma\", \"gamma_dual\".", mode);
+      utils::check(mode == "none" or mode == "gamma" or mode == "gamma_dual" or mode == "w_sm",
+                   "scr_coulomb_t: pol_q0_ward = \"{}\" is not one of \"none\", \"gamma\", \"gamma_dual\", \"w_sm\".", mode);
       _q0_ward = mode;
     }
     std::string const& q0_ward() const { return _q0_ward; }
