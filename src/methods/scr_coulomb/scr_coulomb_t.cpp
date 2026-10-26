@@ -19,6 +19,7 @@
  */
 
 
+#include <algorithm>
 #include <filesystem>
 #include <unordered_set>
 #include <sstream>
@@ -3020,6 +3021,30 @@ namespace solvers {
             auto qv = thc.MF()->Qpts_ibz(iq);
             if (qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2) > 1e-12) {
               ComplexType h = _q0_ward_hw.value()(long(n) + long(w_origin));
+              // taper: h -> f(|q| / r_in) h, f = 1 - smoothstep(q1 -> q2); r_in = min |G| / 2 over G != 0
+              double ftaper = 1.0, qabs = std::sqrt(qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2)), r_in = 0.0;
+              if (_q0_ward_q2 > 0.0) {
+                auto rv = thc.MF()->recv();
+                double g2min = 1e300;
+                for (int i0 = -2; i0 <= 2; ++i0)
+                  for (int i1 = -2; i1 <= 2; ++i1)
+                    for (int i2 = -2; i2 <= 2; ++i2) {
+                      if (i0 == 0 and i1 == 0 and i2 == 0) continue;
+                      double g2 = 0.0;
+                      for (int d = 0; d < 3; ++d) {
+                        double g = i0 * rv(0, d) + i1 * rv(1, d) + i2 * rv(2, d);
+                        g2 += g * g;
+                      }
+                      g2min = std::min(g2min, g2);
+                    }
+                r_in = 0.5 * std::sqrt(g2min);
+                double s = std::clamp((qabs / r_in - _q0_ward_q1) / (_q0_ward_q2 - _q0_ward_q1), 0.0, 1.0);
+                ftaper = 1.0 - s * s * s * (10.0 - 15.0 * s + 6.0 * s * s);
+              }
+              if (long(n) + long(w_origin) == 0 and wq_intra_comm.root() and _q0_ward_q2 > 0.0)
+                app_log(1, "  [q0 ward w_sm taper] q {} |q| {:.4f} = {:.4f} r_in (r_in {:.4f}): f = {:.6f}",
+                        iq, qabs, qabs / r_in, r_in, ftaper);
+              h *= ftaper;
               auto chibar = thc.basis_bar_head();
               nda::array<ComplexType, 1> a(NP), r(NQ);
               a() = 0.0; r() = 0.0;
