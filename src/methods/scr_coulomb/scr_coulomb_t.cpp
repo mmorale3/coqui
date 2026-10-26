@@ -427,7 +427,13 @@ namespace solvers {
         nda::array<ComplexType, 1> L(nts_g);
         for (long t = 0; t < nts_g; ++t) L(t) = head_tq(t, iq_gamma);
 
+        // "gamma": u = chi/||chi||^2. It lowers the head by L but also changes Pi at G != 0 (the aux functions are not
+        // orthogonal across plane waves), i.e. it injects spurious wings. "gamma_dual": u = chibar/(chi^dag chibar) with
+        // chibar = S^-1 chi (thc.basis_bar_head(), <chi_u|chibar_v> = delta_uv): the best representation of the G = 0
+        // plane wave in the span of the aux functions, so the update acts on the head only (up to the ISDF error).
         auto chi = thc.basis_head();                                      // (nqpts_ibz, Np)
+        auto chibar = thc.basis_bar_head();                               // (nqpts_ibz, Np)
+        const bool dual = (_q0_ward == "gamma_dual");
         auto Pl = dPi_tqPQ.local();
         auto t_rng = dPi_tqPQ.local_range(0);
         auto q_rng = dPi_tqPQ.local_range(1);
@@ -435,11 +441,12 @@ namespace solvers {
         auto Q_rng = dPi_tqPQ.local_range(3);
         nda::array<ComplexType, 1> uP(P_rng.size()), uQc(Q_rng.size());
         for (auto [iq, q] : itertools::enumerate(q_rng)) {
-          double n2 = 0.0;
-          for (long P = 0; P < NP; ++P) n2 += std::norm(chi(q, P));
-          if (n2 < 1e-300) continue;
-          for (auto [ip, P] : itertools::enumerate(P_rng)) uP(ip) = chi(q, P) / n2;
-          for (auto [iQ, Q] : itertools::enumerate(Q_rng)) uQc(iQ) = std::conj(chi(q, Q)) / n2;
+          // u = d / (chi^dag d), d = chi or chibar: chi^dag u = 1, so chi^dag (L u u^dag) chi = L
+          ComplexType n2 = 0.0;
+          for (long P = 0; P < NP; ++P) n2 += std::conj(chi(q, P)) * (dual ? chibar(q, P) : chi(q, P));
+          if (std::abs(n2) < 1e-300) continue;
+          for (auto [ip, P] : itertools::enumerate(P_rng)) uP(ip) = (dual ? chibar(q, P) : chi(q, P)) / n2;
+          for (auto [iQ, Q] : itertools::enumerate(Q_rng)) uQc(iQ) = std::conj((dual ? chibar(q, Q) : chi(q, Q)) / n2);
           for (auto [it, t] : itertools::enumerate(t_rng)) {
             ComplexType c = L(t);
             for (long ip = 0; ip < long(P_rng.size()); ++ip) {

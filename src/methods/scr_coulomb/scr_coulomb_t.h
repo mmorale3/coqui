@@ -549,10 +549,11 @@ namespace solvers {
     // the small-q eps_inf fit (report-only; npts = the smallest nonzero |q| used, >= 2)
     void set_eps_inf_fit(bool on, long npts = 3) { _eps_inf_fit = on; _eps_inf_fit_npts = std::max(npts, 2l); }
     bool eps_inf_fit() const { return _eps_inf_fit; }
-    // q = 0 Ward-identity leakage of Pi: "none" | "gamma" (subtract the G=G'=0 element of Pi(q = 0, tau) at every q)
+    // q = 0 Ward-identity leakage of Pi: "none" | "gamma" | "gamma_dual" (subtract the G=G'=0 element of Pi(q = 0, tau) at
+    // every q along u = chi/||chi||^2, resp. along the dual direction u = chibar/(chi^dag chibar))
     void set_q0_ward(std::string mode) {
-      utils::check(mode == "none" or mode == "gamma",
-                   "scr_coulomb_t: pol_q0_ward = \"{}\" is not one of \"none\", \"gamma\".", mode);
+      utils::check(mode == "none" or mode == "gamma" or mode == "gamma_dual",
+                   "scr_coulomb_t: pol_q0_ward = \"{}\" is not one of \"none\", \"gamma\", \"gamma_dual\".", mode);
       _q0_ward = mode;
     }
     std::string const& q0_ward() const { return _q0_ward; }
