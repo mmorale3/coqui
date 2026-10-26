@@ -2835,10 +2835,39 @@ namespace solvers {
         if (qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2) < 1e-12) iq_gamma = iq;
       }
       utils::check(iq_gamma >= 0, "dyson_W_from_Pi_tau: pol_q0_ward = \"w_sm\" needs q = 0 in the IBZ q list.");
-      auto head_wq = div_utils::head_from_prod_basis(dPi_wqPQ, thc);   // (nw, nq), all-reduced
-      nda::array<ComplexType, 1> hw(head_wq.shape(0));
-      for (long n = 0; n < hw.size(); ++n) hw(n) = head_wq(n, iq_gamma);
-      _q0_ward_hw = std::move(hw);
+      if constexpr (::nda::mem::on_host<local_Array_t>) {
+        auto head_wq = div_utils::head_from_prod_basis(dPi_wqPQ, thc);   // (nw, nq), all-reduced
+        nda::array<ComplexType, 1> hw(head_wq.shape(0));
+        for (long n = 0; n < hw.size(); ++n) hw(n) = head_wq(n, iq_gamma);
+        _q0_ward_hw = std::move(hw);
+      } else {
+        // device: only the Gamma column, h(n) = sum_PQ conj(chi(Gamma, P)) Pi(n, Gamma, P, Q) chi(Gamma, Q)
+        // (head_from_prod_basis's bar_basis = false contraction), y = Pi chi on the device per local i nu, then reduced
+        constexpr MEMORY_SPACE MEMW = ::nda::mem::on_host<local_Array_t> ? HOST_MEMORY : DEVICE_MEMORY;
+        const long nw_g = dPi_wqPQ.global_shape()[0];
+        auto [nw_l, nq_l, NP_l, NQ_l] = dPi_wqPQ.local_shape();
+        auto [w_o, q_o, P_o, Q_o] = dPi_wqPQ.origin();
+        nda::array<ComplexType, 1> hw(nw_g);
+        hw() = ComplexType(0.0);
+        if (iq_gamma >= q_o and iq_gamma < q_o + nq_l and NP_l > 0 and NQ_l > 0) {
+          auto chi = thc.basis_head();
+          nda::array<ComplexType, 2> cQ(NQ_l, 1);
+          for (long iQ = 0; iQ < NQ_l; ++iQ) cQ(iQ, 0) = chi(iq_gamma, Q_o + iQ);
+          auto cQd = memory::to_memory_space<MEMW>(cQ);
+          memory::array<MEMW, ComplexType, 2> Bd(NP_l, NQ_l), yd(NP_l, 1);
+          auto Ml = dPi_wqPQ.local();
+          for (long n = 0; n < nw_l; ++n) {
+            Bd = Ml(n, iq_gamma - q_o, nda::ellipsis{});
+            nda::blas::gemm(ComplexType(1.0), Bd, cQd, ComplexType(0.0), yd);
+            auto yh = memory::to_memory_space<HOST_MEMORY>(yd);
+            ComplexType s = 0.0;
+            for (long iP = 0; iP < NP_l; ++iP) s += std::conj(chi(iq_gamma, P_o + iP)) * yh(iP, 0);
+            hw(w_o + n) += s;
+          }
+        }
+        dPi_wqPQ.communicator()->all_reduce_in_place_n(hw.data(), hw.size(), std::plus<>{});
+        _q0_ward_hw = std::move(hw);
+      }
     }
 
     _Timer.start("TEMP_DWFP_dyson_W_in_place");
@@ -3017,7 +3046,7 @@ namespace solvers {
         // change of Pi in the aux basis (the G = 0 plane wave is not in the span of the aux functions), this changes the
         // plane-wave head of P only. Skipped at q = 0, where the G = 0 Coulomb component is absent.
         if (_q0_ward_hw.has_value()) {
-          if constexpr (MEM == HOST_MEMORY) {
+          {
             auto qv = thc.MF()->Qpts_ibz(iq);
             if (qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2) > 1e-12) {
               ComplexType h = _q0_ward_hw.value()(long(n) + long(w_origin));
@@ -3049,30 +3078,56 @@ namespace solvers {
               nda::array<ComplexType, 1> a(NP), r(NQ);
               a() = 0.0; r() = 0.0;
               // W = Z + dW on the local block: a_P = sum_Q W_PQ b_Q, r_Q = sum_P conj(b_P) W_PQ (partial, then reduced)
-              for (long iP = 0; iP < NP_loc; ++iP) {
-                long P = iP + P_origin;
-                for (long iQ = 0; iQ < NQ_loc; ++iQ) {
-                  long Q = iQ + Q_origin;
-                  ComplexType w = Z_PQ(iP, iQ) + Pi_PQ(iP, iQ);
-                  a(P) += w * std::conj(chibar(iq, Q));
-                  r(Q) += chibar(iq, P) * w;
+              if constexpr (MEM == HOST_MEMORY) {
+                for (long iP = 0; iP < NP_loc; ++iP) {
+                  long P = iP + P_origin;
+                  for (long iQ = 0; iQ < NQ_loc; ++iQ) {
+                    long Q = iQ + Q_origin;
+                    ComplexType w = Z_PQ(iP, iQ) + Pi_PQ(iP, iQ);
+                    a(P) += w * std::conj(chibar(iq, Q));
+                    r(Q) += chibar(iq, P) * w;
+                  }
                 }
+              } else if (NP_loc > 0 and NQ_loc > 0) {
+                // device: a = (Z + dW) b and r = b^dag (Z + dW) as gemms against the local slices of b
+                nda::array<ComplexType, 2> bQ(NQ_loc, 1), bP(1, NP_loc);
+                for (long iQ = 0; iQ < NQ_loc; ++iQ) bQ(iQ, 0) = std::conj(chibar(iq, iQ + Q_origin));
+                for (long iP = 0; iP < NP_loc; ++iP) bP(0, iP) = chibar(iq, iP + P_origin);
+                auto bQd = memory::to_memory_space<MEM>(bQ);
+                auto bPd = memory::to_memory_space<MEM>(bP);
+                memory::array<MEM, ComplexType, 2> ad(NP_loc, 1), rd(1, NQ_loc);
+                nda::blas::gemm(ComplexType(1.0), Z_PQ, bQd, ComplexType(0.0), ad);
+                nda::blas::gemm(ComplexType(1.0), Pi_PQ, bQd, ComplexType(1.0), ad);
+                nda::blas::gemm(ComplexType(1.0), bPd, Z_PQ, ComplexType(0.0), rd);
+                nda::blas::gemm(ComplexType(1.0), bPd, Pi_PQ, ComplexType(1.0), rd);
+                auto ah = memory::to_memory_space<HOST_MEMORY>(ad);
+                auto rh = memory::to_memory_space<HOST_MEMORY>(rd);
+                for (long iP = 0; iP < NP_loc; ++iP) a(iP + P_origin) = ah(iP, 0);
+                for (long iQ = 0; iQ < NQ_loc; ++iQ) r(iQ + Q_origin) = rh(0, iQ);
               }
               wq_intra_comm.all_reduce_in_place_n(a.data(), a.size(), std::plus<>{});
               wq_intra_comm.all_reduce_in_place_n(r.data(), r.size(), std::plus<>{});
               ComplexType W00 = 0.0;
               for (long P = 0; P < NP; ++P) W00 += chibar(iq, P) * a(P);
               ComplexType c = h / (ComplexType(1.0) + h * W00);
-              for (long iP = 0; iP < NP_loc; ++iP)
-                for (long iQ = 0; iQ < NQ_loc; ++iQ)
-                  Pi_PQ(iP, iQ) -= c * a(iP + P_origin) * r(iQ + Q_origin);
+              if constexpr (MEM == HOST_MEMORY) {
+                for (long iP = 0; iP < NP_loc; ++iP)
+                  for (long iQ = 0; iQ < NQ_loc; ++iQ)
+                    Pi_PQ(iP, iQ) -= c * a(iP + P_origin) * r(iQ + Q_origin);
+              } else if (NP_loc > 0 and NQ_loc > 0) {
+                // device: dW -= c a r^T as one rank-1 gemm
+                nda::array<ComplexType, 2> aP(NP_loc, 1), rQ(1, NQ_loc);
+                for (long iP = 0; iP < NP_loc; ++iP) aP(iP, 0) = a(iP + P_origin);
+                for (long iQ = 0; iQ < NQ_loc; ++iQ) rQ(0, iQ) = r(iQ + Q_origin);
+                auto aPd = memory::to_memory_space<MEM>(aP);
+                auto rQd = memory::to_memory_space<MEM>(rQ);
+                nda::blas::gemm(-c, aPd, rQd, ComplexType(1.0), Pi_PQ);
+              }
               if (long(n) + long(w_origin) == 0 and wq_intra_comm.root() and iq < 4)
                 app_log(1, "  [q0 ward w_sm] q {} (|q|^2 {:.4e}), i nu = 0: h = {:.6e}, W00 = {:.6e} -> {:.6e}",
                         iq, qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2), h.real(), W00.real(),
                         (W00 / (ComplexType(1.0) + h * W00)).real());
             }
-          } else {
-            utils::check(false, "dyson_W_in_place: pol_q0_ward = \"w_sm\" is host-only (CPU build).");
           }
         }
         _Timer.start("TEMP_DWiP_writeback");
