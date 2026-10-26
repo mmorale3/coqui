@@ -291,6 +291,72 @@ namespace bdft_tests {
   }
 
   /**
+   * The q = 0 Ward-identity leakage treatments of Pi (pol_q0_ward) under the SPIN-DOUBLING identity: plain scGW on the
+   * spin-doubled pyscf_si222 must reproduce the ns = 1 run to round-off. The treatments act on the total (spin-summed) Pi
+   * of the Dyson step, so a spin-resolved head or a missing spin factor would show up here.
+   */
+  TEST_CASE("gw_spin_doubling_q0_ward", "[methods][gw][spin]") {
+    namespace sd = spin_detail;
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::ir_basis, "high");
+
+    auto [src_dir, src_prefix] = utils::utest_filename("pyscf_si222");
+    const std::string dst_dir = "coqui_spin2_q0w_si222";
+    if (mpi_context->comm.root()) sd::make_spin_doubled_pyscf(src_dir, dst_dir);
+    mpi_context->comm.barrier();
+
+    auto mf1 = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "pyscf_si222"));
+    auto mf2 = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf::pyscf_source, dst_dir, src_prefix));
+    REQUIRE(mf2->nspin() == 2);
+    thc_reader_t thc1(mf1, make_thc_reader_ptree(mf1->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mf1->ecutrho(), 1, 1024));
+    thc_reader_t thc2(mf2, make_thc_reader_ptree(mf2->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mf2->ecutrho(), 1, 1024));
+    auto eri1 = mb_eri_t(thc1, thc1);
+    auto eri2 = mb_eri_t(thc2, thc2);
+
+    auto run = [&](std::string const &mode, std::shared_ptr<mf::MF> mf, auto &eri, std::string const &tag) {
+      const std::string out = "coqui_q0w_" + mode + "_" + tag;
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, "gygi", out);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "gygi");
+      scr_eri.set_q0_ward(mode);
+      simple_dyson dyson(mf.get(), &ft);
+      MBState mb_state(mpi_context, ft, out);
+      iter_scf::iter_scf_t iter_sol("damping");
+      sd::run_out r;
+      std::tie(r.e_hf, r.e_corr) = scf_loop(mb_state, dyson, eri, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                            2, false, 1e-9, true);
+      mpi_context->comm.barrier();
+      r.G = nda::array<cplx, 5>(mb_state.sG_tskij.value().local());
+      r.Sigma = nda::array<cplx, 5>(mb_state.sSigma_tskij.value().local());
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root())
+        for (auto const &e : std::filesystem::directory_iterator("."))
+          if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
+      mpi_context->comm.barrier();
+      return r;
+    };
+
+    const auto r0 = run("none", mf1, eri1, "ns1");
+    for (std::string mode : {std::string("gamma"), std::string("gamma_dual"), std::string("w_sm")}) {
+      auto r2 = run(mode, mf2, eri2, "ns2");
+      auto r1 = run(mode, mf1, eri1, "ns1");
+      auto [dG, sG] = sd::spin_block_diff(r2.G, r1.G);
+      auto [dS, sS] = sd::spin_block_diff(r2.Sigma, r1.Sigma);
+      app_log(1, "gw_spin_doubling_q0_ward [{}]: e_corr {:.12f} / {:.12f} (ns = 1 / ns = 2; {:.12f} without the treatment); "
+                 "max |G_s - G| = {:.3e} (|G| {:.3e}), max |Sigma_s - Sigma| = {:.3e} (|Sigma| {:.3e})", mode, r1.e_corr, r2.e_corr,
+              r0.e_corr, dG, sG, dS, sS);
+      REQUIRE(std::abs(r1.e_corr - r0.e_corr) > 1e-8 * std::abs(r0.e_corr));   // the treatment is active
+      REQUIRE(std::abs(r2.e_hf - r1.e_hf) < 1e-9 * std::abs(r1.e_hf));
+      REQUIRE(std::abs(r2.e_corr - r1.e_corr) < 1e-8 * std::abs(r1.e_corr));
+      REQUIRE(dG < 1e-9 * sG);
+      REQUIRE(dS < 1e-9 * sS);
+    }
+    mpi_context->comm.barrier();
+    if (mpi_context->comm.root()) std::filesystem::remove_all(dst_dir);
+    mpi_context->comm.barrier();
+  }
+
+  /**
    * A genuinely spin-polarized system (pyscf_li_222u, UHF, spin-dependent orbitals: nspin_in_basis = 2) through the
    * production P + Sigma chain of "vertex_spin_doubling": a SMOKE test of the spin-resolved secondary basis, the spin units
    * of the dynamic ladder and the per-spin pair Sigma -- finite energies, a finite stored vertex polarization, and spin
