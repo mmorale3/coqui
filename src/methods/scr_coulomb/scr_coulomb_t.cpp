@@ -401,6 +401,75 @@ namespace solvers {
     _Timer.stop("EVALUATE_PI");
     _Timer.stop("TEMP_UW_eval_Pi_qdep");
 
+    // pol_q0_ward = "gamma": the q = 0 Ward-identity leakage of the bubble.
+    // With a correlated G (Z < 1) the G=G'=0 element of Pi does not vanish at q = 0: L(tau) = head of Pi(Gamma, tau)
+    // = the q = 0 bubble sum_k Tr[G_k(tau) G_k(beta - tau)], which a non-interacting gapped G makes zero. It is
+    // q-independent at small q and adds 4 pi L / (Omega q^2) to eps_00(q): metallic screening as q -> 0, the source of
+    // the slow k convergence. It is removed at every q by the rank-1 update
+    //   Pi(t,q) -= L(t) u(q) u(q)^dag,   u(q) = chi(q) / ||chi(q)||^2   (chi = thc.basis_head(), the G = 0 components),
+    // which lowers the head chi^dag Pi chi by exactly L(t): the q -> 0 limit of the Ward-Takahashi vertex
+    // i nu Gamma(k; 0, i nu) = G^-1(k, iw + i nu) - G^-1(k, iw), for which the q = 0 bubble vanishes.
+    if (_q0_ward != "none") {
+      if constexpr (MEM == HOST_MEMORY) {
+        auto MF = thc.MF();
+        long nq = MF->nqpts_ibz();
+        long iq_gamma = -1, iq_min = -1;
+        double q2_min = 1e300;
+        for (long iq = 0; iq < nq; ++iq) {
+          auto qv = MF->Qpts_ibz(iq);
+          double q2 = qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2);
+          if (q2 < 1e-12) { if (iq_gamma < 0) iq_gamma = iq; }
+          else if (q2 < q2_min) { q2_min = q2; iq_min = iq; }
+        }
+        utils::check(iq_gamma >= 0, "update_w: pol_q0_ward = \"{}\" needs q = 0 in the IBZ q list.", _q0_ward);
+        auto head_tq = div_utils::head_from_prod_basis(dPi_tqPQ, thc);   // (nts, nq), all-reduced
+        auto [nts_g, nq_g, NP, NQ] = dPi_tqPQ.global_shape();
+        nda::array<ComplexType, 1> L(nts_g);
+        for (long t = 0; t < nts_g; ++t) L(t) = head_tq(t, iq_gamma);
+
+        auto chi = thc.basis_head();                                      // (nqpts_ibz, Np)
+        auto Pl = dPi_tqPQ.local();
+        auto t_rng = dPi_tqPQ.local_range(0);
+        auto q_rng = dPi_tqPQ.local_range(1);
+        auto P_rng = dPi_tqPQ.local_range(2);
+        auto Q_rng = dPi_tqPQ.local_range(3);
+        nda::array<ComplexType, 1> uP(P_rng.size()), uQc(Q_rng.size());
+        for (auto [iq, q] : itertools::enumerate(q_rng)) {
+          double n2 = 0.0;
+          for (long P = 0; P < NP; ++P) n2 += std::norm(chi(q, P));
+          if (n2 < 1e-300) continue;
+          for (auto [ip, P] : itertools::enumerate(P_rng)) uP(ip) = chi(q, P) / n2;
+          for (auto [iQ, Q] : itertools::enumerate(Q_rng)) uQc(iQ) = std::conj(chi(q, Q)) / n2;
+          for (auto [it, t] : itertools::enumerate(t_rng)) {
+            ComplexType c = L(t);
+            for (long ip = 0; ip < long(P_rng.size()); ++ip) {
+              ComplexType cu = c * uP(ip);
+              for (long iQ = 0; iQ < long(Q_rng.size()); ++iQ) Pl(it, iq, ip, iQ) -= cu * uQc(iQ);
+            }
+          }
+        }
+
+        // report: the leakage and the heads at Gamma and at the smallest nonzero q, before and after, at i nu = 0
+        auto head_after = div_utils::head_from_prod_basis(dPi_tqPQ, thc);
+        long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+        auto to_w0 = [&](auto const& h, long iq) {
+          nda::array<ComplexType, 2> ht(nts_g, 1), hw(nw_half, 1);
+          for (long t = 0; t < nts_g; ++t) ht(t, 0) = h(t, iq);
+          _ft->tau_to_w_PHsym(ht, hw);
+          return hw(0, 0).real();
+        };
+        double Lmax = 0.0;
+        for (long t = 0; t < nts_g; ++t) Lmax = std::max(Lmax, std::abs(L(t)));
+        app_log(1, "  [q0 ward] pol_q0_ward = {}: head of Pi(Gamma) removed at every q. L(i nu = 0) = {:.6e}, "
+                   "max_tau |L| = {:.4e}; head(Gamma, i nu = 0) {:.4e} -> {:.4e}; smallest |q| = {:.4f}: head {:.6e} -> {:.6e}",
+                _q0_ward, to_w0(head_tq, iq_gamma), Lmax, to_w0(head_tq, iq_gamma), to_w0(head_after, iq_gamma),
+                std::sqrt(q2_min), iq_min >= 0 ? to_w0(head_tq, iq_min) : 0.0,
+                iq_min >= 0 ? to_w0(head_after, iq_min) : 0.0);
+      } else {
+        utils::check(false, "update_w: pol_q0_ward = \"{}\" is host-only (CPU build).", _q0_ward);
+      }
+    }
+
     // evaluate screened interaction (dW_tqPQ) and reset polarizability (dPi_tqPQ)
     // a) dPi_tqPQ is reset during dyson_W_from_Pi_tau()
     // b) pgrid and bsize of dW_tqPQ are forced to be the same as in dPi_tqPQ

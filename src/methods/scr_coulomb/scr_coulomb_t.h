@@ -322,6 +322,8 @@ namespace solvers {
     // eps_M(q) on the _eps_inf_fit_npts smallest nonzero |q| next to the stored head (eval_eps_inf_fit).
     bool _eps_inf_fit = false;
     long _eps_inf_fit_npts = 3;
+    // [gw] pol_q0_ward (default "none"): removal of the q = 0 Ward-identity leakage of Pi (update_w).
+    std::string _q0_ward = "none";
     utils::TimerManager _Timer;
 
     // optional second-order-exchange vertex correction (not owned).
@@ -547,6 +549,13 @@ namespace solvers {
     // the small-q eps_inf fit (report-only; npts = the smallest nonzero |q| used, >= 2)
     void set_eps_inf_fit(bool on, long npts = 3) { _eps_inf_fit = on; _eps_inf_fit_npts = std::max(npts, 2l); }
     bool eps_inf_fit() const { return _eps_inf_fit; }
+    // q = 0 Ward-identity leakage of Pi: "none" | "gamma" (subtract the G=G'=0 element of Pi(q = 0, tau) at every q)
+    void set_q0_ward(std::string mode) {
+      utils::check(mode == "none" or mode == "gamma",
+                   "scr_coulomb_t: pol_q0_ward = \"{}\" is not one of \"none\", \"gamma\".", mode);
+      _q0_ward = mode;
+    }
+    std::string const& q0_ward() const { return _q0_ward; }
     long eps_inf_fit_npts() const { return _eps_inf_fit_npts; }
     std::string& screen_type() { return _screen_type; };
     std::string screen_type() const { return _screen_type; };
