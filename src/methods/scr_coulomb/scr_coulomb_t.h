@@ -327,9 +327,10 @@ namespace solvers {
     // "w_sm": the leakage h(i nu) = head of Pi(Gamma, i nu) on the global bosonic grid of the Dyson step (set in
     // dyson_W_from_Pi_tau, consumed by dyson_W_in_place, then reset)
     std::optional<nda::array<ComplexType, 1>> _q0_ward_hw;
-    // [gw] pol_q0_ward_q1 / pol_q0_ward_q2: the "w_sm" taper bounds in units of the inscribed BZ radius (q2 <= 0: off)
-    double _q0_ward_q1 = 0.0;
-    double _q0_ward_q2 = -1.0;
+    // [gw] pol_q0_ward_q1 / pol_q0_ward_q2 (default 0.3 / 1.0): the "w_sm" taper bounds in units of the inscribed BZ
+    // radius (q2 <= 0: off = h(Gamma) at every q)
+    double _q0_ward_q1 = 0.3;
+    double _q0_ward_q2 = 1.0;
     utils::TimerManager _Timer;
 
     // optional second-order-exchange vertex correction (not owned).
@@ -565,7 +566,7 @@ namespace solvers {
     }
     std::string const& q0_ward() const { return _q0_ward; }
     // "w_sm" taper: h(q) = f(|q|/r_in) h(Gamma), r_in = the inscribed Brillouin-zone radius; f = 1 below q1,
-    // a C2 smoothstep to 0 at q2, 0 beyond. q2 <= 0 (default): no taper, h applied at every q.
+    // a C2 smoothstep to 0 at q2, 0 beyond (default q1 = 0.3, q2 = 1.0). q2 <= 0: no taper, h applied at every q.
     void set_q0_ward_taper(double q1, double q2) {
       utils::check(q2 <= 0.0 or (q1 >= 0.0 and q1 < q2),
                    "scr_coulomb_t: pol_q0_ward_q1/q2 = {}/{} need 0 <= q1 < q2 (or q2 <= 0 for no taper).", q1, q2);
