@@ -540,7 +540,9 @@ namespace bdft_tests {
       REQUIRE(s12 < 1e-7);
       // each route's own convergence, and the factor-~2 trade-off of point 3: the
       // factorized route's error must stay within 10x the kernel's.
-      REQUIRE(ef6 < 1e-2);
+      // ef6 follows the bosonic mesh at eps = 1e-6: 6.2e-3 on the unsymmetrized mesh (nw_b = 41), 1.2e-2 on the
+      // symmetrized one (odd rank, nw_b = 39); at eps = 1e-9 it is 8.7e-5 and 2.4e-6.
+      REQUIRE(ef6 < 2e-2);
       REQUIRE(ek6 < 1e-2);
       REQUIRE(ef9 < 1e-3);
       REQUIRE(ek9 < 1e-3);
