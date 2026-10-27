@@ -687,7 +687,12 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     Timer.start("PHI_DYNAMICAL");
     std::optional<double> Phi_dynamical = 0.0;
     if (mb_solver.corr != nullptr) {
-      Phi_dynamical = mb_solver.corr->eval_phi_dynamical(sG_tskij.local(), mb_eri.corr_eri->get());
+      // gw_t evaluates its polarization in MEM, as its self-energy; gf2_t is host-only
+      if constexpr (std::is_same_v<corr_solver_t, solvers::gw_t>)
+        Phi_dynamical = mb_solver.corr->template eval_phi_dynamical<MEM>(sG_tskij.local(),
+                                                                         mb_eri.corr_eri->get());
+      else
+        Phi_dynamical = mb_solver.corr->eval_phi_dynamical(sG_tskij.local(), mb_eri.corr_eri->get());
     }
     Timer.stop("PHI_DYNAMICAL");
 

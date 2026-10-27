@@ -18,6 +18,7 @@
 namespace methods {
   namespace solvers {
 
+    template<MEMORY_SPACE MEM>
     double gw_t::thc_rpa_Xqindep(const nda::MemoryArrayOfRank<5> auto &G_tskij,
                                       THC_ERI auto &thc) {
       /** setup processor grids and block sizes for various intermediate objects **/
@@ -62,7 +63,19 @@ namespace methods {
       }
 
       scr_coulomb_t scr_eri(_ft, "rpa", _div_treatment);
-      auto dPi_tqPQ = scr_eri.eval_Pi_qdep(G_tskij, thc);
+      // Pi(tau) in MEM; the transform to the bosonic frequencies and the determinants below run
+      // on the host copy (one (nt, nq, Np, Np) transfer per evaluation)
+      auto dPi_tqPQ = [&]() {
+        if constexpr (MEM == HOST_MEMORY) {
+          return scr_eri.eval_Pi_qdep(G_tskij, thc);
+        } else {
+          auto dPi_dev = scr_eri.template eval_Pi_rpa_only<MEM>(G_tskij, thc);
+          auto dPi_host = math::nda::make_distributed_array<memory::array<HOST_MEMORY, ComplexType, 4>>(
+              *dPi_dev.communicator(), dPi_dev.grid(), dPi_dev.global_shape(), dPi_dev.block_size());
+          dPi_host.local() = nda::to_host(dPi_dev.local());
+          return dPi_host;
+        }
+      }();
       bool reset_Pi_t = true;
       auto dPi_wqPQ = scr_eri.tau_to_w(dPi_tqPQ, w_pgrid, w_bsize, reset_Pi_t);
       return thc_rpa_energy_all_impl(dPi_wqPQ, thc);

@@ -219,6 +219,18 @@ namespace solvers {
     auto eval_Pi_qdep(MBState &mb_state, THC_ERI auto &thc)
     -> memory::darray_t<memory::array<MEM, ComplexType, 4>, mpi3::communicator>;
 
+    /**
+     * RPA polarization of G_tskij by the R-space algorithm in the memory space MEM, without the
+     * vertex / cRPA / EDMFT terms of eval_Pi_qdep. The input of the RPA correlation energy
+     * (gw_t::rpa_energy) on the device path; requires screen_type = "rpa".
+     * @param G_tskij - [INPUT] Green's function in a primary basis: (nts, ns, nkpts_ibz, nbnd, nbnd)
+     * @param thc     - [INPUT] THC-ERI instance
+     * @return - Polarization function in k space: (nts, nqpts_ibz, Np, Np)
+     */
+    template<MEMORY_SPACE MEM = HOST_MEMORY>
+    auto eval_Pi_rpa_only(const nda::MemoryArrayOfRank<5> auto &G_tskij, THC_ERI auto &thc)
+    -> memory::darray_t<memory::array<MEM, ComplexType, 4>, mpi3::communicator>;
+
     // TODO function to return Pi(w) directly
 
     /**

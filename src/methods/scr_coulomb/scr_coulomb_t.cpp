@@ -3239,6 +3239,16 @@ namespace solvers {
   }
 
   template<MEMORY_SPACE MEM>
+  auto scr_coulomb_t::eval_Pi_rpa_only(const nda::MemoryArrayOfRank<5> auto &G_tskij, THC_ERI auto &thc)
+  -> memory::darray_t<memory::array<MEM, ComplexType, 4>, mpi3::communicator>
+  {
+    utils::check(_screen_type == "rpa",
+                 "scr_coulomb_t::eval_Pi_rpa_only: screen_type = \"rpa\" required, got \"{}\".",
+                 _screen_type);
+    return eval_Pi_rpa_Rspace<MEM>(G_tskij, thc);
+  }
+
+  template<MEMORY_SPACE MEM>
   auto scr_coulomb_t::eval_Pi_qdep(MBState &mb_state, THC_ERI auto &thc)
   -> memory::darray_t<memory::array<MEM, ComplexType, 4>, mpi3::communicator>
   {
@@ -4504,6 +4514,8 @@ namespace solvers {
 #if defined(ENABLE_DEVICE)
   template memory::darray_t<memory::array<DEVICE_MEMORY, ComplexType, 4>, mpi3::communicator>
   scr_coulomb_t::eval_Pi_qdep<DEVICE_MEMORY>(MBState&, thc_reader_t&);
+  template memory::darray_t<memory::array<DEVICE_MEMORY, ComplexType, 4>, mpi3::communicator>
+  scr_coulomb_t::eval_Pi_rpa_only<DEVICE_MEMORY>(const Arrv&, thc_reader_t&);
 #endif
 
 

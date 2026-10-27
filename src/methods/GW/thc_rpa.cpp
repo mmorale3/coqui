@@ -40,6 +40,7 @@
 
 namespace methods {
   namespace solvers {
+    template<MEMORY_SPACE MEM>
     double gw_t::rpa_energy(const nda::MemoryArrayOfRank<5> auto &G_tskij, THC_ERI auto &thc) {
       // http://patorjk.com/software/taag/#p=display&f=Calvin%20S&t=COQUI%20thc-rpa
       app_log(1, "\n"
@@ -72,7 +73,7 @@ namespace methods {
       }
 
       _Timer.start("TOTAL");
-      double e_rpa = thc_rpa_Xqindep(G_tskij, thc);
+      double e_rpa = thc_rpa_Xqindep<MEM>(G_tskij, thc);
       _Timer.stop("TOTAL");
 
       print_thc_rpa_timers();
@@ -85,9 +86,13 @@ namespace methods {
     using Arr = nda::array<ComplexType, 5>;
     using Arrv = nda::array_view<ComplexType, 5>;
     using Arrv2 = nda::array_view<ComplexType, 5, nda::C_layout>;
-    template double gw_t::rpa_energy(const Arr &, thc_reader_t &);
-    template double gw_t::rpa_energy(const Arrv &, thc_reader_t &);
-    template double gw_t::rpa_energy(const Arrv2 &, thc_reader_t &);
+    template double gw_t::rpa_energy<HOST_MEMORY>(const Arr &, thc_reader_t &);
+    template double gw_t::rpa_energy<HOST_MEMORY>(const Arrv &, thc_reader_t &);
+    template double gw_t::rpa_energy<HOST_MEMORY>(const Arrv2 &, thc_reader_t &);
+#if defined(ENABLE_DEVICE)
+    // the device scf_loop (eval_thermodynamics) passes the node-shared G view
+    template double gw_t::rpa_energy<DEVICE_MEMORY>(const Arrv &, thc_reader_t &);
+#endif
 
   }
 }

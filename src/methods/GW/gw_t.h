@@ -99,7 +99,10 @@ namespace methods {
        * @param G_tskij  - [INPUT] Green's function in primary basis: (nts, ns, nkpts_ibz, nbnd, nbnd)
        * @param thc      - [INPUT] THC-ERI object
        * @return - RPA correlation energy
+       * MEM selects the memory space of the polarization (scr_coulomb_t::eval_Pi_rpa_only); the
+       * imaginary-time transform and the determinants of (1 - Pi Z) stay on the host.
        */
+      template<MEMORY_SPACE MEM = HOST_MEMORY>
       double rpa_energy(const nda::MemoryArrayOfRank<5> auto &G_tskij, THC_ERI auto &thc);
 
       /**
@@ -152,8 +155,11 @@ namespace methods {
        * @param eri     - [INPUT] THC or Cholesky ERI object
        * @return - the dynamical part of Phi
        */
+      template<MEMORY_SPACE MEM = HOST_MEMORY>
       std::optional<double> eval_phi_dynamical(const nda::MemoryArrayOfRank<5> auto &G_tskij, auto &eri) {
-        return rpa_energy(G_tskij, eri);
+        // the device polarization exists for a THC ERI only, as the device scf_loop
+        if constexpr (MEM == HOST_MEMORY) return rpa_energy(G_tskij, eri);
+        else return rpa_energy<MEM>(G_tskij, eri);
       }
 
       template<nda::MemoryArray Array_3D_t>
@@ -252,6 +258,7 @@ namespace methods {
                                 THC_ERI auto &thc,
                                 const nda::array<ComplexType, 1> &eps_inv_head);
 
+      template<MEMORY_SPACE MEM>
       double thc_rpa_Xqindep(const nda::MemoryArrayOfRank<5> auto &G_tskij, THC_ERI auto &thc);
 
       /**
