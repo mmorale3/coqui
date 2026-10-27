@@ -40,6 +40,10 @@
 - The vertex in the linearized QSGW loop (`[lqsgw]`): the same pol-vertex keys as `[qpgw]` (the ladder in P,
   `pol_vertex*`, and the Sigma-side vertex, `pol_vertex_sigma`), and the external-G entry (`greens_func_source`).
   The quasiparticle maps `qp_map != "ac_pade"` refine the `qp_eqn` scheme and abort with `lqsgw`.
+- The quasiparticle loops (`evgw`, `qpgw`, `lqsgw`) run W and Sigma in the device memory space (as the Dyson loop), and
+  project Sigma_c onto its causal part before the quasiparticle reduction when a vertex adds to Sigma (the default rule
+  of the Dyson loop, `vertex_debug scf_causal_proj` overrides). The grand potential evaluates its RPA polarization on
+  the device in a device run.
 - `qp_gaps` reads the nested quasiparticle input (`qp_approx`, `[qp_gaps.qp_eqn]`, `[qp_gaps.lqp]`); the former flat
   keys `qp_type`, `ac_alg`, `qp_eta`, `qp_Nfit`, `qp_tol` abort with a pointer to the nested form.
 - `eval_thermodynamics = true` aborts when a vertex is attached (the Luttinger-Ward functional of the vertex-corrected

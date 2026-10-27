@@ -9,6 +9,8 @@
 #   - vertex in P:         pol_vertex = "ladder" + pol_vertex_inject (the ladder injected into P/W)
 #   - vertex in P + Sigma: in addition pol_vertex_sigma = "pair" (the pair-resolved ladder vertex in
 #                          Sigma; pol_vertex_sigma_pair_outer = "dynamic" for its dynamic form)
+# With a vertex in Sigma, Sigma_c is projected onto its causal part before the linearization (as in
+# the Dyson [gw] loop; vertex_debug = "scf_causal_proj=0" disables it): the fit needs 1 - B > 0.
 # Remove the [lqsgw] pol_vertex* lines for plain LQSGW.
 #
 [mean_field.qe]

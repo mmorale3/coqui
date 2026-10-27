@@ -44,6 +44,7 @@
 #include "methods/SCF/qp_maps_matsubara.hpp"
 #include "methods/SCF/qp_modea.hpp"
 #include "methods/SCF/wc_band_elements.hpp"
+#include "methods/SCF/sigma_causal_stage.hpp"
 
 namespace methods {
 
@@ -1522,6 +1523,20 @@ static void qp_eval_sigma(MBState &mb_state, solvers::mb_solver_t<corr_solver_t>
   }
 }
 
+/**
+ * The causal projection of the fresh Sigma_c, with the default rule of scf_loop
+ * (sigma_causal_stage::enabled: on when a vertex adds to Sigma, vertex_debug scf_causal_proj
+ * overrides), before the quasiparticle reduction of Sigma(iw). The stage is owned by qp_scf_loop
+ * (warm starts across iterations); nullptr (a direct caller outside the loop) skips it.
+ */
+template<MEMORY_SPACE MEM, typename eri_t, typename corr_solver_t>
+static void qp_causal_projection(sigma_causal_stage *causal, MBState &mb_state,
+                                 solvers::mb_solver_t<corr_solver_t> &mb_solver, eri_t &eri,
+                                 const imag_axes_ft::IAFT &FT, std::string const& caller) {
+  if (causal == nullptr or not sigma_causal_stage::enabled(mb_solver)) return;
+  causal->apply<MEM>(mb_state.sSigma_tskij.value(), eri.mpi(), FT, mb_solver.corr->iter(), caller);
+}
+
 // W of the previous update is available (host mirror or, on the device path, the device copy)
 static bool qp_has_w(MBState const& mb_state) {
 #if defined(ENABLE_DEVICE)
@@ -1545,7 +1560,8 @@ void add_evscf_vcorr(MBState &mb_state,
                      eri_t &eri,
                      const imag_axes_ft::IAFT &FT,
                      qp_context_t &qp_params, 
-                     bool fixed_w) {
+                     bool fixed_w,
+                     sigma_causal_stage *causal) {
   using math::shm::make_shared_array;
 
   auto mpi = eri.mpi();
@@ -1572,6 +1588,7 @@ void add_evscf_vcorr(MBState &mb_state,
     
     qp_eval_sigma<MEM>(mb_state, mb_solver, eri);
     FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
+    qp_causal_projection<MEM>(causal, mb_state, mb_solver, eri, FT, "add_evscf_vcorr");
     mpi->comm.barrier();
   }
 
@@ -2110,7 +2127,8 @@ void add_qpscf_vcorr(MBState &mb_state,
                      eri_t &eri,
                      const imag_axes_ft::IAFT &FT,
                      qp_context_t &qp_params,
-                     const sArray_t<Array_view_5D_t> *sG_ext) {
+                     const sArray_t<Array_view_5D_t> *sG_ext,
+                     sigma_causal_stage *causal) {
   using math::shm::make_shared_array;
 
   auto& sHeff_skij = mb_state.sHeff_skij.value();
@@ -2137,6 +2155,7 @@ void add_qpscf_vcorr(MBState &mb_state,
   qpt.start("QP_SIGMA");
   qp_eval_sigma<MEM>(mb_state, mb_solver, eri);
   FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
+  qp_causal_projection<MEM>(causal, mb_state, mb_solver, eri, FT, "add_qpscf_vcorr");
   qpt.stop("QP_SIGMA");
 
   // Build the mode-A evaluator context HERE -- this is the only
@@ -2168,7 +2187,8 @@ void add_qpscf_vcorr(MBState &mb_state,
 template<MEMORY_SPACE MEM, typename eri_t, typename corr_solver_t>
 void add_lqp_vcorr(MBState &mb_state, double mu, solvers::mb_solver_t<corr_solver_t> &mb_solver,
                    eri_t &eri, const imag_axes_ft::IAFT &FT, qp_context_t &qp_params,
-                   const sArray_t<Array_view_5D_t> *sG_ext) {
+                   const sArray_t<Array_view_5D_t> *sG_ext,
+                   sigma_causal_stage *causal) {
   using math::shm::make_shared_array;
 
   auto& sHeff_skij = mb_state.sHeff_skij.value();
@@ -2188,6 +2208,7 @@ void add_lqp_vcorr(MBState &mb_state, double mu, solvers::mb_solver_t<corr_solve
   // compute dynamic self-energy in the primary basis
   qp_eval_sigma<MEM>(mb_state, mb_solver, eri);
   FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
+  qp_causal_projection<MEM>(causal, mb_state, mb_solver, eri, FT, "add_lqp_vcorr");
   mpi->comm.barrier();
 
   // 2. per (s,k) in the MO basis
@@ -2425,20 +2446,20 @@ void write_mf_data(mf::MF &mf, const imag_axes_ft::IAFT &ft,
 
 template double update_mu(double, const mf::MF&, const sArray_t<Array_view_3D_t>&, double, double, std::string);
 
-template void add_evscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, bool);
-template void add_evscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, bool);
+template void add_evscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, bool, sigma_causal_stage*);
+template void add_evscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, bool, sigma_causal_stage*);
 
-template void add_qpscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
-template void add_qpscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
+template void add_qpscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*, sigma_causal_stage*);
+template void add_qpscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*, sigma_causal_stage*);
 
-template void add_lqp_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
-template void add_lqp_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
+template void add_lqp_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*, sigma_causal_stage*);
+template void add_lqp_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*, sigma_causal_stage*);
 // DEVICE_MEMORY only for a THC correlated ERI, the one with a device update_w / gw_t::evaluate
 // (as the scf_loop instantiations)
 #if defined(ENABLE_DEVICE)
-template void add_evscf_vcorr<DEVICE_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, bool);
-template void add_qpscf_vcorr<DEVICE_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
-template void add_lqp_vcorr<DEVICE_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
+template void add_evscf_vcorr<DEVICE_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, bool, sigma_causal_stage*);
+template void add_qpscf_vcorr<DEVICE_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*, sigma_causal_stage*);
+template void add_lqp_vcorr<DEVICE_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*, sigma_causal_stage*);
 #endif
 
 template double qp_eqn_linearized(double, analyt_cont::AC_t &, long, double, double, double);
