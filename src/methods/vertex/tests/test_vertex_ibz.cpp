@@ -831,7 +831,9 @@ namespace bdft_tests {
     SUCCEED("vertex_ibz_conservation_sym skipped: build has ENABLE_DLR=OFF.");
 #else
     auto& mpi_context = utils::make_unit_test_mpi_context();
-    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    // wmax = 12: on the symmetrized DLR mesh (odd rank) the residual at wmax = 6 is set by the mesh rather than by
+    // the kernel and D-matrix accuracy this bound tests
+    imag_axes_ft::IAFT ft(1000, 12.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_ibz_cons";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_sym"));
