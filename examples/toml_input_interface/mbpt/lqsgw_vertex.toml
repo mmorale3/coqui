@@ -1,0 +1,63 @@
+#
+# Linearized quasiparticle self-consistent GW (LQSGW) with the dynamical vertex.
+#
+# Every iteration screens W with the polarization of the current QP Green's function, builds the
+# dynamic Sigma(iw) and reduces it to the static QP Hamiltonian Z^1/2 (H0 + V_HF + A - mu) Z^1/2 + mu
+# from the low-frequency fit Sigma(iw) ~ A + iw B, Z = (1 - B)^-1 (no analytic continuation).
+#
+# The vertex keys are those of [qpgw] (and of the pol-vertex branch of [gw]):
+#   - vertex in P:         pol_vertex = "ladder" + pol_vertex_inject (the ladder injected into P/W)
+#   - vertex in P + Sigma: in addition pol_vertex_sigma = "pair" (the pair-resolved ladder vertex in
+#                          Sigma; pol_vertex_sigma_pair_outer = "dynamic" for its dynamic form)
+# Remove the [lqsgw] pol_vertex* lines for plain LQSGW.
+#
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "pwscf"
+outdir   = "qe_output_dir/OUT/"
+filetype = "h5"
+
+[interaction.thc]
+name            = "eri"
+mean_field      = "mf_qe"
+storage         = "incore"
+thresh          = 1e-5
+chol_block_size = 8
+r_blk           = 20
+distr_tol       = 0.4
+
+[lqsgw]
+interaction   = "eri"
+beta          = 1000
+niter         = 12
+conv_thr      = 1e-6
+outdir        = "./"
+prefix        = "lqsgw_vertex"
+div_treatment = "gygi"
+# ---- vertex in P: the ladder (BSE) polarization, dynamic rung ----
+pol_vertex               = "ladder"
+pol_vertex_kernel        = "w0_prev"
+pol_vertex_inject        = "ladder_n2"
+pol_vertex_band_window   = [0, 32]      # bands of the ladder window (or the vertex_wannier_file window)
+pol_vertex_isdf_rank     = 600
+pol_vertex_rung          = "dynamic"
+pol_vertex_dyn_tol       = 1e-8
+pol_vertex_dyn_rung_rank = 4
+# ---- vertex in Sigma (P + Sigma): drop these lines for the vertex in P only ----
+pol_vertex_sigma            = "pair"
+pol_vertex_sigma_pair_col   = "dyn1"
+pol_vertex_sigma_pair_outer = "dynamic"
+pol_vertex_sigma_pair_ibz   = true
+
+[lqsgw.lqp]
+n_fit     = 6                # lowest positive fermionic Matsubara frequencies in the fit window
+fit_order = -1               # -1: exactly-determined fit (recommended)
+
+[lqsgw.iaft]
+wmax  = 15.0
+basis = "dlr"
+prec  = "high"
+
+[lqsgw.iter_alg]
+alg    = "damping"
+mixing = 0.7
