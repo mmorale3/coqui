@@ -45,8 +45,8 @@ namespace methods {
 // The mode-A evaluator context is an opaque pointer here -- its
 // definition (methods/SCF/qp_modea.hpp) is only needed by the .cpp that builds and consumes it.
 namespace qp_modea { struct modea_ctx; }
-// the causal projection stage of the SCF loops (methods/SCF/sigma_causal_stage.hpp)
-class sigma_causal_stage;
+// the causality stages of the quasiparticle loop (methods/SCF/sigma_causal_stage.hpp)
+struct qp_causality_t;
 
 namespace detail {
 
@@ -426,7 +426,7 @@ void add_evscf_vcorr(MBState &mb_state,
                      const imag_axes_ft::IAFT &FT,
                      qp_context_t &qp_params, 
                      bool fixed_w=false,
-                     sigma_causal_stage *causal = nullptr);
+                     qp_causality_t *causal = nullptr);
 /**
  * Add correlated potential V_corr with static approximation to the effective quasiparticle Hamiltonian
  * The static approximation follows T. Kotani et. al., Phys. Rev. B 76, 165106 (2007) in which
@@ -456,7 +456,7 @@ void add_qpscf_vcorr(MBState &mb_state,
                      const imag_axes_ft::IAFT &FT,
                      qp_context_t &qp_params,
                      const sArray_t<Array_view_5D_t> *sG_ext = nullptr,
-                     sigma_causal_stage *causal = nullptr);
+                     qp_causality_t *causal = nullptr);
 
 /**
  * Linearized quasiparticle update of the QP Hamiltonian (qp_scf_mode == "qpscf", qp_approx == "lqp"):
@@ -488,7 +488,7 @@ template<MEMORY_SPACE MEM = HOST_MEMORY, typename eri_t, typename corr_solver_t>
 void add_lqp_vcorr(MBState &mb_state, double mu, solvers::mb_solver_t<corr_solver_t> &mb_solver,
                    eri_t &eri, const imag_axes_ft::IAFT &FT, qp_context_t &qp_params,
                    const sArray_t<Array_view_5D_t> *sG_ext = nullptr,
-                   sigma_causal_stage *causal = nullptr);
+                   qp_causality_t *causal = nullptr);
 
 template<typename function_t>
 double qp_eqn_linearized(double Vhf, function_t &Sigma, long I, double mu, double eps_ks, double eta = 0.0);

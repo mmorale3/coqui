@@ -203,6 +203,7 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   // CAUSAL PROJECTION of the fresh Sigma_c (sigma_causal_stage.hpp); one instance for the loop, which keeps the
   // projector and the per-(s, k) warm starts across iterations.
   sigma_causal_stage causal_stage;
+  causality_meter causality;
 
   // pol_vertex_sigma_dyn_final_full (the in-run nu-sampled dynamic Sigma vertex): the loop ends on an all-node Sigma pass. The
   // iteration niter allows last asks for one; when the convergence test passes earlier on a sampled pass, ONE more iteration
@@ -327,114 +328,10 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     mpi->comm.barrier();
     Timer.stop("HERMITIZE");
     Timer.stop("DYSON");
-    // CAUSALITY METER: a causal G has
-    // -G_ii(tau) >= 0 and a causal Sigma has Sigma_ii(tau) <= 0 on the band diagonal at every (tau, s, k). A too-small
-    // imaginary-axis window leaves a small NON-causal residue that a Dyson loop with semicore states can amplify
-    // geometrically (drift or divergence of the scf loop). Logged every iteration (level 2), at level 1 when the
-    // residue exceeds 1e-6 or grows by more than 3x per iteration. vertex_debug = "scf_causality_meter=0" disables it.
-    // the causality guard (scf_causality_abort = t > 0) needs the meter's numbers: the meter runs when either is on (the meter
-    // switch only controls its log lines); the abort itself waits until this iteration's checkpoint is written (below)
-    const bool causality_log = (vertex_debug::number("scf_causality_meter", 1.0) != 0.0);   // vertex_debug: scf_causality_meter = 0 disables the log
-    const double causality_abort = vertex_debug::number("scf_causality_abort", 0.0);       // vertex_debug: scf_causality_abort = t (Ha)
-    std::string causality_abort_msg;
-    if (causality_log or causality_abort > 0.0) {
-      double gmin = 1e300, smax = -1e300;
-      long nviol = 0;
-      if (mpi->node_comm.root()) {
-        auto G = sG_tskij.local();
-        auto S = sSigma_tskij.local();
-        const long nt = G.shape(0), ns = G.shape(1), nk = G.shape(2), nb = G.shape(3);
-        for (long is = 0; is < ns; ++is)
-          for (long ik = 0; ik < nk; ++ik)
-            for (long i = 0; i < nb; ++i) {
-              double gm = 1e300;
-              for (long it = 0; it < nt; ++it) {
-                gm = std::min(gm, -G(it, is, ik, i, i).real());
-                smax = std::max(smax, S(it, is, ik, i, i).real());
-              }
-              gmin = std::min(gmin, gm);
-              if (gm < -1e-6) ++nviol;
-            }
-      }
-      // MATRIX test: a causal G / Sigma_c has -X(tau) positive semidefinite at every (tau, s, k), not only non-negative
-      // diagonals: lambda_min of the Hermitian part of -X(tau, s, k), X = G and Sigma_c, with its tau node.
-      // vertex_debug scf_causality_matrix = 1 | 0 | auto (default: on while the eigenvalue work 2 nt ns nk nb^3 stays
-      // below ~2e10 operations; larger bases skip it).
-      double glam = 1e300, slam = 1e300;
-      long glam_t = -1, slam_t = -1;
-      bool mat_on = false;
-      {
-        auto G = sG_tskij.local();
-        const double nt_ = double(G.shape(0)), ns_ = double(G.shape(1)), nk_ = double(G.shape(2)), nb_ = double(G.shape(3));
-        const std::string mk = vertex_debug::text("scf_causality_matrix", "auto");
-        mat_on = (mk == "1") or (mk == "auto" and 2.0 * nt_ * ns_ * nk_ * nb_ * nb_ * nb_ < 2.0e10);
-      }
-      if (mat_on and mpi->node_comm.root()) {
-        auto G = sG_tskij.local();
-        auto S = sSigma_tskij.local();
-        const long nt = G.shape(0), ns = G.shape(1), nk = G.shape(2), nb = G.shape(3);
-        nda::matrix<ComplexType> Y(nb, nb);
-        for (long it = 0; it < nt; ++it)
-          for (long is = 0; is < ns; ++is)
-            for (long ik = 0; ik < nk; ++ik)
-              for (int which = 0; which < 2; ++which) {
-                for (long i = 0; i < nb; ++i)
-                  for (long j = 0; j < nb; ++j) {
-                    const ComplexType a = (which == 0) ? G(it, is, ik, i, j) : S(it, is, ik, i, j);
-                    const ComplexType b = (which == 0) ? G(it, is, ik, j, i) : S(it, is, ik, j, i);
-                    Y(i, j) = -0.5 * (a + std::conj(b));
-                  }
-                auto ev = nda::linalg::eigenvalues(Y);
-                double lm = 1e300;
-                for (auto const &v : ev) lm = std::min(lm, double(std::real(v)));
-                if (which == 0 and lm < glam) { glam = lm; glam_t = it; }
-                if (which == 1 and lm < slam) { slam = lm; slam_t = it; }
-              }
-      }
-      gmin = -mpi->comm.all_reduce_value(-gmin, boost::mpi3::max<>{});
-      smax = mpi->comm.all_reduce_value(smax, boost::mpi3::max<>{});
-      nviol = mpi->comm.all_reduce_value(nviol, std::plus<>{});
-      if (mat_on) {
-        glam = -mpi->comm.all_reduce_value(-glam, boost::mpi3::max<>{});
-        slam = -mpi->comm.all_reduce_value(-slam, boost::mpi3::max<>{});
-        glam_t = mpi->comm.all_reduce_value(glam_t, boost::mpi3::max<>{});   // node roots agree (the tables are node-shared)
-        slam_t = mpi->comm.all_reduce_value(slam_t, boost::mpi3::max<>{});
-      }
-      static double gmin_prev = 0.0, slam_prev = 0.0;
-      if (output_iter == output_iter_init) { gmin_prev = 0.0; slam_prev = 0.0; }   // a new scf loop in this process
-      const bool warn = (gmin < -1e-6) or (gmin_prev < 0.0 and gmin < 3.0 * gmin_prev) or
-                        (mat_on and slam < -1e-8 and (slam_prev >= 0.0 or slam < 3.0 * slam_prev));
-      if (causality_log)
-      app_log(warn ? 1 : 2, "  [causality] iteration {}: min(-G_ii(tau)) = {:.3e}, max(Sigma_ii(tau)) = {:.3e}, violators (min < -1e-6) = {}{}",
-              output_iter, gmin, smax, nviol,
-              warn ? "  <-- a non-causal residue is present or growing: check the imaginary-axis window (iaft wmax ~ 5 x the bandwidth)" : "");
-      if (mat_on and causality_log) {
-        auto tm = FT.tau_mesh();
-        // a growth factor only between two negative (non-causal) values; a sign change makes the ratio meaningless
-        auto growth = [](double v, double v_prev) {
-          if (not (v < 0.0 and v_prev < 0.0)) return std::string("n/a");
-          char buf[32];
-          std::snprintf(buf, sizeof(buf), "x%.2f", v / v_prev);
-          return std::string(buf);
-        };
-        app_log(warn ? 1 : 2, "  [causality] iteration {}: matrix test lambda_min(-G(tau,k)) = {:.3e} (tau node {}, mesh value {:+.4f}), "
-                              "lambda_min(-Sigma_c(tau,k)) = {:.3e} (tau node {}, {:+.4f}); growth vs the previous iteration: G {}, "
-                              "Sigma_c {}", output_iter, glam, glam_t, glam_t >= 0 ? double(tm(glam_t)) : 0.0, slam, slam_t,
-                slam_t >= 0 ? double(tm(slam_t)) : 0.0, growth(gmin, gmin_prev), growth(slam, slam_prev));
-      }
-      // Abort guard: vertex_debug scf_causality_abort = t > 0 stops the run when the non-causal residue of G (diagonal or
-      // matrix test) passes -t, instead of iterating a non-causal G that a Dyson loop can amplify into divergence.
-      if (causality_abort > 0.0) {
-        const double worst = mat_on ? std::min(gmin, glam) : gmin;
-        if (worst < -causality_abort)
-          causality_abort_msg = std::format("scf_loop: CAUSALITY GUARD (scf_causality_abort = {:.1e}) -- iteration {}: the non-causal "
-                                            "residue of G reached {:.3e} (Sigma_c matrix test {:.3e}); this iteration's checkpoint was "
-                                            "written. The imaginary-axis window is likely too small for the self-energy in use.",
-                                            causality_abort, output_iter, worst, mat_on ? slam : 0.0);
-      }
-      gmin_prev = gmin;
-      if (mat_on) slam_prev = slam;
-    }
+    // CAUSALITY METER and guard on G and Sigma_c (causality_meter, sigma_causal_stage.hpp); the abort itself waits until
+    // this iteration's checkpoint is written (below)
+    const std::string causality_abort_msg =
+        causality.measure(sG_tskij, sSigma_tskij, mpi, FT, output_iter, "scf_loop");
 
 
     Timer.start("ENERGY");
@@ -730,9 +627,10 @@ double qp_scf_loop(
       return energy_converged and std::abs(Heff_conv) <= std::abs(conv_tol);
     return energy_converged;
   };
-  // the causal projection of Sigma_c before the quasiparticle reduction, as in scf_loop
-  // (sigma_causal_stage.hpp: on when a vertex adds to Sigma); one instance for the warm starts
-  sigma_causal_stage causal_stage;
+  // the causality stages of scf_loop before the quasiparticle reduction (sigma_causal_stage.hpp): the
+  // projection of Sigma_c (on when a vertex adds to Sigma) and the causality meter / guard; one
+  // instance for the warm starts and the meter's history
+  qp_causality_t causal_stage;
   long it = init_it + 1;
   do {
     app_log(1, "\n** Iteration # {} **", it);
@@ -864,6 +762,8 @@ double qp_scf_loop(
     Timer.start("WRITE");
     mb_state.dump_qpscf(it, mu);
     Timer.stop("WRITE");
+    // the causality guard of this iteration's update (vertex_debug scf_causality_abort), after its checkpoint
+    utils::check(causal_stage.abort_msg.empty(), "{}", causal_stage.abort_msg);
 
     it++;
   } while(it<init_it+niter+1 and not converged());
