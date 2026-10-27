@@ -319,6 +319,9 @@ namespace bdft_tests {
       solvers::gw_t gw(&ft, "gygi", out);
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", "gygi");
       scr_eri.set_q0_ward(mode);
+      // the default w_sm taper (q1 = 0.3, q2 = 1.0) vanishes at every q != 0 of the 2x2x2 mesh (|q| >= r_in), which
+      // would leave "w_sm" inactive here: taper off (q2 <= 0)
+      scr_eri.set_q0_ward_taper(0.3, 0.0);
       simple_dyson dyson(mf.get(), &ft);
       MBState mb_state(mpi_context, ft, out);
       iter_scf::iter_scf_t iter_sol("damping");
