@@ -1220,6 +1220,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         .qp_eqn = {.solver = "sc", .ac_nfit = 18, .eta = M_PI/ft.beta(), 
                    .tol = conv_thr, .off_diag_mode = "fermi"},
     };
+    reject_flat_qp_keys(pt, {"qp_type", "ac_alg", "Nfit", "eta", "off_diag_mode"}, solver_type);
     read_qp_block(pt, qp_params);
     utils::check(qp_params.qp_approx == "qp_eqn",
                  "mbpt: solver_type = evgw requires qp_approx = qp_eqn; qp_approx = lqp is only "
@@ -1534,6 +1535,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
             .mu_tolerance = mu_tol, .mu_update_alg = mu_update_alg,
             .qp_eqn = {.solver = "sc", .ac_nfit = 18, .eta = M_PI/ft.beta(),
                        .tol = 1e-8, .off_diag_mode = "fermi"}};
+    reject_flat_qp_keys(pt, {"qp_type", "ac_alg", "Nfit", "eta", "off_diag_mode"}, solver_type);
     read_qp_block(pt, qp_params);
     if (lqsgw) {
       utils::check(qp_params.qp_approx == "lqp",
@@ -2261,6 +2263,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         .qp_eqn = {.solver = "sc", .ac_nfit = 18, .eta = M_PI/ft.beta(),
                    .tol = 1e-8, .off_diag_mode = "fermi"},
     };
+    reject_flat_qp_keys(pt, {"qp_type", "ac_alg", "Nfit", "eta", "off_diag_mode"}, solver_type);
     read_qp_block(pt, qp_params);
     utils::check(qp_params.qp_approx == "qp_eqn",
                  "mbpt: \"qpgw\" requires qp_approx = qp_eqn.");
@@ -2600,6 +2603,7 @@ void downfolding_1e(std::shared_ptr<mf::MF> mf, ptree const& pt) {
         .qp_eqn = {.solver = "sc", .ac_nfit = 30, .eta = M_PI/ft.beta(), 
                    .tol = 1e-8, .off_diag_mode = "qp_energy"},
     };
+    reject_flat_qp_keys(pt, {"qp_type", "ac_alg", "Nfit", "eta", "off_diag_mode"}, "downfold_1e");
     read_qp_block(pt, qp_params);
     utils::check(qp_params.qp_approx == "qp_eqn",
                  "mbpt: the quasiparticle embedding scheme requires qp_approx = qp_eqn; "
@@ -2929,6 +2933,7 @@ void gw_downfold(eri_t &eri, ptree &pt) {
       .qp_eqn = {.solver = "sc", .ac_nfit = 30, .eta = M_PI/ft.beta(), 
                  .tol = 1e-8, .off_diag_mode = "qp_energy"},
   };
+  reject_flat_qp_keys(pt, {"qp_type", "ac_alg", "Nfit", "eta", "off_diag_mode"}, "gw_downfold");
   read_qp_block(pt, qp_params);
   utils::check(qp_params.qp_approx == "qp_eqn",
                "mbpt: the quasiparticle embedding scheme requires qp_approx = qp_eqn; "

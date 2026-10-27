@@ -148,6 +148,7 @@ namespace methods {
                        .off_diag_mode = "fermi"},
             .lqp = {.n_fit = 6, .fit_order = -1, .symmetric_window = true,
                     .fit_resid_tol = 1e-8}};
+        reject_flat_qp_keys(pt, {"qp_type", "qp_eta", "qp_Nfit", "qp_tol"}, "band_interpolation");
         read_qp_block(pt, qp_params);
         return qp_params;
       };
@@ -223,13 +224,8 @@ namespace methods {
       mpi->comm.broadcast_n(buffer.data(), buffer.size(), 0);
       iteration = long(buffer[0]); beta = buffer[1];
       // The quasiparticle controls are read from the nested qp_approx / [qp_gaps.qp_eqn] /
-      // [qp_gaps.lqp] input, as in band_interpolation. The flat spellings this driver used to
-      // read would otherwise be ignored without notice, so they abort.
-      for (auto const* key : {"qp_type", "ac_alg", "qp_eta", "qp_Nfit", "qp_tol"})
-        utils::check(not pt.get_optional<std::string>(key),
-                     "qp_gaps: the flat key {} is no longer read. Use qp_approx = \"qp_eqn\" | \"lqp\" "
-                     "and the nested [qp_gaps.qp_eqn] block (solver, ac_alg, ac_nfit, eta, tol) or "
-                     "[qp_gaps.lqp] block (n_fit, fit_order, fit_resid_tol).", key);
+      // [qp_gaps.lqp] input, as in band_interpolation.
+      reject_flat_qp_keys(pt, {"qp_type", "ac_alg", "qp_eta", "qp_Nfit", "qp_tol"}, "qp_gaps");
       qp_context_t qp_params{
           .qp_approx = "qp_eqn",
           .qp_eqn = {.solver = "sc", .ac_nfit = 18, .eta = M_PI/beta, .tol = 1e-8,

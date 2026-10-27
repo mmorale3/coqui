@@ -22,6 +22,7 @@
 #ifndef COQUI_QP_PARAMS_UTILS_HPP
 #define COQUI_QP_PARAMS_UTILS_HPP
 
+#include <initializer_list>
 #include <string>
 
 #include "IO/ptree/ptree_utilities.hpp"
@@ -76,6 +77,25 @@ inline void read_qp_block(ptree const& pt, qp_context_t& defaults) {
   utils::check(qp_eqn.off_diag_mode == "fermi" or qp_eqn.off_diag_mode == "qp_energy",
                "read_qp_block: unknown qp_eqn.off_diag_mode {}. Valid options are \"fermi\" "
                "and \"qp_energy\".", qp_eqn.off_diag_mode);
+}
+
+/**
+ * Aborts if any of the flat quasiparticle keys that predate the nested [<block>.qp_eqn] block is
+ * present in `pt`. read_qp_block reads only the nested form; the Python entry points convert the
+ * flat spellings (coqui.utils.qp_input) before calling C++, but TOML input reaches the drivers
+ * unchanged, where a flat key would otherwise be dropped without notice.
+ *
+ * @param pt     - [INPUT] the block's subtree
+ * @param keys   - [INPUT] the flat spellings the call site used to accept
+ * @param caller - [INPUT] name of the input block, used in the message
+ */
+inline void reject_flat_qp_keys(ptree const& pt, std::initializer_list<char const*> keys,
+                                std::string const& caller) {
+  for (auto const* key : keys)
+    utils::check(not pt.get_optional<std::string>(key),
+                 "{}: the flat key {} is no longer read. Use qp_approx = \"qp_eqn\" | \"lqp\" and the "
+                 "nested [{}.qp_eqn] block (solver, ac_alg, ac_nfit, eta, tol, off_diag_mode) or "
+                 "[{}.lqp] block (n_fit, fit_order, fit_resid_tol).", caller, key, caller, caller);
 }
 
 } // methods

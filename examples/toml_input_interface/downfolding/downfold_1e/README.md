@@ -86,10 +86,12 @@ dc_type       = "gw"                     # double counting formula.
 # optional variable
 qp_selfenergy = true                     # quasiparticle embedding scheme or not. default = false
 force_real    = true                     # enforce the downfolded Hamiltonian to be real or not
-# qp qpprox. parameters (all optional)
+# qp approx. parameters (all optional)
+
+[downfold_1e.qp_eqn]
 ac_alg        = "pade"                   # analytical continuation algorithm. default = "pade"
 eta           = 1e-6                     # infinitesimal shift above the real axis
-Nfit          = 30                       # Number of poles to fit
+ac_nfit       = 30                       # Matsubara points fed to the continuation
 off_diag_mode = "qp_energy"              # QP schemes for off-diagonal self-energy: "qp_energy" or "fermi". 
                                          # default: "qp_energy" 
 ```
