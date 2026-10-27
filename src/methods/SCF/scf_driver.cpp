@@ -511,8 +511,13 @@ double qp_scf_loop(
              "║  ║ ║║═╬╗║ ║║  │─┼┐├─┘───└─┐│  ├┤ \n"
              "╚═╝╚═╝╚═╝╚╚═╝╩  └─┘└┴     └─┘└─┘└  \n");
   app_log(1, "  Maximum iteration number    = {}", niter);
-  utils::check(mb_solver.scr_eri == nullptr or not mb_solver.scr_eri->sigma_dyn_final_full(),
-               "qp_scf_loop: pol_vertex_sigma_dyn_final_full is implemented for the Dyson scf loop only.");
+  // keep_scr_coulomb_fixed skips update_w after the first iteration, and the Sigma vertex is built at the
+  // update_w tail and released by the self-energy that consumes it: later iterations would carry no vertex in Sigma
+  utils::check(not (qp_params.qp_scf_mode == "evscf" and qp_params.keep_scr_coulomb_fixed and
+                    mb_solver.scr_eri != nullptr and mb_solver.scr_eri->sigma_vertex_active()),
+               "qp_scf_loop: keep_scr_coulomb_fixed = true with a vertex in Sigma (pol_vertex_sigma) is not supported: the "
+               "Sigma vertex is rebuilt by every screening update, so only the first iteration would carry it. Set "
+               "keep_scr_coulomb_fixed = false or remove the Sigma vertex.");
   app_log(1, "  QP-SCF mode                 = {}", qp_params.qp_scf_mode);
   app_log(1, "  QP approximation            = {}", qp_params.qp_approx);
   app_log(1, "  Keep screened Coulomb fixed = {}", qp_params.keep_scr_coulomb_fixed);
@@ -631,9 +636,22 @@ double qp_scf_loop(
   // projection of Sigma_c (on when a vertex adds to Sigma) and the causality meter / guard; one
   // instance for the warm starts and the meter's history
   qp_causality_t causal_stage;
+  // pol_vertex_sigma_dyn_final_full (the in-run nu-sampled dynamic Sigma vertex), as in scf_loop: the loop ends on
+  // an all-node Sigma pass. The last iteration niter allows asks for one; when the convergence test passes earlier on
+  // a sampled pass, ONE more iteration runs with an all-node pass and the loop stops after it whatever its own
+  // convergence numbers. The quasiparticle Hamiltonian of that iteration is formed (and mixed) from the full Sigma.
+  const bool sigma_final_full = mb_solver.scr_eri != nullptr and mb_solver.scr_eri->sigma_dyn_final_full();
+  bool final_after_conv = false;   // this iteration is the all-node pass after a convergence on a sampled pass
+  bool stop = false;
   long it = init_it + 1;
   do {
     app_log(1, "\n** Iteration # {} **", it);
+    if (sigma_final_full and (final_after_conv or it == init_it + niter)) {
+      mb_solver.scr_eri->request_sigma_dyn_full_pass();
+      app_log(1, "  [qp-scf] pol_vertex_sigma_dyn_final_full: the dynamic Sigma vertex of this iteration solves every node ({}).",
+              final_after_conv ? "the convergence test passed on the previous, sampled pass; the loop stops after this iteration"
+                               : "the last iteration niter allows");
+    }
 
     Timer.start("MBPT_SOLVERS");
     if (mb_solver.hf != nullptr) { // HF
@@ -766,7 +784,18 @@ double qp_scf_loop(
     utils::check(causal_stage.abort_msg.empty(), "{}", causal_stage.abort_msg);
 
     it++;
-  } while(it<init_it+niter+1 and not converged());
+    if (final_after_conv) {
+      stop = true;
+    } else {
+      stop = (it >= init_it+niter+1) or converged();
+      if (stop and sigma_final_full and it < init_it+niter+1 and not mb_solver.scr_eri->sigma_dyn_last_pass_full()) {
+        app_log(1, "  [qp-scf] converged on a nu-SAMPLED dynamic Sigma pass: one more iteration with an all-node pass "
+                   "(pol_vertex_sigma_dyn_final_full); the loop stops after it.");
+        final_after_conv = true;
+        stop = false;
+      }
+    }
+  } while (not stop);
   Timer.stop("SCF_TOTAL");
 
   app_log(2, "\n  QP-SCF timers");
