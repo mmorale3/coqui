@@ -797,16 +797,17 @@ namespace bdft_tests {
 #else
     decltype(nda::range::all) all;
     auto& mpi_context = utils::make_unit_test_mpi_context();
-    // wmax = 10: the vertex kernels' composite tau-product intermediates need ~3x
+    // wmax = 12: the vertex kernels' composite tau-product intermediates need ~3x
     // headroom over the LiH spectral range (~1.2); wmax = 1.2 (the plain-GW choice)
     // destroys the dynamic-rung cancellations.
     // The DLR mesh is the symmetrized one (odd rank: one node fewer than the unsymmetrized mesh at the same eps).
     // At prec = "low" a vertex scGW iteration (the Pi^C / Sigma^C pair this identity needs) is unstable on it for wmax in [6, 8] (the non-causal
-    // residue of G grows ~1e4 per iteration) and stable for wmax = 5 and wmax >= 9, so wmax = 10 is used.
+    // residue of G grows ~1e4 per iteration) and stable for wmax = 5 and wmax >= 9; wmax = 12 is used (the conservation
+    // residuals there are 2e-6 and 3e-5, against 1e-4 and 1.3e-3 at wmax = 10).
     // the identity holds to the kernels' accuracy only with the auxiliary-node interpolation
     // pole fit (dlr_pole_fit_scheme); least squares leaves ~1e-4 here and ~4e-2 with the head
     imag_axes_ft::dlr_pole_fit_scheme_scope fit_scheme(imag_axes_ft::dlr_pole_fit_scheme::aux_interpolation);
-    imag_axes_ft::IAFT ft(1000, 10.0, imag_axes_ft::dlr_basis, "low");
+    imag_axes_ft::IAFT ft(1000, 12.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_conservation_smoke";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));

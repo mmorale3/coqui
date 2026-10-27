@@ -71,8 +71,8 @@ namespace bdft_tests {
     // like.
     // The DLR mesh is the symmetrized one (odd rank: one node fewer than the unsymmetrized mesh at the same eps).
     // At prec = "low" a two-iteration scGW with the vertex is unstable on it for wmax in [6, 8] (the non-causal
-    // residue of G grows ~1e4 per iteration) and stable for wmax = 5 and wmax >= 9, so wmax = 10 is used.
-    imag_axes_ft::IAFT ft(1000, 10.0, imag_axes_ft::dlr_basis, "low");
+    // residue of G grows ~1e4 per iteration) and stable for wmax = 5 and wmax >= 9; wmax = 12 is used.
+    imag_axes_ft::IAFT ft(1000, 12.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_static_e2e";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
