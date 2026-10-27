@@ -416,7 +416,7 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
  * @param fixed_w        - [INPUT] whether to keep the screened interactions fixed from mb_state. 
  *                         If false, the dynamically screened interaction will be updated at each iteration.
  */
-template<typename eri_t, typename corr_solver_t>
+template<MEMORY_SPACE MEM = HOST_MEMORY, typename eri_t, typename corr_solver_t>
 void add_evscf_vcorr(MBState &mb_state,
                      double mu,
                      solvers::mb_solver_t<corr_solver_t> &mb_solver,
@@ -445,7 +445,7 @@ void add_evscf_vcorr(MBState &mb_state,
  *                        the analytic QP G is used.
  * @return new qp energies in share memory sE_ska(ns, nkpts, nbnd)
  */
-template<typename eri_t, typename corr_solver_t>
+template<MEMORY_SPACE MEM = HOST_MEMORY, typename eri_t, typename corr_solver_t>
 void add_qpscf_vcorr(MBState &mb_state,
                      double mu,
                      solvers::mb_solver_t<corr_solver_t> &mb_solver,
@@ -480,7 +480,7 @@ void add_qpscf_vcorr(MBState &mb_state,
  *                    step 1 for W and Sigma (the re-QP-ization entry of qp_scf_loop, as in
  *                    add_qpscf_vcorr); nullptr builds G0 from the current QP spectrum.
  */
-template<typename eri_t, typename corr_solver_t>
+template<MEMORY_SPACE MEM = HOST_MEMORY, typename eri_t, typename corr_solver_t>
 void add_lqp_vcorr(MBState &mb_state, double mu, solvers::mb_solver_t<corr_solver_t> &mb_solver,
                    eri_t &eri, const imag_axes_ft::IAFT &FT, qp_context_t &qp_params,
                    const sArray_t<Array_view_5D_t> *sG_ext = nullptr);

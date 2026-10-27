@@ -719,7 +719,7 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
 }
 
 
-template<typename eri_t, typename corr_solver_t>
+template<MEMORY_SPACE MEM, typename eri_t, typename corr_solver_t>
 double qp_scf_loop(
   MBState &mb_state, 
   eri_t &mb_eri, 
@@ -792,6 +792,14 @@ double qp_scf_loop(
   app_log(1, "  Number of processors        = {} cores per node, {} nodes\n",
           mpi->node_comm.size(), mpi->internode_comm.size());
   FT.metadata_log();
+
+  // the shared device pool for the duration of the loop, as in scf_loop (inert unless
+  // COQUI_DEVICE_POOL_GB is set)
+  std::optional<utils::device_pool_guard> pool_guard;
+  if constexpr (MEM != HOST_MEMORY) {
+    if (std::size_t pool_bytes = utils::device_pool_size_from_env(); pool_bytes > 0)
+      pool_guard.emplace(pool_bytes, "qp-scf");
+  }
 
   Timer.start("SCF_TOTAL");
   mb_state.sHeff_skij.emplace(make_shared_array<Array_view_4D_t>(*mpi, {mf->nspin(), mf->nkpts_ibz(), mf->nbnd(), mf->nbnd()}));
@@ -930,18 +938,18 @@ double qp_scf_loop(
         // add_evscf_vcorr update two things in mb_state: 
         // 1. QP energies
         // 2. sHeff_skij with the updated QP energies while keeping sMO_skia the same.
-        add_evscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params, qp_params.keep_scr_coulomb_fixed);
+        add_evscf_vcorr<MEM>(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params, qp_params.keep_scr_coulomb_fixed);
       } else {
         // add_qpscf_vcorr / add_lqp_vcorr only update sHeff_skij (add_lqp_vcorr also stores the
         // pole weights). MO_skia and E_ska are updated later.
         // sG_ext is non-null in ITERATION 1 ONLY -- it is released right after, so
         // iterations >= 2 fall back to the loop's own analytic QP G.
         if (qp_params.qp_approx == "lqp") {
-          add_lqp_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params,
-                        sG_ext? std::addressof(sG_ext.value()) : nullptr);
+          add_lqp_vcorr<MEM>(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params,
+                             sG_ext? std::addressof(sG_ext.value()) : nullptr);
         } else {
-          add_qpscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params,
-                          sG_ext? std::addressof(sG_ext.value()) : nullptr);
+          add_qpscf_vcorr<MEM>(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params,
+                               sG_ext? std::addressof(sG_ext.value()) : nullptr);
         }
         sG_ext.reset();
       }
@@ -1121,9 +1129,9 @@ GF2_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
 #undef GF2_SCF_LOOP_INST
 
 
-#define QPSCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
+#define QPSCF_LOOP_INST_MEM(MEM, HF, HARTREE, EXCHANGE, CORR) \
 template double                                      \
-qp_scf_loop(MBState&,                         \
+qp_scf_loop<MEM>(MBState&,                         \
             mb_eri_t<HF, HARTREE, EXCHANGE, CORR>&,    \
             const imag_axes_ft::IAFT&,         \
             qp_context_t&, \
@@ -1131,7 +1139,18 @@ qp_scf_loop(MBState&,                         \
             iter_scf::iter_scf_t*, \
             int, bool, double, std::string, long);
 
-// All combinations of thc/chol for 4 eri slots
+#define QPSCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
+   QPSCF_LOOP_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+
+// DEVICE_MEMORY instantiation only when the corr ERI is THC, as for scf_loop
+#if defined(ENABLE_DEVICE)
+#  define QPSCF_LOOP_INST_DEV_THC(HF, HARTREE, EXCHANGE) \
+   QPSCF_LOOP_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, thc_reader_t)
+#else
+#  define QPSCF_LOOP_INST_DEV_THC(HF, HARTREE, EXCHANGE)
+#endif
+
+// All combinations of thc/chol for 4 eri slots (HOST)
 QPSCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, thc_reader_t)
 QPSCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, chol_reader_t)
 QPSCF_LOOP_INST(thc_reader_t, thc_reader_t, chol_reader_t, thc_reader_t)
@@ -1149,6 +1168,18 @@ QPSCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, chol_reader_t)
 QPSCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
 QPSCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
 
+// DEVICE instantiations only for CORR=thc_reader_t
+QPSCF_LOOP_INST_DEV_THC(thc_reader_t, thc_reader_t, thc_reader_t)
+QPSCF_LOOP_INST_DEV_THC(thc_reader_t, thc_reader_t, chol_reader_t)
+QPSCF_LOOP_INST_DEV_THC(thc_reader_t, chol_reader_t, thc_reader_t)
+QPSCF_LOOP_INST_DEV_THC(thc_reader_t, chol_reader_t, chol_reader_t)
+QPSCF_LOOP_INST_DEV_THC(chol_reader_t, thc_reader_t, thc_reader_t)
+QPSCF_LOOP_INST_DEV_THC(chol_reader_t, thc_reader_t, chol_reader_t)
+QPSCF_LOOP_INST_DEV_THC(chol_reader_t, chol_reader_t, thc_reader_t)
+QPSCF_LOOP_INST_DEV_THC(chol_reader_t, chol_reader_t, chol_reader_t)
+
 #undef QPSCF_LOOP_INST
+#undef QPSCF_LOOP_INST_DEV_THC
+#undef QPSCF_LOOP_INST_MEM
 
 }

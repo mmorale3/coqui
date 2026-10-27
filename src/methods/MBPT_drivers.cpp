@@ -1205,8 +1205,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // no self-energy is added, so only the chemical-potential controls matter
     qp_context_t qp_params{.mu_tolerance = mu_tol, .mu_update_alg = mu_update_alg,
                            .qp_eqn = {}, .lqp = {}};
-    qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf), iter_solver.get(),
-                niter, restart, conv_thr);
+    qp_scf_loop<SCF_MEM>(mb_state, eri, ft, qp_params, mb_solver_t(&hf), iter_solver.get(),
+                         niter, restart, conv_thr);
 
   } else if (solver_type == "evgw") {
 
@@ -1511,8 +1511,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     mbpt_vertex_audit::check_vertex_requests(pol_vertex_carrier, pt, "mbpt [" + solver_type + "]");
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     MBState mb_state(mpi, ft, output);
-    qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
-                niter, restart, conv_thr);
+    qp_scf_loop<SCF_MEM>(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
+                         niter, restart, conv_thr);
 
   } else if (solver_type == "qpgw" or solver_type == "lqsgw") {
 
@@ -1847,8 +1847,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  "qpgw: greens_func_source = \"{}\" is not supported. Valid options: "
                  "absent (the loop's own analytic QP G), \"scf\", \"embed\".", qp_gf_grp);
     MBState mb_state(mpi, ft, output);
-    qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
-                niter, restart, conv_thr, qp_gf_grp, qp_gf_iter);
+    qp_scf_loop<SCF_MEM>(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
+                         niter, restart, conv_thr, qp_gf_grp, qp_gf_iter);
 
   } else
     APP_ABORT("mbpt: Unknown solver type: {}",solver_type);
@@ -2570,8 +2570,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
       local_polarizabilities.reset();
     }
 
-    qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
-                niter, restart, conv_thr, qp_gf_grp, qp_gf_iter);
+    qp_scf_loop<SCF_MEM>(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
+                         niter, restart, conv_thr, qp_gf_grp, qp_gf_iter);
 
   } else
     APP_ABORT("mbpt: Unknown solver type: {}",solver_type);

@@ -67,7 +67,9 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
  * With mb_solver.corr == nullptr (HF) no self-energy is added and the axes are irrelevant.
  *
  * The template parameters allow for different types of self-energy solvers (e.g. HF, GW, GF2)
- * and different types of Coulomb Hamiltonian representations (e.g. THC, Cholesky).
+ * and different types of Coulomb Hamiltonian representations (e.g. THC, Cholesky). MEM selects
+ * the memory space of W and of the correlated self-energy (update_w / gw_t::evaluate), as in
+ * scf_loop; DEVICE_MEMORY needs a THC correlated ERI.
  * @param mb_state    - [INPUT/OUTPUT] many-body state; Heff, MO, E and Dm are (re)allocated here
  * @param mb_eri      - [INPUT] ERI bundle (Hartree-Fock and correlated parts)
  * @param FT          - [INPUT] imaginary-axis transform driver
@@ -87,7 +89,7 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
  * @param gf_iter     - [INPUT] iteration inside gf_grp; -1 = that group's "final_iter".
  * @return the total energy of the last iteration [Ha]
  */
-template<typename eri_t, typename corr_solver_t>
+template<MEMORY_SPACE MEM = HOST_MEMORY, typename eri_t, typename corr_solver_t>
 double qp_scf_loop(MBState &mb_state, eri_t &mb_eri, const imag_axes_ft::IAFT& FT,
                    qp_context_t &qp_params, solvers::mb_solver_t<corr_solver_t> mb_solver,
                    iter_scf::iter_scf_t *iter_solver = nullptr, int niter = 1,

@@ -1494,7 +1494,51 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
   comm->barrier();
 }
 
-template<typename eri_t, typename corr_solver_t>
+/**
+ * The W and Sigma stages of one quasiparticle update in the memory space MEM, as in scf_loop:
+ * scr_coulomb_t::update_w<MEM> and gw_t::evaluate<MEM>. On the device path W lives in
+ * mb_state.dW_qtPQ_dev; the host mirror mb_state.dW_qtPQ is requested only when a consumer
+ * of this update reads it, i.e. the real-axis maps qp_map = "mode_a" / "mode_b" (the W^c band
+ * elements of wc_band_elements.hpp).
+ */
+template<MEMORY_SPACE MEM, typename eri_t, typename corr_solver_t>
+static void qp_update_w(MBState &mb_state, solvers::mb_solver_t<corr_solver_t> &mb_solver,
+                        eri_t &eri, qp_context_t const& qp_params) {
+  if constexpr (MEM != HOST_MEMORY) {
+    if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") mb_state.keep_host_W = true;
+  }
+  mb_solver.scr_eri->template update_w<MEM>(mb_state, eri, mb_solver.corr->iter());
+}
+
+template<MEMORY_SPACE MEM, typename eri_t, typename corr_solver_t>
+static void qp_eval_sigma(MBState &mb_state, solvers::mb_solver_t<corr_solver_t> &mb_solver,
+                          eri_t &eri) {
+  // gw_t::evaluate is MEM-templated; the other correlated solvers are host-only
+  if constexpr (std::is_same_v<corr_solver_t, solvers::gw_t>) {
+    mb_solver.corr->template evaluate<MEM>(mb_state, eri);
+  } else {
+    static_assert(MEM == HOST_MEMORY, "qp_scf_common: only gw_t supports DEVICE_MEMORY");
+    mb_solver.corr->evaluate(mb_state, eri);
+  }
+}
+
+// W of the previous update is available (host mirror or, on the device path, the device copy)
+static bool qp_has_w(MBState const& mb_state) {
+#if defined(ENABLE_DEVICE)
+  if (mb_state.dW_qtPQ_dev.has_value()) return true;
+#endif
+  return mb_state.dW_qtPQ.has_value();
+}
+
+// releases W in both memory spaces
+static void qp_release_w(MBState &mb_state) {
+  mb_state.dW_qtPQ.reset();
+#if defined(ENABLE_DEVICE)
+  mb_state.dW_qtPQ_dev.reset();
+#endif
+}
+
+template<MEMORY_SPACE MEM, typename eri_t, typename corr_solver_t>
 void add_evscf_vcorr(MBState &mb_state,
                      double mu,
                      solvers::mb_solver_t<corr_solver_t> &mb_solver,
@@ -1521,12 +1565,12 @@ void add_evscf_vcorr(MBState &mb_state,
     FT.check_leakage(mb_state.sG_tskij.value(), imag_axes_ft::fermion, "Green's function");
     
     // update dyanmically screened interaction in mb_state if necessary.
-    if (not fixed_w or not mb_state.dW_qtPQ.has_value()) {
+    if (not fixed_w or not qp_has_w(mb_state)) {
       utils::check(mb_solver.scr_eri!=nullptr, "add_evscf_vcorr: mb_solver.scr_eri == nullptr when update_W is true.");
-      mb_solver.scr_eri->update_w(mb_state, eri, mb_solver.corr->iter());
+      qp_update_w<MEM>(mb_state, mb_solver, eri, qp_params);
     }
     
-    mb_solver.corr->evaluate(mb_state, eri);
+    qp_eval_sigma<MEM>(mb_state, mb_solver, eri);
     FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
     mpi->comm.barrier();
   }
@@ -1540,7 +1584,7 @@ void add_evscf_vcorr(MBState &mb_state,
 
   // deallocate dynamically screened interaction if it is not fixed for the next iteration.
   if (not fixed_w) {
-    mb_state.dW_qtPQ.reset();
+    qp_release_w(mb_state);
   }
 
   // Solve the QP equation to get new QP energies.
@@ -2059,7 +2103,7 @@ static void build_qp_G(MBState &mb_state, double mu, const imag_axes_ft::IAFT &F
   }
 }
 
-template<typename eri_t, typename corr_solver_t>
+template<MEMORY_SPACE MEM, typename eri_t, typename corr_solver_t>
 void add_qpscf_vcorr(MBState &mb_state,
                      double mu,
                      solvers::mb_solver_t<corr_solver_t> &mb_solver,
@@ -2086,12 +2130,12 @@ void add_qpscf_vcorr(MBState &mb_state,
   // compute screen interaction
   utils::check(mb_solver.scr_eri!=nullptr, "add_qpscf_vcorr: mb_solver.scr_eri == nullptr.");
   qpt.start("QP_SCR_COULOMB");
-  mb_solver.scr_eri->update_w(mb_state, eri, mb_solver.corr->iter());
+  qp_update_w<MEM>(mb_state, mb_solver, eri, qp_params);
   qpt.stop("QP_SCR_COULOMB");
 
   // compute dynamic self-energy in the primary basis
   qpt.start("QP_SIGMA");
-  mb_solver.corr->evaluate(mb_state, eri);
+  qp_eval_sigma<MEM>(mb_state, mb_solver, eri);
   FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
   qpt.stop("QP_SIGMA");
 
@@ -2121,7 +2165,7 @@ void add_qpscf_vcorr(MBState &mb_state,
 }
 
 
-template<typename eri_t, typename corr_solver_t>
+template<MEMORY_SPACE MEM, typename eri_t, typename corr_solver_t>
 void add_lqp_vcorr(MBState &mb_state, double mu, solvers::mb_solver_t<corr_solver_t> &mb_solver,
                    eri_t &eri, const imag_axes_ft::IAFT &FT, qp_context_t &qp_params,
                    const sArray_t<Array_view_5D_t> *sG_ext) {
@@ -2139,10 +2183,10 @@ void add_lqp_vcorr(MBState &mb_state, double mu, solvers::mb_solver_t<corr_solve
 
   // compute screen interaction
   utils::check(mb_solver.scr_eri != nullptr, "qp_scf_common.cpp::add_lqp_vcorr: mb_solver.scr_eri == nullptr.");
-  mb_solver.scr_eri->update_w(mb_state, eri, mb_solver.corr->iter());
+  qp_update_w<MEM>(mb_state, mb_solver, eri, qp_params);
   
   // compute dynamic self-energy in the primary basis
-  mb_solver.corr->evaluate(mb_state, eri);
+  qp_eval_sigma<MEM>(mb_state, mb_solver, eri);
   FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
   mpi->comm.barrier();
 
@@ -2381,14 +2425,21 @@ void write_mf_data(mf::MF &mf, const imag_axes_ft::IAFT &ft,
 
 template double update_mu(double, const mf::MF&, const sArray_t<Array_view_3D_t>&, double, double, std::string);
 
-template void add_evscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, bool);
-template void add_evscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, bool);
+template void add_evscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, bool);
+template void add_evscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, bool);
 
-template void add_qpscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
-template void add_qpscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
+template void add_qpscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
+template void add_qpscf_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
 
-template void add_lqp_vcorr(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
-template void add_lqp_vcorr(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
+template void add_lqp_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
+template void add_lqp_vcorr<HOST_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
+// DEVICE_MEMORY only for a THC correlated ERI, the one with a device update_w / gw_t::evaluate
+// (as the scf_loop instantiations)
+#if defined(ENABLE_DEVICE)
+template void add_evscf_vcorr<DEVICE_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, bool);
+template void add_qpscf_vcorr<DEVICE_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
+template void add_lqp_vcorr<DEVICE_MEMORY>(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_context_t&, const sArray_t<Array_view_5D_t>*);
+#endif
 
 template double qp_eqn_linearized(double, analyt_cont::AC_t &, long, double, double, double);
 template std::tuple<double,double> qp_eqn_bisection(double, analyt_cont::AC_t &, long, double, double, double, double);
