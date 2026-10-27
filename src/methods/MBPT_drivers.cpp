@@ -20,7 +20,9 @@
 
 
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 #include "configuration.hpp"
 #include "mpi3/environment.hpp"
@@ -295,6 +297,27 @@ namespace mbpt_vertex_audit {
     v.set_sigma_dyn_final_full(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_final_full",false));
     v.set_sigma_dyn_fit_cut(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_fit_cut_cst",1e-14),
                             io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_fit_cut_t",1e-14));
+  }
+
+  /** keys of the Dyson-loop blocks ([hf], [gw]) that the quasiparticle drivers (qphf, evgw, qpgw, lqsgw) do not
+   *  implement: a non-default value would be dropped, so it aborts. screen_type must be one of screen_types (the
+   *  projector-less quasiparticle drivers screen with "rpa" only). */
+  inline void check_qp_driver_keys(ptree const& pt, std::string const& driver,
+                                   std::vector<std::string> const& screen_types) {
+    utils::check(not io::get_value_with_default<bool>(pt, "const_mu", false),
+                 "{}: const_mu = true is not supported by the quasiparticle loop (mu is re-solved for every quasiparticle "
+                 "spectrum). Remove it.", driver);
+    utils::check(not io::get_value_with_default<bool>(pt, "eval_thermodynamics", false),
+                 "{}: eval_thermodynamics = true is implemented for the Dyson scf loop only (the grand potential of a "
+                 "static quasiparticle Hamiltonian is not defined there). Remove it.", driver);
+    utils::check(not io::get_value_with_default<bool>(pt, "dump_w_to_h5", false),
+                 "{}: dump_w_to_h5 = true is implemented for the Dyson [gw] driver only (the quasiparticle loop releases W "
+                 "after every update). Remove it.", driver);
+    auto st = io::get_value_with_default<std::string>(pt, "screen_type", screen_types.front());
+    io::tolower(st);
+    utils::check(std::find(screen_types.begin(), screen_types.end(), st) != screen_types.end(),
+                 "{}: screen_type = \"{}\" is not supported by this quasiparticle driver (valid: {}).", driver, st,
+                 [&] { std::string v; for (auto const &x : screen_types) v += (v.empty() ? "\"" : ", \"") + x + "\""; return v; }());
   }
 
 } // namespace mbpt_vertex_audit
@@ -1196,6 +1219,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
 
   } else if (solver_type == "qphf") {
 
+    mbpt_vertex_audit::check_qp_driver_keys(pt, "mbpt [qphf]", {"rpa"});
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
     } else {
@@ -1210,6 +1234,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
 
   } else if (solver_type == "evgw") {
 
+    mbpt_vertex_audit::check_qp_driver_keys(pt, "mbpt [evgw]", {"rpa"});
     // every quasiparticle default of this driver. 
     // [evgw.qp_eqn] input block overrides them in read_qp_block
     qp_context_t qp_params{
@@ -1525,6 +1550,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // (the ladder in P and the Sigma-side vertex, pol_vertex_*), the external-G entry and the
     // qp_scf_loop call, so a vertex request acts on lqsgw exactly as on qpgw.
     const bool lqsgw = (solver_type == "lqsgw");
+    mbpt_vertex_audit::check_qp_driver_keys(pt, "mbpt [" + solver_type + "]", {"rpa"});
     qp_context_t qp_params = lqsgw ?
         qp_context_t{
             .qp_approx = "lqp", .qp_scf_mode = "qpscf", .keep_scr_coulomb_fixed = false,
@@ -2251,6 +2277,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     // greens_func_source (below), when the qpgw stage runs inside the outer cycle.
     auto screen_type = io::get_value_with_default<std::string>(pt,"screen_type", "rpa");
     io::tolower(screen_type);
+    mbpt_vertex_audit::check_qp_driver_keys(pt, "mbpt [qpgw]", {"rpa", "gw_edmft"});
     utils::check(screen_type == "rpa" or screen_type == "gw_edmft",
                  "qpgw: screen_type = \"{}\" is not supported by the qpGW lattice stage. "
                  "Valid options: \"rpa\", \"gw_edmft\".", screen_type);
