@@ -556,10 +556,26 @@ double qp_scf_loop(
   // pseudopotential handler 
   auto psp = hamilt::make_pseudopot(*mf);
   long init_it = 0;
+  // A restart from a quasiparticle checkpoint keeps its stored mu: it is the chemical potential of the stored
+  // Heff_skij (update_mu at the end of that iteration), so the resumed iteration rebuilds exactly the G of the
+  // interrupted one -- which the input probes of the vertex checkpoints (the Sigma-vertex mid-iteration
+  // checkpoints and the reference pass) compare at the 1e-12 level. Re-solving mu from the stored value would
+  // move it within mu_tolerance. A Dyson checkpoint (F_skij) carries a mu of another spectrum: re-solved.
+  bool mu_from_qp_chkpt = false;
   if (!restart) {
     hamilt::set_fock(*mf, psp.get(), sHeff_skij, false);
   } else {
     init_it = chkpt::read_qpscf(mpi->node_comm, sHeff_skij, mu, mb_state.coqui_prefix);
+    int has_heff = 0;
+    if (mpi->comm.root()) {
+      utils::h5_quiesce();
+      h5::file file(mb_state.coqui_prefix + ".mbpt.h5", 'r');
+      has_heff = h5::group(file).open_group("scf/iter" + std::to_string(init_it)).has_dataset("Heff_skij") ? 1 : 0;
+    }
+    mpi->comm.broadcast_n(&has_heff, 1, 0);
+    mu_from_qp_chkpt = (has_heff == 1);
+    app_log(1, "  Restart from {}/scf/iter{} ({} checkpoint): mu = {:.12f}{}", mb_state.coqui_prefix + ".mbpt.h5", init_it,
+            mu_from_qp_chkpt ? "quasiparticle" : "Dyson", mu, mu_from_qp_chkpt ? " (kept)" : " (re-solved for the QP spectrum)");
   }
   
   auto sH0_skij = make_shared_array<Array_view_4D_t>(*mpi, {mf->nspin(), mf->nkpts_ibz(), mf->nbnd(), mf->nbnd()});
@@ -570,7 +586,8 @@ double qp_scf_loop(
   // Obtains MO coefficients and energies from the given mean-field object
   Timer.start("CANONICALIZATION");
   update_MOs(sMO_skia, sE_ska, sHeff_skij, sS_skij);
-  mu = update_mu(mu, *mf, sE_ska, FT.beta(), qp_params.mu_tolerance, qp_params.mu_update_alg);
+  if (not mu_from_qp_chkpt)
+    mu = update_mu(mu, *mf, sE_ska, FT.beta(), qp_params.mu_tolerance, qp_params.mu_update_alg);
   update_Dm(sDm_skij, sMO_skia, sE_ska, mu, FT.beta());
   Timer.stop("CANONICALIZATION");
 
