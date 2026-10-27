@@ -620,9 +620,12 @@ namespace bdft_tests {
     auto& mpi_context = utils::make_unit_test_mpi_context();
     // the conservation identities below hold to the kernels' accuracy with the auxiliary-node fit
     imag_axes_ft::dlr_pole_fit_scheme_scope fit_scheme(imag_axes_ft::dlr_pole_fit_scheme::aux_interpolation);
-    // wmax = 6.0: the headroom the vertex needs so that products of tau-objects (pair and
+    // wmax = 10: the headroom the vertex needs so that products of tau-objects (pair and
     // triple products) stay within the IAFT basis span
-    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    // The DLR mesh is the symmetrized one (odd rank: one node fewer than the unsymmetrized mesh at the same eps).
+    // At prec = "low" a two-iteration scGW with the vertex is unstable on it for wmax in [6, 8] (the non-causal
+    // residue of G grows ~1e4 per iteration) and stable for wmax = 5 and wmax >= 9, so wmax = 10 is used.
+    imag_axes_ft::IAFT ft(1000, 10.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_secisdf";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));

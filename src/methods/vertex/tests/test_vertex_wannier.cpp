@@ -208,7 +208,10 @@ namespace bdft_tests {
     // Anderson) that turns rounding-level differences of its input or its BLAS into ~1e-6 changes of e_hf / e_corr (two
     // identical runs differ by ~1e-12 after 10 iterations and ~1e-6 after its 6000), which would hide the identities below
     vertex_debug::set("scf_causal_proj=0");
-    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    // The DLR mesh is the symmetrized one (odd rank: one node fewer than the unsymmetrized mesh at the same eps).
+    // At prec = "low" a two-iteration scGW with the vertex is unstable on it for wmax in [6, 8] (the non-causal
+    // residue of G grows ~1e4 per iteration) and stable for wmax = 5 and wmax >= 9, so wmax = 10 is used.
+    imag_axes_ft::IAFT ft(1000, 10.0, imag_axes_ft::dlr_basis, "low");
 
     const long W0 = 1, M = 2, nW = 2;               // LiH-222 window [1,3), M = 2
     const nda::range window(W0, W0 + nW);
