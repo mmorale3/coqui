@@ -44,6 +44,12 @@
   project Sigma_c onto its causal part before the quasiparticle reduction when a vertex adds to Sigma (the default rule
   of the Dyson loop, `vertex_debug scf_causal_proj` overrides). The grand potential evaluates its RPA polarization on
   the device in a device run.
+- The quasiparticle loops honour `pol_vertex_sigma_dyn_final_full` (the loop ends on an all-node dynamic Sigma-vertex
+  pass, as the Dyson loop) and the `vertex_debug` causality meter and guard (`scf_causality_meter`, `_matrix`,
+  `_abort`). A restart from a quasiparticle checkpoint keeps its stored mu, so the resumed iteration reproduces the
+  interrupted one and the Sigma-vertex mid-iteration checkpoints are reused. `const_mu`, `eval_thermodynamics`,
+  `dump_w_to_h5` and a `screen_type` other than `"rpa"` abort in the quasiparticle drivers instead of being ignored;
+  `keep_scr_coulomb_fixed = true` with a vertex in Sigma aborts.
 - `qp_gaps` reads the nested quasiparticle input (`qp_approx`, `[qp_gaps.qp_eqn]`, `[qp_gaps.lqp]`); the former flat
   keys `qp_type`, `ac_alg`, `qp_eta`, `qp_Nfit`, `qp_tol` abort with a pointer to the nested form.
 - `eval_thermodynamics = true` aborts when a vertex is attached (the Luttinger-Ward functional of the vertex-corrected
