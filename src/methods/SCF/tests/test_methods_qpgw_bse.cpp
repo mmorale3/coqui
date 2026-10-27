@@ -221,8 +221,10 @@ namespace bdft_tests {
    * Leg (i)   knob ABSENT: the qpGW loop must still reproduce the stored reference. The
    *           tight check of that number is test_methods_qp_map_ab (which runs the same
    *           fixture/settings); here it is re-checked against the
-   *           stored ac_pade gap 11.8024 eV of qp_map_modea_lih222 at its own quoted
+   *           stored ac_pade gap 11.8148 eV of qp_map_modea_lih222 at its own quoted
    *           precision, so an edit to shared code that moves the loop cannot pass unnoticed.
+   *           (11.8024 eV before the cppdlr pin 7a0f60c: the new DLR mesh of this fixture, 53
+   *           tau / 54 Matsubara nodes instead of 52 / 52, moves the ac_nfit = 18 Pade input.)
    * Leg (ii)  pol_vertex_inject = "ladder_n2" with an EMPTY C window: the injection is a
    *           STRUCTURAL no-op (pol_vertex_active() false), so the run must be BITWISE
    *           identical to leg (i) -- the scgwt_noop pattern.
@@ -243,10 +245,10 @@ namespace bdft_tests {
 
     auto r0 = run_qpgw(mpi_context, mf, ft, "noop_a", "ac_pade", "none", "none",
                        nda::range(0, 0), 12, 1e-10, 20, 1e-6);
-    // (i) the stored reference (qp_map_modea_lih222: ac_pade 11.8024 eV)
-    app_log(1, "@@BSE_NOOP leg (i): gap = {:.6f} eV vs the stored ac_pade reference 11.8024 eV "
-               "(d = {:+.2e})", r0.gap_eV(), r0.gap_eV() - 11.8024);
-    REQUIRE(std::abs(r0.gap_eV() - 11.8024) < 1e-4);
+    // (i) the stored reference (qp_map_modea_lih222: ac_pade 11.8148 eV)
+    app_log(1, "@@BSE_NOOP leg (i): gap = {:.6f} eV vs the stored ac_pade reference 11.8148 eV "
+               "(d = {:+.2e})", r0.gap_eV(), r0.gap_eV() - 11.8148);
+    REQUIRE(std::abs(r0.gap_eV() - 11.8148) < 1e-4);
     REQUIRE(r0.eps_rpa == -1.0);        // no readout ran
     REQUIRE(r0.lam_nu0 == -1.0);        // ... and no injection
 
