@@ -23,7 +23,7 @@
 #include "methods/vertex/vertex_debug.hpp"
 #include <cstdlib>
 #include <filesystem>
-#include <cstdlib>
+#include <limits>
 #include <optional>
 #include <map>
 #include <format>
@@ -54,7 +54,7 @@ template<MEMORY_SPACE MEM,
 auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_axes_ft::IAFT& FT,
               solvers::mb_solver_t<corr_solver_t> mb_solver, iter_scf::iter_scf_t *iter_solver,
               int niter, bool restart, double conv_tol, bool const_mu,
-              std::string input_grp, int input_iter)
+              std::string input_grp, int input_iter, bool eval_thermodynamics)
               -> std::tuple<double, double> {
   utils::TimerManager Timer;
   auto mpi = mb_eri.corr_eri->get().mpi();
@@ -63,6 +63,14 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
                "SCF loop: mpi context of mb_state and mb_eri should be the same!");
   utils::check(&FT == mb_state.ft,
                "SCF loop: imag_axes_ft of mb_state and scf_loop should be the same!");
+  // The grand potential takes the dynamical Luttinger-Ward functional of the correlated solver
+  // (the RPA ring sum for gw_t). A vertex in P or Sigma makes the self-energy depart from that
+  // functional, so Omega would not belong to the computed solution.
+  utils::check(not eval_thermodynamics or mb_solver.scr_eri == nullptr or
+               mb_solver.scr_eri->vertex() == nullptr,
+               "scf_loop: eval_thermodynamics = true is not supported with a vertex correction "
+               "(the Luttinger-Ward functional of the vertex-corrected self-energy is not "
+               "implemented). Set eval_thermodynamics = false or remove the vertex input.");
   // HERMITIZE and ENERGY exist so the children sum to SCF_TOTAL: without them
   // part of the loop falls in the gap between the four phase timers.
   for( auto& v: {"SCF_TOTAL", "DYSON", "MBPT_SOLVERS", "ITERATIVE", "WRITE",
@@ -124,7 +132,7 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   }
   Timer.stop("WRITE");
 
-  double F_conv, Sigma_conv;
+  double F_conv = std::numeric_limits<double>::infinity(), Sigma_conv = F_conv;
   std::vector<double> energies(4, 0.0);
   std::vector<double> energies_diff(3, 0.0);
   auto converged = [&]() {
@@ -665,6 +673,47 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
           Timer.elapsed("SCF_TOTAL") - Timer.elapsed("DYSON") - Timer.elapsed("MBPT_SOLVERS")
           - Timer.elapsed("ITERATIVE") - Timer.elapsed("WRITE") - Timer.elapsed("ENERGY"));
 
+  if (eval_thermodynamics) {
+    for (auto &v: {"THERMODYNAMICS", "PHI_DYNAMICAL", "OTHERS"}) {
+      Timer.add(v);
+    }
+    Timer.start("THERMODYNAMICS");
+
+    // Obtain the dynamical part of the Luttinger-Ward functional Phi. 
+    // std::nullopt is returned when the phi functional is not implemented for 
+    // a given solver. In such case the grand potential is incomplete and the
+    // evaluation below is skipped. 
+    // A null corr solver (HF-only) has no dynamic self-energy, so Phi_dynamical = 0.
+    Timer.start("PHI_DYNAMICAL");
+    std::optional<double> Phi_dynamical = 0.0;
+    if (mb_solver.corr != nullptr) {
+      Phi_dynamical = mb_solver.corr->eval_phi_dynamical(sG_tskij.local(), mb_eri.corr_eri->get());
+    }
+    Timer.stop("PHI_DYNAMICAL");
+
+    // Evaluate the thermodynamic properties only when Phi_dynamical is available.
+    if (Phi_dynamical) {
+      Timer.start("OTHERS");
+      mb_state.thermodynamics = eval_thermodynamic_properties(mpi->comm, dyson, sF_skij, sSigma_tskij,
+                                                              energies, *Phi_dynamical, mu, false);
+      Timer.stop("OTHERS");
+      Timer.stop("THERMODYNAMICS");
+
+      app_log(2, "\n  Thermodynamic property evaluation timers");
+      app_log(2, "  ----------------");
+      app_log(2, "    Total:                 {0:.3f} sec", Timer.elapsed("THERMODYNAMICS"));
+      app_log(2, "    Dynamical part of Phi: {0:.3f} sec", Timer.elapsed("PHI_DYNAMICAL"));
+      app_log(2, "    Other properties:      {0:.3f} sec", Timer.elapsed("OTHERS"));
+      app_log(2, "\n");
+    } else {
+      Timer.stop("THERMODYNAMICS");
+      app_log(1, "\n[WARNING] scf_loop: thermodynamic-property (grand potential) evaluation "
+                 "is not yet supported for this correlated solver; skipping it. "
+                 "Set eval_thermodynamics = false to silence this message.\n");
+    }
+    
+  }
+
   app_log(1, "####### SCF routines end #######\n");
   return std::make_tuple(energies[0]+energies[1], energies[2]);
 }
@@ -675,7 +724,7 @@ double qp_scf_loop(
   MBState &mb_state, 
   eri_t &mb_eri, 
   const imag_axes_ft::IAFT& FT,
-  qp_params_t& qp_params, 
+  qp_context_t& qp_params, 
   solvers::mb_solver_t<corr_solver_t> mb_solver,
   iter_scf::iter_scf_t *iter_solver,
   int niter,
@@ -691,9 +740,25 @@ double qp_scf_loop(
   for( auto& v: {"SCF_TOTAL", "CANONICALIZATION", "MBPT_SOLVERS", "ITERATIVE", "WRITE"} ) {
     Timer.add(v);
   }
-  utils::check(qp_params.qp_type=="sc" or qp_params.qp_type=="sc_newton" or
-               qp_params.qp_type=="sc_bisection" or qp_params.qp_type=="linearized" or qp_params.qp_type=="spectral",
-               "qp_scf_loop: unknown qp_type {}: sc or linearized.", qp_params.qp_type);
+  // Two independent axes: qp_approx says how Sigma(iw) is reduced to a static QP Hamiltonian,
+  // qp_scf_mode says what the loop updates with it.
+  utils::check(qp_params.qp_approx == "qp_eqn" or qp_params.qp_approx == "lqp",
+               "scf_driver.cpp::qp_scf_loop: unknown qp_approx {}: qp_eqn or lqp.",
+               qp_params.qp_approx);
+  utils::check(qp_params.qp_scf_mode == "qpscf" or qp_params.qp_scf_mode == "evscf",
+               "scf_driver.cpp::qp_scf_loop: unknown qp_scf_mode {}: qpscf or evscf.",
+               qp_params.qp_scf_mode);
+  utils::check(not (qp_params.qp_scf_mode == "evscf" and qp_params.qp_approx == "lqp"),
+               "scf_driver.cpp::qp_scf_loop: qp_scf_mode = evscf with qp_approx = lqp is not "
+               "implemented. Use qp_scf_mode = qpscf (solver_type = lqsgw) for the linearized "
+               "scheme.");
+  if (qp_params.qp_approx == "qp_eqn") {
+    auto const& sol = qp_params.qp_eqn.solver;
+    utils::check(sol=="sc" or sol=="sc_newton" or sol=="sc_bisection" or
+                 sol=="linearized" or sol=="spectral",
+                 "scf_driver.cpp::qp_scf_loop: unknown qp_eqn.solver {}: sc, sc_bisection, "
+                 "sc_newton, spectral or linearized.", sol);
+  }
   // Re-quasiparticle-ization of an external Green's function. gf_grp empty (the default):
   // iteration 1 builds its own analytic QP G. When set ("scf"/"embed"), iteration 1 consumes
   // the EXTERNAL G of that checkpoint group for the HF density matrix (the Hartree term of
@@ -715,7 +780,8 @@ double qp_scf_loop(
   app_log(1, "  Maximum iteration number    = {}", niter);
   utils::check(mb_solver.scr_eri == nullptr or not mb_solver.scr_eri->sigma_dyn_final_full(),
                "qp_scf_loop: pol_vertex_sigma_dyn_final_full is implemented for the Dyson scf loop only.");
-  app_log(1, "  Eigenvalue scf only         = {}", qp_params.qp_scf_mode == "evscf");
+  app_log(1, "  QP-SCF mode                 = {}", qp_params.qp_scf_mode);
+  app_log(1, "  QP approximation            = {}", qp_params.qp_approx);
   app_log(1, "  Keep screened Coulomb fixed = {}", qp_params.keep_scr_coulomb_fixed);
   app_log(1, "  Convergence tolerance       = {}", conv_tol);
   app_log(1, "  Checkpoint HDF5             = {}", mb_state.coqui_prefix+".mbpt.h5");
@@ -732,6 +798,9 @@ double qp_scf_loop(
   mb_state.sDm_skij.emplace(make_shared_array<Array_view_4D_t>(*mpi, {mf->nspin(), mf->nkpts_ibz(), mf->nbnd(), mf->nbnd()}));
   mb_state.sMO_skia.emplace(make_shared_array<Array_view_4D_t>(*mpi, {mf->nspin(), mf->nkpts_ibz(), mf->nbnd(), mf->nbnd()}));
   mb_state.sE_ska.emplace(make_shared_array<Array_view_3D_t>(*mpi, {mf->nspin(), mf->nkpts_ibz(), mf->nbnd()}));
+  // pole weights are set only by add_lqp_vcorr: clear any left from an earlier run on this
+  // MBState, so dump_qpscf never writes another scheme's weights
+  mb_state.sZqp_ska.reset();
   auto& sHeff_skij = mb_state.sHeff_skij.value();
   auto& sDm_skij = mb_state.sDm_skij.value();
   auto& sMO_skia = mb_state.sMO_skia.value();
@@ -799,13 +868,24 @@ double qp_scf_loop(
   Timer.start("WRITE");
   if (!restart) {
     chkpt::write_metadata(mpi->comm, *mf, FT, sH0_skij, sS_skij, mb_state.coqui_prefix);
-    chkpt::dump_scf(mpi->comm, 0, sDm_skij, sHeff_skij, sMO_skia, sE_ska, mu, mb_state.coqui_prefix);
+    mb_state.dump_qpscf(0, mu);
   }
   Timer.stop("WRITE");
 
-  double Heff_conv;
+  double Heff_conv = std::numeric_limits<double>::infinity();
   double e_tot  = 0.0;
   double e_diff = 0.0;
+  // the energy contributions {non-interacting (H0), beyond H0} and their change per iteration
+  std::vector<double> energies(2, 0.0), energies_diff(2, 0.0);
+  // as in scf_loop: converged when every energy contribution has stopped changing and, 
+  // Heff as well (if iter_solver is present).  
+  auto converged = [&]() {
+    bool energy_converged = std::all_of(energies_diff.begin(), energies_diff.end(),
+                                        [conv_tol](double x) { return std::abs(x) < conv_tol; });
+    if (iter_solver != nullptr)
+      return energy_converged and std::abs(Heff_conv) <= std::abs(conv_tol);
+    return energy_converged;
+  };
   long it = init_it + 1;
   do {
     app_log(1, "\n** Iteration # {} **", it);
@@ -852,18 +932,25 @@ double qp_scf_loop(
         // 2. sHeff_skij with the updated QP energies while keeping sMO_skia the same.
         add_evscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params, qp_params.keep_scr_coulomb_fixed);
       } else {
-        // add_qpscf_vcorr only updates sHeff_skij. MO_skia and E_ska are updated later.
+        // add_qpscf_vcorr / add_lqp_vcorr only update sHeff_skij (add_lqp_vcorr also stores the
+        // pole weights). MO_skia and E_ska are updated later.
         // sG_ext is non-null in ITERATION 1 ONLY -- it is released right after, so
         // iterations >= 2 fall back to the loop's own analytic QP G.
-        add_qpscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params,
+        if (qp_params.qp_approx == "lqp") {
+          add_lqp_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params,
                         sG_ext? std::addressof(sG_ext.value()) : nullptr);
+        } else {
+          add_qpscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params,
+                          sG_ext? std::addressof(sG_ext.value()) : nullptr);
+        }
         sG_ext.reset();
       }
     }
     Timer.stop("MBPT_SOLVERS");
 
     Timer.start("ITERATIVE");
-    Heff_conv = solve_iterative(*mpi, *iter_solver, it, mb_state.coqui_prefix, sHeff_skij, sS_skij);
+    if (iter_solver != nullptr)
+      Heff_conv = solve_iterative(*mpi, *iter_solver, it, mb_state.coqui_prefix, sHeff_skij, sS_skij);
     Timer.stop("ITERATIVE");
 
     Timer.start("CANONICALIZATION");
@@ -876,15 +963,19 @@ double qp_scf_loop(
     Timer.stop("CANONICALIZATION");
 
     auto k_weight = mf->k_weight();
-    auto [e_1e, e_hf] = eval_hf_energy(sDm_skij, sHeff_skij, sH0_skij, k_weight, true);
-    e_diff = e_tot - (e_1e + e_hf);
-    e_tot  = e_1e + e_hf;
+    // e_beyond_h0 = 1/2 Tr[Dm (Heff - H0)]: the interaction energy of the static QP Hamiltonian
+    // (Hartree-Fock plus its static correlation potential), not a Hartree-Fock energy
+    auto [e_1e, e_beyond_h0] = eval_hf_energy(sDm_skij, sHeff_skij, sH0_skij, k_weight, true);
+    e_diff = e_tot - (e_1e + e_beyond_h0);
+    e_tot  = e_1e + e_beyond_h0;
+    energies_diff = {e_1e - energies[0], e_beyond_h0 - energies[1]};
+    energies = {e_1e, e_beyond_h0};
 
     // print energies and scf convergence
     app_log(1, "\nEnergy contributions");
     app_log(1, "--------------------");
     app_log(1, "  non-interacting (H0):           {} a.u.", e_1e);
-    app_log(1, "  beyond H0:                      {} a.u.", e_hf);
+    app_log(1, "  beyond H0:                      {} a.u.", e_beyond_h0);
     app_log(1, "  total energy:                   {} a.u.", e_tot);
     app_log(1, " ");
     app_log(1, "energy difference:                {} a.u.", e_diff);
@@ -923,11 +1014,11 @@ double qp_scf_loop(
     }
 
     Timer.start("WRITE");
-    chkpt::dump_scf(mpi->comm, it, sDm_skij, sHeff_skij, sMO_skia, sE_ska, mu, mb_state.coqui_prefix);
+    mb_state.dump_qpscf(it, mu);
     Timer.stop("WRITE");
 
     it++;
-  } while(it<init_it+niter+1 and std::abs(Heff_conv) > std::abs(conv_tol));
+  } while(it<init_it+niter+1 and not converged());
   Timer.stop("SCF_TOTAL");
 
   app_log(2, "\n  QP-SCF timers");
@@ -951,7 +1042,7 @@ scf_loop<MEM>(MBState&, simple_dyson&, \
          const imag_axes_ft::IAFT&, \
          solvers::mb_solver_t<solvers::gw_t>, \
          iter_scf::iter_scf_t*, \
-         int, bool, double, bool, std::string, int);
+         int, bool, double, bool, std::string, int, bool);
 
 #define GW_SCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
    GW_SCF_LOOP_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
@@ -1007,7 +1098,7 @@ scf_loop(MBState&, simple_dyson&, \
          const imag_axes_ft::IAFT&, \
          solvers::mb_solver_t<solvers::gf2_t>, \
          iter_scf::iter_scf_t*, \
-         int, bool, double, bool, std::string, int);
+         int, bool, double, bool, std::string, int, bool);
 
 // All combinations of thc/chol for 4 eri slots
 GF2_SCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, thc_reader_t)
@@ -1035,7 +1126,7 @@ template double                                      \
 qp_scf_loop(MBState&,                         \
             mb_eri_t<HF, HARTREE, EXCHANGE, CORR>&,    \
             const imag_axes_ft::IAFT&,         \
-            qp_params_t&, \
+            qp_context_t&, \
             solvers::mb_solver_t<solvers::gw_t>,       \
             iter_scf::iter_scf_t*, \
             int, bool, double, std::string, long);

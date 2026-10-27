@@ -19,38 +19,109 @@
  */
 
 
-#ifndef COQUI_QP_CONTEXT_H
-#define COQUI_QP_CONTEXT_H
+#ifndef COQUI_QP_CONTEXT_T_H
+#define COQUI_QP_CONTEXT_T_H
+
+#include <string>
+
+namespace methods::lqp {
+
+/**
+ * Controls of the linearized quasiparticle scheme (qp_approx = "lqp"): the low-frequency fit of
+ * Sigma(iw) and the pole-weight extraction, consumed by the kernel (linearized_qp.hpp, which
+ * includes this header rather than the reverse: the inputs must not depend on the kernel).
+ * Input block [<block>.lqp].
+ */
+struct params_t {
+  // Number of lowest positive fermionic Matsubara frequencies in the fit window. With
+  // symmetric_window the window is n = +/-1, +/-3, ..., +/-(2 n_fit - 1), i.e. 2 n_fit nodes.
+  int    n_fit            = 6;
+  // Highest power of (i w) in the polynomial; -1 means "#nodes - 1", the exactly-determined
+  // (interpolating) fit, which is the recommended setting.
+  int    fit_order        = -1;
+  // Use +/-w pairs. This makes the Hermiticity of the coefficients exact by construction and
+  // decouples the even/odd powers; turning it off is for diagnostics only.
+  bool   symmetric_window = true;
+  // Residual gate of an exactly-determined fit: the polynomial must reproduce the data to this
+  // relative accuracy, otherwise the design matrix has lost conditioning (too many nodes) and
+  // the coefficients are unreliable.
+  double fit_resid_tol    = 1e-8;
+};
+
+} // methods::lqp
+
+namespace methods::qp_eqn {
+
+/**
+ * Controls of the quasiparticle-equation schemes (qp_approx = "qp_eqn"): 
+ * the diagonal Sigma_aa(iw) is continued to the real axis and the scalar 
+ * quasiparticle equation is solved there. 
+ * Corresponding solvers are implemented in qp_solvers.hpp.
+ */
+struct params_t {
+  // Which scalar quasiparticle equation is solved on the real axis:
+  // - "sc" / "sc_bisection": bisection on w = eps + Re Sigma(w) ("sc" is an alias)
+  // - "sc_newton":           secant iteration on the same equation
+  // - "spectral":            peak of the spectral function on a scan of w
+  // - "linearized":          first-order Taylor expansion of Sigma(w) around eps_KS
+  //                          (a different approximation, not a cheaper solver)
+  std::string solver        = "sc";
+  // Analytic continuation algorithm passed to analyt_cont::AC_t.
+  std::string ac_alg        = "pade";
+  // Number of Matsubara points used by the continuation. Unrelated to lqp.n_fit, which counts
+  // the Matsubara nodes of the polynomial fit in the linearized scheme.
+  int         ac_nfit       = 18;
+  // Broadening [Ha] at which the continued Sigma(w + i*eta) is evaluated.
+  double      eta           = 1e-4;
+  // Convergence tolerance of the root finder ("sc*", "spectral").
+  double      tol           = 1e-8;
+  // Off-diagonal mode of T. Kotani et al., Phys. Rev. B 76, 165106 (2007):
+  // "fermi": evaluate off-diagonal elements of the self-energy at the Fermi level;
+  // "qp_energy": at the quasiparticle energy (the average of the two diagonal elements).
+  std::string off_diag_mode = "fermi";
+};
+
+} // methods::qp_eqn
 
 namespace methods {
 
-struct qp_params_t {
-  std::string qp_type = "sc";
-  std::string ac_alg = "pade";
-  int Nfit = 18;
-  double eta = 0.0001;
-  double tol = 1e-8;
+/**
+ * Inputs of every quasiparticle calculation, self-consistent or one-shot.
+ */
+struct qp_context_t {
+  // How the dynamic Sigma(iw) is reduced to a static quasiparticle Hamiltonian:
+  // - "qp_eqn": analytic continuation + the scalar quasiparticle equation on the real axis
+  //             (see qp_eqn for details controls)
+  // - "lqp":    matrix linearization Sigma(iw) ~ A + iw B on the Matsubara axis 
+  //             (see lqp for details controls)
+  std::string qp_approx   = "qp_eqn";
 
-  // SCF mode selector:
-  // - evscf: update only QP energies and keep QP wavefunctions fixed to mean-field ones.
-  // - qpscf: update both QP energies and QP wavefunctions.
+  // What does the self-consistent loop updates:
+  // - "evscf": QP energies only, QP wavefunctions stay at the mean-field ones
+  // - "qpscf": both QP energies and QP wavefunctions
   std::string qp_scf_mode = "qpscf";
 
-  // whether to update dynamically screened interaction W in evscf.
-  bool keep_scr_coulomb_fixed = false;
+  // Whether to update dynamically screened interaction W.
+  bool        keep_scr_coulomb_fixed = false;
 
-  // off-diagonal mode defined in T. Kotani et. al., Phys. Rev. B 76, 165106 (2007)
-  // "fermi": evaluate off-diagonal elements of self-energy at the Fermi level;
-  // "qp_energy": evaluate off-diagonal elements of self-energy at the quasiparticle energy
-  // (defined as the average of the two diagonal elements)
-  std::string off_diag_mode = "fermi";
-
-  double mu_tolerance = 1e-9;
+  // Tolerance for the chemical potential update.
+  double      mu_tolerance  = 1e-9;
   std::string mu_update_alg = "bisection";
 
+  // Scheme-specific controls, one namespace and one member per qp_approx choice.
+  qp_eqn::params_t qp_eqn;
+  lqp::params_t    lqp;
+
+  // ---- Quasiparticle maps of the qp_eqn scheme ----
+  // The members below refine qp_approx = "qp_eqn" only: they select how the static
+  // quasiparticle Hamiltonian is obtained from Sigma(iw) in place of the analytic continuation
+  // controlled by qp_eqn. qp_approx = "lqp" requires qp_map = "ac_pade" (the drivers abort
+  // otherwise). They are declared after qp_eqn and lqp so that the designated initializers of
+  // the drivers stay valid.
+  //
   // Quasiparticle-map selector.
-  // - "ac_pade":     Pade AC of Sigma(iw) evaluated near the real axis
-  //                  (solve_qp_eqn / qp_approx). DEFAULT.
+  // - "ac_pade":     analytic continuation of Sigma(iw) evaluated near the real axis
+  //                  (solve_qp_eqn / qp_approx, controlled by qp_eqn). DEFAULT.
   // - "mats_lin":    Matsubara-native omega ~ 0 linearization
   //                  (qp_maps_matsubara.hpp map (i)) -- no analytic continuation.
   // - "mats_gmatch": Matsubara-native variational Green's-function matching
@@ -68,9 +139,6 @@ struct qp_params_t {
   double qp_map_wpow = 2.0;
 
   // ---- qp_map = "mode_a" ----
-  // NOTE ON ORDER: qp_params_t is an aggregate and the drivers use parenthesized aggregate
-  // initialization positionally (MBPT_drivers.cpp), so new members must be APPENDED.
-  //
   // Sigma^c evaluator for mode_a:
   // - "cd":        the contour-deformation closed form (sigma_route_b::sigma_cd) fed by
   //                the state-resolved W^c band elements. Production default.
@@ -326,4 +394,4 @@ struct qp_params_t {
 
 } // methods
 
-#endif //COQUI_QP_CONTEXT_H
+#endif //COQUI_QP_CONTEXT_T_H

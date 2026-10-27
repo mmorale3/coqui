@@ -61,7 +61,7 @@
 #include "nda/tensor.hpp"
 #include "numerics/distributed_array/detail/concepts.hpp"
 #if defined(ENABLE_SLATE)
-#include "slate/slate.hh"
+#include "numerics/distributed_array/detail/slate_include.hpp"
 #endif
 #if defined(ENABLE_CUDA)
 #include "cuda_runtime.h"

@@ -1,13 +1,14 @@
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
-# qp_gaps fine-mesh Wannier interpolation: the coarse-mesh identity check of
-# pproc_t::interpolate_qp_bands_on_mesh (checkpoint-free, the lih222 projector) and the
+# test_pproc_qp_gaps.cpp: qp_gaps fine-mesh Wannier interpolation: the coarse-mesh identity
+# check of pproc_t::interpolate_qp_bands_on_mesh (checkpoint-free, the lih222 projector) and the
 # end-to-end qp_gaps driver with qp_gaps_interp = true on a short scGW checkpoint.
-# Links methods_lib: the driver needs the scf/gw/eri stack next to pproc_lib.
+# test_qp_approx.cpp: the qp_approx post-processing driver.
+# Links methods_lib: the drivers need the scf/gw/eri stack next to pproc_lib.
 set(TEST_ID methods_pproc)
 
-add_executable(test_${TEST_ID} test_pproc_qp_gaps.cpp)
+add_executable(test_${TEST_ID} test_pproc_qp_gaps.cpp test_qp_approx.cpp)
 target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield methods_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})

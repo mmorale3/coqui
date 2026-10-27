@@ -102,7 +102,9 @@ namespace bdft_tests {
       thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd()*thc_prefactor, "", "incore", "", output,
                                                  thc_tol, mf->ecutrho(), 1, 1024));
       auto eri = mb_eri_t(thc, thc);
-      qp_params_t qp_params("sc", "pade", 18, 0.0001, 1e-8, mode);
+      qp_context_t qp_params{.qp_scf_mode = mode,
+                             .qp_eqn = {.solver = "sc", .ac_alg = "pade", .ac_nfit = 18,
+                                        .eta = 0.0001, .tol = 1e-8}};
       qp_params.qp_map = map;
       qp_params.qp_modea_wfit = wfit;
       qp_params.qp_modea_eta = eta;

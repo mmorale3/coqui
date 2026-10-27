@@ -37,6 +37,7 @@
 #include "mean_field/mf_utils.hpp"
 #include "methods/ERI/mb_eri_context.h"
 #include "methods/mb_state/mb_state.hpp"
+#include "methods/SCF/qp/qp_params_utils.hpp"
 #include "methods/SCF/dca_dyson.h"
 #include "methods/SCF/simple_dyson.h"
 #include "methods/embedding/embed_t.h"
@@ -782,9 +783,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     MBState mb_state(mpi, ft, output);
     scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf),
              iter_solver.get(), niter, restart, conv_thr, const_mu,
-             greens_func_source, greens_func_iteration);
+             greens_func_source, greens_func_iteration, 
+             io::get_value_with_default<bool>(pt, "eval_thermodynamics", false));
 
   } else if(solver_type == "gw") {
+
     auto screen_type = io::get_value_with_default<std::string>(pt,"screen_type", "rpa");
 
     // optional second-order-exchange vertex correction
@@ -1099,7 +1102,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       MBState mb_state(ft, output, mf, wannier_file, trans_home_cell);
       scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
                     iter_solver.get(), niter, restart, conv_thr, const_mu,
-                    greens_func_source, greens_func_iteration);
+                    greens_func_source, greens_func_iteration,
+                    io::get_value_with_default<bool>(pt, "eval_thermodynamics", false));
 
       auto dump_w_to_h5 = io::get_value_with_default<bool>(pt,"dump_w_to_h5", false);
       if (dump_w_to_h5) {
@@ -1113,12 +1117,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
           math::nda::h5_write(grp, "W_qtPQ", W_qtPQ);
         }
       }
+
     } else {
 
       MBState mb_state(mpi, ft, output);
       scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
                     iter_solver.get(), niter, restart, conv_thr, const_mu,
-                    greens_func_source, greens_func_iteration);
+                    greens_func_source, greens_func_iteration,
+                    io::get_value_with_default<bool>(pt, "eval_thermodynamics", false));
 
       auto dump_w_to_h5 = io::get_value_with_default<bool>(pt,"dump_w_to_h5", false);
       if (dump_w_to_h5) {
@@ -1143,6 +1149,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     auto gf2_sosex_save_memory = io::get_value_with_default<bool>(pt,"gf2_sosex_save_memory",true);
     auto t_prescreen_thresh = io::get_value_with_default<double>(pt,"t_prescreen_thresh",0.0);
 
+    auto eval_thermodynamics = io::get_value_with_default<bool>(pt, "eval_thermodynamics", false);
+    if (eval_thermodynamics) {
+      utils::check(false, "thermodynamic-property (grand potential) evaluation is not yet supported for the GF2 solver.");
+    }
+
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
@@ -1159,7 +1170,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     if (gf2_direct_type == "gf2") {
       scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gf2),
                iter_solver.get(), niter, restart, conv_thr, const_mu,
-               greens_func_source, greens_func_iteration);
+               greens_func_source, greens_func_iteration, eval_thermodynamics);
     } else {
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", div_treatment);
       scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
@@ -1168,7 +1179,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                 io::get_value_with_default<double>(pt,"pol_q0_ward_q2",1.0));   // w_sm taper
       scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gf2, &scr_eri),
                iter_solver.get(), niter, restart, conv_thr, const_mu,
-               greens_func_source, greens_func_iteration);
+               greens_func_source, greens_func_iteration, eval_thermodynamics);
     }
 
   } else if(solver_type == "gw_dca") {
@@ -1191,21 +1202,28 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       iter_solver = nullptr;
     }
     MBState mb_state(mpi, ft, output);
-    qp_params_t qp_params;
-    qp_params.mu_tolerance = mu_tol;
-    qp_params.mu_update_alg = mu_update_alg;
+    // no self-energy is added, so only the chemical-potential controls matter
+    qp_context_t qp_params{.mu_tolerance = mu_tol, .mu_update_alg = mu_update_alg,
+                           .qp_eqn = {}, .lqp = {}};
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf), iter_solver.get(),
                 niter, restart, conv_thr);
 
   } else if (solver_type == "evgw") {
 
-    auto keep_scr_coulomb_fixed = io::get_value_with_default<bool>(pt,"keep_scr_coulomb_fixed", false);
-    auto qp_type = io::get_value_with_default<std::string>(pt,"qp_type","sc");
-    auto ac_alg  = io::get_value_with_default<std::string>(pt,"ac_alg","pade");
-    auto eta     = io::get_value_with_default<double>(pt,"eta", M_PI/ft.beta());
-    auto Nfit    = io::get_value_with_default<int>(pt,"Nfit",18);
-    io::tolower(ac_alg);
-    io::tolower(qp_type);
+    // every quasiparticle default of this driver. 
+    // [evgw.qp_eqn] input block overrides them in read_qp_block
+    qp_context_t qp_params{
+        .qp_approx = "qp_eqn", .qp_scf_mode = "evscf",
+        .keep_scr_coulomb_fixed =
+            io::get_value_with_default<bool>(pt, "keep_scr_coulomb_fixed", false),
+        .mu_tolerance = mu_tol, .mu_update_alg = mu_update_alg,
+        .qp_eqn = {.solver = "sc", .ac_nfit = 18, .eta = M_PI/ft.beta(), 
+                   .tol = conv_thr, .off_diag_mode = "fermi"},
+    };
+    read_qp_block(pt, qp_params);
+    utils::check(qp_params.qp_approx == "qp_eqn",
+                 "mbpt: solver_type = evgw requires qp_approx = qp_eqn; qp_approx = lqp is only "
+                 "implemented for qp_scf_mode = qpscf (solver_type = lqsgw).");
     auto qp_map = io::get_value_with_default<std::string>(pt,"qp_map","ac_pade");
     io::tolower(qp_map);
     utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
@@ -1213,8 +1231,6 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  "evgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
                  "\"mats_gmatch\", \"mode_a\", \"mode_b\".",
                  qp_map);
-    qp_params_t qp_params(qp_type, ac_alg, Nfit, eta, conv_thr, "evscf", keep_scr_coulomb_fixed,
-                          "fermi", mu_tol, mu_update_alg);
     qp_params.qp_map = qp_map;
     qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
     utils::check(qp_params.qp_map_wpow >= 0.0, "evgw: qp_map_wpow must be >= 0.");
@@ -1234,7 +1250,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check(qp_params.qp_modea_eta_far >= 0.0,
                  "evgw: qp_modea_eta_far must be >= 0 (0 = out-of-strip states are evaluated at mu).");
     // the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset = the
-    // E_PH-derived strip. See qp_params_t.h.
+    // E_PH-derived strip. See qp/qp_context_t.h.
     qp_params.qp_modea_strip_lo =
         io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
     qp_params.qp_modea_strip_hi =
@@ -1246,7 +1262,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  "evgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
                  "for an explicit window, both 0 for the E_PH strip).");
     // the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not the spacing; h is
-    // derived from an empirical error model (see qp_params_t.h). 0 = cache off.
+    // derived from an empirical error model (see qp/qp_context_t.h). 0 = cache off.
     qp_params.qp_tc_wgrid_mev =
         io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
     utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
@@ -1274,7 +1290,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  "evgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
                  "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
     // the tilted-contour route (qp_modea_wfit = "contour"), a SIBLING of the "spectral"
-    // knob family. Every value is documented on qp_params_t.h.
+    // knob family. Every value is documented on qp/qp_context_t.h.
     qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
     utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
                  "evgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
@@ -1498,16 +1514,35 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
                 niter, restart, conv_thr);
 
-  } else if (solver_type == "qpgw") {
+  } else if (solver_type == "qpgw" or solver_type == "lqsgw") {
 
-    auto ac_alg  = io::get_value_with_default<std::string>(pt,"ac_alg","pade");
-    auto eta     = io::get_value_with_default<double>(pt,"eta", M_PI/ft.beta());
-    auto Nfit    = io::get_value_with_default<int>(pt,"Nfit",18);
-    auto off_diag_mode = io::get_value_with_default<std::string>(pt,"off_diag_mode","fermi");
-    io::tolower(ac_alg);
-    io::tolower(off_diag_mode);
-    utils::check(off_diag_mode=="fermi" or off_diag_mode=="qp_energy",
-                 "unknown off_diag_mode: {}. Valid options are \"fermi\" and \"qp_energy\"");
+    // qpgw:  the quasiparticle equation on the real axis (qp_approx = "qp_eqn"); the
+    //        [qpgw.qp_eqn] input block overrides the defaults below in read_qp_block.
+    // lqsgw: the linearized QP self-consistent GW of Kutepov et al. 2017 (qp_approx = "lqp");
+    //        the [lqsgw.lqp] input block overrides the defaults below in read_qp_block.
+    // Both share everything else in this branch: the screening, the pol-vertex knob carrier
+    // (the ladder in P and the Sigma-side vertex, pol_vertex_*), the external-G entry and the
+    // qp_scf_loop call, so a vertex request acts on lqsgw exactly as on qpgw.
+    const bool lqsgw = (solver_type == "lqsgw");
+    qp_context_t qp_params = lqsgw ?
+        qp_context_t{
+            .qp_approx = "lqp", .qp_scf_mode = "qpscf", .keep_scr_coulomb_fixed = false,
+            .mu_tolerance = mu_tol, .mu_update_alg = mu_update_alg,
+            .lqp = {.n_fit = 6, .fit_order = -1, .symmetric_window = true, .fit_resid_tol = 1e-8}} :
+        qp_context_t{
+            .qp_approx = "qp_eqn", .qp_scf_mode = "qpscf", .keep_scr_coulomb_fixed = false,
+            .mu_tolerance = mu_tol, .mu_update_alg = mu_update_alg,
+            .qp_eqn = {.solver = "sc", .ac_nfit = 18, .eta = M_PI/ft.beta(),
+                       .tol = 1e-8, .off_diag_mode = "fermi"}};
+    read_qp_block(pt, qp_params);
+    if (lqsgw) {
+      utils::check(qp_params.qp_approx == "lqp",
+                   "mbpt: lqsgw fixes qp_approx = lqp; remove qp_approx = {} or use "
+                   "solver_type = qpgw.", qp_params.qp_approx);
+    } else {
+      utils::check(qp_params.qp_approx == "qp_eqn",
+                   "mbpt: \"qpgw\" requires qp_approx = qp_eqn.");
+    }
     auto qp_map = io::get_value_with_default<std::string>(pt,"qp_map","ac_pade");
     io::tolower(qp_map);
     utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
@@ -1515,8 +1550,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  "qpgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
                  "\"mats_gmatch\", \"mode_a\", \"mode_b\".",
                  qp_map);
-    qp_params_t qp_params("sc", ac_alg, Nfit, eta, 1e-8, "qpscf", false, off_diag_mode,
-                          mu_tol, mu_update_alg);
+    // the quasiparticle maps refine the qp_eqn scheme only; the linearized scheme has its own
+    // reduction of Sigma(iw) (add_lqp_vcorr) and would ignore them
+    utils::check(not lqsgw or qp_map == "ac_pade",
+                 "mbpt: qp_map = \"{}\" selects a map of the qp_eqn scheme and is not supported by "
+                 "lqsgw (qp_approx = lqp). Remove qp_map or use solver_type = qpgw.", qp_map);
     qp_params.qp_map = qp_map;
     qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
     utils::check(qp_params.qp_map_wpow >= 0.0, "qpgw: qp_map_wpow must be >= 0.");
@@ -1536,7 +1574,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check(qp_params.qp_modea_eta_far >= 0.0,
                  "qpgw: qp_modea_eta_far must be >= 0 (0 = out-of-strip states are evaluated at mu).");
     // the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset = the
-    // E_PH-derived strip. See qp_params_t.h.
+    // E_PH-derived strip. See qp/qp_context_t.h.
     qp_params.qp_modea_strip_lo =
         io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
     qp_params.qp_modea_strip_hi =
@@ -1548,7 +1586,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  "qpgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
                  "for an explicit window, both 0 for the E_PH strip).");
     // the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not the spacing; h is
-    // derived from an empirical error model (see qp_params_t.h). 0 = cache off.
+    // derived from an empirical error model (see qp/qp_context_t.h). 0 = cache off.
     qp_params.qp_tc_wgrid_mev =
         io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
     utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
@@ -1576,7 +1614,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
                  "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
     // the tilted-contour route (qp_modea_wfit = "contour"), a SIBLING of the "spectral"
-    // knob family. Every value is documented on qp_params_t.h.
+    // knob family. Every value is documented on qp/qp_context_t.h.
     qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
     utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
                  "qpgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
@@ -2196,7 +2234,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
 
     scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
                   iter_solver.get(), niter, restart, conv_thr, const_mu,
-                  greens_func_source, greens_func_iteration);
+                  greens_func_source, greens_func_iteration,
+                  io::get_value_with_default<bool>(pt, "eval_thermodynamics", false));
 
   } else if (solver_type == "qpgw") {
 
@@ -2214,14 +2253,17 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                  "qpgw: screen_type = \"{}\" is not supported by the qpGW lattice stage. "
                  "Valid options: \"rpa\", \"gw_edmft\".", screen_type);
 
-    auto ac_alg  = io::get_value_with_default<std::string>(pt,"ac_alg","pade");
-    auto eta     = io::get_value_with_default<double>(pt,"eta", M_PI/ft.beta());
-    auto Nfit    = io::get_value_with_default<int>(pt,"Nfit",18);
-    auto off_diag_mode = io::get_value_with_default<std::string>(pt,"off_diag_mode","fermi");
-    io::tolower(ac_alg);
-    io::tolower(off_diag_mode);
-    utils::check(off_diag_mode=="fermi" or off_diag_mode=="qp_energy",
-                 "unknown off_diag_mode: {}. Valid options are \"fermi\" and \"qp_energy\"");
+    // every quasiparticle default of this driver
+    // [qpgw.qp_eqn] input block overrides them in read_qp_block
+    qp_context_t qp_params{
+        .qp_approx = "qp_eqn", .qp_scf_mode = "qpscf", .keep_scr_coulomb_fixed = false,
+        .mu_tolerance = mu_tol, .mu_update_alg = mu_update_alg,
+        .qp_eqn = {.solver = "sc", .ac_nfit = 18, .eta = M_PI/ft.beta(),
+                   .tol = 1e-8, .off_diag_mode = "fermi"},
+    };
+    read_qp_block(pt, qp_params);
+    utils::check(qp_params.qp_approx == "qp_eqn",
+                 "mbpt: \"qpgw\" requires qp_approx = qp_eqn.");
     auto qp_map = io::get_value_with_default<std::string>(pt,"qp_map","ac_pade");
     io::tolower(qp_map);
     utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
@@ -2229,8 +2271,6 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                  "qpgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
                  "\"mats_gmatch\", \"mode_a\", \"mode_b\".",
                  qp_map);
-    qp_params_t qp_params("sc", ac_alg, Nfit, eta, 1e-8, "qpscf", false, off_diag_mode,
-                          mu_tol, mu_update_alg);
     qp_params.qp_map = qp_map;
     qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
     utils::check(qp_params.qp_map_wpow >= 0.0, "qpgw: qp_map_wpow must be >= 0.");
@@ -2250,7 +2290,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     utils::check(qp_params.qp_modea_eta_far >= 0.0,
                  "qpgw: qp_modea_eta_far must be >= 0 (0 = out-of-strip states are evaluated at mu).");
     // the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset = the
-    // E_PH-derived strip. See qp_params_t.h.
+    // E_PH-derived strip. See qp/qp_context_t.h.
     qp_params.qp_modea_strip_lo =
         io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
     qp_params.qp_modea_strip_hi =
@@ -2262,7 +2302,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                  "qpgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
                  "for an explicit window, both 0 for the E_PH strip).");
     // the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not the spacing; h is
-    // derived from an empirical error model (see qp_params_t.h). 0 = cache off.
+    // derived from an empirical error model (see qp/qp_context_t.h). 0 = cache off.
     qp_params.qp_tc_wgrid_mev =
         io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
     utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
@@ -2290,7 +2330,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                  "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
                  "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
     // the tilted-contour route (qp_modea_wfit = "contour"), a SIBLING of the "spectral"
-    // knob family. Every value is documented on qp_params_t.h.
+    // knob family. Every value is documented on qp/qp_context_t.h.
     qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
     utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
                  "qpgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
@@ -2553,16 +2593,17 @@ void downfolding_1e(std::shared_ptr<mf::MF> mf, ptree const& pt) {
   MBState mb_state(ft, outdir+"/"+prefix, mf, wannier_file, trans_home_cell, false);
 
   if (qp_selfenergy) {
-    auto ac_alg  = io::get_value_with_default<std::string>(pt,"ac_alg","pade");
-    auto off_diag_mode = io::get_value_with_default<std::string>(pt,"off_diag_mode","qp_energy");
-    io::tolower(ac_alg);
-    io::tolower(off_diag_mode);
-    utils::check(off_diag_mode=="fermi" or off_diag_mode=="qp_energy",
-                 "unknown off_diag_mode: {}. Valid options are \"fermi\" and \"qp_energy\"");
-    qp_params_t qp_params("sc", ac_alg,
-                io::get_value_with_default<int>(pt,"Nfit",30),
-                io::get_value_with_default<double>(pt,"eta", M_PI/ft.beta()),
-                1e-8, "qpscf", false, off_diag_mode);
+    // Quasiparticle default of the downfolding drivers
+    // The [<block>.qp_eqn] input block overrides them in read_qp_block
+    qp_context_t qp_params{
+        .qp_approx = "qp_eqn",
+        .qp_eqn = {.solver = "sc", .ac_nfit = 30, .eta = M_PI/ft.beta(), 
+                   .tol = 1e-8, .off_diag_mode = "qp_energy"},
+    };
+    read_qp_block(pt, qp_params);
+    utils::check(qp_params.qp_approx == "qp_eqn",
+                 "mbpt: the quasiparticle embedding scheme requires qp_approx = qp_eqn; "
+                 "qp_approx = lqp is not implemented for downfolding.");
     embed.downfolding(mb_state, pt, &qp_params);
   } else {
     embed.downfolding(mb_state, pt);
@@ -2832,11 +2873,13 @@ void hf_downfold(eri_t &eri, ptree const& pt) {
  *  - force_real: false. If true, forces the 2-electron interaction tensor to be real. 
  *  - factorization_type: "cholesky", Type of factorization. {choices: "none", "cholesky", "cholesky_high_memory", "choleksy_from_4index", "thc"}
  *  - thresh: 1e-6. Threshold used if factorization is requested.
- *  Parameters used by quasiparticle algorithm:
- *  - ac_alg: Algorithm for analytic continuation, default:pade {choices: pade}
- *  - eta: Smearing parameter: default:1e-6
- *  - Nfit: Number of terms in AC fit, default: 30
- *  - off_diag_mode: Off diagonal treatment, default: qp_energy. {choices: fermi, qp_energy} 
+ *  Quasiparticle approximation, in the nested block [<block>.qp_eqn] (read by read_qp_block):
+ *  - solver: scalar QP-equation solver, default: sc
+ *  - ac_alg: analytic continuation, default: pade {choices: pade}
+ *  - ac_nfit: number of terms in the AC fit, default: 30
+ *  - eta: broadening [Ha], default: pi/beta
+ *  - tol: tolerance of the QP-equation solver, default: 1e-8
+ *  - off_diag_mode: off-diagonal treatment, default: qp_energy {choices: fermi, qp_energy}
  */
 template<typename eri_t>
 void gw_downfold(eri_t &eri, ptree &pt) {
@@ -2879,17 +2922,17 @@ void gw_downfold(eri_t &eri, ptree &pt) {
                              io::get_value_with_default<double>(pt, "thresh", 1e-6));
 
   // one body hamiltonian
-  auto ac_alg  = io::get_value_with_default<std::string>(pt,"ac_alg","pade");
-  auto off_diag_mode = io::get_value_with_default<std::string>(pt,"off_diag_mode","qp_energy");
-  io::tolower(ac_alg);
-  io::tolower(off_diag_mode);
-  utils::check(off_diag_mode=="fermi" or off_diag_mode=="qp_energy",
-               "unknown off_diag_mode: {}. Valid options are \"fermi\" and \"qp_energy\"");
-  qp_params_t qp_params(
-      "sc", ac_alg,
-      io::get_value_with_default<int>(pt,"Nfit",30),
-      io::get_value_with_default<double>(pt,"eta", M_PI/ft.beta()),
-      1e-8, "qpscf", false, off_diag_mode);
+  // Quasiparticle default of the downfolding drivers
+  // The [<block>.qp_eqn] input block overrides them in read_qp_block
+  qp_context_t qp_params{
+      .qp_approx = "qp_eqn",
+      .qp_eqn = {.solver = "sc", .ac_nfit = 30, .eta = M_PI/ft.beta(), 
+                 .tol = 1e-8, .off_diag_mode = "qp_energy"},
+  };
+  read_qp_block(pt, qp_params);
+  utils::check(qp_params.qp_approx == "qp_eqn",
+               "mbpt: the quasiparticle embedding scheme requires qp_approx = qp_eqn; "
+               "qp_approx = lqp is not implemented for downfolding.");
   embed_t embed(*mf, wannier_file, trans_home_cell);
   pt.put("update_dc", true);
   pt.put("dc_type", "gw");

@@ -41,6 +41,7 @@
 #include "methods/SCF/scf_common.hpp"
 #include "numerics/ac/ac_context.h"
 #include "methods/pproc/pproc_t.h"
+#include "methods/SCF/qp/qp_params_utils.hpp"
 #include "mean_field/symmetry/unfold_bz.h"
 #include "hamiltonian/one_body_hamiltonian.hpp"
 
@@ -139,6 +140,18 @@ namespace methods {
         write_mf_data(*mf, ft, *psp.get(), scf_output);
       }
 
+      // Quasiparticle defaults of band_interpolation kernel
+      auto make_qp_params = [&pt](double beta) {
+        qp_context_t qp_params{
+            .qp_approx = "qp_eqn",
+            .qp_eqn = {.solver = "sc", .ac_nfit = 18, .eta = M_PI/beta, .tol = 1e-8,
+                       .off_diag_mode = "fermi"},
+            .lqp = {.n_fit = 6, .fit_order = -1, .symmetric_window = true,
+                    .fit_resid_tol = 1e-8}};
+        read_qp_block(pt, qp_params);
+        return qp_params;
+      };
+
       // Check if a QP solution exist already. 
       // If not, compute QP energies on the IBZ k-mesh from dynamic self-energy and write to the checkpoint file.
       bool heff_exists = false;
@@ -148,11 +161,18 @@ namespace methods {
         auto grp = h5::group(file).open_group(grp_name);
         if (iteration == -1) h5::read(grp, "final_iter", iteration);
         auto iter_grp = grp.open_group("iter"+std::to_string(iteration));
-        // Check if Heff_skij dataset exists
-        if (iter_grp.has_dataset("Heff_skij") or (iter_grp.has_subgroup("qp_approx") and iter_grp.open_group("qp_approx").has_dataset("Heff_skij"))) {
-          heff_exists = true;
-        }
         h5::read(h5::group(file), "imaginary_fourier_transform/beta", beta);
+        // A QP-SCF iteration (or the mean-field starting point) stores Heff_skij itself; a
+        // Dyson-SCF one may hold qp_approx/ from an earlier post-processing run, reused only if
+        // it answers the request (qp_approx_reusable)
+        if (iter_grp.has_dataset("Heff_skij")) {
+          heff_exists = true;
+          app_log(1, "  {}/iter{} holds its own Heff_skij (a quasiparticle self-consistent iteration\n"
+                     "  or the mean-field starting point): interpolating it as is. The qp_approx,\n"
+                     "  qp_eqn and lqp settings do not apply.", grp_name, iteration);
+        } else {
+          heff_exists = pproc_t::qp_approx_reusable(iter_grp, make_qp_params(beta));
+        }
       }
       std::array<double,3> buffer = {(heff_exists)? 1.0 : 0.0, double(iteration), beta};
       mpi->comm.broadcast_n(buffer.data(), buffer.size(), 0);
@@ -160,22 +180,17 @@ namespace methods {
       iteration = static_cast<int>(buffer[1]);
       beta = buffer[2];
       if (!heff_exists) {
-        // Compute QP energies from dynamic self-energy on IBZ 
-        qp_params_t qp_params;
-        qp_params.ac_alg  = io::get_value_with_default<std::string>(pt,"ac_alg","pade");
-        qp_params.qp_type = io::get_value_with_default<std::string>(pt, "qp_type", "sc");
-        qp_params.eta     = io::get_value_with_default<double>(pt, "qp_eta", M_PI/beta);
-        qp_params.Nfit    = io::get_value_with_default<int>(pt, "qp_Nfit", 18);
-        qp_params.tol     = io::get_value_with_default<double>(pt, "qp_tol", 1e-8);
-
-        pp.compute_qp_on_ibz_kmesh(*mf, qp_params, grp_name, iteration); 
+        // Compute QP energies from dynamic self-energy on IBZ
+        auto qp_params = make_qp_params(beta);
+        pp.qp_approx_from_dyson(qp_params, grp_name, iteration); 
       }
 
       pp.wannier_interpolation(*mf, pt, wannier_file, "quasiparticle", grp_name, iteration, trans_home_cell);
 
     } else if (pp_type == "qp_gaps") {
       // Quasiparticle energies on the IBZ k-mesh from the Dyson self-energy of a scGW
-      // checkpoint (Pade AC of the MO-diagonal Sigma + the QP equation, compute_qp_on_ibz_kmesh -> qp_approx/E_ska)
+      // checkpoint (qp_approx_from_dyson -> qp_approx/E_ska: the AC of the MO-diagonal Sigma + the
+      // QP equation for qp_approx = "qp_eqn", the linearized QP Hamiltonian for "lqp")
       // followed by the band gaps on that mesh: fundamental (min CBM - max VBM over the mesh, occupation by mu),
       // direct at Gamma, and the smallest direct gap. Results are printed in
       // eV and written to <grp>/iter<n>/qp_approx/gaps; epsilon_inf of the same iteration is printed alongside.
@@ -207,13 +222,22 @@ namespace methods {
       std::array<double,2> buffer = {double(iteration), beta};
       mpi->comm.broadcast_n(buffer.data(), buffer.size(), 0);
       iteration = long(buffer[0]); beta = buffer[1];
-      qp_params_t qp_params;
-      qp_params.ac_alg  = io::get_value_with_default<std::string>(pt,"ac_alg","pade");
-      qp_params.qp_type = io::get_value_with_default<std::string>(pt, "qp_type", "sc");
-      qp_params.eta     = io::get_value_with_default<double>(pt, "qp_eta", M_PI/beta);
-      qp_params.Nfit    = io::get_value_with_default<int>(pt, "qp_Nfit", 18);
-      qp_params.tol     = io::get_value_with_default<double>(pt, "qp_tol", 1e-8);
-      pp.compute_qp_on_ibz_kmesh(*mf, qp_params, grp_name, iteration);
+      // The quasiparticle controls are read from the nested qp_approx / [qp_gaps.qp_eqn] /
+      // [qp_gaps.lqp] input, as in band_interpolation. The flat spellings this driver used to
+      // read would otherwise be ignored without notice, so they abort.
+      for (auto const* key : {"qp_type", "ac_alg", "qp_eta", "qp_Nfit", "qp_tol"})
+        utils::check(not pt.get_optional<std::string>(key),
+                     "qp_gaps: the flat key {} is no longer read. Use qp_approx = \"qp_eqn\" | \"lqp\" "
+                     "and the nested [qp_gaps.qp_eqn] block (solver, ac_alg, ac_nfit, eta, tol) or "
+                     "[qp_gaps.lqp] block (n_fit, fit_order, fit_resid_tol).", key);
+      qp_context_t qp_params{
+          .qp_approx = "qp_eqn",
+          .qp_eqn = {.solver = "sc", .ac_nfit = 18, .eta = M_PI/beta, .tol = 1e-8,
+                     .off_diag_mode = "fermi"},
+          .lqp = {.n_fit = 6, .fit_order = -1, .symmetric_window = true,
+                  .fit_resid_tol = 1e-8}};
+      read_qp_block(pt, qp_params);
+      pp.qp_approx_from_dyson(qp_params, grp_name, iteration);
       mpi->comm.barrier();
       if (mpi->comm.root()) {
         const double HA = 27.211386245988;
@@ -234,8 +258,13 @@ namespace methods {
           for (int i = 0; i < 3; ++i) d = std::max(d, std::abs(kc(ik, i) - std::round(kc(ik, i))));
           if (d < 1e-6) ik_gamma = ik;
         }
-        app_log(1, "\n  [qp_gaps] {} iteration {}: QP energies (Pade AC of the Dyson Sigma, {} solver, Nfit {}, eta {:.3e} Ha) on {} IBZ k-points x {} bands; mu = {:.6f} Ha; epsilon_inf = {}",
-                prefix, iteration, qp_params.qp_type, qp_params.Nfit, qp_params.eta, nk, nb, mu, (eps_inf > 0.0) ? std::to_string(eps_inf) : std::string("n/a"));
+        const std::string qp_desc = (qp_params.qp_approx == "lqp")
+            ? std::format("linearized QP of the Dyson Sigma, n_fit {}", qp_params.lqp.n_fit)
+            : std::format("{} AC of the Dyson Sigma, {} solver, ac_nfit {}, eta {:.3e} Ha",
+                          qp_params.qp_eqn.ac_alg, qp_params.qp_eqn.solver,
+                          qp_params.qp_eqn.ac_nfit, qp_params.qp_eqn.eta);
+        app_log(1, "\n  [qp_gaps] {} iteration {}: QP energies ({}) on {} IBZ k-points x {} bands; mu = {:.6f} Ha; epsilon_inf = {}",
+                prefix, iteration, qp_desc, nk, nb, mu, (eps_inf > 0.0) ? std::to_string(eps_inf) : std::string("n/a"));
         auto gaps_grp = qp_grp.has_subgroup("gaps") ? qp_grp.open_group("gaps") : qp_grp.create_group("gaps");
         for (long is = 0; is < ns; ++is) {
           double vbm = -1e9, cbm = 1e9, dmin = 1e9, dgam = -1.0;

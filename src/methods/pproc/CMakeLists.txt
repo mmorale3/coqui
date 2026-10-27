@@ -3,9 +3,9 @@
 
 add_library(pproc_lib pproc_t.cpp hamiltonians.cpp wavefunction_utils.cpp)
 if(ENABLE_NEVANLINNA)
-    target_link_libraries(pproc_lib PUBLIC utils numerics meanfield hamilt embed_lib ac_lib)
+    target_link_libraries(pproc_lib PUBLIC utils numerics meanfield hamilt embed_lib ac_lib qp_lib)
 else()
-    target_link_libraries(pproc_lib PUBLIC utils numerics meanfield hamilt embed_lib)
+    target_link_libraries(pproc_lib PUBLIC utils numerics meanfield hamilt embed_lib qp_lib)
 endif()
 # cvv_eps readout uses cvv_head_t (scr_coulomb) + simple_dyson (scf)
 target_link_libraries(pproc_lib PUBLIC scr_coulomb_lib scf_lib)

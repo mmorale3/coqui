@@ -169,7 +169,7 @@
 namespace methods {
 namespace qp_modea {
 
-  /** knobs (qp_params_t / toml). */
+  /** knobs (qp_context_t / toml). */
   struct modea_opts {
     std::string route = "cd";          // {cd, expansion}
     long nconsist = 5;                 // inner-consistency cap
@@ -205,7 +205,7 @@ namespace qp_modea {
     //                     chain is asked to Dyson Gamma, so it is computed, not zeroed) and
     //                     leaves only the scalar head on appended LS poles. On a metal "ls"
     //                     can need orders of magnitude more cancellation (Sabs/|Sigma^c|)
-    //                     than "spectral". The qp_params_t default (qp_modea_spectral_gamma)
+    //                     than "spectral". The qp_context_t default (qp_modea_spectral_gamma)
     //                     is "spectral"; the "ls" value below applies only when modea_opts
     //                     is built directly.
     std::string spectral_gamma = "ls";
@@ -227,7 +227,7 @@ namespace qp_modea {
     // only pays at looser cuts (see that file's header).
     double wunion = -1.0;
     // ---- the tilted-contour route (wfit == "contour") ----------
-    // Documented on qp_params_t.h; inert for every other wfit.
+    // Documented on qp/qp_context_t.h; inert for every other wfit.
     double      tc_eps = 1e-6;
     double      tc_delta = 0.0;        // a.u.; 0 = the default recipe (1.2 W_band/N_k floor)
     double      tc_rho = 0.65;

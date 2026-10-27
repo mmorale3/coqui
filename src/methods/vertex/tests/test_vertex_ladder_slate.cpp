@@ -99,7 +99,9 @@ namespace bdft_tests {
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd()*12, "", "incore", "",
                                                output, 1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
-    qp_params_t qp_params("sc", "pade", 18, 0.0001, 1e-8, "qpscf");
+    qp_context_t qp_params{.qp_scf_mode = "qpscf",
+                           .qp_eqn = {.solver = "sc", .ac_alg = "pade", .ac_nfit = 18,
+                                      .eta = 0.0001, .tol = 1e-8}};
     qp_params.qp_map = "ac_pade";
     solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd(), div);
     vtx.set_pol_vertex("ladder", "w0_prev", window, -1, 1e-8, -1.0, -1.0, -1.0, "none");

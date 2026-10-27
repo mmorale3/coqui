@@ -106,7 +106,7 @@ namespace bdft_tests {
      * The THC/solver wiring is the [qpgw] driver's, copied from run_qpgw in
      * test_methods_qpgw_bse.cpp so the two suites screen with the same objects.
      *
-     * NOTE ON mu: qp_params_t's default mu_update_alg is "bisection", and
+     * NOTE ON mu: qp_context_t's default mu_update_alg is "bisection", and
      * update_mu_bisection_impl returns old_mu UNCHANGED when |N(old_mu) - N| < mu_tol.
      * That is what makes the source-swap check sharp: the restart-init mu is bitwise the
      * checkpointed mu, so read_greens_function's on-the-fly analytic G (built from the
@@ -131,7 +131,9 @@ namespace bdft_tests {
       thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd()*thc_prefactor, "", "incore", "",
                                                  output, thc_tol, mf->ecutrho(), 1, 1024));
       auto eri = mb_eri_t(thc, thc);
-      qp_params_t qp_params("sc", "pade", 18, 0.0001, 1e-8, "qpscf");
+      qp_context_t qp_params{.qp_scf_mode = "qpscf",
+                             .qp_eqn = {.solver = "sc", .ac_alg = "pade", .ac_nfit = 18,
+                                        .eta = 0.0001, .tol = 1e-8}};
       qp_params.qp_map = "ac_pade";
 
       // the driver's [qpgw] wiring: a pure knob carrier, attached to scr_eri only. It must

@@ -46,7 +46,7 @@
 #include "numerics/distributed_array/matrix_array.hpp"
 #include "numerics/distributed_array/detail/slate_aux.hpp"
 #if defined(ENABLE_SLATE)
-#include "slate/slate.hh"
+#include "numerics/distributed_array/detail/slate_include.hpp"
 #endif
 
 namespace math::nda

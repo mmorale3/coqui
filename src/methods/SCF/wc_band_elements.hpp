@@ -1028,7 +1028,7 @@ namespace qp_modea {
       // transfers, and the Sabs probe reports its share of Sabs separately so any residual
       // cancellation is measured; (ii) the fit is the "nu" route rather than the "tau"
       // default, because nu is the better-conditioned of the two at REAL z by about an
-      // order of magnitude in the residue ratio (see qp_params_t.h); (iii) it carries the
+      // order of magnitude in the residue ratio (see qp/qp_context_t.h); (iii) it carries the
       // SAME support constraint gap_edge the LS path uses.
       sp.iq_gamma = 0;                 // the Gamma transfer, div_utils / embed_eri_t convention
       sp.gamma_ls = (opts.spectral_gamma != "spectral");

@@ -29,7 +29,7 @@
 
 #include "mean_field/MF.hpp"
 #include "utilities/mpi_context.h"
-#include "methods/SCF/qp_params_t.h"
+#include "methods/SCF/qp/qp_context_t.h"
 #include "methods/SCF/mb_solver_t.h"
 #include "methods/mb_state/mb_state.hpp"
 #include "numerics/imag_axes_ft/IAFT.hpp"
@@ -370,7 +370,7 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
                   const sArray_t<Array_view_4D_t> &sVhf_skij,
                   const sArray_t<Array_view_4D_t> &sMO_skia,
                   double mu,
-                  const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
+                  const imag_axes_ft::IAFT &FT, qp_context_t &qp_params,
                   const qp_modea::modea_ctx *modea_ctx = nullptr);
 
 /**
@@ -391,7 +391,7 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
 auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
                const sArray_t<Array_view_4D_t> &sMO_skia,
                const sArray_t<Array_view_3D_t> &sE_ska, double mu,
-               const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
+               const imag_axes_ft::IAFT &FT, qp_context_t &qp_params,
                const sArray_t<Array_view_4D_t> *sHstat_skij = nullptr,
                const qp_modea::modea_ctx *modea_ctx = nullptr)
   -> sArray_t<Array_view_4D_t>;
@@ -399,7 +399,7 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
 /**
  * Given a correlated solver, compute the dynamic self-energy and
  * solve the quasi-particle Eqn in the presence of correlated potential V_corr(w) in MO basis
- * Specifically, this functions does the following:
+ * Specifically, this function does the following:
  * 1. compute dynamic self-energy from 'corr_solver'
  * 2. compute diagonals of V_corr(iw) in MO basis
  * 3. solve the quasiparticle equations for e_qp with V_corr(w)
@@ -422,7 +422,7 @@ void add_evscf_vcorr(MBState &mb_state,
                      solvers::mb_solver_t<corr_solver_t> &mb_solver,
                      eri_t &eri,
                      const imag_axes_ft::IAFT &FT,
-                     qp_params_t &qp_params, 
+                     qp_context_t &qp_params, 
                      bool fixed_w=false);
 /**
  * Add correlated potential V_corr with static approximation to the effective quasiparticle Hamiltonian
@@ -451,8 +451,39 @@ void add_qpscf_vcorr(MBState &mb_state,
                      solvers::mb_solver_t<corr_solver_t> &mb_solver,
                      eri_t &eri,
                      const imag_axes_ft::IAFT &FT,
-                     qp_params_t &qp_params,
+                     qp_context_t &qp_params,
                      const sArray_t<Array_view_5D_t> *sG_ext = nullptr);
+
+/**
+ * Linearized quasiparticle update of the QP Hamiltonian (qp_scf_mode == "qpscf", qp_approx == "lqp"):
+ * 1. G0 from (MO_skia, E_ska, mu); W; dynamic Sigma(tau) in the primary basis
+ * 2. per (s,k): rotate F = Heff (H0 + V_HF) and Sigma(tau) to the MO basis, fit A = Sigma(0),
+ *    B = Sigma'(0), Z = (1 - B)^-1, H_QP = Z^1/2 (F + A - mu) Z^1/2 
+ * 3. Heff <- C^-dag H_QP C^-1 in the primary basis (H_QP is already in absolute energies);
+ *    pole weights <v|Z|v> are stored in mb_state.sZqp_ska.
+ * The loop is then closed with the unit-weight G0 of H_QP (Kutepov et al. 2017, Eq. 23).
+ *
+ * The MO basis is orthonormal (C^dag S C = 1), so this function applies unchanged
+ * to a non-orthogonal primary basis; the overlap enters only through C and C^-1.
+ *
+ * @tparam eri_t         - ERI implementation (thc_reader_t or chol_reader_t)
+ * @tparam corr_solver_t - correlated solver supplying the dynamic self-energy (e.g. gw_t)
+ * @param mb_state  - [INPUT/OUTPUT] many-body state. Reads sHeff_skij, sMO_skia and sE_ska;
+ *                    replaces sHeff_skij by the new QP Hamiltonian and sets sZqp_ska. The
+ *                    intermediates sG_tskij, sSigma_tskij and dW_qtPQ are allocated and released.
+ * @param mu        - [INPUT] chemical potential [Ha] of the current iteration
+ * @param mb_solver - [INPUT] solver bundle; both mb_solver.corr and mb_solver.scr_eri are required
+ * @param eri       - [INPUT] ERI instance, also the source of the MPI context
+ * @param FT        - [INPUT] Fourier transform driver on the imaginary axes
+ * @param qp_params - [INPUT] quasi-particle fitting parameters.
+ * @param sG_ext    - [INPUT] optional external Green's function used in place of the G0 of
+ *                    step 1 for W and Sigma (the re-QP-ization entry of qp_scf_loop, as in
+ *                    add_qpscf_vcorr); nullptr builds G0 from the current QP spectrum.
+ */
+template<typename eri_t, typename corr_solver_t>
+void add_lqp_vcorr(MBState &mb_state, double mu, solvers::mb_solver_t<corr_solver_t> &mb_solver,
+                   eri_t &eri, const imag_axes_ft::IAFT &FT, qp_context_t &qp_params,
+                   const sArray_t<Array_view_5D_t> *sG_ext = nullptr);
 
 template<typename function_t>
 double qp_eqn_linearized(double Vhf, function_t &Sigma, long I, double mu, double eps_ks, double eta = 0.0);
@@ -568,6 +599,41 @@ template<typename comm_t, typename X_t, nda::ArrayOfRank<1> Array1D>
 double eval_corr_energy(comm_t& comm, const imag_axes_ft::IAFT &FT,
                         const X_t & G_shm, const X_t & Sigma_shm,
                         Array1D &k_weight);
+
+/**
+ * Evaluate the electronic grand potential from the Luttinger-Ward functional 
+ * and the derived thermodynamic properties (Helmholtz free energy, entropy, 
+ * electron number) using a given Dyson-SCF solution: 
+ *
+ *     Omega = Phi[G] - Tr[Sigma G] - Tr ln(-G0) - Tr ln(1 - G0 Sigma) , 
+ *
+ * Derived quantities (spin degeneracy and k-weights included throughout):
+ *
+ *     Helmholtz free energy  A = Omega + mu N , 
+ *     entropy                S = beta (E - A) ,  
+ *
+ * where N is the electron number and E is the total electronic energy.
+ *
+ * @param comm           - [INPUT] communicator the (is, ik) and frequency loops are distributed over
+ * @param dyson          - [INPUT] dyson object (provides MF, IAFT, H0, S, spectra)
+ * @param sF_skij        - [INPUT] Hartree-Fock potential (see F_has_H0)
+ * @param sSigma_tskij   - [INPUT] dynamic self-energy in imaginary time
+ * @param elec_energies  - [INPUT] electronic energy contributions:
+ *                                 [0] one-electron (H0), [1] Hartree-Fock,
+ *                                 [2] correlation, [3] total
+ * @param Phi_dynamical  - [INPUT] dynamical part of the Luttinger-Ward functional Phi
+ * @param mu             - [INPUT] chemical potential
+ * @param F_has_H0       - [INPUT] whether sF_skij already includes the non-interacting
+ *                                Hamiltonian H0; if false, H0 is added internally
+ * @return - thermodynamic observables (Omega, A, S, N)
+ */
+template<typename comm_t, typename dyson_type, typename X_t, typename Xt_t>
+auto eval_thermodynamic_properties(comm_t& comm, dyson_type &dyson, 
+                                   const X_t &sF_skij, const Xt_t &sSigma_tskij, 
+                                   const std::vector<double> &elec_energies, double Phi_dynamical, 
+                                   double mu, bool F_has_H0)
+-> thermodynamics_t;
+
 template<typename X_t, nda::ArrayOfRank<1> Array1D>
 auto eval_hf_energy(const X_t &sDm_skij, const X_t &sF_skij, const X_t &sH0_skij,
                     Array1D &k_weight, bool F_has_H0=true)

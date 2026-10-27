@@ -37,6 +37,13 @@
   reduction order, i.e. on the rank count or the GPU model; 0 restores the previous selection.
 - Small Si unit-test fixtures (2×2×2, 3×3×3, 4×4×4; symmetric, time-reversal-only and unreduced meshes) for the IBZ and
   dynamic-vertex symmetry tests.
+- The vertex in the linearized QSGW loop (`[lqsgw]`): the same pol-vertex keys as `[qpgw]` (the ladder in P,
+  `pol_vertex*`, and the Sigma-side vertex, `pol_vertex_sigma`), and the external-G entry (`greens_func_source`).
+  The quasiparticle maps `qp_map != "ac_pade"` refine the `qp_eqn` scheme and abort with `lqsgw`.
+- `qp_gaps` reads the nested quasiparticle input (`qp_approx`, `[qp_gaps.qp_eqn]`, `[qp_gaps.lqp]`); the former flat
+  keys `qp_type`, `ac_alg`, `qp_eta`, `qp_Nfit`, `qp_tol` abort with a pointer to the nested form.
+- `eval_thermodynamics = true` aborts when a vertex is attached (the Luttinger-Ward functional of the vertex-corrected
+  self-energy is not implemented).
 
 ### Improved
 
@@ -66,6 +73,81 @@
 - The causal projection of Σ_c (unconverged ADMM with Anderson acceleration, 6000 iterations) amplifies roundoff-level
   differences of its input (different CPU, BLAS or FFT code path) to about 1% of the removed part, i.e. ~1e-6 Ha in
   `e_corr` and a scatter of the little-group residual of G. Runs on the same hardware and build are reproducible.
+
+## CoQui vX.Y.Z [YYYY-MM-DD]
+
+### Notes
+
+- DLR mesh construction changed in this release: DLR checkpoints written by CoQui v0.4.0 or earlier are no longer compatible and must be regenerated. 
+
+### Added
+
+- Imaginary-time and Matsubara meshes to h5 checkpoint, written by both the C++ and the Python IAFT. (#51)
+- `CPPDLR` CMake variable to configure against a local cppdlr source tree instead of the one fetched by `FetchContent`. (#51)
+- Linearized quasiparticle self-consistent GW (LQSGW), `run_lqsgw` in the Python API.
+- Linearized quasiparticle approximation of a Dyson-SCF solution as post-processing.
+
+### Improved
+
+- More stable DLR mesh construction: `cppdlr` pin bumped from `f6bd6ab` to `7a0f60c`. (#51)
+- IAFT mesh compatibility checking when reading a checkpoint. (#51)
+- Convergence logic of the quasiparticle self-consistent loops (`qphf`, `evgw`, `qpgw`, `lqsgw`). 
+
+### API Updates
+
+- One input interface for every quasiparticle approximation: `qp_approx` selects the scheme (`"qp_eqn"` or `"lqp"`, replacing `qp_type`), and each scheme reads its controls from its own nested block, `qp_eqn` or `lqp`, instead of flat keys.
+- The flat quasiparticle-equation keys of `evgw`, `qpgw`, `downfold_1e`, `gw_downfold` and `band_interpolation` move into the `qp_eqn` block: `ac_alg` → `qp_eqn.ac_alg`, `Nfit`/`qp_Nfit` → `qp_eqn.ac_nfit`, `eta`/`qp_eta` → `qp_eqn.eta`, `off_diag_mode` → `qp_eqn.off_diag_mode`, `qp_tol` → `qp_eqn.tol`. 
+- `band_plot` no longer draws the legend: call `ax.legend()` after plotting.
+
+### Fixed
+
+- Wrong Wannier projectors from `wannier90` library mode when the outer disentanglement window excludes the lowest of the KS bands at some k-point.
+- Hang in `mlwf_h5_from_wannier90_output` with more than one MPI rank when no `.eig` file is present.
+- Wannier90 output files from `wannier90` library mode silently written to a truncated path outside `outdir` when `outdir/prefix` exceeds 50 characters; library mode now aborts instead.
+- DMFT unit test `test_extract_h0_and_delta_with_real_downfold_gloc` failing with more than one MPI rank.
+
+### Default Value Updates
+
+- Default imaginary-axis window: `wmax = 1.5 * [(emax - emin) + max(emax - ef, ef - emin)]`, sized for the `Sigma = G*W` convolution, instead of `wmax = 1.5 * max(emax - ef, ef - emin)`. (#56)
+
+## CoQui v0.4.0 [2026-09-21]
+
+### Added
+
+- Grand potential and the derived thermodynamic properties (Helmholtz free energy, entropy, electron number) from a Dyson-SCF solution, enabled by `eval_thermodynamics` (default `false`). Available for HF and GW; not yet implemented for GF2. (#38)
+- `COQUI_FFT_BACKEND` to select the FFT implementation explicitly: `FFTW` (default, real FFTW3) or `MKL`. (#43)
+- `calc_type` in `post_proc.band_plot` to plot the band structure of a DMFT-type calculation: `"dmft"` reads the `embed` group, `"mbpt"` (default) the `scf` group. (#58)
+
+### Improved
+
+- GW+EDMFT bosonic causal projection is now configured per fit target (`Wloc`, `U_weiss`, impurity), each with its own bath count and its own number of excluded low-frequency Matsubara points (see API Updates). (#58)
+- GW+EDMFT parameter handling and input validation. (#39)
+- `fft_lib` is built as a shared library under `COQUI_PYTHON_SUPPORT`, so all c2py modules bind `fftw_*` to a single FFT implementation. (#43)
+- Consistent HDF5 library usage: using the public `HDFArchive` API instead of the private `h5._h5py` binding. (#39)
+- `.gitignore` coverage. (#57)
+
+### Fixed
+
+- Compilation error from a duplicate `c2py` target. (#55, issue #52)
+- Compilation error from the `roundup` macro conflict in SLATE. (#42, icl-utk-edu/slate#227)
+- Crash in `make_thc_coulomb` under Python from FFTW/MKL symbol interposition. (#43)
+- `dyson_scf_gw_diis_vs_damping` failing depending on the BLAS/LAPACK implementation: the imaginary-axis window is widened to cover the spectrum and the references regenerated. (#54, issue #53)
+- MPI broadcast of the effective-Hamiltonian path in Wannier interpolation. (#39)
+- `NameError` in `solve_impurities_from_chkpt` when `degenerate_blk` is set. (#39)
+- Cast `n_warmup_cycles` to `int` before reaching the impurity solver in the auxiliary chemical-potential search. (#39)
+- `plot_edmft_convergence` on checkpoints with an incomplete impurity iteration. (#39)
+- `read_last_it.py` now preserves the `Format` attribute of serialized TRIQS objects, so a trimmed checkpoint can still be reconstructed on read. (#58)
+
+### API Updates
+
+- `ENABLE_FFTW` is removed; use `COQUI_FFT_BACKEND=FFTW|MKL` instead. (#43)
+- GW+EDMFT `causal_projection`: `nbath_per_orbital`, `exclude_w0` and `target` are replaced by the per-target keys `nbath_per_orbital_{wloc,u_weiss,impurity}` (default `-1` = skip that fit) and `n_exclude_low_freq_{wloc,u_weiss,impurity}` (default `0`). (#58)
+- `dmft.bath_fit.causal_projection_boson` takes `nbath_per_orbital` and `n_exclude_low_freq` as explicit arguments instead of a `causal_params` dict. (#58)
+- `scf_loop` takes a trailing `eval_thermodynamics` flag. (#38)
+
+### Default Value Updates
+
+- EDMFT impurity mixing: `mix_in_first_iter` default changed to `True` (from `False`). (#39)
 
 ## CoQui v0.3.0 [2026-06-03]
 

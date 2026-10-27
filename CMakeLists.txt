@@ -103,7 +103,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 ######################################################################
 option(ENABLE_ROCM " Build device code with ROCM backend" OFF)
 option(ENABLE_OPENMP " Build device code with OPENMP backend" OFF)
-option(ENABLE_FFTW "Build using FFTW3 library." ON)
 # ENABLE_FINUFFT defaults OFF: cmake/finufft.cmake pulls FINUFFT with FetchContent at
 # CONFIGURE time, i.e. it needs network access, which cluster compute nodes often lack.
 # Builds that need the real-axis module turn it ON explicitly; with it OFF the real-axis
@@ -363,16 +362,37 @@ else()
 endif()
 
 ######################################################################
-# FFTW: not using MKL's FFTW yet, figure out how if requested
+# FFT backend selection (FFTW3 real vs MKL's FFTW3 interface)
 ######################################################################
-if(ENABLE_FFTW)
+
+set(COQUI_FFT_BACKEND FFTW CACHE STRING "FFT backend: FFTW (real FFTW3) or MKL")
+set_property(CACHE COQUI_FFT_BACKEND PROPERTY STRINGS FFTW MKL)
+
+# Disable ENABLE_FFTW from users; use COQUI_FFT_BACKEND instead.  
+if(DEFINED ENABLE_FFTW)
+  message(FATAL_ERROR "ENABLE_FFTW is removed; use -DCOQUI_FFT_BACKEND=FFTW or =MKL.")
+endif()
+
+if(COQUI_FFT_BACKEND STREQUAL "FFTW")
   # The component list only names DOUBLE_OPENMP_LIB, but FindFFTW searches for every
   # flavour unconditionally and exports FFTW::DoubleThreads / FFTW::DoubleOpenMP whenever it
   # finds them, so nothing has to be promoted to a REQUIRED component to pick one. See
   # src/numerics/fft/CMakeLists.txt for WHICH one gets linked and why.
   find_package(FFTW REQUIRED DOUBLE_OPENMP_LIB)
-  add_compile_definitions(ENABLE_FFTW)
+  message(STATUS "FFT backend: FFTW3 (real)  [${FFTW_DOUBLE_LIB}]")
+elseif(COQUI_FFT_BACKEND STREQUAL "MKL")
+  set(MKL_FFTW_INCLUDE_DIR "$ENV{MKLROOT}/include/fftw")
+  if(NOT EXISTS "${MKL_FFTW_INCLUDE_DIR}/fftw3.h")
+    message(FATAL_ERROR "COQUI_FFT_BACKEND=MKL but ${MKL_FFTW_INCLUDE_DIR}/fftw3.h "
+                        "was not found. Set MKLROOT.")
+  endif()
+  message(STATUS "FFT backend: MKL FFTW3 interface  [$ENV{MKLROOT}]")
+else()
+  message(FATAL_ERROR "Invalid COQUI_FFT_BACKEND='${COQUI_FFT_BACKEND}' (expected FFTW or MKL).")
 endif()
+
+# fftw-API CPU backend is always compiled in (both backends use fftw_*).
+add_compile_definitions(ENABLE_FFTW)
 
 ######################################################################
 # HEFFTE: Highly Efficient FFT for Exascale
@@ -463,6 +483,35 @@ if(ENABLE_SPDLOG)
   # turn off warnings
   set_property(TARGET spdlog PROPERTY SYSTEM TRUE)
   add_compile_definitions(ENABLE_SPDLOG)
+endif()
+
+######################################################################
+# Python, c2py and clair for pybinding
+#
+# Fetched before nda and the other dependencies so that they all reuse this
+# single, self-consistent c2py target instead of resolving one of their own.
+######################################################################
+if(COQUI_PYTHON_SUPPORT)
+  find_package(Python COMPONENTS Interpreter Development NumPy)
+
+  if(DEFINED C2PY)
+    set(FETCHCONTENT_SOURCE_DIR_C2PY ${C2PY})
+  endif()
+  FetchContent_Declare(
+    c2py
+    GIT_REPOSITORY https://github.com/flatironinstitute/c2py
+    GIT_TAG        unstable
+    EXCLUDE_FROM_ALL
+  )
+  if(NOT TARGET c2py)
+    FetchContent_MakeAvailable(c2py)
+  else()
+    message(STATUS "Reusing c2py target already provided by other dependency")
+  endif()
+
+  if (COQUI_UPDATE_PYTHON_BINDINGS)
+    find_program(clair-c2py clair-c2py REQUIRED)
+  endif()
 endif()
 
 ######################################################################
@@ -576,38 +625,6 @@ if(ENABLE_CPPTRACE)
   FetchContent_MakeAvailable(cpptrace)
 endif(ENABLE_CPPTRACE)
 
-########################
-# Find Python, c2py and clair for pybinding
-########################
-if(COQUI_PYTHON_SUPPORT)
-  find_package(Python COMPONENTS Interpreter Development NumPy)
-  # Fetch the c2py library.
-  #
-  # h5 -- pulled in transitively by nda once PythonSupport=ON, see the nda block above --
-  # may fetch c2py ITSELF through nda's external_dependency(), which add_subdirectory()s
-  # it under _deps/nda-build/deps/h5/deps/c2py_src and thereby defines the c2py,
-  # c2py_warnings and c2py::c2py targets. FetchContent has no record of that population,
-  # so an unconditional FetchContent_MakeAvailable(c2py) here aborts the configure with
-  #   "_add_library cannot create target \"c2py_warnings\" because another target with the
-  #    same name already exists"  (CMP0002).
-  # Both paths track flatironinstitute/c2py @ unstable, so reuse whatever is already there.
-  if(TARGET c2py::c2py)
-    message(STATUS "c2py already provided by a dependency (h5 via nda); reusing its targets.")
-  else()
-    FetchContent_Declare(
-      c2py
-      GIT_REPOSITORY https://github.com/flatironinstitute/c2py
-      GIT_TAG        unstable
-      EXCLUDE_FROM_ALL
-    )
-    FetchContent_MakeAvailable(c2py)
-  endif()
-
-  if (COQUI_UPDATE_PYTHON_BINDINGS)
-    find_program(clair-c2py clair-c2py REQUIRED)
-  endif()
-endif()
-
 ######################################################################
 # lab-cosmo sphericart 
 ######################################################################
@@ -686,10 +703,15 @@ if(ENABLE_DLR)
     set(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT FALSE)
   endif()
 
+  # Allow a user-provided cppdlr source tree
+  if(DEFINED CPPDLR)
+    set(FETCHCONTENT_SOURCE_DIR_CPPDLR ${CPPDLR})
+  endif()
   FetchContent_Declare(
       cppdlr
       GIT_REPOSITORY https://github.com/flatironinstitute/cppdlr.git
-      GIT_TAG        f6bd6ab1823403015486c2c6b3399fd4db4468c1 #main
+      # Pin cppdlr main as of 2026-09-09.
+      GIT_TAG        7a0f60cba2da69d64361971613b6859bb8c078ce
   )
   FetchContent_MakeAvailable(cppdlr)
   # temporary workaround before cppdlr's nda dependency is updated. 

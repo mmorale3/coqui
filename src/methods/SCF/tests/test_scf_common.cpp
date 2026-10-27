@@ -21,6 +21,9 @@
 
 #undef NDEBUG
 
+#include <cstdio>
+#include <cmath>
+
 #include "catch2/catch.hpp"
 
 #include "configuration.hpp"
@@ -146,7 +149,7 @@ namespace bdft_tests {
         thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd()*thc_prefactor, "", "incore", "", output,
                                                    thc_tol, mf->ecutrho(), 1, 1024));
         auto eri = mb_eri_t(thc, thc);
-        qp_params_t qp_params;
+        qp_context_t qp_params;
         MBState mb_state(mpi_context, ft, output);
         double e_hf = qp_scf_loop(mb_state, eri, ft, qp_params,
                                   solvers::mb_solver_t(&hf), &iter_sol,
@@ -189,8 +192,11 @@ namespace bdft_tests {
   TEST_CASE("dyson_scf_gw_diis_vs_damping", "[methods_scf]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
 
-    // Cheap setup for regression: lower beta/wmax and compact THC factors.
-    imag_axes_ft::IAFT ft(200.0, 0.8, imag_axes_ft::dlr_basis);
+    // Cheap setup for regression: short beta and compact THC factors. wmax must
+    // cover the spectrum of H0+F relative to mu (max|eps_max-eps_min| ~ 5 a.u. here);
+    // a narrower window leaves G outside the DLR's representable range, and the
+    // converged energies then vary by ~1e-6 between BLAS/LAPACK implementations.
+    imag_axes_ft::IAFT ft(100.0, 7.0, imag_axes_ft::dlr_basis);
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
 
     auto run_dyson_gw = [&](iter_scf::iter_scf_t &iter_sol, const std::string &output)
@@ -205,7 +211,7 @@ namespace bdft_tests {
       MBState mb_state(mpi_context, ft, output);
       auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                      solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
-                                     50, false, 1e-7, true);
+                                     50, false, 5e-8, true);
       mpi_context->comm.barrier();
       if (mpi_context->comm.root()) std::remove((output + ".mbpt.h5").c_str());
       mpi_context->comm.barrier();
@@ -218,25 +224,61 @@ namespace bdft_tests {
     auto [e_hf_damp, e_corr_damp] = run_dyson_gw(damp_sol, "dyson_gw_damping_test");
     auto [e_hf_diis, e_corr_diis] = run_dyson_gw(diis_sol, "dyson_gw_diis_test");
 
-    // DIIS must converge to the damping state: both stop at the 1e-7 criterion of the loop
-    // (measured agreement 5e-10 on every platform).
-    constexpr double tol_alg = 1e-7;
-    VALUE_EQUAL(e_hf_diis, e_hf_damp, tol_alg, 1e-12);
-    VALUE_EQUAL(e_corr_diis, e_corr_damp, tol_alg, 1e-12);
-    // Damping reference for this cheap setup. The converged state itself is NOT reproducible
-    // across platforms to 1e-6: the first GW iteration already differs by ~3e-7 (relative, in
-    // Sigma) between platforms, and the converged e_hf comes out -4.1693088 (reference),
-    // -4.1693157 (Linux, gcc + MKL) and -4.1693190 (macOS, clang + OpenBLAS), e_corr -0.1098516 /
-    // -0.1098500 / -0.1098489, independent of the MPI rank count, the pivot tie rule, the THC
-    // point count (128 or 400: the same 3.3e-6 spread) and the mu search.
-    // The absolute check therefore carries 3x the largest measured spread (1.0e-5).
-    constexpr double e_hf_ref = -0.41698958999621144 + -3.7523191620415846;
-    constexpr double e_corr_ref = -0.10985159447702234;
-    constexpr double tol_ref = 3e-5;
-    VALUE_EQUAL(e_hf_damp, e_hf_ref, tol_ref, 1e-12);
-    VALUE_EQUAL(e_corr_damp, e_corr_ref, tol_ref, 1e-12);
+    // Reference from a converged wmax = 10.0 run with accuracy ~ 1e-7.
+    constexpr double e_hf_ref = -0.41469260619183446 + -3.8312790207998515;
+    constexpr double e_corr_ref = -0.0890230059782452;
+    constexpr double abs_tol = 1e-6;
+    VALUE_EQUAL(e_hf_damp, e_hf_ref, abs_tol, abs_tol);
+    VALUE_EQUAL(e_corr_damp, e_corr_ref, abs_tol, abs_tol);
+    VALUE_EQUAL(e_hf_diis, e_hf_ref, abs_tol, abs_tol);
+    VALUE_EQUAL(e_corr_diis, e_corr_ref, abs_tol, abs_tol);
   }
 
 
+
+  TEST_CASE("lqsgw_lih222", "[methods_scf][lqp]") {
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(100.0, 7.0, imag_axes_ft::dlr_basis);
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+
+    auto run_lqsgw = [&](iter_scf::iter_scf_t *iter_sol, const std::string &output, int niter)
+        -> std::tuple<double, nda::array<double, 3>> {
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, "ignore_g0", output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd()*8, "", "incore", "", output,
+                                                 1e-8, mf->ecutrho(), 1, 512));
+      auto eri = mb_eri_t(thc, thc);
+      qp_context_t qp;
+      qp.qp_scf_mode = "qpscf"; qp.qp_approx = "lqp"; qp.lqp.n_fit = 4;
+      MBState mb_state(mpi_context, ft, output);
+      double e_tot = qp_scf_loop(mb_state, eri, ft, qp, solvers::mb_solver_t(&hf, &gw, &scr_eri),
+                                 iter_sol, niter, false, 1e-6);
+      mpi_context->comm.barrier();
+      nda::array<double, 3> Z;
+      if (mpi_context->comm.root()) {
+        h5::file file(output + ".mbpt.h5", 'r');
+        long it; h5::h5_read(h5::group(file).open_group("scf"), "final_iter", it);
+        nda::h5_read(h5::group(file).open_group("scf/iter" + std::to_string(it)), "Zqp_ska", Z);
+      }
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) std::remove((output + ".mbpt.h5").c_str());
+      mpi_context->comm.barrier();
+      return {e_tot, Z};
+    };
+
+    iter_scf::iter_scf_t damp_sol(iter_scf::damp_t(0.7));
+    auto [e_damp, Z] = run_lqsgw(&damp_sol, "lqsgw_lih222_damping_test", 3);
+    if (mpi_context->comm.root()) {
+      REQUIRE(Z.size() > 0);
+      for (auto z : Z) { CHECK(z > 0.0); CHECK(z <= 1.0 + 1e-10); CHECK(z < 1.0 - 1e-6); }
+      std::printf("lqsgw_lih222: e_tot(damping, 3 iterations) = %.16f\n", e_damp);
+    }
+    // Regression reference from the first damping run (16 ranks: -4.2355209995661243,
+    // 4 ranks: -4.2355209995661252). 
+    constexpr double e_ref = -4.2355209995661243;
+    VALUE_EQUAL(e_damp, e_ref, 1e-6, 1e-6);
+    CHECK(std::isfinite(e_damp));
+  }
 
 } // bdft_tests
