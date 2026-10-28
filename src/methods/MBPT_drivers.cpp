@@ -78,7 +78,12 @@ namespace {
     c.start = io::get_value_with_default<long>(pt, "pol_vertex_sc_start", 1);
     c.mix = io::get_value_with_default<double>(pt, "pol_vertex_sc_mix", 0.5);
     c.head = io::get_value_with_default<std::string>(pt, "pol_vertex_sc_head", "coarse");
-    c.col = io::get_value_with_default<std::string>(pt, "pol_vertex_sc_col", "gam1");
+    // the injected column: "gam1" with the dynamic rung; with the static rung (pol_vertex_rung = "static", the static-rung ladder
+    // alone) the static column is the only one
+    auto rung = io::get_value_with_default<std::string>(pt, "pol_vertex_rung", "static");
+    io::tolower(rung);
+    const bool col_given = pt.get_optional<std::string>("pol_vertex_sc_col").has_value();
+    c.col = io::get_value_with_default<std::string>(pt, "pol_vertex_sc_col", rung == "dynamic" ? "gam1" : "static");
     c.restart_file = io::get_value_with_default<std::string>(pt, "pol_vertex_sc_restart_file", "");
     c.batch = io::get_value_with_default<long>(pt, "pol_vertex_sc_batch", 8);
     c.trev = io::get_value_with_default<bool>(pt, "pol_vertex_sc_trev", true);
@@ -109,7 +114,13 @@ namespace {
     utils::check(c.head == "coarse" or c.head == "fine" or c.head == "none",
                  "pol_vertex_sc_head = \"{}\" is not valid: options are \"coarse\" (default), \"fine\", \"none\".", c.head);
     utils::check(c.col == "gam1" or c.col == "dyn" or c.col == "static",
-                 "pol_vertex_sc_col = \"{}\" is not valid: options are \"gam1\" (default), \"dyn\", \"static\".", c.col);
+                 "pol_vertex_sc_col = \"{}\" is not valid: options are \"gam1\" (default with pol_vertex_rung = \"dynamic\"), \"dyn\", "
+                 "\"static\" (default with pol_vertex_rung = \"static\").", c.col);
+    utils::check(not c.enabled() or rung == "dynamic" or c.col == "static",
+                 "pol_vertex_sc_col = \"{}\" needs pol_vertex_rung = \"dynamic\": with pol_vertex_rung = \"{}\" the self-consistent "
+                 "ladder is the static-rung one and injects its static column (pol_vertex_sc_col = \"static\").", c.col, rung);
+    if (c.enabled() and rung != "dynamic" and not col_given)
+      app_log(1, "  [vertex self-consistency] pol_vertex_rung = \"{}\": the static-rung sublattice ladder, injected column \"static\".", rung);
     return c;
   }
 }
@@ -563,13 +574,19 @@ namespace mbpt_vertex_audit {
  *                 The vertex polarization is recomputed every pol_vertex_sc_period W updates (from pol_vertex_sc_start) from the
  *                 current G and W with the ladder's INTERNAL momenta on the coarse sublattice pol_vertex_sc_mesh = [n1, n2, n3]
  *                 of the k mesh (N_c = n1 n2 n3 points), mixed with pol_vertex_sc_mix (0.5) into a node-shared store that the
- *                 W-Dyson equation of every update injects (pol_vertex_inject = "ladder_n2", pol_vertex_rung = "dynamic";
- *                 no pol_vertex_interp_file / pol_vertex_chain). "interp" (S1) solves the sublattice's own transfers (N_c / 2
+ *                 W-Dyson equation of every update injects (pol_vertex_inject = "ladder_n2"; no pol_vertex_interp_file /
+ *                 pol_vertex_chain). pol_vertex_rung = "dynamic": the dynamic-rung sublattice ladder (the W-bar cache of the
+ *                 update, restricted to the sublattice transfers); pol_vertex_rung = "static": the STATIC-RUNG sublattice ladder
+ *                 alone -- the rung W-bar_0 = W(q, i nu' = 0) of the update, resummed at every external nu (the static
+ *                 quasiparticle BSE: the static column of the dynamic-rung pass, without the W-bar cache, the dynamic rung tables
+ *                 or a solve; on the device the static-only unit). The static rung is P-side only (the dynamic pair Sigma vertex
+ *                 needs pol_vertex_rung = "dynamic") and has no ladder_tda / Ward legs. "interp" (S1) solves the sublattice's own transfers (N_c / 2
  *                 with pol_vertex_sc_trev = true, Pi-bar(-q) = conj Pi-bar(q)) and Fourier-interpolates (Wigner-Seitz images of
  *                 the sublattice's supercell) to the mesh's IBZ transfers; "direct" (S2) solves EVERY fine IBZ transfer with the
  *                 internal sums on the sublattice (exact at the fine q, no interpolation). pol_vertex_sc_head ("coarse" | "fine" |
  *                 "none"): the Gamma-row head weight rescaled to the sublattice's Madelung weight N_c xi_c (default), kept, or
- *                 removed; pol_vertex_sc_col ("gam1" | "dyn" | "static") the ladder column; pol_vertex_sc_batch (8) external
+ *                 removed; pol_vertex_sc_col ("gam1" | "dyn" | "static") the ladder column (default "gam1" with the dynamic rung;
+ *                 the static rung injects "static", its only column: "gam1" / "dyn" abort); pol_vertex_sc_batch (8) external
  *                 transfers per ladder pass; pol_vertex_sc_unfold ("fit" | "solve": on a symmetric mesh "interp" solves the
  *                 IBZ sublattice transfers only and unfolds their star images in the aux frame through the ISDF fit of the
  *                 rotated pair densities, Pi-bar(S q) = conj(T) Pi-bar(q) T^T; "solve" solves every sublattice transfer, time
@@ -615,7 +632,7 @@ namespace mbpt_vertex_audit {
  *                 readout gains a "+DeltaLambda" column (chi0_Lambda alone). Requires
  *                 ladder_solve_grid = 1.
  *  - pol_vertex_rung: "static" The ladder's RUNG. {choices: "static", "dynamic"}. "static":
- *                 the W0bar rung. "dynamic" resums the ladder with the FULL-FREQUENCY
+ *                 the W0bar rung (with pol_vertex_sc: the static-rung sublattice ladder, see there). "dynamic" resums the ladder with the FULL-FREQUENCY
  *                 screened rung W(inu') (two-family DLR representation of the loop frequency,
  *                 static part exact, dynamic remainder by GMRES); the eps_M readout gains the
  *                 columns +static(sign-corrected) / +static+Pi^C_dyn / +Gamma_1 / +resummed at

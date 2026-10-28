@@ -173,6 +173,10 @@ namespace methods::solvers::dynbse_cuda {
     // nonres_src 3 = every node rung resident; 0 / 1 = the others reconstructed (2, the pinned-host copy, is not a source here)
     long nfac = 0;
     long recon_stage = 4;
+    // 1: the STATIC-ONLY engine (the static-rung ladder alone: the dynamic driver's static column). It holds K_s, the LU of
+    // M = 1 - Cb K_s, Cb_k, the L0 plan and the readout buffers; no K_d rungs, no tau buffers, no refit, no Sigma deposits,
+    // no dressed legs (ndist, nres, nfac, rung_fuse and the block grouping are ignored). Its block is ue_static.
+    int static_only = 0;
   };
   struct rung_stream;
 
@@ -217,7 +221,8 @@ namespace methods::solvers::dynbse_cuda {
   /** run-wide: KF, KF2 (nt, np) real; the basis' DLR refit (imag_axes_ft::dlr_pole_fit at its fixed rank, the np_fit DLR
    *  nodes): Ut (n_kept, nt) = its first n_kept rows, Vs (np_fit, n_kept) = its first n_kept columns (compacted), Kc (nt, np_fit) */
   void ue_set_basis(unit_engine *e, double const *KF, double const *KF2, cplx const *Ut, cplx const *Vs, cplx const *Kc);
-  /** per (s, q): K_s (D, D), K_d(s_r) (ndist, D, D), K_d(0) (D, D); trep (nt) maps a tau node to its representative */
+  /** per (s, q): K_s (D, D), K_d(s_r) (ndist, D, D), K_d(0) (D, D); trep (nt) maps a tau node to its representative
+   *  (static_only: K_s alone, Kds / Kd0 not read) */
   void ue_set_rung(unit_engine *e, cplx const *Ks, cplx const *Kds, cplx const *Kd0, long const *trep, cplx scale_k);
   /** per (s, q, nu): Cb_k (nk, nc^2, nc^2); the L0 tables (host pointers; Xfam / Xcst / act of t are ignored); returns the
    *  getrf info of M = 1 - Cb K_s (0 = success). tfold and inu come in t; nu0 selects the nu = 0 kernel. */
@@ -242,6 +247,11 @@ namespace methods::solvers::dynbse_cuda {
    *  resident L0 D -- one extra K_d and L0 instead of a second driver pass; kept on the device for ue_readout(which = 2). */
   double ue_gamma1(unit_engine *e, long nR, cplx const *Dblk, cplx *Gsum0, cplx *Gsum1, cplx *y1fam, cplx *y1cst, double *timing,
                    bool want_r1 = false);
+  /** the STATIC column of a block of width nR (any engine; the only block of a static_only one): Dblk (D, nR) in, the static
+   *  ladder's frequency sum Gsum0 = (L_s D)^sum = Fsum + Cb T_s Fsum with F = L0 D -- the first half of ue_gamma1 without the
+   *  L0 of the T_s image (Gamma is not formed). Kept on the device for ue_readout(which = 0); Gsum0 (D, nR) out when non-null.
+   *  timing (8) as ue_gamma1: [0] L0, [1] T_s, [4] vector ops, [5] H2D, [6] D2H -- ADDED. */
+  void ue_static(unit_engine *e, long nR, cplx const *Dblk, cplx *Gsum0, double *timing);
   /** the blocks per rung pass the engine chose (1 = the per-block flow above) */
   long ue_nblk(unit_engine const *e);
   /** THE BLOCK-BATCHED FLOW (ue_nblk > 1): ue_batch_begin with the widths of the group's blocks (nb <= ue_nblk) and the rung
@@ -261,7 +271,8 @@ namespace methods::solvers::dynbse_cuda {
   // straight into the engine: K_s = scale_k K[W0], K_d(r) = K[Wd(rep r)], K_d0 = K[Wd0] -- two batched gemms per W table and
   // (k-chunk) and a scatter kernel; no host rung arrays, no per-transfer upload of the (large) K_d stack.
   /** run-wide: Xb (ns, nk, Nm, nc), qx_of (nk, nk), W0 (nq, Nm, Nm), Wd0 (nq, Nm, Nm), Wds (nrep, nq, Nm, Nm) (the tau
-   *  representatives' W in the driver's rep order). false (why) = no room: the host builds and ue_set_rung uploads. */
+   *  representatives' W in the driver's rep order). false (why) = no room: the host builds and ue_set_rung uploads.
+   *  A static_only engine builds K_s alone: nrep = 0, Wd0 and Wds are not read (may be null). */
   /** The layout of the rung builds beyond the plain full mesh (null = the plain layout: nk_arr = nk, one leg set, no
    *  transposed reads). nk_arr: the k extent of the leg table, whose first nk entries are the internal points (the partner
    *  indices of ue_kb_build point anywhere in it). nsym > 1: the legs are (ns, nsym, nk_arr, Nm, nc) -- one leg set per

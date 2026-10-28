@@ -590,9 +590,10 @@ namespace solvers {
     // reports the loop-side eps_M(q_min) as a cross-check of the injected Pi.
     // The DYNAMIC-rung readout needs THIS iteration's dW folded into the readout
     // instance's W-bar cache, so it runs after the dW publication below; the static readout
-    // runs here.
+    // runs here. With pol_vertex_sc (either rung) the sublattice refresh below replaces the full-mesh readout.
     const bool pol_dyn_readout = (pol_readout and _pol_vtx != nullptr and _pol_vtx->ladder_dynamic_rung());
-    if (pol_readout and not pol_dyn_readout)
+    const bool pol_sc_pass = (pol_readout and _pol_vtx != nullptr and _pol_sc.cfg.enabled());
+    if (pol_readout and not pol_dyn_readout and not pol_sc_pass)
       pol_ladder_eps_readout(mb_state, thc, _pol_pi0_qPQ, std::addressof(eps_inv_head_q));
 
     // make routine to transposed distributed arrays over any 2 indices, so should
@@ -715,27 +716,34 @@ namespace solvers {
     };
     // the conditioning meter of the static ladders (ladder_cond.hpp): one record set for this update's P-side ladder pass
     (void)solvers::ladder_cond::take_pending();          // summaries no h5 group took (passes outside update_w)
-    if (pol_dyn_readout) solvers::ladder_cond::begin("P refresh");
-    if (pol_dyn_readout and _pol_sc.cfg.enabled()) {
+    const bool pol_p_pass = pol_dyn_readout or pol_sc_pass;   // this update runs a P-side ladder pass
+    if (pol_p_pass) solvers::ladder_cond::begin("P refresh");
+    if (pol_sc_pass) {
       // pol_vertex_sc: no full-mesh ladder. When a refresh is due the vertex polarization is recomputed from THIS update's
-      // G and W on the coarse sublattice; the next updates inject it (inject_pol_ladder).
+      // G and W on the coarse sublattice; the next updates inject it (inject_pol_ladder). The dynamic rung reads the W-bar
+      // cache, the static rung (pol_vertex_rung = "static": the static column alone) W-bar_0 only -- no cache fill.
       if (h5_iter >= 0) {
         ++_pol_sc_updates;
         if (_pol_sc.due(_pol_sc_updates)) {
           const double w0 = uw_wall();
-          // the rungs of the sublattice ladder read W-bar at the sublattice transfers only: restrict the cache to them
-          if (_pol_vtx->wcache_rows().empty() and methods::vertex_debug::number("sc_wcache_rows", 1.0) != 0.0) {   // vertex_debug: sc_wcache_rows
-            auto MFp = thc.MF();
-            const nda::array<double, 2> kc(MFp->kpts_crystal());
-            auto v0 = solvers::vertex_view::make_view(*MFp, solvers::vertex_view::sublattice(kc, _pol_sc.cfg.mesh), std::vector<long>{0});
-            if (long(v0.wrows.size()) < MFp->nqpts_ibz()) _pol_vtx->set_wcache_rows(v0.wrows, MFp->nqpts_ibz());
+          if (pol_dyn_readout) {
+            // the rungs of the sublattice ladder read W-bar at the sublattice transfers only: restrict the cache to them
+            if (_pol_vtx->wcache_rows().empty() and methods::vertex_debug::number("sc_wcache_rows", 1.0) != 0.0) {   // vertex_debug: sc_wcache_rows
+              auto MFp = thc.MF();
+              const nda::array<double, 2> kc(MFp->kpts_crystal());
+              auto v0 = solvers::vertex_view::make_view(*MFp, solvers::vertex_view::sublattice(kc, _pol_sc.cfg.mesh), std::vector<long>{0});
+              if (long(v0.wrows.size()) < MFp->nqpts_ibz()) _pol_vtx->set_wcache_rows(v0.wrows, MFp->nqpts_ibz());
+            }
+            _pol_vtx->cache_w(mb_state, thc);
           }
-          _pol_vtx->cache_w(mb_state, thc);
           const double w1 = uw_wall();
           park_W();
           preflight_sigma_pair(mb_state, thc);
           refresh_pol_sc(mb_state, thc);
-          app_log(1, "  [update_w wall] vertex self-consistency: W-bar cache fill {:.1f} s, refresh {:.1f} s", w1 - w0, uw_wall() - w1);
+          if (pol_dyn_readout)
+            app_log(1, "  [update_w wall] vertex self-consistency: W-bar cache fill {:.1f} s, refresh {:.1f} s", w1 - w0, uw_wall() - w1);
+          else
+            app_log(1, "  [update_w wall] vertex self-consistency (static rung, no W-bar cache): refresh {:.1f} s", uw_wall() - w1);
         } else {
           app_log(1, "  [vertex self-consistency] update {}: no refresh (period {}, start {}); the stored vertex polarization "
                      "(refresh {}) stays.", _pol_sc_updates, _pol_sc.cfg.period, _pol_sc.cfg.start, _pol_sc.n_refresh);
@@ -751,7 +759,7 @@ namespace solvers {
       app_log(1, "  [update_w wall] readout instance: W-bar cache fill {:.1f} s, eps readout (incl. the dynamic-rung driver) {:.1f} s",
               w1 - w0, uw_wall() - w1);
     }
-    if (pol_dyn_readout) (void)solvers::ladder_cond::report(thc.mpi()->comm);
+    if (pol_p_pass) (void)solvers::ladder_cond::report(thc.mpi()->comm);
 
     const double w_dump0 = uw_wall();
     _Timer.start("TEMP_UW_dump_eps_inv_head");
@@ -984,10 +992,25 @@ namespace solvers {
     if (_pol_sc.cfg.enabled()) {
       auto MF = thc.MF();
       auto const &sc = _pol_sc.cfg;
-      utils::check(_vertex->ladder_rung() == "dynamic" and _vertex->pol_vertex_inject_enabled() and _vertex->pol_interp_file().empty()
-                   and not _vertex->pol_chain(),
-                   "pol_vertex_sc = \"{}\" needs pol_vertex_rung = \"dynamic\" and pol_vertex_inject = \"ladder_n2\", without "
-                   "pol_vertex_interp_file / pol_vertex_chain (the injected polarization is the one this run computes).", sc.mode);
+      utils::check(_vertex->pol_vertex_inject_enabled() and _vertex->pol_interp_file().empty() and not _vertex->pol_chain(),
+                   "pol_vertex_sc = \"{}\" needs pol_vertex_inject = \"ladder_n2\", without pol_vertex_interp_file / pol_vertex_chain "
+                   "(the injected polarization is the one this run computes).", sc.mode);
+      // the STATIC rung: the sublattice ladder with the static rung W-bar_0 alone -- the static column of the dynamic-rung pass,
+      // without the W-bar cache and the dynamic machinery. P side only: the dynamic Sigma vertex rides the dynamic-rung pass, and
+      // the full-mesh static ladder's TDA / Ward legs have no sublattice form.
+      if (not _vertex->ladder_dynamic_rung()) {
+        utils::check(sc.col == "static", "pol_vertex_sc with pol_vertex_rung = \"static\" injects the static column: pol_vertex_sc_col "
+                     "= \"{}\" needs pol_vertex_rung = \"dynamic\" (use pol_vertex_sc_col = \"static\", the default with the static rung).",
+                     sc.col);
+        utils::check(not (_vertex->sigma_pair_enabled() and _vertex->sigma_pair_dynamic()) and not _vertex->sigma_share(),
+                     "pol_vertex_sc with pol_vertex_rung = \"static\" is a P-side vertex: the dynamic pair Sigma vertex "
+                     "(pol_vertex_sigma = \"pair\", column \"{}\"{}) needs the W-bar cache of the dynamic-rung pass -- use "
+                     "pol_vertex_rung = \"dynamic\" (pol_vertex_sc_col = \"static\" injects the same static column).",
+                     _vertex->sigma_pair_col(), _vertex->sigma_share() ? ", pol_vertex_sigma_share" : "");
+        utils::check(not _vertex->ladder_tda() and not _vertex->ladder_ward_legs(),
+                     "pol_vertex_sc with pol_vertex_rung = \"static\": ladder_tda / pol_vertex_legs = \"ward\" belong to the full-mesh "
+                     "static ladder and have no sublattice form.");
+      }
       const double Nc = double(sc.mesh[0] * sc.mesh[1] * sc.mesh[2]), Nk = double(MF->nkpts());
       double ratio = 1.0, xi_c = 0.0;
       if (sc.head == "none") ratio = 0.0;

@@ -54,6 +54,11 @@
   keys `qp_type`, `ac_alg`, `qp_eta`, `qp_Nfit`, `qp_tol` abort with a pointer to the nested form.
 - `eval_thermodynamics = true` aborts when a vertex is attached (the Luttinger-Ward functional of the vertex-corrected
   self-energy is not implemented).
+- Static-rung vertex self-consistency: `pol_vertex_sc` with `pol_vertex_rung = "static"` resums the sublattice ladder with
+  the static rung W̄(q, iν' = 0) alone at every external frequency (the static quasiparticle BSE) and injects it into P;
+  `pol_vertex_sc_col` defaults to `"static"` with the static rung (`"gam1"` / `"dyn"` abort). The same static column as the
+  dynamic-rung pass, without the W̄ cache, the dynamic rung tables or a solve; a static-only device unit (K_s, the LU of
+  1 − C̄ K_s, L0, T_s) runs it on the GPU. P side only: the dynamic pair Σ vertex keeps `pol_vertex_rung = "dynamic"`.
 
 ### Improved
 

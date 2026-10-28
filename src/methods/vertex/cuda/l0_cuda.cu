@@ -1648,7 +1648,25 @@ namespace methods::solvers::dynbse_cuda {
     return (c.nblk > 1) ? std::max(base, c.nblk * c.batch_nin * 2 * c.nR_max) : base;
   }
 
+  namespace {
+  // the STATIC-ONLY engine (ue_config::static_only): K_s, M, Cb_k, the L0 output family, the (D, nR) column buffers of L0, T_s and
+  // the readout, the legs, the readout block and the basis tables of ue_set_basis
+  double ue_static_bytes(ue_config const &c) {
+    const double D = double(c.nk * c.nc * c.nc), W = D * double(c.nR_max), np = double(c.np), nt = double(c.nt);
+    double b = 2.0 * D * D;                                                 // K_s, M
+    b += 2.0 * np * W + 8.0 * W;                                            // Ffam; Fsum, Y, csb, cbb, Dblk, Gs0, CbD, Vr
+    b += D * double(c.nout) + double(c.nout * c.nR_max);                    // the legs, the readout block
+    b += double(c.nk * c.nc * c.nc * c.nc * c.nc);                          // Cb_k
+    b += 2.0 * nt * np + double(c.n_kept) * (nt + double(c.np_fit)) + nt * double(c.np_fit);   // KF, KF2, Ut, Vs, Kc
+    b *= 16.0;
+    b += l0_plan::fixed_bytes(c.np, c.nk, c.nc, c.ng) +
+         l0_plan::per_k_bytes(c.np, c.nc, c.ng, c.nR_max, c.l0_fused != 0, c.l0_asm_gemm != 0);   // L0 at K = 1
+    return b * 1.05 + 512.0e6;                                              // cuSOLVER / cuBLAS workspaces
+  }
+  } // namespace
+
   double ue_bytes(ue_config const &c) {
+    if (c.static_only) return ue_static_bytes(c);
     const double D = double(c.nk * c.nc * c.nc), W = D * double(c.nR_max), np = double(c.np);
     const double fam = 2.0 * np * W, cst = W;
     const long nres = c.stream ? 0 : ((c.nres < 0 or c.nres >= c.ndist) ? c.ndist : c.nres);
@@ -1677,6 +1695,7 @@ namespace methods::solvers::dynbse_cuda {
 
   double ue_min_bytes(ue_config const &c_in) {
     // ue_create's candidate set without the budget: every residency, staging count and block grouping it may try
+    if (c_in.static_only) return ue_static_bytes(c_in);
     const bool recon = (c_in.nfac > 0 and not c_in.stream);
     const bool can_rebuild = recon ? (c_in.nonres_src != 3)
                                    : ((c_in.partial_ok != 0) and c_in.nonres_src != 2 and c_in.nonres_src != 3);
@@ -1748,7 +1767,64 @@ namespace methods::solvers::dynbse_cuda {
     return 16.0 * (double(4 * ng * np) + 4.0 * double(ng * nk * nc2) + double(D * nout) * 3.0 + W * (2.0 * ng + 3.0 * ng + 1.0));
   }
 
+  namespace {
+  // the STATIC-ONLY engine: the buffers of ue_set_rung / ue_kb_build (K_s), ue_set_unit (Cb_k, the LU of M), ue_static (L0 of the
+  // external leg, T_s) and ue_readout; the dynamic-rung buffers stay unallocated (null)
+  unit_engine *ue_create_static(ue_config const &c_in, double free_bytes, char *why, long why_len) {
+    const double avail = 0.9 * free_bytes - std::max(0.0, c_in.reserve_bytes);
+    const double need = ue_static_bytes(c_in);
+    if (need > avail) {
+      std::snprintf(why, size_t(why_len), "the static-only unit needs %.1f GB of device memory, %.1f GB available (%.1f GB free, "
+                    "%.1f GB reserved)", need / 1e9, avail / 1e9, free_bytes / 1e9, c_in.reserve_bytes / 1e9);
+      return nullptr;
+    }
+    ue_config c = c_in;
+    c.ndist = 0; c.nres = 0; c.nfac = 0; c.rung_fuse = 0; c.stream = 0; c.nblk = 1; c.nblk_want = 1; c.batch = 0;
+    auto *e = new unit_engine;
+    e->c = c;
+    e->nres = 0;
+    e->fuse = false;
+    e->nblk = 1;
+    e->nc2 = c.nc * c.nc;
+    e->D = c.nk * e->nc2;
+    const size_t D = size_t(e->D), W = D * size_t(c.nR_max), np = size_t(c.np), nt = size_t(c.nt);
+    cub_check(cublasCreate(&e->cb), "ue cublasCreate");
+    if (cusolverDnCreate(&e->cs) != CUSOLVER_STATUS_SUCCESS) APP_ABORT(std::string(" ue_create: cusolverDnCreate failed."));
+    e->KF = dalloc<cd>(nt * np, "ue KF"); e->KF2 = dalloc<cd>(nt * np, "ue KF2");
+    e->Ut = dalloc<cd>(size_t(c.n_kept) * nt, "ue Ut"); e->Vs = dalloc<cd>(size_t(c.np_fit) * size_t(c.n_kept), "ue Vs");
+    e->Kmat = dalloc<cd>(nt * size_t(c.np_fit), "ue Kc");
+    e->Ks = dalloc<cd>(D * D, "ue Ks");
+    e->Cbk = dalloc<cd>(size_t(c.nk) * e->nc2 * e->nc2, "ue Cbk"); e->M = dalloc<cd>(D * D, "ue M");
+    e->ipiv = dalloc<int>(D, "ue ipiv"); e->dinfo = dalloc<int>(1, "ue info");
+    if (cusolverDnZgetrf_bufferSize(e->cs, int(D), int(D), e->M, int(D), &e->lwork) != CUSOLVER_STATUS_SUCCESS)
+      APP_ABORT(std::string(" ue_create: getrf_bufferSize failed."));
+    e->work = dalloc<cd>(size_t(std::max(e->lwork, 1)), "ue getrf work");
+    e->Ffam = dalloc<cd>(2 * np * W, "ue fam");
+    for (cd **pp : {&e->Fsum, &e->Y, &e->csb, &e->cbb, &e->Dblk, &e->Gs0, &e->CbD, &e->Vr}) *pp = dalloc<cd>(W, "ue cst");
+    e->Dcj = dalloc<cd>(D * size_t(std::max(c.nout, 1l)), "ue legs");
+    e->Pr = dalloc<cd>(size_t(std::max(c.nout, 1l)) * size_t(c.nR_max), "ue readout");
+    e->flags = dalloc<int>(1 + 2 * np, "ue flags"); e->hflags.assign(1 + 2 * np, 0);
+    e->red = dalloc<unsigned long long>(2, "ue red");
+    size_t fr = 0, tot = 0;
+    cu_check(cudaMemGetInfo(&fr, &tot), "ue memgetinfo");
+    const double l0_room = std::max(0.0, double(fr) - c.reserve_bytes);
+    e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, l0_room, c.l0_fused != 0, c.l0_asm_gemm != 0, c.l0_fused == 2);
+    {
+      const size_t used = std::strlen(why);
+      std::snprintf(why + used, size_t(why_len) - used, "%sresident L0 k-batch K = %ld of %ld", used ? "; " : "", e->l0->K, long(c.nk));
+    }
+    e->l0->fz_cfg = c.l0_fz_cfg;
+    e->l0->fz_bench = (c.l0_fz_bench != 0);
+    return e;
+  }
+  // the entry points of the dynamic-rung blocks refuse a static-only engine (its rung, tau and refit buffers do not exist)
+  void no_static(unit_engine const *e, char const *who) {
+    if (e->c.static_only) APP_ABORT(std::string(" ") + who + ": the engine was created static-only (ue_config::static_only) -- ABORTING.");
+  }
+  } // namespace
+
   unit_engine *ue_create(ue_config const &c_in, double free_bytes, char *why, long why_len) {
+    if (c_in.static_only) return ue_create_static(c_in, free_bytes, why, why_len);
     // the budget: 90 % of the free memory minus the bytes the caller keeps for the later device stages (rung builds, Sigma
     // deposits, dressed legs). Candidates in order: every rung resident (two-input pass if asked, then one input), then the
     // partial residencies (the most resident first) when a source for the non-resident rungs exists (device rebuild with the
@@ -2003,6 +2079,7 @@ namespace methods::solvers::dynbse_cuda {
   }
   void ue_set_stream(unit_engine *e, rung_stream *rs) {
     if (not e->stream) APP_ABORT(std::string(" ue_set_stream: the engine was not created in stream mode."));
+    no_static(e, "ue_set_stream");
     e->rs = rs;
   }
 
@@ -2016,7 +2093,7 @@ namespace methods::solvers::dynbse_cuda {
       recon_form(e, 0, e->nres, e->Kds);
       cu_check(cudaDeviceSynchronize(), "reconstruct (resident node rungs)");
       e->t_form += wnow() - tf; e->nform += e->nres;
-    } else if (not e->stream) {                              // stream mode: Kds / Kd0 are the caller's empty arrays
+    } else if (not e->stream and not e->c.static_only) {     // stream mode: Kds / Kd0 are the caller's empty arrays (static-only too)
       h2d_c(e->Kd0, Kd0h, D * D, "ue Kd0");
       h2d_c(e->Kds, Kdsh, size_t(e->nres) * D * D, "ue Kds (resident)");
       // host-built rungs: the non-resident ones are copied per application (no device rebuild without the W tables)
@@ -2568,8 +2645,30 @@ namespace methods::solvers::dynbse_cuda {
     timing[0] += wnow() - t0;
   }
 
+  void ue_static(unit_engine *e, long nR, cplx const *Dblkh, cplx *Gsum0h, double *tim) {
+    if (not e->unit_ok) APP_ABORT(std::string(" ue_static: the unit's LU failed or was not set."));
+    if (nR > e->c.nR_max) APP_ABORT(std::string(" ue_static: block wider than the engine's nR_max."));
+    const long W = e->D * nR;
+    double t0 = wnow();
+    h2d_c(e->Dblk, Dblkh, size_t(W), "ue Dblk");
+    e->cbd_ok = false;
+    e->r1_ok = false;
+    tim[5] += wnow() - t0;
+    // ls_apply(D, y = 0) read through its sum only: F = L0 D, c = T_s Fsum, Gsum0 = Fsum + Cb c (as ue_gamma1's Gs0)
+    ue_l0(e, nR, nullptr, e->Dblk, e->Ffam, e->Fsum, &tim[0]);
+    ue_ts(e, nR, e->Fsum, &tim[1]);
+    t0 = wnow();
+    add2_kernel<<<grid_for(W), 256>>>(W, e->Fsum, e->cbb, e->Gs0);
+    launch_check("ue static Gs0");
+    cu_check(cudaDeviceSynchronize(), "ue static Gs0");
+    tim[4] += wnow() - t0; t0 = wnow();
+    if (Gsum0h != nullptr) cu_check(cudaMemcpy(Gsum0h, e->Gs0, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum0");
+    tim[6] += wnow() - t0;
+  }
+
   double ue_gamma1(unit_engine *e, long nR, cplx const *Dblkh, cplx *Gsum0h, cplx *Gsum1h, cplx *y1famh, cplx *y1csth, double *tim,
                    bool want_r1) {
+    no_static(e, "ue_gamma1");
     if (not e->unit_ok) APP_ABORT(std::string(" ue_gamma1: the unit's LU failed or was not set."));
     if (nR > e->c.nR_max) APP_ABORT(std::string(" ue_gamma1: block wider than the engine's nR_max."));
     const long D = e->D, np = e->c.np, W = D * nR;
@@ -2685,6 +2784,7 @@ namespace methods::solvers::dynbse_cuda {
   long ue_nblk(unit_engine const *e) { return e->nblk; }
 
   void ue_batch_begin(unit_engine *e, long nb, long const *widths, long nin) {
+    no_static(e, "ue_batch_begin");
     if (e->stream) APP_ABORT(std::string(" ue_batch_begin: the block-batched flow runs on the dense rungs (per-tau or factorized) only."));
     if (nb < 1 or nb > e->nblk) APP_ABORT(" ue_batch_begin: " + std::to_string(nb) + " blocks for an engine sized for " + std::to_string(e->nblk) + ".");
     if (nin < 1 or nin > 2 or (nin == 2 and e->bGc1 == nullptr))
@@ -2866,6 +2966,7 @@ namespace methods::solvers::dynbse_cuda {
 
   bool ue_sd_init(unit_engine *e, sd_config const &c, cplx const *Ttwh, cplx const *Uwh, cplx const *Gwh, double const *eps,
                   double const *epsG, double free_bytes, char *why, long why_len) {
+    no_static(e, "ue_sd_init");
     auto &s = e->sd;
     if (c.nk != e->c.nk or c.nc != e->c.nc or c.np != e->c.np or c.nt != e->c.nt or c.ng != e->c.ng) {
       APP_ABORT(std::string(" ue_sd_init: the Sigma deposit sizes differ from the engine's (internal inconsistency) -- ABORTING."));
@@ -3551,7 +3652,8 @@ namespace methods::solvers::dynbse_cuda {
     k.KC = long(std::min<double>(double(nk), std::max(1.0, std::floor(std::min(0.5 * (0.9 * free_bytes - need), 4.0e9) / (16.0 * per_k)))));
     auto al = [&](size_t n, char const *what) { cd *p = dalloc<cd>(n, what); k.allocs.push_back(p); return p; };
     k.X = al(size_t(ns * nsx * nka * Nm * e->c.nc), "kb X");
-    k.W0 = al(size_t(nq * Nm * Nm), "kb W0"); k.Wd0 = al(size_t(nq * Nm * Nm), "kb Wd0");
+    const bool st = (e->c.static_only != 0);                // static-only: K_s alone (no W_d0, no W_d tables)
+    k.W0 = al(size_t(nq * Nm * Nm), "kb W0"); k.Wd0 = st ? nullptr : al(size_t(nq * Nm * Nm), "kb Wd0");
     k.Wds = al(size_t(nrep * nq * Nm * Nm), "kb Wds");
     const size_t chunk = size_t(k.KC * nk);
     k.U1 = al(chunk * size_t(Nm * nc2), "kb U1"); k.U2 = al(chunk * size_t(Nm * nc2), "kb U2");
@@ -3572,7 +3674,8 @@ namespace methods::solvers::dynbse_cuda {
       for (long v = 0; v < nk * nk; ++v) any = any or (lay->tr_of[v] != 0);
       if (any) k.tr.assign(lay->tr_of, lay->tr_of + nk * nk);
     }
-    h2d_c(k.W0, W0h, size_t(nq * Nm * Nm), "kb W0"); h2d_c(k.Wd0, Wd0h, size_t(nq * Nm * Nm), "kb Wd0");
+    h2d_c(k.W0, W0h, size_t(nq * Nm * Nm), "kb W0");
+    if (not st) h2d_c(k.Wd0, Wd0h, size_t(nq * Nm * Nm), "kb Wd0");
     h2d_c(k.Wds, Wdsh, size_t(nrep * nq * Nm * Nm), "kb Wds");
     k.qx.assign(qx_of, qx_of + nk * nk);
     k.on = true;
@@ -3749,7 +3852,7 @@ namespace methods::solvers::dynbse_cuda {
     const cd one = make_cuDoubleComplex(1.0, 0.0);
     std::vector<long> ts = {-2, -1};
     std::vector<cd *> Kts = {e->Ks, e->Kd0};
-    if (e->stream) { ts.pop_back(); Kts.pop_back(); }        // stream mode: K_s only (the rung streams)
+    if (e->stream or e->c.static_only) { ts.pop_back(); Kts.pop_back(); }   // stream mode (the rung streams), static-only: K_s only
     if (e->recon)                                            // the reconstructed rung: its R factors K_r = K[A_r]
       for (long r = 0; r < e->rr; ++r) { ts.push_back(r); Kts.push_back(e->Kfac + size_t(r) * size_t(D) * size_t(D)); }
     else
@@ -4027,6 +4130,7 @@ namespace methods::solvers::dynbse_cuda {
 
   bool ue_dressed_prepare(unit_engine *e, long ng, cplx const *Hh, cplx const *Ghh, cplx const *Gth, cplx const *gkh,
                           cplx const *gkqh, bool ts_zero, char *why, long why_len) {
+    no_static(e, "ue_dressed_prepare");
     auto &d = e->dr;
     const long np = e->c.np, nk = e->c.nk, nc2 = e->nc2, D = e->D, nout = e->c.nout, R = e->c.nR_max;
     const size_t W = size_t(D) * size_t(R);
