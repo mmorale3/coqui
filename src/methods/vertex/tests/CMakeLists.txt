@@ -304,6 +304,18 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
+# The static-rung vertex self-consistency (pol_vertex_sc, pol_vertex_rung = "static"): the injected polarization, G, Sigma
+# and the energies equal those of the dynamic-rung chain injecting its static column; the static chain fills no W-bar cache.
+set(TEST_ID methods_vertex_sc_static)
+
+add_executable(test_${TEST_ID} test_vertex_sc_static.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib scr_coulomb_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
+
 # Ward legs: the discrete-Ward leg vertex ALGEBRA (ward_legs.hpp) on exact rational data --
 # closed-form pole sums vs dense Matsubara oracles, the q = 0 matrix telescoping, the
 # Z-link + positivity, R = 0 bitwise, the window complement identity. Pure toy.
