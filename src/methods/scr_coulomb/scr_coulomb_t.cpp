@@ -534,6 +534,23 @@ namespace solvers {
     // from eps_inv_head_q (the q-resolved head of THIS dW, div_treatment-independent), reported next to
     // the stored head above as the check of the div_treatment's q -> 0 recipe. Report-only, all ranks
     // evaluate the same replicated numbers; when off, no output line or dataset changes.
+    // vertex_debug head_meter: the q-resolved static eps_M(q) = 1 / Re eps^-1_00(q, i nu = 0) at the smallest |q|
+    if (methods::vertex_debug::number("head_meter", 0.0) != 0.0 and thc.mpi()->comm.root()) {
+      auto MF = thc.MF();
+      const long nq = eps_inv_head_q.shape(1);
+      long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+      nda::array<ComplexType, 2> eih_wq(nw_half, nq);
+      _ft->tau_to_w_PHsym(eps_inv_head_q, eih_wq);
+      std::vector<std::pair<double, long>> qs;
+      for (long iq = 0; iq < nq; ++iq) {
+        auto qv = MF->Qpts_ibz(iq);
+        qs.emplace_back(qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2), iq);
+      }
+      std::sort(qs.begin(), qs.end());
+      for (size_t i = 0; i < std::min(qs.size(), size_t(12)); ++i)
+        app_log(1, "  [head meter] eps_M(q): iq {:4d} |q|^2 {:12.5e}  eps_M = {:.6f}", qs[i].second, qs[i].first,
+                1.0 / (1.0 + eih_wq(0, qs[i].second).real()));
+    }
     std::optional<eps_fit::eps_inf_fit_t> eps_inf_fit_res;
     if (_eps_inf_fit) {
       eps_inf_fit_res = eval_eps_inf_fit(eps_inv_head_q, *thc.MF());
@@ -1529,6 +1546,44 @@ namespace solvers {
                  "inject_pol_ladder: shape mismatch (ladder {}x{}x{}, t {}x{}x{}, Pi q = "
                  "{}, Np = {}).", Plv.shape(0), Plv.shape(1), Nm, tmap.shape(0),
                  tmap.shape(1), tmap.shape(2), nq_g, Np);
+
+    // vertex_debug head_meter: the plane-wave head of the injected ladder polarization,
+    //   h_lad(q, i nu) = sum_PQ conj(chi_P(q)) dP_PQ(q, i nu) chi_Q(q) = u(q)^dag Pl(i nu, q) u(q),  u_N = sum_Q t_NQ(q) chi_Q(q),
+    // the contraction the w_sm leakage h(i nu) applies to the full Pi at q = 0. Charge conservation requires
+    // h_lad(q -> 0) = O(|q|^2); a finite h_lad(Gamma) is a q = 0 leakage of the ladder. Observer only.
+    if (methods::vertex_debug::number("head_meter", 0.0) != 0.0 and thc.mpi()->comm.root()) {
+      auto chi = thc.basis_head();                                       // (nqpts_ibz, Np)
+      const long nj = std::min(nw_h, 3l);
+      std::vector<std::pair<double, long>> qs;
+      for (long iq = 0; iq < nq_g; ++iq) {
+        auto qv = MF->Qpts_ibz(iq);
+        qs.emplace_back(qv(0) * qv(0) + qv(1) * qv(1) + qv(2) * qv(2), iq);
+      }
+      std::sort(qs.begin(), qs.end());
+      app_log(1, "  [head meter] ladder head h_lad(q, i nu) = u^dag Pl u at the smallest |q| (update {}):", _pol_inj_calls);
+      app_log(1, "  [head meter]   iq        |q|^2   h_lad(nu_0)    h_lad(nu_1)    h_lad(nu_2)   h_lad(nu_0)/|q|^2");
+      nda::array<ComplexType, 1> u(Nm), y(Nm);
+      for (size_t i = 0; i < std::min(qs.size(), size_t(12)); ++i) {
+        const long iq = qs[i].second;
+        for (long m = 0; m < Nm; ++m) {
+          ComplexType s = 0.0;
+          for (long P = 0; P < Np; ++P) s += tmap(iq, m, P) * chi(iq, P);
+          u(m) = s;
+        }
+        double h[3] = {0.0, 0.0, 0.0};
+        for (long j = 0; j < nj; ++j) {
+          nda::blas::gemv(Plv(j, iq, all, all), u, y);
+          ComplexType s = 0.0;
+          for (long m = 0; m < Nm; ++m) s += std::conj(u(m)) * y(m);
+          h[j] = s.real();
+        }
+        if (qs[i].first > 1e-12)
+          app_log(1, "  [head meter] {:4d} {:12.5e} {:+.6e} {:+.6e} {:+.6e}   {:+.6e}", iq, qs[i].first, h[0], h[1], h[2],
+                  h[0] / qs[i].first);
+        else
+          app_log(1, "  [head meter] {:4d} {:12.5e} {:+.6e} {:+.6e} {:+.6e}   (Gamma)", iq, qs[i].first, h[0], h[1], h[2]);
+      }
+    }
 
     // stash the inu = 0 row for the eps_M readout of THIS update_w. Half node 0 IS the nw_b/2
     // node eval_pol_ladder_nu0 evaluates, and the whalf return is already all_reduced/replicated,
