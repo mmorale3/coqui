@@ -1753,6 +1753,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     }
     solvers::scr_coulomb_t scr_eri(&ft, "rpa", div_treatment);
     scr_eri.set_eps_inf_fit(io::get_value_with_default<bool>(pt,"eps_inf_fit",false), io::get_value_with_default<long>(pt,"eps_inf_fit_npts",3));   // eps_inf small-q fit (report-only)
+    // lqsgw builds G from the unit-weight poles of H_QP, whose bubble has no q = 0 leakage to remove
+    utils::check(not lqsgw or io::get_value_with_default<std::string>(pt,"pol_q0_ward","none") == "none",
+                 "mbpt: lqsgw does not use the q = 0 Ward correction of the head of W; remove pol_q0_ward = {}.",
+                 io::get_value_with_default<std::string>(pt,"pol_q0_ward","none"));
     scr_eri.set_q0_ward(io::get_value_with_default<std::string>(pt,"pol_q0_ward","none"));   // q = 0 Ward-identity leakage of Pi
     scr_eri.set_q0_ward_taper(io::get_value_with_default<double>(pt,"pol_q0_ward_q1",0.3),
                               io::get_value_with_default<double>(pt,"pol_q0_ward_q2",1.0));   // w_sm taper
