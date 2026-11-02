@@ -25,6 +25,10 @@
  *   - "static": pol_vertex_rung = "static" (the static-only driver: no W-bar cache, no dynamic rung, no solve),
  * run end to end through scf_loop on identical inputs (pyscf_si222, the identity sublattice = "direct"), must agree to
  * round-off: the stored vertex polarization, G, Sigma and the energies. The static chain must never fill the W-bar cache.
+ *
+ * The LINEARIZED rung (pol_vertex_rung = "linearized") on the same chain (the fit weights of an LQSGW window set directly,
+ * no Z^1/2): with its dynamic remainder set to zero (vertex_debug lin_static_limit) it reproduces the static rung; with the
+ * real W-bar it runs on the same cache as the dynamic rung (the refresh cost is logged next to the static one).
  */
 
 #undef NDEBUG
@@ -54,6 +58,8 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/SCF/scf_driver.hpp"
 #include "methods/vertex/vertex_t.h"
+#include "methods/vertex/vertex_debug.hpp"
+#include "methods/SCF/qp/linearized_qp.hpp"
 #include "h5/h5.hpp"
 #include "nda/h5.hpp"
 
@@ -93,8 +99,8 @@ namespace bdft_tests {
     auto eri = mb_eri_t(thc, thc);
     const nda::range C(2, 6);   // two valence and two conduction bands of the 8 (4 occupied)
 
-    auto run = [&](std::string const &rung) {
-      const std::string out = "coqui_sc_static_" + rung;
+    auto run = [&](std::string const &rung, std::string const &tag = "", std::string const &dbg = "") {
+      const std::string out = "coqui_sc_static_" + rung + tag;
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", out);
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -105,6 +111,21 @@ namespace bdft_tests {
       vtx.set_pol_vertex("ladder", "w0_prev", C, -1, 1e-8, -1.0, -1.0, -1.0, "ladder_n2");
       vtx.set_ladder_rung(rung, 1e-8, 30, 12, -1.0);
       if (rung == "dynamic") vtx.set_ladder_dyn_gamma1_only(true);   // (the injected static column does not depend on it)
+      if (rung == "linearized") {   // the weights of an LQSGW window (n_fit = 6, symmetric, exact order), no Z^1/2
+        auto nw = lqp::fit_window(6, true);
+        std::vector<long> n(nw.begin(), nw.end());
+        lqp::fit_operator_t op;
+        const long nn = long(n.size());
+        op.fit_order = int(nn) - 1;
+        op.M = nda::array<cplx, 2>(nn, nn);
+        for (long j = 0; j < nn; ++j) {
+          const cplx ix(0.0, double(n[size_t(j)]) / 11.0);
+          cplx x = 1.0;
+          for (long q = 0; q < nn; ++q) { op.M(j, q) = x; x *= ix; }
+        }
+        vtx.set_lin_fit(n, lqp::zeroth_order_row(op));
+        vtx.set_lin_z(false);
+      }
       solvers::vertex_sc::config sc;
       sc.mode = "hybrid";
       sc.mesh = {2, 2, 2};   // the identity sublattice: runs as "direct"
@@ -112,11 +133,13 @@ namespace bdft_tests {
       vtx.set_pol_sc(sc);
       scr_eri.set_vertex(&vtx);
       sc_run r;
+      vertex_debug::set(dbg);
       const auto t0 = std::chrono::steady_clock::now();
       std::tie(r.e_hf, r.e_corr) = scf_loop(mb_state, dyson, eri, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
                                             2, false, 1e-9, true);
       mpi_context->comm.barrier();
       r.wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      vertex_debug::set("");
       REQUIRE(scr_eri.pol_vertex_instance() != nullptr);
       r.cached_w = scr_eri.pol_vertex_instance()->has_cached_w();
       r.G = nda::array<cplx, 5>(mb_state.sG_tskij.value().local());
@@ -154,6 +177,24 @@ namespace bdft_tests {
     REQUIRE(dS < tol * sS);
     REQUIRE(std::abs(rs.e_hf - rd.e_hf) < tol * std::abs(rd.e_hf));
     REQUIRE(std::abs(rs.e_corr - rd.e_corr) < tol * std::abs(rd.e_corr));
+
+    // the linearized rung: its static limit (the stored polarization is the Hermitian part of the static one's), then the real W-bar
+    auto rl0 = run("linearized", "_limit", "lin_static_limit=1");
+    auto rl = run("linearized");
+    nda::array<cplx, 4> Ph(rs.Pi);
+    for (long jn = 0; jn < Ph.shape(0); ++jn)
+      for (long iq = 0; iq < Ph.shape(1); ++iq)
+        for (long M = 0; M < Ph.shape(2); ++M)
+          for (long N = 0; N < Ph.shape(3); ++N) Ph(jn, iq, M, N) = 0.5 * (rs.Pi(jn, iq, M, N) + std::conj(rs.Pi(jn, iq, N, M)));
+    auto [dL, sL] = max_diff(rl0.Pi, Ph);
+    auto [dR, sR] = max_diff(rl.Pi, Ph);
+    app_log(1, "vertex_sc_lin_rung: static limit vs the static rung: max |Pi| diff {:.3e} (|Pi| {:.3e}), e_corr {:.12f} / {:.12f}; "
+               "linearized vs static: max |Pi| diff {:.3e}, e_corr {:.12f}; wall {:.1f} s (static) / {:.1f} s (linearized, limit) / "
+               "{:.1f} s (linearized)", dL, sL, rl0.e_corr, rs.e_corr, dR, rl.e_corr, rs.wall, rl0.wall, rl.wall);
+    REQUIRE(dL < 1e-10 * sL);
+    REQUIRE(std::abs(rl0.e_corr - rs.e_corr) < tol * std::abs(rs.e_corr));
+    REQUIRE(dR > 1e-6 * sL);
+    REQUIRE(rl.cached_w);
 #endif
   }
 
