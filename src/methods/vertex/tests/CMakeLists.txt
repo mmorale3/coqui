@@ -304,6 +304,18 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
+# The linearized rung (pol_vertex_rung = "linearized") on an exact rational toy: the separable system against the kd
+# operator, the static limit, the explicit-kernel reference and the q = 0 Ward identity -- seconds to run.
+set(TEST_ID methods_vertex_lin)
+
+add_executable(test_${TEST_ID} test_vertex_lin.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib qp_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
+
 # The static-rung vertex self-consistency (pol_vertex_sc, pol_vertex_rung = "static"): the injected polarization, G, Sigma
 # and the energies equal those of the dynamic-rung chain injecting its static column; the static chain fills no W-bar cache.
 set(TEST_ID methods_vertex_sc_static)
