@@ -182,6 +182,16 @@ namespace solvers {
       // the other outputs stay zero.
       nda::array<cplx, 4> *Pi_bub = nullptr;
       bool bubble_only = false;
+      // THE LINEARIZED RUNG (pol_vertex_rung = "linearized"; dynbse.hpp lin_*): when non-null the vertex is the separable
+      // solution of the kernel K_lin(iw') = sum_j c_j W(iw_j - iw') (n: the odd Matsubara indices of the fit nodes, c their
+      // weights, sum_j c_j = 1), returned in the static output (the only one); with L (ns, nk_arr, nc, nc) the outgoing pair of
+      // the kernel carries S = conj(L(k)) (x) L(k + q) (the Z^1/2 of H_QP in the pair frame; null: none)
+      struct lin_spec {
+        std::vector<long> n;
+        std::vector<cplx> c;
+        nda::array<cplx, 4> const *L = nullptr;
+      };
+      lin_spec const *lin = nullptr;
     };
 
 
@@ -864,6 +874,17 @@ namespace solvers {
           (*o)() = cplx(0.0);
         }
       utils::check(not opt.bubble_only or opt.Pi_bub != nullptr, "pair_space_ladder_dyn: bubble_only needs the Pi_bub output.");
+      const bool lin = (opt.lin != nullptr);                // the linearized rung: the separable solve, static output only
+      if (lin) {
+        utils::check(opt.dense_rung and not opt.static_only and not opt.one_rung_only and not opt.bubble_only and opt.sigma == nullptr and
+                     Pi_dyn1 == nullptr and Pi_gam1 == nullptr and Pi_dyn == nullptr and not wan,
+                     "pair_space_ladder_dyn: the linearized rung runs the dense rung (pol_vertex_dyn_dense = true) on the aux-frame P side "
+                     "alone (static output; no one-rung / bubble-only pass, no Sigma hook, no Wannier-pair output). ABORTING.");
+        utils::check(opt.lin->L == nullptr or (opt.lin->L->shape(0) == ns and opt.lin->L->shape(1) == nk_arr and
+                                               opt.lin->L->shape(2) == nc and opt.lin->L->shape(3) == nc),
+                     "pair_space_ladder_dyn: the linearized rung's Z^1/2 table does not match the pair frame (ns {}, k extent {}, nc {}).",
+                     ns, nk_arr, nc);
+      }
       nda::array<cplx, 4> *spin_ext[4] = {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn};
       std::array<nda::array<cplx, 4>, 4> spin_scr;
       if (wan_spin) {
@@ -1126,6 +1147,15 @@ namespace solvers {
                            "the dense mirror-pair pass"
                          : "FACTORIZED (pol_vertex_dyn_rung_apply = factorized): every K_r on every tau column");
         }
+      }
+      // vertex_debug lin_static_limit = 1 (the linearized rung's test of its static limit): W-bar(i nu) = W-bar(0), i.e. the dynamic
+      // remainder K_d and K_d(0) set to zero -- the separable solve then reduces to the static-rung ladder
+      if (lin and vertex_debug::flag("lin_static_limit")) {   // vertex_debug: lin_static_limit
+        if (shm_w) { sWd_s->win().fence(); sWd0->win().fence(); }
+        if (not shm_w or opt.shm_mpi->node_comm.rank() == 0) { Wd_s() = cplx(0.0); Wd0() = cplx(0.0); }
+        if (shm_w) { sWd_s->win().fence(); sWd0->win().fence(); }
+        if (A_rq.size() > 0) A_rq() = cplx(0.0);
+        if (rank == 0) app_log(1, "  [WARNING] [dynbse] vertex_debug lin_static_limit: the dynamic remainder of the rung is set to zero.");
       }
       // ---- transfer lookup ---------------------------------------------------------------------
       nda::array<long, 2> qx_of(nk, nk);
@@ -1944,6 +1974,10 @@ namespace solvers {
       long ndist = 0;
       nda::array<cplx, 3> Kd_s;
       nda::array<cplx, 2> Kd0;
+      // the linearized rung: the tau-node weights of the rung slots (nslot, nt; 1 on a PH representative's nodes, c_r(s_i) for a
+      // factor K_r) and the (s, q) left factor S (nk, nc^2, nc^2) of the outgoing pair (empty without Z^1/2)
+      nda::array<cplx, 2> lin_w;
+      nda::array<cplx, 3> lin_S;
       std::optional<db::pair_poles> Pcache;
       std::map<long, db::shift_tables> stab_cache;         // the twisted-pair tables depend on the nu node alone
       // NO SILENT WORKFLOW CHANGES. A device stage that does not fit moves to the CPU only when
@@ -1965,21 +1999,21 @@ namespace solvers {
       const std::string dressed_mode = (dr_dbg >= 0.0) ? std::string(dr_dbg != 0.0 ? "on" : "off") : dyn_dressed_state();
       const bool dressed_sig_ok = (opt.sigma == nullptr) or (opt.sigma->col == "dyn1" or opt.sigma->col == "dyn1_bare" or
                                                              opt.sigma->col == "static_dyn");
-      const bool dressed_fits = (opt.gamma1_only or opt.one_rung_only) and not opt.static_only and dressed_sig_ok;
+      const bool dressed_fits = (opt.gamma1_only or opt.one_rung_only) and not opt.static_only and not lin and dressed_sig_ok;
       const bool dressed_req = (dressed_mode != "off") and dressed_fits;
       // pol_vertex_dyn_gamma1_only on the Neumann path (gmres = 0) would run the full resummation while the caller
       // logs it as skipped -- abort (the dressed / one-rung / static paths do not reach the Neumann solver)
-      utils::check(not (opt.gamma1_only and opt.gmres_m <= 0 and not opt.static_only and not opt.one_rung_only and not dressed_req),
+      utils::check(not (opt.gamma1_only and opt.gmres_m <= 0 and not opt.static_only and not lin and not opt.one_rung_only and not dressed_req),
                    "pair_space_ladder_dyn: pol_vertex_dyn_gamma1_only = true with the Neumann solver (pol_vertex_dyn_gmres = 0) is not "
                    "implemented (the Neumann path runs the full resummation). ABORTING: use pol_vertex_dyn_gmres > 0.");
       const std::string dressed_why = (opt.sigma != nullptr and not dressed_sig_ok) ? "Sigma column " + opt.sigma->col
                                                                                    : std::string("the full GMRES resummation");
-      utils::check(not (dressed_mode == "on" and not opt.static_only and not dressed_fits),
+      utils::check(not (dressed_mode == "on" and not opt.static_only and not lin and not dressed_fits),
                    "pair_space_ladder_dyn: pol_vertex_dyn_dressed = on (required) but this dynamic pass cannot use the dressed legs "
                    "({}): ABORTING. The dressed legs apply to the Gamma_1-only / one-bare-rung passes (pol_vertex_dyn_gamma1_only = "
                    "true) and the Sigma columns dyn1 / dyn1_bare / static_dyn; use \"auto\" to run the standard path on the others.",
                    dressed_why);
-      if (rank == 0 and not opt.static_only)
+      if (rank == 0 and not opt.static_only and not lin)
         app_log(1, "  [dynbse] dressed legs (pol_vertex_dyn_dressed = {}): {}", dressed_mode,
                 dressed_req ? std::string("ON for this pass")
                             : (dressed_mode == "off" ? std::string("off -- the standard path runs")
@@ -1999,9 +2033,12 @@ namespace solvers {
       // the host path below.
       const bool ue_st = db::l0_device_enabled() and vertex_debug::number("dynbse_dev_unit", 1.0) != 0.0 and opt.static_only and
                          opt.sigma == nullptr and not opt.bubble_only and db::l0_cols_state();
-      const bool ue_want = ue_st or
+      // the LINEARIZED unit (dynbse.hpp lin_*): the static-only set plus K_d0 and the resident rung slots, the Lam tables and the
+      // separable system's LU on the device (ue_lin_assemble / ue_lin_solve)
+      const bool ue_ln = db::l0_device_enabled() and vertex_debug::number("dynbse_dev_unit", 1.0) != 0.0 and lin and db::l0_cols_state();
+      const bool ue_want = ue_st or ue_ln or
                            (db::l0_device_enabled() and vertex_debug::number("dynbse_dev_unit", 1.0) != 0.0 and   // vertex_debug: dynbse_dev_unit
-                            (opt.dense_rung or ue_stream) and opt.gmres_m > 0 and opt.gamma1_only and not opt.static_only and
+                            (opt.dense_rung or ue_stream) and opt.gmres_m > 0 and opt.gamma1_only and not opt.static_only and not lin and
                             not opt.one_rung_only and db::l0_cols_state() and not b.npf_mask and
                             not (opt.sigma != nullptr and opt.sigma->col == "dyn"));
       if (rank == 0 and db::l0_device_enabled() and not ue_want)
@@ -2017,8 +2054,10 @@ namespace solvers {
       auto unit_config = [&](long nd_x, bool plan_log) {
         dynbse_cuda::ue_config uc;
         uc.static_only = ue_st ? 1 : 0;
+        uc.lin = ue_ln ? 1 : 0;
         uc.np = np; uc.np_fit = b.np_fit; uc.nk = nk; uc.nc = nc; uc.ng = ng; uc.nt = nt; uc.nR_max = nrb;
-        uc.ndist = (rrank > 0 and not rrecon) ? rrank : nd_x; uc.n_kept = b.pf.n_kept; uc.nout = nout;   // R rung slots when frequency-factorized
+        uc.ndist = (rrank > 0 and (not rrecon or ue_ln)) ? rrank : nd_x; uc.n_kept = b.pf.n_kept; uc.nout = nout;   // R rung slots when frequency-factorized
+        if (ue_ln) uc.nres = uc.ndist;                     // (the linearized unit keeps every rung slot resident)
         // the reconstructed rung: the ndist representative rung slots and R resident factor slots; vertex_debug dyn_rung_recon_stage =
         // the rungs reconstructed per gemm (the factors are read once per such gemm; each slot is one D^2 staging buffer)
         uc.nfac = rrecon ? rrank : 0;
@@ -2239,7 +2278,7 @@ namespace solvers {
           dynbse_cuda::ue_config uc = unit_config(ue_st ? 0l : ndist, not sd_planned);
           char why[256] = {0};
           ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
-          if (ue and not ue_st) {                         // the rung form (mirror pairs / frequency-factorized)
+          if (ue and not ue_st and not ue_ln) {           // the rung form (mirror pairs / frequency-factorized)
             // vertex_debug: dyn_rung_recon_check = 1 runs the factorized pass next to every reconstructed one and logs the difference
             nda::array<cplx, 2> c_rep(rrecon ? ndist : 0, rrecon ? rrank : 0);   // reconstructed: the functions by representative slot
             for (long r = 0; r < (rrecon ? ndist : 0); ++r) c_rep(r, all) = c_tr(reps[size_t(r)], all);
@@ -2285,7 +2324,9 @@ namespace solvers {
                       std::to_string(nslot) + ", the others rebuilt on the device or copied from pinned host memory per " + per_pass;
             }
             app_log(1, "  [dynbse] device-resident unit{}: {} ({:.1f} GB estimated{}, {:.1f} GB reserved{}{}){}{}",
-                    ue_st ? " (STATIC-ONLY: K_s, the LU of 1 - Cb K_s, L0, T_s, the static readout)" : "", ue ? "ON" : "OFF",
+                    ue_st ? " (STATIC-ONLY: K_s, the LU of 1 - Cb K_s, L0, T_s, the static readout)"
+                          : (ue_ln ? " (LINEARIZED: K_s, K_d0 and the resident rung slots, the Lam tables, the LU of 1 - S M)" : ""),
+                    ue ? "ON" : "OFF",
                     dynbse_cuda::ue_bytes(ucr) / 1e9, resid, uc.reserve_bytes / 1e9,
                     (ue and ucr.rung_fuse) ? "; two inputs per rung pass" : "", ue_stream ? "; STREAMING rung" : "", ue ? "" : " -- ", ue ? "" : why);
           }
@@ -2371,7 +2412,7 @@ namespace solvers {
             opt.sigma->ks_herm = std::max(opt.sigma->ks_herm, (herm[1] > 0.0) ? herm[0] / herm[1] : 0.0);
             if (not sd_dev.on) dynbse_cuda::ue_get_ks(ue.get(), Ks.data());   // the host deposits read K_s
           }
-          if (rank == 0 and units_taken == 1 and not ue_st) {
+          if (rank == 0 and units_taken == 1 and not ue_st and not ue_ln) {
             const long nres_u = dynbse_cuda::ue_nres(ue.get());
             if (rrecon)
               app_log(2, "  [dynbse] reconstructed rung: R = {} matrices K_r ({:.2f} GB on the device) and {} of {} representative rungs "
@@ -2501,6 +2542,28 @@ namespace solvers {
               utils::check(not (b.eps(a) == Pcache->epsG(j) and a != Pcache->gnode(j)),
                            "pair_space_ladder_dyn: vertex node {} (eps {:.17g}) coincides with G pole {} which is attached to node {} -- a "
                            "degenerate node set (duplicate nodes). ABORTING.", a, b.eps(a), j, Pcache->gnode(j));
+        }
+        if (lin) {
+          const long nslot = (rrank > 0) ? rrank : ndist;
+          if (lin_w.shape(0) != nslot) {
+            lin_w = nda::array<cplx, 2>(nslot, nt);
+            lin_w() = cplx(0.0);
+            for (long i = 0; i < nt; ++i)
+              for (long r = 0; r < nslot; ++r)
+                lin_w(r, i) = (rrank > 0) ? c_tr(i, r) : ((trep[size_t(i)] == r) ? cplx(1.0) : cplx(0.0));
+          }
+          if (opt.lin->L != nullptr) {                     // S(k) = conj(L(k)) (x) L(k + q) on the pair (a at k, b at k + q)
+            auto const &L = *opt.lin->L;
+            lin_S = nda::array<cplx, 3>(nk, nc2, nc2);
+            for (long k = 0; k < nk; ++k) {
+              const long kq = kpq(iq, k);
+              for (long a = 0; a < nc; ++a)
+                for (long bb2 = 0; bb2 < nc; ++bb2)
+                  for (long a2 = 0; a2 < nc; ++a2)
+                    for (long b2 = 0; b2 < nc; ++b2)
+                      lin_S(k, a * nc + bb2, a2 * nc + b2) = std::conj(L(is, k, a, a2)) * L(is, kq, bb2, b2);
+            }
+          }
         }
         last_sq = sq;
 #if defined(ENABLE_CUDA)
@@ -2887,9 +2950,51 @@ namespace solvers {
           }
           build_cb_tau(G_CC, tools, is, iq, m, kpq, Cb_k);
           if (met) met->t_cb += watch.lap();
-          // the static resolvent (or T_s = 0 for the pure one-rung column)
+          // the static resolvent (or T_s = 0 for the pure one-rung column); the linearized rung: the separable system's LU
           db::static_resolvent S;
-          if (opt.one_rung_only) {
+          nda::matrix<cplx> lin_A;
+          nda::array<int, 1> lin_ipiv;
+          if (lin) {
+            const bool cond_on = ladder_cond::wanted(inu == cplx(0.0));
+            ladder_cond::estimate cond;
+            auto kap = db::lin_kappa(b, inu, db::lin_rho(b, inu, opt.lin->n, opt.lin->c), lin_w);
+            nda::array<cplx, 3> const *Sp = (opt.lin->L != nullptr) ? std::addressof(lin_S) : nullptr;
+#if defined(ENABLE_CUDA)
+            if (ue) {
+              double tfold_u = db::tfold_ratio();
+              tfold_u = vertex_debug::number("dynbse_tfold", tfold_u);
+              auto tl = db::make_l0_tables(b, P, stp, inu, tfold_u, ue_store);
+              (void)dynbse_cuda::ue_set_unit(ue.get(), Cb_k.data(), tl, inu == cplx(0.0), 0.0);
+              double tim[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+              const int info = dynbse_cuda::ue_lin_assemble(ue.get(), kap.data(), Sp ? lin_S.data() : nullptr, scale_k, tim);
+              utils::check(info == 0, "pair_space_ladder_dyn: the device getrf of the linearized system (1 - S M) failed (info {}).", info);
+              if (met) { met->t_l0 += tim[0]; met->t_l0_dev += tim[0]; met->t_rung += tim[2]; met->t_ts += tim[1]; met->t_l0_h2d += tim[5]; }
+              if (cond_on) {
+                utils::apply_blas_threads(nthr);
+                cond = ladder_cond::lanczos_inverse_gram(
+                    D, [&](cplx const *X, cplx *Y, long n) { dynbse_cuda::ue_cond_apply(ue.get(), X, Y, n); }, ladder_cond::kmax(),
+                    ladder_cond::block());
+                utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+              }
+            } else
+#endif
+            {
+              const bool lu_thr = (vertex_debug::number("dyn_lu_threads", 1.0) != 0.0);
+              if (lu_thr) utils::apply_blas_threads(nthr);
+              auto Lam = db::lin_lambda(b, P, inu, shared, Cb_k, stp, kap);
+              lin_A = db::lin_system(Ks, Cb_k, Kd_s, Lam, Kd0, scale_k, Sp);
+              lin_ipiv = nda::array<int, 1>(D);
+              const int info = nda::lapack::getrf(lin_A, lin_ipiv);
+              utils::check(info == 0, "pair_space_ladder_dyn: getrf of the linearized system (1 - S M) failed (info {}).", info);
+              if (cond_on)
+                cond = ladder_cond::lanczos_inverse_gram(
+                    D, [&](cplx const *X, cplx *Y, long n) { ladder_cond::apply_lu(D, lin_A.data(), lin_ipiv.data(), X, Y, n); },
+                    ladder_cond::kmax(), ladder_cond::block());
+              if (lu_thr) utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+            }
+            if (cond_on)
+              ladder_cond::add({is, (opt.q_label != nullptr) ? (*opt.q_label)[size_t(iq)] : iq, m, cond_call, inu == cplx(0.0), cond});
+          } else if (opt.one_rung_only) {
             S.D = D; S.nk = nk; S.nc = nc;
             if (opt.resolvent == "lu") {
               S.mode = "lu"; S.zero = true;                  // T_s = 0 without the dense zero matrices
@@ -3075,7 +3180,14 @@ namespace solvers {
             bool have_r1 = false;
 #if defined(ENABLE_CUDA)
             std::optional<nda::array<cplx, 2>> Pd_dev, Pr1_dev;            // the device dressed-leg columns
-            if (ue and dressed_dev) {
+            if (ue and lin) {
+              // the linearized unit: Gsum0 = Cb (1 - S M)^-1 D on the device, read out below (ue_readout(0))
+              res = db::dyson_result{};
+              double tim[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+              dynbse_cuda::ue_lin_solve(ue.get(), nR, Dblk.data(), nullptr, tim);
+              res.converged = true;
+              if (met) { met->t_ts += tim[1]; met->t_l0_h2d += tim[5]; met->t_l0_d2h += tim[6]; }
+            } else if (ue and dressed_dev) {
               have_r1 = want_r1;
               res = db::dyson_result{};
               Pd_dev.emplace(nout, nR); Pr1_dev.emplace(nout, nR);
@@ -3132,7 +3244,13 @@ namespace solvers {
               }
             } else
 #endif
-            if (dressed) {
+            if (lin) {
+              res = db::dyson_result{};
+              res.Gsum0 = db::lin_solve(lin_A, lin_ipiv, Cb_k, Dblk);
+              res.Gsum1 = res.Gsum0;
+              res.Gsum = res.Gsum0;
+              res.converged = true;
+            } else if (dressed) {
               const double tw0 = db::wall_now();
               utils::apply_blas_threads(nthr);
               // d~ = d + T_s Cb d (the ls_apply resolvent arithmetic on a constant input)
@@ -3354,7 +3472,7 @@ namespace solvers {
                   for (long N = 0; N < nR; ++N) Pb(M, N) += (*Pd_dev)(M, N);
                 place(Pi_gam1); place(Pi_dyn);
                 if (have_r1) { Pb() = *Pr1_dev; place(Pi_dyn1); }
-              } else if (opt.static_only) {
+              } else if (opt.static_only or lin) {
                 // the static column (the host static path writes the same sum into the Gamma_1 and resummed slots)
                 dynbse_cuda::ue_readout(ue.get(), nR, 0, Pb.data(), &trd);
                 place(Pi_static); place(Pi_gam1); place(Pi_dyn);
@@ -3445,7 +3563,7 @@ namespace solvers {
             ++met->nunits;
             // count each ending separately (stagnated / readout-stopped still count as done, but are reported; the
             // one-application passes are converged by definition instead of reporting "false")
-            const bool by_def = opt.one_rung_only or opt.static_only;
+            const bool by_def = opt.one_rung_only or opt.static_only or lin;
             if (res.converged) ++met->nconv;
             else if (res.stagnated) { ++met->nconv; ++met->n_stag; }
             else if (res.readout_converged) { ++met->nconv; ++met->n_rconv; }
@@ -4190,6 +4308,9 @@ namespace solvers {
    * With the STATIC rung (pol_vertex_rung = "static") the static column alone (only_col = 0) is evaluated: the static-only
    * pass of the driver (dyn_opts::static_only) on the same grids and node set -- the static column of the dynamic-rung pass,
    * without the W-bar cache (cache_w need not run), the dynamic rung tables or a solve.
+   * With the LINEARIZED rung (pol_vertex_rung = "linearized", only_col = 0) the column is the separable solve of the kernel
+   * K_lin(iw') = sum_j c_j W(iw_j - iw') (dyn_opts::lin, dynbse.hpp lin_*), with the Z^1/2 of the LQSGW quasiparticle
+   * solve on the outgoing pair (lin_z), Hermitized per (node, q) -- the one-sided kernel leaves P non-Hermitian.
    */
   vertex_t::dynbse_cut_result vertex_t::eval_pol_dynbse_cut(MBState &mb_state, THC_ERI auto &thc,
                                                             std::vector<long> const &half_nodes,
@@ -4204,12 +4325,15 @@ namespace solvers {
     utils::check(not _wannier or _wannier_frame != "pair",
                  "vertex_t::eval_pol_dynbse_cut: Wannier mode in the aux/point frame only (the pair frame is inu = 0 only).");
     utils::check(_W0b_qmm.has_value(), "vertex_t::eval_pol_dynbse_cut: W0bar is absent -- build_w0 must run first.");
-    const bool static_rung = (only_col == 0 and not ladder_dynamic_rung());   // the static column of the static-rung ladder alone
-    utils::check(static_rung or ladder_dynamic_rung(), "vertex_t::eval_pol_dynbse_cut: pol_vertex_rung = \"{}\" evaluates the static "
-                 "column alone (only_col = 0); got only_col = {}.", ladder_rung(), only_col);
+    const bool static_rung = (only_col == 0 and _ladder_rung == "static");   // the static column of the static-rung ladder alone
+    const bool lin_rung = (only_col == 0 and ladder_lin_rung());              // the separable solve of the linearized rung
+    utils::check(static_rung or lin_rung or ladder_dynamic_rung(), "vertex_t::eval_pol_dynbse_cut: pol_vertex_rung = \"{}\" evaluates "
+                 "the static column alone (only_col = 0); got only_col = {}.", ladder_rung(), only_col);
     utils::check(static_rung or has_cached_w(), "vertex_t::eval_pol_dynbse_cut: the W-bar cache is absent -- cache_w must run.");
-    utils::check(not static_rung or _shared_hook == nullptr,
+    utils::check(not (static_rung or lin_rung) or _shared_hook == nullptr,
                  "vertex_t::eval_pol_dynbse_cut: the shared Sigma hook needs the dynamic-rung pass (pol_vertex_rung = \"dynamic\").");
+    utils::check(not lin_rung or not _lin_n.empty(), "vertex_t::eval_pol_dynbse_cut: pol_vertex_rung = \"linearized\" needs the fit "
+                 "operator of the linearized quasiparticle loop ([lqsgw]); none was set.");
     auto MF = thc.MF();
     auto mpi = thc.mpi();
     nda::array<ComplexType, 5> G_CC;
@@ -4235,6 +4359,32 @@ namespace solvers {
     auto const &W0_in = (view != nullptr) ? vin.W0b : _W0b_qmm.value();
     auto Wbh_in = (view != nullptr) ? nda::array_view<ComplexType, 4>(vin.Wbh)
                                     : (static_rung ? nda::array_view<ComplexType, 4>(Wnone) : wb_cache());
+    // the linearized rung with lin_z: the left factor L = C^-dag Z^1/2 C^dag of the last LQSGW quasiparticle solve (primary basis,
+    // IBZ) taken to the ladder's frame on the full BZ exactly as G (an nt = 1 Green's function), then to the view's points
+    nda::array<ComplexType, 4> Lz;
+    if (lin_rung and _lin_z) {
+      utils::check(mb_state.sZhalf_skij.has_value(), "vertex_t::eval_pol_dynbse_cut: pol_vertex_lin_z = true needs the Z^1/2 of the "
+                   "LQSGW quasiparticle solve, which is not available at this update (the first update of a run, or a restart from a "
+                   "checkpoint written without Zhalf_skij): set pol_vertex_sc_start >= 2 (the first refresh after the first "
+                   "quasiparticle solve) or pol_vertex_lin_z = false. ABORTING.");
+      auto Zl = mb_state.sZhalf_skij.value().local();
+      const long nsz = Zl.shape(0), nk_ibz = Zl.shape(1), nb = Zl.shape(2), nkf = MF->nkpts(), ncl = subspace_rank();
+      const bool sym_mesh = (MF->nkpts() != MF->nkpts_ibz()) or (MF->nqpts() != MF->nqpts_ibz());
+      nda::array<ComplexType, 5> Z5(1, nsz, nk_ibz, nb, nb), Zc(1, nsz, nkf, ncl, ncl);
+      Z5(0, nda::ellipsis{}) = Zl;
+      if (_wannier)
+        vertex_wannier_detail::build_Gbar_fullbz(Z5, _U_skia, _band_window, sym_mesh, MF->kp_to_ibz(), MF->kp_trev(), Zc);
+      else
+        vertex_ladder_detail::expand_G_CC_fullbz(Z5, _band_window, sym_mesh, MF->kp_to_ibz(), MF->kp_trev(), Zc);
+      if (view != nullptr) {
+        Lz = nda::array<ComplexType, 4>(nsz, view->nk_arr(), ncl, ncl);
+        for (long i = 0; i < view->nk_arr(); ++i) Lz(all, i, all, all) = Zc(0, all, view->kpts(i), all, all);
+      } else {
+        Lz = Zc(0, nda::ellipsis{});
+      }
+    }
+    vd::dyn_opts::lin_spec lin_sp;
+    if (lin_rung) { lin_sp.n = _lin_n; lin_sp.c = _lin_c; lin_sp.L = _lin_z ? std::addressof(Lz) : nullptr; }
     auto const &kmq_in = (view != nullptr) ? view->kpq : kmq;   // (kmq is not read on a view)
     auto const &kpq_in = (view != nullptr) ? view->kpq : kpq;
     vertex_sym::sym_ctx const *symc_in = (view != nullptr) ? vin.symc_ptr() : symc;
@@ -4271,6 +4421,7 @@ namespace solvers {
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
     o.static_only = static_rung;
+    o.lin = lin_rung ? std::addressof(lin_sp) : nullptr;
     // the factorized rung's time functions of this cache (null: per-tau rung; the static rung has none)
     o.rung = static_rung ? nullptr : rung_basis_for_driver(tools.nt_f);
     o.rung_recon = static_rung ? false : ladder_dyn_rung_reconstruct();   // pol_vertex_dyn_rung_apply
@@ -4284,6 +4435,10 @@ namespace solvers {
     if (static_rung)
       app_log(1, "  [vertex ladder] pol_vertex_rung = \"static\": the static-rung ladder alone (the static column, rung W-bar_0); no "
                  "W-bar cache, no dynamic rung, no solve.");
+    else if (lin_rung)
+      app_log(1, "  [vertex ladder] pol_vertex_rung = \"linearized\": the separable ladder of K_lin(iw') = sum_j c_j W(iw_j - iw') "
+                 "({} fit nodes){}; one LU per (s, q, nu) unit, no solve.", _lin_n.size(),
+              _lin_z ? ", Z^1/2 on the outgoing pair" : " (pol_vertex_lin_z = false: no Z^1/2)");
     else if (_dyn_gamma1_only) app_log(1, "  [dynamic vertex] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // the measured unit times
@@ -4330,6 +4485,26 @@ namespace solvers {
     }
     for (auto *A : {&Ps, &P1, &Pg, &Pd, &Pb})
       if (A->size() > 0) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
+    if (lin_rung) {
+      // the one-sided kernel leaves P(q, i nu) non-Hermitian in (M, N); the stored polarization is the Hermitian part (the
+      // PH-symmetric half-node object with P(-i nu) = P(i nu)^dag = P(i nu))
+      double amax = 0.0;
+      nda::array<ComplexType, 2> Ah(Nm, Nm);
+      for (long jn = 0; jn < Ps.shape(0); ++jn)
+        for (long iq = 0; iq < Ps.shape(1); ++iq) {
+          auto A = Ps(jn, iq, all, all);
+          double dn = 0.0, an = 0.0;
+          for (long M = 0; M < Nm; ++M)
+            for (long N = 0; N < Nm; ++N) {
+              Ah(M, N) = 0.5 * (A(M, N) + std::conj(A(N, M)));
+              dn += std::norm(A(M, N) - std::conj(A(N, M)));
+              an += std::norm(A(M, N));
+            }
+          A = Ah;
+          if (an > 0.0) amax = std::max(amax, std::sqrt(dn / an));
+        }
+      r.lin_asym = amax;
+    }
     r.Pi_bub = std::move(Pb);
     met.reduce(mpi->comm);
     met.merge_unit_cost(_dyn_unit_cost);   // the measured unit times for the next call's order
@@ -4352,7 +4527,9 @@ namespace solvers {
                "watchdog max |Ritz(K_d L_s)| {:.3f}; G pole fit {:.2e}, tau refit {:.2e}; wall {:.1f} s (solve {:.1f} s on "
                "the slowest rank: rung {:.1f} s, refit {:.1f} s, L0 {:.1f} s, T_s gemms {:.1f} s, Arnoldi {:.1f} s, rest {:.1f} s; "
                "{} applications), RSS {:.2f} GB, omp_threads {}",
-            bubble_only ? "window bubble (bubble_only)" : (static_rung ? "static-rung ladder (static column)" : "dynamic-rung ladder"), nn,
+            bubble_only ? "window bubble (bubble_only)"
+                        : (static_rung ? "static-rung ladder (static column)" : (lin_rung ? "linearized-rung ladder" : "dynamic-rung ladder")),
+            nn,
             long(r.qsel.size()), o.gap_mask, o.gmres_m, o.rhs_block, met.nunits, met.it_max,
             (met.nunits > 0) ? double(met.it_sum) / double(met.nunits) : 0.0, r.all_converged, met.ritz_max,
             met.fit_err_G, met.refit_err_max, r.t_total, met.t_solve, met.t_rung, met.t_refit, met.t_l0, met.t_ts, met.t_orth,

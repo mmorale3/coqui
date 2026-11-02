@@ -97,7 +97,7 @@ public:
    * Write the QP-SCF state of iteration `iter` to CoQui checkpoint: 
    * 
    * Dm_skij, Heff_skij, MO_skia, E_ska and mu (chkpt::dump_scf), 
-   * plus Zqp_ska when an LQSGW iteration set sZqp_ska.
+   * plus Zqp_ska and Zhalf_skij when an LQSGW iteration set sZqp_ska / sZhalf_skij.
    *
    * Zqp_ska is computed before damping/DIIS, while E_ska is not. 
    * So with damping or DIIS their band labels may not match until convergence.
@@ -195,6 +195,9 @@ public:
   // LQSGW pole weights <v|Z|v> of the current iteration, in the eigenvalue order of the unmixed
   // H_QP (pairing with E_ska: see dump_qpscf)
   std::optional<sArray_t<nda::array_view<double, 3> > > sZqp_ska;
+  // LQSGW: the left factor L = C^-dag Z^1/2 C^dag of the last quasiparticle solve (primary basis, IBZ; delta Heff = L delta(F +
+  // A) L^dag with C the MO coefficients of that solve), the Z^1/2 the linearized vertex rung reads (pol_vertex_lin_z)
+  std::optional<sArray_t<nda::array_view<ComplexType, 4> > > sZhalf_skij;
 
   
   /** local quantities in MLWF basis for quantum embedding */

@@ -59,6 +59,13 @@
   `pol_vertex_sc_col` defaults to `"static"` with the static rung (`"gam1"` / `"dyn"` abort). The same static column as the
   dynamic-rung pass, without the W̄ cache, the dynamic rung tables or a solve; a static-only device unit (K_s, the LU of
   1 − C̄ K_s, L0, T_s) runs it on the GPU. P side only: the dynamic pair Σ vertex keeps `pol_vertex_rung = "dynamic"`.
+- Linearized vertex rung for LQSGW (`pol_vertex_rung = "linearized"`, with `pol_vertex_sc`): the kernel of the linearized
+  quasiparticle Hamiltonian, K_lin(iω′) = Σ_j c_j W̄(iω_j − iω′) with c_j the zeroth-order row of the `[lqsgw.lqp]` fit, a
+  function of the inner loop frequency only. The ladder is separable (one LU per unit, no Krylov solve) and its q = 0 head
+  vanishes for a quasiparticle G. `pol_vertex_lin_z` (default true) puts the Z^½ of the last quasiparticle solve on the
+  outgoing pair (stored per iteration as `Zhalf_skij`); the δZ (δB) term is omitted (a first-order Σ-insertion correction,
+  not included). The one-sided kernel makes P non-Hermitian; its Hermitian part is stored and the anti-Hermitian norm is
+  logged per refresh. Host and device (linearized unit: K_s, K_d(0), the resident rung slots, the LU of 1 − S M) paths.
 
 ### Improved
 

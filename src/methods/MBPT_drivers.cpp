@@ -118,9 +118,10 @@ namespace {
                  "\"static\" (default with pol_vertex_rung = \"static\").", c.col);
     utils::check(not c.enabled() or rung == "dynamic" or c.col == "static",
                  "pol_vertex_sc_col = \"{}\" needs pol_vertex_rung = \"dynamic\": with pol_vertex_rung = \"{}\" the self-consistent "
-                 "ladder is the static-rung one and injects its static column (pol_vertex_sc_col = \"static\").", c.col, rung);
+                 "ladder has a single column, \"static\" (pol_vertex_sc_col = \"static\").", c.col, rung);
     if (c.enabled() and rung != "dynamic" and not col_given)
-      app_log(1, "  [vertex self-consistency] pol_vertex_rung = \"{}\": the static-rung sublattice ladder, injected column \"static\".", rung);
+      app_log(1, "  [vertex self-consistency] pol_vertex_rung = \"{}\": the {} sublattice ladder, injected column \"static\".", rung,
+              rung == "linearized" ? "separable linearized-rung" : "static-rung");
     return c;
   }
 }
@@ -580,13 +581,26 @@ namespace mbpt_vertex_audit {
  *                 alone -- the rung W-bar_0 = W(q, i nu' = 0) of the update, resummed at every external nu (the static
  *                 quasiparticle BSE: the static column of the dynamic-rung pass, without the W-bar cache, the dynamic rung tables
  *                 or a solve; on the device the static-only unit). The static rung is P-side only (the dynamic pair Sigma vertex
- *                 needs pol_vertex_rung = "dynamic") and has no ladder_tda / Ward legs. "interp" (S1) solves the sublattice's own transfers (N_c / 2
+ *                 needs pol_vertex_rung = "dynamic") and has no ladder_tda / Ward legs. pol_vertex_rung = "linearized" ([lqsgw]
+ *                 only): the sublattice ladder of the kernel of the linearized quasiparticle Hamiltonian,
+ *                 K_lin(i w') = sum_j c_j W-bar(i w_j - i w') (c_j the zeroth-order row of the [lqsgw.lqp] fit at its nodes i w_j,
+ *                 sum_j c_j = 1), a function of the INNER loop frequency only: the vertex is frequency-independent and the ladder
+ *                 separable, Gamma = (1 - sum_w' K_lin L0)^-1 D (one LU per (s, q, nu) unit, no Krylov solve; the W-bar cache and
+ *                 the dense rung of the dynamic pass, the frequency-factorized rung when pol_vertex_dyn_rung_rank / _tol is set;
+ *                 on the device the linearized unit). Its q = 0 ladder head vanishes for a quasiparticle G (the one-sided kernel
+ *                 keeps the Ward identity of the bubble). pol_vertex_lin_z (true): the outgoing pair of the kernel carries the
+ *                 Z^1/2 of the last LQSGW quasiparticle solve (delta H_QP = Z^1/2 delta(F + A) Z^1/2; the first refresh needs a
+ *                 solve before it: pol_vertex_sc_start >= 2, or a restart from a checkpoint with Zhalf_skij). The delta Z (delta B)
+ *                 term of delta H_QP is omitted. The one-sided kernel leaves P(q, i nu) non-Hermitian: the stored polarization is
+ *                 its Hermitian part (the refresh logs the relative anti-Hermitian norm). P-side only, like the static rung.
+ *                 "interp" (S1) solves the sublattice's own transfers (N_c / 2
  *                 with pol_vertex_sc_trev = true, Pi-bar(-q) = conj Pi-bar(q)) and Fourier-interpolates (Wigner-Seitz images of
  *                 the sublattice's supercell) to the mesh's IBZ transfers; "direct" (S2) solves EVERY fine IBZ transfer with the
  *                 internal sums on the sublattice (exact at the fine q, no interpolation). pol_vertex_sc_head ("coarse" | "fine" |
  *                 "none"): the Gamma-row head weight rescaled to the sublattice's Madelung weight N_c xi_c (default), kept, or
  *                 removed; pol_vertex_sc_col ("gam1" | "dyn" | "static") the ladder column (default "gam1" with the dynamic rung;
- *                 the static rung injects "static", its only column: "gam1" / "dyn" abort); pol_vertex_sc_batch (8) external
+ *                 the static and the linearized rungs inject "static", their only column -- for the linearized rung the separable
+ *                 ladder of its kernel: "gam1" / "dyn" abort); pol_vertex_sc_batch (8) external
  *                 transfers per ladder pass; pol_vertex_sc_unfold ("fit" | "solve": on a symmetric mesh "interp" solves the
  *                 IBZ sublattice transfers only and unfolds their star images in the aux frame through the ISDF fit of the
  *                 rotated pair densities, Pi-bar(S q) = conj(T) Pi-bar(q) T^T; "solve" solves every sublattice transfer, time
@@ -631,8 +645,9 @@ namespace mbpt_vertex_audit {
  *                 term Delta P^Lambda to the ladder's output, (M,N)-Hermitized. The eps_M
  *                 readout gains a "+DeltaLambda" column (chi0_Lambda alone). Requires
  *                 ladder_solve_grid = 1.
- *  - pol_vertex_rung: "static" The ladder's RUNG. {choices: "static", "dynamic"}. "static":
- *                 the W0bar rung (with pol_vertex_sc: the static-rung sublattice ladder, see there). "dynamic" resums the ladder with the FULL-FREQUENCY
+ *  - pol_vertex_rung: "static" The ladder's RUNG. {choices: "static", "dynamic", "linearized"}. "static":
+ *                 the W0bar rung (with pol_vertex_sc: the static-rung sublattice ladder, see there). "linearized": the kernel of the
+ *                 LQSGW quasiparticle Hamiltonian ([lqsgw] with pol_vertex_sc only, see there). "dynamic" resums the ladder with the FULL-FREQUENCY
  *                 screened rung W(inu') (two-family DLR representation of the loop frequency,
  *                 static part exact, dynamic remainder by GMRES); the eps_M readout gains the
  *                 columns +static(sign-corrected) / +static+Pi^C_dyn / +Gamma_1 / +resummed at
@@ -1801,6 +1816,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
             io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
             io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",12),
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+        // the linearized rung differentiates H_QP of the linearized QP loop; pol_vertex_lin_z: its Z^1/2 on the outgoing pair
+        utils::check(lqsgw or pol_vertex_rung != "linearized",
+                     "mbpt: pol_vertex_rung = \"linearized\" differentiates the linearized quasiparticle Hamiltonian: it needs "
+                     "solver_type = lqsgw.");
+        pol_vertex_carrier.set_lin_z(io::get_value_with_default<bool>(pt,"pol_vertex_lin_z",true));
         pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
         pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
         // freeze / dump the secondary ISDF points, the Wannier output frame, and the fine-mesh consumer of an

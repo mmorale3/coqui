@@ -3531,6 +3531,149 @@ namespace dynbse {
     }
   }
 
+  // ==================================================================================================================
+  // THE LINEARIZED RUNG (pol_vertex_rung = "linearized"): the kernel of the linearized quasiparticle Hamiltonian,
+  //
+  //   K_lin(iw'; inu) = sum_j c_j W(iw_j - iw'),      A = sum_j c_j Sigma(iw_j)   (c: the LQSGW fit operator's A row),
+  //
+  // a function of the INNER loop frequency iw' only. The vertex is then frequency-independent and the ladder separable:
+  //
+  //   Gamma = D + M Gamma,   M = (1/beta) sum_w' K_lin(iw') L0(iw'),   Gsum = Cb Gamma = Cb (1 - M)^-1 D.
+  //
+  // With K = K_s + K_d (the static rung W0bar and the dynamic remainder) and sum_j c_j = 1,
+  //
+  //   M = K_s Cb + sum_j c_j [K_d * L0](iw_j),
+  //
+  // the second term being the dynamic rung's output (kd: the tau product K_d(s) F(s), refit onto the pole families, plus
+  // the constant part -K_d(0) Cb) evaluated at the fit nodes. The refit is linear, so the evaluation is a fixed weight per
+  // tau node, rho_f(s_i) (lin_rho), and with K_d(s_i) shared by the nodes of a rung slot (the PH representative, or the
+  // factor K_r of the frequency-factorized rung with weights c_r(s_i)):
+  //
+  //   M = K_s Cb + scale_k [ sum_r K_r Lam_r - K_d(0) Cb ],   Lam_r(k) = sum_{i in r} w_r(s_i) sum_f rho_f(s_i) L_f(k, s_i),
+  //
+  // L_f(k, s) the tau values of family f of L0 applied to a frequency-constant pair (block diagonal in k). Lam_r is
+  // formed from the L0 families of the identity pairs (one L0 application of nc^2 columns) and the per-node weights
+  // kappa (lin_kappa). An optional block-diagonal left factor S (the Z^1/2 of H_QP on the outgoing pair) multiplies M.
+  // ==================================================================================================================
+
+  /** rho (2, nt): sum_j c_j y(iw_j) = sum_f sum_i rho(f, i) Ys_f(s_i) for the families of a kd output y refit from their tau
+   *  values Ys_f (y(z) = sum_a fam0_a U_a(z) + fam1_a U_a(z) S_a(z) + cst: family 1 holds the twisted pairs, whose tau functions
+   *  carry the phi_nu factor kd leaves out of the refit; the constant part is not included).
+   *  n_fit: the odd Matsubara indices n of the fit nodes iw_j = i n pi / beta; c_fit their weights. At inu = 0 the second
+   *  family is folded into the first before the refit: rho(1, :) = 0. */
+  inline nda::array<cplx, 2> lin_rho(freq_basis const &b, cplx inu, std::vector<long> const &n_fit, std::vector<cplx> const &c_fit) {
+    utils::check(not n_fit.empty() and n_fit.size() == c_fit.size(), "dynbse::lin_rho: {} fit nodes, {} weights.", n_fit.size(),
+                 c_fit.size());
+    const long nt = b.nt;
+    nda::array<cplx, 2> Id(nt, nt);
+    Id() = cplx(0.0);
+    for (long i = 0; i < nt; ++i) Id(i, i) = cplx(1.0);
+    auto R = basis_coeffs(b, Id);                                   // (>= np_fit, nt): the refit map
+    nda::array<cplx, 2> rho(2, nt);
+    rho() = cplx(0.0);
+    const bool nu0 = (inu == cplx(0.0));
+    for (size_t j = 0; j < n_fit.size(); ++j) {
+      const cplx z(0.0, double(n_fit[j]) * M_PI / b.beta);
+      for (long a = 0; a < b.np_fit; ++a) {
+        const cplx u0 = c_fit[j] / (z - b.eps(a)), u1 = nu0 ? cplx(0.0) : u0 / (z + inu - b.eps(a));
+        for (long i = 0; i < nt; ++i) {
+          rho(0, i) += u0 * R(a, i);
+          rho(1, i) += u1 * R(a, i);
+        }
+      }
+    }
+    return rho;
+  }
+
+  /** kappa (nslot, 2 np): the weight of every L0 output component (family f, node p) in Lam_r. wslot (nslot, nt): the weight of
+   *  tau node i in rung slot r (1 on the nodes of a PH representative; c_r(s_i) for a factor K_r). The tau expansion of the
+   *  families is kd's: KF for family 0, and for family 1 KF2 at inu = 0 (folded into family 0) or KF (with rho_1). */
+  inline nda::array<cplx, 2> lin_kappa(freq_basis const &b, cplx inu, nda::array<cplx, 2> const &rho, nda::array<cplx, 2> const &wslot) {
+    const long nt = b.nt, np = b.np, nslot = wslot.shape(0);
+    utils::check(rho.shape(0) == 2 and rho.shape(1) == nt and wslot.shape(1) == nt, "dynbse::lin_kappa: shapes.");
+    const bool nu0 = (inu == cplx(0.0));
+    nda::array<cplx, 2> kap(nslot, 2 * np);
+    kap() = cplx(0.0);
+    for (long r = 0; r < nslot; ++r)
+      for (long i = 0; i < nt; ++i) {
+        const cplx w = wslot(r, i);
+        if (w == cplx(0.0)) continue;
+        const cplx w0 = w * rho(0, i), w1 = w * (nu0 ? rho(0, i) : rho(1, i));
+        for (long p = 0; p < np; ++p) {
+          kap(r, p) += w0 * b.KF(i, p);
+          kap(r, np + p) += w1 * (nu0 ? b.KF2(i, p) : b.KF(i, p));
+        }
+      }
+    return kap;
+  }
+
+  /** Lam (nslot, nk, nc^2, nc^2), Lam_r(k)[pair, c] = sum_{f, p} kappa(r, f np + p) [L0 e_c].fam(f, p, k, pair): L0 applied to
+   *  the frequency-constant identity pairs (column c = the unit pair c at every k), contracted with kappa. */
+  inline nda::array<cplx, 4> lin_lambda(freq_basis const &b, pair_poles const &P, cplx inu, bool shared, nda::array<cplx, 3> const &Cb_k,
+                                        shift_tables const *st, nda::array<cplx, 2> const &kappa) {
+    const long nk = P.nk, nc = P.nc, nc2 = nc * nc, np = b.np, nslot = kappa.shape(0);
+    utils::check(kappa.shape(1) == 2 * np, "dynbse::lin_lambda: kappa has {} columns, expected 2 np = {}.", kappa.shape(1), 2 * np);
+    tf_vector X(np, nk, nc, nc2), F(np, nk, nc, nc2);
+    nda::array<cplx, 4> Fsum(nk, nc, nc, nc2);
+    for (long k = 0; k < nk; ++k)
+      for (long c = 0; c < nc2; ++c) X.cst(k, c / nc, c % nc, c) = cplx(1.0);
+    l0_apply(b, P, inu, shared, X, F, Fsum, &Cb_k, st, false, true);
+    nda::array<cplx, 4> Lam(nslot, nk, nc2, nc2);
+    auto F2 = nda::reshape(F.fam, std::array<long, 2>{2 * np, nk * nc2 * nc2});
+    auto L2 = nda::reshape(Lam, std::array<long, 2>{nslot, nk * nc2 * nc2});
+    nda::blas::gemm(kappa, F2, L2);
+    return Lam;
+  }
+
+  /** the row-major (D x D) system A = 1 - S M of the separable solve (A Gamma = D), M = Ks Cb + scale [sum_r K_r Lam_r - Kd0 Cb]
+   *  with Ks already scaled, Cb_k and Lam_r block diagonal in k, S (nk, nc^2, nc^2) block diagonal on the rows (null: none). */
+  inline nda::matrix<cplx> lin_system(nda::array<cplx, 2> const &Ks, nda::array<cplx, 3> const &Cb_k, nda::array<cplx, 3> const &Kslot,
+                                      nda::array<cplx, 4> const &Lam, nda::array<cplx, 2> const &Kd0, cplx scale,
+                                      nda::array<cplx, 3> const *S) {
+    decltype(nda::range::all) all;
+    const long nk = Cb_k.shape(0), nc2 = Cb_k.shape(1), D = nk * nc2, nslot = Lam.shape(0);
+    utils::check(Ks.shape(0) == D and Kd0.shape(0) == D and Kslot.shape(0) >= nslot and (nslot == 0 or Kslot.shape(1) == D),
+                 "dynbse::lin_system: shapes (D = {}, {} rung slots).", D, nslot);
+    nda::matrix<cplx> M(D, D);
+    for (long k = 0; k < nk; ++k) {
+      const auto cols = nda::range(k * nc2, (k + 1) * nc2);
+      auto Mk = M(all, cols);
+      nda::blas::gemm(cplx(1.0), Ks(all, cols), Cb_k(k, all, all), cplx(0.0), Mk);
+      for (long r = 0; r < nslot; ++r) nda::blas::gemm(scale, Kslot(r, all, cols), Lam(r, k, all, all), cplx(1.0), Mk);
+      nda::blas::gemm(-scale, Kd0(all, cols), Cb_k(k, all, all), cplx(1.0), Mk);
+    }
+    if (S != nullptr) {
+      utils::check(S->shape(0) == nk and S->shape(1) == nc2 and S->shape(2) == nc2, "dynbse::lin_system: S shape.");
+      nda::array<cplx, 2> Mk(nc2, D);
+      for (long k = 0; k < nk; ++k) {
+        const auto rows = nda::range(k * nc2, (k + 1) * nc2);
+        Mk() = M(rows, all);
+        auto Mo = M(rows, all);
+        nda::blas::gemm((*S)(k, all, all), Mk, Mo);
+      }
+    }
+    for (long i = 0; i < D; ++i)
+      for (long j = 0; j < D; ++j) M(i, j) = ((i == j) ? cplx(1.0) : cplx(0.0)) - M(i, j);
+    return M;
+  }
+
+  /** Gsum = Cb (1 - S M)^-1 D for the external legs Dblk (nk, nc, nc, nR), from the getrf factors of lin_system */
+  inline nda::array<cplx, 4> lin_solve(nda::matrix<cplx> const &Alu, nda::array<int, 1> const &ipiv, nda::array<cplx, 3> const &Cb_k,
+                                       nda::array<cplx, 4> const &Dblk) {
+    const long nk = Dblk.shape(0), nc = Dblk.shape(1), nc2 = nc * nc, nR = Dblk.shape(3), D = nk * nc2;
+    nda::matrix<cplx, nda::F_layout> Y(D, nR);
+    Y() = nda::reshape(Dblk, std::array<long, 2>{D, nR});
+    const int info = nda::lapack::getrs(Alu, Y, ipiv);
+    utils::check(info == 0, "dynbse::lin_solve: getrs failed (info {}).", info);
+    nda::array<cplx, 2> z(Y);
+    nda::array<cplx, 4> Gsum(nk, nc, nc, nR);
+    for (long k = 0; k < nk; ++k) {
+      auto Gk = nda::reshape(Gsum(k, nda::ellipsis{}), std::array<long, 2>{nc2, nR});
+      nda::blas::gemm(Cb_k(k, nda::range::all, nda::range::all), z(nda::range(k * nc2, (k + 1) * nc2), nda::range::all), Gk);
+    }
+    return Gsum;
+  }
+
 } // namespace dynbse
 } // namespace solvers
 } // namespace methods

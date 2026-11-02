@@ -70,6 +70,14 @@ namespace methods {
       }
       mpi->comm.barrier();
     }
+    if (sZhalf_skij.has_value()) {
+      if (mpi->comm.root()) {
+        h5::file file(coqui_prefix + ".mbpt.h5", 'a');
+        auto iter_grp = h5::group(file).open_group("scf/iter" + std::to_string(iter));
+        nda::h5_write(iter_grp, "Zhalf_skij", sZhalf_skij.value().local(), false);
+      }
+      mpi->comm.barrier();
+    }
   }
 
   void MBState::set_zero_local_polarizabilities() {

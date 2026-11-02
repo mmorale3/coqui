@@ -53,7 +53,7 @@ namespace vertex_debug {
         "dynbse_l0_device", "dynbse_l0_fused", "dynbse_l0_fz_bench", "dynbse_l0_fz_cfg", "dynbse_l0_pb", "dynbse_refit_loop",
         "dynbse_ritz", "dynbse_sq_cache", "dynbse_tfold", "dynbse_tkeep", "dynbse_union", "dynbse_vmask", "eps_readout_device",
         "eta_device", "head_meter", "inject_device", "interp_cache", "kd_blas_threads", "keep_host_w", "l2_blas_threads",
-        "ladder_cond_abort", "ladder_cond_all_nu", "ladder_cond_block", "ladder_cond_iters", "ladder_cond_warn", "park_w_device",
+        "ladder_cond_abort", "ladder_cond_all_nu", "ladder_cond_block", "ladder_cond_iters", "ladder_cond_warn", "lin_static_limit", "park_w_device",
         "pi_hooks_device", "rung_dump", "rung_dump_exit", "rung_rank", "sc_wcache_rows", "scf_causality_abort", "scf_causality_matrix", "scf_causality_meter",
         "scf_causal_proj", "scf_causal_proj_maxit", "scf_causal_proj_tol", "scf_causal_proj_rho", "scf_causal_proj_wmax",
         "scf_causal_proj_wmin", "scf_causal_proj_nw", "scf_causal_proj_select", "scf_causal_proj_warn", "scf_causal_proj_device", "scf_causal_proj_dump",

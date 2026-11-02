@@ -91,6 +91,12 @@ namespace solvers {
                                    (_vertex->enabled() and _vertex->active()));
   }
 
+  void scr_coulomb_t::set_lin_fit(std::vector<long> n, std::vector<ComplexType> c) {
+    if (_vertex == nullptr) return;
+    _vertex->set_lin_fit(n, c);
+    if (_pol_vtx) _pol_vtx->set_lin_fit(std::move(n), std::move(c));
+  }
+
   bool scr_coulomb_t::sigma_dyn_final_full() const {
     return _vertex != nullptr and _vertex->sigma_pair_enabled() and _vertex->sigma_pair_dynamic() and _vertex->sigma_dyn_self_ref()
            and _vertex->sigma_dyn_final_full() and _vertex->sigma_interp_file().empty();
@@ -720,13 +726,14 @@ namespace solvers {
     if (pol_p_pass) solvers::ladder_cond::begin("P refresh");
     if (pol_sc_pass) {
       // pol_vertex_sc: no full-mesh ladder. When a refresh is due the vertex polarization is recomputed from THIS update's
-      // G and W on the coarse sublattice; the next updates inject it (inject_pol_ladder). The dynamic rung reads the W-bar
-      // cache, the static rung (pol_vertex_rung = "static": the static column alone) W-bar_0 only -- no cache fill.
+      // G and W on the coarse sublattice; the next updates inject it (inject_pol_ladder). The dynamic and the linearized rung
+      // read the W-bar cache, the static rung (pol_vertex_rung = "static": the static column alone) W-bar_0 only -- no cache fill.
       if (h5_iter >= 0) {
         ++_pol_sc_updates;
         if (_pol_sc.due(_pol_sc_updates)) {
           const double w0 = uw_wall();
-          if (pol_dyn_readout) {
+          const bool sc_wcache = _pol_vtx->ladder_needs_wcache();   // the dynamic and the linearized rung read the W-bar cache
+          if (sc_wcache) {
             // the rungs of the sublattice ladder read W-bar at the sublattice transfers only: restrict the cache to them
             if (_pol_vtx->wcache_rows().empty() and methods::vertex_debug::number("sc_wcache_rows", 1.0) != 0.0) {   // vertex_debug: sc_wcache_rows
               auto MFp = thc.MF();
@@ -740,7 +747,7 @@ namespace solvers {
           park_W();
           preflight_sigma_pair(mb_state, thc);
           refresh_pol_sc(mb_state, thc);
-          if (pol_dyn_readout)
+          if (sc_wcache)
             app_log(1, "  [update_w wall] vertex self-consistency: W-bar cache fill {:.1f} s, refresh {:.1f} s", w1 - w0, uw_wall() - w1);
           else
             app_log(1, "  [update_w wall] vertex self-consistency (static rung, no W-bar cache): refresh {:.1f} s", uw_wall() - w1);
@@ -989,6 +996,8 @@ namespace solvers {
       _pol_sc.cfg.mode = "direct";
     }
     _pol_vtx->set_pol_sc(_pol_sc.cfg);   // the readout instance's Sigma vertex runs on the same sublattice (eval_sigma_pair_dyn)
+    utils::check(not _vertex->ladder_lin_rung() or _pol_sc.cfg.enabled(),
+                 "pol_vertex_rung = \"linearized\" runs in the vertex self-consistency only (pol_vertex_sc with pol_vertex_sc_mesh).");
     if (_pol_sc.cfg.enabled()) {
       auto MF = thc.MF();
       auto const &sc = _pol_sc.cfg;
@@ -999,17 +1008,23 @@ namespace solvers {
       // without the W-bar cache and the dynamic machinery. P side only: the dynamic Sigma vertex rides the dynamic-rung pass, and
       // the full-mesh static ladder's TDA / Ward legs have no sublattice form.
       if (not _vertex->ladder_dynamic_rung()) {
-        utils::check(sc.col == "static", "pol_vertex_sc with pol_vertex_rung = \"static\" injects the static column: pol_vertex_sc_col "
-                     "= \"{}\" needs pol_vertex_rung = \"dynamic\" (use pol_vertex_sc_col = \"static\", the default with the static rung).",
-                     sc.col);
+        // the static and the linearized rungs: one column, "static" (for the linearized rung: the separable ladder of its kernel)
+        const std::string rn = _vertex->ladder_rung();
+        utils::check(sc.col == "static", "pol_vertex_sc with pol_vertex_rung = \"{}\" injects its only column, \"static\": "
+                     "pol_vertex_sc_col = \"{}\" needs pol_vertex_rung = \"dynamic\" (use pol_vertex_sc_col = \"static\", the default with "
+                     "this rung).", rn, sc.col);
         utils::check(not (_vertex->sigma_pair_enabled() and _vertex->sigma_pair_dynamic()) and not _vertex->sigma_share(),
-                     "pol_vertex_sc with pol_vertex_rung = \"static\" is a P-side vertex: the dynamic pair Sigma vertex "
-                     "(pol_vertex_sigma = \"pair\", column \"{}\"{}) needs the W-bar cache of the dynamic-rung pass -- use "
-                     "pol_vertex_rung = \"dynamic\" (pol_vertex_sc_col = \"static\" injects the same static column).",
-                     _vertex->sigma_pair_col(), _vertex->sigma_share() ? ", pol_vertex_sigma_share" : "");
+                     "pol_vertex_sc with pol_vertex_rung = \"{}\" is a P-side vertex: the dynamic pair Sigma vertex "
+                     "(pol_vertex_sigma = \"pair\", column \"{}\"{}) needs the dynamic-rung pass -- use pol_vertex_rung = \"dynamic\".",
+                     rn, _vertex->sigma_pair_col(), _vertex->sigma_share() ? ", pol_vertex_sigma_share" : "");
         utils::check(not _vertex->ladder_tda() and not _vertex->ladder_ward_legs(),
-                     "pol_vertex_sc with pol_vertex_rung = \"static\": ladder_tda / pol_vertex_legs = \"ward\" belong to the full-mesh "
-                     "static ladder and have no sublattice form.");
+                     "pol_vertex_sc with pol_vertex_rung = \"{}\": ladder_tda / pol_vertex_legs = \"ward\" belong to the full-mesh "
+                     "static ladder and have no sublattice form.", rn);
+        utils::check(rn != "linearized" or not _vertex->lin_fit_nodes().empty(),
+                     "pol_vertex_rung = \"linearized\" differentiates the linearized quasiparticle Hamiltonian of the [lqsgw] loop "
+                     "(qp_approx = \"lqp\"): no fit operator was set -- this rung needs the [lqsgw] solver.");
+        utils::check(rn != "linearized" or _vertex->ladder_dyn_dense(),
+                     "pol_vertex_rung = \"linearized\" needs the dense rung (pol_vertex_dyn_dense = true).");
       }
       const double Nc = double(sc.mesh[0] * sc.mesh[1] * sc.mesh[2]), Nk = double(MF->nkpts());
       double ratio = 1.0, xi_c = 0.0;
@@ -1033,6 +1048,8 @@ namespace solvers {
     // the rung (static / dynamic) and its solve knobs too.
     _pol_vtx->set_ladder_rung(_vertex->ladder_rung(), _vertex->ladder_dyn_tol(), _vertex->ladder_dyn_maxit(),
                               _vertex->ladder_dyn_gmres(), _vertex->ladder_dyn_sign());
+    if (not _vertex->lin_fit_nodes().empty()) _pol_vtx->set_lin_fit(_vertex->lin_fit_nodes(), _vertex->lin_fit_weights());
+    _pol_vtx->set_lin_z(_vertex->lin_z());
     _pol_vtx->set_ladder_dyn_rhs_block(_vertex->ladder_dyn_rhs_block());
     _pol_vtx->set_ladder_dyn_dump(_vertex->ladder_dyn_dump());
     _pol_vtx->set_wcache_mode(_vertex->wcache_mode());
@@ -2008,7 +2025,7 @@ namespace solvers {
               not _pol_sc.has() ? "no stored Pi-bar yet: the basis" : "the periodic renewal of the basis");
     }
     long n_units = 0;
-    double t_solve = 0.0;
+    double t_solve = 0.0, lin_asym = -1.0;
     bool all_conv = true, started = false;
     auto make = [&](std::vector<long> const &k_int, std::vector<long> const &q_ext) { return vvw::make_view(*MF, k_int, q_ext); };
     auto solve = [&](vvw::k_view const &view) {
@@ -2016,6 +2033,7 @@ namespace solvers {
       auto r = _pol_vtx->eval_pol_dynbse_cut(mb_state, thc, nodes, std::vector<long>{}, _pol_dyn_calls, false, std::addressof(view), icol);
       _pol_dyn_ritz = std::max(_pol_dyn_ritz, r.ritz_max);
       n_units += r.nunits; t_solve += r.t_total; all_conv = all_conv and r.all_converged;
+      lin_asym = std::max(lin_asym, r.lin_asym);
       if (Rnu.size() > 0) {                              // the sampled nodes -> every half node
         auto &PS = r.Pi_col;
         const long NS = PS.shape(0), rest = long(PS.size()) / std::max(1L, NS);
@@ -2057,6 +2075,9 @@ namespace solvers {
             _pol_sc.bytes() / 1.0e9, Nm, rss0, ladder_meter::rss_gb());
     if (not all_conv)
       app_log(1, "  [vertex self-consistency] WARNING: not every ladder unit of this refresh converged.");
+    if (lin_asym >= 0.0)
+      app_log(1, "  [vertex self-consistency] linearized rung: max over (nu, q) of |P - P^dag|_F / |P|_F = {:.3e} before the "
+                 "Hermitization (the stored polarization is the Hermitian part).", lin_asym);
     if (mpi->comm.root()) {
       nda::array<double, 2> qi(nq_ibz, 3);
       for (long iq = 0; iq < nq_ibz; ++iq) qi(iq, all) = qc(iq, all);

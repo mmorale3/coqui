@@ -958,6 +958,10 @@ namespace vertex_pi { struct iaft_tools; }
     // the ladder's rung, "static" (default) | "dynamic" (the resummed full-frequency W
     // rung), + its solve knobs.
     std::string _ladder_rung = "static";
+    // the linearized rung's fit nodes / weights and the Z^1/2 switch (set_lin_fit, set_lin_z)
+    std::vector<long> _lin_n;
+    std::vector<ComplexType> _lin_c;
+    bool _lin_z = true;
     double _dyn_tol = 1e-8, _dyn_sign = -1.0;
     long _dyn_maxit = 30, _dyn_gmres = 12;
     long _dyn_rhs_block = 32;    // pol_vertex_dyn_rhs_block: RHS column block width of the dynamic solves
@@ -1960,9 +1964,15 @@ namespace vertex_pi { struct iaft_tools; }
      * instance.
      */
     void set_ladder_rung(std::string rung, double tol, long maxit, long gmres_m, double sign_ks) {
-      utils::check(rung == "static" or rung == "dynamic",
+      utils::check(rung == "static" or rung == "dynamic" or rung == "linearized",
                    "vertex_t::set_ladder_rung: unknown pol_vertex_rung \"{}\". Valid options are "
-                   "\"static\" (default), \"dynamic\".", rung);
+                   "\"static\" (default), \"dynamic\", \"linearized\".", rung);
+      if (rung == "linearized") {
+        utils::check(_ft->basis() == imag_axes_ft::dlr_basis,
+                     "pol_vertex_rung = \"linearized\" requires the DLR IAFT backend (iaft basis = \"dlr\").");
+        utils::check(_ladder_legs != "ward", "pol_vertex_rung = \"linearized\" and pol_vertex_legs = \"ward\" are exclusive.");
+        utils::check(sign_ks == -1.0 or sign_ks == 1.0, "pol_vertex_dyn_sign must be -1 or +1 (got {}).", sign_ks);
+      }
       if (rung == "dynamic") {
         utils::check(_ft->basis() == imag_axes_ft::dlr_basis,
                      "pol_vertex_rung = \"dynamic\" requires the DLR IAFT backend (iaft basis = \"dlr\").");
@@ -1981,6 +1991,27 @@ namespace vertex_pi { struct iaft_tools; }
     }
     std::string ladder_rung() const { return _ladder_rung; }
     bool ladder_dynamic_rung() const { return _ladder_rung == "dynamic"; }
+    bool ladder_lin_rung() const { return _ladder_rung == "linearized"; }
+    /** the rungs that read the W-bar(q, i nu) cache (cache_w): the dynamic and the linearized one */
+    bool ladder_needs_wcache() const { return ladder_dynamic_rung() or ladder_lin_rung(); }
+    /**
+     * The linearized rung's fit (pol_vertex_rung = "linearized"): the odd Matsubara indices n_j of the LQSGW fit nodes and
+     * the weights c_j of A = sum_j c_j Sigma(i w_j), the zeroth-order row of the fit operator (sum_j c_j = 1). Set by the
+     * linearized QP loop; travels to the readout instance. lin_z: the outgoing pair of the kernel carries the Z^1/2 of
+     * H_QP (pol_vertex_lin_z).
+     */
+    void set_lin_fit(std::vector<long> n, std::vector<ComplexType> c) {
+      utils::check(not n.empty() and n.size() == c.size(), "vertex_t::set_lin_fit: {} nodes, {} weights.", n.size(), c.size());
+      ComplexType sum = 0.0;
+      for (auto const &v : c) sum += v;
+      utils::check(std::abs(sum - 1.0) < 1e-10, "vertex_t::set_lin_fit: the fit weights sum to {:.3e}{:+.3e}i, not 1 (the zeroth-order "
+                   "row of an exact polynomial fit reproduces constants).", sum.real(), sum.imag());
+      _lin_n = std::move(n); _lin_c = std::move(c);
+    }
+    std::vector<long> const &lin_fit_nodes() const { return _lin_n; }
+    std::vector<ComplexType> const &lin_fit_weights() const { return _lin_c; }
+    void set_lin_z(bool on) { _lin_z = on; }
+    bool lin_z() const { return _lin_z; }
     double ladder_dyn_tol() const { return _dyn_tol; }
     long ladder_dyn_maxit() const { return _dyn_maxit; }
     long ladder_dyn_gmres() const { return _dyn_gmres; }
@@ -2446,6 +2477,8 @@ namespace vertex_pi { struct iaft_tools; }
       long it_max = 0, it_sum = 0, nunits = 0;
       bool all_converged = false;
       double t_total = 0.0, t_solve = 0.0, rss_gb = 0.0;
+      // the linearized rung: max over (node, q) of |P - P^dag|_F / |P|_F before the Hermitization (-1: not that rung)
+      double lin_asym = -1.0;
     };
     // view: a restricted k view (vertex_view.hpp) -- the internal k sums run over the view's internal points and the
     // q axis of the result is the view's external transfer list (qsel must then be empty)

@@ -1555,6 +1555,9 @@ namespace methods::solvers::dynbse_cuda {
     long nst = 0, nrecon = 0, nrecon_gemm = 0, nform = 0;
     double t_recon = 0.0, t_form = 0.0, chk_num = 0.0, chk_den = 0.0;
     cd *Gs0 = nullptr;                                       // Gsum0 of the last block (the Sigma columns static_dyn / dyn1_bare)
+    // the linearized engine (ue_config::lin): the rung products' accumulator T (with the S factor), the Lam_r tables (ndist, D,
+    // nc^2), their per-chunk staging Lc (ndist, D, nR_max), S (nk, nc^2, nc^2) and kappa (ndist, 2 np)
+    cd *T = nullptr, *Lam = nullptr, *Lc = nullptr, *Smat = nullptr, *kap = nullptr;
     cd *Gr1 = nullptr;                                       // the one-bare-rung Gsum of the last block (when requested)
     cd *Dcj = nullptr, *CbD = nullptr, *Vr = nullptr, *Pr = nullptr;   // conj(legs) (D, nout); the readout scratch
     bool legs_ok = false, cbd_ok = false, r1_ok = false;
@@ -1663,9 +1666,17 @@ namespace methods::solvers::dynbse_cuda {
          l0_plan::per_k_bytes(c.np, c.nc, c.ng, c.nR_max, c.l0_fused != 0, c.l0_asm_gemm != 0);   // L0 at K = 1
     return b * 1.05 + 512.0e6;                                              // cuSOLVER / cuBLAS workspaces
   }
+  // the LINEARIZED engine (ue_config::lin): the static-only set plus K_d0, the ndist resident rung slots, T, Lam, Lc, S, kappa
+  double ue_lin_bytes(ue_config const &c) {
+    const double D = double(c.nk * c.nc * c.nc), nc2 = double(c.nc * c.nc), nd = double(c.ndist);
+    const double extra = (2.0 + nd) * D * D + nd * D * nc2 + nd * D * double(c.nR_max) + double(c.nk) * nc2 * nc2 +
+                         2.0 * nd * double(c.np);
+    return ue_static_bytes(c) + 16.0 * 1.05 * extra;
+  }
   } // namespace
 
   double ue_bytes(ue_config const &c) {
+    if (c.lin) return ue_lin_bytes(c);
     if (c.static_only) return ue_static_bytes(c);
     const double D = double(c.nk * c.nc * c.nc), W = D * double(c.nR_max), np = double(c.np);
     const double fam = 2.0 * np * W, cst = W;
@@ -1695,6 +1706,7 @@ namespace methods::solvers::dynbse_cuda {
 
   double ue_min_bytes(ue_config const &c_in) {
     // ue_create's candidate set without the budget: every residency, staging count and block grouping it may try
+    if (c_in.lin) return ue_lin_bytes(c_in);
     if (c_in.static_only) return ue_static_bytes(c_in);
     const bool recon = (c_in.nfac > 0 and not c_in.stream);
     const bool can_rebuild = recon ? (c_in.nonres_src != 3)
@@ -1771,18 +1783,22 @@ namespace methods::solvers::dynbse_cuda {
   // the STATIC-ONLY engine: the buffers of ue_set_rung / ue_kb_build (K_s), ue_set_unit (Cb_k, the LU of M), ue_static (L0 of the
   // external leg, T_s) and ue_readout; the dynamic-rung buffers stay unallocated (null)
   unit_engine *ue_create_static(ue_config const &c_in, double free_bytes, char *why, long why_len) {
+    const bool lin = (c_in.lin != 0);
     const double avail = 0.9 * free_bytes - std::max(0.0, c_in.reserve_bytes);
-    const double need = ue_static_bytes(c_in);
+    const double need = lin ? ue_lin_bytes(c_in) : ue_static_bytes(c_in);
     if (need > avail) {
-      std::snprintf(why, size_t(why_len), "the static-only unit needs %.1f GB of device memory, %.1f GB available (%.1f GB free, "
-                    "%.1f GB reserved)", need / 1e9, avail / 1e9, free_bytes / 1e9, c_in.reserve_bytes / 1e9);
+      std::snprintf(why, size_t(why_len), "the %s unit needs %.1f GB of device memory (%ld resident rung slots), %.1f GB available "
+                    "(%.1f GB free, %.1f GB reserved)", lin ? "linearized" : "static-only", need / 1e9, lin ? c_in.ndist : 0l,
+                    avail / 1e9, free_bytes / 1e9, c_in.reserve_bytes / 1e9);
       return nullptr;
     }
     ue_config c = c_in;
-    c.ndist = 0; c.nres = 0; c.nfac = 0; c.rung_fuse = 0; c.stream = 0; c.nblk = 1; c.nblk_want = 1; c.batch = 0;
+    if (not lin) c.ndist = 0;
+    c.nres = c.ndist; c.nfac = 0; c.rung_fuse = 0; c.stream = 0; c.nblk = 1; c.nblk_want = 1; c.batch = 0;
+    c.static_only = lin ? 0 : 1;
     auto *e = new unit_engine;
     e->c = c;
-    e->nres = 0;
+    e->nres = c.ndist;
     e->fuse = false;
     e->nblk = 1;
     e->nc2 = c.nc * c.nc;
@@ -1794,6 +1810,16 @@ namespace methods::solvers::dynbse_cuda {
     e->Ut = dalloc<cd>(size_t(c.n_kept) * nt, "ue Ut"); e->Vs = dalloc<cd>(size_t(c.np_fit) * size_t(c.n_kept), "ue Vs");
     e->Kmat = dalloc<cd>(nt * size_t(c.np_fit), "ue Kc");
     e->Ks = dalloc<cd>(D * D, "ue Ks");
+    if (lin) {
+      const size_t nd = size_t(c.ndist), nc2 = size_t(e->nc2);
+      e->Kd0 = dalloc<cd>(D * D, "ue Kd0");
+      e->Kds = dalloc<cd>(nd * D * D, "ue Kds (the linearized rung slots)");
+      e->T = dalloc<cd>(D * D, "ue T (linearized)");
+      e->Lam = dalloc<cd>(nd * D * nc2, "ue Lam (linearized)");
+      e->Lc = dalloc<cd>(nd * D * size_t(c.nR_max), "ue Lam chunk (linearized)");
+      e->Smat = dalloc<cd>(size_t(c.nk) * nc2 * nc2, "ue S (linearized)");
+      e->kap = dalloc<cd>(nd * 2 * np, "ue kappa (linearized)");
+    }
     e->Cbk = dalloc<cd>(size_t(c.nk) * e->nc2 * e->nc2, "ue Cbk"); e->M = dalloc<cd>(D * D, "ue M");
     e->ipiv = dalloc<int>(D, "ue ipiv"); e->dinfo = dalloc<int>(1, "ue info");
     if (cusolverDnZgetrf_bufferSize(e->cs, int(D), int(D), e->M, int(D), &e->lwork) != CUSOLVER_STATUS_SUCCESS)
@@ -1817,14 +1843,16 @@ namespace methods::solvers::dynbse_cuda {
     e->l0->fz_bench = (c.l0_fz_bench != 0);
     return e;
   }
-  // the entry points of the dynamic-rung blocks refuse a static-only engine (its rung, tau and refit buffers do not exist)
+  // the entry points of the dynamic-rung blocks refuse a static-only or linearized engine (no tau and refit buffers)
   void no_static(unit_engine const *e, char const *who) {
-    if (e->c.static_only) APP_ABORT(std::string(" ") + who + ": the engine was created static-only (ue_config::static_only) -- ABORTING.");
+    if (e->c.static_only or e->c.lin)
+      APP_ABORT(std::string(" ") + who + ": the engine was created " + (e->c.lin ? "linearized (ue_config::lin)" : "static-only (ue_config::static_only)") +
+                " -- ABORTING.");
   }
   } // namespace
 
   unit_engine *ue_create(ue_config const &c_in, double free_bytes, char *why, long why_len) {
-    if (c_in.static_only) return ue_create_static(c_in, free_bytes, why, why_len);
+    if (c_in.static_only or c_in.lin) return ue_create_static(c_in, free_bytes, why, why_len);
     // the budget: 90 % of the free memory minus the bytes the caller keeps for the later device stages (rung builds, Sigma
     // deposits, dressed legs). Candidates in order: every rung resident (two-input pass if asked, then one input), then the
     // partial residencies (the most resident first) when a source for the non-resident rungs exists (device rebuild with the
@@ -2009,7 +2037,8 @@ namespace methods::solvers::dynbse_cuda {
                     (void *)e->Ys, (void *)e->g, (void *)e->coef, (void *)e->rec, (void *)e->pA, (void *)e->pB, (void *)e->pC,
                     (void *)e->flags, (void *)e->red, (void *)e->Gs0, (void *)e->Gr1, (void *)e->Dcj, (void *)e->CbD, (void *)e->Vr,
                     (void *)e->Pr, (void *)e->yfam1, (void *)e->ycst1, (void *)e->Fbig, (void *)e->Ybig, (void *)e->dslot, (void *)e->cv,
-                    (void *)e->bDblk, (void *)e->bGs0, (void *)e->bGc1})
+                    (void *)e->bDblk, (void *)e->bGs0, (void *)e->bGc1, (void *)e->T, (void *)e->Lam, (void *)e->Lc, (void *)e->Smat,
+                    (void *)e->kap})
       if (p) (void)cudaFree(p);
     for (void *p : e->sd.allocs)
       if (p) (void)cudaFree(p);
@@ -2118,6 +2147,10 @@ namespace methods::solvers::dynbse_cuda {
     h2d_c(e->Cbk, Cbkh, size_t(nk) * nc2 * nc2, "ue Cbk");
     e->l0->load(t, nu0);
     e->nu0 = nu0;
+    if (e->c.lin) {                                          // the linearized unit: the system is formed by ue_lin_assemble
+      e->unit_ok = false;
+      return 0;
+    }
     // M = 1 - Cb K_s, one block row per k: (M_k)^T (D x nc2) = -(K_s rows of k)^T (D x nc2) . Cb_k^T (nc2 x nc2)
     const cd mone = make_cuDoubleComplex(-1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
     cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(D), int(nc2), int(nc2), &mone,
@@ -2662,6 +2695,119 @@ namespace methods::solvers::dynbse_cuda {
     launch_check("ue static Gs0");
     cu_check(cudaDeviceSynchronize(), "ue static Gs0");
     tim[4] += wnow() - t0; t0 = wnow();
+    if (Gsum0h != nullptr) cu_check(cudaMemcpy(Gsum0h, e->Gs0, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum0");
+    tim[6] += wnow() - t0;
+  }
+
+  // ---- THE LINEARIZED UNIT (dynbse.hpp lin_*). Row-major (D x D) matrices are column-major transposes for cuBLAS: a right
+  // product with a block-diagonal B (nk blocks nc2 x nc2) is, per k, a row block of the transpose, C'_k = B_k^T A'_k; a left
+  // product with a block-diagonal S is, per k, a column block, C'_k = A'_k S_k^T -- both one strided-batched gemm.
+  namespace {
+    __global__ void lin_ident_kernel(long D, long nc2, long c0, long nR, cd *__restrict__ X) {
+      const long tot = D * nR;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long row = e / nR, c = e % nR;
+        X[e] = make_cuDoubleComplex((row % nc2 == c0 + c) ? 1.0 : 0.0, 0.0);
+      }
+    }
+    // C[:, k block] = alpha A[:, k block] B_k + beta C[:, k block]   (row-major D x D A, C; B (nk, nc2, nc2))
+    void lin_rmul_bd(unit_engine *e, cd const *A, cd const *B, cd *C, cd alpha, cd beta) {
+      const long D = e->D, nc2 = e->nc2, nk = e->c.nk;
+      cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nc2), int(D), int(nc2), &alpha, B, int(nc2),
+                                          (long long)(nc2 * nc2), A, int(D), (long long)nc2, &beta, C, int(D), (long long)nc2, int(nk)),
+                "ue lin A . blockdiag(B)");
+    }
+    // C[k block, :] = alpha S_k A[k block, :]   (row-major D x D A, C; S (nk, nc2, nc2)); C != A
+    void lin_lmul_bd(unit_engine *e, cd const *S, cd const *A, cd *C, cd alpha) {
+      const long D = e->D, nc2 = e->nc2, nk = e->c.nk;
+      const cd zero = make_cuDoubleComplex(0.0, 0.0);
+      cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(D), int(nc2), int(nc2), &alpha, A, int(D),
+                                          (long long)(nc2 * D), S, int(nc2), (long long)(nc2 * nc2), &zero, C, int(D),
+                                          (long long)(nc2 * D), int(nk)),
+                "ue lin blockdiag(S) . A");
+    }
+  } // namespace
+
+  int ue_lin_assemble(unit_engine *e, cplx const *kappah, cplx const *Sh, cplx scale, double *tim) {
+    if (not e->c.lin) APP_ABORT(std::string(" ue_lin_assemble: the engine is not a linearized one (ue_config::lin) -- ABORTING."));
+    const long D = e->D, nc2 = e->nc2, np = e->c.np, nd = e->c.ndist, nRm = e->c.nR_max;
+    const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+    const cd sc = make_cuDoubleComplex(scale.real(), scale.imag()), msc = make_cuDoubleComplex(-scale.real(), -scale.imag());
+    double t0 = wnow();
+    h2d_c(e->kap, kappah, size_t(nd * 2 * np), "ue lin kappa");
+    if (Sh != nullptr) h2d_c(e->Smat, Sh, size_t(e->c.nk) * nc2 * nc2, "ue lin S");
+    tim[5] += wnow() - t0;
+    // Lam_r = kappa_r . [L0 of the identity pairs], nR_max columns of the nc2 at a time
+    for (long c0 = 0; c0 < nc2; c0 += nRm) {
+      const long nR = std::min(nRm, nc2 - c0);
+      lin_ident_kernel<<<grid_for(D * nR), 256>>>(D, nc2, c0, nR, e->Dblk);
+      launch_check("ue lin identity");
+      ue_l0(e, nR, nullptr, e->Dblk, e->Ffam, e->Fsum, &tim[0]);
+      t0 = wnow();
+      if (nd > 0) {
+        // Lc (nd, D nR) = kappa (nd, 2 np) . Ffam (2 np, D nR), row-major: Lc^T = Ffam^T kappa^T
+        cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(D * nR), int(nd), int(2 * np), &one, e->Ffam, int(D * nR), e->kap,
+                              int(2 * np), &zero, e->Lc, int(D * nR)), "ue lin kappa . L0");
+        cu_check(cudaMemcpy2D(e->Lam + c0, size_t(nc2) * sizeof(cd), e->Lc, size_t(nR) * sizeof(cd), size_t(nR) * sizeof(cd),
+                              size_t(nd * D), cudaMemcpyDeviceToDevice), "ue lin Lam scatter");
+      }
+      cu_check(cudaDeviceSynchronize(), "ue lin Lam");
+      tim[2] += wnow() - t0;
+    }
+    e->cbd_ok = false;
+    // A = 1 - S M, M = K_s Cb + scale [sum_r K_r Lam_r - K_d0 Cb]: accumulated in T (then S) or directly negated into M
+    t0 = wnow();
+    const bool hasS = (Sh != nullptr);
+    cd *acc = hasS ? e->T : e->M;
+    const cd sgn = hasS ? one : make_cuDoubleComplex(-1.0, 0.0);
+    const cd a_sc = hasS ? sc : msc, a_msc = hasS ? msc : sc;
+    lin_rmul_bd(e, e->Ks, e->Cbk, acc, sgn, zero);
+    for (long r = 0; r < nd; ++r)
+      lin_rmul_bd(e, e->Kds + size_t(r) * size_t(D) * size_t(D), e->Lam + size_t(r) * size_t(D) * size_t(nc2), acc, a_sc, one);
+    lin_rmul_bd(e, e->Kd0, e->Cbk, acc, a_msc, one);
+    if (hasS) lin_lmul_bd(e, e->Smat, e->T, e->M, make_cuDoubleComplex(-1.0, 0.0));
+    add_identity_kernel<<<grid_for(D), 256>>>(D, e->M);
+    launch_check("ue lin 1 - S M");
+    cu_check(cudaDeviceSynchronize(), "ue lin system");
+    tim[2] += wnow() - t0;
+    // the LU of the memory (column-major A^T), solved with op T as the static unit's
+    t0 = wnow();
+    if (cusolverDnZgetrf(e->cs, int(D), int(D), e->M, int(D), e->work, e->ipiv, e->dinfo) != CUSOLVER_STATUS_SUCCESS)
+      APP_ABORT(std::string(" ue_lin_assemble: cusolverDnZgetrf failed."));
+    int info = 0;
+    cu_check(cudaMemcpy(&info, e->dinfo, sizeof(int), cudaMemcpyDeviceToHost), "ue lin getrf info");
+    tim[1] += wnow() - t0;
+    e->unit_ok = (info == 0);
+    return info;
+  }
+
+  void ue_lin_solve(unit_engine *e, long nR, cplx const *Dblkh, cplx *Gsum0h, double *tim) {
+    if (not e->c.lin) APP_ABORT(std::string(" ue_lin_solve: the engine is not a linearized one (ue_config::lin) -- ABORTING."));
+    if (not e->unit_ok) APP_ABORT(std::string(" ue_lin_solve: the unit's LU failed or was not set."));
+    if (nR > e->c.nR_max) APP_ABORT(std::string(" ue_lin_solve: block wider than the engine's nR_max."));
+    const long D = e->D, W = D * nR;
+    const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+    double t0 = wnow();
+    h2d_c(e->Dblk, Dblkh, size_t(W), "ue Dblk");
+    e->cbd_ok = false;
+    e->r1_ok = false;
+    tim[5] += wnow() - t0;
+    t0 = wnow();
+    // z = A^-1 D: the (D, nR) row-major block transposed to column-major, getrs with op T, back
+    cub_check(cublasZgeam(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(D), int(nR), &one, e->Dblk, int(nR), &zero, e->Y, int(D), e->Y, int(D)),
+              "ue lin transpose D");
+    if (cusolverDnZgetrs(e->cs, CUBLAS_OP_T, int(D), int(nR), e->M, int(D), e->ipiv, e->Y, int(D), e->dinfo) != CUSOLVER_STATUS_SUCCESS)
+      APP_ABORT(std::string(" ue_lin_solve: cusolverDnZgetrs failed."));
+    {
+      int info = 0;
+      cu_check(cudaMemcpy(&info, e->dinfo, sizeof(int), cudaMemcpyDeviceToHost), "ue lin getrs info");
+      if (info != 0) APP_ABORT(" ue_lin_solve: cusolverDnZgetrs devInfo = " + std::to_string(info) + " -- ABORTING.");
+    }
+    cub_check(cublasZgeam(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(nR), int(D), &one, e->Y, int(D), &zero, e->csb, int(nR), e->csb, int(nR)),
+              "ue lin transpose z");
+    ue_cb_times(e, nR, e->csb, e->Gs0, false);              // Gsum0 = Cb z
+    cu_check(cudaDeviceSynchronize(), "ue lin solve");
+    tim[1] += wnow() - t0; t0 = wnow();
     if (Gsum0h != nullptr) cu_check(cudaMemcpy(Gsum0h, e->Gs0, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum0");
     tim[6] += wnow() - t0;
   }

@@ -44,6 +44,7 @@
 #include "methods/SCF/qp_modea.hpp"   // qp_modea::last_run(), read-only
 #include "methods/SCF/sigma_causal_projection.hpp"
 #include "methods/SCF/sigma_causal_stage.hpp"
+#include "methods/SCF/qp/linearized_qp.hpp"
 #include "simple_dyson.h"
 #include "dca_dyson.h"
 #include "scf_driver.hpp"
@@ -547,6 +548,14 @@ double qp_scf_loop(
   // pole weights are set only by add_lqp_vcorr: clear any left from an earlier run on this
   // MBState, so dump_qpscf never writes another scheme's weights
   mb_state.sZqp_ska.reset();
+  mb_state.sZhalf_skij.reset();
+  // the linearized vertex rung (pol_vertex_rung = "linearized") differentiates A = sum_j c_j Sigma(i w_j): the fit's nodes and
+  // zeroth-order weights go to the screening's vertex
+  if (qp_params.qp_approx == "lqp" and mb_solver.scr_eri != nullptr) {
+    auto op = lqp::make_fit_operator(FT, qp_params.lqp);
+    auto nw = lqp::fit_window(qp_params.lqp.n_fit, qp_params.lqp.symmetric_window);
+    mb_solver.scr_eri->set_lin_fit(std::vector<long>(nw.begin(), nw.end()), lqp::zeroth_order_row(op));
+  }
   auto& sHeff_skij = mb_state.sHeff_skij.value();
   auto& sDm_skij = mb_state.sDm_skij.value();
   auto& sMO_skia = mb_state.sMO_skia.value();
@@ -574,6 +583,27 @@ double qp_scf_loop(
     }
     mpi->comm.broadcast_n(&has_heff, 1, 0);
     mu_from_qp_chkpt = (has_heff == 1);
+    // the Z^1/2 factor of the stored quasiparticle solve (written by an LQSGW iteration; the linearized vertex rung reads it)
+    int has_zh = 0;
+    if (mpi->comm.root()) {
+      h5::file file(mb_state.coqui_prefix + ".mbpt.h5", 'r');
+      has_zh = h5::group(file).open_group("scf/iter" + std::to_string(init_it)).has_dataset("Zhalf_skij") ? 1 : 0;
+    }
+    mpi->comm.broadcast_n(&has_zh, 1, 0);
+    if (has_zh == 1) {
+      mb_state.sZhalf_skij.emplace(make_shared_array<Array_view_4D_t>(*mpi, {mf->nspin(), mf->nkpts_ibz(), mf->nbnd(), mf->nbnd()}));
+      auto &sZh = mb_state.sZhalf_skij.value();
+      sZh.win().fence();
+      if (mpi->node_comm.root()) {
+        h5::file file(mb_state.coqui_prefix + ".mbpt.h5", 'r');
+        nda::array<ComplexType, 4> Zh;
+        nda::h5_read(h5::group(file).open_group("scf/iter" + std::to_string(init_it)), "Zhalf_skij", Zh);
+        utils::check(Zh.shape() == sZh.local().shape(), "qp_scf_loop: Zhalf_skij of the checkpoint has another shape than the run.");
+        sZh.local() = Zh;
+      }
+      sZh.win().fence();
+      mpi->comm.barrier();
+    }
     app_log(1, "  Restart from {}/scf/iter{} ({} checkpoint): mu = {:.12f}{}", mb_state.coqui_prefix + ".mbpt.h5", init_it,
             mu_from_qp_chkpt ? "quasiparticle" : "Dyson", mu, mu_from_qp_chkpt ? " (kept)" : " (re-solved for the QP spectrum)");
   }

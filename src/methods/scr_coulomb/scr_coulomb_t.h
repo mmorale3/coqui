@@ -590,6 +590,9 @@ namespace solvers {
     std::string screen_type() const { return _screen_type; };
 
     void set_vertex(vertex_t* vertex) { _vertex = vertex; }
+    // the linearized vertex rung's fit (vertex_t::set_lin_fit): set by the linearized quasiparticle loop on the attached knob
+    // carrier and, once it exists, on the readout instance. No-op without an attached vertex. Defined in the .cpp.
+    void set_lin_fit(std::vector<long> n, std::vector<ComplexType> c);
     const vertex_t* vertex() const { return _vertex; }
     // true iff a vertex correction is attached and active (non-empty subspace C)
     // (defined in the .cpp: vertex_t is only forward-declared here).

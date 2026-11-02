@@ -177,6 +177,11 @@ namespace methods::solvers::dynbse_cuda {
     // M = 1 - Cb K_s, Cb_k, the L0 plan and the readout buffers; no K_d rungs, no tau buffers, no refit, no Sigma deposits,
     // no dressed legs (ndist, nres, nfac, rung_fuse and the block grouping are ignored). Its block is ue_static.
     int static_only = 0;
+    // 1: the LINEARIZED engine (pol_vertex_rung = "linearized", dynbse.hpp lin_*): the static-only buffers plus K_d0, the
+    // ndist rung slots (the PH-representative tau rungs, or the factors K_r of the frequency-factorized rung), all resident,
+    // the per-unit Lam_r tables and the separable system A = 1 - S M (ue_lin_assemble, ue_lin_solve). No tau buffers, no
+    // refit, no Sigma deposits, no dressed legs (nres, nfac, rung_fuse and the block grouping are ignored).
+    int lin = 0;
   };
   struct rung_stream;
 
@@ -252,6 +257,14 @@ namespace methods::solvers::dynbse_cuda {
    *  L0 of the T_s image (Gamma is not formed). Kept on the device for ue_readout(which = 0); Gsum0 (D, nR) out when non-null.
    *  timing (8) as ue_gamma1: [0] L0, [1] T_s, [4] vector ops, [5] H2D, [6] D2H -- ADDED. */
   void ue_static(unit_engine *e, long nR, cplx const *Dblk, cplx *Gsum0, double *timing);
+  /** the LINEARIZED unit (ue_config::lin): after ue_set_unit (which then uploads Cb_k and the L0 tables only), the system of
+   *  the separable solve, A = 1 - S M, M = K_s Cb + scale [sum_r K_r Lam_r - K_d0 Cb] (dynbse.hpp lin_system), its LU kept
+   *  in place of the static one. kappa (ndist, 2 np) host (dynbse::lin_kappa); S (nk, nc^2, nc^2) host or null. Lam_r is formed
+   *  on the device from L0 of the identity pairs (nc^2 columns in blocks of nR_max). Returns the getrf info. timing (8) as
+   *  ue_gamma1 ([0] L0, [2] the rung products, [1] the LU) -- ADDED. */
+  int ue_lin_assemble(unit_engine *e, cplx const *kappa, cplx const *S, cplx scale, double *timing);
+  /** the separable solve of a block: Dblk (D, nR) in, Gsum0 = Cb A^-1 D kept for ue_readout(which = 0) (D2H when non-null) */
+  void ue_lin_solve(unit_engine *e, long nR, cplx const *Dblk, cplx *Gsum0, double *timing);
   /** the blocks per rung pass the engine chose (1 = the per-block flow above) */
   long ue_nblk(unit_engine const *e);
   /** THE BLOCK-BATCHED FLOW (ue_nblk > 1): ue_batch_begin with the widths of the group's blocks (nb <= ue_nblk) and the rung
@@ -272,7 +285,8 @@ namespace methods::solvers::dynbse_cuda {
   // (k-chunk) and a scatter kernel; no host rung arrays, no per-transfer upload of the (large) K_d stack.
   /** run-wide: Xb (ns, nk, Nm, nc), qx_of (nk, nk), W0 (nq, Nm, Nm), Wd0 (nq, Nm, Nm), Wds (nrep, nq, Nm, Nm) (the tau
    *  representatives' W in the driver's rep order). false (why) = no room: the host builds and ue_set_rung uploads.
-   *  A static_only engine builds K_s alone: nrep = 0, Wd0 and Wds are not read (may be null). */
+   *  A static_only engine builds K_s alone: nrep = 0, Wd0 and Wds are not read (may be null). A lin engine builds all of
+   *  its ndist slots resident. */
   /** The layout of the rung builds beyond the plain full mesh (null = the plain layout: nk_arr = nk, one leg set, no
    *  transposed reads). nk_arr: the k extent of the leg table, whose first nk entries are the internal points (the partner
    *  indices of ue_kb_build point anywhere in it). nsym > 1: the legs are (ns, nsym, nk_arr, Nm, nc) -- one leg set per

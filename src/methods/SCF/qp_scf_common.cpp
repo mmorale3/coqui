@@ -2227,14 +2227,16 @@ void add_lqp_vcorr(MBState &mb_state, double mu, solvers::mb_solver_t<corr_solve
   auto& sSigma = mb_state.sSigma_tskij.value();
   auto sHnew_skij = make_shared_array<Array_view_4D_t>(*mpi, {ns, nkpts, nbnd, nbnd});
   auto sZqp_ska     = make_shared_array<nda::array_view<double, 3>>(*mpi, {ns, nkpts, nbnd});
-  sHnew_skij.set_zero(); sZqp_ska.set_zero();
+  // the left factor L = C^-dag Z^1/2 C^dag of this solve (delta Heff = L delta(F + A) L^dag): the linearized vertex rung's Z^1/2
+  auto sZhalf_skij  = make_shared_array<Array_view_4D_t>(*mpi, {ns, nkpts, nbnd, nbnd});
+  sHnew_skij.set_zero(); sZqp_ska.set_zero(); sZhalf_skij.set_zero();
   nda::array<double, 2> min_eig_Zinv_sk(ns, nkpts), resid_sk(ns, nkpts);
   min_eig_Zinv_sk() = 0.0; resid_sk() = 0.0;
 
   nda::array<ComplexType, 2> tmp(nbnd, nbnd), F_MO(nbnd, nbnd);
   nda::matrix<ComplexType> Cinv(nbnd, nbnd);   // reused for every (s,k): no allocation in the loop
   nda::array<ComplexType, 3> Sigma_MO(nt, nbnd, nbnd);
-  sHnew_skij.win().fence(); sZqp_ska.win().fence();
+  sHnew_skij.win().fence(); sZqp_ska.win().fence(); sZhalf_skij.win().fence();
   for (long sk = mpi->comm.rank(); sk < ns*nkpts; sk += mpi->comm.size()) {
     long is = sk / nkpts, ik = sk % nkpts;
     auto C = sMO_skia.local()(is, ik, nda::ellipsis{});
@@ -2252,14 +2254,17 @@ void add_lqp_vcorr(MBState &mb_state, double mu, solvers::mb_solver_t<corr_solve
     nda::inverse_in_place(Cinv);
     nda::blas::gemm(results.Hqp, Cinv, tmp);
     nda::blas::gemm(nda::dagger(Cinv), tmp, sHnew_skij.local()(is, ik, nda::ellipsis{}));
+    nda::blas::gemm(results.Zhalf, nda::dagger(C), tmp);
+    nda::blas::gemm(nda::dagger(Cinv), tmp, sZhalf_skij.local()(is, ik, nda::ellipsis{}));
     for (long a = 0; a < nbnd; ++a) sZqp_ska.local()(is, ik, a) = results.Zqp(a);
     min_eig_Zinv_sk(is, ik) = results.min_eig_Zinv; 
     resid_sk(is, ik) = results.resid;
   }
-  sHnew_skij.win().fence(); sZqp_ska.win().fence();
+  sHnew_skij.win().fence(); sZqp_ska.win().fence(); sZhalf_skij.win().fence();
   // ranks wrote disjoint (s,k) blocks of node-shared arrays; reduce across nodes
   sHnew_skij.all_reduce();
   sZqp_ska.all_reduce();
+  sZhalf_skij.all_reduce();
   mpi->comm.all_reduce_in_place_n(min_eig_Zinv_sk.data(), min_eig_Zinv_sk.size(), std::plus<>{});
   mpi->comm.all_reduce_in_place_n(resid_sk.data(), resid_sk.size(), std::plus<>{});
 
@@ -2270,6 +2275,7 @@ void add_lqp_vcorr(MBState &mb_state, double mu, solvers::mb_solver_t<corr_solve
   if (mpi->node_comm.root()) sHeff_skij.local() = sHnew_skij.local();
   mpi->comm.barrier();
   mb_state.sZqp_ska = std::move(sZqp_ska);
+  mb_state.sZhalf_skij = std::move(sZhalf_skij);
 
   // deallocation
   mb_state.dW_qtPQ.reset();

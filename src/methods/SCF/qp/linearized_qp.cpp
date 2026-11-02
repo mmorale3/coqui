@@ -205,6 +205,22 @@ fit_operator_t make_fit_operator(imag_axes_ft::IAFT const& ft, params_t const& p
   return op;
 }
 
+std::vector<ComplexType> zeroth_order_row(fit_operator_t const& op) {
+  long nn = op.M.shape(0), P = op.M.shape(1) - 1;
+  // the same least-squares solve as low_freq_coefficients, on the identity data: X = pinv(M), (P+1, nn)
+  nda::matrix<ComplexType, nda::F_layout> Mf(op.M), Bf(nn, nn);
+  Bf() = 0.0;
+  for (long j = 0; j < nn; ++j) Bf(j, j) = 1.0;
+  nda::vector<double> sing_vals(std::min<long>(nn, P + 1));
+  int rank = 0;
+  double rcond = std::numeric_limits<double>::epsilon() * double(std::max<long>(nn, P + 1));
+  utils::check(nda::lapack::gelss(Mf, Bf, sing_vals, rcond, rank) == 0,
+               "linearized_qp.cpp::zeroth_order_row: gelss failed");
+  std::vector<ComplexType> c(static_cast<size_t>(nn));
+  for (long j = 0; j < nn; ++j) c[size_t(j)] = Bf(0, j);
+  return c;
+}
+
 low_freq_fit_t low_freq_coefficients(nda::array_const_view<ComplexType, 3> Sigma_wab,
                                      fit_operator_t const& op, params_t const& params) {
   long nn = Sigma_wab.shape(0), norb = Sigma_wab.shape(1);
@@ -283,19 +299,19 @@ void solve_linearized_dyson(nda::array_const_view<ComplexType, 2> K_ab,
   if (results.min_eig_Zinv <= 0.0) { results.status = 2; return; }
 
   // Z = U diag(1/w) U^dag,  Z^1/2 = U diag(1/sqrt w) U^dag
-  nda::array<ComplexType, 2> Zhalf(norb, norb);            // construction intermediate, not kept
+  results.Zhalf = nda::array<ComplexType, 2>(norb, norb);
   results.Z = nda::array<ComplexType, 2>(norb, norb);
   for (long l = 0; l < norb; ++l) tmp(nda::range::all, l) = U(nda::range::all, l) * (1.0 / w(l));
   nda::blas::gemm(tmp, nda::dagger(U), results.Z);
   for (long l = 0; l < norb; ++l) tmp(nda::range::all, l) = U(nda::range::all, l) / std::sqrt(w(l));
-  nda::blas::gemm(tmp, nda::dagger(U), Zhalf);
-  hermitize(results.Z()); hermitize(Zhalf());
+  nda::blas::gemm(tmp, nda::dagger(U), results.Zhalf);
+  hermitize(results.Z()); hermitize(results.Zhalf());
 
   // H_QP = Z^1/2 K Z^1/2, Hermitized. K needs no Hermitization of its own: with Z^1/2 Hermitian,
   // the Hermitian part of Z^1/2 K Z^1/2 is exactly Z^1/2 [(K + K^dag)/2] Z^1/2.
   results.Hqp = nda::array<ComplexType, 2>(norb, norb);
-  nda::blas::gemm(K_ab, Zhalf, tmp);
-  nda::blas::gemm(Zhalf, tmp, results.Hqp);
+  nda::blas::gemm(K_ab, results.Zhalf, tmp);
+  nda::blas::gemm(results.Zhalf, tmp, results.Hqp);
   hermitize(results.Hqp());
   auto [E, V] = nda::linalg::eigenelements(results.Hqp);
   results.E = std::move(E); results.V = std::move(V);

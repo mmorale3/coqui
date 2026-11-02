@@ -21,6 +21,8 @@
 #ifndef COQUI_LINEARIZED_QP_HPP
 #define COQUI_LINEARIZED_QP_HPP
 
+#include <vector>
+
 #include "configuration.hpp"
 #include "nda/nda.hpp"
 #include "mpi3/communicator.hpp"
@@ -107,8 +109,8 @@ struct result_kpoint_t {
   nda::array<double, 1>      E;
   // Eigenvectors of H_QP as columns, in the basis of K and B.
   nda::array<ComplexType, 2> V;
-  // Z = (1 - B)^-1, the renormalization matrix.
-  nda::array<ComplexType, 2> Z;
+  // Z = (1 - B)^-1, the renormalization matrix, and its Hermitian square root Z^1/2.
+  nda::array<ComplexType, 2> Z, Zhalf;
   // H_QP = Z^1/2 K Z^1/2, Hermitized.
   nda::array<ComplexType, 2> Hqp;
   // Pole weights <v_l|Z|v_l>: the diagonal of Z in the H_QP eigenbasis, one per level.
@@ -231,6 +233,16 @@ nda::array<long, 1> fit_window(int n_fit, bool symmetric_window);
  *       the largest admissible n_fit, and if the fit is under-determined (nnodes < fit_order + 1).
  */
 fit_operator_t make_fit_operator(imag_axes_ft::IAFT const& ft, params_t const& params);
+
+/**
+ * The zeroth-order row of the fit: the weights c_j of A = sum_j c_j Sigma(i w_j) before its Hermitization, i.e. row 0 of the
+ * pseudo-inverse of the design matrix (the least-squares solution low_freq_coefficients computes, applied to unit data).
+ * An exact polynomial fit reproduces constants: sum_j c_j = 1. The linearized vertex rung's kernel
+ * K_lin(i w') = sum_j c_j W(i w_j - i w') is dA/dG with these weights.
+ * @param op - [INPUT] fit operator from make_fit_operator
+ * @return c_j, one per fit node, in the order of fit_window
+ */
+std::vector<ComplexType> zeroth_order_row(fit_operator_t const& op);
 
 /**
  * What step 1 returns: the two low-frequency coefficients of Sigma(iw) the linearization uses,
