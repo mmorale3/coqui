@@ -48,6 +48,7 @@ from .thc_gw import LineGW
 from .closure import fit_sigma_sectors, lehmann_from_sigma, chemical_potential, compress_sectors
 from .closure import fit_sigma_total, wp_thermal, chemical_potential_auto, chemical_potential_neutral, chemical_potential_T, electron_count_T
 from .closure import qp_diag
+from .line_dyson import LineDyson, chemical_potential_line, line_quadrature
 from .thc_gw import node_floor_mask, thermal_rho
 from .. import finite_t as _ft
 
@@ -94,7 +95,9 @@ class LineSCGW:
         # "count": as "new", and the poles keep the closure's own mu (mu_rule; "number": N_closure = N_el)
         assert hyb_frame in ('old', 'new', 'count'); self.hyb_frame = hyb_frame
         assert not self.nu0_intraband or (beta is not None and scheme == 'scgw'), "nu0_intraband: finite T, scheme scgw"
-        assert g_repr in ('compressed', 'lehmann')
+        assert g_repr in ('compressed', 'lehmann', 'line_dyson')
+        assert g_repr != 'line_dyson' or (beta is None and scheme in ('scgw', 'scgw0')), "line_dyson: T = 0, scgw / scgw0"
+        self.ld_quad = line_quadrature() if g_repr == 'line_dyson' else None
         self.g_repr, self.g_emax = g_repr, (lam if g_emax is None else g_emax)
         self.g_wtol, self.g_emin_frac, self.g_wsmall = g_wtol, g_emin_frac, g_wsmall
         self.tol_gram = tol_gram if tol_gram is not None else 1e-10
@@ -313,6 +316,8 @@ class LineSCGW:
             self.F = self.mixing_F * self.F + (1.0 - self.mixing_F) * self.F_used
         self.F_used = self.F
         Hstat = self.H0 + self.F - self.mu * np.eye(nb)[None]
+        if self.g_repr == 'line_dyson':
+            return self._close_line_dyson(t0, tW, tS, dS, Sig, Hstat)
         e_all, v_all, info_all = [], [], []
         for ik in range(nk):
             w, g = fit_sigma_sectors(self.bp, self.bh, self.fz, Sig[ik][0], Sig[ik][1])
@@ -346,6 +351,41 @@ class LineSCGW:
             print(f"iter {len(self.history)}: dSigma {dS:.2e}  mu {self.mu:.6f} (dmu {dmu*27.2114:+.4f} eV)  QP gap {rec['gap_eV']:.4f} eV  "
                   f"nelec {nel:.6f} (Lehmann {nel_exact:.6f}, dropped weight {dropped:.1e})  npoles {min(rec['npoles'])}-{max(rec['npoles'])}  "
                   f"held-out {max(rec['heldout']):.1e}  [W {tW:.0f}s, Sigma {tS:.0f}s, total {rec['ttot']:.0f}s]", flush=True)
+        return rec
+
+    def _close_line_dyson(self, t0, tW, tS, dS, Sig, Hstat):
+        """g_repr = "line_dyson" (line_dyson.py): G from the Dyson equation on the line, no Cayley closure. mu from the plateau of
+        N(mu), D (-> F) from the line integral, G^> / G^< by the Cauchy split and the signed one-sided fits of the compressed path.
+        Frame (line_dyson.py): Sigma_c fixed relative to mu, H - dmu; Sigma_c is used only on its own line."""
+        gw, nk, t1 = self.gw, self.nk, time.time()
+        wk_ = np.full(nk, 1.0 / nk) if self.k_weight is None else np.asarray(self.k_weight) / np.sum(self.k_weight)
+        lds = []
+        for ik in range(nk):
+            w, g = fit_sigma_sectors(self.bp, self.bh, self.fz, Sig[ik][0], Sig[ik][1])
+            lds.append(LineDyson(Hstat[ik], w, g, self.theta, quad=self.ld_quad))
+        dmu, e_homo, e_lumo, N = chemical_potential_line(lds, self.nelec, wk_)
+        self.mu += dmu; gw.mu = self.mu
+        tM = time.time() - t1
+        wg = np.concatenate([self.gh.w, self.gp.w]); c_g, D, res = [], [], 0.0
+        for ik in range(nk):
+            Gp, Gh = lds[ik].sectors(self.fz, dmu)
+            cp, ch = self.gp.fit(self.fz, Gp), self.gh.fit(self.fz, Gh)
+            res = max(res, np.abs(self.gp.eval(cp, self.fz) - Gp).max(), np.abs(self.gh.eval(ch, self.fz) - Gh).max())
+            c_g.append(np.concatenate([ch, cp], axis=0)); D.append(lds[ik].density(dmu))
+        D = np.array(D)
+        gw.set_poles(np.array([wg] * nk), coef=np.array(c_g))
+        Dfit = gw.density_matrix()
+        nel = float(2 * np.sum(wk_ * np.einsum('kii->k', D).real))
+        nel_fit = float(2 * np.sum(wk_ * np.einsum('kii->k', Dfit).real))
+        self.F = gw.hartree_exchange(D)
+        cmax = float(np.abs(np.array(c_g)).max())
+        rec = dict(dSigma=dS, mu=self.mu, dmu=dmu, gap_S0_eV=(e_lumo - e_homo) * 27.211386, nelec=nel, nelec_exact=nel, nelec_fit=nel_fit, N_mu=N,
+                   D_fit_err=float(np.abs(D - Dfit).max()), G_fit_res=float(res), cmax=cmax, dropped_weight=0.0, tW=tW, tS=tS, tM=tM, ttot=time.time() - t0)
+        self.history.append(rec)
+        if self.verbose:
+            print(f"iter {len(self.history)} (line Dyson): dSigma {dS:.2e}  mu {self.mu:.6f} (dmu {dmu*27.2114:+.4f} eV)  gap of H+Sigma(0) {rec['gap_S0_eV']:.4f} eV  "
+                  f"N {nel:.8f} (fit {nel_fit:.6f}, max|dD| {rec['D_fit_err']:.1e})  G fit res {res:.1e}  max|c| {cmax:.1e}  "
+                  f"[W {tW:.0f}s, Sigma {tS:.0f}s, mu {tM:.0f}s, total {rec['ttot']:.0f}s]", flush=True)
         return rec
 
     def _w_residues(self):
