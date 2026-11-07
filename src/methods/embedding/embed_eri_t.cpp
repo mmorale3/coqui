@@ -158,14 +158,14 @@ namespace methods {
     // Valid screen types (static to avoid repeated construction)
     static const std::unordered_set<std::string> valid_screen_types = {
       "gw_edmft", "gw_edmft_rpa", "gw_edmft_rpa_density", "gw_edmft_density",
-      "rpa", "crpa", "crpa_ks", "crpa_vasp", "crpa_edmft", "crpa_edmft_density"
+      "rpa", "crpa", "crpa_ks", "crpa_vasp", "crpa_qp", "crpa_edmft", "crpa_edmft_density"
     };
 
     // Sanity checks
     utils::check(valid_screen_types.count(screen_type),
       "embed_eri_t::downfolding_wloc: invalid screen_type: {}. "
       "Acceptable options are \"gw_edmft\", \"gw_edmft_rpa\", \"gw_edmft_density\", "
-      "\"rpa\", \"crpa\", \"crpa_ks\", \"crpa_vasp\", \"crpa_edmft\", \"crpa_edmft_density\".",
+      "\"rpa\", \"crpa\", \"crpa_ks\", \"crpa_vasp\", \"crpa_qp\", \"crpa_edmft\", \"crpa_edmft_density\".",
       screen_type);
 
     utils::check(_context == eri.mpi() && _context == mb_state.mpi,
@@ -428,7 +428,7 @@ namespace methods {
       std::string factorization_type, double thresh) {
 
     std::unordered_set<std::string> valid_screen_types = {
-      "bare", "crpa", "crpa_ks", "crpa_vasp", "crpa_edmft", "crpa_edmft_density"
+      "bare", "crpa", "crpa_ks", "crpa_vasp", "crpa_qp", "crpa_edmft", "crpa_edmft_density"
     };
     utils::check(valid_screen_types.count(screen_type),
                  "embed_eri_t::downfolding_crpa: invalid screen_type: {}. "
@@ -1542,6 +1542,7 @@ namespace methods {
                "-----------------------------------------\n");
     app_log(1, "  Screening = {}\n", screen_type);
     solvers::scr_coulomb_t scr_coulomb(&ft, screen_type, _div_treatment);
+    scr_coulomb.set_crpa_qp_bands(_crpa_qp_band_first, _crpa_qp_band_last);
     auto dPi_tqPQ = scr_coulomb.eval_Pi_qdep(mb_state, thc);
 
     auto[w_pgrid, w_bsize] = solvers::scr_coulomb_t::W_omega_proc_grid(mpi->comm.size(), _MF->nqpts_ibz(), ft.nw_b(), thc.Np());
@@ -1582,6 +1583,7 @@ namespace methods {
     // Dynamical screened interactions
     app_log(1, "Downfolding the dynamic screened interactions with screening type = {}.\n", screen_type);
     solvers::scr_coulomb_t scr_coulomb(&ft, screen_type, _div_treatment);
+    scr_coulomb.set_crpa_qp_bands(_crpa_qp_band_first, _crpa_qp_band_last);
     auto dPi_tqPQ = scr_coulomb.eval_Pi_qdep(mb_state, thc);
 
     auto[w_pgrid, w_bsize] = solvers::scr_coulomb_t::W_omega_proc_grid(mpi->comm.size(), _MF->nqpts_ibz(), ft.nw_b(), thc.Np());
@@ -1629,6 +1631,7 @@ namespace methods {
     // Dynamical screened interactions
     app_log(1, "Downfolding the dynamic screened interactions with screening type = {}.\n", screen_type);
     solvers::scr_coulomb_t scr_coulomb(&ft, screen_type, _div_treatment);
+    scr_coulomb.set_crpa_qp_bands(_crpa_qp_band_first, _crpa_qp_band_last);
     auto dPi_tqPQ = scr_coulomb.eval_Pi_qdep(mb_state, thc);
 
     auto[w_pgrid, w_bsize] = solvers::scr_coulomb_t::W_omega_proc_grid(mpi->comm.size(), _MF->nqpts_ibz(), ft.nw_b(), thc.Np());

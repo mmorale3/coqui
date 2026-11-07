@@ -131,7 +131,7 @@ namespace solvers {
 
     const std::unordered_set<std::string> valid_pi_scheme = {
         "rpa", "rpa_r", "rpa_k",
-        "crpa", "crpa_ks", "crpa_vasp",
+        "crpa", "crpa_ks", "crpa_vasp", "crpa_qp",
         "gw_edmft", "gw_edmft_density",
         "gw_edmft_rpa", "gw_edmft_rpa_density",
         "gw_edmft_zero_pi_imp", "gw_edmft_zero_pi_imp_density",
@@ -3308,7 +3308,8 @@ namespace solvers {
     if (_screen_type.find("crpa") != std::string::npos) {
 
       utils::check(proj != nullptr, "scr_coulomb_t::eval_Pi_qdep: projector is missing in the crpa mode.");
-      int crpa_scheme = (_screen_type.find("crpa_vasp")!=std::string::npos)? 2 :
+      int crpa_scheme = (_screen_type.find("crpa_qp")!=std::string::npos)? 3 :
+                        (_screen_type.find("crpa_vasp")!=std::string::npos)? 2 :
                         (_screen_type.find("crpa_ks")!=std::string::npos)? 1 : 0;
       // Pi_dc and Pi are distributed in the same way among the processors since "eval_Pi_rpa_active" call "eval_Pi_qdep" under the hood.
       auto dPi_tqPQ_dc = eval_Pi_rpa_active(G_tskij, thc, proj->proj_fermi(), crpa_scheme);
@@ -3645,7 +3646,8 @@ namespace solvers {
 
         utils::check(mb_state.proj_boson.has_value(),
                      "scr_coulomb_t::eval_Pi_qdep: projector is missing in the crpa mode.");
-        int crpa_scheme = (_screen_type.find("crpa_vasp")!=std::string::npos)? 2 :
+        int crpa_scheme = (_screen_type.find("crpa_qp")!=std::string::npos)? 3 :
+                          (_screen_type.find("crpa_vasp")!=std::string::npos)? 2 :
                           (_screen_type.find("crpa_ks")!=std::string::npos)? 1 : 0;
         // Pi_dc and Pi are distributed in the same way among the processors since "eval_Pi_rpa_active" call "eval_Pi_qdep" under the hood.
         auto& proj_boson = mb_state.proj_boson.value();

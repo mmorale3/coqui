@@ -467,6 +467,15 @@ void run(mpi3::communicator &comm, InputParser &parser)
         APP_ABORT(cname+": Could not find integral block.");
       }
 
+    } else if (cname == "hf_local_split") {
+
+      ptree pt = it.second;
+      if (auto name = methods::get_thc(mpi_context, pt, mf_list, thc_list)) {
+        methods::hf_local_split(*std::get<1>(thc_list[*name]), pt);
+      } else {
+        APP_ABORT(cname+": Could not find integral block.");
+      }
+
     } else if (cname == "gw_downfold") {
 
       ptree pt = it.second;

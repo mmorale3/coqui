@@ -320,7 +320,11 @@ namespace methods {
 
     std::string _output_type = "default";
 
+    long _crpa_qp_band_first = -1;
+    long _crpa_qp_band_last = -1;
+
   public:
+    void set_crpa_qp_bands(long first, long last) { _crpa_qp_band_first = first; _crpa_qp_band_last = last; }
     mf::MF* MF() const { return _MF; }
     const std::string& div_treatment() const { return _div_treatment; }
 

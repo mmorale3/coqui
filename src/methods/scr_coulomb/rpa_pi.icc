@@ -657,6 +657,102 @@ namespace solvers {
       }
       sGG_tskij.win().fence();
 
+    } else if (scheme == 3) {
+      const bool by_band = (_crpa_qp_band_first >= 0);
+      app_log(1, "Evaluate polarizability within the active space using the eigenstates of the input G:\n"
+                 "at each k, the active states are removed exactly (crpa_qp), chosen by {}.\n"
+                 "G commutes with their projector, so Pi - Pi_active contains only the other transitions.",
+              by_band ? "the QP band range crpa_qp_band_first/last" : "the most projector weight");
+      auto C_skIai = proj.C_skIai();
+      auto W_rng = proj.W_rng();
+      auto [ns, nkpts, nImps, nImpOrbs, nOrbs_W] = C_skIai.shape();
+      utils::check(nImps == 1, "eval_Pi_rpa_active: crpa_qp supports one impurity, got {}.", nImps);
+      long nts = G_tskij.shape(0);
+      long nkpts_ibz = G_tskij.shape(2);
+      long nbnd = G_tskij.shape(3);
+      if (by_band) {
+        app_log(1, "  crpa_qp: active QP bands [{}, {}] (0-based, energy order)", _crpa_qp_band_first, _crpa_qp_band_last);
+        utils::check(_crpa_qp_band_last - _crpa_qp_band_first + 1 == nImpOrbs and _crpa_qp_band_last < nbnd,
+                     "eval_Pi_rpa_active: crpa_qp band range [{}, {}] must hold {} states below {}.",
+                     _crpa_qp_band_first, _crpa_qp_band_last, nImpOrbs, nbnd);
+      }
+      const auto W = W_rng[0];
+      const long iw = _ft->nw_f() / 2; // the first positive frequency of the symmetric fermionic mesh
+      nda::array<double, 3> census(ns, nkpts_ibz, 3); // selected weight min, rest weight max, non-QP defect of G
+      census() = 0.0;
+      nda::array<ComplexType, 3> G_tij(nts, nbnd, nbnd);
+      nda::array<ComplexType, 2> PQ(nbnd, nbnd), G_tmp(nbnd, nbnd);
+      nda::matrix<ComplexType> G_w(nbnd, nbnd), H(nbnd, nbnd), A(nbnd, nbnd);
+      nda::array<ComplexType, 1> Cv(nImpOrbs);
+      nda::array<double, 1> wgt(nbnd);
+      std::vector<long> order(nbnd);
+      auto GG_loc = sGG_tskij.local();
+      sGG_tskij.win().fence();
+      for (long sk = mpi->node_comm.rank(); sk < ns * nkpts_ibz; sk += mpi->node_comm.size()) {
+        long is = sk / nkpts_ibz;
+        long ik = sk % nkpts_ibz;
+        G_tij = G_tskij(nda::range::all, is, ik, nda::range::all, nda::range::all);
+        _ft->tau_to_w(G_tij, G_w, imag_axes_ft::fermion, iw);
+        nda::inverse_in_place(G_w);
+        // G(iw)^-1 = iw + mu - H for a quasiparticle G: the hermitian part has its eigenstates, the rest is a constant
+        H = 0.5 * (G_w + nda::dagger(G_w));
+        A = 0.5 * (G_w - nda::dagger(G_w));
+        ComplexType a_avg = 0.0;
+        for (long i = 0; i < nbnd; ++i) a_avg += A(i, i) / double(nbnd);
+        for (long i = 0; i < nbnd; ++i) A(i, i) -= a_avg;
+        double defect = 0.0;
+        for (auto const &v : A) defect = std::max(defect, std::abs(v));
+        auto [ev, V] = nda::linalg::eigenelements(H);
+        for (long a = 0; a < nbnd; ++a) {
+          Cv() = 0.0;
+          for (long m = 0; m < nImpOrbs; ++m)
+            for (long i = 0; i < nOrbs_W; ++i)
+              Cv(m) += C_skIai(is, ik, 0, m, i) * V(W.first() + i, a);
+          double w = 0.0;
+          for (long m = 0; m < nImpOrbs; ++m) w += std::norm(Cv(m));
+          wgt(a) = w;
+          order[a] = a;
+        }
+        // The hermitian part of G^-1 is mu - H, so its ascending eigenvalues are descending band energies.
+        auto active = [&](long a) {
+          long b = nbnd - 1 - a;
+          return !by_band or (b >= _crpa_qp_band_first and b <= _crpa_qp_band_last);
+        };
+        std::sort(order.begin(), order.end(), [&](long x, long y) {
+          if (active(x) != active(y)) return active(x);
+          return wgt(x) > wgt(y);
+        });
+        census(is, ik, 0) = wgt(order[nImpOrbs - 1]);
+        census(is, ik, 1) = wgt(order[nImpOrbs]);
+        census(is, ik, 2) = defect;
+        PQ() = 0.0;
+        for (long n = 0; n < nImpOrbs; ++n)
+          for (long j = 0; j < nbnd; ++j)
+            for (long i = 0; i < nbnd; ++i)
+              PQ(i, j) += V(i, order[n]) * std::conj(V(j, order[n]));
+        for (long it = 0; it < nts; ++it) {
+          nda::blas::gemm(G_tij(it, nda::range::all, nda::range::all), PQ, G_tmp);
+          nda::blas::gemm(ComplexType(1.0), PQ, G_tmp, ComplexType(0.0), GG_loc(it, is, ik, nda::range::all, nda::range::all));
+        }
+      }
+      sGG_tskij.win().fence();
+      mpi->node_comm.all_reduce_in_place_n(census.data(), census.size(), std::plus<>{});
+      double sel_min = 1e300, rest_max = 0.0, defect_max = 0.0;
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nkpts_ibz; ++ik) {
+          sel_min = std::min(sel_min, census(is, ik, 0));
+          rest_max = std::max(rest_max, census(is, ik, 1));
+          defect_max = std::max(defect_max, census(is, ik, 2));
+        }
+      app_log(1, "  crpa_qp: smallest selected projector weight = {:.5f}, largest unselected = {:.5f}, max non-QP defect of G = {:.3e}",
+              sel_min, rest_max, defect_max);
+      if (sel_min - rest_max < 0.1)
+        app_log(0, "  [WARNING] crpa_qp: selected and unselected states are close in projector weight: {}.",
+                by_band ? "the band range is not a clean projector subspace at some k"
+                        : "the active states are ambiguous at some k, set crpa_qp_band_first/last");
+      if (defect_max > 1e-6)
+        app_log(0, "  [WARNING] crpa_qp: G is not a quasiparticle G (defect {:.3e}): the removal is not exact.", defect_max);
+
     } else
       utils::check(false, "embed_eri_t::eval_Pi_active: invalid scheme = {} for polarizability in the active space.", scheme);
     mpi->comm.barrier();

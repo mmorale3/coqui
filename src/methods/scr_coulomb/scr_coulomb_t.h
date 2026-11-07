@@ -321,10 +321,17 @@ namespace solvers {
         std::array<long, 4> pgrid, std::array<long, 4> bsize)
     -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>;
 
+  public:
+    void set_crpa_qp_bands(long first, long last) { _crpa_qp_band_first = first; _crpa_qp_band_last = last; }
+
   private:
     const imag_axes_ft::IAFT* _ft = nullptr;
 
     std::string _screen_type = "";
+
+    // crpa_qp active states: 0-based QP band range in energy order, inclusive. -1: choose by projector weight.
+    long _crpa_qp_band_first = -1;
+    long _crpa_qp_band_last = -1;
 
     std::string _div_treatment;
     // CVV head (div_treatment = "cvv"): R-shell truncation tolerance handed to

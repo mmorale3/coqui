@@ -163,6 +163,9 @@ template<typename eri_t>
 void hf_downfold(eri_t &eri, ptree const& pt);
 
 template<typename eri_t>
+void hf_local_split(eri_t &eri, ptree const& pt);
+
+template<typename eri_t>
 void gw_downfold(eri_t &eri, ptree &pt);
 
 /**

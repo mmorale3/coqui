@@ -33,6 +33,7 @@
 #include "IO/app_loggers.h"
 #include "IO/ptree/ptree_utilities.hpp"
 
+#include "hamiltonian/one_body_hamiltonian.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
 #include "utilities/mpi_context.h"
 #include "mean_field/MF.hpp"
@@ -2818,6 +2819,9 @@ downfold_coulomb(eri_t &eri, ptree const& pt,
  *  - outdir: "./" Directory where the source and output files are.
  *  - div_treatment: "gygi" Divergent treatment for Coulomb kernel. {choices: "ignore_g0", "gygi"}
  *  - bare_div_treatment: "gygi" Divergent treatment for the bare Coulomb kernel. {choices: "ignore_g0", "gygi"}
+ *  - crpa_qp_band_first, crpa_qp_band_last: -1 With screen_type = "crpa_qp", the active states removed at
+ *    every k: 0-based QP band indices in energy order, inclusive, as many as the Wannier orbitals. -1 selects
+ *    the states with the most projector weight, which is ambiguous when the window is entangled (see the log).
  * Optional arguments used only when outdir/prefix.mbpt.h5 does not exist:
  *  - beta: "1000" Inverse temperature (a.u.)
  *  - wmax: "12.0" Frequency cutoff for the IAFT grid (a.u.)
@@ -2849,6 +2853,15 @@ void downfolding_2e(eri_t &eri, ptree const& pt,
   }
 
   embed_eri_t embed_eri(*mf, div_treatment, bare_div_treatment, "default");
+
+  auto crpa_qp_band_first = io::get_value_with_default<long>(pt, "crpa_qp_band_first", -1);
+  auto crpa_qp_band_last = io::get_value_with_default<long>(pt, "crpa_qp_band_last", -1);
+  if (crpa_qp_band_first >= 0 or crpa_qp_band_last >= 0) {
+    utils::check(screen_type == "crpa_qp", "downfolding_2e: crpa_qp_band_first/last require screen_type = crpa_qp, got {}.", screen_type);
+    utils::check(crpa_qp_band_first >= 0 and crpa_qp_band_last >= crpa_qp_band_first,
+                 "downfolding_2e: invalid crpa_qp band range [{}, {}].", crpa_qp_band_first, crpa_qp_band_last);
+    embed_eri.set_crpa_qp_bands(crpa_qp_band_first, crpa_qp_band_last);
+  }
 
   if (screen_type.substr(0, 8) == "gw_edmft") {
     embed_eri.downfolding_edmft(eri, mb_state, pt, screen_type);
@@ -2923,6 +2936,90 @@ void hf_downfold(eri_t &eri, ptree const& pt) {
                        io::get_value_with_default<bool>(pt, "force_real", true),
                        hf_div_treatment);
 
+}
+
+/**
+ * Splits the Hartree and exchange potentials of a checkpointed density matrix and projects them
+ * onto the local block of a Wannier subspace C. Used to size the part of the local exchange whose
+ * internal lines leave C, which an impurity does not contain.
+ *
+ * Writes outdir/prefix.hf_split.h5 with, all (spin, imp, a, b):
+ *  - Dm_loc_sIab: local density matrix in C.
+ *  - J_loc_sIab, K_loc_sIab: local blocks of J[Dm] and K[Dm], with all lines of the primary basis.
+ *  - Kid_loc_sIab: local block of K[Dm_id], with Dm_id(k) = C(k) Dm_loc C(k)^dag. All its internal
+ *    lines are local and in C, so it must equal the C-only contraction of the bare local interaction.
+ *    This is the check on the comparison.
+ * Required arguments:
+ *  - prefix: Prefix of the checkpoint, outdir/prefix.mbpt.h5.
+ *  - wannier_file: h5 file in which the Wannier transformation matrices are stored.
+ * Optional arguments (with default values):
+ *  - outdir: "./" Directory of the checkpoint and of the output.
+ *  - iter: -1 Iteration of the "scf" group to read. -1 is the last one.
+ *  - hf_div_treatment: "gygi" Divergent treatment for the bare Coulomb kernel.
+ *  - translate_home_cell: false
+ */
+template<typename eri_t>
+void hf_local_split(eri_t &eri, ptree const& pt) {
+  using math::shm::make_shared_array;
+  std::string err = std::string("hf_local_split - Incorrect input - ");
+  auto prefix = io::get_value<std::string>(pt,"prefix",err+"prefix");
+  auto outdir = io::get_value_with_default<std::string>(pt,"outdir","./");
+  auto wannier_file = io::get_value<std::string>(pt,"wannier_file",err+"wannier_file");
+  auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
+  auto hf_div_treatment = io::tolower_copy(io::get_value_with_default<std::string>(pt,"hf_div_treatment","gygi"));
+  auto iter = io::get_value_with_default<long>(pt,"iter",-1);
+
+  auto mf = eri.MF();
+  auto mpi = eri.mpi();
+  std::string output = outdir + "/" + prefix;
+  long ns = mf->nspin(), nk = mf->nkpts_ibz(), nb = mf->nbnd();
+
+  auto [gw_iter, weiss_f_iter, weiss_b_iter, embed_iter] = chkpt::read_input_iterations(output+".mbpt.h5");
+  iter = (iter < 0) ? gw_iter : iter;
+  utils::check(iter >= 0 and iter <= gw_iter,
+               "hf_local_split: scf/iter{} is not in {}.mbpt.h5 (last iteration: {}).", iter, output, gw_iter);
+
+  auto sDm = make_shared_array<Array_view_4D_t>(*mpi, {ns, nk, nb, nb});
+  auto sS = make_shared_array<Array_view_4D_t>(*mpi, {ns, nk, nb, nb});
+  auto sJ = make_shared_array<Array_view_4D_t>(*mpi, {ns, nk, nb, nb});
+  auto sK = make_shared_array<Array_view_4D_t>(*mpi, {ns, nk, nb, nb});
+  auto sDm_id = make_shared_array<Array_view_4D_t>(*mpi, {ns, nk, nb, nb});
+  auto sK_id = make_shared_array<Array_view_4D_t>(*mpi, {ns, nk, nb, nb});
+
+  sDm.win().fence();
+  if (mpi->node_comm.root()) {
+    h5::file file(output+".mbpt.h5", 'r');
+    auto iter_grp = h5::group(file).open_group("scf").open_group("iter"+std::to_string(iter));
+    auto Dm = sDm.local();
+    nda::h5_read(iter_grp, "Dm_skij", Dm);
+  }
+  sDm.win().fence();
+  mpi->comm.barrier();
+  hamilt::set_ovlp(*mf, sS);
+
+  solvers::hf_t hf(hf_div_treatment);
+  hf.evaluate(sJ, sDm.local(), eri, sS.local(), true, false);
+  hf.evaluate(sK, sDm.local(), eri, sS.local(), false, true);
+
+  methods::projector_t proj(*mf, wannier_file, trans_home_cell);
+  auto Dm_loc = proj.downfold_loc<false>(sDm, "Dm_loc");
+  auto J_loc = proj.downfold_loc<false>(sJ, "J_loc");
+  auto K_loc = proj.downfold_loc<false>(sK, "K_loc");
+
+  proj.upfold(sDm_id, Dm_loc);
+  hf.evaluate(sK_id, sDm_id.local(), eri, sS.local(), false, true);
+  auto Kid_loc = proj.downfold_loc<false>(sK_id, "Kid_loc");
+
+  if (mpi->comm.root()) {
+    h5::file file(output+".hf_split.h5", 'w');
+    auto grp = h5::group(file);
+    h5::h5_write(grp, "iter", iter);
+    nda::h5_write(grp, "Dm_loc_sIab", Dm_loc, false);
+    nda::h5_write(grp, "J_loc_sIab", J_loc, false);
+    nda::h5_write(grp, "K_loc_sIab", K_loc, false);
+    nda::h5_write(grp, "Kid_loc_sIab", Kid_loc, false);
+  }
+  mpi->comm.barrier();
 }
 
 /**
@@ -3106,6 +3203,7 @@ template void downfolding_2e(
      thc_reader_t&, ptree const&, std::optional<std::map<std::string, nda::array<ComplexType, 5> > >);
 
 template void hf_downfold(thc_reader_t&, ptree const&);
+template void hf_local_split(thc_reader_t&, ptree const&);
 template void gw_downfold(thc_reader_t&, ptree&);
 
 #define MBPT_INST_MEM(MEM, HF, HARTREE, EXCHANGE, CORR) \
