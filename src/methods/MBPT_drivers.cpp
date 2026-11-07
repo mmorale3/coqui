@@ -1596,6 +1596,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                        .tol = 1e-8, .off_diag_mode = "fermi"}};
     reject_flat_qp_keys(pt, {"qp_type", "ac_alg", "Nfit", "eta", "off_diag_mode"}, solver_type);
     read_qp_block(pt, qp_params);
+    qp_params.hf_dm_correction_file = io::get_value_with_default<std::string>(pt, "hf_dm_correction_file", "");
+    qp_params.hf_dm_correction_dataset = io::get_value_with_default<std::string>(pt, "hf_dm_correction_dataset", "dDm_skij");
+    utils::check(lqsgw or qp_params.hf_dm_correction_file.empty(),
+                 "mbpt: hf_dm_correction_file is supported by lqsgw only (solver_type = {}).", solver_type);
     if (lqsgw) {
       utils::check(qp_params.qp_approx == "lqp",
                    "mbpt: lqsgw fixes qp_approx = lqp; remove qp_approx = {} or use "
@@ -1916,6 +1920,12 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check(qp_gf_grp=="" or qp_gf_grp=="scf" or qp_gf_grp=="embed",
                  "qpgw: greens_func_source = \"{}\" is not supported. Valid options: "
                  "absent (the loop's own analytic QP G), \"scf\", \"embed\".", qp_gf_grp);
+    // lqsgw is the quasiparticle backbone: only the loop's own G_qp may enter P, the ladder, W, Sigma and the HF
+    // density. An external G in iteration 1 (an "embed" Dyson G, or an "scf" group that stores a full G) breaks that.
+    utils::check(!lqsgw or qp_gf_grp == "",
+                 "lqsgw: greens_func_source = \"{}\" would feed an external Green's function into the polarization, W, "
+                 "Sigma and the HF density in iteration 1. lqsgw uses only its own quasiparticle G: continue an lqsgw "
+                 "run with restart = true instead.", qp_gf_grp);
     MBState mb_state(mpi, ft, output);
     qp_scf_loop<SCF_MEM>(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
                          niter, restart, conv_thr, qp_gf_grp, qp_gf_iter);
@@ -2721,6 +2731,22 @@ auto downfold_gloc_with_projector_from_h5(std::shared_ptr<mf::MF> mf, ptree cons
       mf, MBState(ft, outdir+"/"+prefix, mf, wannier_file, trans_home_cell, false), pt);
 }
 
+/**
+ * Hands the crpa_qp active band range of a downfolding block (crpa_qp_band_first, crpa_qp_band_last:
+ * 0-based QP band indices in energy order, inclusive) to embed_eri_t. Absent: the states with the most
+ * projector weight are removed. Aborts if the keys are set with another screen_type.
+ */
+static void set_crpa_qp_bands_from_input(embed_eri_t &embed_eri, ptree const& pt, std::string const& screen_type,
+                                         std::string const& caller) {
+  auto first = io::get_value_with_default<long>(pt, "crpa_qp_band_first", -1);
+  auto last = io::get_value_with_default<long>(pt, "crpa_qp_band_last", -1);
+  if (first < 0 and last < 0) return;
+  utils::check(screen_type == "crpa_qp", "{}: crpa_qp_band_first/last require screen_type = crpa_qp, got {}.",
+               caller, screen_type);
+  utils::check(first >= 0 and last >= first, "{}: invalid crpa_qp band range [{}, {}].", caller, first, last);
+  embed_eri.set_crpa_qp_bands(first, last);
+}
+
 template<typename eri_t>
 std::tuple<nda::array<ComplexType, 4>, nda::array<ComplexType, 5> >
 downfold_coulomb_impl(eri_t &eri, MBState&& mb_state, ptree const& pt, 
@@ -2752,6 +2778,7 @@ downfold_coulomb_impl(eri_t &eri, MBState&& mb_state, ptree const& pt,
     local_polarizabilities.reset();
   }
   embed_eri_t embed_eri(*mf, div_treatment, bare_div_treatment, "default");
+  set_crpa_qp_bands_from_input(embed_eri, pt, screen_type, "downfold_coulomb");
   return (output_in_tau)?
     embed_eri.compute_downfolded_coulomb_tensors<true>(
       eri, mb_state, screen_type, permut_symm, force_real, mb_state.ft, 
@@ -2853,15 +2880,7 @@ void downfolding_2e(eri_t &eri, ptree const& pt,
   }
 
   embed_eri_t embed_eri(*mf, div_treatment, bare_div_treatment, "default");
-
-  auto crpa_qp_band_first = io::get_value_with_default<long>(pt, "crpa_qp_band_first", -1);
-  auto crpa_qp_band_last = io::get_value_with_default<long>(pt, "crpa_qp_band_last", -1);
-  if (crpa_qp_band_first >= 0 or crpa_qp_band_last >= 0) {
-    utils::check(screen_type == "crpa_qp", "downfolding_2e: crpa_qp_band_first/last require screen_type = crpa_qp, got {}.", screen_type);
-    utils::check(crpa_qp_band_first >= 0 and crpa_qp_band_last >= crpa_qp_band_first,
-                 "downfolding_2e: invalid crpa_qp band range [{}, {}].", crpa_qp_band_first, crpa_qp_band_last);
-    embed_eri.set_crpa_qp_bands(crpa_qp_band_first, crpa_qp_band_last);
-  }
+  set_crpa_qp_bands_from_input(embed_eri, pt, screen_type, "downfolding_2e");
 
   if (screen_type.substr(0, 8) == "gw_edmft") {
     embed_eri.downfolding_edmft(eri, mb_state, pt, screen_type);

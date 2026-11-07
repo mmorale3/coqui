@@ -45,13 +45,16 @@ def convert_gw_edmft_params(gw_edmft_params: dict):
         raise ValueError("'edmft_iter_per_loop' must be a non-negative integer.")
 
     # Lattice-stage selector. "gw": coqui.run_gw inside every GW+EDMFT cycle;
-    # "qpgw": a qpGW+BSE lattice stage producing a quasiparticle H_eff.
+    # "qpgw": a qpGW+BSE lattice stage producing a quasiparticle H_eff;
+    # "lqsgw": the quasiparticle backbone of qpGW+EDMFT (Stage 1: frozen LQSGW lattice, U from crpa_qp).
     lattice_solver = gw_edmft_group.get('lattice_solver', 'gw')
-    if lattice_solver not in {'gw', 'qpgw'}:
+    if lattice_solver not in {'gw', 'qpgw', 'lqsgw'}:
         raise ValueError(
-            f"'lattice_solver' must be one of \"gw\", \"qpgw\" (got {lattice_solver!r})."
+            f"'lattice_solver' must be one of \"gw\", \"qpgw\", \"lqsgw\" (got {lattice_solver!r})."
         )
     gw_edmft_params['lattice_solver'] = lattice_solver
+    if lattice_solver == 'lqsgw' and edmft_iter_per_loop == 0:
+        raise ValueError("lattice_solver=\"lqsgw\" needs 'edmft_iter_per_loop' >= 1.")
     if lattice_solver == 'qpgw' and edmft_iter_per_loop == 0:
         raise ValueError(
             "lattice_solver=\"qpgw\" runs the qpGW+BSE lattice stage ONCE before the "
@@ -173,8 +176,43 @@ def convert_gw_edmft_params(gw_edmft_params: dict):
         qpgw_params.update(deepcopy(gw_edmft_group.get('qpgw', {})))
         gw_edmft_params['qpgw'] = qpgw_params
 
+    # qpGW+EDMFT lattice-stage parameters (lattice_solver="lqsgw"); see notes on the scheme in scf_driver.py.
+    #   lattice : the [lqsgw] run (skipped with run_lattice = False when the checkpoint already holds a converged one)
+    #   full_g  : the one-shot [gw] Dyson step on G_qp -> h_HF[gamma_qp], Sigma_c^lat, the full lattice G
+    #   u       : the downfold_2e block of the Stage-1 U (screen_type crpa_qp; crpa_qp_band_first/last where
+    #             the window is entangled). A "_metal" div_treatment is wrong for constrained RPA, so u
+    #             defaults to plain "gygi" and the input must say otherwise explicitly.
+    if lattice_solver == 'lqsgw':
+        if screen_type not in {'rpa', 'gw_edmft'}:
+            raise ValueError(
+                f"lattice_solver=\"lqsgw\" needs the lattice RPA W_loc for the double counting: screen_type in "
+                f"{{\"rpa\", \"gw_edmft\"}} (got {screen_type!r})."
+            )
+        lq = deepcopy(gw_edmft_group.pop('lqsgw', {}))
+        unknown = set(lq) - {'run_lattice', 'lattice', 'full_g', 'u'}
+        if unknown:
+            raise ValueError(f"'lqsgw' section: unknown keys {sorted(unknown)} "
+                             f"(valid: run_lattice, lattice, full_g, u).")
+        lattice = {'outdir': outdir, 'prefix': prefix, 'restart': True, 'niter': 40,
+                   'div_treatment': div_treatment, 'screen_type': 'rpa', 'iter_alg': gw_iter_params}
+        lattice.update(lq.get('lattice', {}))
+        full_g = {'outdir': outdir, 'prefix': prefix, 'restart': True, 'niter': 1,
+                  'div_treatment': div_treatment, 'iter_alg': {'alg': 'damping', 'mixing': 1.0}}
+        full_g.update(lq.get('full_g', {}))
+        if full_g['niter'] != 1:
+            raise ValueError("'lqsgw.full_g.niter' must be 1: the step is one Dyson solve on G_qp, not a GW loop.")
+        u = {'outdir': outdir, 'prefix': prefix, 'screen_type': 'crpa_qp', 'div_treatment': 'gygi',
+             'output_in_tau': True}
+        u.update(lq.get('u', {}))
+        if 'crpa' not in u['screen_type']:
+            raise ValueError(f"'lqsgw.u.screen_type' must be a constrained RPA type (got {u['screen_type']!r}).")
+        gw_edmft_params['lqsgw'] = {'run_lattice': lq.get('run_lattice', True),
+                                    'lattice': lattice, 'full_g': full_g, 'u': u}
+    elif 'lqsgw' in gw_edmft_group:
+        raise ValueError("The 'lqsgw' section requires lattice_solver=\"lqsgw\".")
+
     # wloc parameters
-    gw_edmft_params['wloc'] = {'outdir': outdir, 'prefix': prefix, 'screen_type': screen_type, 
+    gw_edmft_params['wloc'] = {'outdir': outdir, 'prefix': prefix, 'screen_type': screen_type,
                                'div_treatment': div_treatment, 'output_in_tau': True}
     # gloc parameters
     gw_edmft_params['gloc'] = {'outdir': outdir, 'prefix': prefix}

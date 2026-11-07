@@ -527,6 +527,71 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
     }
   }
 
+  TEST_CASE("downfold_2e_crpa_qp", "[methods][embed][df_2e]") {
+    // crpa_qp removes, at every k, the eigenstates of the input G that form the active space. On a mean-field G
+    // with the LiH window (bands 0-1, the two Wannier orbitals, a unitary C at every k), those states span exactly
+    // the window, the same subspace the default crpa projects on, so U must equal the downfold_2e_crpa reference.
+    // Both selections are tested: by projector weight and by the explicit band range [0, 1].
+    auto& mpi = utils::make_unit_test_mpi_context();
+
+    auto downfold_crpa_qp = [&](std::shared_ptr<mf::MF> &mf, std::string wannier_file, long band_first, long band_last) {
+      thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd()*20, "", "incore", "", "bdft",
+                                                 1e-10, mf->ecutrho(), 1, 1024));
+
+      std::string prefix = "coqui";
+      imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::ir_basis, "high", true);
+      simple_dyson dyson(mf.get(), &ft);
+      write_mf_data(*mf, ft, dyson, prefix);
+      mpi->comm.barrier();
+
+      nda::array<ComplexType, 4> Vloc;
+      nda::array<ComplexType, 5> Uloc;
+      MBState mb_state(ft, prefix, mf, wannier_file, true);
+      ptree pt;
+      pt.put("permut_symm", true);
+      pt.put("force_real", true);
+      pt.put("greens_func_source", "");
+      embed_eri_t embed_2e(*mf, "gygi_smallest_q");
+      embed_2e.set_crpa_qp_bands(band_first, band_last);
+      embed_2e.downfolding_crpa(thc, mb_state, pt, "crpa_qp");
+      mpi->comm.barrier();
+
+      long iter;
+      h5::file file(prefix+".mbpt.h5", 'r');
+      auto df_grp = h5::group(file).open_group("downfold_2e");
+      h5::h5_read(df_grp, "final_iter", iter);
+      auto iter_grp = df_grp.open_group("iter"+std::to_string(iter));
+      nda::h5_read(iter_grp, "Vloc_abcd", Vloc);
+      nda::h5_read(iter_grp, "Uloc_wabcd", Uloc);
+
+      VALUE_EQUAL(Vloc(0,0,0,0), 1.416143628383, 1e-5);
+      VALUE_EQUAL(Vloc(1,1,1,1), 0.555000665573, 1e-5);
+      VALUE_EQUAL(Uloc(0,0,0,0,0), -0.350315268764, 1e-5);
+      VALUE_EQUAL(Uloc(0,0,1,0,1), -0.000005850911, 1e-5);
+      VALUE_EQUAL(Uloc(0,1,1,1,1), -0.220910992415, 1e-5);
+      VALUE_EQUAL(Uloc(0,0,0,1,1), -0.115140041097, 1e-5);
+      mpi->comm.barrier();
+
+      if (mpi->comm.root()) {
+        std::string filename = prefix + ".mbpt.h5";
+        remove(filename.c_str());
+      }
+      mpi->comm.barrier();
+    };
+
+    SECTION("nosym_qe_weight") {
+      auto [outdir, prefix] = utils::utest_filename("qe_lih222");
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih222"));
+      downfold_crpa_qp(mf, outdir + "/lih_wan.h5", -1, -1);
+    }
+
+    SECTION("sym_qe_band_range") {
+      auto [outdir, prefix] = utils::utest_filename("qe_lih222_sym");
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih222_sym"));
+      downfold_crpa_qp(mf, outdir + "/lih_wan.h5", 0, 1);
+    }
+  }
+
   TEST_CASE("compute_downfolded_coulomb_tensors", "[methods][embed][df_2e]") {
     auto& mpi = utils::make_unit_test_mpi_context();
 

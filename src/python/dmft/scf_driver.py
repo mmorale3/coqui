@@ -331,6 +331,7 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
     # Lattice stage selector: "gw" (per-cycle coqui.run_gw) or "qpgw".
     lattice_solver = params.pop('lattice_solver', 'gw')
     qpgw_params = params.pop('qpgw', None)
+    lqsgw_params = params.pop('lqsgw', None)
     # Outer-loop selector: "option1" is the frozen-H_eff stage; "option2" re-derives
     # H_eff every cycle.
     outer_loop = params.pop('outer_loop', 'option1')
@@ -397,6 +398,15 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
 
     coqui_mpi.barrier()
 
+    # qpGW+EDMFT, Stage 1a (lattice_solver="lqsgw"): the LQSGW lattice, its full G and the crpa_qp U are
+    # built ONCE here and stay frozen; the cycles below only iterate the impurity.
+    qp_backbone = None
+    if lattice_solver == "lqsgw":
+        if inner_loop_alg != 1:
+            raise ValueError("lattice_solver=\"lqsgw\" supports inner_loop_alg=1 only.")
+        qp_backbone = _lqsgw_lattice_stage(h_int, proj_info, dmft_state, lqsgw_params, coqui_chkpt_h5)
+        coqui_mpi.barrier()
+
     if lattice_solver == "qpgw" and not option2:
         # No qp_selfenergy/dc_type knob is set here: the python EDMFT loop never routes
         # through coqui.downfold_1e, so both keys would be inert.
@@ -429,6 +439,10 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
                              f"H_eff is FROZEN (outer_loop = \"option1\").\n"
                              f"  --> skipping the per-cycle lattice update; "
                              f"the qpGW+BSE stage ran once before the outer loop.\n")
+        elif lattice_solver == "lqsgw":
+            coqui.app_log(1, f"[GW+EDMFT cycle {iteration+1}/{niter}] lattice_solver = \"lqsgw\" (Stage 1a): "
+                             f"the LQSGW lattice (scf/iter{qp_backbone['qp_iter']}), its full G "
+                             f"(scf/iter{qp_backbone['full_iter']}) and U are frozen.\n")
         elif gw_params is not None and gw_iter_per_loop >= 1:
             # update GW solution with fixed impurity self-energies and polarizabilities
             _gw_loop(
@@ -449,6 +463,11 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
                 with HDFArchive(coqui_chkpt_h5, 'r') as ar:
                     gf_for_wloc_source = "scf"
                     gf_for_wloc_iteration = ar["scf/final_iter"]
+            elif lattice_solver == "lqsgw":
+                # W_loc of the double counting is the lattice RPA W of G_qp: the LQSGW iteration, rebuilt
+                # from (MO_skia, E_ska, mu) -- never the full G of the next iteration.
+                gf_for_wloc_source = "scf"
+                gf_for_wloc_iteration = qp_backbone['qp_iter']
             else:
                 with HDFArchive(coqui_chkpt_h5, 'r') as ar:
                     mbpt_final_iter = ar["scf/final_iter"]
@@ -470,9 +489,10 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
                 raise ValueError(f"Unknown inner_loop_alg={inner_loop_alg!r} (expected 1, or 2)")
         
             edmft_impl(
-                mf, h_int, proj_info, dmft_state, solver_chkpt_h5, coqui_chkpt_h5, 
-                gloc_params, wloc_params, impurity_params['solver'], embed_params, 
-                iterative_params, edmft_iter_per_loop
+                mf, h_int, proj_info, dmft_state, solver_chkpt_h5, coqui_chkpt_h5,
+                gloc_params, wloc_params, impurity_params['solver'], embed_params,
+                iterative_params, edmft_iter_per_loop,
+                **({'qp_backbone': qp_backbone} if qp_backbone is not None else {})
             )
 
         if option2:
@@ -587,6 +607,74 @@ def _qpgw_lattice_stage(h_int, proj_info, dmft_state, qpgw_params,
         local_polarizabilities = dmft_state.local_pi_w
     )
     coqui_mpi.barrier()
+
+
+def _lqsgw_lattice_stage(h_int, proj_info, dmft_state, lqsgw_params, coqui_chkpt_h5):
+    """
+    The frozen lattice of qpGW+EDMFT Stage 1a (``lattice_solver="lqsgw"``).
+
+    1. ``[lqsgw]`` to convergence (skipped with ``run_lattice=False``): G_qp, H_qp, mu_qp in ``scf/iterN``.
+    2. One ``[gw]`` Dyson step restarted from ``scf/iterN``. It rebuilds G_qp from (MO_skia, E_ska, mu) and
+       writes ``scf/iterN+1``: F_skij = h_HF[gamma_qp], Sigma_tskij = G_qp (W - v) with W = W[P[G_qp]], and the
+       full lattice G without impurity with its own mu. ``dmft_embed`` builds the full G with the impurity on
+       top of exactly these F and Sigma, so Sigma_imp = Sigma_DC reproduces ``scf/iterN+1``.
+    3. The Stage-1 U from constrained RPA on G_qp (``screen_type="crpa_qp"`` by default), fixed for the run.
+
+    Returns a dict: ``qp_iter`` (N), ``full_iter`` (N+1) and ``u_weiss_iw`` (per impurity, U(i nu) - V in
+    the product basis on the impurity bosonic mesh, the object ``_compute_weiss_fields`` returns as u_weiss).
+    """
+    coqui_mpi = h_int.mpi()
+
+    def _scf_state():
+        with HDFArchive(coqui_chkpt_h5, 'r') as ar:
+            final = ar["scf/final_iter"]
+            keys = list(ar[f"scf/iter{final}"].keys())
+            prev_keys = list(ar[f"scf/iter{final-1}"].keys()) if final >= 1 else []
+        if "MO_skia" in keys and "Sigma_tskij" not in keys:
+            return final, False                  # a quasiparticle iteration, no full G yet
+        if "Sigma_tskij" in keys and "MO_skia" in prev_keys and "Sigma_tskij" not in prev_keys:
+            return final - 1, True               # the one-shot Dyson step already follows it
+        raise RuntimeError(
+            f"lattice_solver=\"lqsgw\": {coqui_chkpt_h5} scf/iter{final} is neither an LQSGW iteration nor the "
+            f"one-shot Dyson step after one. Start from an LQSGW checkpoint.")
+
+    coqui.app_log(1, "Lattice stage: qpGW+EDMFT Stage 1a (frozen LQSGW lattice)")
+    coqui.app_log(1, "-------------------------------------------------------")
+    if lqsgw_params['run_lattice']:
+        qp_iter, has_full = _scf_state()
+        if has_full:
+            raise RuntimeError(
+                f"lattice_solver=\"lqsgw\": scf/iter{qp_iter+1} already holds the one-shot Dyson step of this stage, "
+                f"so the LQSGW loop cannot restart from the end of the checkpoint. Set lqsgw.run_lattice = False.")
+        coqui.run_lqsgw(params=lqsgw_params['lattice'], h_int=h_int)
+        coqui_mpi.barrier()
+    qp_iter, has_full = _scf_state()
+    coqui.app_log(1, f"  LQSGW iteration (G_qp, H_qp)         = scf/iter{qp_iter}")
+
+    if not has_full:
+        full_g = dict(lqsgw_params['full_g'])
+        full_g['greens_func_source'] = "scf"
+        full_g['greens_func_iteration'] = qp_iter
+        coqui.run_gw(full_g, h_int=h_int)
+        coqui_mpi.barrier()
+        qp_check, has_full = _scf_state()
+        if qp_check != qp_iter or not has_full:
+            raise RuntimeError("lattice_solver=\"lqsgw\": the one-shot Dyson step did not write scf/iter{}.".format(qp_iter + 1))
+    coqui.app_log(1, f"  full lattice G, h_HF, Sigma_c^lat    = scf/iter{qp_iter+1}")
+
+    u_params = dict(lqsgw_params['u'])
+    u_params['greens_func_source'] = "scf"
+    u_params['greens_func_iteration'] = qp_iter
+    coqui.app_log(1, f"  Stage-1 U                            = {u_params['screen_type']} on G_qp, "
+                     f"div_treatment {u_params['div_treatment']}"
+                     + (f", QP bands [{u_params['crpa_qp_band_first']}, {u_params['crpa_qp_band_last']}]"
+                        if 'crpa_qp_band_first' in u_params else ", active states by projector weight") + "\n")
+    Vloc_u, Uloc_t = coqui.downfold_coulomb(h_int, u_params, projector_info=proj_info)
+    Uloc_C = dmft_state.embedding['2e'].extract([Uloc_t])
+    u_weiss_iw = [dmft_state.iaft.tau_to_w_phsym(coqui_dmft.chemistry_to_product_basis(U_t[0]), stats='b')
+                  for U_t in Uloc_C]
+    coqui_mpi.barrier()
+    return {'qp_iter': qp_iter, 'full_iter': qp_iter + 1, 'u_weiss_iw': u_weiss_iw}
 
 
 def _option2_cycle_diagnostics(mf, proj_info, dmft_state, coqui_chkpt_h5,
@@ -762,7 +850,15 @@ def _gw_loop(mf, h_int, proj_info,
 
 def _edmft_loop(mf, h_int, proj_info, dmft_state, solver_chkpt_h5, coqui_chkpt_h5, 
                gloc_params, wloc_params, solver_params_list, embed_params,
-               iterative_params, num_iter):
+               iterative_params, num_iter, qp_backbone=None):
+    """
+    The EDMFT inner loop. With ``qp_backbone`` (qpGW+EDMFT Stage 1a, from ``_lqsgw_lattice_stage``):
+      - W_loc is the lattice RPA W of G_qp, with no impurity polarization (Stage 1 has no bosonic feedback);
+      - the bosonic Weiss field is the fixed Stage-1 U, not [W_loc^-1 + Pi_imp]^-1;
+      - the double counting is solve_gw_dc on G_qp,loc: Hartree at U(0) + V, exchange Sigma_x[gamma_qp,loc; V_loc]
+        and correlation -G_qp,loc (W_loc - V), i.e. the local C-only part of what the lattice holds.
+    The bath G_loc is the full G (``embed``, or ``scf/iterN+1`` before the first embedding) in both cases.
+    """
 
     coqui_mpi = mf.mpi()
 
@@ -770,14 +866,29 @@ def _edmft_loop(mf, h_int, proj_info, dmft_state, solver_chkpt_h5, coqui_chkpt_h
         with HDFArchive(coqui_chkpt_h5, 'r') as ar:
             greens_func_source = "embed" if "embed" in ar.keys() else "scf"
             greens_func_iteration = ar[f"{greens_func_source}/final_iter"]
+        if qp_backbone is not None and greens_func_source == "scf" and greens_func_iteration != qp_backbone['full_iter']:
+            raise RuntimeError(f"qpGW+EDMFT: the bath G must come from scf/iter{qp_backbone['full_iter']} "
+                               f"(the full lattice G), but scf/final_iter = {greens_func_iteration}.")
 
         # downfold for W_loc
         # greens_func_source and greens_func_iteration should be fixed during the inner loop
         Vloc, Wloc_t = coqui.downfold_coulomb(
             h_int, wloc_params,
             projector_info=proj_info,
-            local_polarizabilities=dmft_state.local_pi_w
+            local_polarizabilities=None if qp_backbone is not None else dmft_state.local_pi_w
         )
+
+        # qpGW+EDMFT: G_qp,loc for the double counting (the LQSGW iteration, rebuilt from its QP spectrum)
+        Gqp_loc_C = None
+        if qp_backbone is not None:
+            gqp_params = dict(gloc_params)
+            gqp_params["greens_func_source"] = "scf"
+            gqp_params["greens_func_iteration"] = qp_backbone['qp_iter']
+            Gqp_t = coqui.downfold_local_gf(mf, gqp_params, projector_info=proj_info)
+            Gqp_t = [Gqp_t[:, s] for s in range(Gqp_t.shape[1])]
+            if mf.nspin() == 1:
+                Gqp_t = [Gqp_t[0], Gqp_t[0].copy()]
+            Gqp_loc_C = dmft_state.embedding['1e'].extract(Gqp_t)
 
         # downfold for G_loc
         gloc_params["greens_func_source"] = greens_func_source
@@ -822,6 +933,9 @@ def _edmft_loop(mf, h_int, proj_info, dmft_state, solver_chkpt_h5, coqui_chkpt_h
             Input['g_weiss_iw'], Input['u_weiss_iw'] = _compute_weiss_fields(
                 coqui_mpi, Res, Input, solver_params, dmft_state.iaft
             )
+            if qp_backbone is not None:
+                # qpGW+EDMFT Stage 1: the bosonic Weiss field is the fixed U of the lattice stage
+                Input['u_weiss_iw'] = qp_backbone['u_weiss_iw'][imp_index].copy()
             Input['u_weiss_iw'] = coqui_dmft.fit_u_weiss(
                 Input['u_weiss_iw'], dmft_state.iaft, solver_params.get("causal_projection")
             )
@@ -855,6 +969,11 @@ def _edmft_loop(mf, h_int, proj_info, dmft_state, solver_chkpt_h5, coqui_chkpt_h
             dm = -dmft_state.iaft.tau_interpolate(gloc_t_arr, dmft_state.iaft.beta, 'f')[0]
             g_beta_half = -dmft_state.iaft.tau_interpolate(gloc_t_arr, dmft_state.iaft.beta/2, 'f')[0]
             Input['density'] = (np.diag(dm[0]).sum() + np.diag(dm[1]).sum()).real
+            if qp_backbone is not None and coqui_mpi.root():
+                gqp_arr = coqui_dmft.blk_arr_to_arr(Gqp_loc_C[imp_index], Input["gf_struct"])
+                dm_qp = -dmft_state.iaft.tau_interpolate(gqp_arr, dmft_state.iaft.beta, 'f')[0]
+                coqui.app_log(1, f"qpGW+EDMFT: local occupancy of the bath G {Input['density']:.4f}, of G_qp "
+                                 f"{(np.diag(dm_qp[0]).sum() + np.diag(dm_qp[1]).sum()).real:.4f}\n")
             coqui.app_log(1, "Bare/static orbital-averaged interactions for the impurity")
             coqui.app_log(1, "----------------------------------------------------------")
             coqui.app_log(1, f"  intra-orbital                  = {Ub*Hartree_eV:.4f}, {U*Hartree_eV:.4f} eV")
@@ -939,10 +1058,12 @@ def _edmft_loop(mf, h_int, proj_info, dmft_state, solver_chkpt_h5, coqui_chkpt_h
                 #              min eig(U(0)-U(inu_max)), max eig(U(0)-U(inu_max))]
                 Res['causality'] = coqui_dmft.causality_trail(causality)
 
-            # GW double counting contributions (current implementation uses Gloc/Wloc inputs)
+            # GW double counting contributions (current implementation uses Gloc/Wloc inputs;
+            # qpGW+EDMFT uses G_qp,loc, the propagator of the lattice diagrams it replaces)
             Res.update(
                 coqui_dmft.solve_gw_dc(
-                    coqui_dmft.blk_arr_to_arr(Input['Gloc_t'], Res['gf_struct']),
+                    coqui_dmft.blk_arr_to_arr(
+                        Gqp_loc_C[imp_index] if qp_backbone is not None else Input['Gloc_t'], Res['gf_struct']),
                     Input['Vloc'], Input['Wloc_t'], Input['u_weiss_iw'],
                     dmft_state.iaft, density_only=True,
                     gf_struct=Res['gf_struct']

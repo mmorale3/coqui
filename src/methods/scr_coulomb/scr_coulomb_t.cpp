@@ -3692,6 +3692,12 @@ namespace solvers {
           thc.mpi()->comm.barrier();
         }
       }
+    } else {
+      // The cRPA and EDMFT corrections above have no device path; without this check a device run would
+      // return Pi_RPA with them silently left out.
+      utils::check(_screen_type.find("crpa") == std::string::npos and _screen_type.find("edmft") == std::string::npos,
+                   "scr_coulomb_t::eval_Pi_qdep: screen_type = {} needs the cRPA/EDMFT polarization corrections, "
+                   "which are host-only. Run this step with host memory (--compute cpu).", _screen_type);
     }
 
     // Vertex: Pi = Pi_RPA (+ corrections) + Pi^C, ladder injection last (see the hooks above)

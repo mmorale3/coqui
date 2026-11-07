@@ -390,6 +390,14 @@ struct qp_context_t {
   double      qp_tc_wgrid_h = 0.0;
   long        qp_tc_wgrid_audit = 16;
   bool        qp_tc_wgrid_audit_hard = true;
+
+  // lqsgw only: an external correction dDm added to the QP density matrix of the HF build (Hartree and exchange)
+  // in every iteration, e.g. the DMFT charge transfer of the qp_plus_dmft density of qpGW+EDMFT. Read from
+  // hf_dm_correction_file, dataset hf_dm_correction_dataset, shape (ns, nkpts_ibz, nbnd, nbnd), complex, in the
+  // primary basis of the run. Empty file name: no correction. The QP density itself (checkpoint, mu, energies)
+  // is not changed.
+  std::string hf_dm_correction_file = "";
+  std::string hf_dm_correction_dataset = "dDm_skij";
 };
 
 } // methods

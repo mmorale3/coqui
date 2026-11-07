@@ -621,6 +621,42 @@ double qp_scf_loop(
   update_Dm(sDm_skij, sMO_skia, sE_ska, mu, FT.beta());
   Timer.stop("CANONICALIZATION");
 
+  // lqsgw + EDMFT: an external correction dDm of the density matrix that builds Hartree and exchange
+  // (qp_params.hf_dm_correction_file). Every HF build of the loop uses Dm_qp + dDm; Dm_qp itself, mu, the
+  // energies and the checkpoint stay those of the quasiparticle spectrum.
+  std::optional<sArray_t<Array_view_4D_t> > sDm_hf;
+  nda::array<ComplexType, 4> dDm_skij;
+  if (!qp_params.hf_dm_correction_file.empty()) {
+    auto const& dm_file = qp_params.hf_dm_correction_file;
+    auto const& dm_dset = qp_params.hf_dm_correction_dataset;
+    utils::check(std::filesystem::exists(dm_file), "qp_scf_loop: hf_dm_correction_file {} does not exist.", dm_file);
+    sDm_hf.emplace(make_shared_array<Array_view_4D_t>(*mpi, sDm_skij.shape()));
+    {
+      h5::file file(dm_file, 'r');
+      nda::h5_read(h5::group(file), dm_dset, dDm_skij);
+    }
+    auto ds = dDm_skij.shape();
+    auto es = sDm_skij.local().shape();
+    utils::check(ds == es, "qp_scf_loop: {}:{} has shape ({},{},{},{}), the run's density matrix ({},{},{},{}).",
+                 dm_file, dm_dset, ds[0], ds[1], ds[2], ds[3], es[0], es[1], es[2], es[3]);
+    auto kw = mf->k_weight();
+    ComplexType tr = 0.0;
+    double herm = 0.0, amax = 0.0;
+    for (long s = 0; s < ds[0]; ++s)
+      for (long k = 0; k < ds[1]; ++k)
+        for (long i = 0; i < ds[2]; ++i) {
+          tr += kw(k) * dDm_skij(s, k, i, i);
+          for (long j = 0; j < ds[3]; ++j) {
+            amax = std::max(amax, std::abs(dDm_skij(s, k, i, j)));
+            herm = std::max(herm, std::abs(dDm_skij(s, k, i, j) - std::conj(dDm_skij(s, k, j, i))));
+          }
+        }
+    if (ds[0] == 1) tr *= 2.0;
+    app_log(1, "  HF density correction from {}:{}: electrons {:.6e} (imag {:.1e}), max |dDm| = {:.3e}, "
+               "max anti-Hermitian part = {:.1e}", dm_file, dm_dset, tr.real(), tr.imag(), amax, herm);
+    utils::check(herm < 1e-8, "qp_scf_loop: the HF density correction is not Hermitian ({:.1e}).", herm);
+  }
+
   // ITERATION 1 consumes an EXTERNAL G instead of the restart-H_eff's analytic QP G. Two
   // consumers, one object:
   //   (a) sDm_skij <- Dm[G_ext] here, for the HF stage (Hartree term of the lattice density);
@@ -702,21 +738,29 @@ double qp_scf_loop(
 
     Timer.start("MBPT_SOLVERS");
     if (mb_solver.hf != nullptr) { // HF
+      // the density of the HF build: Dm_qp, plus the external correction when one is set (see above)
+      if (sDm_hf) {
+        sDm_hf->win().fence();
+        if (mpi->node_comm.root()) sDm_hf->local() = sDm_skij.local() + dDm_skij;
+        sDm_hf->win().fence();
+        mpi->comm.barrier();
+      }
+      auto& sDm_for_hf = sDm_hf ? sDm_hf.value() : sDm_skij;
       if (mb_eri.hf_eri) {
-        mb_solver.hf->evaluate(sHeff_skij, sDm_skij.local(), mb_eri.hf_eri->get(),
+        mb_solver.hf->evaluate(sHeff_skij, sDm_for_hf.local(), mb_eri.hf_eri->get(),
                                sS_skij.local(), true, true);
       } else if (mb_eri.hartree_eri and mb_eri.exchange_eri) {
-        mb_solver.hf->evaluate(sHeff_skij, sDm_skij.local(), mb_eri.hartree_eri->get(),
+        mb_solver.hf->evaluate(sHeff_skij, sDm_for_hf.local(), mb_eri.hartree_eri->get(),
                                sS_skij.local(), true, false);
         // create temporary buffer for K since hf_solver.evaluate(F) performs in-place evaluation for F.
         sArray_t<Array_view_4D_t> sK_skij(math::shm::make_shared_array<Array_view_4D_t>(*mpi, sHeff_skij.shape()));
-        mb_solver.hf->evaluate(sK_skij, sDm_skij.local(), mb_eri.exchange_eri->get(),
+        mb_solver.hf->evaluate(sK_skij, sDm_for_hf.local(), mb_eri.exchange_eri->get(),
                                sS_skij.local(), false, true);
         if (mpi->node_comm.root()) {
           sHeff_skij.local() += sK_skij.local();
         }
       } else {
-        mb_solver.hf->evaluate(sHeff_skij, sDm_skij.local(), mb_eri.corr_eri->get(),
+        mb_solver.hf->evaluate(sHeff_skij, sDm_for_hf.local(), mb_eri.corr_eri->get(),
                                sS_skij.local(), true, true);
       }
       mpi->comm.barrier();
