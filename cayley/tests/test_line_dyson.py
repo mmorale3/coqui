@@ -2,7 +2,7 @@
 import os, sys
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from cayley.line.line_dyson import LineDyson, chemical_potential_line, line_quadrature
+from cayley.line.line_dyson import LineDyson, chemical_potential_line, electron_count, _bisect_step, line_quadrature
 from cayley.line.line_dlr import LineBasis
 
 THETA = np.deg2rad(20.0)
@@ -80,6 +80,25 @@ def test_chemical_potential_plateau():
     assert abs(N - target) < 1e-2, (N, target)
     e2, v2 = lehmann(H - mid * np.eye(H.shape[0]), w, W)
     assert abs(float(2 * (np.abs(v2[:, e2 < 0]) ** 2).sum()) - N) < 1e-9
+
+
+def test_chemical_potential_rejects_a_step():
+    """A target inside one QP step (a pole crossing mu, as in the Mg2Si iteration 1 with too-gapped bases) must raise, not return.
+    Two k copies with the crossing pole 2e-5 Ha apart: the 'plateau' between their steps is wider than a few tol (the old guard
+    passed it, as on Mg2Si with 8 k) but far below min_gap."""
+    H, w, g, W = model()
+    e, v = lehmann(H, w, W)
+    lds = [LineDyson(H, w, g, THETA), LineDyson(H + 2e-5 * np.eye(H.shape[0]), w, g, THETA)]
+    n0 = float(2 * (np.abs(v[:, e < 0]) ** 2).sum())
+    _, _, el, _ = chemical_potential_line(lds, n0, np.array([0.5, 0.5]))
+    dl = _bisect_step(lds[:1], n0 + 0.5, np.array([1.0]), el, 1.0, 1e-9)  # copy 1 LUMO step (N jumps by 2Z ~ 1)
+    target = electron_count(lds, dl + 1e-5, np.array([0.5, 0.5]))        # between the two copies' LUMO steps
+    try:
+        chemical_potential_line(lds, target, np.array([0.5, 0.5]))
+    except RuntimeError as ex:
+        assert 'no gap' in str(ex), ex
+    else:
+        raise AssertionError('a step was accepted as a plateau')
 
 
 def test_signed_fits_reach_the_imaginary_axis():

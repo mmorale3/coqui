@@ -108,18 +108,20 @@ def _bisect_step(lds, target, k_weight, lo, hi, tol):
     return 0.5 * (lo + hi)
 
 
-def chemical_potential_line(lds, nelec, k_weight, dn=0.05, tol=1e-6, bracket=2.0):
+def chemical_potential_line(lds, nelec, k_weight, dn=0.05, tol=1e-6, bracket=2.0, min_gap=1e-3):
     """T = 0, gapped: N(dmu) is a step function with a plateau at N_el. The plateau edges are where N crosses N_el -+ dn; dn is
     well below the smallest QP step 2 Z w_k and above the integration error. Returns (mid-plateau dmu, lower edge, upper edge,
     N(mid)). The plateau width is the gap of H + Sigma_c(0), NOT the QP gap (no Z factor): the QP edges need the poles of G. N is
     only nearly flat on the plateau for a fixed Sigma_c (the QP weights change with dmu); at the fixed point N = N_el at dmu = 0.
-    Raises if there is no plateau at N_el (a metal or a closed gap)."""
+    Raises if there is no plateau at N_el (a metal or a closed gap). A pole crossing 0 makes N jump within a few tol, which looks
+    like a plateau of width ~tol, so the plateau must exceed min_gap (Ha): below ~1e-3 Ha the one-sided G fits fail anyway (edge
+    poles closer to mu than the lowest fermionic node; notes/paper app. line Dyson)."""
     lo, hi = -bracket, bracket
     if electron_count(lds, lo, k_weight) >= nelec - dn or electron_count(lds, hi, k_weight) <= nelec + dn:
         raise RuntimeError("chemical_potential_line: N_el not bracketed")
     e_h = _bisect_step(lds, nelec - dn, k_weight, lo, hi, tol)
     e_l = _bisect_step(lds, nelec + dn, k_weight, e_h, hi, tol)
-    if e_l - e_h <= 4 * tol:
-        raise RuntimeError(f"chemical_potential_line: no gap at N_el (edges {e_h}, {e_l})")
+    if e_l - e_h <= max(4 * tol, min_gap):
+        raise RuntimeError(f"chemical_potential_line: no gap at N_el (plateau {e_l - e_h:.2e} Ha < min_gap {min_gap:g}; edges {e_h}, {e_l})")
     mid = 0.5 * (e_h + e_l)
     return mid, e_h, e_l, electron_count(lds, mid, k_weight)
