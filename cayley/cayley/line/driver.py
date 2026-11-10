@@ -48,7 +48,7 @@ from .thc_gw import LineGW
 from .closure import fit_sigma_sectors, lehmann_from_sigma, chemical_potential, compress_sectors
 from .closure import fit_sigma_total, wp_thermal, chemical_potential_auto, chemical_potential_neutral, chemical_potential_T, electron_count_T
 from .closure import qp_diag
-from .line_dyson import LineDyson, chemical_potential_line, line_quadrature
+from .line_dyson import LineDyson, NoGapError, chemical_potential_line, line_quadrature
 from .thc_gw import node_floor_mask, thermal_rho
 from .. import finite_t as _ft
 
@@ -59,7 +59,7 @@ class LineSCGW:
                  nodes_per_ray=120, node_range=(1e-3, 60.0), beta=None, thermal_tol=1e-8, thermal_floor=30.0, thermal_floor_f=None,
                  wp_floor=15.0, mu_rule='neutral', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
                  scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5,
-                 g_repr='compressed', g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None, ev_conv='all', ev_conv_zmin=0.5,
+                 g_repr=None, ld_warmup=1, ld_strict=False, g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None, ev_conv='all', ev_conv_zmin=0.5,
                  mixing_F=1.0, nu0_intraband=False, hyb_frame='count'):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
@@ -70,7 +70,13 @@ class LineSCGW:
         scf_density (finite T only): "closure" (default) or "matsubara" (S8b.3 hybrid, module docstring); hyb_wmax: w_max (Ha)
         of the dense Matsubara set; hyb_tau_kw: (nn, per_efold, x0) of the Sigma tau leg (default thc_gw.HYBRID_DEFAULTS).
         theta_t_frac: ray angle theta_t = theta_t_frac * theta (0.5 = theta/2, bitwise the previous rule; metals: 0.25).
-        g_repr (T = 0 loop): "compressed" (default, per-sector LS fit of G on the G bases) or "lehmann" (D1 2026-10-18: the poles and
+        g_repr (T = 0 loop): None = "line_dyson" for beta None and scheme scgw / scgw0, else "compressed".
+        "line_dyson" (2026-11-09 default): G from the Dyson equation on the line (line_dyson.py), no closure in the loop. Start rule:
+        the first ld_warmup iterations use the closure with the Lehmann G (a mean-field start can close the gap of
+        H + Sigma_c(0) once Sigma_c is aligned with the moved mu: Mg2Si from KS, 22 meV), and an iteration whose mu search finds no
+        plateau wider than min_gap is done by the closure too, printed and recorded as history[i]['g_step'] = 'closure'
+        (ld_strict=True raises instead). Converged results should come from 'line_dyson' steps.
+        "compressed" (per-sector LS fit of G on the G bases) or "lehmann" (D1 2026-10-18: the poles and
         vectors of the closure kept, pruned like the C++ driver, closure.hpp g_repr_params_t: (i) |e_m| > g_emax (default lam) or
         e_m == 0 dropped, (ii) weight < g_wtol, (iii) |e_m| < g_emin_frac * QP half gap AND weight < g_wsmall; C++ defaults).
         The compressed fit does not conserve the electron count when the node range barely exceeds the pole range (molecules:
@@ -95,7 +101,10 @@ class LineSCGW:
         # "count": as "new", and the poles keep the closure's own mu (mu_rule; "number": N_closure = N_el)
         assert hyb_frame in ('old', 'new', 'count'); self.hyb_frame = hyb_frame
         assert not self.nu0_intraband or (beta is not None and scheme == 'scgw'), "nu0_intraband: finite T, scheme scgw"
+        if g_repr is None:
+            g_repr = 'line_dyson' if (beta is None and scheme in ('scgw', 'scgw0')) else 'compressed'
         assert g_repr in ('compressed', 'lehmann', 'line_dyson')
+        self.ld_warmup, self.ld_strict = int(ld_warmup), bool(ld_strict)
         assert g_repr != 'line_dyson' or (beta is None and scheme in ('scgw', 'scgw0')), "line_dyson: T = 0, scgw / scgw0"
         self.ld_quad = line_quadrature() if g_repr == 'line_dyson' else None
         self.g_repr, self.g_emax = g_repr, (lam if g_emax is None else g_emax)
@@ -316,8 +325,18 @@ class LineSCGW:
             self.F = self.mixing_F * self.F + (1.0 - self.mixing_F) * self.F_used
         self.F_used = self.F
         Hstat = self.H0 + self.F - self.mu * np.eye(nb)[None]
-        if self.g_repr == 'line_dyson':
-            return self._close_line_dyson(t0, tW, tS, dS, Sig, Hstat)
+        g_step = 'closure'
+        if self.g_repr == 'line_dyson' and len(self.history) >= self.ld_warmup:
+            try:
+                return self._close_line_dyson(t0, tW, tS, dS, Sig, Hstat)
+            except NoGapError as ex:
+                if self.ld_strict:
+                    raise
+                g_step = 'closure (line Dyson: no gap)'
+                print(f"iter {len(self.history) + 1}: line Dyson mu search found no gap ({ex}); this iteration by the closure", flush=True)
+        elif self.g_repr == 'line_dyson':
+            g_step = 'closure (warm-up)'
+
         e_all, v_all, info_all = [], [], []
         for ik in range(nk):
             w, g = fit_sigma_sectors(self.bp, self.bh, self.fz, Sig[ik][0], Sig[ik][1])
@@ -331,7 +350,7 @@ class LineSCGW:
         self.mu += dmu; e_arr = e_arr - dmu; self.gw.mu = self.mu
         wk_ = np.full(nk, 1.0 / nk) if self.k_weight is None else np.asarray(self.k_weight) / np.sum(self.k_weight)
         nel_exact = float(sum(2.0 * wk_[k] * (np.abs(v_arr[k][:, e_arr[k] < 0]) ** 2).sum() for k in range(nk)))
-        if self.g_repr == 'lehmann':                                         # pruned Lehmann G (C++ g_repr "lehmann")
+        if self.g_repr in ('lehmann', 'line_dyson'):                         # pruned Lehmann G (C++ g_repr "lehmann"); line_dyson warm-up
             e_k, v_k, dropped, npr = self._prune_lehmann(e_arr, v_arr, 0.5 * (e_lumo - e_homo))
             M = max(len(e) for e in e_k)                                     # pad: zero vectors far away (no contribution)
             gw.set_poles(np.array([np.pad(e, (0, M - len(e)), constant_values=1e6) for e in e_k]),
@@ -345,10 +364,10 @@ class LineSCGW:
         Dm = gw.density_matrix(); nel = 2 * np.einsum('kii->', Dm).real / nk
         self.F = gw.hartree_exchange(Dm)
         rec = dict(dSigma=dS, mu=self.mu, dmu=dmu, gap_eV=(e_lumo - e_homo) * 27.211386, nelec=nel, nelec_exact=nel_exact, dropped_weight=dropped,
-                   pruned=npr, npoles=[i['npoles'] for i in info_all], heldout=[i['heldout_err'] for i in info_all], tW=tW, tS=tS, ttot=time.time() - t0)
+                   pruned=npr, g_step=g_step, npoles=[i['npoles'] for i in info_all], heldout=[i['heldout_err'] for i in info_all], tW=tW, tS=tS, ttot=time.time() - t0)
         self.history.append(rec)
         if self.verbose:
-            print(f"iter {len(self.history)}: dSigma {dS:.2e}  mu {self.mu:.6f} (dmu {dmu*27.2114:+.4f} eV)  QP gap {rec['gap_eV']:.4f} eV  "
+            print(f"iter {len(self.history)}{'' if g_step == 'closure' else ' (' + g_step + ')'}: dSigma {dS:.2e}  mu {self.mu:.6f} (dmu {dmu*27.2114:+.4f} eV)  QP gap {rec['gap_eV']:.4f} eV  "
                   f"nelec {nel:.6f} (Lehmann {nel_exact:.6f}, dropped weight {dropped:.1e})  npoles {min(rec['npoles'])}-{max(rec['npoles'])}  "
                   f"held-out {max(rec['heldout']):.1e}  [W {tW:.0f}s, Sigma {tS:.0f}s, total {rec['ttot']:.0f}s]", flush=True)
         return rec
@@ -380,7 +399,7 @@ class LineSCGW:
         self.F = gw.hartree_exchange(D)
         cmax = float(np.abs(np.array(c_g)).max())
         rec = dict(dSigma=dS, mu=self.mu, dmu=dmu, gap_S0_eV=(e_lumo - e_homo) * 27.211386, nelec=nel, nelec_exact=nel, nelec_fit=nel_fit, N_mu=N,
-                   D_fit_err=float(np.abs(D - Dfit).max()), G_fit_res=float(res), cmax=cmax, dropped_weight=0.0, tW=tW, tS=tS, tM=tM, ttot=time.time() - t0)
+                   D_fit_err=float(np.abs(D - Dfit).max()), g_step='line_dyson', G_fit_res=float(res), cmax=cmax, dropped_weight=0.0, tW=tW, tS=tS, tM=tM, ttot=time.time() - t0)
         self.history.append(rec)
         if self.verbose:
             print(f"iter {len(self.history)} (line Dyson): dSigma {dS:.2e}  mu {self.mu:.6f} (dmu {dmu*27.2114:+.4f} eV)  gap of H+Sigma(0) {rec['gap_S0_eV']:.4f} eV  "

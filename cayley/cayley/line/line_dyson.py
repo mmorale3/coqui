@@ -92,6 +92,10 @@ class LineDyson:
         return Gpart, Ghole
 
 
+class NoGapError(RuntimeError):
+    """No plateau of N(dmu) at N_el wider than min_gap: the G of this Sigma_c (aligned with mu) is metallic or nearly so."""
+
+
 def electron_count(lds, dmu, k_weight):
     """N(dmu) = 2 sum_k w_k Tr D_k(dmu)."""
     return float(sum(2.0 * wk * np.trace(ld.density(dmu)).real for ld, wk in zip(lds, k_weight)))
@@ -118,10 +122,10 @@ def chemical_potential_line(lds, nelec, k_weight, dn=0.05, tol=1e-6, bracket=2.0
     poles closer to mu than the lowest fermionic node; notes/paper app. line Dyson)."""
     lo, hi = -bracket, bracket
     if electron_count(lds, lo, k_weight) >= nelec - dn or electron_count(lds, hi, k_weight) <= nelec + dn:
-        raise RuntimeError("chemical_potential_line: N_el not bracketed")
+        raise NoGapError("chemical_potential_line: N_el not bracketed")
     e_h = _bisect_step(lds, nelec - dn, k_weight, lo, hi, tol)
     e_l = _bisect_step(lds, nelec + dn, k_weight, e_h, hi, tol)
     if e_l - e_h <= max(4 * tol, min_gap):
-        raise RuntimeError(f"chemical_potential_line: no gap at N_el (plateau {e_l - e_h:.2e} Ha < min_gap {min_gap:g}; edges {e_h}, {e_l})")
+        raise NoGapError(f"chemical_potential_line: no gap at N_el (plateau {e_l - e_h:.2e} Ha < min_gap {min_gap:g}; edges {e_h}, {e_l})")
     mid = 0.5 * (e_h + e_l)
     return mid, e_h, e_l, electron_count(lds, mid, k_weight)

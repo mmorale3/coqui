@@ -40,6 +40,11 @@ Modules (`cayley/`):
                  NOTE (S8b.1): the bosonic fit restricted to the unmasked nodes does NOT determine W below zeta_T, and Sigma_c
                  at every node depends on it (progress entry "S8b.1"); the line Sigma_c matches Eq. fT_sigma to 1e-10 only
                  with W known on all nodes.
+                 T = 0 G representation (`LineSCGW(g_repr=...)`): default `line_dyson` for scgw / scgw0 (`line/line_dyson.py`: G
+                 from the Dyson equation on the line, Cauchy split into G^> / G^<, mu from the plateau of N(dmu), no closure in the
+                 loop; spectra still from the closure). Start rule: `ld_warmup=1` closure iteration(s) first, and an iteration whose mu
+                 search finds no plateau > `min_gap` (1e-3 Ha) is done by the closure, printed and logged as `history[i]['g_step']`
+                 (`ld_strict=True` raises instead). `compressed` / `lehmann` keep the closure in the loop (default for evgw / finite T).
 
 Tests: `tests/` (run `python3 -m pytest tests` or the files directly). Scripts: `scripts/` (finite-T references for the C++
 tests: `scripts/gen_finiteT_ref.py <lih222|lih223>`; svo222: `scripts/gen_metal_ref.py casida|ref|merge svo222 ...`; finite-T Casida: `scripts/make_casida.py ... --beta B`).
