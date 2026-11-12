@@ -101,9 +101,10 @@ class NoGapError(LineDysonFailure):
 
 
 class GFitError(LineDysonFailure):
-    """The signed one-sided fits of G^> / G^< at the nodes miss the Cauchy-split values by more than ld_fit_tol. Seen on Mg2Si
-    (QP gap 0.29 eV) with an ungapped G basis and Sigma basis gap 0.002 Ha: residual 2.5e-6 -> 2.4e-5 -> 0.2 and max|c| 2e3 -> 5e8 over
-    three iterations; Si (1.1 eV) stays at 9e-9."""
+    """The signed one-sided fits of G^> / G^< at the nodes miss the Cauchy-split values by more than ld_fit_tol, or their max|c|
+    grows by more than ld_cmax_growth per step. Seen on Mg2Si (QP gap 0.29 eV, basis gaps 0.002 Ha, lowest node 1e-3 Ha): residual
+    2.5e-6 -> 2.4e-5 -> 0.2, max|c| 2e3 -> 3e4 -> 5e8 over three iterations (Si: 9e-9, 13). Cause: near-mu structure only 2x above the
+    lowest node; a small-gap toy diverges the same way with the node floor at 1e-3 and contracts (max|c| < 70) at 1e-4."""
 
 
 def electron_count(lds, dmu, k_weight):

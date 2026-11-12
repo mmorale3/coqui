@@ -59,7 +59,7 @@ class LineSCGW:
                  nodes_per_ray=120, node_range=(1e-3, 60.0), beta=None, thermal_tol=1e-8, thermal_floor=30.0, thermal_floor_f=None,
                  wp_floor=15.0, mu_rule='neutral', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
                  scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5,
-                 g_repr=None, ld_warmup=1, ld_strict=False, ld_fit_tol=1e-5, g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None, ev_conv='all', ev_conv_zmin=0.5,
+                 g_repr=None, ld_warmup=1, ld_strict=False, ld_fit_tol=1e-4, ld_cmax_growth=10.0, g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None, ev_conv='all', ev_conv_zmin=0.5,
                  mixing_F=1.0, nu0_intraband=False, hyb_frame='count'):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
@@ -74,10 +74,12 @@ class LineSCGW:
         "line_dyson" (2026-11-09 default): G from the Dyson equation on the line (line_dyson.py), no closure in the loop. Start rule:
         the first ld_warmup iterations use the closure with the Lehmann G (a mean-field start can close the gap of
         H + Sigma_c(0) once Sigma_c is aligned with the moved mu: Mg2Si from KS, 22 meV), and an iteration whose mu search finds no
-        plateau wider than min_gap, or whose G^> / G^< fits miss the split values by more than ld_fit_tol, is done by the closure
-        too, printed and recorded in history[i]['g_step'] (ld_strict=True raises instead). Converged results should come from
-        'line_dyson' steps. Small gaps: g_gap and sig_gap must sit inside the QP gap (G poles beyond the QP edges, Sigma_c poles
-        beyond edge + lowest Pi pole), else the fits place spurious poles in the gap (GFitError in line_dyson.py).
+        plateau wider than min_gap, or whose G^> / G^< fits miss the split values by more than ld_fit_tol or whose max|c| grew by
+        more than ld_cmax_growth since the last line-Dyson step, is done by the closure too, printed and recorded in
+        history[i]['g_step'] (ld_strict=True raises instead). Converged results should come from 'line_dyson' steps.
+        Small gaps: the lowest node (node_range[0]) must lie ~20x below the smallest basis gap (bos_gap, sig_gap) and the QP edges,
+        else the signed G fits need cancelling coefficients that grow from iteration to iteration (GFitError in line_dyson.py;
+        Mg2Si with gaps 0.002 Ha needs node_range (1e-4, 60)).
         "compressed" (per-sector LS fit of G on the G bases) or "lehmann" (D1 2026-10-18: the poles and
         vectors of the closure kept, pruned like the C++ driver, closure.hpp g_repr_params_t: (i) |e_m| > g_emax (default lam) or
         e_m == 0 dropped, (ii) weight < g_wtol, (iii) |e_m| < g_emin_frac * QP half gap AND weight < g_wsmall; C++ defaults).
@@ -106,7 +108,7 @@ class LineSCGW:
         if g_repr is None:
             g_repr = 'line_dyson' if (beta is None and scheme in ('scgw', 'scgw0')) else 'compressed'
         assert g_repr in ('compressed', 'lehmann', 'line_dyson')
-        self.ld_warmup, self.ld_strict, self.ld_fit_tol = int(ld_warmup), bool(ld_strict), float(ld_fit_tol)
+        self.ld_warmup, self.ld_strict, self.ld_fit_tol, self.ld_cmax_growth = int(ld_warmup), bool(ld_strict), float(ld_fit_tol), float(ld_cmax_growth)
         assert g_repr != 'line_dyson' or (beta is None and scheme in ('scgw', 'scgw0')), "line_dyson: T = 0, scgw / scgw0"
         self.ld_quad = line_quadrature() if g_repr == 'line_dyson' else None
         self.g_repr, self.g_emax = g_repr, (lam if g_emax is None else g_emax)
@@ -392,8 +394,12 @@ class LineSCGW:
             cp, ch = self.gp.fit(self.fz, Gp), self.gh.fit(self.fz, Gh)
             res = max(res, np.abs(self.gp.eval(cp, self.fz) - Gp).max(), np.abs(self.gh.eval(ch, self.fz) - Gh).max())
             c_g.append(np.concatenate([ch, cp], axis=0)); D.append(lds[ik].density(dmu))
-        if not res <= self.ld_fit_tol:                                     # nothing committed yet (mu, poles, F): the closure can take over
-            raise GFitError(f"G^>/G^< fit residual {res:.1e} > ld_fit_tol {self.ld_fit_tol:g} (max|c| {np.abs(np.array(c_g)).max():.1e})")
+        cmax = float(np.abs(np.array(c_g)).max())
+        prev = [r['cmax'] for r in self.history if r.get('g_step') == 'line_dyson']
+        grow = cmax / prev[-1] if prev else 1.0
+        if not (res <= self.ld_fit_tol and grow <= self.ld_cmax_growth):  # nothing committed yet (mu, poles, F): the closure can take over
+            raise GFitError(f"G^>/G^< fit residual {res:.1e} (ld_fit_tol {self.ld_fit_tol:g}), max|c| {cmax:.1e} "
+                            f"(x{grow:.1f} vs the last line-Dyson step, ld_cmax_growth {self.ld_cmax_growth:g})")
         self.mu += dmu; gw.mu = self.mu
         D = np.array(D)
         gw.set_poles(np.array([wg] * nk), coef=np.array(c_g))
@@ -401,7 +407,6 @@ class LineSCGW:
         nel = float(2 * np.sum(wk_ * np.einsum('kii->k', D).real))
         nel_fit = float(2 * np.sum(wk_ * np.einsum('kii->k', Dfit).real))
         self.F = gw.hartree_exchange(D)
-        cmax = float(np.abs(np.array(c_g)).max())
         rec = dict(dSigma=dS, mu=self.mu, dmu=dmu, gap_S0_eV=(e_lumo - e_homo) * 27.211386, nelec=nel, nelec_exact=nel, nelec_fit=nel_fit, N_mu=N,
                    D_fit_err=float(np.abs(D - Dfit).max()), g_step='line_dyson', G_fit_res=float(res), cmax=cmax, dropped_weight=0.0, tW=tW, tS=tS, tM=tM, ttot=time.time() - t0)
         self.history.append(rec)

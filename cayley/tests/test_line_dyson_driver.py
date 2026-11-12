@@ -61,6 +61,24 @@ def test_g_fit_fallback():
     assert abs(sc.history[-1]['nelec'] - 4.0) < 2e-2
 
 
+def test_small_gap_node_floor():
+    """KS gap ~0.6 eV, basis gaps 0.002 Ha: with the lowest node at 1e-3 the G-fit coefficients grow x5, x37, ... (the Mg2Si failure)
+    and the guard hands the step to the closure; at 1e-4 (20x below the basis gaps) line Dyson contracts with max|c| < 1e2."""
+    e2 = np.array([[-1.2, -0.012, 0.012, 1.5], [-0.9, -0.010, 0.014, 2.0]])
+    H2 = np.array([np.diag(e2[k] + 0.3) for k in range(nk)]).astype(complex)
+    def run(nr, npr, n):
+        sc = LineSCGW(X, Z, qk, nk, 4.0, H2, 0.3, eps=1e-8, lam=6.0, bos_lam=4.0, K=4, verbose=False, qminus=qminus, nodes_per_ray=npr,
+                      node_range=nr, bos_gap=0.002, sig_gap=(0.002, 0.002))
+        sc.start_from_hamiltonian(H2)
+        return sc, [sc.iterate()['g_step'] for _ in range(n)]
+    sc, steps = run((1e-4, 60.0), 150, 5)
+    assert steps == ['closure (warm-up)'] + ['line_dyson'] * 4, steps
+    dS = [r['dSigma'] for r in sc.history[1:]]
+    assert all(b < 0.7 * a for a, b in zip(dS, dS[1:])) and max(r['cmax'] for r in sc.history[1:]) < 1e2, (dS, [r['cmax'] for r in sc.history[1:]])
+    sc, steps = run((1e-3, 60.0), 120, 4)
+    assert steps[-1] == 'closure (line Dyson: G fit)', steps
+
+
 if __name__ == '__main__':
     for name, f in list(globals().items()):
         if name.startswith('test_'):
