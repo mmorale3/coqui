@@ -17,7 +17,8 @@ H0 = np.array([np.diag(e[k] + 0.3) for k in range(nk)]).astype(complex)
 
 
 def make(**kw):
-    sc = LineSCGW(X, Z, qk, nk, 4.0, H0, 0.3, eps=1e-8, lam=6.0, bos_lam=4.0, K=4, nodes_per_ray=30, verbose=False, qminus=qminus, **kw)
+    kw = {'nodes_per_ray': 120, **kw}     # 30 nodes/ray under-determine the fits (60 data, 132 Sigma / 204 G functions): G fit res 2e-3, diverges
+    sc = LineSCGW(X, Z, qk, nk, 4.0, H0, 0.3, eps=1e-8, lam=6.0, bos_lam=4.0, K=4, verbose=False, qminus=qminus, **kw)
     sc.start_from_hamiltonian(H0)
     return sc
 
@@ -26,9 +27,12 @@ def test_default_and_warmup():
     sc = make()
     assert sc.g_repr == 'line_dyson'
     assert make(scheme='scgw0').g_repr == 'line_dyson' and make(scheme='evgw').g_repr == 'compressed'
-    steps = [sc.iterate()['g_step'] for _ in range(3)]
-    assert steps == ['closure (warm-up)', 'line_dyson', 'line_dyson'], steps
-    assert abs(sc.history[-1]['nelec'] - 4.0) < 1e-2, sc.history[-1]['nelec']    # N(mid-plateau): exact only at the fixed point
+    steps = [sc.iterate()['g_step'] for _ in range(5)]
+    assert steps == ['closure (warm-up)'] + ['line_dyson'] * 4, steps
+    assert abs(sc.history[-1]['nelec'] - 4.0) < 1e-3, sc.history[-1]['nelec']    # N(mid-plateau): exact only at the fixed point
+    dS = [r['dSigma'] for r in sc.history[1:]]
+    assert all(b < 0.7 * a for a, b in zip(dS, dS[1:])), dS                     # contracts (x0.5 per iteration on this toy)
+    assert max(r['G_fit_res'] for r in sc.history[1:]) < sc.ld_fit_tol
 
 
 def test_no_gap_fallback_and_strict():
@@ -47,6 +51,14 @@ def test_no_gap_fallback_and_strict():
             raise AssertionError('ld_strict did not raise')
     finally:
         drv.chemical_potential_line = orig
+
+
+def test_g_fit_fallback():
+    """A G^>/G^< fit worse than ld_fit_tol: nothing is committed by line Dyson, the closure does the iteration."""
+    sc = make(ld_fit_tol=-1.0)                                                    # every fit fails the tolerance
+    steps = [sc.iterate()['g_step'] for _ in range(2)]
+    assert steps == ['closure (warm-up)', 'closure (line Dyson: G fit)'], steps
+    assert abs(sc.history[-1]['nelec'] - 4.0) < 2e-2
 
 
 if __name__ == '__main__':

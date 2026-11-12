@@ -92,8 +92,18 @@ class LineDyson:
         return Gpart, Ghole
 
 
-class NoGapError(RuntimeError):
+class LineDysonFailure(RuntimeError):
+    """This iteration cannot be closed by line Dyson; the driver does it by the closure (unless ld_strict)."""
+
+
+class NoGapError(LineDysonFailure):
     """No plateau of N(dmu) at N_el wider than min_gap: the G of this Sigma_c (aligned with mu) is metallic or nearly so."""
+
+
+class GFitError(LineDysonFailure):
+    """The signed one-sided fits of G^> / G^< at the nodes miss the Cauchy-split values by more than ld_fit_tol. Seen on Mg2Si
+    (QP gap 0.29 eV) with an ungapped G basis and Sigma basis gap 0.002 Ha: residual 2.5e-6 -> 2.4e-5 -> 0.2 and max|c| 2e3 -> 5e8 over
+    three iterations; Si (1.1 eV) stays at 9e-9."""
 
 
 def electron_count(lds, dmu, k_weight):
