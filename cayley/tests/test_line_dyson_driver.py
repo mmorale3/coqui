@@ -53,6 +53,15 @@ def test_no_gap_fallback_and_strict():
         drv.chemical_potential_line = orig
 
 
+def test_switch_after_settling():
+    """ld_switch_dS: closure until its dSigma drops below the threshold, then line Dyson for good."""
+    sc = make(ld_switch_dS=2e-2)
+    steps = [sc.iterate()['g_step'] for _ in range(4)]
+    dS = [r['dSigma'] for r in sc.history]
+    k = next(i for i, d in enumerate(dS) if 0 < d < 2e-2)
+    assert steps == ['closure (warm-up)'] * k + ['line_dyson'] * (4 - k) and 1 < k < 4, (steps, dS)
+
+
 def test_g_fit_fallback():
     """A G^>/G^< fit worse than ld_fit_tol: nothing is committed by line Dyson, the closure does the iteration."""
     sc = make(ld_fit_tol=-1.0)                                                    # every fit fails the tolerance

@@ -59,7 +59,7 @@ class LineSCGW:
                  nodes_per_ray=120, node_range=(1e-3, 60.0), beta=None, thermal_tol=1e-8, thermal_floor=30.0, thermal_floor_f=None,
                  wp_floor=15.0, mu_rule='neutral', bos_eps_T=1e-10, qminus=None, wstep=None, mu_dn_max=0.1, mu_th_factor=10.0,
                  scf_density='closure', hyb_wmax=100.0, hyb_tau_kw=None, theta_t_frac=0.5,
-                 g_repr=None, ld_warmup=1, ld_strict=False, ld_fit_tol=1e-4, ld_cmax_growth=10.0, g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None, ev_conv='all', ev_conv_zmin=0.5,
+                 g_repr=None, ld_warmup=1, ld_strict=False, ld_fit_tol=1e-4, ld_cmax_growth=10.0, ld_switch_dS=None, g_emax=None, g_wtol=1e-12, g_emin_frac=0.5, g_wsmall=1e-4, scheme='scgw', ev_window=None, ev_conv='all', ev_conv_zmin=0.5,
                  mixing_F=1.0, nu0_intraband=False, hyb_frame='count'):
         """lam: real-pole range (Ha) of the fermionic bases (must cover the support of Sigma_c and of G: band edges + plasmon,
         ~5 Ha for Si); bos_lam: bosonic (W) range; the fermionic data live on a dense log grid of nodes_per_ray points per ray
@@ -77,7 +77,10 @@ class LineSCGW:
         plateau wider than min_gap, or whose G^> / G^< fits miss the split values by more than ld_fit_tol or whose max|c| grew by
         more than ld_cmax_growth since the last line-Dyson step, is done by the closure too, printed and recorded in
         history[i]['g_step'] (ld_strict=True raises instead). Converged results should come from 'line_dyson' steps.
-        Small gaps: the lowest node (node_range[0]) must lie ~20x below the smallest basis gap (bos_gap, sig_gap) and the QP edges,
+        ld_switch_dS (default None = off): the warm-up also lasts until the closure's dSigma < ld_switch_dS (Mg2Si from KS: the
+        first iterations swing the static gap to 0.07 eV; dSigma < 3e-3 from it ~6), then line Dyson for good (fallbacks as above).
+        lam must cover G and Sigma_c including semicore satellites (Mg2Si with Mg 2s2p: H_stat down to -3.6 Ha, G-fit coefficients
+        pile up at -lam = -6 Ha; use 12). Small gaps: the lowest node (node_range[0]) must lie ~20x below the smallest basis gap (bos_gap, sig_gap) and the QP edges,
         else the signed G fits need cancelling coefficients that grow from iteration to iteration (GFitError in line_dyson.py;
         Mg2Si with gaps 0.002 Ha needs node_range (1e-4, 60)).
         "compressed" (per-sector LS fit of G on the G bases) or "lehmann" (D1 2026-10-18: the poles and
@@ -109,6 +112,7 @@ class LineSCGW:
             g_repr = 'line_dyson' if (beta is None and scheme in ('scgw', 'scgw0')) else 'compressed'
         assert g_repr in ('compressed', 'lehmann', 'line_dyson')
         self.ld_warmup, self.ld_strict, self.ld_fit_tol, self.ld_cmax_growth = int(ld_warmup), bool(ld_strict), float(ld_fit_tol), float(ld_cmax_growth)
+        self.ld_switch_dS = None if ld_switch_dS is None else float(ld_switch_dS)
         assert g_repr != 'line_dyson' or (beta is None and scheme in ('scgw', 'scgw0')), "line_dyson: T = 0, scgw / scgw0"
         self.ld_quad = line_quadrature() if g_repr == 'line_dyson' else None
         self.g_repr, self.g_emax = g_repr, (lam if g_emax is None else g_emax)
@@ -330,7 +334,9 @@ class LineSCGW:
         self.F_used = self.F
         Hstat = self.H0 + self.F - self.mu * np.eye(nb)[None]
         g_step = 'closure'
-        if self.g_repr == 'line_dyson' and len(self.history) >= self.ld_warmup:
+        switched = any(r.get('g_step') == 'line_dyson' for r in self.history)
+        settled = self.ld_switch_dS is None or switched or 0.0 < dS < self.ld_switch_dS
+        if self.g_repr == 'line_dyson' and len(self.history) >= self.ld_warmup and settled:
             try:
                 return self._close_line_dyson(t0, tW, tS, dS, Sig, Hstat)
             except LineDysonFailure as ex:
